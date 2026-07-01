@@ -42,6 +42,7 @@ Powder follows the Canary-style deployment pattern:
 
 - one Rust service image
 - SQLite database at `POWDER_DB_PATH`
+- dual-stack/private-Fly listener at `POWDER_BIND_ADDR`
 - Fly volume mounted at `/data`
 - optional Litestream replication to Fly Tigris
 - `/healthz`, `/readyz`, and `/api/v1/onboarding`
@@ -58,7 +59,25 @@ POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 
 Agent routes require `Authorization: Bearer <key>` in `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
-supported tailnet identity headers. Use `none` only for local development.
+supported tailnet identity headers and strips spoofed client-supplied identity
+headers. Use `none` only for local development.
+
+Fly instance shape:
+
+```sh
+fly apps create powder --org misty-step
+fly volumes create powder_data --size 1 --region iad --app powder
+fly deploy --app powder
+```
+
+The default `fly.toml` keeps one machine warm, mounts `/data`, listens on
+`[::]:4000` for Fly private IPv6, checks `/healthz` and `/readyz`, and sets
+`POWDER_PUBLIC_BASE_URL` to `https://powder.internal` for a tailnet-fronted
+instance. The companion bastion lane can expose `http://powder.internal:4000`
+through Tailscale Serve while Powder keeps its own database and secrets on its
+Fly volume. The Fly profile redacts the first bootstrap key in logs; create an
+operator-held key over SSH with `powder key-create --db /data/powder.db --name
+operator --scope admin --show-secret` and store it in a secret manager.
 
 ## Gate
 

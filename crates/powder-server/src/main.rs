@@ -36,7 +36,7 @@ struct Config {
     db_path: PathBuf,
     auth_mode: AuthMode,
     public_base_url: Option<String>,
-    port: u16,
+    bind_addr: SocketAddr,
     disclose_bootstrap_key: bool,
 }
 
@@ -94,12 +94,21 @@ impl Config {
             env_value(&vars, "POWDER_DISCLOSE_BOOTSTRAP_KEY"),
         )?
         .unwrap_or(true);
+        let bind_addr = match env_value(&vars, "POWDER_BIND_ADDR") {
+            Some(value) => value.parse::<SocketAddr>().map_err(|err| {
+                ConfigError::new(
+                    "POWDER_BIND_ADDR",
+                    format!("expected socket address: {err}"),
+                )
+            })?,
+            None => SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], port)),
+        };
 
         Ok(Self {
             db_path,
             auth_mode,
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
-            port,
+            bind_addr,
             disclose_bootstrap_key,
         })
     }
@@ -219,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let addr = config.bind_addr;
     let state = AppState {
         config: Arc::new(config),
         store: Arc::new(Mutex::new(store)),
@@ -609,7 +618,10 @@ mod tests {
         let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
 
         assert_eq!(config.db_path, PathBuf::from(DEFAULT_DB_PATH));
-        assert_eq!(config.port, DEFAULT_PORT);
+        assert_eq!(
+            config.bind_addr,
+            SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT))
+        );
         assert_eq!(config.auth_mode, AuthMode::ApiKey);
         assert!(config.disclose_bootstrap_key);
     }
@@ -633,6 +645,18 @@ mod tests {
         let err = Config::from_pairs([("POWDER_AUTH_MODE", "open")]).unwrap_err();
 
         assert_eq!(err.variable, "POWDER_AUTH_MODE");
+    }
+
+    #[test]
+    fn config_accepts_explicit_bind_addr() {
+        let config = Config::from_pairs([("POWDER_BIND_ADDR", "127.0.0.1:4100")]).unwrap();
+        assert_eq!(
+            config.bind_addr,
+            "127.0.0.1:4100".parse::<SocketAddr>().unwrap()
+        );
+
+        let err = Config::from_pairs([("POWDER_BIND_ADDR", "localhost")]).unwrap_err();
+        assert_eq!(err.variable, "POWDER_BIND_ADDR");
     }
 
     #[tokio::test]
@@ -783,7 +807,7 @@ mod tests {
                 db_path: PathBuf::from(":memory:"),
                 auth_mode,
                 public_base_url: None,
-                port: DEFAULT_PORT,
+                bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
                 disclose_bootstrap_key: false,
             }),
             store: Arc::new(Mutex::new(store)),
