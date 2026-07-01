@@ -30,6 +30,21 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/cards/{id}/release",
+        intent: "release an active claim and make the card ready",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/cards/{id}/renew",
+        intent: "extend an active claim lease",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/cards/{id}/heartbeat",
+        intent: "record liveness for an active claim",
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/cards/{id}/status",
         intent: "move a card through an allowed status transition",
     },
@@ -70,6 +85,9 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
         assert!(paths.contains(&"/api/v1/cards/{id}/claim"));
+        assert!(paths.contains(&"/api/v1/cards/{id}/release"));
+        assert!(paths.contains(&"/api/v1/cards/{id}/renew"));
+        assert!(paths.contains(&"/api/v1/cards/{id}/heartbeat"));
         assert!(paths.contains(&"/api/v1/cards/{id}/links"));
         assert!(paths.contains(&"/api/v1/runs/{id}/input"));
     }

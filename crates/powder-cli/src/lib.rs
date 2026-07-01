@@ -11,6 +11,9 @@ pub const COMMANDS: &[&str] = &[
     "create-card",
     "list-ready",
     "claim",
+    "release-claim",
+    "renew-claim",
+    "heartbeat",
     "update-status",
     "add-link",
     "request-input",
@@ -27,6 +30,9 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "create-card" => create_card(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest),
         [command, rest @ ..] if command == "claim" => claim(rest),
+        [command, rest @ ..] if command == "release-claim" => release_claim(rest),
+        [command, rest @ ..] if command == "renew-claim" => renew_claim(rest),
+        [command, rest @ ..] if command == "heartbeat" => heartbeat(rest),
         [command, rest @ ..] if command == "update-status" => update_status(rest),
         [command, rest @ ..] if command == "add-link" => add_link(rest),
         [command, rest @ ..] if command == "request-input" => request_input(rest),
@@ -47,6 +53,9 @@ pub fn help() -> String {
     help.push_str("  powder import backlog.d --db ./data/powder.db\n");
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
+    help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
+    help.push_str("  powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600\n");
+    help.push_str("  powder release-claim 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder update-status 001 --db ./data/powder.db --status running\n");
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof\n\n",
@@ -202,15 +211,53 @@ fn claim(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "claim")?;
     let agent = required_flag(args, "--agent")?;
-    let ttl_seconds = flag_value(args, "--ttl")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(3600);
+    let ttl_seconds = optional_ttl(args)?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let claim = store
         .claim_card(&card_id, agent, now, ttl_seconds)
         .map_err(store_err)?;
     Ok(format!(
         "claimed\t{}\t{}\t{}\n",
+        claim.card_id, claim.run_id, claim.expires_at
+    ))
+}
+
+fn release_claim(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "release-claim")?;
+    let run_id = required_run_flag(args)?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let claim = store
+        .release_claim(&card_id, &run_id, now)
+        .map_err(store_err)?;
+    Ok(format!("released\t{}\t{}\n", claim.card_id, claim.run_id))
+}
+
+fn renew_claim(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "renew-claim")?;
+    let run_id = required_run_flag(args)?;
+    let ttl_seconds = optional_ttl(args)?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let claim = store
+        .renew_claim(&card_id, &run_id, now, ttl_seconds)
+        .map_err(store_err)?;
+    Ok(format!(
+        "renewed\t{}\t{}\t{}\n",
+        claim.card_id, claim.run_id, claim.expires_at
+    ))
+}
+
+fn heartbeat(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "heartbeat")?;
+    let run_id = required_run_flag(args)?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let claim = store
+        .heartbeat_claim(&card_id, &run_id, now)
+        .map_err(store_err)?;
+    Ok(format!(
+        "heartbeat\t{}\t{}\t{}\n",
         claim.card_id, claim.run_id, claim.expires_at
     ))
 }
@@ -284,6 +331,21 @@ fn positional_card_id(args: &[String], command: &str) -> Result<CardId, ShellErr
         .and_then(|id| CardId::new(id).map_err(ShellError::from))
 }
 
+fn required_run_flag(args: &[String]) -> Result<RunId, ShellError> {
+    required_flag(args, "--run").and_then(|id| RunId::new(id).map_err(ShellError::from))
+}
+
+fn optional_ttl(args: &[String]) -> Result<u64, ShellError> {
+    flag_value(args, "--ttl")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| ShellError::Invalid(format!("invalid --ttl: {value}")))
+        })
+        .transpose()
+        .map(|ttl| ttl.unwrap_or(3600))
+}
+
 fn parse_limit(args: &[String]) -> Option<usize> {
     flag_value(args, "--limit").and_then(|value| value.parse::<usize>().ok())
 }
@@ -335,6 +397,9 @@ mod tests {
         assert!(COMMANDS.contains(&"init-db"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"claim"));
+        assert!(COMMANDS.contains(&"release-claim"));
+        assert!(COMMANDS.contains(&"renew-claim"));
+        assert!(COMMANDS.contains(&"heartbeat"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
     }
@@ -358,6 +423,41 @@ mod tests {
             ]),
             vec!["001"]
         );
+    }
+
+    #[test]
+    fn cli_rejects_invalid_ttl_values() {
+        let claim_err = run(&args([
+            "claim",
+            "ttl-test",
+            "--db",
+            "/tmp/not-opened.db",
+            "--agent",
+            "codex",
+            "--ttl",
+            "not-a-number",
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            claim_err,
+            ShellError::Invalid(message) if message == "invalid --ttl: not-a-number"
+        ));
+
+        let renew_err = run(&args([
+            "renew-claim",
+            "ttl-test",
+            "--db",
+            "/tmp/not-opened.db",
+            "--run",
+            "run-1",
+            "--ttl",
+            "not-a-number",
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            renew_err,
+            ShellError::Invalid(message) if message == "invalid --ttl: not-a-number"
+        ));
     }
 
     #[test]
@@ -394,6 +494,28 @@ mod tests {
         ]))
         .unwrap();
         let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
+        let heartbeat = run(&args([
+            "heartbeat",
+            "cli-test",
+            "--db",
+            &db,
+            "--run",
+            &run_id,
+        ]))
+        .unwrap();
+        assert!(heartbeat.contains("heartbeat\tcli-test"));
+        let renewed = run(&args([
+            "renew-claim",
+            "cli-test",
+            "--db",
+            &db,
+            "--run",
+            &run_id,
+            "--ttl",
+            "3600",
+        ]))
+        .unwrap();
+        assert!(renewed.contains("renewed\tcli-test"));
         run(&args([
             "update-status",
             "cli-test",
@@ -434,6 +556,59 @@ mod tests {
         .unwrap();
 
         assert!(completed.contains("completed\tcli-test\tdone"));
+    }
+
+    #[test]
+    fn cli_release_claim_makes_the_card_ready_again() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-release-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "release-test",
+            "--title",
+            "Release test",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let claimed = run(&args([
+            "claim",
+            "release-test",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--ttl",
+            "3600",
+        ]))
+        .unwrap();
+        let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
+        let released = run(&args([
+            "release-claim",
+            "release-test",
+            "--db",
+            &db,
+            "--run",
+            &run_id,
+        ]))
+        .unwrap();
+
+        assert!(released.contains("released\trelease-test"));
+        let ready = run(&args(["list-ready", "--db", &db])).unwrap();
+        assert!(ready.contains("release-test"));
     }
 
     fn args<const N: usize>(items: [&str; N]) -> Vec<String> {
