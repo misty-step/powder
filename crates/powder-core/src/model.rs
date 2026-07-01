@@ -106,6 +106,15 @@ impl Priority {
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::P0 => "P0",
+            Self::P1 => "P1",
+            Self::P2 => "P2",
+            Self::P3 => "P3",
+        }
+    }
 }
 
 impl Default for Priority {
@@ -147,6 +156,66 @@ impl CardStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Shipped | Self::Abandoned)
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Ready => "ready",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::AwaitingInput => "awaiting_input",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Shipped => "shipped",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+
+        matches!(
+            (self, next),
+            (Self::Backlog, Self::Ready | Self::Blocked | Self::Abandoned)
+                | (Self::Ready, Self::Claimed | Self::Blocked | Self::Abandoned)
+                | (
+                    Self::Claimed,
+                    Self::Running
+                        | Self::AwaitingInput
+                        | Self::Ready
+                        | Self::Blocked
+                        | Self::Abandoned
+                )
+                | (
+                    Self::Running,
+                    Self::AwaitingInput | Self::Ready | Self::Blocked | Self::Abandoned
+                )
+                | (
+                    Self::AwaitingInput,
+                    Self::Running | Self::Ready | Self::Blocked | Self::Abandoned
+                )
+                | (Self::Blocked, Self::Ready | Self::Abandoned)
+                | (Self::Done, Self::Shipped)
+        )
+    }
+
+    pub fn can_complete(self) -> bool {
+        matches!(self, Self::Claimed | Self::Running | Self::AwaitingInput)
+    }
+
+    pub fn validate_transition(self, next: Self) -> Result<(), DomainError> {
+        if self.can_transition_to(next) {
+            Ok(())
+        } else {
+            Err(DomainError::conflict(format!(
+                "invalid card status transition: {} -> {}",
+                self.as_str(),
+                next.as_str()
+            )))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +229,31 @@ pub enum RunState {
     Stale,
 }
 
+impl RunState {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "active" => Some(Self::Active),
+            "awaiting-input" | "awaiting_input" => Some(Self::AwaitingInput),
+            "error" => Some(Self::Error),
+            "complete" => Some(Self::Complete),
+            "stale" => Some(Self::Stale),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::AwaitingInput => "awaiting_input",
+            Self::Error => "error",
+            Self::Complete => "complete",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityType {
@@ -169,6 +263,31 @@ pub enum ActivityType {
     Elicitation,
     Error,
     Prompt,
+}
+
+impl ActivityType {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "thought" => Some(Self::Thought),
+            "action" => Some(Self::Action),
+            "response" => Some(Self::Response),
+            "elicitation" => Some(Self::Elicitation),
+            "error" => Some(Self::Error),
+            "prompt" => Some(Self::Prompt),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Thought => "thought",
+            Self::Action => "action",
+            Self::Response => "response",
+            Self::Elicitation => "elicitation",
+            Self::Error => "error",
+            Self::Prompt => "prompt",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

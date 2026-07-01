@@ -16,3 +16,4 @@ path = "src/main.rs"
 powder-api = { path = "../powder-api" }
 powder-core = { path = "../powder-core" }
 powder-shell = { path = "../powder-shell" }
+powder-store = { path = "../powder-store" }

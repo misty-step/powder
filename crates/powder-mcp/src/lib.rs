@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use powder_core::{Board, CardId, CardStatus, ReadyQuery, RunId};
+use powder_store::Store;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,39 @@ pub fn handle_json_rpc(board: &mut Board, request: &Value, now: i64) -> Option<V
     })
 }
 
+pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Option<Value> {
+    let id = request.get("id").cloned();
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": request["params"]["protocolVersion"]
+                .as_str()
+                .unwrap_or("2024-11-05"),
+            "serverInfo": {"name": "powder", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"tools": {"listChanged": false}},
+        })),
+        "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
+        "tools/call" => {
+            let params = &request["params"];
+            let name = params["name"].as_str().unwrap_or("");
+            let args = &params["arguments"];
+            call_tool_store(store, name, args, now)
+        }
+        "ping" => Ok(json!({})),
+        other => Err(format!("method not found: {other}")),
+    };
+
+    id.map(|id| match result {
+        Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+        Err(message) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32603, "message": message},
+        }),
+    })
+}
+
 pub fn call_tool(board: &mut Board, name: &str, args: &Value, now: i64) -> Result<Value, String> {
     let payload = match name {
         "list_ready" => {
@@ -147,6 +181,64 @@ pub fn call_tool(board: &mut Board, name: &str, args: &Value, now: i64) -> Resul
     Ok(json!({"content": [{"type": "text", "text": text}]}))
 }
 
+pub fn call_tool_store(
+    store: &mut Store,
+    name: &str,
+    args: &Value,
+    now: i64,
+) -> Result<Value, String> {
+    let payload = match name {
+        "list_ready" => {
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            json!(store
+                .list_ready(ReadyQuery::new(now, limit))
+                .map_err(to_string)?)
+        }
+        "claim_card" => {
+            let card_id = card_id(args, "card_id")?;
+            let agent = required_str(args, "agent")?;
+            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
+            json!(store
+                .claim_card(&card_id, agent, now, ttl_seconds)
+                .map_err(to_string)?)
+        }
+        "update_status" => {
+            let card_id = card_id(args, "card_id")?;
+            let status = CardStatus::parse(required_str(args, "status")?)
+                .ok_or_else(|| "invalid status".to_string())?;
+            json!(store
+                .update_status(&card_id, status, now)
+                .map_err(to_string)?)
+        }
+        "add_link" => {
+            let card_id = card_id(args, "card_id")?;
+            let label = required_str(args, "label")?;
+            let url = required_str(args, "url")?;
+            json!(store
+                .add_link(&card_id, label, url, now)
+                .map_err(to_string)?)
+        }
+        "request_input" => {
+            let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
+            let question = required_str(args, "question")?;
+            json!(store
+                .request_input(&run_id, question, now)
+                .map_err(to_string)?)
+        }
+        "complete_card" => {
+            let card_id = card_id(args, "card_id")?;
+            let proof = required_str(args, "proof")?;
+            json!(store
+                .complete_card(&card_id, proof, now)
+                .map_err(to_string)?)
+        }
+        other => return Err(format!("unknown tool: {other}")),
+    };
+
+    let text = serde_json::to_string_pretty(&payload).map_err(to_string)?;
+    Ok(json!({"content": [{"type": "text", "text": text}]}))
+}
+
 fn card_id(args: &Value, key: &'static str) -> Result<CardId, String> {
     CardId::new(required_str(args, key)?).map_err(to_string)
 }
@@ -167,6 +259,7 @@ fn to_string(err: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use powder_core::{parse_backlog_card, Board};
+    use powder_store::Store;
 
     #[test]
     fn mcp_tools_are_agent_intents_not_rest_routes() {
@@ -236,5 +329,45 @@ Expose tools.
             14,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn mcp_tools_can_operate_against_sqlite_store() {
+        let text = r#"# Ship persistent MCP tools
+
+Priority: P0 | Status: ready | Estimate: M
+
+## Goal
+Expose tools against the DB.
+
+## Oracle
+- [ ] tool flow works
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![parse_backlog_card(
+                "backlog.d/005-persistent-mcp-tools.md",
+                text,
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+
+        let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 1}), 10).unwrap();
+        assert!(ready["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("005"));
+
+        let claimed = call_tool_store(
+            &mut store,
+            "claim_card",
+            &json!({"card_id": "005", "agent": "codex", "ttl_seconds": 60}),
+            11,
+        )
+        .unwrap();
+        let claimed_text = claimed["content"][0]["text"].as_str().unwrap();
+        assert!(claimed_text.contains("run-"));
     }
 }

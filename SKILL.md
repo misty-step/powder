@@ -16,6 +16,10 @@ status rows. Real card data belongs in a deployed instance database, not in the
 product repository. Read `VISION.md` before changing Powder's product scope,
 card/run model, runner boundary, or self-hosting assumptions.
 
+For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
+`POWDER_BACKLOG_DIR` value imports markdown into that database on startup. If
+`POWDER_DB_PATH` is absent, MCP falls back to the old in-memory fixture mode.
+
 ## Operating Contract
 
 - Use `list_ready` before claiming work.
@@ -33,6 +37,17 @@ card/run model, runner boundary, or self-hosting assumptions.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: attach proof and mark the card complete for human review.
+
+## Instance CLI
+
+```sh
+powder init-db --db ./data/powder.db --show-secret
+powder import backlog.d --db ./data/powder.db
+powder list-ready --db ./data/powder.db --limit 10
+powder claim 001 --db ./data/powder.db --agent codex
+powder update-status 001 --db ./data/powder.db --status running
+powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof
+```
 
 ## Local Gate
 

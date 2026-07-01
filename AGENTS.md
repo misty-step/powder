@@ -13,6 +13,8 @@ boundary, or the self-hosting/deployment shape.
   network, filesystem, or process-launching crates.
 - `powder-shell` owns effect traits and ports. Concrete stores and clients
   implement those traits outside the core.
+- `powder-store` owns SQLite schema, migrations, WAL pragmas, API keys, and
+  transactional persistence. Adapters do not assemble lifecycle SQL directly.
 - `powder-api`, `powder-cli`, and `powder-mcp` are thin faces over the same
   domain and shell contracts. No business rule may live only in an adapter.
 - The board store is separate from the runner. A dispatch daemon may consume
@@ -21,8 +23,9 @@ boundary, or the self-hosting/deployment shape.
 - No real backlog/card/run data belongs in this repo. Use synthetic fixtures
   under tests only. Instance data lives in the deployed SQLite database.
 - Follow the Canary-style deployment shape: one deployable Rust service, SQLite
-  path from env, Fly volume at `/data`, Litestream optional replication, health
-  and readiness routes, and tailnet-friendly auth configuration.
+  path from env, WAL, Fly volume at `/data`, Litestream optional replication,
+  health and readiness routes, first-run bootstrap key, and tailnet-friendly
+  auth configuration.
 
 ## Gates
 

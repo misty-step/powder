@@ -81,19 +81,25 @@ database and must not be committed here.
 The current scaffold already establishes the shape:
 
 - `powder-core` defines cards, runs, activity, links, comments, ready
-  eligibility, expiring claims, completion proof, and markdown backlog parsing.
-- `powder-cli` can dry-run imports and list ready cards from synthetic fixture
-  data.
+  eligibility, expiring claims, transition enforcement, completion proof, and
+  markdown backlog parsing.
+- `powder-store` persists the instance database in SQLite, enables WAL, owns
+  migrations, stores hashed API keys, seeds the first bootstrap key once, and
+  runs transactional card lifecycle operations.
+- `powder-cli` can initialize an instance database, import backlog markdown
+  into it, create cards, list ready work, claim, transition, and complete cards.
 - `powder-mcp` exposes `list_ready`, `claim_card`, `update_status`, `add_link`,
-  `request_input`, and `complete_card` over stdio using the same domain model.
+  `request_input`, and `complete_card` over stdio using the same domain model;
+  it uses SQLite when `POWDER_DB_PATH` is set.
 - `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
-  and first-run onboarding state.
+  first-run onboarding state, API-key auth, and tailnet/none modes.
 - Docker, Fly, Litestream, and env examples follow the Canary-style
   self-hosted deployment pattern.
 
-The important gap is persistence: the board rules exist in memory today. The
-next durable milestone is a SQLite store, migrations, auth enforcement, and
-import into the instance database rather than fixture-backed memory.
+The important remaining gap is polish around the deployed surface: richer
+onboarding, admin key management, stricter scoped permissions, and a thin human
+control surface. The core lifecycle should already be durable enough to prove
+with a reopened SQLite database.
 
 ## Non-Goals
 

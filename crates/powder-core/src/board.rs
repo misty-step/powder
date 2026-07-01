@@ -185,6 +185,7 @@ impl Board {
             .get_mut(card_id)
             .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?;
 
+        card.status.validate_transition(status)?;
         if status.is_terminal() {
             card.claim = None;
         }
@@ -253,6 +254,22 @@ impl Board {
             .cards
             .get_mut(card_id)
             .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?;
+
+        if !card.status.can_complete() {
+            return Err(DomainError::conflict(format!(
+                "card {card_id} cannot complete from {}",
+                card.status.as_str()
+            )));
+        }
+        if card
+            .claim
+            .as_ref()
+            .is_none_or(|claim| claim.is_expired(now))
+        {
+            return Err(DomainError::conflict(format!(
+                "card {card_id} requires an active claim before completion"
+            )));
+        }
 
         card.status = CardStatus::Done;
         card.claim = None;
@@ -416,5 +433,33 @@ mod tests {
             board.get_run(&claim.run_id).unwrap().state,
             RunState::Complete
         );
+    }
+
+    #[test]
+    fn update_status_rejects_invalid_transition_to_done_without_proof() {
+        let mut board = Board::default();
+        let card_id = CardId::new("001").unwrap();
+        board.import_cards(vec![ready_card("001", Priority::P0, 0)]);
+
+        let err = board
+            .update_status(&card_id, CardStatus::Done, 10)
+            .unwrap_err();
+
+        assert!(matches!(err, DomainError::Conflict(_)));
+        assert_eq!(board.get_card(&card_id).unwrap().status, CardStatus::Ready);
+    }
+
+    #[test]
+    fn complete_card_requires_claimed_work() {
+        let mut board = Board::default();
+        let card_id = CardId::new("001").unwrap();
+        board.import_cards(vec![ready_card("001", Priority::P0, 0)]);
+
+        let err = board
+            .complete_card(&card_id, "https://example.test/proof", 10)
+            .unwrap_err();
+
+        assert!(matches!(err, DomainError::Conflict(_)));
+        assert_eq!(board.get_card(&card_id).unwrap().status, CardStatus::Ready);
     }
 }
