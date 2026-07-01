@@ -3,6 +3,9 @@ set -e
 
 DB_PATH="${POWDER_DB_PATH:-/data/powder.db}"
 POWDER_BIN="${POWDER_BIN:-/app/bin/powder-server}"
+DB_DIR="$(dirname "$DB_PATH")"
+
+mkdir -p "$DB_DIR"
 
 LITESTREAM_READY=0
 if [ -z "${BUCKET_NAME:-}" ]; then
@@ -29,8 +32,7 @@ if [ ! -f "$DB_PATH" ] && [ "$LITESTREAM_READY" = "1" ]; then
   litestream restore -if-replica-exists -o "$DB_PATH" -config /etc/litestream.yml "$DB_PATH"
 
   if [ ! -s "$DB_PATH" ]; then
-    echo "ERROR: Litestream restore did not materialize $DB_PATH - refusing to start on an empty database" >&2
-    exit 1
+    echo "No Litestream replica found for $DB_PATH; starting with a fresh database" >&2
   fi
 fi
 

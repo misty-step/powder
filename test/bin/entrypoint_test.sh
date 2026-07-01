@@ -187,20 +187,31 @@ assert_file_contains "$LITESTREAM_LOG" \
 assert_contains "$OUTPUT" "EXEC:litestream replicate" "starts via litestream after restore"
 assert_not_contains "$OUTPUT" "did not materialize" "does not warn when restore creates DB"
 
-echo "Test 6: Missing DB fails closed when restore does not materialize"
+echo "Test 6: Missing DB with no replica starts fresh"
 reset_env
 setup_stubs without_db
 export BUCKET_NAME="my-bucket"
 export AWS_ACCESS_KEY_ID="key"
 export AWS_SECRET_ACCESS_KEY="secret"
+OUTPUT=$(run_entrypoint)
+assert_contains "$OUTPUT" "No Litestream replica found for $POWDER_DB_PATH" \
+  "reports first-run empty replica"
+assert_contains "$OUTPUT" "EXEC:litestream replicate" "starts via litestream for fresh first-run DB"
+
+echo "Test 7: Restore command failure fails closed"
+reset_env
+setup_stubs without_db
+export BUCKET_NAME="my-bucket"
+export AWS_ACCESS_KEY_ID="key"
+export AWS_SECRET_ACCESS_KEY="secret"
+export LITESTREAM_STUB_EXIT=1
 OUTPUT=$(run_entrypoint_failure)
 STATUS=$(printf '%s' "$OUTPUT" | head -n 1)
 BODY=$(printf '%s' "$OUTPUT" | tail -n +2)
-assert_exit_code "$STATUS" "1" "exits non-zero when restore leaves DB missing"
-assert_contains "$BODY" "Litestream restore did not materialize $POWDER_DB_PATH" "reports restore miss"
-assert_not_contains "$BODY" "EXEC:litestream replicate" "does not start after restore miss"
+assert_exit_code "$STATUS" "1" "exits non-zero when restore command fails"
+assert_not_contains "$BODY" "EXEC:litestream replicate" "does not start after restore command failure"
 
-echo "Test 7: Existing DB skips restore"
+echo "Test 8: Existing DB skips restore"
 reset_env
 setup_stubs
 export BUCKET_NAME="my-bucket"
