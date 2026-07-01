@@ -1,0 +1,19 @@
+[package]
+name = "powder-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "powder"
+path = "src/main.rs"
+
+[dependencies]
+powder-api = { path = "../powder-api" }
+powder-core = { path = "../powder-core" }
+powder-shell = { path = "../powder-shell" }
+powder-store = { path = "../powder-store" }

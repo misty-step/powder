@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/powder-core",
+  "crates/powder-shell",
+  "crates/powder-store",
+  "crates/powder-api",
+  "crates/powder-cli",
+  "crates/powder-mcp",
+  "crates/powder-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["phaedrus"]
+
+[profile.dev.package."*"]
+opt-level = 2

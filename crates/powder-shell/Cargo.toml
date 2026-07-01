@@ -1,0 +1,12 @@
+[package]
+name = "powder-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+powder-core = { path = "../powder-core" }

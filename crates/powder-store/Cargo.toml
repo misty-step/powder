@@ -1,0 +1,18 @@
+[package]
+name = "powder-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bcrypt = "0.17.1"
+nanoid = "0.4"
+powder-core = { path = "../powder-core" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0"
