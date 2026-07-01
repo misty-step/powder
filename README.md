@@ -73,7 +73,10 @@ The default `fly.toml` keeps one machine warm, mounts `/data`, checks
 `/healthz` and `/readyz`, and sets `POWDER_PUBLIC_BASE_URL` to
 `https://powder.internal` for a tailnet-fronted instance. The companion bastion
 lane can expose `http://powder.internal:4000` through Tailscale Serve while
-Powder keeps its own database and secrets on its Fly volume.
+Powder keeps its own database and secrets on its Fly volume. The Fly profile
+redacts the first bootstrap key in logs; create an operator-held key over SSH
+with `powder key-create --db /data/powder.db --name operator --scope admin
+--show-secret` and store it in a secret manager.
 
 ## Gate
 
