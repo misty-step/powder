@@ -76,10 +76,7 @@ pub trait CardStore {
 }
 
 pub fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
 pub fn load_backlog_dir(path: impl AsRef<Path>, now: i64) -> ShellResult<Vec<Card>> {
