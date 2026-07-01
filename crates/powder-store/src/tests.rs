@@ -300,6 +300,74 @@ fn heartbeat_records_liveness_without_releasing_the_claim() -> Result<()> {
 }
 
 #[test]
+fn answer_input_preserves_question_and_resumes_run() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let claim = store.claim_card(&card_id, "agent-a", 10, 3600)?;
+    store.update_status(&card_id, CardStatus::Running, 11)?;
+    store.add_link(&card_id, "context", "https://example.test/context", 12)?;
+    store.request_input(&claim.run_id, "Approve completion?", 13)?;
+
+    let awaiting = store.list_awaiting_input(10)?;
+    assert_eq!(awaiting.len(), 1);
+    assert_eq!(awaiting[0].run.id, claim.run_id);
+    assert_eq!(awaiting[0].card.id, card_id);
+    assert_eq!(
+        awaiting[0]
+            .question
+            .as_ref()
+            .map(|activity| activity.payload.as_str()),
+        Some("Approve completion?")
+    );
+
+    let card_detail = store.get_card_detail(&card_id)?.expect("card detail");
+    assert_eq!(card_detail.card.status, CardStatus::AwaitingInput);
+    assert_eq!(card_detail.runs.len(), 1);
+    assert_eq!(card_detail.links.len(), 1);
+    assert!(card_detail.comments.is_empty());
+    assert!(card_detail
+        .activities
+        .iter()
+        .any(|activity| activity.payload == "Approve completion?"));
+
+    let answered = store.answer_input(&claim.run_id, "operator", "Approved", 13)?;
+    assert_eq!(answered.state, RunState::Active);
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::Running);
+
+    let run_detail = store.get_run_detail(&claim.run_id)?.expect("run detail");
+    assert_eq!(run_detail.run.state, RunState::Active);
+    assert_eq!(
+        run_detail
+            .card
+            .claim
+            .as_ref()
+            .map(|claim| claim.agent.as_str()),
+        Some("agent-a")
+    );
+    assert_eq!(run_detail.links.len(), 1);
+    let question_position = run_detail
+        .activities
+        .iter()
+        .position(|activity| activity.payload == "Approve completion?")
+        .expect("original question activity");
+    let response_position = run_detail
+        .activities
+        .iter()
+        .position(|activity| {
+            activity.activity_type == powder_core::ActivityType::Response
+                && activity.payload.contains("operator")
+                && activity.payload.contains("Approved")
+        })
+        .expect("actor-attributed response activity");
+    assert!(question_position < response_position);
+    Ok(())
+}
+
+#[test]
 fn completion_after_same_second_release_reclaim_completes_current_run() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

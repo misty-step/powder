@@ -527,6 +527,8 @@ dependencies = [
  "powder-core",
  "powder-shell",
  "powder-store",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -14,6 +14,10 @@ pub const COMMANDS: &[&str] = &[
     "release-claim",
     "renew-claim",
     "heartbeat",
+    "get-card",
+    "get-run",
+    "list-awaiting-input",
+    "answer-input",
     "update-status",
     "add-link",
     "request-input",
@@ -33,6 +37,10 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "release-claim" => release_claim(rest),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest),
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest),
+        [command, rest @ ..] if command == "get-card" => get_card(rest),
+        [command, rest @ ..] if command == "get-run" => get_run(rest),
+        [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
+        [command, rest @ ..] if command == "answer-input" => answer_input(rest),
         [command, rest @ ..] if command == "update-status" => update_status(rest),
         [command, rest @ ..] if command == "add-link" => add_link(rest),
         [command, rest @ ..] if command == "request-input" => request_input(rest),
@@ -56,6 +64,11 @@ pub fn help() -> String {
     help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600\n");
     help.push_str("  powder release-claim 001 --db ./data/powder.db --run run-id\n");
+    help.push_str("  powder get-card 001 --db ./data/powder.db\n");
+    help.push_str("  powder list-awaiting-input --db ./data/powder.db\n");
+    help.push_str(
+        "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
+    );
     help.push_str("  powder update-status 001 --db ./data/powder.db --status running\n");
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof\n\n",
@@ -262,6 +275,54 @@ fn heartbeat(args: &[String]) -> Result<String, ShellError> {
     ))
 }
 
+fn get_card(args: &[String]) -> Result<String, ShellError> {
+    let card_id = positional_card_id(args, "get-card")?;
+    let store = open_store(required_flag(args, "--db")?)?;
+    let detail = store
+        .get_card_detail(&card_id)
+        .map_err(store_err)?
+        .ok_or_else(|| ShellError::NotFound(format!("card not found: {card_id}")))?;
+    to_pretty_json(&detail)
+}
+
+fn get_run(args: &[String]) -> Result<String, ShellError> {
+    let run_id = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("get-run requires a run id".to_string()))
+        .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
+    let store = open_store(required_flag(args, "--db")?)?;
+    let detail = store
+        .get_run_detail(&run_id)
+        .map_err(store_err)?
+        .ok_or_else(|| ShellError::NotFound(format!("run not found: {run_id}")))?;
+    to_pretty_json(&detail)
+}
+
+fn list_awaiting_input(args: &[String]) -> Result<String, ShellError> {
+    let store = open_store(required_flag(args, "--db")?)?;
+    let awaiting = store
+        .list_awaiting_input(parse_limit(args).unwrap_or(20))
+        .map_err(store_err)?;
+    to_pretty_json(&serde_json::json!({ "awaiting": awaiting }))
+}
+
+fn answer_input(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let run_id = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("answer-input requires a run id".to_string()))
+        .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
+    let actor = required_flag(args, "--actor")?;
+    let answer = required_flag(args, "--answer")?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let run = store
+        .answer_input(&run_id, actor, answer, now)
+        .map_err(store_err)?;
+    Ok(format!("answered-input\t{}\t{}\n", run.id, run.card_id))
+}
+
 fn update_status(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "update-status")?;
@@ -388,6 +449,12 @@ fn store_err(err: StoreError) -> ShellError {
     ShellError::Store(err.to_string())
 }
 
+fn to_pretty_json(value: &impl serde::Serialize) -> Result<String, ShellError> {
+    serde_json::to_string_pretty(value)
+        .map(|json| format!("{json}\n"))
+        .map_err(|err| ShellError::Store(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +467,10 @@ mod tests {
         assert!(COMMANDS.contains(&"release-claim"));
         assert!(COMMANDS.contains(&"renew-claim"));
         assert!(COMMANDS.contains(&"heartbeat"));
+        assert!(COMMANDS.contains(&"get-card"));
+        assert!(COMMANDS.contains(&"get-run"));
+        assert!(COMMANDS.contains(&"list-awaiting-input"));
+        assert!(COMMANDS.contains(&"answer-input"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
     }
@@ -609,6 +680,89 @@ mod tests {
         assert!(released.contains("released\trelease-test"));
         let ready = run(&args(["list-ready", "--db", &db])).unwrap();
         assert!(ready.contains("release-test"));
+    }
+
+    #[test]
+    fn cli_exposes_answer_loop_details() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-answer-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "answer-test",
+            "--title",
+            "Answer test",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let claimed = run(&args([
+            "claim",
+            "answer-test",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+        ]))
+        .unwrap();
+        let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
+        run(&args([
+            "update-status",
+            "answer-test",
+            "--db",
+            &db,
+            "--status",
+            "running",
+        ]))
+        .unwrap();
+        run(&args([
+            "request-input",
+            &run_id,
+            "--db",
+            &db,
+            "--question",
+            "Approve?\nwith\ttab",
+        ]))
+        .unwrap();
+
+        let awaiting = run(&args(["list-awaiting-input", "--db", &db])).unwrap();
+        assert!(awaiting.contains("\"awaiting\""));
+        assert!(awaiting.contains("answer-test"));
+        assert!(awaiting.contains("Approve?\\nwith\\ttab"));
+
+        let card = run(&args(["get-card", "answer-test", "--db", &db])).unwrap();
+        assert!(card.contains("\"activities\""));
+        assert!(card.contains("Approve?\\nwith\\ttab"));
+
+        let answered = run(&args([
+            "answer-input",
+            &run_id,
+            "--db",
+            &db,
+            "--actor",
+            "operator",
+            "--answer",
+            "Approved",
+        ]))
+        .unwrap();
+        assert!(answered.contains("answered-input"));
+
+        let run_detail = run(&args(["get-run", &run_id, "--db", &db])).unwrap();
+        assert!(run_detail.contains("\"state\": \"active\""));
+        assert!(run_detail.contains("operator"));
+        assert!(run_detail.contains("Approved"));
     }
 
     fn args<const N: usize>(items: [&str; N]) -> Vec<String> {

@@ -36,6 +36,11 @@ RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
 cargo run -q -p powder-cli -- heartbeat 001 --db "$DB" --run "$RUN_ID"
 cargo run -q -p powder-cli -- renew-claim 001 --db "$DB" --run "$RUN_ID" --ttl 3600
 cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status running
+cargo run -q -p powder-cli -- request-input "$RUN_ID" --db "$DB" --question "Approve completion?"
+cargo run -q -p powder-cli -- list-awaiting-input --db "$DB"
+cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator --answer approved
+cargo run -q -p powder-cli -- get-card 001 --db "$DB"
+cargo run -q -p powder-cli -- get-run "$RUN_ID" --db "$DB"
 cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --proof https://example.test/proof
 POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```

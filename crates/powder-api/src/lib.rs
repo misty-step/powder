@@ -24,6 +24,11 @@ pub const ROUTES: &[ApiRoute] = &[
         intent: "list ready cards for an agent to claim",
     },
     ApiRoute {
+        method: "GET",
+        path: "/api/v1/cards/{id}",
+        intent: "read one card with runs, activity, links, comments, and claim state",
+    },
+    ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/claim",
         intent: "claim one card and open a run",
@@ -60,6 +65,21 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/runs/{id}/answer",
+        intent: "answer an awaiting-input run and resume it",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/runs/{id}",
+        intent: "read one run with activity, card, links, and comments",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/runs/awaiting-input",
+        intent: "list runs waiting on human or agent input",
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/cards/{id}/complete",
         intent: "complete a card with proof",
     },
@@ -89,6 +109,10 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards/{id}/renew"));
         assert!(paths.contains(&"/api/v1/cards/{id}/heartbeat"));
         assert!(paths.contains(&"/api/v1/cards/{id}/links"));
+        assert!(paths.contains(&"/api/v1/cards/{id}"));
+        assert!(paths.contains(&"/api/v1/runs/{id}"));
+        assert!(paths.contains(&"/api/v1/runs/awaiting-input"));
         assert!(paths.contains(&"/api/v1/runs/{id}/input"));
+        assert!(paths.contains(&"/api/v1/runs/{id}/answer"));
     }
 }

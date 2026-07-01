@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    non_empty, Activity, ActivityId, ActivityType, Card, CardId, CardStatus, DomainError, Link,
-    LinkId, Run, RunId, RunState,
+    non_empty, Activity, ActivityId, ActivityType, AwaitingInput, Card, CardDetail, CardId,
+    CardStatus, Comment, DomainError, Link, LinkId, Run, RunDetail, RunId, RunState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,7 @@ pub struct Board {
     runs: BTreeMap<RunId, Run>,
     activities: Vec<Activity>,
     links: Vec<Link>,
+    comments: Vec<Comment>,
     next_run: u64,
     next_activity: u64,
     next_link: u64,
@@ -60,6 +61,53 @@ impl Board {
 
     pub fn get_run(&self, run_id: &RunId) -> Option<&Run> {
         self.runs.get(run_id)
+    }
+
+    pub fn get_card_detail(&self, card_id: &CardId) -> Option<CardDetail> {
+        let card = self.cards.get(card_id)?.clone();
+        Some(CardDetail {
+            card,
+            runs: self.runs_for_card(card_id),
+            activities: self.activities_for_card(card_id),
+            links: self.links_for_card(card_id),
+            comments: self.comments_for_card(card_id),
+        })
+    }
+
+    pub fn get_run_detail(&self, run_id: &RunId) -> Option<RunDetail> {
+        let run = self.runs.get(run_id)?.clone();
+        let card = self.cards.get(&run.card_id)?.clone();
+        Some(RunDetail {
+            links: self.links_for_card(&run.card_id),
+            comments: self.comments_for_card(&run.card_id),
+            activities: self.activities_for_run(run_id),
+            run,
+            card,
+        })
+    }
+
+    pub fn list_awaiting_input(&self, limit: usize) -> Vec<AwaitingInput> {
+        let mut awaiting = self
+            .runs
+            .values()
+            .filter(|run| run.state == RunState::AwaitingInput)
+            .filter_map(|run| {
+                let card = self.cards.get(&run.card_id)?;
+                Some(AwaitingInput {
+                    card: card.clone(),
+                    run: run.clone(),
+                    question: self.latest_elicitation(&run.id),
+                })
+            })
+            .collect::<Vec<_>>();
+        awaiting.sort_by(|left, right| {
+            left.run
+                .updated_at
+                .cmp(&right.run.updated_at)
+                .then_with(|| left.run.id.cmp(&right.run.id))
+        });
+        awaiting.truncate(limit.max(1));
+        awaiting
     }
 
     pub fn activities(&self) -> &[Activity] {
@@ -346,6 +394,47 @@ impl Board {
         Ok(self.runs.get(run_id).expect("run exists").clone())
     }
 
+    pub fn answer_input(
+        &mut self,
+        run_id: &RunId,
+        actor: &str,
+        answer: &str,
+        now: i64,
+    ) -> Result<Run, DomainError> {
+        let actor = non_empty("actor", actor.to_owned())?;
+        let answer = non_empty("answer", answer.to_owned())?;
+        let mut run = self
+            .runs
+            .get(run_id)
+            .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?
+            .clone();
+        if run.state != RunState::AwaitingInput {
+            return Err(DomainError::conflict(format!(
+                "run {run_id} is not awaiting input"
+            )));
+        }
+        let mut card = self
+            .cards
+            .get(&run.card_id)
+            .ok_or_else(|| DomainError::not_found("card", run.card_id.to_string()))?
+            .clone();
+        card.status.validate_transition(CardStatus::Running)?;
+        card.status = CardStatus::Running;
+        card.updated_at = now;
+        run.state = RunState::Active;
+        run.updated_at = now;
+
+        self.cards.insert(card.id.clone(), card);
+        self.runs.insert(run.id.clone(), run.clone());
+        self.append_activity(
+            run_id.clone(),
+            ActivityType::Response,
+            format!("answered by {actor}: {answer}"),
+            now,
+        )?;
+        Ok(run)
+    }
+
     pub fn complete_card(
         &mut self,
         card_id: &CardId,
@@ -455,6 +544,77 @@ impl Board {
     fn next_link_id(&mut self) -> LinkId {
         self.next_link += 1;
         LinkId::new(format!("link-{}", self.next_link)).expect("generated link id is valid")
+    }
+
+    fn runs_for_card(&self, card_id: &CardId) -> Vec<Run> {
+        let mut runs = self
+            .runs
+            .values()
+            .filter(|run| &run.card_id == card_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        runs
+    }
+
+    fn activities_for_card(&self, card_id: &CardId) -> Vec<Activity> {
+        self.activities
+            .iter()
+            .filter(|activity| {
+                self.runs
+                    .get(&activity.run_id)
+                    .is_some_and(|run| &run.card_id == card_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    fn activities_for_run(&self, run_id: &RunId) -> Vec<Activity> {
+        self.activities
+            .iter()
+            .filter(|activity| &activity.run_id == run_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+
+    fn links_for_card(&self, card_id: &CardId) -> Vec<Link> {
+        let mut links = self
+            .links
+            .iter()
+            .filter(|link| &link.card_id == card_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        links.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        links
+    }
+
+    fn comments_for_card(&self, card_id: &CardId) -> Vec<Comment> {
+        let mut comments = self
+            .comments
+            .iter()
+            .filter(|comment| &comment.card_id == card_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        comments.sort_by_key(|comment| comment.created_at);
+        comments
+    }
+
+    fn latest_elicitation(&self, run_id: &RunId) -> Option<Activity> {
+        self.activities
+            .iter()
+            .rev()
+            .find(|activity| {
+                &activity.run_id == run_id && activity.activity_type == ActivityType::Elicitation
+            })
+            .cloned()
     }
 }
 

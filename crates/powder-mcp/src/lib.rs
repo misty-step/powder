@@ -38,6 +38,26 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"}}}"#,
     },
     ToolDef {
+        name: "get_card",
+        description: "Read one card with runs, activities, links, comments, and claim state.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "get_run",
+        description: "Read one run with its card, activities, links, comments, and run state.",
+        input_schema: r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "list_awaiting_input",
+        description: "List runs currently paused for human or agent input.",
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "answer_input",
+        description: "Answer an awaiting-input run with an actor-attributed response and resume it.",
+        input_schema: r#"{"type":"object","required":["run_id","actor","answer"],"properties":{"run_id":{"type":"string"},"actor":{"type":"string"},"answer":{"type":"string"}}}"#,
+    },
+    ToolDef {
         name: "update_status",
         description: "Move a card through an allowed status transition when external progress changes.",
         input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"}}}"#,
@@ -181,6 +201,30 @@ pub fn call_tool(board: &mut Board, name: &str, args: &Value, now: i64) -> Resul
                 .heartbeat_claim(&card_id, &run_id, now)
                 .map_err(to_string)?)
         }
+        "get_card" => {
+            let card_id = card_id(args, "card_id")?;
+            json!(board
+                .get_card_detail(&card_id)
+                .ok_or_else(|| format!("card not found: {card_id}"))?)
+        }
+        "get_run" => {
+            let run_id = run_id(args, "run_id")?;
+            json!(board
+                .get_run_detail(&run_id)
+                .ok_or_else(|| format!("run not found: {run_id}"))?)
+        }
+        "list_awaiting_input" => {
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            json!(board.list_awaiting_input(limit))
+        }
+        "answer_input" => {
+            let run_id = run_id(args, "run_id")?;
+            let actor = required_str(args, "actor")?;
+            let answer = required_str(args, "answer")?;
+            json!(board
+                .answer_input(&run_id, actor, answer, now)
+                .map_err(to_string)?)
+        }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = CardStatus::parse(required_str(args, "status")?)
@@ -261,6 +305,32 @@ pub fn call_tool_store(
                 .heartbeat_claim(&card_id, &run_id, now)
                 .map_err(to_string)?)
         }
+        "get_card" => {
+            let card_id = card_id(args, "card_id")?;
+            json!(store
+                .get_card_detail(&card_id)
+                .map_err(to_string)?
+                .ok_or_else(|| format!("card not found: {card_id}"))?)
+        }
+        "get_run" => {
+            let run_id = run_id(args, "run_id")?;
+            json!(store
+                .get_run_detail(&run_id)
+                .map_err(to_string)?
+                .ok_or_else(|| format!("run not found: {run_id}"))?)
+        }
+        "list_awaiting_input" => {
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            json!(store.list_awaiting_input(limit).map_err(to_string)?)
+        }
+        "answer_input" => {
+            let run_id = run_id(args, "run_id")?;
+            let actor = required_str(args, "actor")?;
+            let answer = required_str(args, "answer")?;
+            json!(store
+                .answer_input(&run_id, actor, answer, now)
+                .map_err(to_string)?)
+        }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = CardStatus::parse(required_str(args, "status")?)
@@ -328,12 +398,16 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 9);
+        assert_eq!(TOOLS.len(), 13);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"claim_card"));
         assert!(names.contains(&"release_claim"));
         assert!(names.contains(&"renew_claim"));
         assert!(names.contains(&"heartbeat"));
+        assert!(names.contains(&"get_card"));
+        assert!(names.contains(&"get_run"));
+        assert!(names.contains(&"list_awaiting_input"));
+        assert!(names.contains(&"answer_input"));
         assert!(names.contains(&"add_link"));
         assert!(names.contains(&"request_input"));
     }
@@ -398,18 +472,41 @@ Expose tools.
             14,
         )
         .unwrap();
+        let awaiting =
+            call_tool(&mut board, "list_awaiting_input", &json!({"limit": 10}), 15).unwrap();
+        assert!(awaiting["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Approve?"));
+        call_tool(
+            &mut board,
+            "answer_input",
+            &json!({"run_id": "run-1", "actor": "operator", "answer": "Approved"}),
+            16,
+        )
+        .unwrap();
+        let run = call_tool(&mut board, "get_run", &json!({"run_id": "run-1"}), 17).unwrap();
+        assert!(run["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Approved"));
         call_tool(
             &mut board,
             "add_link",
             &json!({"card_id": "004", "label": "PR", "url": "https://github.com/misty-step/powder/pull/1"}),
-            15,
+            18,
         )
         .unwrap();
+        let card = call_tool(&mut board, "get_card", &json!({"card_id": "004"}), 19).unwrap();
+        assert!(card["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"activities\""));
         call_tool(
             &mut board,
             "complete_card",
             &json!({"card_id": "004", "proof": "https://github.com/misty-step/powder/pull/1"}),
-            16,
+            20,
         )
         .unwrap();
     }
@@ -471,12 +568,37 @@ Expose tools against the DB.
         .unwrap();
         call_tool_store(
             &mut store,
-            "release_claim",
-            &json!({"card_id": "005", "run_id": run_id}),
+            "request_input",
+            &json!({"run_id": run_id, "question": "Need approval?"}),
             14,
         )
         .unwrap();
-        let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 1}), 15).unwrap();
+        let awaiting =
+            call_tool_store(&mut store, "list_awaiting_input", &json!({"limit": 10}), 15).unwrap();
+        assert!(awaiting["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Need approval?"));
+        call_tool_store(
+            &mut store,
+            "answer_input",
+            &json!({"run_id": run_id, "actor": "operator", "answer": "Approved"}),
+            16,
+        )
+        .unwrap();
+        let run = call_tool_store(&mut store, "get_run", &json!({"run_id": run_id}), 17).unwrap();
+        assert!(run["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Approved"));
+        call_tool_store(
+            &mut store,
+            "release_claim",
+            &json!({"card_id": "005", "run_id": run_id}),
+            18,
+        )
+        .unwrap();
+        let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 1}), 19).unwrap();
         assert!(ready["content"][0]["text"]
             .as_str()
             .unwrap()

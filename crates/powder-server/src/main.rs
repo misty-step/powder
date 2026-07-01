@@ -209,6 +209,12 @@ struct InputRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct AnswerRequest {
+    actor: String,
+    answer: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CompleteRequest {
     proof: String,
 }
@@ -257,6 +263,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards", post(create_card))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
+        .route("/api/v1/cards/{id}", get(get_card))
         .route("/api/v1/cards/{id}/claim", post(claim_card))
         .route("/api/v1/cards/{id}/release", post(release_claim))
         .route("/api/v1/cards/{id}/renew", post(renew_claim))
@@ -264,7 +271,10 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
+        .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
+        .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/input", post(request_input))
+        .route("/api/v1/runs/{id}/answer", post(answer_input))
         .with_state(state)
 }
 
@@ -337,6 +347,19 @@ async fn import_cards(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let count = lock_store(&state)?.import_cards(cards)?;
     Ok(Json(json!({ "imported": count })))
+}
+
+async fn get_card(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let detail = lock_store(&state)?
+        .get_card_detail(&card_id)?
+        .ok_or_else(|| powder_core::DomainError::not_found("card", card_id.to_string()))?;
+    Ok(Json(json!(detail)))
 }
 
 async fn create_card(
@@ -466,6 +489,43 @@ async fn request_input(
     let run_id = RunId::new(id)?;
     let run = lock_store(&state)?.request_input(&run_id, &request.question, unix_now())?;
     Ok(Json(json!(run)))
+}
+
+async fn answer_input(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AnswerRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let run_id = RunId::new(id)?;
+    let run =
+        lock_store(&state)?.answer_input(&run_id, &request.actor, &request.answer, unix_now())?;
+    Ok(Json(json!(run)))
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let run_id = RunId::new(id)?;
+    let detail = lock_store(&state)?
+        .get_run_detail(&run_id)?
+        .ok_or_else(|| powder_core::DomainError::not_found("run", run_id.to_string()))?;
+    Ok(Json(json!(detail)))
+}
+
+async fn list_awaiting_input(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReadyParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let limit = params.limit.unwrap_or(20).max(1);
+    let awaiting = lock_store(&state)?.list_awaiting_input(limit)?;
+    Ok(Json(json!({ "awaiting": awaiting })))
 }
 
 async fn complete_card(
@@ -658,312 +718,4 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{
-        body::{to_bytes, Body},
-        http::{Method, Request},
-    };
-    use tower::ServiceExt;
-
-    #[test]
-    fn config_defaults_to_api_key_auth_and_data_path() {
-        let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
-
-        assert_eq!(config.db_path, PathBuf::from(DEFAULT_DB_PATH));
-        assert_eq!(
-            config.bind_addr,
-            SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT))
-        );
-        assert_eq!(config.auth_mode, AuthMode::ApiKey);
-        assert!(config.disclose_bootstrap_key);
-    }
-
-    #[test]
-    fn config_accepts_tailnet_and_none_modes() {
-        let tailnet = Config::from_pairs([
-            ("POWDER_AUTH_MODE", "tailnet"),
-            ("POWDER_DISCLOSE_BOOTSTRAP_KEY", "false"),
-        ])
-        .unwrap();
-        let none = Config::from_pairs([("POWDER_AUTH_MODE", "none")]).unwrap();
-
-        assert_eq!(tailnet.auth_mode, AuthMode::TailscaleHeader);
-        assert!(!tailnet.disclose_bootstrap_key);
-        assert_eq!(none.auth_mode, AuthMode::None);
-    }
-
-    #[test]
-    fn config_rejects_invalid_auth_mode() {
-        let err = Config::from_pairs([("POWDER_AUTH_MODE", "open")]).unwrap_err();
-
-        assert_eq!(err.variable, "POWDER_AUTH_MODE");
-    }
-
-    #[test]
-    fn config_accepts_explicit_bind_addr() {
-        let config = Config::from_pairs([("POWDER_BIND_ADDR", "127.0.0.1:4100")]).unwrap();
-        assert_eq!(
-            config.bind_addr,
-            "127.0.0.1:4100".parse::<SocketAddr>().unwrap()
-        );
-
-        let err = Config::from_pairs([("POWDER_BIND_ADDR", "localhost")]).unwrap_err();
-        assert_eq!(err.variable, "POWDER_BIND_ADDR");
-    }
-
-    #[tokio::test]
-    async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
-        let (state, raw_key) = test_state(AuthMode::ApiKey);
-        let app = app(state);
-
-        let missing = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/v1/cards/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
-
-        let created = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards",
-                Some(&raw_key),
-                r#"{"id":"api-test","title":"API test","body":"exercise","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(created.status(), StatusCode::OK);
-
-        let claimed = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-test/claim",
-                Some(&raw_key),
-                r#"{"agent":"codex","ttl_seconds":3600}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(claimed.status(), StatusCode::OK);
-        let claimed = response_json(claimed).await;
-        assert!(claimed["run_id"].as_str().unwrap().starts_with("run-"));
-        let run_id = claimed["run_id"].as_str().unwrap().to_owned();
-
-        let running = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-test/status",
-                Some(&raw_key),
-                r#"{"status":"running"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(running.status(), StatusCode::OK);
-
-        let link = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-test/links",
-                Some(&raw_key),
-                r#"{"label":"proof","url":"https://example.test/proof"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(link.status(), StatusCode::OK);
-
-        let input = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                &format!("/api/v1/runs/{run_id}/input"),
-                Some(&raw_key),
-                r#"{"question":"Approve completion?"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(input.status(), StatusCode::OK);
-
-        let complete = app
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-test/complete",
-                Some(&raw_key),
-                r#"{"proof":"https://example.test/proof"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(complete.status(), StatusCode::OK);
-        let complete = response_json(complete).await;
-        assert_eq!(complete["status"], "done");
-    }
-
-    #[tokio::test]
-    async fn api_key_auth_allows_claim_renew_heartbeat_and_release() {
-        let (state, raw_key) = test_state(AuthMode::ApiKey);
-        let app = app(state);
-
-        let created = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards",
-                Some(&raw_key),
-                r#"{"id":"api-lease","title":"API lease","body":"exercise","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(created.status(), StatusCode::OK);
-
-        let claimed = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-lease/claim",
-                Some(&raw_key),
-                r#"{"agent":"codex","ttl_seconds":3600}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(claimed.status(), StatusCode::OK);
-        let claimed = response_json(claimed).await;
-        let run_id = claimed["run_id"].as_str().unwrap();
-
-        let heartbeat = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-lease/heartbeat",
-                Some(&raw_key),
-                &format!(r#"{{"run_id":"{run_id}"}}"#),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(heartbeat.status(), StatusCode::OK);
-
-        let renewed = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-lease/renew",
-                Some(&raw_key),
-                &format!(r#"{{"run_id":"{run_id}","ttl_seconds":3600}}"#),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(renewed.status(), StatusCode::OK);
-
-        let released = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards/api-lease/release",
-                Some(&raw_key),
-                &format!(r#"{{"run_id":"{run_id}"}}"#),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(released.status(), StatusCode::OK);
-
-        let ready = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/v1/cards/ready")
-                    .header(AUTHORIZATION, format!("Bearer {raw_key}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(ready.status(), StatusCode::OK);
-        let ready = response_json(ready).await;
-        assert_eq!(ready["cards"][0]["id"], "api-lease");
-    }
-
-    #[tokio::test]
-    async fn tailnet_and_none_modes_authorize_as_configured() {
-        let (tailnet_state, _) = test_state(AuthMode::TailscaleHeader);
-        let tailnet_app = app(tailnet_state);
-        let missing = tailnet_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/v1/cards/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
-
-        let accepted = tailnet_app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/v1/cards/ready")
-                    .header("Tailscale-User-Login", "agent@example.test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(accepted.status(), StatusCode::OK);
-
-        let (none_state, _) = test_state(AuthMode::None);
-        let none = app(none_state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/v1/cards/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(none.status(), StatusCode::OK);
-    }
-
-    fn test_state(auth_mode: AuthMode) -> (AppState, String) {
-        let mut store = Store::open_in_memory().unwrap();
-        store.migrate().unwrap();
-        let key = store.apply_initial_seed(1).unwrap().unwrap();
-        let state = AppState {
-            config: Arc::new(Config {
-                db_path: PathBuf::from(":memory:"),
-                auth_mode,
-                public_base_url: None,
-                bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
-                disclose_bootstrap_key: false,
-            }),
-            store: Arc::new(Mutex::new(store)),
-        };
-        (state, key.raw_key)
-    }
-
-    fn json_request(method: Method, uri: &str, raw_key: Option<&str>, body: &str) -> Request<Body> {
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("Content-Type", "application/json");
-        if let Some(raw_key) = raw_key {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {raw_key}"));
-        }
-        builder.body(Body::from(body.to_owned())).unwrap()
-    }
-
-    async fn response_json(response: Response) -> serde_json::Value {
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-}
+mod tests;

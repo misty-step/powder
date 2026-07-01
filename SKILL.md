@@ -28,7 +28,10 @@ For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
   and status transitions.
 - Release the claim when stopping voluntarily so another worker can pick the
   card up immediately.
+- Use `get_card`, `get_run`, and `list_awaiting_input` to read timelines before
+  answering or completing work.
 - Use `request_input` when a human decision is needed; do not invent approvals.
+- Use `answer_input` only with an actor and the actual answer text.
 - Use `complete_card` only when a proof artifact exists.
 - Do not spawn agents from Powder core. Dispatch belongs to a separate runner.
 
@@ -39,6 +42,10 @@ For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
 - `release_claim`: clear an active claim by run id and make the card ready.
 - `renew_claim`: extend an active claim lease by run id.
 - `heartbeat`: record liveness for an active claim without changing ownership.
+- `get_card`: read one card with runs, activities, links, comments, and claim state.
+- `get_run`: read one run with its card, activities, links, comments, and run state.
+- `list_awaiting_input`: list runs paused for human or agent input.
+- `answer_input`: append an actor-attributed answer and resume the run.
 - `update_status`: move a card or run through an allowed transition.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `request_input`: move the run to `awaiting_input` with the exact question.
@@ -54,13 +61,20 @@ powder claim 001 --db ./data/powder.db --agent codex
 powder heartbeat 001 --db ./data/powder.db --run run-id
 powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600
 powder release-claim 001 --db ./data/powder.db --run run-id
+powder get-card 001 --db ./data/powder.db
 powder update-status 001 --db ./data/powder.db --status running
+powder request-input run-id --db ./data/powder.db --question "Approve?"
+powder list-awaiting-input --db ./data/powder.db
+powder answer-input run-id --db ./data/powder.db --actor operator --answer approved
+powder get-run run-id --db ./data/powder.db
 powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof
 ```
 
 ## Local Gate
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
