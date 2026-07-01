@@ -86,5 +86,13 @@ operator --scope admin --show-secret` and store it in a secret manager.
 ## Gate
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+Pull requests run the same gate through GitHub Actions as
+`Rust CI / fmt-clippy-test`. The `main` branch protection rule requires that
+status check with strict status checks and admin enforcement enabled. The
+Landmark release-note workflow remains release-only and does not replace the
+Rust gate.

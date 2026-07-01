@@ -34,8 +34,14 @@ boundary, or the self-hosting/deployment shape.
 Run before claiming completion:
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+The `main` branch protection rule requires the GitHub Actions
+`Rust CI / fmt-clippy-test` status check with strict status checks and admin
+enforcement enabled; `main` runs the same gate after merge.
 
 ## Red Lines
 
