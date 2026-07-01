@@ -10,6 +10,7 @@ use powder_core::{
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
 
+mod answer_loop;
 mod schema;
 #[cfg(test)]
 mod tests;

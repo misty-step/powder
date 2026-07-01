@@ -553,6 +553,31 @@ pub struct Comment {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardDetail {
+    pub card: Card,
+    pub runs: Vec<Run>,
+    pub activities: Vec<Activity>,
+    pub links: Vec<Link>,
+    pub comments: Vec<Comment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDetail {
+    pub run: Run,
+    pub card: Card,
+    pub activities: Vec<Activity>,
+    pub links: Vec<Link>,
+    pub comments: Vec<Comment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwaitingInput {
+    pub card: Card,
+    pub run: Run,
+    pub question: Option<Activity>,
+}
+
 pub fn non_empty(field: &'static str, value: String) -> Result<String, DomainError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
