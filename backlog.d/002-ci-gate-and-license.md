@@ -20,3 +20,9 @@ to keep release-intelligence automation from being the only GitHub workflow.
 - Run a red-check proof against an injected failure and then remove the failure.
 - Record the expected PR gate in README or AGENTS if the repo contract changes.
 - Keep release-intelligence integration as a separate workflow concern.
+
+## Evidence
+- Disposable red proof: PR #6 (`proof: intentional rustfmt failure`) closed
+  after `Rust CI / fmt-clippy-test` failed on the injected formatting error.
+- Branch protection: `main` requires strict status check `fmt-clippy-test` with
+  admin enforcement enabled; force pushes and branch deletion are disabled.
