@@ -1,0 +1,14 @@
+product:
+  name: Powder
+  description: Agent-first work board for claimable context objects, auditable runs, and human steering.
+audience: developer
+voice: Clear, concrete, and specific to shipped operator behavior.
+changelog:
+  source: auto
+release:
+  profile: synthesis-only
+model:
+  policy: balanced
+budget:
+  max_input_tokens: 12000
+  max_output_tokens: 1200
