@@ -20,8 +20,10 @@ boundary, or the self-hosting/deployment shape.
 - The board store is separate from the runner. A dispatch daemon may consume
   `ready` cards later, but it is not in the core.
 - MCP tools are designed around agent intent, not one-to-one REST wrappers.
-- No real backlog/card/run data belongs in this repo. Use synthetic fixtures
-  under tests only. Instance data lives in the deployed SQLite database.
+- Root `backlog.d/` may contain Powder product-development epics in the house
+  Goal/Oracle format. Do not commit imported/operator/customer card, run,
+  claim, activity, or instance export data; fixtures belong under tests only.
+  Instance data lives in the deployed SQLite database.
 - Follow the Canary-style deployment shape: one deployable Rust service, SQLite
   path from env, WAL, Fly volume at `/data`, Litestream optional replication,
   health and readiness routes, first-run bootstrap key, and tailnet-friendly
