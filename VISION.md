@@ -1,6 +1,7 @@
 # Powder Vision
 
-Powder is the self-hostable work substrate for agent-driven software teams.
+Powder is the self-hostable work substrate for agent-driven software teams: a
+dumb, reliable ledger for work, claims, timelines, and proof.
 
 The repository ships the application. A deployed instance owns the data.
 Operators bring their own backlog, store it in their own SQLite database, and
@@ -9,9 +10,12 @@ and skill surfaces.
 
 Powder should feel like the narrow missing tool between "a chat thread full of
 tasks" and "a hosted project-management system that assumes humans are the
-primary workers." It is not the operator's backlog, not a static `backlog.d`
-repo, and not a private Factory board. It is the public product someone deploys
-so their work can be claimed, paused, audited, and completed with proof.
+primary workers." It is not the operator's backlog, not an instance-data dump,
+and not a private Factory board. It is the public product someone deploys so
+their work can be claimed, paused, audited, and completed with proof.
+Powder never calls a model. Intelligence belongs in orchestrators such as
+Bitterblossom workloads that read and write through Powder's deterministic
+interfaces.
 
 ## Why It Exists
 
@@ -25,9 +29,16 @@ Agent work needs durable coordination primitives:
 - an explicit awaiting-input state instead of invented approvals
 
 Hosted task tools can store tickets, but they usually treat agents as API
-clients bolted onto a human workflow. Powder treats agents as first-class
-workers while keeping ownership, policy, auth, persistence, and audit in the
-operator's deployment.
+clients bolted onto a human workflow. Orchestrators can remember their own
+leases, but that partitions work by runner. Powder's differentiated bet is
+that the board is the lock manager: Bitterblossom, Codex, Herdr, cron, and a
+human with curl can share one pool without trusting chat memory or duplicate
+dispatch loops.
+
+That bet makes claim correctness the product's load-bearing invariant. A card
+advertised as ready must be claimable. A released claim must be visible
+immediately. A stale runner must not wedge the queue. Every adapter should
+inherit those facts from the same domain contract.
 
 ## Audience
 
@@ -51,13 +62,20 @@ over the same domain language: cards, runs, activity, claims, links, comments,
 ready work, input requests, and proof-backed completion.
 
 **A board, not a runner.** Powder stores work, locks, session state, timelines,
-and evidence. Codex, Herdr, Sprites, cron jobs, or other dispatchers may claim
-work from Powder and execute elsewhere, but the dispatch loop is outside the
-core.
+events, and evidence. Codex, Herdr, Sprites, cron jobs, Bitterblossom agents,
+or other dispatchers may claim work from Powder and execute elsewhere, but the
+dispatch loop and every model call are outside the core.
 
-**Instance data stays in instances.** The public repo may contain synthetic
-fixtures and sample config. Real backlog/card/run data belongs in a deployed
-database and must not be committed here.
+**A human face on the same state.** The API/MCP/CLI contract comes first, but
+the product should still feel excellent to operate. The human UI is a thin,
+gorgeous Kanban board over the same cards, claims, timelines, blockers,
+awaiting-input states, and proof links that agents consume. It is not a
+separate human-only project-management system.
+
+**Instance data stays in instances.** The public repo may contain Powder's own
+product-development epics, synthetic fixtures, and sample config. Imported or
+operator/customer backlog, card, run, claim, activity, and proof data belongs in
+a deployed database and must not be committed here.
 
 ## Product Principles
 
@@ -75,10 +93,16 @@ database and must not be committed here.
    private instances, tailnet-friendly auth, and bring-your-own-data operation.
 7. **Small beats feature parity.** Do not clone a full project-management UI
    before the agent contract is boring and trustworthy.
+8. **Triggers beat polling.** Ready queries must exist, but Powder should also
+   emit deterministic events that other systems can subscribe to.
+9. **No model boundary inside Powder.** Rules, persistence, identity, policy,
+   locks, and event delivery are deterministic. Judgment happens in external
+   workers that write their results back.
 
-## Current Product Truth
+## Current Build Shape And Proof Debt
 
-The current scaffold already establishes the shape:
+The current scaffold establishes the intended shape, but the contract is not
+yet trustworthy enough for a fleet to depend on:
 
 - `powder-core` defines cards, runs, activity, links, comments, ready
   eligibility, expiring claims, transition enforcement, completion proof, and
@@ -96,15 +120,17 @@ The current scaffold already establishes the shape:
 - Docker, Fly, Litestream, and env examples follow the Canary-style
   self-hosted deployment pattern.
 
-The important remaining gap is polish around the deployed surface: richer
-onboarding, admin key management, stricter scoped permissions, and a thin human
-control surface. The core lifecycle should already be durable enough to prove
-with a reopened SQLite database.
+The important remaining gaps are not polish. The claim lifecycle needs
+SQLite-backed correctness tests, one implementation of lifecycle semantics, a
+readable answer loop, real identity and authority, private-ingress
+conformance, deterministic event emission, and a Kanban surface that makes the
+same state legible to humans.
 
 ## Non-Goals
 
 - No real operator backlog, run, claim, or activity data in this repository.
 - No dispatch daemon inside `powder-core`.
+- No model calls inside Powder.
 - No hidden dependency on Gradient, Hermes, or any one operator's `kanban.db`.
 - No one-to-one REST-to-MCP wrapper dump that obscures agent intent.
 - No hosted multi-tenant SaaS assumption in the product core.
@@ -115,10 +141,13 @@ with a reopened SQLite database.
 Powder is the obvious self-hosted work ledger for agentic software teams. A new
 operator can deploy it on Fly, mount SQLite storage, choose tailnet or shared
 secret auth, complete first-run onboarding, import their own backlog markdown,
-and let agents safely ask:
+configure rules and webhooks, inspect a beautiful Kanban board, and let agents
+safely ask:
 
 > What is ready, can I claim it, what context matters, and what proof do I need
 > to finish?
 
 Humans inspect the same state agents use. Each run leaves a durable trail.
-Private backlog data stays in the deployment that owns it.
+Private backlog data stays in the deployment that owns it. External workers can
+make intelligent judgments, but Powder remains the boring source of truth for
+what work exists, who holds it, what happened, and what proof settled it.
