@@ -1,6 +1,6 @@
 # CI gate and license
 
-Priority: P0 | Status: backlog | Type: Epic
+Priority: P0 | Status: done | Type: Epic
 
 ## Goal
 Make Powder's quality floor external to the agent running a local command. The
@@ -9,11 +9,11 @@ license file; the remaining work is to make the Rust gate run on every PR and
 to keep release-intelligence automation from being the only GitHub workflow.
 
 ## Oracle
-- [ ] GitHub Actions runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` on pull requests.
-- [ ] A deliberately failing test or formatting error produces a red PR check in a disposable branch.
-- [ ] The Landmark release workflow remains intact and does not replace the Rust gate.
-- [ ] The root `LICENSE` remains MIT for Misty Step LLC and package metadata stays consistent.
-- [ ] Branch protection or an equivalent repository rule is documented or enabled so the gate is not honor-system only.
+- [x] GitHub Actions runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` on pull requests.
+- [x] A deliberately failing test or formatting error produces a red PR check in a disposable branch.
+- [x] The Landmark release workflow remains intact and does not replace the Rust gate.
+- [x] The root `LICENSE` remains MIT for Misty Step LLC and package metadata stays consistent.
+- [x] Branch protection or an equivalent repository rule is documented or enabled so the gate is not honor-system only.
 
 ## Children
 - Add the CI workflow.
