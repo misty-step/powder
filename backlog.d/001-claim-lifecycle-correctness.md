@@ -1,6 +1,6 @@
 # Claim lifecycle correctness
 
-Priority: P0 | Status: ready | Type: Epic
+Priority: P0 | Status: done | Type: Epic
 
 ## Goal
 Make Powder's claim lifecycle boring enough that heterogeneous runners can
@@ -10,12 +10,12 @@ semantics must be implemented once and exercised through the SQLite-backed
 surface every adapter uses.
 
 ## Oracle
-- [ ] The live-proven reclaim repro passes: a running card with an expired claim appears ready and can be claimed by a different agent without a `running -> claimed` transition failure.
-- [ ] Voluntary release clears claim ownership immediately and the card is visible to another agent before TTL expiry.
-- [ ] Claim renewal and heartbeat/update operations extend liveness without requiring huge initial TTLs.
-- [ ] Same-agent retry is idempotent for a still-valid claim, while competing agents receive a conflict.
-- [ ] `rg` and tests show one lifecycle implementation owns claim/release/renew/heartbeat semantics; adapters do not maintain divergent domain rules.
-- [ ] `cargo test --workspace` passes with regression coverage for the prior livelock and claim-leak bugs.
+- [x] The live-proven reclaim repro passes: a running card with an expired claim appears ready and can be claimed by a different agent without a `running -> claimed` transition failure.
+- [x] Voluntary release clears claim ownership immediately and the card is visible to another agent before TTL expiry.
+- [x] Claim renewal and heartbeat/update operations extend liveness without requiring huge initial TTLs.
+- [x] Same-agent retry is idempotent for a still-valid claim, while competing agents receive a conflict.
+- [x] `rg` and tests show one lifecycle implementation owns claim/release/renew/heartbeat semantics; adapters do not maintain divergent domain rules.
+- [x] `cargo test --workspace` passes with regression coverage for the prior livelock and claim-leak bugs.
 
 ## Children
 - Reclaim expired `claimed` and `running` cards atomically in the store.

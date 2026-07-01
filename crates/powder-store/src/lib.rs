@@ -317,19 +317,10 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
 
-        if let Some(claim) = &card.claim {
-            if !claim.is_expired(now) {
-                return Err(DomainError::conflict(format!(
-                    "card {card_id} is already claimed by {} until {}",
-                    claim.agent, claim.expires_at
-                ))
-                .into());
-            }
-        }
-        if !card.can_be_claimed_at(now) {
-            return Err(
-                DomainError::conflict(format!("card {card_id} is not ready to claim")).into(),
-            );
+        if let Some(claim) = card.active_claim_for_agent(&agent, now) {
+            let receipt = claim_receipt(card_id, claim);
+            transaction.commit()?;
+            return Ok(receipt);
         }
 
         transaction.execute(
@@ -342,16 +333,7 @@ impl Store {
         )?;
 
         let run_id = RunId::new(format!("run-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?;
-        let expires_at = now + ttl_seconds as i64;
-        card.status.validate_transition(CardStatus::Claimed)?;
-        card.status = CardStatus::Claimed;
-        card.claim = Some(Claim {
-            agent: agent.clone(),
-            run_id: run_id.clone(),
-            acquired_at: now,
-            expires_at,
-        });
-        card.updated_at = now;
+        let claim = card.apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds)?;
         persist_card(&transaction, &card)?;
 
         let run = Run {
@@ -360,7 +342,7 @@ impl Store {
             state: RunState::Active,
             agent: agent.clone(),
             model: None,
-            claim_expires_at: expires_at,
+            claim_expires_at: claim.expires_at,
             turn_count: 0,
             token_count: 0,
             consecutive_failures: 0,
@@ -384,7 +366,7 @@ impl Store {
             card_id: card_id.clone(),
             run_id,
             agent,
-            expires_at,
+            expires_at: claim.expires_at,
         })
     }
 
@@ -398,15 +380,109 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
-        card.status.validate_transition(status)?;
-        if status.is_terminal() {
-            card.claim = None;
-        }
-        card.status = status;
-        card.updated_at = now;
+        let released_claim = card.apply_status(status, now)?;
         persist_card(&transaction, &card)?;
+        if let Some(claim) = released_claim {
+            release_run(&transaction, &claim.run_id, now)?;
+            append_activity(
+                &transaction,
+                &claim.run_id,
+                ActivityType::Action,
+                &format!("released {card_id}"),
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn release_claim(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+    ) -> Result<ClaimReceipt> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        let claim = card.release_claim(run_id, now)?;
+        persist_card(&transaction, &card)?;
+        release_run(&transaction, run_id, now)?;
+        append_activity(
+            &transaction,
+            run_id,
+            ActivityType::Action,
+            &format!("released {card_id}"),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(claim_receipt(card_id, &claim))
+    }
+
+    pub fn renew_claim(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        ttl_seconds: u64,
+    ) -> Result<ClaimReceipt> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        let claim = card.renew_claim(run_id, now, ttl_seconds)?;
+        persist_card(&transaction, &card)?;
+        let updated = transaction.execute(
+            "UPDATE runs
+             SET claim_expires_at = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![run_id.as_str(), claim.expires_at, now],
+        )?;
+        if updated == 0 {
+            return Err(DomainError::not_found("run", run_id.to_string()).into());
+        }
+        append_activity(
+            &transaction,
+            run_id,
+            ActivityType::Action,
+            &format!("renewed {card_id} until {}", claim.expires_at),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(claim_receipt(card_id, &claim))
+    }
+
+    pub fn heartbeat_claim(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+    ) -> Result<ClaimReceipt> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        let claim = card.heartbeat_claim(run_id, now)?;
+        persist_card(&transaction, &card)?;
+        let updated = transaction.execute(
+            "UPDATE runs
+             SET updated_at = ?2
+             WHERE id = ?1",
+            params![run_id.as_str(), now],
+        )?;
+        if updated == 0 {
+            return Err(DomainError::not_found("run", run_id.to_string()).into());
+        }
+        append_activity(
+            &transaction,
+            run_id,
+            ActivityType::Action,
+            &format!("heartbeat {card_id}"),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(claim_receipt(card_id, &claim))
     }
 
     pub fn add_link(&mut self, card_id: &CardId, label: &str, url: &str, now: i64) -> Result<Link> {
@@ -488,31 +564,27 @@ impl Store {
             .into());
         }
 
-        let run_id = transaction
-            .query_row(
-                "SELECT id FROM runs
-                 WHERE card_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1",
-                [card_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
+        let run_id = card
+            .claim
+            .as_ref()
+            .map(|claim| claim.run_id.clone())
             .ok_or_else(|| {
                 DomainError::conflict(format!("card {card_id} has no run to complete"))
             })?;
-        let run_id = RunId::new(run_id)?;
 
         card.status = CardStatus::Done;
         card.claim = None;
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE runs
              SET state = 'complete', proof = ?2, updated_at = ?3
              WHERE id = ?1",
             params![run_id.as_str(), proof, now],
         )?;
+        if updated == 0 {
+            return Err(DomainError::not_found("run", run_id.to_string()).into());
+        }
         append_activity(
             &transaction,
             &run_id,
@@ -654,6 +726,28 @@ fn append_activity(
         ],
     )?;
     Ok(activity)
+}
+
+fn release_run(connection: &Connection, run_id: &RunId, now: i64) -> Result<()> {
+    let updated = connection.execute(
+        "UPDATE runs
+         SET state = 'released', claim_expires_at = ?2, updated_at = ?2
+         WHERE id = ?1",
+        params![run_id.as_str(), now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    Ok(())
+}
+
+fn claim_receipt(card_id: &CardId, claim: &Claim) -> ClaimReceipt {
+    ClaimReceipt {
+        card_id: card_id.clone(),
+        run_id: claim.run_id.clone(),
+        agent: claim.agent.clone(),
+        expires_at: claim.expires_at,
+    }
 }
 
 fn load_card(connection: &Connection, card_id: &CardId) -> Result<Card> {

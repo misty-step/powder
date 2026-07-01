@@ -87,11 +87,12 @@ id_type!(RunId, "run_id");
 id_type!(ActivityId, "activity_id");
 id_type!(LinkId, "link_id");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     P0,
     P1,
+    #[default]
     P2,
     P3,
 }
@@ -114,12 +115,6 @@ impl Priority {
             Self::P2 => "P2",
             Self::P3 => "P3",
         }
-    }
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Self::P2
     }
 }
 
@@ -224,6 +219,7 @@ pub enum RunState {
     Pending,
     Active,
     AwaitingInput,
+    Released,
     Error,
     Complete,
     Stale,
@@ -235,6 +231,7 @@ impl RunState {
             "pending" => Some(Self::Pending),
             "active" => Some(Self::Active),
             "awaiting-input" | "awaiting_input" => Some(Self::AwaitingInput),
+            "released" => Some(Self::Released),
             "error" => Some(Self::Error),
             "complete" => Some(Self::Complete),
             "stale" => Some(Self::Stale),
@@ -247,6 +244,7 @@ impl RunState {
             Self::Pending => "pending",
             Self::Active => "active",
             Self::AwaitingInput => "awaiting_input",
+            Self::Released => "released",
             Self::Error => "error",
             Self::Complete => "complete",
             Self::Stale => "stale",
@@ -399,6 +397,116 @@ impl Card {
     pub fn can_be_claimed_at(&self, now: i64) -> bool {
         self.is_ready_at(now)
     }
+
+    pub fn active_claim_for_agent(&self, agent: &str, now: i64) -> Option<&Claim> {
+        self.claim
+            .as_ref()
+            .filter(|claim| claim.agent == agent && !claim.is_expired(now))
+    }
+
+    pub fn apply_claim(
+        &mut self,
+        agent: impl Into<String>,
+        run_id: RunId,
+        now: i64,
+        ttl_seconds: u64,
+    ) -> Result<Claim, DomainError> {
+        let agent = non_empty("agent", agent.into())?;
+        validate_ttl(ttl_seconds)?;
+
+        if let Some(claim) = &self.claim {
+            if !claim.is_expired(now) {
+                return Err(DomainError::conflict(format!(
+                    "card {} is already claimed by {} until {}",
+                    self.id, claim.agent, claim.expires_at
+                )));
+            }
+        }
+
+        if !self.can_be_claimed_at(now) {
+            return Err(DomainError::conflict(format!(
+                "card {} is not ready to claim",
+                self.id
+            )));
+        }
+
+        let claim = Claim {
+            agent,
+            run_id,
+            acquired_at: now,
+            expires_at: now + ttl_seconds as i64,
+        };
+        self.status = CardStatus::Claimed;
+        self.claim = Some(claim.clone());
+        self.updated_at = now;
+        Ok(claim)
+    }
+
+    pub fn apply_status(
+        &mut self,
+        status: CardStatus,
+        now: i64,
+    ) -> Result<Option<Claim>, DomainError> {
+        self.status.validate_transition(status)?;
+        let released_claim =
+            if matches!(status, CardStatus::Ready | CardStatus::Blocked) || status.is_terminal() {
+                self.claim.take()
+            } else {
+                None
+            };
+        self.status = status;
+        self.updated_at = now;
+        Ok(released_claim)
+    }
+
+    pub fn release_claim(&mut self, run_id: &RunId, now: i64) -> Result<Claim, DomainError> {
+        self.status.validate_transition(CardStatus::Ready)?;
+        let claim = self.matching_active_claim(run_id, now)?.clone();
+        self.claim = None;
+        self.status = CardStatus::Ready;
+        self.updated_at = now;
+        Ok(claim)
+    }
+
+    pub fn renew_claim(
+        &mut self,
+        run_id: &RunId,
+        now: i64,
+        ttl_seconds: u64,
+    ) -> Result<Claim, DomainError> {
+        validate_ttl(ttl_seconds)?;
+        let claim = self.matching_active_claim_mut(run_id, now)?;
+        claim.expires_at = now + ttl_seconds as i64;
+        let claim = claim.clone();
+        self.updated_at = now;
+        Ok(claim)
+    }
+
+    pub fn heartbeat_claim(&mut self, run_id: &RunId, now: i64) -> Result<Claim, DomainError> {
+        let claim = self.matching_active_claim(run_id, now)?.clone();
+        self.updated_at = now;
+        Ok(claim)
+    }
+
+    fn matching_active_claim(&self, run_id: &RunId, now: i64) -> Result<&Claim, DomainError> {
+        let claim = self.claim.as_ref().ok_or_else(|| {
+            DomainError::conflict(format!("card {} has no active claim", self.id))
+        })?;
+        validate_claim_run(&self.id, claim, run_id, now)?;
+        Ok(claim)
+    }
+
+    fn matching_active_claim_mut(
+        &mut self,
+        run_id: &RunId,
+        now: i64,
+    ) -> Result<&mut Claim, DomainError> {
+        let claim = self.claim.as_mut().ok_or_else(|| {
+            DomainError::conflict(format!("card {} has no active claim", self.id))
+        })?;
+        validate_claim_run(&self.id, claim, run_id, now)?;
+        Ok(claim)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,4 +568,35 @@ pub fn clean_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
         .map(|item| item.trim().to_owned())
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+fn validate_ttl(ttl_seconds: u64) -> Result<(), DomainError> {
+    if ttl_seconds == 0 {
+        Err(DomainError::validation(
+            "ttl_seconds",
+            "claim ttl must be greater than zero",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_claim_run(
+    card_id: &CardId,
+    claim: &Claim,
+    run_id: &RunId,
+    now: i64,
+) -> Result<(), DomainError> {
+    if claim.run_id != *run_id {
+        return Err(DomainError::conflict(format!(
+            "card {card_id} is claimed by a different run"
+        )));
+    }
+    if claim.is_expired(now) {
+        return Err(DomainError::conflict(format!(
+            "card {card_id} claim expired at {}",
+            claim.expires_at
+        )));
+    }
+    Ok(())
 }

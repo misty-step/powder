@@ -23,6 +23,21 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["card_id","agent"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":60}}}"#,
     },
     ToolDef {
+        name: "release_claim",
+        description: "Release an active claim by run id and make the card ready immediately.",
+        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "renew_claim",
+        description: "Extend an active claim lease by run id.",
+        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "heartbeat",
+        description: "Record liveness for an active claim without changing ownership.",
+        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
         name: "update_status",
         description: "Move a card through an allowed status transition when external progress changes.",
         input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"}}}"#,
@@ -144,6 +159,28 @@ pub fn call_tool(board: &mut Board, name: &str, args: &Value, now: i64) -> Resul
                 .claim_card(&card_id, agent, now, ttl_seconds)
                 .map_err(to_string)?)
         }
+        "release_claim" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            json!(board
+                .release_claim(&card_id, &run_id, now)
+                .map_err(to_string)?)
+        }
+        "renew_claim" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
+            json!(board
+                .renew_claim(&card_id, &run_id, now, ttl_seconds)
+                .map_err(to_string)?)
+        }
+        "heartbeat" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            json!(board
+                .heartbeat_claim(&card_id, &run_id, now)
+                .map_err(to_string)?)
+        }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = CardStatus::parse(required_str(args, "status")?)
@@ -202,6 +239,28 @@ pub fn call_tool_store(
                 .claim_card(&card_id, agent, now, ttl_seconds)
                 .map_err(to_string)?)
         }
+        "release_claim" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            json!(store
+                .release_claim(&card_id, &run_id, now)
+                .map_err(to_string)?)
+        }
+        "renew_claim" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
+            json!(store
+                .renew_claim(&card_id, &run_id, now, ttl_seconds)
+                .map_err(to_string)?)
+        }
+        "heartbeat" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            json!(store
+                .heartbeat_claim(&card_id, &run_id, now)
+                .map_err(to_string)?)
+        }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = CardStatus::parse(required_str(args, "status")?)
@@ -243,6 +302,10 @@ fn card_id(args: &Value, key: &'static str) -> Result<CardId, String> {
     CardId::new(required_str(args, key)?).map_err(to_string)
 }
 
+fn run_id(args: &Value, key: &'static str) -> Result<RunId, String> {
+    RunId::new(required_str(args, key)?).map_err(to_string)
+}
+
 fn required_str<'a>(args: &'a Value, key: &'static str) -> Result<&'a str, String> {
     args[key]
         .as_str()
@@ -265,9 +328,12 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 6);
+        assert_eq!(TOOLS.len(), 9);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"claim_card"));
+        assert!(names.contains(&"release_claim"));
+        assert!(names.contains(&"renew_claim"));
+        assert!(names.contains(&"heartbeat"));
         assert!(names.contains(&"add_link"));
         assert!(names.contains(&"request_input"));
     }
@@ -307,26 +373,43 @@ Expose tools.
         .unwrap();
         let claimed_text = claimed["content"][0]["text"].as_str().unwrap();
         assert!(claimed_text.contains("run-1"));
+        let claimed_json = tool_payload(&claimed);
+        let run_id = claimed_json["run_id"].as_str().unwrap();
+
+        call_tool(
+            &mut board,
+            "heartbeat",
+            &json!({"card_id": "004", "run_id": run_id}),
+            12,
+        )
+        .unwrap();
+        call_tool(
+            &mut board,
+            "renew_claim",
+            &json!({"card_id": "004", "run_id": run_id, "ttl_seconds": 60}),
+            13,
+        )
+        .unwrap();
 
         call_tool(
             &mut board,
             "request_input",
             &json!({"run_id": "run-1", "question": "Approve?"}),
-            12,
+            14,
         )
         .unwrap();
         call_tool(
             &mut board,
             "add_link",
             &json!({"card_id": "004", "label": "PR", "url": "https://github.com/misty-step/powder/pull/1"}),
-            13,
+            15,
         )
         .unwrap();
         call_tool(
             &mut board,
             "complete_card",
             &json!({"card_id": "004", "proof": "https://github.com/misty-step/powder/pull/1"}),
-            14,
+            16,
         )
         .unwrap();
     }
@@ -369,5 +452,38 @@ Expose tools against the DB.
         .unwrap();
         let claimed_text = claimed["content"][0]["text"].as_str().unwrap();
         assert!(claimed_text.contains("run-"));
+        let claimed_json = tool_payload(&claimed);
+        let run_id = claimed_json["run_id"].as_str().unwrap();
+
+        call_tool_store(
+            &mut store,
+            "heartbeat",
+            &json!({"card_id": "005", "run_id": run_id}),
+            12,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "renew_claim",
+            &json!({"card_id": "005", "run_id": run_id, "ttl_seconds": 60}),
+            13,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "release_claim",
+            &json!({"card_id": "005", "run_id": run_id}),
+            14,
+        )
+        .unwrap();
+        let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 1}), 15).unwrap();
+        assert!(ready["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("005"));
+    }
+
+    fn tool_payload(response: &Value) -> Value {
+        serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap()
     }
 }

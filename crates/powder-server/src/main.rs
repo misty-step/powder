@@ -187,6 +187,12 @@ struct ClaimRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct LeaseRequest {
+    run_id: String,
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct StatusRequest {
     status: String,
 }
@@ -252,6 +258,9 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
         .route("/api/v1/cards/{id}/claim", post(claim_card))
+        .route("/api/v1/cards/{id}/release", post(release_claim))
+        .route("/api/v1/cards/{id}/renew", post(renew_claim))
+        .route("/api/v1/cards/{id}/heartbeat", post(heartbeat_claim))
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
@@ -374,6 +383,50 @@ async fn claim_card(
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
     )?;
+    Ok(Json(json!(receipt)))
+}
+
+async fn release_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LeaseRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let run_id = RunId::new(request.run_id)?;
+    let receipt = lock_store(&state)?.release_claim(&card_id, &run_id, unix_now())?;
+    Ok(Json(json!(receipt)))
+}
+
+async fn renew_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LeaseRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let run_id = RunId::new(request.run_id)?;
+    let receipt = lock_store(&state)?.renew_claim(
+        &card_id,
+        &run_id,
+        unix_now(),
+        request.ttl_seconds.unwrap_or(3600),
+    )?;
+    Ok(Json(json!(receipt)))
+}
+
+async fn heartbeat_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<LeaseRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let run_id = RunId::new(request.run_id)?;
+    let receipt = lock_store(&state)?.heartbeat_claim(&card_id, &run_id, unix_now())?;
     Ok(Json(json!(receipt)))
 }
 
@@ -752,6 +805,89 @@ mod tests {
         assert_eq!(complete.status(), StatusCode::OK);
         let complete = response_json(complete).await;
         assert_eq!(complete["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_allows_claim_renew_heartbeat_and_release() {
+        let (state, raw_key) = test_state(AuthMode::ApiKey);
+        let app = app(state);
+
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&raw_key),
+                r#"{"id":"api-lease","title":"API lease","body":"exercise","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let claimed = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards/api-lease/claim",
+                Some(&raw_key),
+                r#"{"agent":"codex","ttl_seconds":3600}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let claimed = response_json(claimed).await;
+        let run_id = claimed["run_id"].as_str().unwrap();
+
+        let heartbeat = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards/api-lease/heartbeat",
+                Some(&raw_key),
+                &format!(r#"{{"run_id":"{run_id}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+
+        let renewed = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards/api-lease/renew",
+                Some(&raw_key),
+                &format!(r#"{{"run_id":"{run_id}","ttl_seconds":3600}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renewed.status(), StatusCode::OK);
+
+        let released = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards/api-lease/release",
+                Some(&raw_key),
+                &format!(r#"{{"run_id":"{run_id}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(released.status(), StatusCode::OK);
+
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/cards/ready")
+                    .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        let ready = response_json(ready).await;
+        assert_eq!(ready["cards"][0]["id"], "api-lease");
     }
 
     #[tokio::test]

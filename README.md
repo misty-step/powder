@@ -30,7 +30,11 @@ DB=/tmp/powder-smoke/powder.db
 cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret
 cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
 cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
-cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex
+CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex)
+printf "%s" "$CLAIM"
+RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
+cargo run -q -p powder-cli -- heartbeat 001 --db "$DB" --run "$RUN_ID"
+cargo run -q -p powder-cli -- renew-claim 001 --db "$DB" --run "$RUN_ID" --ttl 3600
 cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status running
 cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --proof https://example.test/proof
 POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp

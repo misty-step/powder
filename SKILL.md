@@ -24,7 +24,10 @@ For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
 
 - Use `list_ready` before claiming work.
 - Claim exactly one card at a time unless the operator authorizes a batch.
-- Keep the card updated through activity events and status transitions.
+- Keep the card updated through lease heartbeats, renewals, activity events,
+  and status transitions.
+- Release the claim when stopping voluntarily so another worker can pick the
+  card up immediately.
 - Use `request_input` when a human decision is needed; do not invent approvals.
 - Use `complete_card` only when a proof artifact exists.
 - Do not spawn agents from Powder core. Dispatch belongs to a separate runner.
@@ -33,6 +36,9 @@ For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
 
 - `list_ready`: return claimable cards sorted by priority, age, and identifier.
 - `claim_card`: acquire an expiring lock for one card and open a run.
+- `release_claim`: clear an active claim by run id and make the card ready.
+- `renew_claim`: extend an active claim lease by run id.
+- `heartbeat`: record liveness for an active claim without changing ownership.
 - `update_status`: move a card or run through an allowed transition.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `request_input`: move the run to `awaiting_input` with the exact question.
@@ -45,6 +51,9 @@ powder init-db --db ./data/powder.db --show-secret
 powder import backlog.d --db ./data/powder.db
 powder list-ready --db ./data/powder.db --limit 10
 powder claim 001 --db ./data/powder.db --agent codex
+powder heartbeat 001 --db ./data/powder.db --run run-id
+powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600
+powder release-claim 001 --db ./data/powder.db --run run-id
 powder update-status 001 --db ./data/powder.db --status running
 powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof
 ```

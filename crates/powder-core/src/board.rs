@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    non_empty, Activity, ActivityId, ActivityType, Card, CardId, CardStatus, Claim, DomainError,
-    Link, LinkId, Run, RunId, RunState,
+    non_empty, Activity, ActivityId, ActivityType, Card, CardId, CardStatus, DomainError, Link,
+    LinkId, Run, RunId, RunState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,38 +109,24 @@ impl Board {
                 .get(card_id)
                 .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?;
 
-            if let Some(claim) = &card.claim {
-                if !claim.is_expired(now) {
-                    return Err(DomainError::conflict(format!(
-                        "card {card_id} is already claimed by {} until {}",
-                        claim.agent, claim.expires_at
-                    )));
-                }
-            }
-
-            if !card.can_be_claimed_at(now) {
-                return Err(DomainError::conflict(format!(
-                    "card {card_id} is not ready to claim"
-                )));
+            if let Some(claim) = card.active_claim_for_agent(&agent, now) {
+                return Ok(ClaimReceipt {
+                    card_id: card_id.clone(),
+                    run_id: claim.run_id.clone(),
+                    agent,
+                    expires_at: claim.expires_at,
+                });
             }
         }
 
         self.mark_expired_runs_stale(card_id, now);
 
         let run_id = self.next_run_id();
-        let expires_at = now + ttl_seconds as i64;
-        let claim = Claim {
-            agent: agent.clone(),
-            run_id: run_id.clone(),
-            acquired_at: now,
-            expires_at,
-        };
-
-        if let Some(card) = self.cards.get_mut(card_id) {
-            card.status = CardStatus::Claimed;
-            card.claim = Some(claim);
-            card.updated_at = now;
-        }
+        let claim = self
+            .cards
+            .get_mut(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds)?;
 
         let run = Run {
             id: run_id.clone(),
@@ -148,7 +134,7 @@ impl Board {
             state: RunState::Active,
             agent: agent.clone(),
             model: None,
-            claim_expires_at: expires_at,
+            claim_expires_at: claim.expires_at,
             turn_count: 0,
             token_count: 0,
             consecutive_failures: 0,
@@ -170,7 +156,7 @@ impl Board {
             card_id: card_id.clone(),
             run_id,
             agent,
-            expires_at,
+            expires_at: claim.expires_at,
         })
     }
 
@@ -180,18 +166,135 @@ impl Board {
         status: CardStatus,
         now: i64,
     ) -> Result<Card, DomainError> {
-        let card = self
+        let mut card = self
             .cards
-            .get_mut(card_id)
-            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?;
-
-        card.status.validate_transition(status)?;
-        if status.is_terminal() {
-            card.claim = None;
+            .get(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .clone();
+        let released_claim = card.apply_status(status, now)?;
+        if let Some(claim) = &released_claim {
+            self.require_run(&claim.run_id)?;
         }
-        card.status = status;
-        card.updated_at = now;
-        Ok(card.clone())
+        self.cards.insert(card_id.clone(), card.clone());
+        if let Some(claim) = released_claim {
+            let run = self
+                .runs
+                .get_mut(&claim.run_id)
+                .expect("run existence checked before card update");
+            run.state = RunState::Released;
+            run.claim_expires_at = now;
+            run.updated_at = now;
+            self.append_activity(
+                claim.run_id,
+                ActivityType::Action,
+                format!("released {card_id}"),
+                now,
+            )?;
+        }
+        Ok(card)
+    }
+
+    pub fn release_claim(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+    ) -> Result<ClaimReceipt, DomainError> {
+        let mut card = self
+            .cards
+            .get(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .clone();
+        let claim = card.release_claim(run_id, now)?;
+        self.require_run(run_id)?;
+        self.cards.insert(card_id.clone(), card);
+        let run = self
+            .runs
+            .get_mut(run_id)
+            .expect("run existence checked before card update");
+        run.state = RunState::Released;
+        run.claim_expires_at = now;
+        run.updated_at = now;
+        self.append_activity(
+            run_id.clone(),
+            ActivityType::Action,
+            format!("released {card_id}"),
+            now,
+        )?;
+        Ok(ClaimReceipt {
+            card_id: card_id.clone(),
+            run_id: claim.run_id,
+            agent: claim.agent,
+            expires_at: claim.expires_at,
+        })
+    }
+
+    pub fn renew_claim(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        ttl_seconds: u64,
+    ) -> Result<ClaimReceipt, DomainError> {
+        let mut card = self
+            .cards
+            .get(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .clone();
+        let claim = card.renew_claim(run_id, now, ttl_seconds)?;
+        self.require_run(run_id)?;
+        self.cards.insert(card_id.clone(), card);
+        let run = self
+            .runs
+            .get_mut(run_id)
+            .expect("run existence checked before card update");
+        run.claim_expires_at = claim.expires_at;
+        run.updated_at = now;
+        self.append_activity(
+            run_id.clone(),
+            ActivityType::Action,
+            format!("renewed {card_id} until {}", claim.expires_at),
+            now,
+        )?;
+        Ok(ClaimReceipt {
+            card_id: card_id.clone(),
+            run_id: claim.run_id,
+            agent: claim.agent,
+            expires_at: claim.expires_at,
+        })
+    }
+
+    pub fn heartbeat_claim(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+    ) -> Result<ClaimReceipt, DomainError> {
+        let mut card = self
+            .cards
+            .get(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .clone();
+        let claim = card.heartbeat_claim(run_id, now)?;
+        self.require_run(run_id)?;
+        self.cards.insert(card_id.clone(), card);
+        let run = self
+            .runs
+            .get_mut(run_id)
+            .expect("run existence checked before card update");
+        run.updated_at = now;
+        self.append_activity(
+            run_id.clone(),
+            ActivityType::Action,
+            format!("heartbeat {card_id}"),
+            now,
+        )?;
+        Ok(ClaimReceipt {
+            card_id: card_id.clone(),
+            run_id: claim.run_id,
+            agent: claim.agent,
+            expires_at: claim.expires_at,
+        })
     }
 
     pub fn add_link(
@@ -250,10 +353,11 @@ impl Board {
         now: i64,
     ) -> Result<Card, DomainError> {
         let proof = non_empty("proof", proof.to_owned())?;
-        let card = self
+        let mut card = self
             .cards
-            .get_mut(card_id)
-            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?;
+            .get(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .clone();
 
         if !card.status.can_complete() {
             return Err(DomainError::conflict(format!(
@@ -271,32 +375,40 @@ impl Board {
             )));
         }
 
+        let run_id = card
+            .claim
+            .as_ref()
+            .map(|claim| claim.run_id.clone())
+            .expect("active claim checked above");
+        self.require_run(&run_id)?;
         card.status = CardStatus::Done;
         card.claim = None;
         card.updated_at = now;
 
-        let run_id = self
+        self.cards.insert(card_id.clone(), card.clone());
+        let run = self
             .runs
-            .values()
-            .filter(|run| &run.card_id == card_id)
-            .max_by_key(|run| run.created_at)
-            .map(|run| run.id.clone());
+            .get_mut(&run_id)
+            .expect("run existence checked before card update");
+        run.state = RunState::Complete;
+        run.proof = Some(proof.clone());
+        run.updated_at = now;
+        self.append_activity(
+            run_id,
+            ActivityType::Response,
+            format!("completed: {proof}"),
+            now,
+        )?;
 
-        if let Some(run_id) = run_id {
-            if let Some(run) = self.runs.get_mut(&run_id) {
-                run.state = RunState::Complete;
-                run.proof = Some(proof.clone());
-                run.updated_at = now;
-            }
-            self.append_activity(
-                run_id,
-                ActivityType::Response,
-                format!("completed: {proof}"),
-                now,
-            )?;
+        Ok(card)
+    }
+
+    fn require_run(&self, run_id: &RunId) -> Result<(), DomainError> {
+        if self.runs.contains_key(run_id) {
+            Ok(())
+        } else {
+            Err(DomainError::not_found("run", run_id.to_string()))
         }
-
-        Ok(self.cards.get(card_id).expect("card exists").clone())
     }
 
     fn mark_expired_runs_stale(&mut self, card_id: &CardId, now: i64) {
@@ -349,7 +461,7 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Priority, RunState};
+    use crate::{Claim, Priority, RunState};
 
     fn ready_card(id: &str, priority: Priority, created_at: i64) -> Card {
         Card::new(CardId::new(id).unwrap(), format!("Card {id}"), "")
@@ -358,6 +470,17 @@ mod tests {
             .with_priority(priority)
             .with_created_at(created_at)
             .with_acceptance(["proof exists".to_string()])
+    }
+
+    fn card_with_orphan_claim(id: &str) -> Card {
+        let mut card = ready_card(id, Priority::P0, 0).with_status(CardStatus::Running);
+        card.claim = Some(Claim {
+            agent: "agent-a".to_string(),
+            run_id: RunId::new("missing-run").unwrap(),
+            acquired_at: 10,
+            expires_at: 70,
+        });
+        card
     }
 
     #[test]
@@ -461,5 +584,76 @@ mod tests {
 
         assert!(matches!(err, DomainError::Conflict(_)));
         assert_eq!(board.get_card(&card_id).unwrap().status, CardStatus::Ready);
+    }
+
+    #[test]
+    fn completion_with_orphan_claim_fails_without_mutating_card() {
+        let mut board = Board::default();
+        let card_id = CardId::new("001").unwrap();
+        board.import_cards(vec![card_with_orphan_claim("001")]);
+
+        let err = board
+            .complete_card(&card_id, "https://example.test/proof", 20)
+            .unwrap_err();
+
+        assert!(matches!(err, DomainError::NotFound { entity: "run", .. }));
+        let card = board.get_card(&card_id).unwrap();
+        assert_eq!(card.status, CardStatus::Running);
+        assert!(card.claim.is_some());
+    }
+
+    #[test]
+    fn lease_mutations_with_orphan_claim_fail_without_mutating_card() {
+        let card_id = CardId::new("001").unwrap();
+        let run_id = RunId::new("missing-run").unwrap();
+
+        for action in ["release", "renew", "heartbeat"] {
+            let mut board = Board::default();
+            board.import_cards(vec![card_with_orphan_claim("001")]);
+
+            let err = match action {
+                "release" => board.release_claim(&card_id, &run_id, 20).map(|_| ()),
+                "renew" => board.renew_claim(&card_id, &run_id, 20, 60).map(|_| ()),
+                "heartbeat" => board.heartbeat_claim(&card_id, &run_id, 20).map(|_| ()),
+                _ => unreachable!(),
+            }
+            .unwrap_err();
+
+            assert!(matches!(err, DomainError::NotFound { entity: "run", .. }));
+            let card = board.get_card(&card_id).unwrap();
+            assert_eq!(card.status, CardStatus::Running);
+            assert!(card.claim.is_some());
+        }
+    }
+
+    #[test]
+    fn completion_after_release_reclaim_completes_current_run() {
+        let mut board = Board::default();
+        let card_id = CardId::new("001").unwrap();
+        board.import_cards(vec![ready_card("001", Priority::P0, 0)]);
+
+        let first = board.claim_card(&card_id, "agent-a", 10, 60).unwrap();
+        board.release_claim(&card_id, &first.run_id, 10).unwrap();
+        let second = board.claim_card(&card_id, "agent-b", 10, 60).unwrap();
+        board
+            .update_status(&card_id, CardStatus::Running, 10)
+            .unwrap();
+        board
+            .complete_card(&card_id, "https://example.test/proof", 10)
+            .unwrap();
+
+        assert_eq!(
+            board.get_run(&first.run_id).unwrap().state,
+            RunState::Released
+        );
+        assert!(board.get_run(&first.run_id).unwrap().proof.is_none());
+        assert_eq!(
+            board.get_run(&second.run_id).unwrap().state,
+            RunState::Complete
+        );
+        assert_eq!(
+            board.get_run(&second.run_id).unwrap().proof.as_deref(),
+            Some("https://example.test/proof")
+        );
     }
 }
