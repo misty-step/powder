@@ -1,0 +1,17 @@
+product:
+  name: Powder
+  description: Self-hostable agent-first work board for cards, runs, activity, proof, and human-in-loop pauses.
+audience: developer
+voice: Clear, concrete, and release-operator friendly.
+changelog:
+  source: auto
+artifacts:
+  markdown: docs/releases/{version}.md
+  json: docs/releases/releases.json
+release:
+  profile: synthesis-only
+model:
+  policy: balanced
+budget:
+  max_input_tokens: 12000
+  max_output_tokens: 1200

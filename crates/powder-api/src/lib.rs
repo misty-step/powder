@@ -25,6 +25,11 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/cards/{id}/links",
+        intent: "attach proof, PRs, CI, or reference links to a card",
+    },
+    ApiRoute {
+        method: "POST",
         path: "/runs/{id}/input",
         intent: "pause a run for human input",
     },
@@ -53,6 +58,7 @@ mod tests {
 
         assert!(paths.contains(&"/cards/ready"));
         assert!(paths.contains(&"/cards/{id}/claim"));
+        assert!(paths.contains(&"/cards/{id}/links"));
         assert!(paths.contains(&"/runs/{id}/input"));
     }
 }

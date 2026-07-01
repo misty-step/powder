@@ -1,8 +1,8 @@
 # Powder Repo Contract
 
-Powder is a Rust-first, agent-first work board. It is greenfield: do not reuse
-Gradient or the Hermes `kanban.db`. The only planned migration input is
-repository `backlog.d/` markdown.
+Powder is a Rust-first, public, self-hostable agent work application. It is the
+tool people deploy to host their own backlog data; it is not a repository that
+stores the operator's backlog.
 
 ## Architecture
 
@@ -15,6 +15,11 @@ repository `backlog.d/` markdown.
 - The board store is separate from the runner. A dispatch daemon may consume
   `ready` cards later, but it is not in the core.
 - MCP tools are designed around agent intent, not one-to-one REST wrappers.
+- No real backlog/card/run data belongs in this repo. Use synthetic fixtures
+  under tests only. Instance data lives in the deployed SQLite database.
+- Follow the Canary-style deployment shape: one deployable Rust service, SQLite
+  path from env, Fly volume at `/data`, Litestream optional replication, health
+  and readiness routes, and tailnet-friendly auth configuration.
 
 ## Gates
 
@@ -26,8 +31,6 @@ cargo test --workspace
 
 ## Red Lines
 
-- Do not create, push to, or mutate the GitHub remote until the operator
-  explicitly approves the `misty-step/powder` remote plan.
+- Do not add personal/operator backlog data to the repo.
 - Do not lower gates or add mocked internal collaborators to get green.
-- Do not add a UI, DB schema, dispatch loop, or real MCP runtime in scaffold
-  work unless the backlog item explicitly scopes it.
+- Do not add a dispatch loop to the core.

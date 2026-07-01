@@ -6,6 +6,7 @@ members = [
   "crates/powder-api",
   "crates/powder-cli",
   "crates/powder-mcp",
+  "crates/powder-server",
 ]
 
 [workspace.package]

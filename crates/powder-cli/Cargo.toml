@@ -14,3 +14,5 @@ path = "src/main.rs"
 
 [dependencies]
 powder-api = { path = "../powder-api" }
+powder-core = { path = "../powder-core" }
+powder-shell = { path = "../powder-shell" }
