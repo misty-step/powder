@@ -13,6 +13,7 @@ kill_timeout = "30s"
 [env]
   POWDER_DB_PATH = "/data/powder.db"
   POWDER_AUTH_MODE = "api-key"
+  POWDER_PUBLIC_BASE_URL = "https://powder.internal"
   POWDER_DISCLOSE_BOOTSTRAP_KEY = "true"
   PORT = "4000"
 

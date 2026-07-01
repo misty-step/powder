@@ -58,7 +58,22 @@ POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 
 Agent routes require `Authorization: Bearer <key>` in `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
-supported tailnet identity headers. Use `none` only for local development.
+supported tailnet identity headers and strips spoofed client-supplied identity
+headers. Use `none` only for local development.
+
+Fly instance shape:
+
+```sh
+fly apps create powder --org misty-step
+fly volumes create powder_data --size 1 --region iad --app powder
+fly deploy --app powder
+```
+
+The default `fly.toml` keeps one machine warm, mounts `/data`, checks
+`/healthz` and `/readyz`, and sets `POWDER_PUBLIC_BASE_URL` to
+`https://powder.internal` for a tailnet-fronted instance. The companion bastion
+lane can expose `http://powder.internal:4000` through Tailscale Serve while
+Powder keeps its own database and secrets on its Fly volume.
 
 ## Gate
 
