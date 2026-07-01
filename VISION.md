@@ -1,154 +1,118 @@
 # Powder Vision
 
-## North Star
+Powder is the self-hostable work substrate for agent-driven software teams.
 
-Powder is a public, self-hostable work-management application for agent-driven
-software teams. It is not a repository for the operator's backlog data; it is
-the tool someone deploys so their own backlog, cards, runs, activity, links,
-comments, and human-in-loop pauses live in their own database.
+The repository ships the application. A deployed instance owns the data.
+Operators bring their own backlog, store it in their own SQLite database, and
+connect their own agents, runners, and humans through Powder's API, CLI, MCP,
+and skill surfaces.
 
-Think Linear, but agent-first and self-hostable: Linear is not any one user's
-backlog, it is the application where users put backlog data. Powder should work
-the same way.
+Powder should feel like the narrow missing tool between "a chat thread full of
+tasks" and "a hosted project-management system that assumes humans are the
+primary workers." It is not the operator's backlog, not a static `backlog.d`
+repo, and not a private Factory board. It is the public product someone deploys
+so their work can be claimed, paused, audited, and completed with proof.
 
-Premise Source:
+## Why It Exists
 
-- `sha256:b8a981522941a7623b3310ebdb28e991f684d254261b097fb6f094723ffe7be4` `/Users/phaedrus/artifacts/public/a/factory/index.html`
-- `sha256:378a96eb94605bd996953e9e37ecc50d77c678ad11025b0786ae03456bb38175` `/Users/phaedrus/.factory-lanes/_brief.md`
-- `sha256:f21d935694d60db0857f25c37100e81826e82a15ac0678a50e9a3590449e0c2a` `/Users/phaedrus/.factory-lanes/powder.md`
-- 2026-07-01 operator reframe: Powder is a public self-hostable product; personal instance data is deployed separately.
+Agent work needs durable coordination primitives:
+
+- a card with enough context and an acceptance oracle
+- a ready query that deterministic code can answer
+- an expiring claim so duplicate agents do not collide
+- a run timeline that survives handoff, crash, and compaction
+- proof links and completion records a human can inspect
+- an explicit awaiting-input state instead of invented approvals
+
+Hosted task tools can store tickets, but they usually treat agents as API
+clients bolted onto a human workflow. Powder treats agents as first-class
+workers while keeping ownership, policy, auth, persistence, and audit in the
+operator's deployment.
 
 ## Audience
 
-- Operators who want a self-hosted alternative to hosted agent-work boards.
-- Agent orchestrators that need a narrow, callable work API instead of chat-only
-  task assignment.
-- Teams that want durable run/session traces, claim locks, proof links, and
-  human input pauses without handing backlog data to a hosted SaaS.
+Powder is for operators and small teams who want a self-hosted alternative to
+hosted agent-work boards. It is also for agent orchestrators that need a narrow
+work API instead of assigning jobs through chat transcripts.
 
-## Category
+The primary user is technical: someone comfortable running one service,
+mounting one volume, configuring auth by env, and importing their own data. A
+future hosted version may exist, but the product core must not assume one.
 
-Powder is a self-hostable, agent-first work tool. It is not a generic
-project-management clone, not a Factory-private board, and not a static
-`backlog.d` repository.
+## Product Shape
 
-The repo ships the application. A deployed instance owns the data.
+**One deployable.** Powder should remain a Rust service with one Docker image,
+one SQLite database, one Fly-friendly deployment target, optional Litestream
+replication, health/readiness routes, first-run onboarding, and configuration
+through environment variables.
 
-## Job To Be Done
+**One semantic contract.** HTTP, CLI, MCP, and the shipped skill are adapters
+over the same domain language: cards, runs, activity, claims, links, comments,
+ready work, input requests, and proof-backed completion.
 
-When a person or agent has work that should be claimable, auditable, and safe to
-pause for human input, Powder hosts that work as cards and runs in a database
-the operator controls. Agents can ask what is ready, claim one card, append
-activity, request input, add evidence links, and complete work with proof.
+**A board, not a runner.** Powder stores work, locks, session state, timelines,
+and evidence. Codex, Herdr, Sprites, cron jobs, or other dispatchers may claim
+work from Powder and execute elsewhere, but the dispatch loop is outside the
+core.
 
-## Product Standards
+**Instance data stays in instances.** The public repo may contain synthetic
+fixtures and sample config. Real backlog/card/run data belongs in a deployed
+database and must not be committed here.
 
-- Self-hostable first: one Rust service, one Docker image, one SQLite database,
-  one Fly-friendly deployment target.
-- Bring your own data: importers load user-supplied backlog files into an
-  instance database; no real backlog data lives in this repo.
-- Agent-native first: API, CLI, MCP, and shipped skill all speak the same
-  domain language.
-- One core, many faces: business-rule changes land in `powder-core` once.
-- The board is not the runner: Powder stores cards, claims, runs, activity, and
-  proof. External dispatchers spawn Codex, Herdr panes, Sprites, or other
-  workers.
-- Proof beats status: done means accepted evidence, not process exit zero.
-- Human-in-loop is first-class: awaiting input is a run state, not a comment
-  convention.
-- Tailnet-friendly auth: a deployment can run behind private networking, shared
-  secret auth, or a trusted identity header from an ingress layer.
-- First-run onboarding is product behavior: a new instance should reveal setup
-  state and guide the operator toward the first admin/API key/import.
+## Product Principles
 
-## Core Model
+1. **Ready is a query, not vibes.** Eligibility must be explainable from card
+   status, blockers, acceptance, priority, age, and claim expiry.
+2. **Claim before work.** Agents acquire an expiring lock before acting so
+   duplicate workers do not silently collide.
+3. **Proof beats status.** Completion requires evidence: a PR, artifact, CI
+   run, transcript, or other reviewable link.
+4. **Human input is a state.** Awaiting a decision is part of the run model,
+   not a buried comment convention.
+5. **Adapters stay thin.** Business rules live in `powder-core`; API, CLI, MCP,
+   and skill surfaces should not grow separate semantics.
+6. **Private by deployment, public by repo.** Powder is a public product for
+   private instances, tailnet-friendly auth, and bring-your-own-data operation.
+7. **Small beats feature parity.** Do not clone a full project-management UI
+   before the agent contract is boring and trustworthy.
 
-### Card
+## Current Product Truth
 
-A durable context object with:
+The current scaffold already establishes the shape:
 
-- identifier, title, body, acceptance oracle, status, priority, labels
-- repo, workspace path, branch name, assignee
-- blockers, links, comments, attachments
-- optional source provenance for imported data
+- `powder-core` defines cards, runs, activity, links, comments, ready
+  eligibility, expiring claims, completion proof, and markdown backlog parsing.
+- `powder-cli` can dry-run imports and list ready cards from synthetic fixture
+  data.
+- `powder-mcp` exposes `list_ready`, `claim_card`, `update_status`, `add_link`,
+  `request_input`, and `complete_card` over stdio using the same domain model.
+- `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
+  and first-run onboarding state.
+- Docker, Fly, Litestream, and env examples follow the Canary-style
+  self-hosted deployment pattern.
 
-### Run
-
-A session against one card with:
-
-- state: pending, active, awaiting input, error, complete, stale
-- agent, model, claim lock, claim expiry
-- turn count, token counts, consecutive failures, last error
-- result and proof links
-
-### Activity
-
-An append-only timeline for a run:
-
-- thought, action, response, elicitation, error, prompt
-- payload and creation time
-
-### Link and Comment
-
-Supporting context and operator communication. Links carry proof, PRs, CI,
-artifacts, docs, or external references. Comments carry human/agent context but
-do not drive scheduling by themselves.
-
-## Architecture
-
-Powder follows a functional-core / imperative-shell split:
-
-- `powder-core`: pure domain types, validation, status transitions, ready-card
-  eligibility, claim invariants, importer parsing, and completion rules.
-- `powder-shell`: filesystem and future persistence ports.
-- `powder-server`: the single deployable HTTP app and onboarding/health surface.
-- `powder-api`: HTTP route vocabulary.
-- `powder-cli`: local/operator commands and import dry-runs.
-- `powder-mcp`: intent-shaped tools for agent orchestrators.
-- `SKILL.md`: progressive-disclosure instructions for agents using Powder.
-
-The eventual persistence layer should be SQLite-backed and single-writer, with
-Litestream replication in self-hosted deployments. The repo should include
-fixtures and sample data only when they are synthetic tests, never real operator
-backlog data.
-
-## v0 Scope
-
-The v0 product should:
-
-- serve one deployable HTTP app with `/healthz`, `/readyz`, and onboarding state
-- store cards, runs, activities, links, comments, and claims in SQLite
-- import user-supplied `backlog.d/*.md` tickets into the instance database
-- answer the `ready` query
-- claim and release cards with expiring locks
-- update card/run status through allowed transitions
-- append run activity
-- attach proof/reference links to cards
-- request operator input by moving a run to `awaiting_input`
-- complete a card only with a proof payload
-- expose the same capabilities through CLI and MCP tools
+The important gap is persistence: the board rules exist in memory today. The
+next durable milestone is a SQLite store, migrations, auth enforcement, and
+import into the instance database rather than fixture-backed memory.
 
 ## Non-Goals
 
-- No personal or operator backlog data in this public repo.
-- No dispatch daemon in the core.
-- No migration from Gradient or Hermes `kanban.db`.
-- No feature-parity project-management UI before the agent contract is solid.
-- No one-to-one REST-to-MCP wrapper dump.
+- No real operator backlog, run, claim, or activity data in this repository.
+- No dispatch daemon inside `powder-core`.
+- No hidden dependency on Gradient, Hermes, or any one operator's `kanban.db`.
+- No one-to-one REST-to-MCP wrapper dump that obscures agent intent.
 - No hosted multi-tenant SaaS assumption in the product core.
-
-## GitHub Remote
-
-Target remote: `misty-step/powder`.
-
-Status: created and made public on 2026-07-01. The application repository is
-public; individual deployments and their SQLite databases are private instance
-state.
+- No feature-parity Linear clone before the agent-first contract is solid.
 
 ## Excellent In 6-12 Months
 
-Powder is the obvious self-hosted work substrate for agentic software teams.
-Agents consume it through MCP and skills, humans inspect it through a thin
-control surface, and each deployment can import existing backlog markdown into
-claimable, auditable work without leaking private backlog data into the product
-repository.
+Powder is the obvious self-hosted work ledger for agentic software teams. A new
+operator can deploy it on Fly, mount SQLite storage, choose tailnet or shared
+secret auth, complete first-run onboarding, import their own backlog markdown,
+and let agents safely ask:
+
+> What is ready, can I claim it, what context matters, and what proof do I need
+> to finish?
+
+Humans inspect the same state agents use. Each run leaves a durable trail.
+Private backlog data stays in the deployment that owns it.

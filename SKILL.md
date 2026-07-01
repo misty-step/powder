@@ -13,7 +13,8 @@ argument-hint: "[list-ready|claim|update-status|request-input|complete-card]"
 Powder is a self-hostable work tool. It exposes one core through API, CLI, MCP,
 and this skill. Treat cards as context objects with acceptance oracles, not
 status rows. Real card data belongs in a deployed instance database, not in the
-product repository.
+product repository. Read `VISION.md` before changing Powder's product scope,
+card/run model, runner boundary, or self-hosting assumptions.
 
 ## Operating Contract
 
@@ -41,8 +42,6 @@ cargo test --workspace
 
 ## Red Lines
 
-- Do not create or push the `misty-step/powder` GitHub remote without operator
-  approval.
 - Do not import from Gradient or Hermes `kanban.db`.
 - Do not add personal or operator backlog data to the Powder repository.
 - Do not treat exit zero as completion without proof.

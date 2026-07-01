@@ -6,6 +6,8 @@ human-in-loop pauses.
 
 The repo ships the application. A deployment owns the data.
 
+Read the project direction in [`VISION.md`](VISION.md).
+
 The first milestone is intentionally small:
 
 - `powder-core`: pure domain vocabulary and scheduling rules.

@@ -4,6 +4,9 @@ Powder is a Rust-first, public, self-hostable agent work application. It is the
 tool people deploy to host their own backlog data; it is not a repository that
 stores the operator's backlog.
 
+Read `VISION.md` before changing product scope, the card/run model, the runner
+boundary, or the self-hosting/deployment shape.
+
 ## Architecture
 
 - `powder-core` owns domain rules and imports no adapter, shell, runtime, DB,
