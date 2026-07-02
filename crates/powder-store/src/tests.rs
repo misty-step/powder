@@ -130,6 +130,53 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
 }
 
 #[test]
+fn blockers_resolve_against_terminality_not_mere_presence() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let blocker_id = CardId::new("blocker-a")?;
+    let blocked_id = CardId::new("blocked-b")?;
+    let mut blocked = ready_card("blocked-b", 10);
+    blocked.blocked_by.push(blocker_id.clone());
+    store.import_cards(vec![ready_card("blocker-a", 5), blocked])?;
+
+    // the blocker is still non-terminal (Ready): B is neither listed as
+    // ready nor claimable, exactly like before this fix.
+    let ready = store.list_ready(ReadyQuery::new(20, 10))?;
+    assert!(!ready.iter().any(|card| card.id == blocked_id));
+    let claim_while_blocked =
+        store.claim_card(&blocked_id, "agent-a", 20, 60, &Authority::unchecked());
+    assert!(matches!(claim_while_blocked, Err(StoreError::Domain(_))));
+
+    // the blocker reaches a terminal status -- B becomes ready and
+    // claimable immediately, with no edit to blocked_by.
+    store.update_status(
+        &blocker_id,
+        CardStatus::Abandoned,
+        30,
+        &Authority::unchecked(),
+    )?;
+
+    let ready = store.list_ready(ReadyQuery::new(40, 10))?;
+    assert!(ready.iter().any(|card| card.id == blocked_id));
+    let claim = store.claim_card(&blocked_id, "agent-a", 40, 60, &Authority::unchecked())?;
+    assert_eq!(claim.agent, "agent-a");
+
+    // an unresolvable blocker (never imported) fails closed -- it never
+    // silently unblocks the card that references it.
+    let mut phantom_blocked = ready_card("phantom-blocked", 50);
+    phantom_blocked
+        .blocked_by
+        .push(CardId::new("does-not-exist")?);
+    store.import_cards(vec![phantom_blocked])?;
+    let ready = store.list_ready(ReadyQuery::new(60, 10))?;
+    assert!(!ready
+        .iter()
+        .any(|card| card.id.as_str() == "phantom-blocked"));
+    Ok(())
+}
+
+#[test]
 fn bootstrap_seed_only_discloses_once() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

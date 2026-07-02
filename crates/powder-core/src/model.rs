@@ -449,8 +449,17 @@ impl Card {
         self
     }
 
-    pub fn is_ready_at(&self, now: i64) -> bool {
-        if self.acceptance.is_empty() || !self.blocked_by.is_empty() {
+    /// `blocker_is_terminal` answers, for one blocker id, whether that
+    /// blocker has reached a terminal status (done/shipped/abandoned) --
+    /// the caller supplies this because a `Card` has no access to other
+    /// cards. A card is blocked only while at least one entry in
+    /// `blocked_by` is *not yet* terminal; once every blocker resolves, the
+    /// card is eligible again with no edit to `blocked_by` required.
+    pub fn is_ready_at(&self, now: i64, blocker_is_terminal: impl Fn(&CardId) -> bool) -> bool {
+        if self.acceptance.is_empty() {
+            return false;
+        }
+        if self.blocked_by.iter().any(|id| !blocker_is_terminal(id)) {
             return false;
         }
 
@@ -467,8 +476,12 @@ impl Card {
         }
     }
 
-    pub fn can_be_claimed_at(&self, now: i64) -> bool {
-        self.is_ready_at(now)
+    pub fn can_be_claimed_at(
+        &self,
+        now: i64,
+        blocker_is_terminal: impl Fn(&CardId) -> bool,
+    ) -> bool {
+        self.is_ready_at(now, blocker_is_terminal)
     }
 
     pub fn active_claim_for_agent(&self, agent: &str, now: i64) -> Option<&Claim> {
@@ -518,6 +531,7 @@ impl Card {
         run_id: RunId,
         now: i64,
         ttl_seconds: u64,
+        blocker_is_terminal: impl Fn(&CardId) -> bool,
     ) -> Result<Claim, DomainError> {
         let agent = non_empty("agent", agent.into())?;
         validate_ttl(ttl_seconds)?;
@@ -531,7 +545,7 @@ impl Card {
             }
         }
 
-        if !self.can_be_claimed_at(now) {
+        if !self.can_be_claimed_at(now, blocker_is_terminal) {
             return Err(DomainError::conflict(format!(
                 "card {} is not ready to claim",
                 self.id

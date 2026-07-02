@@ -164,7 +164,10 @@ mod tests {
             card.acceptance.is_empty(),
             "acceptance must never be fabricated for an imported issue"
         );
-        assert!(!card.is_ready_at(10), "no acceptance means never ready");
+        assert!(
+            !card.is_ready_at(10, |_| true),
+            "no acceptance means never ready"
+        );
         assert!(card.source.unwrap().digest.starts_with("sha256:"));
     }
 
