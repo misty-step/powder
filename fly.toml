@@ -25,6 +25,12 @@ kill_timeout = "30s"
   POWDER_AUTH_MODE = "api-key"
   POWDER_PUBLIC_BASE_URL = "http://powder.internal:4000"
   POWDER_DISCLOSE_BOOTSTRAP_KEY = "false"
+  # Fail boot loudly if Litestream backup configuration is ever missing or
+  # incomplete, instead of silently running an unreplicated instance (the
+  # entrypoint's default behavior otherwise: a warning on stderr, easy to
+  # miss). The required secrets (BUCKET_NAME, AWS_*) are already deployed;
+  # see docs/litestream-restore-drill.md for the restore proof and drill.
+  POWDER_REQUIRE_LITESTREAM = "1"
   PORT = "4000"
 
 # Flycast-only ingress: deliberately no http_service stanza, since that is
