@@ -13,7 +13,7 @@ deployed instance rather than local-only database files.
 - [x] A private ingress smoke test reaches health/readiness and an authenticated agent route from the operator network.
 - [x] Unauthenticated onboarding/health exposure is reviewed and either minimized or explicitly documented as safe.
 - [x] MCP works against the deployed instance through an HTTP or hosted MCP transport; it no longer silently falls back to evaporating in-memory state for real work.
-- [ ] Litestream restore and required-backup behavior are documented and tested for the deployment profile.
+- [x] Litestream restore and required-backup behavior are documented and tested for the deployment profile.
 
 ## Children
 - Add private-ingress checks around the deploy profile.
@@ -89,3 +89,23 @@ deployed instance rather than local-only database files.
   (proving the by-design contract didn't regress) and that none of their
   response bodies contain `db_path` or the actual configured path. 92
   workspace tests green (fmt/clippy/test).
+- 2026-07-02 slice (overnight autonomous): closed the Litestream oracle
+  item. Added `POWDER_REQUIRE_LITESTREAM = "1"` to `fly.toml` (the required
+  secrets -- `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` --
+  are already deployed): a mis-secreted future deploy now refuses to boot
+  instead of silently running unreplicated with only a warning on stderr,
+  the gap the original groom teardown flagged. `docs/litestream-restore-drill.md`
+  documents what's replicated, the required-backup enforcement, the
+  automatic on-boot restore path, and a non-destructive drill procedure
+  (`litestream restore` to a scratch path on the live machine, verified by
+  reading a real card through the restored file with the CLI binary already
+  on the machine, then removed). Ran the drill live against the deployed
+  instance as part of writing the doc: the restored replica contained
+  `mcp-live-proof` (the card created during backlog.d/005's earlier MCP
+  verification session) with its real status and proof intact, confirming
+  the S3 replica is a genuine, current, restorable copy -- not just a file
+  that exists. Locked the config with a new `deploy_contract` assertion
+  that `fly.toml` sets the flag. This closes the last open backlog.d/005
+  oracle item; the epic's oracle is now fully checked.
+  Proof: 92 workspace tests green (fmt/clippy/test), plus the live restore
+  drill transcript in the new doc.
