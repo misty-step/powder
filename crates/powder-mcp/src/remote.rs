@@ -67,6 +67,17 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let limit = args["limit"].as_u64().unwrap_or(20);
             client.get(&format!("/api/v1/cards/ready?limit={limit}"))?["cards"].clone()
         }
+        "list_cards" => {
+            let limit = args["limit"].as_u64().unwrap_or(20);
+            let mut query = format!("limit={limit}");
+            if let Some(status) = args["status"].as_str() {
+                query.push_str(&format!("&status={}", urlencode(status)));
+            }
+            if let Some(repo) = args["repo"].as_str() {
+                query.push_str(&format!("&repo={}", urlencode(repo)));
+            }
+            client.get(&format!("/api/v1/cards?{query}"))?["cards"].clone()
+        }
         "claim_card" => {
             let id = card_id(args, "card_id")?;
             let agent = required_str(args, "agent")?;
@@ -160,6 +171,21 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
 
     let text = serde_json::to_string_pretty(&payload).map_err(to_string)?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
+}
+
+/// Percent-encode a query parameter value. Repo slugs contain `/`, which
+/// must not reach the wire unescaped inside a query string.
+fn urlencode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -304,6 +330,31 @@ mod tests {
         assert_eq!(requests[0].method, "GET");
         assert_eq!(requests[0].path, "/api/v1/cards/ready?limit=5");
         assert_eq!(requests[0].authorization, None);
+    }
+
+    #[test]
+    fn list_cards_sends_get_with_status_and_url_encoded_repo_query() {
+        let (base_url, recorded) =
+            spawn_test_server(vec![(200, json!({"cards": [{"id": "blocked-1"}]}))]);
+        let client = RemoteClient::new(base_url, None);
+
+        let result = call_tool_remote(
+            &client,
+            "list_cards",
+            &json!({"status": "blocked", "repo": "misty-step/example", "limit": 5}),
+        )
+        .unwrap();
+
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("blocked-1"));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
+        );
     }
 
     #[test]

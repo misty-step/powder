@@ -25,6 +25,11 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/api/v1/cards",
+        intent: "list cards by optional status/repo filter, including blocked, review, and done cards list_ready never surfaces",
+    },
+    ApiRoute {
+        method: "GET",
         path: "/api/v1/cards/{id}",
         intent: "read one card with runs, activity, links, comments, and claim state",
     },

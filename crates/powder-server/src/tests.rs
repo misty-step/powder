@@ -87,6 +87,106 @@ async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
 }
 
 #[tokio::test]
+async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let blocked = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::OK);
+
+    let ticket = "# Done in another repo\n\nPriority: P0 | Status: done\n\n## Goal\nG.\n\n## Oracle\n- [x] g\n";
+    let imported = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&raw_key),
+            &json!({
+                "files": [{"path": "001-done.md", "contents": ticket}],
+                "repo": "misty-step/other",
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::OK);
+
+    let ids_from = |value: &serde_json::Value| -> Vec<String> {
+        value["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let all = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(all.status(), StatusCode::OK);
+    let all_ids = ids_from(&response_json(all).await);
+    assert!(all_ids.contains(&"blocked-1".to_string()));
+    assert!(all_ids.contains(&"other-001".to_string()));
+
+    let blocked_only = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?status=blocked",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_from(&response_json(blocked_only).await),
+        vec!["blocked-1".to_string()]
+    );
+
+    let other_repo = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?repo=misty-step/other",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_from(&response_json(other_repo).await),
+        vec!["other-001".to_string()]
+    );
+
+    let invalid_status = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?status=not-a-real-status",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

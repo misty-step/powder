@@ -43,6 +43,8 @@ must never silently evaporate on process exit.
 ## Expected MCP Tools
 
 - `list_ready`: return claimable cards sorted by priority, age, and identifier.
+- `list_cards`: enumerate cards by optional status/repo filter, including
+  `blocked`, `review`, and `done` cards `list_ready` never surfaces.
 - `claim_card`: acquire an expiring lock for one card and open a run.
 - `release_claim`: clear an active claim by run id and make the card ready.
 - `renew_claim`: extend an active claim lease by run id.

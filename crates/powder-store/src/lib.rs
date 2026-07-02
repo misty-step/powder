@@ -53,6 +53,14 @@ pub struct Store {
     connection: Connection,
 }
 
+/// Filter for [`Store::list_cards`]: `None` on either field means
+/// unfiltered on that dimension.
+#[derive(Debug, Clone, Default)]
+pub struct CardFilter {
+    pub status: Option<CardStatus>,
+    pub repo: Option<String>,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -213,6 +221,41 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
         });
         cards.truncate(query.limit);
+        Ok(cards)
+    }
+
+    /// List cards by optional `status`/`repo` filter, not just ready-eligible
+    /// ones -- `list_ready` answers "what can an agent claim now"; this
+    /// answers "what exists," including `blocked`, `review`, and `done`
+    /// cards no other surface can enumerate without opening the database
+    /// file directly. Same sort as `list_ready` (priority, age, id).
+    pub fn list_cards(&self, filter: &CardFilter, limit: usize) -> Result<Vec<Card>> {
+        let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
+        let records = statement
+            .query_map([], CardRecord::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut cards = records
+            .into_iter()
+            .map(CardRecord::into_card)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|card| filter.status.map(|s| card.status == s).unwrap_or(true))
+            .filter(|card| {
+                filter
+                    .repo
+                    .as_deref()
+                    .map(|repo| card.repo.as_deref() == Some(repo))
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+
+        cards.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        cards.truncate(limit.max(1));
         Ok(cards)
     }
 
