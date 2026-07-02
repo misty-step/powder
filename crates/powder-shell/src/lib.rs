@@ -103,6 +103,30 @@ pub fn load_backlog_dir(path: impl AsRef<Path>, now: i64) -> ShellResult<Vec<Car
     Ok(cards)
 }
 
+/// Load one repo's backlog.d for a multi-repo import: cards are tagged with
+/// `repo` and their id is namespaced `{repo-slug}-{original-id}` so cards
+/// from independently numbered repos (every repo's backlog.d starts its own
+/// `001-*.md`) can share one Powder instance without id collisions.
+/// `repo` is the full slug (e.g. `misty-step/bitterblossom`); only the part
+/// after the last `/` is used as the id prefix.
+pub fn load_backlog_dir_for_repo(
+    path: impl AsRef<Path>,
+    repo: &str,
+    now: i64,
+) -> ShellResult<Vec<Card>> {
+    let id_prefix = repo.rsplit('/').next().filter(|part| !part.is_empty());
+    let Some(id_prefix) = id_prefix else {
+        return Err(ShellError::Invalid(format!("invalid repo slug: {repo}")));
+    };
+
+    let mut cards = load_backlog_dir(path, now)?;
+    for card in &mut cards {
+        card.id = CardId::new(format!("{id_prefix}-{}", card.id)).map_err(ShellError::from)?;
+        card.repo = Some(repo.to_string());
+    }
+    Ok(cards)
+}
+
 fn markdown_files(path: &Path) -> ShellResult<Vec<PathBuf>> {
     if !path.exists() {
         return Err(ShellError::NotFound(format!(
@@ -137,5 +161,34 @@ mod tests {
     #[test]
     fn unix_now_is_positive() {
         assert!(unix_now() > 0);
+    }
+
+    #[test]
+    fn load_backlog_dir_for_repo_namespaces_ids_and_tags_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "powder-shell-repo-import-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("001-example.md"),
+            "# Example ticket\n\nPriority: P1 | Status: ready\n\n## Goal\nDo it.\n\n## Oracle\n- [ ] done\n",
+        )
+        .unwrap();
+
+        let cards = load_backlog_dir_for_repo(&dir, "misty-step/bitterblossom", 10).unwrap();
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id.as_str(), "bitterblossom-001");
+        assert_eq!(cards[0].repo.as_deref(), Some("misty-step/bitterblossom"));
+    }
+
+    #[test]
+    fn load_backlog_dir_for_repo_rejects_a_trailing_slash_slug() {
+        let err = load_backlog_dir_for_repo("backlog.d", "misty-step/", 10).unwrap_err();
+        assert!(matches!(err, ShellError::Invalid(_)));
     }
 }

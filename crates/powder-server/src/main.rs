@@ -168,6 +168,7 @@ struct ReadyParams {
 #[derive(Debug, Deserialize)]
 struct ImportRequest {
     path: String,
+    dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -354,8 +355,12 @@ async fn import_cards(
     let now = unix_now();
     let cards = load_backlog_dir(&request.path, now)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let count = lock_store(&state)?.import_cards(cards)?;
-    Ok(Json(json!({ "imported": count })))
+    let outcome = if request.dry_run.unwrap_or(false) {
+        lock_store(&state)?.preview_import(&cards)?
+    } else {
+        lock_store(&state)?.import_cards(cards)?
+    };
+    Ok(Json(json!(outcome)))
 }
 
 async fn get_card(

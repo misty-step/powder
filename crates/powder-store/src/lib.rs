@@ -122,16 +122,45 @@ impl Store {
             .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?)
     }
 
-    pub fn import_cards(&mut self, cards: Vec<Card>) -> Result<usize> {
-        let count = cards.len();
+    /// Import backlog.d cards without clobbering live lifecycle state: a
+    /// card that is claimed, running, awaiting input, or already at a
+    /// terminal outcome keeps its stored status/claim, while its content
+    /// (title, body, acceptance, labels, source digest, ...) still refreshes
+    /// from the freshly parsed file. See [`Card::merge_reimport`].
+    pub fn import_cards(&mut self, cards: Vec<Card>) -> Result<ImportOutcome> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for card in cards {
-            persist_card(&transaction, &card)?;
+        let mut outcome = ImportOutcome::default();
+        for incoming in cards {
+            match load_card_optional(&transaction, &incoming.id)? {
+                None => {
+                    persist_card(&transaction, &incoming)?;
+                    outcome.created += 1;
+                }
+                Some(current) => {
+                    let class = classify_reimport(&current, &incoming);
+                    persist_card(&transaction, &current.merge_reimport(incoming))?;
+                    outcome.record(class);
+                }
+            }
         }
         transaction.commit()?;
-        Ok(count)
+        Ok(outcome)
+    }
+
+    /// Compute what [`Store::import_cards`] would do to `cards` without
+    /// writing anything, so a caller can show a create/update/preserve/
+    /// unchanged report before committing to the import.
+    pub fn preview_import(&self, cards: &[Card]) -> Result<ImportOutcome> {
+        let mut outcome = ImportOutcome::default();
+        for incoming in cards {
+            match load_card_optional(&self.connection, &incoming.id)? {
+                None => outcome.created += 1,
+                Some(current) => outcome.record(classify_reimport(&current, incoming)),
+            }
+        }
+        Ok(outcome)
     }
 
     pub fn upsert_card(&mut self, card: Card) -> Result<Card> {
@@ -662,6 +691,63 @@ fn load_card(connection: &Connection, card_id: &CardId) -> Result<Card> {
         .optional()?
         .ok_or_else(|| DomainError::not_found("card", card_id.to_string()).into())
         .and_then(CardRecord::into_card)
+}
+
+fn load_card_optional(connection: &Connection, card_id: &CardId) -> Result<Option<Card>> {
+    connection
+        .query_row(CARD_SELECT_SQL, [card_id.as_str()], CardRecord::from_row)
+        .optional()?
+        .map(CardRecord::into_card)
+        .transpose()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReimportClass {
+    Preserved,
+    Updated,
+    Unchanged,
+}
+
+fn classify_reimport(current: &Card, incoming: &Card) -> ReimportClass {
+    if current.protects_lifecycle_on_reimport() {
+        return ReimportClass::Preserved;
+    }
+    let current_digest = current.source.as_ref().map(|source| source.digest.as_str());
+    let incoming_digest = incoming
+        .source
+        .as_ref()
+        .map(|source| source.digest.as_str());
+    if current_digest == incoming_digest {
+        ReimportClass::Unchanged
+    } else {
+        ReimportClass::Updated
+    }
+}
+
+/// Counts of what a backlog.d import did (or, from
+/// [`Store::preview_import`], would do) to each card: newly created, content
+/// refreshed, lifecycle preserved against a stale reimport, or left
+/// untouched because the source file hasn't changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ImportOutcome {
+    pub created: usize,
+    pub updated: usize,
+    pub preserved: usize,
+    pub unchanged: usize,
+}
+
+impl ImportOutcome {
+    pub fn total(&self) -> usize {
+        self.created + self.updated + self.preserved + self.unchanged
+    }
+
+    fn record(&mut self, class: ReimportClass) {
+        match class {
+            ReimportClass::Preserved => self.preserved += 1,
+            ReimportClass::Updated => self.updated += 1,
+            ReimportClass::Unchanged => self.unchanged += 1,
+        }
+    }
 }
 
 fn to_json(value: &impl Serialize) -> Result<String> {
