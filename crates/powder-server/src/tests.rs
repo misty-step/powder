@@ -187,6 +187,123 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
 }
 
 #[tokio::test]
+async fn board_shell_serves_from_root_and_board_without_auth() {
+    let (state, _) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let root = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::OK);
+    assert!(root
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    let root = response_text(root).await;
+    assert!(root.contains(r#"id="powder-board-app""#));
+    assert!(root.contains("/assets/powder-board.js"));
+
+    let board = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/board")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(board.status(), StatusCode::OK);
+    assert_eq!(response_text(board).await, root);
+}
+
+#[tokio::test]
+async fn board_assets_are_served_with_specific_content_types() {
+    let (state, _) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let aesthetic = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/assets/aesthetic.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(aesthetic.status(), StatusCode::OK);
+    assert!(aesthetic
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/css"));
+    assert!(response_text(aesthetic).await.contains("aesthetic v2.8.1"));
+
+    let script = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/assets/powder-board.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(script.status(), StatusCode::OK);
+    assert!(script
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/javascript"));
+    assert!(response_text(script).await.contains("const CARD_STATUSES"));
+}
+
+#[tokio::test]
+async fn api_routes_are_not_shadowed_by_the_board_shell() {
+    let (state, _) = test_state(AuthMode::None);
+    let app = app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/onboarding")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("application/json"));
+    let body = response_json(response).await;
+    assert_eq!(body["auth_mode"], "none");
+}
+
+#[tokio::test]
 async fn add_comment_appears_in_get_card_immediately() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -1200,4 +1317,9 @@ fn json_request(method: Method, uri: &str, raw_key: Option<&str>, body: &str) ->
 async fn response_json(response: Response) -> serde_json::Value {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn response_text(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
 }

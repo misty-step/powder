@@ -10,7 +10,10 @@ use std::{
 
 use axum::{
     extract::{Path, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, StatusCode,
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -305,6 +308,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn app(state: AppState) -> Router {
     Router::new()
+        .route("/", get(board_index))
+        .route("/board", get(board_index))
+        .route("/assets/aesthetic.css", get(aesthetic_css))
+        .route("/assets/powder-board.css", get(board_css))
+        .route("/assets/powder-board.js", get(board_js))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/v1/onboarding", get(onboarding))
@@ -331,6 +339,34 @@ fn app(state: AppState) -> Router {
         // already in use; never touches headers or bodies, so bearer keys
         // and card content never reach the log.
         .layer(TraceLayer::new_for_http())
+}
+
+async fn board_index() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../static/index.html"),
+    )
+}
+
+async fn aesthetic_css() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/assets/aesthetic.css"),
+    )
+}
+
+async fn board_css() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../static/assets/powder-board.css"),
+    )
+}
+
+async fn board_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../static/assets/powder-board.js"),
+    )
 }
 
 async fn healthz() -> Json<Health> {
