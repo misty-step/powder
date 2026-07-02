@@ -15,9 +15,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use powder_core::{Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
+use powder_core::{Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
 use powder_shell::{load_backlog_dir, unix_now};
-use powder_store::{Store, StoreError};
+use powder_store::{ApiKeyScope, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -341,7 +341,7 @@ async fn import_cards(
     headers: HeaderMap,
     Json(request): Json<ImportRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let now = unix_now();
     let cards = load_backlog_dir(&request.path, now)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -367,7 +367,7 @@ async fn create_card(
     headers: HeaderMap,
     Json(request): Json<CreateCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    authorize(&state, &headers)?;
+    require_admin(&state, &headers)?;
     let now = unix_now();
     let status = request
         .status
@@ -401,16 +401,12 @@ async fn claim_card(
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let requested_agent = request.agent.as_deref().unwrap_or(&actor.display_name);
-    if actor.enforces_identity && requested_agent != actor.display_name {
-        return Err(ApiError::forbidden(
-            "claim agent must match authenticated actor",
-        ));
-    }
     let receipt = lock_store(&state)?.claim_card(
         &card_id,
         requested_agent,
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
+        &actor.authority(),
     )?;
     Ok(Json(json!(receipt)))
 }
@@ -421,10 +417,11 @@ async fn release_claim(
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
-    let receipt = lock_store(&state)?.release_claim(&card_id, &run_id, unix_now())?;
+    let receipt =
+        lock_store(&state)?.release_claim(&card_id, &run_id, unix_now(), &actor.authority())?;
     Ok(Json(json!(receipt)))
 }
 
@@ -434,7 +431,7 @@ async fn renew_claim(
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
     let receipt = lock_store(&state)?.renew_claim(
@@ -442,6 +439,7 @@ async fn renew_claim(
         &run_id,
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
+        &actor.authority(),
     )?;
     Ok(Json(json!(receipt)))
 }
@@ -452,10 +450,11 @@ async fn heartbeat_claim(
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
-    let receipt = lock_store(&state)?.heartbeat_claim(&card_id, &run_id, unix_now())?;
+    let receipt =
+        lock_store(&state)?.heartbeat_claim(&card_id, &run_id, unix_now(), &actor.authority())?;
     Ok(Json(json!(receipt)))
 }
 
@@ -465,11 +464,12 @@ async fn update_status(
     Path(id): Path<String>,
     Json(request): Json<StatusRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let status = CardStatus::parse(&request.status)
         .ok_or_else(|| ApiError::bad_request("invalid status"))?;
-    let card = lock_store(&state)?.update_status(&card_id, status, unix_now())?;
+    let card =
+        lock_store(&state)?.update_status(&card_id, status, unix_now(), &actor.authority())?;
     Ok(Json(card))
 }
 
@@ -491,9 +491,14 @@ async fn request_input(
     Path(id): Path<String>,
     Json(request): Json<InputRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let run_id = RunId::new(id)?;
-    let run = lock_store(&state)?.request_input(&run_id, &request.question, unix_now())?;
+    let run = lock_store(&state)?.request_input(
+        &run_id,
+        &request.question,
+        unix_now(),
+        &actor.authority(),
+    )?;
     Ok(Json(json!(run)))
 }
 
@@ -503,10 +508,15 @@ async fn answer_input(
     Path(id): Path<String>,
     Json(request): Json<AnswerRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let run_id = RunId::new(id)?;
-    let run =
-        lock_store(&state)?.answer_input(&run_id, &request.actor, &request.answer, unix_now())?;
+    let run = lock_store(&state)?.answer_input(
+        &run_id,
+        &request.actor,
+        &request.answer,
+        unix_now(),
+        &actor.authority(),
+    )?;
     Ok(Json(json!(run)))
 }
 
@@ -540,9 +550,14 @@ async fn complete_card(
     Path(id): Path<String>,
     Json(request): Json<CompleteRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let card = lock_store(&state)?.complete_card(&card_id, &request.proof, unix_now())?;
+    let card = lock_store(&state)?.complete_card(
+        &card_id,
+        &request.proof,
+        unix_now(),
+        &actor.authority(),
+    )?;
     Ok(Json(card))
 }
 
@@ -550,6 +565,19 @@ async fn complete_card(
 struct AuthorizedActor {
     display_name: String,
     enforces_identity: bool,
+    is_admin: bool,
+}
+
+impl AuthorizedActor {
+    /// Project this HTTP-layer identity into the domain-level `Authority`
+    /// that `Store` mutation methods check claim ownership against.
+    fn authority(&self) -> Authority {
+        if self.enforces_identity {
+            Authority::actor(self.display_name.clone(), self.is_admin)
+        } else {
+            Authority::unchecked()
+        }
+    }
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
@@ -557,12 +585,14 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
         AuthMode::None => Ok(AuthorizedActor {
             display_name: "anonymous".to_string(),
             enforces_identity: false,
+            is_admin: false,
         }),
         AuthMode::TailscaleHeader => {
             if let Some(identity) = trusted_tailnet_identity(headers) {
                 Ok(AuthorizedActor {
                     display_name: identity.to_string(),
                     enforces_identity: true,
+                    is_admin: true,
                 })
             } else {
                 Err(ApiError::unauthorized(
@@ -581,6 +611,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                 Ok(AuthorizedActor {
                     display_name: key.actor.display_name,
                     enforces_identity: true,
+                    is_admin: key.scope == ApiKeyScope::Admin,
                 })
             } else {
                 Err(ApiError::forbidden(
@@ -588,6 +619,19 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                 ))
             }
         }
+    }
+}
+
+/// Gate operator/admin-only routes (card authoring, bulk import) that are
+/// not scoped to any single claim and so cannot be checked via claim
+/// ownership. Agent-scoped API keys are rejected; trusted tailnet callers
+/// and disabled auth pass through.
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
+    let actor = authorize(state, headers)?;
+    if !actor.enforces_identity || actor.is_admin {
+        Ok(actor)
+    } else {
+        Err(ApiError::forbidden("admin scope required"))
     }
 }
 
@@ -691,6 +735,10 @@ impl From<powder_core::DomainError> for ApiError {
             },
             powder_core::DomainError::Conflict(_) => Self {
                 status: StatusCode::CONFLICT,
+                message: value.to_string(),
+            },
+            powder_core::DomainError::Forbidden(_) => Self {
+                status: StatusCode::FORBIDDEN,
                 message: value.to_string(),
             },
         }

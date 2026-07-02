@@ -3,8 +3,8 @@
 use std::{fs, path::Path};
 
 use powder_core::{
-    Activity, ActivityId, ActivityType, Card, CardId, CardSource, CardStatus, Claim, ClaimReceipt,
-    DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
+    Activity, ActivityId, ActivityType, Authority, Card, CardId, CardSource, CardStatus, Claim,
+    ClaimReceipt, DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -184,8 +184,10 @@ impl Store {
         agent: &str,
         now: i64,
         ttl_seconds: u64,
+        authority: &Authority,
     ) -> Result<ClaimReceipt> {
         let agent = non_empty("agent", agent)?;
+        authority.require_identity(&agent)?;
         if ttl_seconds == 0 {
             return Err(DomainError::validation(
                 "ttl_seconds",
@@ -257,11 +259,13 @@ impl Store {
         card_id: &CardId,
         status: CardStatus,
         now: i64,
+        authority: &Authority,
     ) -> Result<Card> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authority.require_holder(card.claim_holder())?;
         let released_claim = card.apply_status(status, now)?;
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
@@ -283,11 +287,13 @@ impl Store {
         card_id: &CardId,
         run_id: &RunId,
         now: i64,
+        authority: &Authority,
     ) -> Result<ClaimReceipt> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authority.require_holder(card.claim_holder())?;
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
@@ -308,11 +314,13 @@ impl Store {
         run_id: &RunId,
         now: i64,
         ttl_seconds: u64,
+        authority: &Authority,
     ) -> Result<ClaimReceipt> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authority.require_holder(card.claim_holder())?;
         let claim = card.renew_claim(run_id, now, ttl_seconds)?;
         persist_card(&transaction, &card)?;
         let updated = transaction.execute(
@@ -340,11 +348,13 @@ impl Store {
         card_id: &CardId,
         run_id: &RunId,
         now: i64,
+        authority: &Authority,
     ) -> Result<ClaimReceipt> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authority.require_holder(card.claim_holder())?;
         let claim = card.heartbeat_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         let updated = transaction.execute(
@@ -392,12 +402,19 @@ impl Store {
         Ok(link)
     }
 
-    pub fn request_input(&mut self, run_id: &RunId, question: &str, now: i64) -> Result<Run> {
+    pub fn request_input(
+        &mut self,
+        run_id: &RunId,
+        question: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<Run> {
         let question = non_empty("question", question)?;
         let mut run = self
             .get_run(run_id)?
             .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?;
         let mut card = load_card(&self.connection, &run.card_id)?;
+        authority.require_holder(card.claim_holder())?;
 
         card.status.validate_transition(CardStatus::AwaitingInput)?;
         card.status = CardStatus::AwaitingInput;
@@ -421,7 +438,13 @@ impl Store {
         Ok(run)
     }
 
-    pub fn complete_card(&mut self, card_id: &CardId, proof: &str, now: i64) -> Result<Card> {
+    pub fn complete_card(
+        &mut self,
+        card_id: &CardId,
+        proof: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<Card> {
         let proof = non_empty("proof", proof)?;
         let transaction = self
             .connection
@@ -445,6 +468,7 @@ impl Store {
             ))
             .into());
         }
+        authority.require_holder(card.claim_holder())?;
 
         let run_id = card
             .claim

@@ -16,6 +16,7 @@ pub enum ShellError {
     Conflict(String),
     Invalid(String),
     Store(String),
+    Forbidden(String),
 }
 
 impl fmt::Display for ShellError {
@@ -24,7 +25,8 @@ impl fmt::Display for ShellError {
             Self::NotFound(message)
             | Self::Conflict(message)
             | Self::Invalid(message)
-            | Self::Store(message) => f.write_str(message),
+            | Self::Store(message)
+            | Self::Forbidden(message) => f.write_str(message),
         }
     }
 }
@@ -37,6 +39,7 @@ impl From<DomainError> for ShellError {
             DomainError::NotFound { .. } => Self::NotFound(value.to_string()),
             DomainError::Conflict(_) => Self::Conflict(value.to_string()),
             DomainError::Validation { .. } => Self::Invalid(value.to_string()),
+            DomainError::Forbidden(_) => Self::Forbidden(value.to_string()),
         }
     }
 }
