@@ -8,6 +8,10 @@ use std::{
 
 use powder_core::{parse_backlog_card, Card, CardId, CardStatus, DomainError};
 
+mod github;
+
+pub use github::{github_issue_to_card, load_github_issues_file, GitHubIssue, GitHubLabel};
+
 pub type ShellResult<T> = Result<T, ShellError>;
 
 #[derive(Debug)]
@@ -134,7 +138,7 @@ pub fn namespace_cards_for_repo(mut cards: Vec<Card>, repo: &str) -> ShellResult
     Ok(cards)
 }
 
-fn validate_repo_slug(repo: &str) -> ShellResult<&str> {
+pub(crate) fn validate_repo_slug(repo: &str) -> ShellResult<&str> {
     repo.rsplit('/')
         .next()
         .filter(|part| !part.is_empty())

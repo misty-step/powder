@@ -10,7 +10,7 @@ rewrite of claims, statuses, runs, or proof.
 ## Oracle
 - [x] Re-importing a backlog file over a claimed or running card preserves claim and runtime state.
 - [x] Digest-aware import reports content drift without clobbering live lifecycle fields.
-- [ ] GitHub issue import maps source URL, title, body, labels, and state without creating personal/operator data in the product repo.
+- [x] GitHub issue import maps source URL, title, body, labels, and state without creating personal/operator data in the product repo.
 - [x] A dry-run report shows create/update/skip/conflict counts before mutation.
 - [x] A synthetic multi-repo fixture proves import ordering and duplicate handling.
 
@@ -19,7 +19,7 @@ rewrite of claims, statuses, runs, or proof.
 - Add digest-aware update semantics.
 - Namespace card ids per repo so eight independently numbered backlog.d directories can share one instance (done — `load_backlog_dir_for_repo` / `powder import-repo`).
 - Add a body-content import request shape so a remote client can push parsed cards to a flycast-only deployed instance instead of only reading a server-local path (done — `POST /api/v1/cards/import` accepts `files`/`repo`).
-- Add GitHub issue source adapter with dry-run mode.
+- Add GitHub issue source adapter with dry-run mode — done, `powder_shell::github` + `powder import-github-issues`.
 - Add a synthetic multi-repo fixture (id collision, claimed card, in-directory duplicate) — done, `crates/powder-cli/tests/multi_repo_import.rs`.
 - Import Factory backlog into the deployed Powder instance after the sync contract is safe.
 
@@ -110,6 +110,43 @@ rewrite of claims, statuses, runs, or proof.
   possibly a follow-up session) and the CLI `--api-base-url` remote-push
   convenience noted in the slice above remain open in this epic.
   90 workspace tests green (fmt/clippy/test).
+- 2026-07-02 slice (overnight autonomous): closed the GitHub issue adapter
+  oracle item — see §5 below for the design. New `powder_shell::github`
+  module (`github_issue_to_card`, `load_github_issues_file`) maps an
+  already-fetched-by-the-operator JSON array of GitHub issues into
+  namespaced, digest-tracked `Card`s; new CLI command
+  `powder import-github-issues <file.json> --repo org/repo --db X
+  [--dry-run]` wires it to the existing `Store::import_cards`/
+  `preview_import`, so it gets reimport-safety, dry-run reporting, and
+  digest-aware drift detection for free -- no new store or HTTP code
+  needed, only a new source of `Vec<Card>`. Deliberately does not talk to
+  the GitHub API itself: no token ever needs to reach powder, and the
+  operator's own `gh issue list --json ... > issues.json` step is the only
+  place credentials or rate limits are a concern. Acceptance is
+  deliberately left empty on import rather than fabricated, so an imported
+  issue stays unclaimable until a real oracle exists for it -- proved live
+  via a CLI test that shows moving an acceptance-less card to `ready`
+  doesn't make it show up in `list-ready`.
+  Proof: 6 new `powder_shell::github` unit tests (open→Backlog with no
+  fabricated acceptance, closed→Done, digest changes on body/state edits,
+  different repos never collide on the same issue number, a real JSON
+  array maps correctly, an invalid repo slug is rejected) and 1 new CLI
+  integration test
+  (`cli_import_github_issues_maps_open_and_closed_issues_and_survives_reimport`)
+  proving: no fabricated acceptance, status-alone doesn't make a card
+  claimable, and reopening a closed issue on GitHub can't revert Powder's
+  `Done` status on reimport (while content like title/body still refreshes,
+  identically to backlog.d reimport). 99 workspace tests green
+  (fmt/clippy/test).
+  This closes all 5 backlog.d/007 oracle items -- the sync contract (fixed
+  reimport, digest-aware drift, dry-run reporting, multi-repo namespacing +
+  fixture, GitHub issues) is now provably safe. What's still open is the
+  epic's last Children item: actually running this against the other eight
+  Factory repos' real backlog.d/issues and importing into the deployed
+  instance -- a separate, larger undertaking (needs live checkouts of
+  those repos, GitHub read access, and likely coordination with the other
+  repos' own lanes) that stays out of scope for an unattended overnight
+  session. Status stays `backlog` until that migration actually runs.
 
 ## Design: importing all nine Factory repos' backlog.d
 
@@ -157,15 +194,24 @@ malformed backlog.d with two `001-*.md` files) resolve last-write-wins
 within the transaction, same as today — worth a fixture case, not a code
 change.
 
-**5. GitHub issue adapter (separate child, still unscoped).** Out of
-scope for this slice. When picked up: map `source` to the issue URL (not a
-local file path — `CardSource.digest` still works over the issue body's
-content hash), `labels` from GitHub labels, `status` from open/closed (+
-maybe a label convention for `ready`/`blocked`), and route through the
-same `Card::merge_reimport` so a closed-then-reopened issue can't clobber
-an in-flight Powder claim either. Needs its own dry-run mode and must not
-create personal/operator data in this repo (per `AGENTS.md`) — the adapter
-lives in powder-shell/powder-store, not a data file committed here.
+**5. Closed: GitHub issue adapter.** `powder_shell::github` maps an
+already-fetched GitHub issue to a `Card`: id `{repo-slug}-{issue-number}`,
+`source` set to the issue's `html_url` (not a local file path — the digest
+is computed over title+body+labels+state instead of file bytes, so it still
+tracks drift), `labels` from GitHub labels, `status` open→`Backlog` /
+closed→`Done`, routed through the existing `Card::merge_reimport` so a
+reopened issue can't revert Powder's `Done` record. Deliberately
+file-based, not a live GitHub API client: an operator runs
+`gh issue list --json number,title,body,labels,state,url --repo org/repo > issues.json`
+themselves (their own credentials, their own rate limits), and
+`powder import-github-issues issues.json --repo org/repo --db X
+[--dry-run]` only maps and imports what's already on disk — no GitHub
+token ever needs to reach powder, no personal/operator issue data is ever
+committed to this repo (the JSON is a local, gitignored-by-convention
+scratch file, same as any `--db` path). Acceptance is deliberately left
+empty on import (GitHub issues don't carry a backlog.d-style Oracle
+section) — an imported issue stays unclaimable until a real oracle is
+added later, rather than fabricating one.
 
 **6. Closed: synthetic multi-repo fixture.**
 `crates/powder-cli/tests/fixtures/multi_repo/{repo-a,repo-b}` +
