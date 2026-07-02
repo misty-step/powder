@@ -145,15 +145,20 @@ fn import(args: &[String]) -> Result<String, ShellError> {
     let cards = load_backlog_dir(path, now)?;
     let mut out = String::new();
 
-    if dry_run {
-        out.push_str(&format!("dry-run\t{}\n", cards.len()));
-    } else {
-        let mut store = open_store(required_flag(args, "--db")?)?;
-        let count = store.import_cards(cards.clone()).map_err(store_err)?;
-        out.push_str(&format!(
-            "imported\t{count}\t{}\n",
-            required_flag(args, "--db")?
-        ));
+    match (dry_run, flag_value(args, "--db")) {
+        (true, None) => {
+            out.push_str(&format!("dry-run\t{}\n", cards.len()));
+        }
+        (true, Some(db)) => {
+            let store = open_store(db)?;
+            let outcome = store.preview_import(&cards).map_err(store_err)?;
+            out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
+        }
+        (false, _) => {
+            let mut store = open_store(required_flag(args, "--db")?)?;
+            let outcome = store.import_cards(cards.clone()).map_err(store_err)?;
+            out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
+        }
     }
 
     for card in cards {
@@ -166,6 +171,17 @@ fn import(args: &[String]) -> Result<String, ShellError> {
         ));
     }
     Ok(out)
+}
+
+fn outcome_line(outcome: &powder_store::ImportOutcome) -> String {
+    format!(
+        "total={}\tcreated={}\tupdated={}\tpreserved={}\tunchanged={}",
+        outcome.total(),
+        outcome.created,
+        outcome.updated,
+        outcome.preserved,
+        outcome.unchanged
+    )
 }
 
 fn create_card(args: &[String]) -> Result<String, ShellError> {
@@ -649,6 +665,61 @@ mod tests {
         .unwrap();
 
         assert!(completed.contains("completed\tcli-test\tdone"));
+    }
+
+    #[test]
+    fn cli_reimport_over_a_claimed_card_preserves_the_claim() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db = std::env::temp_dir().join(format!("powder-cli-import-{nanos}.db"));
+        let db = db.to_string_lossy().to_string();
+        let backlog_dir = std::env::temp_dir().join(format!("powder-cli-import-backlog-{nanos}"));
+        std::fs::create_dir_all(&backlog_dir).unwrap();
+        let ticket_path = backlog_dir.join("001-reimport-test.md");
+        let ticket = "# Reimport test\n\nPriority: P0 | Status: ready\n\n## Goal\nProve reimport safety.\n\n## Oracle\n- [ ] reimport preserves an active claim\n";
+        std::fs::write(&ticket_path, ticket).unwrap();
+        let backlog_dir = backlog_dir.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+
+        let first_import = run(&args(["import", &backlog_dir, "--db", &db])).unwrap();
+        assert!(first_import
+            .contains("imported\ttotal=1\tcreated=1\tupdated=0\tpreserved=0\tunchanged=0"));
+
+        run(&args(["claim", "001", "--db", &db, "--agent", "codex"])).unwrap();
+        run(&args([
+            "update-status",
+            "001",
+            "--db",
+            &db,
+            "--status",
+            "running",
+        ]))
+        .unwrap();
+
+        // re-importing the exact same, unedited backlog.d file must not
+        // clobber the active claim/status.
+        let second_import = run(&args(["import", &backlog_dir, "--db", &db])).unwrap();
+        assert!(second_import
+            .contains("imported\ttotal=1\tcreated=0\tupdated=0\tpreserved=1\tunchanged=0"));
+
+        let card = run(&args(["get-card", "001", "--db", &db])).unwrap();
+        assert!(card.contains("\"status\": \"running\""));
+        assert!(card.contains("\"agent\": \"codex\""));
+
+        // a dry-run against the same --db reports what would happen without
+        // mutating anything.
+        let dry_run = run(&args(["import", &backlog_dir, "--db", &db, "--dry-run"])).unwrap();
+        assert!(
+            dry_run.contains("dry-run\ttotal=1\tcreated=0\tupdated=0\tpreserved=1\tunchanged=0")
+        );
+        let card_after_dry_run = run(&args(["get-card", "001", "--db", &db])).unwrap();
+        assert_eq!(
+            card, card_after_dry_run,
+            "dry-run must not mutate the store"
+        );
     }
 
     #[test]

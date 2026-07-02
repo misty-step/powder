@@ -1,8 +1,8 @@
 use powder_core::{
-    Authority, Card, CardId, CardStatus, DomainError, Priority, ReadyQuery, RunState,
+    Authority, Card, CardId, CardSource, CardStatus, DomainError, Priority, ReadyQuery, RunState,
 };
 
-use crate::{ApiKeyScope, Result, Store, StoreError, API_KEY_ALPHABET};
+use crate::{ApiKeyScope, ImportOutcome, Result, Store, StoreError, API_KEY_ALPHABET};
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -647,5 +647,199 @@ fn answer_input_rejects_actor_impersonation() -> Result<()> {
         &Authority::actor("codex", false),
     )?;
     assert_eq!(answered.state, RunState::Active);
+    Ok(())
+}
+
+fn backlog_card(id: &str, created_at: i64, digest: &str) -> Card {
+    let mut card = ready_card(id, created_at);
+    card.source = Some(CardSource {
+        path: format!("backlog.d/{id}-test.md"),
+        digest: digest.to_string(),
+    });
+    card
+}
+
+#[test]
+fn reimport_over_a_claimed_card_preserves_claim_and_status() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    let claim = store.claim_card(
+        &card_id,
+        "agent-a",
+        10,
+        3600,
+        &Authority::actor("agent-a", false),
+    )?;
+    store.update_status(
+        &card_id,
+        CardStatus::Running,
+        11,
+        &Authority::actor("agent-a", false),
+    )?;
+
+    // a stale reimport of the same backlog.d file (still says "ready", no
+    // claim) must not clobber the live claim or status.
+    let outcome = store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::Running);
+    assert_eq!(
+        card.claim.as_ref().map(|claim| claim.agent.as_str()),
+        Some("agent-a")
+    );
+    assert_eq!(card.claim.as_ref().map(|c| &c.run_id), Some(&claim.run_id));
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            preserved: 1,
+            ..Default::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn reimport_over_a_terminal_card_keeps_its_outcome() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.complete_card(
+        &card_id,
+        "https://example.test/proof",
+        12,
+        &Authority::unchecked(),
+    )?;
+
+    let outcome = store.import_cards(vec![backlog_card("001", 2, "sha256:v2-edited")])?;
+
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::Done, "shipped work stays shipped");
+    assert!(card.claim.is_none());
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            preserved: 1,
+            ..Default::default()
+        }
+    );
+    let run = store.get_run(&claim.run_id)?.expect("run");
+    assert_eq!(run.state, RunState::Complete);
+    Ok(())
+}
+
+#[test]
+fn reimport_over_a_quiescent_card_refreshes_content_and_status() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+
+    let mut edited = backlog_card("001", 999, "sha256:v2-edited");
+    edited.status = CardStatus::Blocked;
+    edited.title = "Edited title".to_string();
+    let outcome = store.import_cards(vec![edited])?;
+
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(
+        card.status,
+        CardStatus::Blocked,
+        "no one owns it, safe to refresh"
+    );
+    assert_eq!(card.title, "Edited title");
+    assert_eq!(card.created_at, 2, "created_at is never reset by reimport");
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            updated: 1,
+            ..Default::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn reimport_with_no_content_change_is_reported_unchanged() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+
+    let outcome = store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            unchanged: 1,
+            ..Default::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn import_reports_create_update_preserve_and_unchanged_together() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        backlog_card("001", 1, "sha256:v1"), // will stay unchanged
+        backlog_card("002", 1, "sha256:v1"), // will be edited
+        backlog_card("003", 1, "sha256:v1"), // will be claimed then reimported
+    ])?;
+    store.claim_card(
+        &CardId::new("003")?,
+        "agent-a",
+        5,
+        3600,
+        &Authority::unchecked(),
+    )?;
+
+    let mut edited_002 = backlog_card("002", 1, "sha256:v2");
+    edited_002.title = "Edited".to_string();
+    let outcome = store.import_cards(vec![
+        backlog_card("001", 1, "sha256:v1"),
+        edited_002,
+        backlog_card("003", 1, "sha256:v1"),
+        backlog_card("004", 1, "sha256:v1"),
+    ])?;
+
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            created: 1,
+            updated: 1,
+            preserved: 1,
+            unchanged: 1,
+        }
+    );
+    assert_eq!(outcome.total(), 4);
+    Ok(())
+}
+
+#[test]
+fn preview_import_reports_without_mutating_the_store() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+
+    let preview = store.preview_import(&[backlog_card("001", 2, "sha256:v2-edited")])?;
+    assert_eq!(
+        preview,
+        ImportOutcome {
+            preserved: 1,
+            ..Default::default()
+        }
+    );
+
+    // preview must not have written anything.
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::Running);
+    assert!(card.claim.is_some());
     Ok(())
 }

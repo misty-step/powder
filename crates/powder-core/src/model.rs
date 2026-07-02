@@ -483,6 +483,35 @@ impl Card {
         self.claim.as_ref().map(|claim| claim.agent.as_str())
     }
 
+    /// Whether this card's lifecycle (status + claim) must survive a
+    /// backlog.d reimport: an active claim, a claimed/running/awaiting-input
+    /// status, or a terminal outcome. A backlog/ready/blocked card with no
+    /// claim has no live lifecycle to protect, so a reimport may refresh its
+    /// status along with its content.
+    pub fn protects_lifecycle_on_reimport(&self) -> bool {
+        self.claim.is_some()
+            || matches!(
+                self.status,
+                CardStatus::Claimed | CardStatus::Running | CardStatus::AwaitingInput
+            )
+            || self.status.is_terminal()
+    }
+
+    /// Merge freshly parsed backlog.d content (`incoming`) onto this card's
+    /// stored state: `created_at` always survives, and when
+    /// [`protects_lifecycle_on_reimport`](Self::protects_lifecycle_on_reimport)
+    /// is true, this card's live `status`/`claim` survive too instead of
+    /// being clobbered by the source file's (necessarily claim-less) values.
+    pub fn merge_reimport(&self, incoming: Card) -> Card {
+        let mut merged = incoming;
+        if self.protects_lifecycle_on_reimport() {
+            merged.status = self.status;
+            merged.claim = self.claim.clone();
+        }
+        merged.created_at = self.created_at;
+        merged
+    }
+
     pub fn apply_claim(
         &mut self,
         agent: impl Into<String>,
@@ -703,4 +732,77 @@ fn validate_claim_run(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(id: &str, status: CardStatus) -> Card {
+        Card::new(CardId::new(id).unwrap(), "Title", "body")
+            .unwrap()
+            .with_status(status)
+            .with_created_at(10)
+    }
+
+    fn fresh_reimport(id: &str) -> Card {
+        Card::new(
+            CardId::new(id).unwrap(),
+            "Refreshed title",
+            "refreshed body",
+        )
+        .unwrap()
+        .with_status(CardStatus::Ready)
+        .with_created_at(999)
+    }
+
+    #[test]
+    fn quiescent_card_takes_the_reimported_content_and_status() {
+        let current = card("001", CardStatus::Blocked);
+        let merged = current.merge_reimport(fresh_reimport("001"));
+
+        assert_eq!(merged.status, CardStatus::Ready);
+        assert_eq!(merged.title, "Refreshed title");
+        assert_eq!(merged.created_at, 10, "created_at survives reimport");
+    }
+
+    #[test]
+    fn claimed_card_keeps_status_and_claim_across_reimport() {
+        let mut current = card("001", CardStatus::Running);
+        current.claim = Some(Claim {
+            agent: "agent-a".to_string(),
+            run_id: RunId::new("run-1").unwrap(),
+            acquired_at: 5,
+            expires_at: 100,
+        });
+
+        let merged = current.merge_reimport(fresh_reimport("001"));
+
+        assert_eq!(merged.status, CardStatus::Running);
+        assert_eq!(merged.claim, current.claim);
+        assert_eq!(merged.title, "Refreshed title", "content still refreshes");
+        assert_eq!(merged.created_at, 10);
+    }
+
+    #[test]
+    fn terminal_card_keeps_its_outcome_across_reimport() {
+        let current = card("001", CardStatus::Done);
+        let merged = current.merge_reimport(fresh_reimport("001"));
+
+        assert_eq!(merged.status, CardStatus::Done);
+        assert_eq!(merged.title, "Refreshed title");
+    }
+
+    #[test]
+    fn protects_lifecycle_on_reimport_covers_active_and_terminal_states() {
+        assert!(!card("001", CardStatus::Backlog).protects_lifecycle_on_reimport());
+        assert!(!card("001", CardStatus::Ready).protects_lifecycle_on_reimport());
+        assert!(!card("001", CardStatus::Blocked).protects_lifecycle_on_reimport());
+        assert!(card("001", CardStatus::Claimed).protects_lifecycle_on_reimport());
+        assert!(card("001", CardStatus::Running).protects_lifecycle_on_reimport());
+        assert!(card("001", CardStatus::AwaitingInput).protects_lifecycle_on_reimport());
+        assert!(card("001", CardStatus::Done).protects_lifecycle_on_reimport());
+        assert!(card("001", CardStatus::Shipped).protects_lifecycle_on_reimport());
+        assert!(card("001", CardStatus::Abandoned).protects_lifecycle_on_reimport());
+    }
 }
