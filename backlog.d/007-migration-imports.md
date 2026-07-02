@@ -12,7 +12,7 @@ rewrite of claims, statuses, runs, or proof.
 - [x] Digest-aware import reports content drift without clobbering live lifecycle fields.
 - [ ] GitHub issue import maps source URL, title, body, labels, and state without creating personal/operator data in the product repo.
 - [x] A dry-run report shows create/update/skip/conflict counts before mutation.
-- [ ] A synthetic multi-repo fixture proves import ordering and duplicate handling.
+- [x] A synthetic multi-repo fixture proves import ordering and duplicate handling.
 
 ## Children
 - Fix the import-clobber bug before importing real fleet work.
@@ -20,7 +20,7 @@ rewrite of claims, statuses, runs, or proof.
 - Namespace card ids per repo so eight independently numbered backlog.d directories can share one instance (done — `load_backlog_dir_for_repo` / `powder import-repo`).
 - Add a body-content import request shape so a remote client can push parsed cards to a flycast-only deployed instance instead of only reading a server-local path (done — `POST /api/v1/cards/import` accepts `files`/`repo`).
 - Add GitHub issue source adapter with dry-run mode.
-- Add a synthetic multi-repo fixture (id collision, claimed card, in-directory duplicate).
+- Add a synthetic multi-repo fixture (id collision, claimed card, in-directory duplicate) — done, `crates/powder-cli/tests/multi_repo_import.rs`.
 - Import Factory backlog into the deployed Powder instance after the sync contract is safe.
 
 ## Progress
@@ -91,6 +91,25 @@ rewrite of claims, statuses, runs, or proof.
   creates a card, `files`+`repo` namespaces the id over HTTP, `path`+`files`
   together is 400, neither is 400). 86 workspace tests green
   (fmt/clippy/test).
+- 2026-07-02 slice (overnight autonomous): added the synthetic multi-repo
+  fixture from §6 below. `crates/powder-cli/tests/fixtures/multi_repo/{repo-a,repo-b}`
+  ships two repos that each number their own tickets from `001`, plus an
+  in-directory duplicate in repo-a (`001-first.md` and
+  `001-first-duplicate.md`, both parsing to bare id `001`). The new
+  integration test `crates/powder-cli/tests/multi_repo_import.rs` drives
+  `import-repo` on both repos through real SQLite and proves: the id
+  collision never happens (`repo-a-001` and `repo-b-001` coexist), the
+  in-directory duplicate resolves deterministically (alphabetical
+  processing order, canonical file persisted last, its content wins), an
+  ordinary second card imports fine alongside the collision cases, and --
+  reusing the reimport-safety fix from this epic's first slice -- claiming
+  `repo-a-001` and then reimporting repo-a again reports both source files
+  mapping to it as `preserved` (never `updated`), proving the claim/status
+  survives a stale reimport even when a duplicate file is present in the
+  same batch. Only the GitHub issue adapter (needs its own scoping pass,
+  possibly a follow-up session) and the CLI `--api-base-url` remote-push
+  convenience noted in the slice above remain open in this epic.
+  90 workspace tests green (fmt/clippy/test).
 
 ## Design: importing all nine Factory repos' backlog.d
 
@@ -148,11 +167,10 @@ an in-flight Powder claim either. Needs its own dry-run mode and must not
 create personal/operator data in this repo (per `AGENTS.md`) — the adapter
 lives in powder-shell/powder-store, not a data file committed here.
 
-**6. Synthetic multi-repo fixture (test-only, still open).** A
-`tests/fixtures/` tree with 2-3 fake repos' backlog.d (mirroring
-`crates/powder-core/tests/fixtures/backlog.d/001-example.md`'s existing
-single-repo fixture), including: an id collision across repos (both ship
-`001-*.md`), a card claimed in one repo, and a stale duplicate within one
-repo's directory — to exercise the full `import-repo` → `import_cards`
-path end-to-end the way `cli_import_repo_namespaces_ids_so_two_repos_never_collide`
-does today, but as a reusable fixture rather than inline `tempdir` writes.
+**6. Closed: synthetic multi-repo fixture.**
+`crates/powder-cli/tests/fixtures/multi_repo/{repo-a,repo-b}` +
+`crates/powder-cli/tests/multi_repo_import.rs` exercise the full
+`import-repo` → `import_cards` path end-to-end against real SQLite: an id
+collision across repos, an in-directory duplicate resolving
+deterministically, and a claimed card surviving a stale reimport of the
+same repo.
