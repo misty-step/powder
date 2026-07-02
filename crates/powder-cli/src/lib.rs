@@ -313,19 +313,31 @@ fn create_card(args: &[String]) -> Result<String, ShellError> {
     let id = required_flag(args, "--id")?;
     let title = required_flag(args, "--title")?;
     let body = flag_value(args, "--body").unwrap_or_default();
+    // No fabricated acceptance: an omitted --acceptance means empty, not a
+    // placeholder oracle that would falsely make the card look claimable
+    // ("ready is a query, not vibes", VISION.md). An explicit --status is
+    // still honored regardless -- status is a label, is_ready_at is the
+    // independent gate -- but the *default* status must reflect whether a
+    // real oracle exists.
+    let acceptance: Vec<String> = flag_value(args, "--acceptance")
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
     let status = flag_value(args, "--status")
         .and_then(CardStatus::parse)
-        .unwrap_or(CardStatus::Ready);
+        .unwrap_or(if acceptance.is_empty() {
+            CardStatus::Backlog
+        } else {
+            CardStatus::Ready
+        });
     let priority = flag_value(args, "--priority")
         .and_then(Priority::parse)
         .unwrap_or_default();
-    let acceptance = flag_value(args, "--acceptance").unwrap_or("proof exists");
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = Card::new(CardId::new(id).map_err(ShellError::from)?, title, body)
         .map_err(ShellError::from)?
         .with_status(status)
         .with_priority(priority)
-        .with_acceptance([acceptance.to_string()])
+        .with_acceptance(acceptance)
         .with_created_at(now);
     let card = store.upsert_card(card).map_err(store_err)?;
     Ok(format!(
@@ -904,6 +916,78 @@ mod tests {
         assert!(card_a.contains("Repo A ticket one"));
         let card_b = run(&args(["get-card", "repo-b-001", "--db", &db])).unwrap();
         assert!(card_b.contains("Repo B ticket one"));
+    }
+
+    #[test]
+    fn create_card_with_no_acceptance_never_fabricates_one_and_defaults_to_backlog() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-no-fabricated-acceptance-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "no-acceptance",
+            "--title",
+            "Untriaged",
+        ]))
+        .unwrap();
+
+        let card = run(&args(["get-card", "no-acceptance", "--db", &db])).unwrap();
+        assert!(
+            card.contains("\"acceptance\": []"),
+            "an omitted --acceptance must never fabricate a placeholder oracle: {card}"
+        );
+        assert!(
+            card.contains("\"status\": \"backlog\""),
+            "empty acceptance must not default to a claimable status: {card}"
+        );
+        let ready = run(&args(["list-ready", "--db", &db])).unwrap();
+        assert!(!ready.contains("no-acceptance"));
+
+        // an explicit --status is still honored even with empty acceptance
+        // (status is a label; is_ready_at is the independent gate).
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "forced-ready",
+            "--title",
+            "Explicitly forced ready",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let forced = run(&args(["get-card", "forced-ready", "--db", &db])).unwrap();
+        assert!(forced.contains("\"status\": \"ready\""));
+        assert!(forced.contains("\"acceptance\": []"));
+
+        // real acceptance still makes the default status ready, matching
+        // prior behavior for callers who do provide a criterion.
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "with-acceptance",
+            "--title",
+            "Has a real oracle",
+            "--acceptance",
+            "the tests pass",
+        ]))
+        .unwrap();
+        let with_acceptance = run(&args(["get-card", "with-acceptance", "--db", &db])).unwrap();
+        assert!(with_acceptance.contains("\"acceptance\": [\n      \"the tests pass\"\n    ]"));
+        assert!(with_acceptance.contains("\"status\": \"ready\""));
     }
 
     #[test]

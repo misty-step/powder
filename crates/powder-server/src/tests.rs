@@ -52,6 +52,41 @@ fn config_accepts_explicit_bind_addr() {
 }
 
 #[tokio::test]
+async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"no-acceptance","title":"Untriaged","acceptance":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let card = response_json(created).await;
+    assert_eq!(
+        card["status"], "backlog",
+        "empty acceptance must not default to a claimable status: {card}"
+    );
+
+    let ready = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let ready = response_json(ready).await;
+    assert!(!ready.to_string().contains("no-acceptance"));
+}
+
+#[tokio::test]
 async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
