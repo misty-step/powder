@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
   name TEXT NOT NULL,
   key_prefix TEXT NOT NULL,
   key_hash TEXT NOT NULL,
+  hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
   scope TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   revoked_at INTEGER
@@ -117,6 +118,14 @@ SET actor_id = 'actor-' || id
 WHERE actor_id IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+"#;
+
+/// Existing keys were bcrypt-hashed; tag them explicitly so `verify_api_key`
+/// keeps using bcrypt for them (they never break) while every newly created
+/// key hashes with SHA-256 instead (the correct tool for a high-entropy
+/// random secret, and far cheaper than bcrypt's deliberately slow KDF).
+pub const MIGRATE_2_TO_3: &str = r#"
+ALTER TABLE api_keys ADD COLUMN hash_algorithm TEXT NOT NULL DEFAULT 'bcrypt';
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, status, priority, labels_json,

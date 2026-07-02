@@ -140,6 +140,7 @@ impl Store {
         let prefix = key_prefix(raw_key);
         let mut statement = self.connection.prepare(
             "SELECT api_keys.id, api_keys.name, api_keys.scope, api_keys.key_hash,
+                    api_keys.hash_algorithm,
                     actors.id, actors.kind, actors.display_name, actors.created_at
              FROM api_keys
              JOIN actors ON actors.id = api_keys.actor_id
@@ -156,7 +157,8 @@ impl Store {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -166,10 +168,19 @@ impl Store {
             return Ok(None);
         }
 
-        for (id, name, scope, key_hash, actor_id, actor_kind, actor_name, actor_created_at) in
-            candidates
+        for (
+            id,
+            name,
+            scope,
+            key_hash,
+            hash_algorithm,
+            actor_id,
+            actor_kind,
+            actor_name,
+            actor_created_at,
+        ) in candidates
         {
-            if matches!(verify(raw_key, &key_hash), Ok(true)) {
+            if verify_secret(raw_key, &key_hash, &hash_algorithm) {
                 let scope = ApiKeyScope::parse(&scope).ok_or(StoreError::InvalidStoredValue {
                     field: "api_keys.scope",
                     value: scope,
@@ -315,7 +326,14 @@ fn new_api_key(name: &str, scope: ApiKeyScope, now: i64) -> Result<ApiKeyCreated
 }
 
 fn insert_api_key(connection: &Connection, key: &ApiKeyCreated) -> Result<()> {
-    let key_hash = bcrypt::hash(&key.raw_key, bcrypt::DEFAULT_COST)?;
+    // New keys hash with SHA-256, not bcrypt: an API key is already a
+    // high-entropy random secret (32 chars from a 64-symbol alphabet), not a
+    // low-entropy human password, so bcrypt's deliberately-slow KDF buys no
+    // security here -- it only costs ~200-300ms of CPU per verify, held
+    // under the server's global store mutex, which caps the whole
+    // instance's authenticated request rate. Legacy bcrypt-hashed keys keep
+    // verifying via bcrypt (see `verify_secret`); only new keys switch.
+    let key_hash = sha256_hex(key.raw_key.as_bytes());
     connection.execute(
         "INSERT INTO actors (id, kind, display_name, created_at)
          VALUES (?1, ?2, ?3, ?4)",
@@ -327,8 +345,8 @@ fn insert_api_key(connection: &Connection, key: &ApiKeyCreated) -> Result<()> {
         ],
     )?;
     connection.execute(
-        "INSERT INTO api_keys (id, actor_id, name, key_prefix, key_hash, scope, created_at, revoked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+        "INSERT INTO api_keys (id, actor_id, name, key_prefix, key_hash, hash_algorithm, scope, created_at, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'sha256', ?6, ?7, NULL)",
         params![
             key.id,
             key.actor.id,
@@ -340,6 +358,37 @@ fn insert_api_key(connection: &Connection, key: &ApiKeyCreated) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// `hash_algorithm` is 'sha256' for every key created after this migration
+/// and 'bcrypt' for every key created before it (see `MIGRATE_2_TO_3`).
+/// Unrecognized values fail closed (never authenticate) rather than guess.
+fn verify_secret(raw_key: &str, key_hash: &str, hash_algorithm: &str) -> bool {
+    match hash_algorithm {
+        "sha256" => constant_time_eq(
+            sha256_hex(raw_key.as_bytes()).as_bytes(),
+            key_hash.as_bytes(),
+        ),
+        "bcrypt" => matches!(verify(raw_key, key_hash), Ok(true)),
+        _ => false,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn key_prefix(raw_key: &str) -> String {

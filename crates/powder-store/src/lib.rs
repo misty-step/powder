@@ -18,8 +18,8 @@ mod tests;
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 
 use schema::{
-    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, RUN_SELECT_SQL, SCHEMA,
-    SCHEMA_VERSION,
+    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
+    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -81,28 +81,37 @@ impl Store {
         Ok(store)
     }
 
+    /// Applies migrations one version at a time until reaching
+    /// `SCHEMA_VERSION`, so a database several versions behind steps through
+    /// every intermediate migration rather than jumping straight to current
+    /// while skipping schema changes those steps introduced.
     pub fn migrate(&mut self) -> Result<()> {
-        let current = self.schema_version()?;
-        if current > SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchema(current));
-        }
-        if current == SCHEMA_VERSION {
-            return Ok(());
-        }
-        match current {
-            0 => {
-                self.connection.execute_batch(SCHEMA)?;
-                self.connection
-                    .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        loop {
+            let current = self.schema_version()?;
+            if current > SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchema(current));
             }
-            1 => {
-                self.connection.execute_batch(MIGRATE_1_TO_2)?;
-                self.connection
-                    .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+            if current == SCHEMA_VERSION {
+                return Ok(());
             }
-            _ => return Err(StoreError::UnsupportedSchema(current)),
+            let next = match current {
+                0 => {
+                    self.connection.execute_batch(SCHEMA)?;
+                    SCHEMA_VERSION
+                }
+                1 => {
+                    self.connection.execute_batch(MIGRATE_1_TO_2)?;
+                    2
+                }
+                2 => {
+                    self.connection.execute_batch(MIGRATE_2_TO_3)?;
+                    3
+                }
+                _ => return Err(StoreError::UnsupportedSchema(current)),
+            };
+            self.connection
+                .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
-        Ok(())
     }
 
     pub fn readiness_check(&self) -> Result<()> {

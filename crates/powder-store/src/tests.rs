@@ -555,8 +555,12 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 2);
+    assert_eq!(store.schema_version()?, 3);
 
+    // a v1 database steps through every intermediate migration (1->2->3),
+    // not just straight to current: the legacy bcrypt-hashed key must still
+    // verify after picking up hash_algorithm (defaulted to 'bcrypt' for
+    // pre-existing rows), proving the loop didn't skip a step.
     let verified = store.verify_api_key(raw_key)?.expect("migrated key");
     assert_eq!(verified.name, "legacy-agent");
     assert_eq!(verified.actor.id, "actor-key-legacy");
@@ -569,6 +573,89 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
         .expect("new key after migration");
     assert_eq!(verified.actor.display_name, "new-agent");
     assert_eq!(verified.actor.kind.as_str(), "agent");
+    Ok(())
+}
+
+#[test]
+fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<()> {
+    let path = temp_db("v2-identity");
+    let raw_key = "sk_powder_legacy_v2_bcrypt_key_before_sha256";
+    let key_hash = bcrypt::hash(raw_key, bcrypt::DEFAULT_COST)?;
+    let key_prefix = raw_key.chars().take(12).collect::<String>();
+
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE api_keys (
+              id TEXT PRIMARY KEY,
+              actor_id TEXT NOT NULL REFERENCES actors(id),
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER
+            );
+            CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            PRAGMA user_version = 2;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO actors (id, kind, display_name, created_at)
+             VALUES ('actor-v2', 'agent', 'v2-agent', 10)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO api_keys (id, actor_id, name, key_prefix, key_hash, scope, created_at, revoked_at)
+             VALUES ('key-v2', 'actor-v2', 'v2-agent', ?1, ?2, 'agent', 10, NULL)",
+            rusqlite::params![key_prefix, key_hash],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, 3);
+
+    // the pre-existing bcrypt key keeps authenticating after the migration
+    // adds hash_algorithm (defaulted to 'bcrypt' for existing rows) --
+    // switching new keys to sha256 must never break a key that already
+    // exists in the wild on a deployed instance.
+    let verified = store.verify_api_key(raw_key)?.expect("legacy v2 key");
+    assert_eq!(verified.actor.display_name, "v2-agent");
+
+    // a key created after the migration is hashed with sha256, not bcrypt.
+    let created = store.create_api_key("post-migration-agent", ApiKeyScope::Agent, 30)?;
+    let stored_algorithm: String = store.connection.query_row(
+        "SELECT hash_algorithm FROM api_keys WHERE id = ?1",
+        [&created.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_algorithm, "sha256");
+    let verified = store
+        .verify_api_key(&created.raw_key)?
+        .expect("new sha256 key");
+    assert_eq!(verified.actor.display_name, "post-migration-agent");
+    Ok(())
+}
+
+#[test]
+fn verify_api_key_fails_closed_for_an_unrecognized_hash_algorithm() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let created = store.create_api_key("weird-agent", ApiKeyScope::Agent, 10)?;
+    store.connection.execute(
+        "UPDATE api_keys SET hash_algorithm = 'md5' WHERE id = ?1",
+        [&created.id],
+    )?;
+
+    assert!(store.verify_api_key(&created.raw_key)?.is_none());
     Ok(())
 }
 
