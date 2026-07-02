@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use powder_core::{parse_backlog_card, Card, CardId, CardStatus, DomainError};
+use powder_core::{parse_backlog_card, Card, CardId, DomainError};
 
 mod github;
 
@@ -46,40 +46,6 @@ impl From<DomainError> for ShellError {
             DomainError::Forbidden(_) => Self::Forbidden(value.to_string()),
         }
     }
-}
-
-pub trait Clock {
-    fn now_utc(&self) -> i64;
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_utc(&self) -> i64 {
-        unix_now()
-    }
-}
-
-pub trait IdGenerator {
-    fn next_card_id(&mut self) -> ShellResult<CardId>;
-    fn next_run_id(&mut self) -> ShellResult<String>;
-    fn next_activity_id(&mut self) -> ShellResult<String>;
-}
-
-pub trait CardStore {
-    fn import_cards(&mut self, cards: Vec<Card>) -> ShellResult<usize>;
-    fn get_card(&self, card_id: &CardId) -> ShellResult<Option<Card>>;
-    fn list_ready(&self, now: i64, limit: usize) -> ShellResult<Vec<Card>>;
-    fn update_status(&mut self, card_id: &CardId, status: CardStatus) -> ShellResult<Card>;
-    fn claim_card(
-        &mut self,
-        card_id: &CardId,
-        agent: &str,
-        now: i64,
-        ttl_seconds: u64,
-    ) -> ShellResult<String>;
-    fn complete_card(&mut self, card_id: &CardId, proof: &str, now: i64) -> ShellResult<Card>;
 }
 
 pub fn unix_now() -> i64 {
