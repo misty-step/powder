@@ -19,7 +19,7 @@ use powder_core::{
     parse_backlog_card, Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
-use powder_store::{ApiKeyScope, Store, StoreError};
+use powder_store::{ApiKeyScope, CardFilter, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -172,6 +172,13 @@ struct ReadyParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListCardsParams {
+    status: Option<String>,
+    repo: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ImportFile {
     path: String,
     contents: String,
@@ -294,7 +301,7 @@ fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/v1/onboarding", get(onboarding))
-        .route("/api/v1/cards", post(create_card))
+        .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
         .route("/api/v1/cards/{id}", get(get_card))
@@ -366,6 +373,32 @@ async fn list_ready(
     authorize(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
     let cards = lock_store(&state)?.list_ready(ReadyQuery::new(unix_now(), limit))?;
+    Ok(Json(json!({ "cards": cards })))
+}
+
+/// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
+/// `review`, and `done` cards are otherwise invisible without opening the
+/// database file directly.
+async fn list_cards(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ListCardsParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let status = params
+        .status
+        .as_deref()
+        .map(|raw| {
+            CardStatus::parse(raw)
+                .ok_or_else(|| ApiError::bad_request(format!("invalid status: {raw}")))
+        })
+        .transpose()?;
+    let limit = params.limit.unwrap_or(20).max(1);
+    let filter = CardFilter {
+        status,
+        repo: params.repo,
+    };
+    let cards = lock_store(&state)?.list_cards(&filter, limit)?;
     Ok(Json(json!({ "cards": cards })))
 }
 

@@ -2,7 +2,7 @@ use powder_core::{
     Authority, Card, CardId, CardSource, CardStatus, DomainError, Priority, ReadyQuery, RunState,
 };
 
-use crate::{ApiKeyScope, ImportOutcome, Result, Store, StoreError, API_KEY_ALPHABET};
+use crate::{ApiKeyScope, CardFilter, ImportOutcome, Result, Store, StoreError, API_KEY_ALPHABET};
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -67,6 +67,65 @@ fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
     let run = store.get_run(&claim.run_id)?.expect("persisted run");
     assert_eq!(run.state, RunState::Complete);
     assert_eq!(run.proof.as_deref(), Some("https://example.test/proof"));
+    Ok(())
+}
+
+#[test]
+fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let mut blocked = ready_card("blocked-1", 10);
+    blocked.status = CardStatus::Blocked;
+    blocked.repo = Some("misty-step/example".to_string());
+    store.import_cards(vec![blocked])?;
+
+    let mut done = ready_card("done-1", 20);
+    done.status = CardStatus::Done;
+    done.repo = Some("misty-step/other".to_string());
+    store.import_cards(vec![done])?;
+
+    store.import_cards(vec![ready_card("ready-1", 30)])?;
+
+    // no filter: every card, including non-ready ones list_ready would
+    // never surface.
+    let all = store.list_cards(&CardFilter::default(), 20)?;
+    assert_eq!(all.len(), 3);
+
+    // status filter alone.
+    let blocked_only = store.list_cards(
+        &CardFilter {
+            status: Some(CardStatus::Blocked),
+            repo: None,
+        },
+        20,
+    )?;
+    assert_eq!(blocked_only.len(), 1);
+    assert_eq!(blocked_only[0].id.as_str(), "blocked-1");
+
+    // repo filter alone.
+    let other_repo = store.list_cards(
+        &CardFilter {
+            status: None,
+            repo: Some("misty-step/other".to_string()),
+        },
+        20,
+    )?;
+    assert_eq!(other_repo.len(), 1);
+    assert_eq!(other_repo[0].id.as_str(), "done-1");
+
+    // both filters together, and a limit that truncates.
+    let done_in_other = store.list_cards(
+        &CardFilter {
+            status: Some(CardStatus::Done),
+            repo: Some("misty-step/other".to_string()),
+        },
+        20,
+    )?;
+    assert_eq!(done_in_other.len(), 1);
+
+    let limited = store.list_cards(&CardFilter::default(), 1)?;
+    assert_eq!(limited.len(), 1);
     Ok(())
 }
 

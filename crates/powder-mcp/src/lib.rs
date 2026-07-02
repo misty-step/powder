@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use powder_core::{Authority, CardId, CardStatus, ReadyQuery, RunId};
-use powder_store::Store;
+use powder_store::{CardFilter, Store};
 use serde_json::{json, Value};
 
 mod remote;
@@ -20,6 +20,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "list_ready",
         description: "List claimable cards sorted by priority, age, and identifier. Use before claiming work.",
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "list_cards",
+        description: "List cards by optional status/repo filter, not just ready-eligible ones -- enumerate blocked, in-review, or done cards.",
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string"},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
         name: "claim_card",
@@ -185,6 +190,19 @@ pub fn call_tool_store(
                 .list_ready(ReadyQuery::new(now, limit))
                 .map_err(to_string)?)
         }
+        "list_cards" => {
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let status = match args["status"].as_str() {
+                Some(raw) => {
+                    Some(CardStatus::parse(raw).ok_or_else(|| format!("invalid status: {raw}"))?)
+                }
+                None => None,
+            };
+            let repo = args["repo"].as_str().map(str::to_string);
+            json!(store
+                .list_cards(&CardFilter { status, repo }, limit)
+                .map_err(to_string)?)
+        }
         "claim_card" => {
             let card_id = card_id(args, "card_id")?;
             let agent = required_str(args, "agent")?;
@@ -323,8 +341,9 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 13);
+        assert_eq!(TOOLS.len(), 14);
         assert!(names.contains(&"list_ready"));
+        assert!(names.contains(&"list_cards"));
         assert!(names.contains(&"claim_card"));
         assert!(names.contains(&"release_claim"));
         assert!(names.contains(&"renew_claim"));
@@ -429,6 +448,36 @@ Expose tools against the DB.
             .as_str()
             .unwrap()
             .contains("005"));
+    }
+
+    #[test]
+    fn mcp_list_cards_filters_by_status_and_enumerates_non_ready_cards() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![parse_backlog_card(
+                "backlog.d/blocked.md",
+                "# Blocked\n\nPriority: P0 | Status: blocked\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+
+        let all = call_tool_store(&mut store, "list_cards", &json!({}), 10).unwrap();
+        assert!(tool_payload(&all)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|card| card["id"] == "blocked"));
+
+        let filtered =
+            call_tool_store(&mut store, "list_cards", &json!({"status": "blocked"}), 10).unwrap();
+        let cards = tool_payload(&filtered);
+        assert_eq!(cards.as_array().unwrap().len(), 1);
+
+        let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
+            .unwrap_err();
+        assert!(invalid.contains("invalid status"));
     }
 
     #[test]

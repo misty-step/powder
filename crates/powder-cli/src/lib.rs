@@ -4,7 +4,7 @@ use powder_core::{Authority, Board, Card, CardId, CardStatus, Priority, ReadyQue
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
 };
-use powder_store::{ApiKeyScope, Store, StoreError};
+use powder_store::{ApiKeyScope, CardFilter, Store, StoreError};
 
 pub const COMMANDS: &[&str] = &[
     "init-db",
@@ -16,6 +16,7 @@ pub const COMMANDS: &[&str] = &[
     "import-github-issues",
     "create-card",
     "list-ready",
+    "list-cards",
     "claim",
     "release-claim",
     "renew-claim",
@@ -43,6 +44,7 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest),
+        [command, rest @ ..] if command == "list-cards" => list_cards(rest),
         [command, rest @ ..] if command == "claim" => claim(rest),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest),
@@ -82,6 +84,9 @@ pub fn help() -> String {
         "  powder import-github-issues issues.json --repo misty-step/bitterblossom --db ./data/powder.db\n",
     );
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
+    help.push_str(
+        "  powder list-cards --db ./data/powder.db --status blocked --repo misty-step/example\n",
+    );
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
     help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600\n");
@@ -381,6 +386,40 @@ fn list_ready(args: &[String]) -> Result<String, ShellError> {
     Ok(out)
 }
 
+/// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
+/// `review`, and `done` cards are otherwise invisible without opening the
+/// database file directly.
+fn list_cards(args: &[String]) -> Result<String, ShellError> {
+    let limit = parse_limit(args).unwrap_or(20);
+    let store = open_store(required_flag(args, "--db")?)?;
+    let status = flag_value(args, "--status")
+        .map(|raw| {
+            CardStatus::parse(raw)
+                .ok_or_else(|| ShellError::Invalid(format!("invalid status: {raw}")))
+        })
+        .transpose()?;
+    let filter = CardFilter {
+        status,
+        repo: flag_value(args, "--repo").map(str::to_string),
+    };
+    let cards = store.list_cards(&filter, limit).map_err(store_err)?;
+
+    let mut out = String::new();
+    for card in cards {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            card.id,
+            card.priority.as_str(),
+            card.status.as_str(),
+            card.title
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("no-cards\n");
+    }
+    Ok(out)
+}
+
 fn claim(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "claim")?;
@@ -642,6 +681,7 @@ mod tests {
         assert!(COMMANDS.contains(&"import-repo"));
         assert!(COMMANDS.contains(&"import-github-issues"));
         assert!(COMMANDS.contains(&"list-ready"));
+        assert!(COMMANDS.contains(&"list-cards"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
         assert!(COMMANDS.contains(&"renew-claim"));
@@ -988,6 +1028,64 @@ mod tests {
         let with_acceptance = run(&args(["get-card", "with-acceptance", "--db", &db])).unwrap();
         assert!(with_acceptance.contains("\"acceptance\": [\n      \"the tests pass\"\n    ]"));
         assert!(with_acceptance.contains("\"status\": \"ready\""));
+    }
+
+    #[test]
+    fn cli_list_cards_filters_by_status_and_repo() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-list-cards-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "blocked-1",
+            "--title",
+            "Blocked ticket",
+            "--status",
+            "blocked",
+        ]))
+        .unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "ready-1",
+            "--title",
+            "Ready ticket",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+
+        let all = run(&args(["list-cards", "--db", &db])).unwrap();
+        assert!(all.contains("blocked-1"));
+        assert!(all.contains("ready-1"));
+
+        let blocked_only = run(&args(["list-cards", "--db", &db, "--status", "blocked"])).unwrap();
+        assert!(blocked_only.contains("blocked-1"));
+        assert!(!blocked_only.contains("ready-1"));
+
+        let err = run(&args([
+            "list-cards",
+            "--db",
+            &db,
+            "--status",
+            "not-a-status",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, ShellError::Invalid(_)));
     }
 
     #[test]
