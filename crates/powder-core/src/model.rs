@@ -13,6 +13,7 @@ pub enum DomainError {
         id: String,
     },
     Conflict(String),
+    Forbidden(String),
 }
 
 impl DomainError {
@@ -33,6 +34,10 @@ impl DomainError {
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict(message.into())
     }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::Forbidden(message.into())
+    }
 }
 
 impl fmt::Display for DomainError {
@@ -41,11 +46,79 @@ impl fmt::Display for DomainError {
             Self::Validation { field, message } => write!(f, "{field}: {message}"),
             Self::NotFound { entity, id } => write!(f, "{entity} not found: {id}"),
             Self::Conflict(message) => f.write_str(message),
+            Self::Forbidden(message) => f.write_str(message),
         }
     }
 }
 
 impl std::error::Error for DomainError {}
+
+/// The caller performing a mutation, resolved by the adapter (HTTP bearer key,
+/// CLI `--actor` flag, or MCP tool argument) into a shape the domain can check
+/// claim ownership against without depending on any adapter's identity types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authority {
+    /// No identity enforcement: single-operator surfaces (CLI/MCP without an
+    /// explicit actor, or HTTP auth disabled) that predate real identity.
+    Unchecked,
+    Actor {
+        display_name: String,
+        is_admin: bool,
+    },
+}
+
+impl Authority {
+    pub fn unchecked() -> Self {
+        Self::Unchecked
+    }
+
+    pub fn actor(display_name: impl Into<String>, is_admin: bool) -> Self {
+        Self::Actor {
+            display_name: display_name.into(),
+            is_admin,
+        }
+    }
+
+    /// A non-admin actor may only act using their own identity string
+    /// (guards fields like `claim.agent` or `answer.actor` that a caller
+    /// supplies directly).
+    pub fn require_identity(&self, requested: &str) -> Result<(), DomainError> {
+        match self {
+            Self::Unchecked => Ok(()),
+            Self::Actor { is_admin: true, .. } => Ok(()),
+            Self::Actor {
+                display_name,
+                is_admin: false,
+            } => {
+                if display_name == requested {
+                    Ok(())
+                } else {
+                    Err(DomainError::forbidden(format!(
+                        "actor {display_name} cannot act as {requested}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// A non-admin actor may only mutate a card that they hold the active
+    /// claim on. `holder` is `None` when the card has no active claim.
+    pub fn require_holder(&self, holder: Option<&str>) -> Result<(), DomainError> {
+        match self {
+            Self::Unchecked => Ok(()),
+            Self::Actor { is_admin: true, .. } => Ok(()),
+            Self::Actor {
+                display_name,
+                is_admin: false,
+            } => match holder {
+                Some(current) if current == display_name => Ok(()),
+                _ => Err(DomainError::forbidden(format!(
+                    "actor {display_name} does not hold the active claim"
+                ))),
+            },
+        }
+    }
+}
 
 macro_rules! id_type {
     ($name:ident, $field:literal) => {
@@ -402,6 +475,12 @@ impl Card {
         self.claim
             .as_ref()
             .filter(|claim| claim.agent == agent && !claim.is_expired(now))
+    }
+
+    /// The agent holding the card's active claim, if any, regardless of
+    /// expiry. Used to authorize mutations against the claim holder.
+    pub fn claim_holder(&self) -> Option<&str> {
+        self.claim.as_ref().map(|claim| claim.agent.as_str())
     }
 
     pub fn apply_claim(

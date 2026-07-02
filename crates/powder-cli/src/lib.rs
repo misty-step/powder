@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use powder_core::{Board, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
+use powder_core::{Authority, Board, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
 use powder_shell::{load_backlog_dir, unix_now, ShellError};
 use powder_store::{ApiKeyScope, Store, StoreError};
 
@@ -71,7 +71,16 @@ pub fn help() -> String {
     );
     help.push_str("  powder update-status 001 --db ./data/powder.db --status running\n");
     help.push_str(
-        "  powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof\n\n",
+        "  powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof\n",
+    );
+    help.push_str(
+        "  powder update-status 001 --db ./data/powder.db --status running --actor codex\n\n",
+    );
+    help.push_str(
+        "claim-holder enforcement:\n  add --actor <name> (and --admin to bypass ownership) to \
+         claim/release-claim/renew-claim/heartbeat/update-status/request-input/complete-card \
+         to check the caller against the card's claim holder, matching HTTP/MCP authority \
+         errors. Omitting --actor keeps prior direct-DB-access trust (no enforcement).\n\n",
     );
     help.push_str("api contract:\n");
     help.push_str(&powder_api::route_summary());
@@ -227,7 +236,7 @@ fn claim(args: &[String]) -> Result<String, ShellError> {
     let ttl_seconds = optional_ttl(args)?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let claim = store
-        .claim_card(&card_id, agent, now, ttl_seconds)
+        .claim_card(&card_id, agent, now, ttl_seconds, &authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "claimed\t{}\t{}\t{}\n",
@@ -241,7 +250,7 @@ fn release_claim(args: &[String]) -> Result<String, ShellError> {
     let run_id = required_run_flag(args)?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let claim = store
-        .release_claim(&card_id, &run_id, now)
+        .release_claim(&card_id, &run_id, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!("released\t{}\t{}\n", claim.card_id, claim.run_id))
 }
@@ -253,7 +262,7 @@ fn renew_claim(args: &[String]) -> Result<String, ShellError> {
     let ttl_seconds = optional_ttl(args)?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let claim = store
-        .renew_claim(&card_id, &run_id, now, ttl_seconds)
+        .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "renewed\t{}\t{}\t{}\n",
@@ -267,7 +276,7 @@ fn heartbeat(args: &[String]) -> Result<String, ShellError> {
     let run_id = required_run_flag(args)?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let claim = store
-        .heartbeat_claim(&card_id, &run_id, now)
+        .heartbeat_claim(&card_id, &run_id, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "heartbeat\t{}\t{}\t{}\n",
@@ -318,7 +327,7 @@ fn answer_input(args: &[String]) -> Result<String, ShellError> {
     let answer = required_flag(args, "--answer")?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let run = store
-        .answer_input(&run_id, actor, answer, now)
+        .answer_input(&run_id, actor, answer, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!("answered-input\t{}\t{}\n", run.id, run.card_id))
 }
@@ -331,7 +340,7 @@ fn update_status(args: &[String]) -> Result<String, ShellError> {
         .ok_or_else(|| ShellError::Invalid("update-status requires --status".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .update_status(&card_id, status, now)
+        .update_status(&card_id, status, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!("status\t{}\t{}\n", card.id, card.status.as_str()))
 }
@@ -358,7 +367,7 @@ fn request_input(args: &[String]) -> Result<String, ShellError> {
     let question = required_flag(args, "--question")?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let run = store
-        .request_input(&run_id, question, now)
+        .request_input(&run_id, question, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!("awaiting-input\t{}\t{}\n", run.id, run.card_id))
 }
@@ -369,7 +378,7 @@ fn complete_card(args: &[String]) -> Result<String, ShellError> {
     let proof = required_flag(args, "--proof")?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .complete_card(&card_id, proof, now)
+        .complete_card(&card_id, proof, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "completed\t{}\t{}\n",
@@ -394,6 +403,16 @@ fn positional_card_id(args: &[String], command: &str) -> Result<CardId, ShellErr
 
 fn required_run_flag(args: &[String]) -> Result<RunId, ShellError> {
     required_flag(args, "--run").and_then(|id| RunId::new(id).map_err(ShellError::from))
+}
+
+/// Build the `Authority` a mutation is checked against from `--actor` (and
+/// `--admin`). Omitting `--actor` preserves prior CLI behavior exactly: a
+/// direct-DB-access operator is trusted and no ownership check runs.
+fn authority(args: &[String]) -> Authority {
+    match flag_value(args, "--actor") {
+        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
+        None => Authority::unchecked(),
+    }
 }
 
 fn optional_ttl(args: &[String]) -> Result<u64, ShellError> {
@@ -442,11 +461,14 @@ fn positional(args: &[String]) -> Vec<&str> {
 }
 
 fn flag_takes_value(flag: &str) -> bool {
-    !matches!(flag, "--dry-run" | "--show-secret")
+    !matches!(flag, "--dry-run" | "--show-secret" | "--admin")
 }
 
 fn store_err(err: StoreError) -> ShellError {
-    ShellError::Store(err.to_string())
+    match err {
+        StoreError::Domain(domain_err) => ShellError::from(domain_err),
+        other => ShellError::Store(other.to_string()),
+    }
 }
 
 fn to_pretty_json(value: &impl serde::Serialize) -> Result<String, ShellError> {
@@ -680,6 +702,87 @@ mod tests {
         assert!(released.contains("released\trelease-test"));
         let ready = run(&args(["list-ready", "--db", &db])).unwrap();
         assert!(ready.contains("release-test"));
+    }
+
+    #[test]
+    fn cli_actor_flag_enforces_claim_holder_like_http_and_mcp() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-holder-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "holder-test",
+            "--title",
+            "Holder test",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        run(&args([
+            "claim",
+            "holder-test",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--actor",
+            "codex",
+        ]))
+        .unwrap();
+
+        let denied = run(&args([
+            "update-status",
+            "holder-test",
+            "--db",
+            &db,
+            "--status",
+            "running",
+            "--actor",
+            "intruder",
+        ]))
+        .unwrap_err();
+        assert!(matches!(denied, ShellError::Forbidden(_)));
+        assert!(denied.to_string().contains("intruder"));
+
+        // an admin actor bypasses claim ownership.
+        run(&args([
+            "update-status",
+            "holder-test",
+            "--db",
+            &db,
+            "--status",
+            "running",
+            "--actor",
+            "operator",
+            "--admin",
+        ]))
+        .unwrap();
+
+        // the real holder is unaffected by the rejected intrusion.
+        let completed = run(&args([
+            "complete-card",
+            "holder-test",
+            "--db",
+            &db,
+            "--proof",
+            "https://example.test/proof",
+            "--actor",
+            "codex",
+        ]))
+        .unwrap();
+        assert!(completed.contains("completed\tholder-test\tdone"));
     }
 
     #[test]

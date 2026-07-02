@@ -1,6 +1,6 @@
 use powder_core::{
-    Activity, ActivityId, ActivityType, AwaitingInput, CardDetail, CardId, CardStatus, Comment,
-    DomainError, Link, LinkId, Run, RunDetail, RunId, RunState,
+    Activity, ActivityId, ActivityType, Authority, AwaitingInput, CardDetail, CardId, CardStatus,
+    Comment, DomainError, Link, LinkId, Run, RunDetail, RunId, RunState,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -71,9 +71,11 @@ impl Store {
         actor: &str,
         answer: &str,
         now: i64,
+        authority: &Authority,
     ) -> Result<Run> {
         let actor = non_empty("actor", actor)?;
         let answer = non_empty("answer", answer)?;
+        authority.require_identity(&actor)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

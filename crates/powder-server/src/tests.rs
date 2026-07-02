@@ -148,7 +148,14 @@ async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
 
 #[tokio::test]
 async fn api_key_claim_rejects_cross_agent_impersonation() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
     let app = app(state);
 
     let created = app
@@ -156,7 +163,7 @@ async fn api_key_claim_rejects_cross_agent_impersonation() {
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards",
-            Some(&raw_key),
+            Some(&admin_key),
             r#"{"id":"api-identity","title":"API identity","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
         ))
         .await
@@ -168,8 +175,8 @@ async fn api_key_claim_rejects_cross_agent_impersonation() {
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards/api-identity/claim",
-            Some(&raw_key),
-            r#"{"agent":"codex","ttl_seconds":3600}"#,
+            Some(&agent_key),
+            r#"{"agent":"someone-else","ttl_seconds":3600}"#,
         ))
         .await
         .unwrap();
@@ -179,14 +186,14 @@ async fn api_key_claim_rejects_cross_agent_impersonation() {
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards/api-identity/claim",
-            Some(&raw_key),
-            r#"{"agent":"bootstrap","ttl_seconds":3600}"#,
+            Some(&agent_key),
+            r#"{"agent":"codex","ttl_seconds":3600}"#,
         ))
         .await
         .unwrap();
     assert_eq!(claimed.status(), StatusCode::OK);
     let claimed = response_json(claimed).await;
-    assert_eq!(claimed["agent"], "bootstrap");
+    assert_eq!(claimed["agent"], "codex");
 }
 
 #[tokio::test]
@@ -410,6 +417,184 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
         })
         .expect("actor-attributed response activity");
     assert!(question_position < response_position);
+}
+
+#[tokio::test]
+async fn agent_scoped_key_cannot_author_or_import_cards() {
+    let (state, _admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&agent_key),
+            r#"{"id":"agent-authored","title":"Agent authored","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::FORBIDDEN);
+
+    let imported = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&agent_key),
+            r#"{"path":"backlog.d"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let holder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("holder", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("intruder", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"contested","title":"Contested","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/claim",
+            Some(&holder_key),
+            r#"{"agent":"holder","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed = response_json(claimed).await;
+    let run_id = claimed["run_id"].as_str().unwrap().to_owned();
+
+    let status_denied = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/status",
+            Some(&intruder_key),
+            r#"{"status":"running"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status_denied.status(), StatusCode::FORBIDDEN);
+
+    let heartbeat_denied = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/heartbeat",
+            Some(&intruder_key),
+            &format!(r#"{{"run_id":"{run_id}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(heartbeat_denied.status(), StatusCode::FORBIDDEN);
+
+    let renew_denied = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/renew",
+            Some(&intruder_key),
+            &format!(r#"{{"run_id":"{run_id}","ttl_seconds":3600}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(renew_denied.status(), StatusCode::FORBIDDEN);
+
+    let input_denied = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/runs/{run_id}/input"),
+            Some(&intruder_key),
+            r#"{"question":"Approve?"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(input_denied.status(), StatusCode::FORBIDDEN);
+
+    let complete_denied = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/complete",
+            Some(&intruder_key),
+            r#"{"proof":"https://example.test/proof"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete_denied.status(), StatusCode::FORBIDDEN);
+
+    let release_denied = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/release",
+            Some(&intruder_key),
+            &format!(r#"{{"run_id":"{run_id}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(release_denied.status(), StatusCode::FORBIDDEN);
+
+    // the actual holder is unaffected by the rejected intrusions.
+    let status_ok = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/status",
+            Some(&holder_key),
+            r#"{"status":"running"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status_ok.status(), StatusCode::OK);
+
+    let complete_ok = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/contested/complete",
+            Some(&holder_key),
+            r#"{"proof":"https://example.test/proof"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete_ok.status(), StatusCode::OK);
 }
 
 #[tokio::test]

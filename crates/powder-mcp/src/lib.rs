@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use powder_core::{Board, CardId, CardStatus, ReadyQuery, RunId};
+use powder_core::{Authority, Board, CardId, CardStatus, ReadyQuery, RunId};
 use powder_store::Store;
 use serde_json::{json, Value};
 
@@ -19,23 +19,23 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "claim_card",
-        description: "Claim one ready card for an agent and open a run with an expiring lock.",
-        input_schema: r#"{"type":"object","required":["card_id","agent"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":60}}}"#,
+        description: "Claim one ready card for an agent and open a run with an expiring lock. Optional actor/admin authorize the caller; omit both to keep unchecked local trust.",
+        input_schema: r#"{"type":"object","required":["card_id","agent"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":60},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "release_claim",
-        description: "Release an active claim by run id and make the card ready immediately.",
-        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"}}}"#,
+        description: "Release an active claim by run id and make the card ready immediately. Optional actor/admin are checked against the claim holder.",
+        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "renew_claim",
-        description: "Extend an active claim lease by run id.",
-        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1}}}"#,
+        description: "Extend an active claim lease by run id. Optional actor/admin are checked against the claim holder.",
+        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "heartbeat",
-        description: "Record liveness for an active claim without changing ownership.",
-        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"}}}"#,
+        description: "Record liveness for an active claim without changing ownership. Optional actor/admin are checked against the claim holder.",
+        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "get_card",
@@ -59,8 +59,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "update_status",
-        description: "Move a card through an allowed status transition when external progress changes.",
-        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"}}}"#,
+        description: "Move a card through an allowed status transition when external progress changes. Optional actor/admin are checked against the claim holder.",
+        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "add_link",
@@ -69,13 +69,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "request_input",
-        description: "Pause a run in awaiting_input with the exact operator question.",
-        input_schema: r#"{"type":"object","required":["run_id","question"],"properties":{"run_id":{"type":"string"},"question":{"type":"string"}}}"#,
+        description: "Pause a run in awaiting_input with the exact operator question. Optional actor/admin are checked against the claim holder.",
+        input_schema: r#"{"type":"object","required":["run_id","question"],"properties":{"run_id":{"type":"string"},"question":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "complete_card",
-        description: "Complete a card only after attaching a proof artifact or URL.",
-        input_schema: r#"{"type":"object","required":["card_id","proof"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"}}}"#,
+        description: "Complete a card only after attaching a proof artifact or URL. Optional actor/admin are checked against the claim holder.",
+        input_schema: r#"{"type":"object","required":["card_id","proof"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
 ];
 
@@ -280,14 +280,14 @@ pub fn call_tool_store(
             let agent = required_str(args, "agent")?;
             let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
             json!(store
-                .claim_card(&card_id, agent, now, ttl_seconds)
+                .claim_card(&card_id, agent, now, ttl_seconds, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "release_claim" => {
             let card_id = card_id(args, "card_id")?;
             let run_id = run_id(args, "run_id")?;
             json!(store
-                .release_claim(&card_id, &run_id, now)
+                .release_claim(&card_id, &run_id, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "renew_claim" => {
@@ -295,14 +295,14 @@ pub fn call_tool_store(
             let run_id = run_id(args, "run_id")?;
             let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
             json!(store
-                .renew_claim(&card_id, &run_id, now, ttl_seconds)
+                .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "heartbeat" => {
             let card_id = card_id(args, "card_id")?;
             let run_id = run_id(args, "run_id")?;
             json!(store
-                .heartbeat_claim(&card_id, &run_id, now)
+                .heartbeat_claim(&card_id, &run_id, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "get_card" => {
@@ -328,7 +328,7 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let answer = required_str(args, "answer")?;
             json!(store
-                .answer_input(&run_id, actor, answer, now)
+                .answer_input(&run_id, actor, answer, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "update_status" => {
@@ -336,7 +336,7 @@ pub fn call_tool_store(
             let status = CardStatus::parse(required_str(args, "status")?)
                 .ok_or_else(|| "invalid status".to_string())?;
             json!(store
-                .update_status(&card_id, status, now)
+                .update_status(&card_id, status, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "add_link" => {
@@ -351,14 +351,14 @@ pub fn call_tool_store(
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
             let question = required_str(args, "question")?;
             json!(store
-                .request_input(&run_id, question, now)
+                .request_input(&run_id, question, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "complete_card" => {
             let card_id = card_id(args, "card_id")?;
             let proof = required_str(args, "proof")?;
             json!(store
-                .complete_card(&card_id, proof, now)
+                .complete_card(&card_id, proof, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         other => return Err(format!("unknown tool: {other}")),
@@ -382,6 +382,21 @@ fn required_str<'a>(args: &'a Value, key: &'static str) -> Result<&'a str, Strin
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("missing required argument: {key}"))
+}
+
+/// Build the `Authority` a mutation is checked against from the optional
+/// `actor`/`admin` tool arguments. Omitting `actor` preserves prior MCP
+/// behavior exactly: a stdio-local caller is trusted and no ownership check
+/// runs, matching the CLI's `--actor` default.
+fn authority_arg(args: &Value) -> Authority {
+    match args["actor"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
+        None => Authority::unchecked(),
+    }
 }
 
 fn to_string(err: impl std::fmt::Display) -> String {
@@ -603,6 +618,71 @@ Expose tools against the DB.
             .as_str()
             .unwrap()
             .contains("005"));
+    }
+
+    #[test]
+    fn mcp_actor_argument_enforces_claim_holder_like_http_and_cli() {
+        let text = r#"# Holder enforcement
+Priority: P0 | Status: ready | Estimate: M
+
+## Goal
+Expose tools against the DB.
+
+## Oracle
+- [ ] tool flow works
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![parse_backlog_card(
+                "backlog.d/006-holder-enforcement.md",
+                text,
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+
+        call_tool_store(
+            &mut store,
+            "claim_card",
+            &json!({"card_id": "006", "agent": "codex", "actor": "codex"}),
+            10,
+        )
+        .unwrap();
+
+        let denied = call_tool_store(
+            &mut store,
+            "update_status",
+            &json!({"card_id": "006", "status": "running", "actor": "intruder"}),
+            11,
+        )
+        .unwrap_err();
+        assert!(denied.contains("intruder"));
+        assert!(denied.contains("does not hold the active claim"));
+
+        // an admin actor bypasses claim ownership.
+        call_tool_store(
+            &mut store,
+            "update_status",
+            &json!({"card_id": "006", "status": "running", "actor": "operator", "admin": true}),
+            12,
+        )
+        .unwrap();
+
+        // the real holder is unaffected by the rejected intrusion.
+        call_tool_store(
+            &mut store,
+            "complete_card",
+            &json!({"card_id": "006", "proof": "https://example.test/proof", "actor": "codex"}),
+            13,
+        )
+        .unwrap();
+
+        let card = call_tool_store(&mut store, "get_card", &json!({"card_id": "006"}), 14).unwrap();
+        assert!(card["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"done\""));
     }
 
     fn tool_payload(response: &Value) -> Value {
