@@ -18,7 +18,7 @@ rewrite of claims, statuses, runs, or proof.
 - Fix the import-clobber bug before importing real fleet work.
 - Add digest-aware update semantics.
 - Namespace card ids per repo so eight independently numbered backlog.d directories can share one instance (done — `load_backlog_dir_for_repo` / `powder import-repo`).
-- Add a body-content import request shape so a remote client can push parsed cards to a flycast-only deployed instance instead of only reading a server-local path.
+- Add a body-content import request shape so a remote client can push parsed cards to a flycast-only deployed instance instead of only reading a server-local path (done — `POST /api/v1/cards/import` accepts `files`/`repo`).
 - Add GitHub issue source adapter with dry-run mode.
 - Add a synthetic multi-repo fixture (id collision, claimed card, in-directory duplicate).
 - Import Factory backlog into the deployed Powder instance after the sync contract is safe.
@@ -66,6 +66,31 @@ rewrite of claims, statuses, runs, or proof.
   (`cli_import_repo_namespaces_ids_so_two_repos_never_collide`, two repos
   each shipping a `001-first.md`, both survive under distinct ids). 76
   workspace tests green.
+- 2026-07-02 slice (overnight autonomous): closed the HTTP body-content gap
+  from §3 below. `ImportRequest` now takes `path: Option<String>` (server-
+  local, unchanged) *or* `files: Option<Vec<{path, contents}>>` (raw
+  markdown, parsed server-side via the same `parse_backlog_card` the
+  local-path route already uses, so digest computation stays in one
+  place), plus an optional `repo` that runs the result through
+  `namespace_cards_for_repo` -- the same id-namespacing `import-repo`
+  already does locally, now reachable over HTTP. Sending both `path` and
+  `files`, or neither, is a 400. Extracted `powder_shell::namespace_cards_for_repo`
+  out of `load_backlog_dir_for_repo` (which now validates the repo slug
+  before touching the filesystem, fixing an ordering bug the refactor's
+  own test caught) so the HTTP route and the CLI share one namespacing
+  implementation instead of two. A remote client (an operator's machine,
+  a CI job) can now push a repo's backlog.d to a flycast-only deployed
+  instance's `/api/v1/cards/import` without the instance ever reading a
+  local path. Still open: a `powder import-repo --api-base-url/--api-key`
+  CLI variant that builds this request automatically (today a caller
+  drives the new shape directly, e.g. with curl or the existing MCP-remote
+  bearer-key pattern from backlog.d/005) -- deferred to keep this slice
+  focused; noted as a follow-up, not silently dropped.
+  Proof: 3 new powder-shell tests (direct `namespace_cards_for_repo`
+  coverage + the ordering-bug regression), 4 new HTTP tests (`files` body
+  creates a card, `files`+`repo` namespaces the id over HTTP, `path`+`files`
+  together is 400, neither is 400). 86 workspace tests green
+  (fmt/clippy/test).
 
 ## Design: importing all nine Factory repos' backlog.d
 
@@ -93,29 +118,15 @@ already true today: `import_cards`/`preview_import` compare digests and
 protect claimed/running/awaiting-input/terminal cards regardless of which
 repo tagged the card.
 
-**3. Remaining gap: the HTTP import route reads a *server-side* path.**
-`POST /api/v1/cards/import` takes `{"path": "..."}` and calls
-`load_backlog_dir(&request.path, now)` — it re-parses markdown living on
-the *deployed instance's own filesystem*. That's fine for Powder's own
-`backlog.d/` (bakeable into the image, or committed if ever mounted), but
-the other eight repos' checkouts live wherever the importer runs (an
-operator's machine, a CI job, a herdr lane) — not inside the flycast-only
-deployed container. Pushing parsed cards to a *remote* instance therefore
-needs the route to accept content in the request body, not a path:
-  - Add `cards: Option<Vec<Card>>` (or a raw `files: Vec<{path, contents}>`
-    to parse server-side, keeping the digest computation in one place) as
-    an alternative to `path` on `ImportRequest`.
-  - `import_cards`/`preview_import` already operate on `Vec<Card>` — no
-    store-level change needed, only the HTTP request shape.
-  - The natural client is a `powder import-repo` variant that, instead of
-    (or in addition to) `--db`, takes `--api-base-url`/`--api-key` (mirroring
-    the MCP remote client from backlog.d/005) and POSTs the namespaced cards
-    it already builds locally via `load_backlog_dir_for_repo`.
-  - Until that ships, a fleet import can still run today by copying/mounting
-    each source repo's backlog.d next to the deployed instance's binary and
-    driving `powder-cli`/`powder-server`'s `--db`-direct path from inside
-    the same filesystem (e.g. a one-off `fly ssh console` or a sidecar
-    machine) — clumsier, but not blocked.
+**3. Closed: the HTTP import route no longer requires a server-side path.**
+`POST /api/v1/cards/import` now takes `{"path": "..."}` (server-local,
+unchanged) *or* `{"files": [{"path", "contents"}], "repo": "..."}` (raw
+markdown parsed server-side, then optionally namespaced) — a remote client
+(an operator's machine, a CI job) can push a repo's backlog.d to a
+flycast-only deployed instance without the instance ever reading a local
+path. Still open: a `powder import-repo --api-base-url/--api-key` CLI
+variant that builds this request automatically instead of a caller driving
+it directly (curl, or a small script) — small, deferred, not blocking.
 
 **4. Ordering and duplicate handling.** Import repos in a fixed order
 (alphabetical by slug is simplest and reviewable in a log) so a partial

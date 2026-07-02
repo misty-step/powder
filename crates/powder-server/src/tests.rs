@@ -420,6 +420,132 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
 }
 
 #[tokio::test]
+async fn import_accepts_raw_file_contents_body_for_a_remote_client() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let ticket = r#"# Body-content import test
+
+Priority: P0 | Status: ready
+
+## Goal
+Prove a remote client can push parsed cards without server filesystem access.
+
+## Oracle
+- [ ] it works
+"#;
+    let body = json!({
+        "files": [{"path": "backlog.d/001-body-import.md", "contents": ticket}],
+    })
+    .to_string();
+
+    let imported = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&admin_key),
+            &body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::OK);
+    let outcome = response_json(imported).await;
+    assert_eq!(outcome["created"], 1);
+
+    let card = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/001")
+                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(card.status(), StatusCode::OK);
+    let card = response_json(card).await;
+    assert_eq!(card["card"]["title"], "Body-content import test");
+}
+
+#[tokio::test]
+async fn import_with_repo_namespaces_card_ids_over_http() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let ticket = "# Remote repo ticket\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n";
+    let body = json!({
+        "files": [{"path": "001-first.md", "contents": ticket}],
+        "repo": "misty-step/bitterblossom",
+    })
+    .to_string();
+
+    let imported = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&admin_key),
+            &body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::OK);
+
+    let card = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/bitterblossom-001")
+                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        card.status(),
+        StatusCode::OK,
+        "card id must be namespaced bitterblossom-001"
+    );
+}
+
+#[tokio::test]
+async fn import_rejects_both_path_and_files_together() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&admin_key),
+            r#"{"path":"backlog.d","files":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn import_rejects_neither_path_nor_files() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&admin_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn agent_scoped_key_cannot_author_or_import_cards() {
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state

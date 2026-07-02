@@ -15,8 +15,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use powder_core::{Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
-use powder_shell::{load_backlog_dir, unix_now};
+use powder_core::{
+    parse_backlog_card, Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId,
+};
+use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{ApiKeyScope, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -166,8 +168,26 @@ struct ReadyParams {
 }
 
 #[derive(Debug, Deserialize)]
-struct ImportRequest {
+struct ImportFile {
     path: String,
+    contents: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportRequest {
+    /// A backlog.d directory on the *server's* own filesystem (e.g. this
+    /// instance's own baked-in backlog.d). Mutually exclusive with `files`.
+    path: Option<String>,
+    /// Raw markdown content parsed server-side, for a remote client (a
+    /// private/flycast-only deployed instance has no access to another
+    /// repo's local checkout) pushing a repo's backlog.d over the wire
+    /// instead of pointing at a path this instance can read. Mutually
+    /// exclusive with `path`.
+    files: Option<Vec<ImportFile>>,
+    /// When set, namespaces every card id `{repo-slug}-{original-id}` and
+    /// tags `card.repo`, so cards from independently numbered repos never
+    /// collide in one instance (see `powder_shell::namespace_cards_for_repo`).
+    repo: Option<String>,
     dry_run: Option<bool>,
 }
 
@@ -355,8 +375,33 @@ async fn import_cards(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state, &headers)?;
     let now = unix_now();
-    let cards = load_backlog_dir(&request.path, now)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let mut cards = match (&request.path, request.files) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "import accepts either path or files, not both",
+            ));
+        }
+        (Some(path), None) => {
+            load_backlog_dir(path, now).map_err(|err| ApiError::bad_request(err.to_string()))?
+        }
+        (None, Some(mut files)) => {
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            files
+                .into_iter()
+                .map(|file| {
+                    parse_backlog_card(&file.path, &file.contents, now)
+                        .map_err(|err| ApiError::bad_request(err.to_string()))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        }
+        (None, None) => {
+            return Err(ApiError::bad_request("import requires path or files"));
+        }
+    };
+    if let Some(repo) = request.repo.as_deref() {
+        cards = namespace_cards_for_repo(cards, repo)
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    }
     let outcome = if request.dry_run.unwrap_or(false) {
         lock_store(&state)?.preview_import(&cards)?
     } else {

@@ -114,17 +114,31 @@ pub fn load_backlog_dir_for_repo(
     repo: &str,
     now: i64,
 ) -> ShellResult<Vec<Card>> {
-    let id_prefix = repo.rsplit('/').next().filter(|part| !part.is_empty());
-    let Some(id_prefix) = id_prefix else {
-        return Err(ShellError::Invalid(format!("invalid repo slug: {repo}")));
-    };
+    // Validate the slug before touching the filesystem: a bad --repo value
+    // should fail fast, not depend on whether the path also happens to be
+    // invalid.
+    validate_repo_slug(repo)?;
+    namespace_cards_for_repo(load_backlog_dir(path, now)?, repo)
+}
 
-    let mut cards = load_backlog_dir(path, now)?;
+/// Tag `cards` with `repo` and namespace each id `{repo-slug}-{original-id}`.
+/// Shared by [`load_backlog_dir_for_repo`] and by callers (e.g. an HTTP
+/// import route) that parse cards from a source other than a local
+/// directory but still need the same collision-free multi-repo id scheme.
+pub fn namespace_cards_for_repo(mut cards: Vec<Card>, repo: &str) -> ShellResult<Vec<Card>> {
+    let id_prefix = validate_repo_slug(repo)?;
     for card in &mut cards {
         card.id = CardId::new(format!("{id_prefix}-{}", card.id)).map_err(ShellError::from)?;
         card.repo = Some(repo.to_string());
     }
     Ok(cards)
+}
+
+fn validate_repo_slug(repo: &str) -> ShellResult<&str> {
+    repo.rsplit('/')
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| ShellError::Invalid(format!("invalid repo slug: {repo}")))
 }
 
 fn markdown_files(path: &Path) -> ShellResult<Vec<PathBuf>> {
@@ -189,6 +203,22 @@ mod tests {
     #[test]
     fn load_backlog_dir_for_repo_rejects_a_trailing_slash_slug() {
         let err = load_backlog_dir_for_repo("backlog.d", "misty-step/", 10).unwrap_err();
+        assert!(matches!(err, ShellError::Invalid(_)));
+    }
+
+    #[test]
+    fn namespace_cards_for_repo_tags_and_prefixes_ids_of_already_parsed_cards() {
+        let card = powder_core::Card::new(CardId::new("001").unwrap(), "Title", "body").unwrap();
+
+        let namespaced = namespace_cards_for_repo(vec![card], "misty-step/crucible").unwrap();
+
+        assert_eq!(namespaced[0].id.as_str(), "crucible-001");
+        assert_eq!(namespaced[0].repo.as_deref(), Some("misty-step/crucible"));
+    }
+
+    #[test]
+    fn namespace_cards_for_repo_rejects_an_empty_slug() {
+        let err = namespace_cards_for_repo(Vec::new(), "").unwrap_err();
         assert!(matches!(err, ShellError::Invalid(_)));
     }
 }
