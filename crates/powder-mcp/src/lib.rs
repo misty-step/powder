@@ -4,6 +4,10 @@ use powder_core::{Authority, Board, CardId, CardStatus, ReadyQuery, RunId};
 use powder_store::Store;
 use serde_json::{json, Value};
 
+mod remote;
+
+pub use remote::{call_tool_remote, RemoteClient};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolDef {
     pub name: &'static str,
@@ -150,6 +154,42 @@ pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Op
             let name = params["name"].as_str().unwrap_or("");
             let args = &params["arguments"];
             call_tool_store(store, name, args, now)
+        }
+        "ping" => Ok(json!({})),
+        other => Err(format!("method not found: {other}")),
+    };
+
+    id.map(|id| match result {
+        Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
+        Err(message) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32603, "message": message},
+        }),
+    })
+}
+
+/// Same JSON-RPC dispatch as [`handle_json_rpc_store`], but against a
+/// deployed instance's HTTP API via `client` instead of a local `Store`. The
+/// deployed instance supplies its own clock, so there is no `now` parameter.
+pub fn handle_json_rpc_remote(client: &RemoteClient, request: &Value) -> Option<Value> {
+    let id = request.get("id").cloned();
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+
+    let result = match method {
+        "initialize" => Ok(json!({
+            "protocolVersion": request["params"]["protocolVersion"]
+                .as_str()
+                .unwrap_or("2024-11-05"),
+            "serverInfo": {"name": "powder", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"tools": {"listChanged": false}},
+        })),
+        "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
+        "tools/call" => {
+            let params = &request["params"];
+            let name = params["name"].as_str().unwrap_or("");
+            let args = &params["arguments"];
+            call_tool_remote(client, name, args)
         }
         "ping" => Ok(json!({})),
         other => Err(format!("method not found: {other}")),
