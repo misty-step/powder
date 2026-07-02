@@ -198,13 +198,7 @@ impl Board {
             card_id: card_id.clone(),
             state: RunState::Active,
             agent: agent.clone(),
-            model: None,
             claim_expires_at: claim.expires_at,
-            turn_count: 0,
-            token_count: 0,
-            consecutive_failures: 0,
-            last_error: None,
-            result: None,
             proof: None,
             created_at: now,
             updated_at: now,
@@ -520,7 +514,7 @@ impl Board {
     fn mark_expired_runs_stale(&mut self, card_id: &CardId, now: i64) {
         for run in self.runs.values_mut() {
             if &run.card_id == card_id
-                && matches!(run.state, RunState::Active | RunState::Pending)
+                && run.state == RunState::Active
                 && run.claim_expires_at <= now
             {
                 run.state = RunState::Stale;

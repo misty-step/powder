@@ -289,7 +289,6 @@ impl CardStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
-    Pending,
     Active,
     AwaitingInput,
     Released,
@@ -301,7 +300,6 @@ pub enum RunState {
 impl RunState {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "pending" => Some(Self::Pending),
             "active" => Some(Self::Active),
             "awaiting-input" | "awaiting_input" => Some(Self::AwaitingInput),
             "released" => Some(Self::Released),
@@ -314,7 +312,6 @@ impl RunState {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Pending => "pending",
             Self::Active => "active",
             Self::AwaitingInput => "awaiting_input",
             Self::Released => "released",
@@ -637,13 +634,7 @@ pub struct Run {
     pub card_id: CardId,
     pub state: RunState,
     pub agent: String,
-    pub model: Option<String>,
     pub claim_expires_at: i64,
-    pub turn_count: u32,
-    pub token_count: u64,
-    pub consecutive_failures: u32,
-    pub last_error: Option<String>,
-    pub result: Option<String>,
     pub proof: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,

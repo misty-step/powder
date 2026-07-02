@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -55,13 +55,7 @@ CREATE TABLE IF NOT EXISTS runs (
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   state TEXT NOT NULL,
   agent TEXT NOT NULL,
-  model TEXT,
   claim_expires_at INTEGER NOT NULL,
-  turn_count INTEGER NOT NULL,
-  token_count INTEGER NOT NULL,
-  consecutive_failures INTEGER NOT NULL,
-  last_error TEXT,
-  result TEXT,
   proof TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -128,6 +122,21 @@ pub const MIGRATE_2_TO_3: &str = r#"
 ALTER TABLE api_keys ADD COLUMN hash_algorithm TEXT NOT NULL DEFAULT 'bcrypt';
 "#;
 
+/// `model`/`turn_count`/`token_count`/`consecutive_failures`/`last_error`/
+/// `result` were never set to a real value by any surface -- only ever
+/// re-persisted as whatever was already there (0/None from claim time) via
+/// the store's own `ON CONFLICT ... = excluded.*` upsert. Dead columns since
+/// the day this schema was written; `proof` is untouched, since
+/// `complete_card` genuinely writes it.
+pub const MIGRATE_3_TO_4: &str = r#"
+ALTER TABLE runs DROP COLUMN model;
+ALTER TABLE runs DROP COLUMN turn_count;
+ALTER TABLE runs DROP COLUMN token_count;
+ALTER TABLE runs DROP COLUMN consecutive_failures;
+ALTER TABLE runs DROP COLUMN last_error;
+ALTER TABLE runs DROP COLUMN result;
+"#;
+
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, status, priority, labels_json,
 assignee, blocked_by_json, repo, workspace_path, branch_name, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
@@ -143,6 +152,5 @@ labels_json, assignee, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards";
 
-pub const RUN_SELECT_SQL: &str = "SELECT id, card_id, state, agent, model, claim_expires_at,
-turn_count, token_count, consecutive_failures, last_error, result, proof,
+pub const RUN_SELECT_SQL: &str = "SELECT id, card_id, state, agent, claim_expires_at, proof,
 created_at, updated_at FROM runs WHERE id = ?1";

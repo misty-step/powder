@@ -39,8 +39,7 @@ impl Store {
 
     pub fn list_awaiting_input(&self, limit: usize) -> Result<Vec<AwaitingInput>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, card_id, state, agent, model, claim_expires_at,
-             turn_count, token_count, consecutive_failures, last_error, result, proof,
+            "SELECT id, card_id, state, agent, claim_expires_at, proof,
              created_at, updated_at
              FROM runs
              WHERE state = 'awaiting_input'
@@ -116,8 +115,7 @@ fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run> {
 
 fn load_runs_for_card(connection: &Connection, card_id: &CardId) -> Result<Vec<Run>> {
     let mut statement = connection.prepare(
-        "SELECT id, card_id, state, agent, model, claim_expires_at,
-         turn_count, token_count, consecutive_failures, last_error, result, proof,
+        "SELECT id, card_id, state, agent, claim_expires_at, proof,
          created_at, updated_at
          FROM runs
          WHERE card_id = ?1

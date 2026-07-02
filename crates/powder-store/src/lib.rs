@@ -19,7 +19,7 @@ pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, 
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_3_TO_4, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -114,6 +114,10 @@ impl Store {
                 2 => {
                     self.connection.execute_batch(MIGRATE_2_TO_3)?;
                     3
+                }
+                3 => {
+                    self.connection.execute_batch(MIGRATE_3_TO_4)?;
+                    4
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -301,7 +305,7 @@ impl Store {
             "UPDATE runs
              SET state = 'stale', updated_at = ?2
              WHERE card_id = ?1
-               AND state IN ('active', 'pending')
+               AND state = 'active'
                AND claim_expires_at <= ?2",
             params![card_id.as_str(), now],
         )?;
@@ -326,13 +330,7 @@ impl Store {
             card_id: card_id.clone(),
             state: RunState::Active,
             agent: agent.clone(),
-            model: None,
             claim_expires_at: claim.expires_at,
-            turn_count: 0,
-            token_count: 0,
-            consecutive_failures: 0,
-            last_error: None,
-            result: None,
             proof: None,
             created_at: now,
             updated_at: now,
@@ -700,21 +698,14 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
 fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     connection.execute(
         "INSERT INTO runs (
-            id, card_id, state, agent, model, claim_expires_at, turn_count,
-            token_count, consecutive_failures, last_error, result, proof,
+            id, card_id, state, agent, claim_expires_at, proof,
             created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
            card_id = excluded.card_id,
            state = excluded.state,
            agent = excluded.agent,
-           model = excluded.model,
            claim_expires_at = excluded.claim_expires_at,
-           turn_count = excluded.turn_count,
-           token_count = excluded.token_count,
-           consecutive_failures = excluded.consecutive_failures,
-           last_error = excluded.last_error,
-           result = excluded.result,
            proof = excluded.proof,
            created_at = excluded.created_at,
            updated_at = excluded.updated_at",
@@ -723,13 +714,7 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
             run.card_id.as_str(),
             run.state.as_str(),
             run.agent,
-            run.model,
             run.claim_expires_at,
-            run.turn_count,
-            run.token_count,
-            run.consecutive_failures,
-            run.last_error,
-            run.result,
             run.proof,
             run.created_at,
             run.updated_at
@@ -978,13 +963,7 @@ struct RunRecord {
     card_id: String,
     state: String,
     agent: String,
-    model: Option<String>,
     claim_expires_at: i64,
-    turn_count: u32,
-    token_count: u64,
-    consecutive_failures: u32,
-    last_error: Option<String>,
-    result: Option<String>,
     proof: Option<String>,
     created_at: i64,
     updated_at: i64,
@@ -997,16 +976,10 @@ impl RunRecord {
             card_id: row.get(1)?,
             state: row.get(2)?,
             agent: row.get(3)?,
-            model: row.get(4)?,
-            claim_expires_at: row.get(5)?,
-            turn_count: row.get(6)?,
-            token_count: row.get(7)?,
-            consecutive_failures: row.get(8)?,
-            last_error: row.get(9)?,
-            result: row.get(10)?,
-            proof: row.get(11)?,
-            created_at: row.get(12)?,
-            updated_at: row.get(13)?,
+            claim_expires_at: row.get(4)?,
+            proof: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
         })
     }
 
@@ -1019,13 +992,7 @@ impl RunRecord {
                 value: self.state,
             })?,
             agent: self.agent,
-            model: self.model,
             claim_expires_at: self.claim_expires_at,
-            turn_count: self.turn_count,
-            token_count: self.token_count,
-            consecutive_failures: self.consecutive_failures,
-            last_error: self.last_error,
-            result: self.result,
             proof: self.proof,
             created_at: self.created_at,
             updated_at: self.updated_at,

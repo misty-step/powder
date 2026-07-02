@@ -1,5 +1,6 @@
 use powder_core::{
-    Authority, Card, CardId, CardSource, CardStatus, DomainError, Priority, ReadyQuery, RunState,
+    Authority, Card, CardId, CardSource, CardStatus, DomainError, Priority, ReadyQuery, RunId,
+    RunState,
 };
 
 use crate::{ApiKeyScope, CardFilter, ImportOutcome, Result, Store, StoreError, API_KEY_ALPHABET};
@@ -676,6 +677,25 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
               revoked_at INTEGER
             );
             CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            -- a real v1 database already had the original runs shape
+            -- (predating the identity/hash-algorithm migrations entirely),
+            -- including the columns backlog.d/018 later dropped.
+            CREATE TABLE runs (
+              id TEXT PRIMARY KEY,
+              card_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              agent TEXT NOT NULL,
+              model TEXT,
+              claim_expires_at INTEGER NOT NULL,
+              turn_count INTEGER NOT NULL,
+              token_count INTEGER NOT NULL,
+              consecutive_failures INTEGER NOT NULL,
+              last_error TEXT,
+              result TEXT,
+              proof TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
             PRAGMA user_version = 1;
             "#,
         )?;
@@ -695,9 +715,9 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 3);
+    assert_eq!(store.schema_version()?, 4);
 
-    // a v1 database steps through every intermediate migration (1->2->3),
+    // a v1 database steps through every intermediate migration (1->2->3->4),
     // not just straight to current: the legacy bcrypt-hashed key must still
     // verify after picking up hash_algorithm (defaulted to 'bcrypt' for
     // pre-existing rows), proving the loop didn't skip a step.
@@ -744,6 +764,24 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
               revoked_at INTEGER
             );
             CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            -- a real v2 database already had the original runs shape,
+            -- including the columns backlog.d/018 later dropped.
+            CREATE TABLE runs (
+              id TEXT PRIMARY KEY,
+              card_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              agent TEXT NOT NULL,
+              model TEXT,
+              claim_expires_at INTEGER NOT NULL,
+              turn_count INTEGER NOT NULL,
+              token_count INTEGER NOT NULL,
+              consecutive_failures INTEGER NOT NULL,
+              last_error TEXT,
+              result TEXT,
+              proof TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
             PRAGMA user_version = 2;
             "#,
         )?;
@@ -761,7 +799,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 3);
+    assert_eq!(store.schema_version()?, 4);
 
     // the pre-existing bcrypt key keeps authenticating after the migration
     // adds hash_algorithm (defaulted to 'bcrypt' for existing rows) --
@@ -782,6 +820,123 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
         .verify_api_key(&created.raw_key)?
         .expect("new sha256 key");
     assert_eq!(verified.actor.display_name, "post-migration-agent");
+    Ok(())
+}
+
+#[test]
+fn migrating_a_v3_database_drops_the_dead_run_columns() -> Result<()> {
+    let path = temp_db("v3-run-columns");
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE api_keys (
+              id TEXT PRIMARY KEY,
+              actor_id TEXT NOT NULL REFERENCES actors(id),
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER
+            );
+            CREATE TABLE cards (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              priority TEXT NOT NULL,
+              labels_json TEXT NOT NULL,
+              assignee TEXT,
+              blocked_by_json TEXT NOT NULL,
+              repo TEXT,
+              workspace_path TEXT,
+              branch_name TEXT,
+              source_path TEXT,
+              source_digest TEXT,
+              claim_agent TEXT,
+              claim_run_id TEXT,
+              claim_acquired_at INTEGER,
+              claim_expires_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE runs (
+              id TEXT PRIMARY KEY,
+              card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+              state TEXT NOT NULL,
+              agent TEXT NOT NULL,
+              model TEXT,
+              claim_expires_at INTEGER NOT NULL,
+              turn_count INTEGER NOT NULL,
+              token_count INTEGER NOT NULL,
+              consecutive_failures INTEGER NOT NULL,
+              last_error TEXT,
+              result TEXT,
+              proof TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 3;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO cards (id, title, body, acceptance_json, status, priority, labels_json,
+                                 blocked_by_json, created_at, updated_at)
+             VALUES ('001', 'Title', 'Body', '[]', 'ready', 'p2', '[]', '[]', 1, 1)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO runs (id, card_id, state, agent, model, claim_expires_at, turn_count,
+                                token_count, consecutive_failures, last_error, result, proof,
+                                created_at, updated_at)
+             VALUES ('run-1', '001', 'active', 'agent-a', 'gpt-legacy', 100, 3, 500, 1,
+                     'timeout', 'partial', NULL, 10, 10)",
+            [],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, 4);
+
+    let columns: Vec<String> = {
+        let mut statement = store
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('runs')")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for dead in [
+        "model",
+        "turn_count",
+        "token_count",
+        "consecutive_failures",
+        "last_error",
+        "result",
+    ] {
+        assert!(
+            !columns.contains(&dead.to_string()),
+            "column {dead} should have been dropped by the v3->v4 migration: {columns:?}"
+        );
+    }
+
+    // the run itself, and its still-relevant columns, survive the migration.
+    let run = store
+        .get_run(&RunId::new("run-1")?)?
+        .expect("run survives column drop");
+    assert_eq!(run.agent, "agent-a");
+    assert_eq!(run.claim_expires_at, 100);
     Ok(())
 }
 
