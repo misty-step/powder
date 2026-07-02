@@ -1118,6 +1118,57 @@ async fn tailnet_and_none_modes_authorize_as_configured() {
     assert_eq!(none.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn every_request_triggers_the_trace_layer_without_leaking_the_bearer_token() {
+    // Proves the wiring pattern deterministically, without depending on
+    // tracing's process-wide, dynamically-scoped subscriber dispatch --
+    // capturing real `tracing_subscriber::fmt` output via
+    // `tracing::subscriber::set_default` is flaky under `cargo test`'s
+    // parallel execution (tracing-core's per-callsite interest cache is
+    // process-wide and races across concurrently running tests that each
+    // try to install their own default). `TraceLayer`'s `on_response`
+    // callback is a plain closure invoked directly by the tower `Service`
+    // machinery regardless of any tracing subscriber, so wrapping the real
+    // `app()` router in a second, test-only layer proves the same
+    // request/response data TraceLayer sees on every request -- method,
+    // path, status -- reaches a callback, and that the raw bearer token
+    // (as opposed to just an auth-succeeded/failed outcome) never does.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state).layer(TraceLayer::new_for_http().on_response(
+        move |response: &Response, _latency: std::time::Duration, _span: &tracing::Span| {
+            recorder
+                .lock()
+                .unwrap()
+                .push(format!("{}", response.status()));
+        },
+    ));
+
+    let response = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = seen.lock().unwrap();
+    assert_eq!(
+        recorded.as_slice(),
+        ["200 OK"],
+        "TraceLayer must observe every request/response pair"
+    );
+    assert!(
+        !recorded.iter().any(|entry| entry.contains(&raw_key)),
+        "the bearer token must never reach anything TraceLayer records: {recorded:?}"
+    );
+}
+
 fn test_state(auth_mode: AuthMode) -> (AppState, String) {
     let mut store = Store::open_in_memory().unwrap();
     store.migrate().unwrap();

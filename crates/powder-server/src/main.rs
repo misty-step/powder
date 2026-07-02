@@ -23,6 +23,7 @@ use powder_store::{ApiKeyScope, CardFilter, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
 
 const DEFAULT_DB_PATH: &str = "/data/powder.db";
 const DEFAULT_PORT: u16 = 4000;
@@ -326,6 +327,10 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .with_state(state)
+        // Method/path/status/latency per request via the tracing crate
+        // already in use; never touches headers or bodies, so bearer keys
+        // and card content never reach the log.
+        .layer(TraceLayer::new_for_http())
 }
 
 async fn healthz() -> Json<Health> {
