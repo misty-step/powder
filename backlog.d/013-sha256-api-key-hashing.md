@@ -54,7 +54,7 @@ nothing here and only taxes every request.
   migration is stored with `hash_algorithm = 'sha256'` and verifies), 1 new
   fail-closed test (an unrecognized `hash_algorithm` never authenticates),
   and the existing v1-migration test extended to assert the full v1->v3
-  jump. 104 workspace tests green (fmt/clippy/test). Residual: this doesn't
+  jump. 103 workspace tests green (fmt/clippy/test). Residual: this doesn't
   address the still-synchronous nature of the store mutex itself (the other
   perf-floor items — `spawn_blocking`, connection pooling, SQL-native
   `list_ready` — remain open follow-ups), but removing the ~200-300ms
