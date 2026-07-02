@@ -65,7 +65,19 @@ pub fn load_backlog_dir(path: impl AsRef<Path>, now: i64) -> ShellResult<Vec<Car
         let contents = fs::read_to_string(&file).map_err(|err| {
             ShellError::Store(format!("could not read {}: {err}", file.display()))
         })?;
-        let display_path = file.to_string_lossy();
+        // Only the basename becomes `Card.source.path`, never the full
+        // (possibly absolute) path this directory was passed as: the full
+        // path would bake the operator's local filesystem layout (home
+        // directory, checkout location) into the card, persisted forever
+        // and visible to any caller who can read the card -- the same leak
+        // class backlog.d/005 closed for the server's db_path. The
+        // basename alone still identifies which file a card came from;
+        // `id_from_path` only ever looks at the basename anyway, so this
+        // doesn't change id derivation.
+        let display_path = file
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.to_string_lossy().into_owned());
         let card = parse_backlog_card(&display_path, &contents, now)
             .map_err(|err| ShellError::Invalid(err.to_string()))?;
         cards.push(card);
@@ -145,6 +157,39 @@ mod tests {
     #[test]
     fn unix_now_is_positive() {
         assert!(unix_now() > 0);
+    }
+
+    #[test]
+    fn load_backlog_dir_never_leaks_the_operators_local_directory_structure() {
+        let dir = std::env::temp_dir().join(format!(
+            "powder-shell-path-leak-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("001-example.md"),
+            "# Example ticket\n\nPriority: P1 | Status: ready\n\n## Goal\nDo it.\n\n## Oracle\n- [ ] done\n",
+        )
+        .unwrap();
+        assert!(
+            dir.is_absolute(),
+            "the test setup itself must exercise an absolute path for this to prove anything"
+        );
+
+        let cards = load_backlog_dir(&dir, 10).unwrap();
+
+        assert_eq!(cards.len(), 1);
+        let source = cards[0].source.as_ref().expect("card has a source");
+        assert_eq!(
+            source.path, "001-example.md",
+            "source.path must be just the basename, never the directory this was imported \
+             from -- the full path would bake the operator's local filesystem layout into \
+             every card, persisted forever: {}",
+            source.path
+        );
     }
 
     #[test]
