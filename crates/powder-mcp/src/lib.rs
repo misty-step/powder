@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use powder_core::{Authority, Board, CardId, CardStatus, ReadyQuery, RunId};
+use powder_core::{Authority, CardId, CardStatus, ReadyQuery, RunId};
 use powder_store::Store;
 use serde_json::{json, Value};
 
@@ -103,39 +103,6 @@ pub fn tool_defs_json() -> Value {
     )
 }
 
-pub fn handle_json_rpc(board: &mut Board, request: &Value, now: i64) -> Option<Value> {
-    let id = request.get("id").cloned();
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": request["params"]["protocolVersion"]
-                .as_str()
-                .unwrap_or("2024-11-05"),
-            "serverInfo": {"name": "powder", "version": env!("CARGO_PKG_VERSION")},
-            "capabilities": {"tools": {"listChanged": false}},
-        })),
-        "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
-        "tools/call" => {
-            let params = &request["params"];
-            let name = params["name"].as_str().unwrap_or("");
-            let args = &params["arguments"];
-            call_tool(board, name, args, now)
-        }
-        "ping" => Ok(json!({})),
-        other => Err(format!("method not found: {other}")),
-    };
-
-    id.map(|id| match result {
-        Ok(value) => json!({"jsonrpc": "2.0", "id": id, "result": value}),
-        Err(message) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32603, "message": message},
-        }),
-    })
-}
-
 pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
@@ -203,103 +170,6 @@ pub fn handle_json_rpc_remote(client: &RemoteClient, request: &Value) -> Option<
             "error": {"code": -32603, "message": message},
         }),
     })
-}
-
-pub fn call_tool(board: &mut Board, name: &str, args: &Value, now: i64) -> Result<Value, String> {
-    let payload = match name {
-        "list_ready" => {
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            json!(board.list_ready(ReadyQuery::new(now, limit)))
-        }
-        "claim_card" => {
-            let card_id = card_id(args, "card_id")?;
-            let agent = required_str(args, "agent")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            json!(board
-                .claim_card(&card_id, agent, now, ttl_seconds)
-                .map_err(to_string)?)
-        }
-        "release_claim" => {
-            let card_id = card_id(args, "card_id")?;
-            let run_id = run_id(args, "run_id")?;
-            json!(board
-                .release_claim(&card_id, &run_id, now)
-                .map_err(to_string)?)
-        }
-        "renew_claim" => {
-            let card_id = card_id(args, "card_id")?;
-            let run_id = run_id(args, "run_id")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            json!(board
-                .renew_claim(&card_id, &run_id, now, ttl_seconds)
-                .map_err(to_string)?)
-        }
-        "heartbeat" => {
-            let card_id = card_id(args, "card_id")?;
-            let run_id = run_id(args, "run_id")?;
-            json!(board
-                .heartbeat_claim(&card_id, &run_id, now)
-                .map_err(to_string)?)
-        }
-        "get_card" => {
-            let card_id = card_id(args, "card_id")?;
-            json!(board
-                .get_card_detail(&card_id)
-                .ok_or_else(|| format!("card not found: {card_id}"))?)
-        }
-        "get_run" => {
-            let run_id = run_id(args, "run_id")?;
-            json!(board
-                .get_run_detail(&run_id)
-                .ok_or_else(|| format!("run not found: {run_id}"))?)
-        }
-        "list_awaiting_input" => {
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            json!(board.list_awaiting_input(limit))
-        }
-        "answer_input" => {
-            let run_id = run_id(args, "run_id")?;
-            let actor = required_str(args, "actor")?;
-            let answer = required_str(args, "answer")?;
-            json!(board
-                .answer_input(&run_id, actor, answer, now)
-                .map_err(to_string)?)
-        }
-        "update_status" => {
-            let card_id = card_id(args, "card_id")?;
-            let status = CardStatus::parse(required_str(args, "status")?)
-                .ok_or_else(|| "invalid status".to_string())?;
-            json!(board
-                .update_status(&card_id, status, now)
-                .map_err(to_string)?)
-        }
-        "add_link" => {
-            let card_id = card_id(args, "card_id")?;
-            let label = required_str(args, "label")?;
-            let url = required_str(args, "url")?;
-            json!(board
-                .add_link(&card_id, label, url, now)
-                .map_err(to_string)?)
-        }
-        "request_input" => {
-            let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
-            let question = required_str(args, "question")?;
-            json!(board
-                .request_input(&run_id, question, now)
-                .map_err(to_string)?)
-        }
-        "complete_card" => {
-            let card_id = card_id(args, "card_id")?;
-            let proof = required_str(args, "proof")?;
-            json!(board
-                .complete_card(&card_id, proof, now)
-                .map_err(to_string)?)
-        }
-        other => return Err(format!("unknown tool: {other}")),
-    };
-
-    let text = serde_json::to_string_pretty(&payload).map_err(to_string)?;
-    Ok(json!({"content": [{"type": "text", "text": text}]}))
 }
 
 pub fn call_tool_store(
@@ -446,7 +316,7 @@ fn to_string(err: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use powder_core::{parse_backlog_card, Board};
+    use powder_core::parse_backlog_card;
     use powder_store::Store;
 
     #[test]
@@ -465,105 +335,6 @@ mod tests {
         assert!(names.contains(&"answer_input"));
         assert!(names.contains(&"add_link"));
         assert!(names.contains(&"request_input"));
-    }
-
-    #[test]
-    fn mcp_claim_request_input_and_complete_flow() {
-        let text = r#"# Ship MCP tools
-
-Priority: P0 | Status: ready | Estimate: M
-
-## Goal
-Expose tools.
-
-## Oracle
-- [ ] tool flow works
-"#;
-        let mut board = Board::default();
-        board.import_cards(vec![parse_backlog_card(
-            "backlog.d/004-ship-v0-mcp-tools.md",
-            text,
-            1,
-        )
-        .unwrap()]);
-
-        let ready = call_tool(&mut board, "list_ready", &json!({"limit": 1}), 10).unwrap();
-        assert!(ready["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("004"));
-
-        let claimed = call_tool(
-            &mut board,
-            "claim_card",
-            &json!({"card_id": "004", "agent": "codex", "ttl_seconds": 60}),
-            11,
-        )
-        .unwrap();
-        let claimed_text = claimed["content"][0]["text"].as_str().unwrap();
-        assert!(claimed_text.contains("run-1"));
-        let claimed_json = tool_payload(&claimed);
-        let run_id = claimed_json["run_id"].as_str().unwrap();
-
-        call_tool(
-            &mut board,
-            "heartbeat",
-            &json!({"card_id": "004", "run_id": run_id}),
-            12,
-        )
-        .unwrap();
-        call_tool(
-            &mut board,
-            "renew_claim",
-            &json!({"card_id": "004", "run_id": run_id, "ttl_seconds": 60}),
-            13,
-        )
-        .unwrap();
-
-        call_tool(
-            &mut board,
-            "request_input",
-            &json!({"run_id": "run-1", "question": "Approve?"}),
-            14,
-        )
-        .unwrap();
-        let awaiting =
-            call_tool(&mut board, "list_awaiting_input", &json!({"limit": 10}), 15).unwrap();
-        assert!(awaiting["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Approve?"));
-        call_tool(
-            &mut board,
-            "answer_input",
-            &json!({"run_id": "run-1", "actor": "operator", "answer": "Approved"}),
-            16,
-        )
-        .unwrap();
-        let run = call_tool(&mut board, "get_run", &json!({"run_id": "run-1"}), 17).unwrap();
-        assert!(run["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Approved"));
-        call_tool(
-            &mut board,
-            "add_link",
-            &json!({"card_id": "004", "label": "PR", "url": "https://github.com/misty-step/powder/pull/1"}),
-            18,
-        )
-        .unwrap();
-        let card = call_tool(&mut board, "get_card", &json!({"card_id": "004"}), 19).unwrap();
-        assert!(card["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("\"activities\""));
-        call_tool(
-            &mut board,
-            "complete_card",
-            &json!({"card_id": "004", "proof": "https://github.com/misty-step/powder/pull/1"}),
-            20,
-        )
-        .unwrap();
     }
 
     #[test]

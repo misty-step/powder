@@ -17,8 +17,11 @@ product repository. Read `VISION.md` before changing Powder's product scope,
 card/run model, runner boundary, or self-hosting assumptions.
 
 For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
-`POWDER_BACKLOG_DIR` value imports markdown into that database on startup. If
-`POWDER_DB_PATH` is absent, MCP falls back to the old in-memory fixture mode.
+`POWDER_BACKLOG_DIR` value imports markdown into that database on startup. To
+reach a deployed instance instead, set `POWDER_API_BASE_URL` (and
+`POWDER_API_KEY`). One of these two must be set — MCP refuses to start
+otherwise; there is no ephemeral in-memory mode, since claims and completions
+must never silently evaporate on process exit.
 
 ## Operating Contract
 
