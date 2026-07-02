@@ -187,6 +187,52 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
 }
 
 #[tokio::test]
+async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"board-readable","title":"Board readable","body":"humans can inspect the board","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    for route in [
+        "/api/v1/cards/ready",
+        "/api/v1/cards",
+        "/api/v1/cards?status=ready",
+        "/api/v1/cards/board-readable",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(route)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "private-ingress board read route {route} should not need a bearer token"
+        );
+        assert!(
+            response_text(response).await.contains("board-readable"),
+            "read route {route} should expose the seeded card"
+        );
+    }
+}
+
+#[tokio::test]
 async fn board_shell_serves_from_root_and_board_without_auth() {
     let (state, _) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -213,6 +259,8 @@ async fn board_shell_serves_from_root_and_board_without_auth() {
     let root = response_text(root).await;
     assert!(root.contains(r#"id="powder-board-app""#));
     assert!(root.contains("/assets/powder-board.js"));
+    assert!(root.contains("Board reads use the private Powder network."));
+    assert!(root.contains("powder key-create --db /data/powder.db --name operator"));
 
     let board = app
         .oneshot(
@@ -282,6 +330,8 @@ async fn board_assets_are_served_with_specific_content_types() {
         script.contains("function cardIdFromHash()"),
         "async board rendering must select cards from #card-* hashes after API load"
     );
+    assert!(script.contains("function classifyFailure("));
+    assert!(script.contains("read-only"));
 }
 
 #[tokio::test]
@@ -364,18 +414,17 @@ async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
-    let missing = app
+    let missing_write_auth = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/cards/ready")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            None,
+            r#"{"id":"missing-auth","title":"Missing auth","acceptance":["proof exists"],"status":"ready"}"#,
+        ))
         .await
         .unwrap();
-    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(missing_write_auth.status(), StatusCode::UNAUTHORIZED);
 
     let created = app
         .clone()
@@ -963,17 +1012,27 @@ async fn admin_can_list_and_revoke_a_key_which_then_loses_access_immediately() {
     assert!(agent_entry["revoked_at"].is_null());
     let agent_key_id = agent_entry["id"].as_str().unwrap().to_string();
 
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"revoked-key-proof","title":"Revoked key proof","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
     // the agent key still works before revocation.
     let still_works = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/cards/ready")
-                .header(AUTHORIZATION, format!("Bearer {agent_key_raw}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/revoked-key-proof/claim",
+            Some(&agent_key_raw),
+            r#"{"agent":"codex","ttl_seconds":3600}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(still_works.status(), StatusCode::OK);
@@ -991,14 +1050,12 @@ async fn admin_can_list_and_revoke_a_key_which_then_loses_access_immediately() {
     assert_eq!(revoked.status(), StatusCode::OK);
 
     let rejected = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/cards/ready")
-                .header(AUTHORIZATION, format!("Bearer {agent_key_raw}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/revoked-key-proof/status",
+            Some(&agent_key_raw),
+            r#"{"status":"running"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(

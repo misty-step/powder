@@ -13,6 +13,8 @@ const CARD_STATUSES = [
 const PAGE_LIMIT = 1000;
 const STORAGE_KEY = "powder-api-key";
 const MODE_KEY = "ae-mode";
+const KEY_MINT_COMMAND =
+  "powder key-create --db /data/powder.db --name operator --scope admin --show-secret";
 
 const els = {
   app: document.getElementById("powder-board-app"),
@@ -41,6 +43,7 @@ const state = {
   detail: null,
   selectedId: null,
   selectedIndex: 0,
+  needsSetup: false,
   filters: {
     source: "",
     label: "",
@@ -48,6 +51,7 @@ const state = {
   },
   loading: true,
   error: "",
+  errorKind: "",
 };
 
 function escapeHtml(value) {
@@ -79,16 +83,15 @@ async function apiJson(path, options = {}) {
     ...options,
     headers: apiHeaders(options.headers || {}),
   });
-  if (response.status === 401) {
-    showAuth("API key required");
-  }
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
       const body = await response.json();
       if (body.error) message = body.error;
     } catch (_err) {}
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -99,19 +102,24 @@ async function loadOnboarding() {
       headers: { Accept: "application/json" },
     }).then((response) => response.json());
     state.authMode = data.auth_mode || "unknown";
+    state.needsSetup = Boolean(data.needs_setup);
     els.apiMode.textContent = state.authMode;
-    if (state.authMode === "api_key" && !state.apiKey) {
-      showAuth(data.needs_setup ? "bootstrap key required" : "API key required");
+    renderAuthState();
+    if (state.authMode === "api_key" && state.needsSetup && !state.apiKey) {
+      showAuth("No write keys exist yet. Mint one on the instance, then paste it here.");
     }
   } catch (_err) {
     state.authMode = "unknown";
+    state.needsSetup = false;
     els.apiMode.textContent = "unknown";
+    renderAuthState();
   }
 }
 
 async function loadBoard({ keepSelection = false } = {}) {
   state.loading = true;
   state.error = "";
+  state.errorKind = "";
   updateConnection("loading", "loading");
   renderBoard();
   try {
@@ -126,7 +134,7 @@ async function loadBoard({ keepSelection = false } = {}) {
     );
     state.cards = groups.flat();
     state.loading = false;
-    updateConnection("ok", "connected");
+    updateSuccessConnection();
     refreshSourceOptions();
     const hashMatched = selectHashCard();
     if (!hashMatched) {
@@ -144,10 +152,23 @@ async function loadBoard({ keepSelection = false } = {}) {
     }
   } catch (err) {
     state.loading = false;
-    state.error = err.message || String(err);
-    updateConnection("error", "offline");
+    const failure = classifyFailure(err);
+    state.error = failure.message;
+    state.errorKind = failure.kind;
+    updateConnection(failure.connectionKind, failure.connectionLabel);
+    if (failure.kind === "auth") {
+      showAuth(failure.action);
+    }
     renderBoard();
     renderDrawer();
+  }
+}
+
+function updateSuccessConnection() {
+  if (state.authMode === "api_key" && !state.apiKey) {
+    updateConnection("readonly", "read-only");
+  } else {
+    updateConnection("ok", "connected");
   }
 }
 
@@ -159,12 +180,62 @@ function updateConnection(kind, label) {
 function showAuth(message) {
   els.authPanel.hidden = false;
   els.apiKeyInput.value = state.apiKey;
-  els.authMessage.textContent = message;
+  renderAuthState(message);
 }
 
 function hideAuth() {
   els.authPanel.hidden = true;
-  els.authMessage.textContent = "";
+  renderAuthState();
+}
+
+function renderAuthState(message = "") {
+  const label = els.apiKeyToggle.querySelector("span");
+  if (label) label.textContent = state.apiKey ? "key saved" : "API key";
+  if (message) {
+    els.authMessage.textContent = message;
+  } else if (state.apiKey) {
+    els.authMessage.textContent =
+      "Key saved. Reads still use the private network; write controls will send this key.";
+  } else if (state.needsSetup) {
+    els.authMessage.textContent = `No write keys exist yet. Mint one with: ${KEY_MINT_COMMAND}`;
+  } else if (state.authMode === "api_key") {
+    els.authMessage.textContent =
+      "No key saved. The board is readable here; save a key before using write controls.";
+  } else {
+    els.authMessage.textContent =
+      "This deployment does not require a stored API key for the board.";
+  }
+}
+
+function classifyFailure(err) {
+  const status = Number(err?.status || 0);
+  const message = err?.message || String(err);
+  if (status === 401 || status === 403) {
+    return {
+      kind: "auth",
+      connectionKind: "auth",
+      connectionLabel: "auth needed",
+      message,
+      action:
+        "This deployment requires trusted ingress identity or a valid key for this read.",
+    };
+  }
+  if (message === "Failed to fetch" || message.includes("NetworkError")) {
+    return {
+      kind: "unreachable",
+      connectionKind: "error",
+      connectionLabel: "unreachable",
+      message: "Powder API is unreachable from this browser.",
+      action: "Check the private network, DNS, and powder-server process.",
+    };
+  }
+  return {
+    kind: "error",
+    connectionKind: "error",
+    connectionLabel: "error",
+    message,
+    action: "Refresh the board or inspect powder-server logs.",
+  };
 }
 
 function refreshSourceOptions() {
@@ -275,12 +346,14 @@ function renderBoard() {
     return;
   }
   if (state.error) {
-    els.board.innerHTML = `<section class="status-column"><div class="column-head"><div class="column-title"><strong>error</strong><span class="column-count ae-num">0000</span></div></div><div class="empty-column error-box"><div><svg class="ae-icon" aria-hidden="true"><use href="#i-alert"></use></svg><p class="ae-item">${escapeHtml(state.error)}</p></div></div></section>`;
+    els.board.innerHTML = renderFailureColumn();
     els.total.textContent = "0000";
     return;
   }
 
   const total = visibleCards().length;
+  const boardEmpty = state.cards.length === 0;
+  const filteredEmpty = !boardEmpty && total === 0;
   els.total.textContent = String(total).padStart(4, "0");
   els.board.innerHTML = CARD_STATUSES.map((status) => {
     const cards = cardsForStatus(status.id);
@@ -296,13 +369,54 @@ function renderBoard() {
           ${
             cards.length
               ? cards.map(renderCard).join("")
-              : renderEmptyColumn(status.label)
+              : renderEmptyColumn(status.label, {
+                  boardEmpty,
+                  filteredEmpty,
+                  firstColumn: status.id === CARD_STATUSES[0].id,
+                })
           }
         </div>
       </section>
     `;
   }).join("");
   focusSelectedCard({ preventScroll: true });
+}
+
+function renderFailureColumn() {
+  const meta = {
+    auth: {
+      title: "auth needed",
+      detail: "Powder is reachable, but this read requires identity from the deployment.",
+    },
+    unreachable: {
+      title: "unreachable",
+      detail: "The browser could not reach powder-server on this network.",
+    },
+    error: {
+      title: "error",
+      detail: "Powder returned an API error while loading the board.",
+    },
+  }[state.errorKind] || {
+    title: "error",
+    detail: "Powder returned an API error while loading the board.",
+  };
+  return `
+    <section class="status-column state-column" aria-labelledby="column-state">
+      <div class="column-head">
+        <div class="column-title">
+          <strong id="column-state">${meta.title}</strong>
+          <span class="column-count ae-num">0000</span>
+        </div>
+      </div>
+      <div class="empty-column error-box">
+        <div class="ae-empty">
+          <svg class="ae-icon" aria-hidden="true"><use href="#i-alert"></use></svg>
+          <p class="ae-item">${escapeHtml(meta.detail)}</p>
+          <p class="ae-chrome">${escapeHtml(state.error)}</p>
+        </div>
+      </div>
+    </section>
+  `;
 }
 
 function renderSkeletonColumn(status) {
@@ -319,12 +433,42 @@ function renderSkeletonColumn(status) {
   `;
 }
 
-function renderEmptyColumn(label) {
+function renderEmptyColumn(label, context = {}) {
+  if (context.boardEmpty && context.firstColumn) {
+    return `
+      <div class="empty-column">
+        <div class="ae-empty">
+          <p class="ae-item">No cards yet</p>
+          <p class="ae-chrome">This instance is reachable and readable. Import backlog data or create cards through the CLI/API.</p>
+        </div>
+      </div>
+    `;
+  }
+  if (context.boardEmpty) {
+    return `
+      <div class="empty-column">
+        <div class="ae-empty">
+          <p class="ae-item">No cards yet</p>
+          <p class="ae-chrome">The board has no imported work.</p>
+        </div>
+      </div>
+    `;
+  }
+  if (context.filteredEmpty) {
+    return `
+      <div class="empty-column">
+        <div class="ae-empty">
+          <p class="ae-item">No matches</p>
+          <p class="ae-chrome">Clear filters to return to the full board.</p>
+        </div>
+      </div>
+    `;
+  }
   return `
     <div class="empty-column">
       <div class="ae-empty">
         <p class="ae-item">No ${escapeHtml(label)} cards</p>
-        <p class="ae-chrome">Nothing matches the current filters.</p>
+        <p class="ae-chrome">This lane is empty.</p>
       </div>
     </div>
   `;
@@ -383,6 +527,14 @@ function renderDrawer(options = {}) {
   }
   const detail = state.detail;
   if (!detail?.card) {
+    if (state.error) {
+      els.drawer.innerHTML = drawerShell("Board unavailable", state.errorKind || "error", `<div class="drawer-section error-box"><svg class="ae-icon" aria-hidden="true"><use href="#i-alert"></use></svg><p>${escapeHtml(state.error)}</p></div>`);
+      return;
+    }
+    if (!state.loading && state.cards.length === 0) {
+      els.drawer.innerHTML = drawerShell("No cards yet", "empty board", `<div class="drawer-section"><div class="ae-empty"><p class="ae-item">No cards imported</p><p class="ae-chrome">The API is reachable. Import backlog data or create a card to populate the board.</p></div></div>`);
+      return;
+    }
     els.drawer.innerHTML = drawerShell("No card selected", "select a card", `<div class="drawer-section"><div class="ae-empty"><p class="ae-item">No card selected</p><p class="ae-chrome">Move with j/k and press enter.</p></div></div>`);
     return;
   }
@@ -725,6 +877,7 @@ els.mode.addEventListener("click", toggleMode);
 
 els.apiKeyToggle.addEventListener("click", () => {
   els.authPanel.hidden = !els.authPanel.hidden;
+  renderAuthState();
   if (!els.authPanel.hidden) {
     els.apiKeyInput.value = state.apiKey;
     els.apiKeyInput.focus();
@@ -736,6 +889,7 @@ els.apiKeyForm.addEventListener("submit", (event) => {
   state.apiKey = els.apiKeyInput.value.trim();
   if (state.apiKey) {
     localStorage.setItem(STORAGE_KEY, state.apiKey);
+    renderAuthState("Key saved. Reloading the board with the stored key available for writes.");
     hideAuth();
     loadBoard({ keepSelection: true });
   } else {
@@ -747,7 +901,7 @@ els.clearApiKey.addEventListener("click", () => {
   state.apiKey = "";
   localStorage.removeItem(STORAGE_KEY);
   els.apiKeyInput.value = "";
-  showAuth("API key cleared");
+  showAuth("API key cleared. The board remains readable on the private network.");
   loadBoard();
 });
 
@@ -778,4 +932,5 @@ window.addEventListener("hashchange", () => {
   applyHashSelection();
 });
 
+renderAuthState();
 loadBoard();
