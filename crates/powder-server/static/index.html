@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Powder Board</title>
+  <script>
+    try {
+      var m = localStorage.getItem('ae-mode');
+      if (m === 'dark' || m === 'light') {
+        document.documentElement.classList.add(m);
+        document.documentElement.setAttribute('data-ae-mode', m);
+        document.documentElement.style.colorScheme = m;
+      }
+    } catch (e) {}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&amp;family=Geist+Mono:wght@100..900&amp;display=swap">
+  <link rel="stylesheet" href="/assets/aesthetic.css">
+  <link rel="stylesheet" href="/assets/powder-board.css">
+</head>
+<body>
+<svg aria-hidden="true" class="icon-sheet" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 6v6l4 2"></path></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="0"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 5h18"></path><path d="M6 12h12"></path><path d="M10 19h4"></path></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"></circle><path d="M11 12 21 2"></path><path d="m16 7 2 2"></path><path d="m19 4 2 2"></path></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></symbol>
+  <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a4 4 0 0 1-4 4H7l-4 4V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"></path></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 7.5A9 9 0 1 1 12 3Z"></path></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.4"></path><path d="M3 12A9 9 0 0 1 18.5 5.6"></path><path d="M3 3v6h6"></path><path d="M21 21v-6h-6"></path></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 11 3H4v7l9.59 9.59a2 2 0 0 0 2.82 0l4.18-4.18a2 2 0 0 0 0-2.82Z"></path><path d="M7.5 7.5h.01"></path></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21a8 8 0 0 0-16 0"></path><circle cx="12" cy="7" r="4"></circle></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+</svg>
+
+<div id="powder-board-app" class="powder-app ae-screen ae-wide" data-drawer="closed">
+  <header class="ae-bar powder-bar">
+    <div class="brand-cluster">
+      <h1 class="brand-word ae-strong">Powder</h1>
+      <span id="connection-status" class="connection ae-chrome" data-kind="loading"><span aria-hidden="true"></span>loading</span>
+    </div>
+    <form id="board-filters" class="filter-bar" role="search">
+      <label class="filter-field">
+        <span class="ae-chrome">repo/source</span>
+        <select id="source-filter" class="ae-input">
+          <option value="">all</option>
+        </select>
+      </label>
+      <label class="filter-field">
+        <span class="ae-chrome">label</span>
+        <input id="label-filter" class="ae-input" type="search" autocomplete="off" placeholder="all labels">
+      </label>
+      <label class="filter-field search-field">
+        <span class="sr-only">filter cards</span>
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+        <input id="text-filter" class="ae-input" type="search" autocomplete="off" placeholder="filter cards...">
+        <kbd>/</kbd>
+      </label>
+    </form>
+    <div class="toolbar">
+      <button id="api-key-toggle" class="ae-button ae-button-quiet ae-button-compact" type="button">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-key"></use></svg>
+        <span>API key</span>
+      </button>
+      <button id="refresh-board" class="ae-button ae-button-quiet ae-button-compact" type="button">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+        <span>refresh</span>
+      </button>
+      <button id="mode-toggle" class="ae-mode" type="button" aria-label="Toggle light and dark mode">
+        <svg class="ae-icon ae-sun" aria-hidden="true"><use href="#i-sun"></use></svg>
+        <svg class="ae-icon ae-moon" aria-hidden="true"><use href="#i-moon"></use></svg>
+      </button>
+    </div>
+  </header>
+
+  <section id="auth-panel" class="auth-panel" hidden>
+    <form id="api-key-form" class="auth-form">
+      <label class="filter-field">
+        <span class="ae-chrome">API key</span>
+        <input id="api-key-input" class="ae-input" type="password" autocomplete="off" placeholder="Bearer token">
+      </label>
+      <button class="ae-button ae-button-compact" type="submit">save</button>
+      <button id="clear-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button">clear</button>
+      <p id="auth-message" class="ae-chrome"></p>
+    </form>
+  </section>
+
+  <main class="ae-stage powder-stage">
+    <section class="board-layout" aria-label="Powder Kanban board">
+      <div id="kanban-board" class="kanban-board" tabindex="-1" aria-live="polite"></div>
+      <aside id="detail-drawer" class="detail-drawer" aria-label="Card detail"></aside>
+    </section>
+  </main>
+
+  <footer class="ae-bar powder-foot">
+    <p class="ae-chrome key-strip">
+      <span>Navigation</span>
+      <kbd>j</kbd><kbd>k</kbd>
+      <span>open</span>
+      <kbd>enter</kbd>
+      <span>filter</span>
+      <kbd>/</kbd>
+    </p>
+    <p class="ae-chrome">
+      <span id="card-total" class="ae-num">0000</span>
+      <span>cards</span>
+      <span class="foot-separator">API</span>
+      <span id="api-mode">unknown</span>
+    </p>
+  </footer>
+</div>
+
+<script src="/assets/powder-board.js" defer></script>
+</body>
+</html>
