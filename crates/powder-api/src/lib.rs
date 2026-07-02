@@ -65,6 +65,11 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/cards/{id}/comments",
+        intent: "attach an actor-attributed comment to a card, visible immediately via get_card/get_run",
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/runs/{id}/input",
         intent: "pause a run for human input",
     },

@@ -77,6 +77,11 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["card_id","label","url"],"properties":{"card_id":{"type":"string"},"label":{"type":"string"},"url":{"type":"string"}}}"#,
     },
     ToolDef {
+        name: "add_comment",
+        description: "Attach an actor-attributed comment to a card, visible immediately via get_card/get_run.",
+        input_schema: r#"{"type":"object","required":["card_id","author","body"],"properties":{"card_id":{"type":"string"},"author":{"type":"string"},"body":{"type":"string"}}}"#,
+    },
+    ToolDef {
         name: "request_input",
         description: "Pause a run in awaiting_input with the exact operator question. Optional actor/admin are checked against the claim holder.",
         input_schema: r#"{"type":"object","required":["run_id","question"],"properties":{"run_id":{"type":"string"},"question":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
@@ -275,6 +280,14 @@ pub fn call_tool_store(
                 .add_link(&card_id, label, url, now)
                 .map_err(to_string)?)
         }
+        "add_comment" => {
+            let card_id = card_id(args, "card_id")?;
+            let author = required_str(args, "author")?;
+            let body = required_str(args, "body")?;
+            json!(store
+                .add_comment(&card_id, author, body, now)
+                .map_err(to_string)?)
+        }
         "request_input" => {
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
             let question = required_str(args, "question")?;
@@ -341,9 +354,10 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 14);
+        assert_eq!(TOOLS.len(), 15);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
+        assert!(names.contains(&"add_comment"));
         assert!(names.contains(&"claim_card"));
         assert!(names.contains(&"release_claim"));
         assert!(names.contains(&"renew_claim"));
@@ -478,6 +492,35 @@ Expose tools against the DB.
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
         assert!(invalid.contains("invalid status"));
+    }
+
+    #[test]
+    fn mcp_add_comment_appears_in_get_card() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![parse_backlog_card(
+                "commented.md",
+                "# Commented\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+
+        let response = call_tool_store(
+            &mut store,
+            "add_comment",
+            &json!({"card_id": "commented", "author": "operator", "body": "looks good"}),
+            10,
+        )
+        .unwrap();
+        let comment = tool_payload(&response);
+        assert_eq!(comment["author"], "operator");
+        assert_eq!(comment["body"], "looks good");
+
+        let card =
+            call_tool_store(&mut store, "get_card", &json!({"card_id": "commented"}), 11).unwrap();
+        assert!(tool_payload(&card)["comments"][0]["body"] == "looks good");
     }
 
     #[test]

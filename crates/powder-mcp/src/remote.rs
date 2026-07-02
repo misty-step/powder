@@ -150,6 +150,15 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 json!({"label": label, "url": url}),
             )?
         }
+        "add_comment" => {
+            let id = card_id(args, "card_id")?;
+            let author = required_str(args, "author")?;
+            let body = required_str(args, "body")?;
+            client.post(
+                &format!("/api/v1/cards/{id}/comments"),
+                json!({"author": author, "body": body}),
+            )?
+        }
         "request_input" => {
             let run = run_id(args, "run_id")?;
             let question = required_str(args, "question")?;
@@ -311,6 +320,34 @@ mod tests {
         assert_eq!(
             requests[0].body,
             Some(json!({"agent": "codex", "ttl_seconds": 60}))
+        );
+    }
+
+    #[test]
+    fn add_comment_posts_author_and_body() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"card_id": "001", "author": "operator", "body": "looks good", "created_at": 10}),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "add_comment",
+            &json!({"card_id": "001", "author": "operator", "body": "looks good"}),
+        )
+        .unwrap();
+
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("looks good"));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/001/comments");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"author": "operator", "body": "looks good"}))
         );
     }
 

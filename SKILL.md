@@ -55,6 +55,8 @@ must never silently evaporate on process exit.
 - `answer_input`: append an actor-attributed answer and resume the run.
 - `update_status`: move a card or run through an allowed transition.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
+- `add_comment`: attach an actor-attributed comment, visible immediately via
+  `get_card`/`get_run`.
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: attach proof and mark the card complete for human review.
 

@@ -4,7 +4,7 @@ use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
     Activity, ActivityId, ActivityType, Authority, Card, CardId, CardSource, CardStatus, Claim,
-    ClaimReceipt, DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
+    ClaimReceipt, Comment, DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -501,6 +501,40 @@ impl Store {
             ],
         )?;
         Ok(link)
+    }
+
+    /// Not claim-holder-gated, matching `add_link`: attaching a comment is
+    /// an additive annotation any authenticated caller can make, not an
+    /// exclusive mutation of the card's own state.
+    pub fn add_comment(
+        &mut self,
+        card_id: &CardId,
+        author: &str,
+        body: &str,
+        now: i64,
+    ) -> Result<Comment> {
+        if self.get_card(card_id)?.is_none() {
+            return Err(DomainError::not_found("card", card_id.to_string()).into());
+        }
+        let comment = Comment {
+            card_id: card_id.clone(),
+            author: non_empty("author", author)?,
+            body: non_empty("body", body)?,
+            created_at: now,
+        };
+        let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+        self.connection.execute(
+            "INSERT INTO comments (id, card_id, author, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                comment.card_id.as_str(),
+                comment.author,
+                comment.body,
+                comment.created_at
+            ],
+        )?;
+        Ok(comment)
     }
 
     pub fn request_input(
