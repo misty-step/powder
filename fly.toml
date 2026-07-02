@@ -12,31 +12,55 @@ kill_timeout = "30s"
 
 [env]
   POWDER_DB_PATH = "/data/powder.db"
+  # `[::]` is a single dual-stack socket on Fly's guest kernel (confirmed
+  # live: it answers a literal 127.0.0.1 connection and traffic tunneled
+  # in over `fly proxy`/`.internal`, which is IPv6-only). `fly deploy`
+  # prints "app is not listening on 0.0.0.0" for this bind regardless — its
+  # scanner only checks the IPv4 socket table, which dual-stack v6 sockets
+  # never populate even though they serve v4 traffic fine. That warning is
+  # a known cosmetic false positive here (health checks stay 2/2 passing);
+  # do not "fix" it by switching to `0.0.0.0`, which binds v4-only and
+  # breaks the private (Flycast/`.internal`) path this app depends on.
   POWDER_BIND_ADDR = "[::]:4000"
   POWDER_AUTH_MODE = "api-key"
-  POWDER_PUBLIC_BASE_URL = "https://powder.internal"
+  POWDER_PUBLIC_BASE_URL = "http://powder.internal:4000"
   POWDER_DISCLOSE_BOOTSTRAP_KEY = "false"
   PORT = "4000"
 
-[http_service]
+# Flycast-only ingress: deliberately no http_service stanza, since that is
+# Fly's public-Anycast-on-80/443 shorthand and would ask flyctl to
+# provision a public IP the next time this app deploys without one. This app
+# is reached solely over Fly's private network: `powder.internal:4000` (6PN,
+# direct machine-to-machine) and `powder.flycast:4000` (Fly Proxy over the
+# private network, autostart-aware). The https-forcing option is
+# intentionally absent too — Flycast is HTTP-only. `fly ips list --app
+# powder` must show no `public` entries; run `bin/check-private-ingress.sh`
+# to verify.
+[[services]]
   internal_port = 4000
-  force_https = true
+  protocol = "tcp"
   auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
 
-  [[http_service.checks]]
+  [[services.ports]]
+    handlers = ["http"]
+    port = 4000
+
+  [[services.http_checks]]
     grace_period = "15s"
     interval = "30s"
-    method = "GET"
+    method = "get"
     path = "/healthz"
+    protocol = "http"
     timeout = "5s"
 
-  [[http_service.checks]]
+  [[services.http_checks]]
     grace_period = "15s"
     interval = "30s"
-    method = "GET"
+    method = "get"
     path = "/readyz"
+    protocol = "http"
     timeout = "5s"
 
 [[vm]]
