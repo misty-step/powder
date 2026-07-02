@@ -402,5 +402,64 @@ fn created_agent_key_verifies_with_agent_scope() -> Result<()> {
 
     assert_eq!(verified.scope, ApiKeyScope::Agent);
     assert_eq!(verified.name, "agent");
+    assert_eq!(verified.actor.display_name, "agent");
+    assert_eq!(verified.actor.kind.as_str(), "agent");
+    Ok(())
+}
+
+#[test]
+fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
+    let path = temp_db("v1-identity");
+    let raw_key = "sk_powder_legacy_agent_key_for_identity_migration";
+    let key_hash = bcrypt::hash(raw_key, bcrypt::DEFAULT_COST)?;
+    let key_prefix = raw_key.chars().take(12).collect::<String>();
+
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE api_keys (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER
+            );
+            CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            PRAGMA user_version = 1;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO api_keys (id, name, key_prefix, key_hash, scope, created_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            rusqlite::params![
+                "key-legacy",
+                "legacy-agent",
+                key_prefix,
+                key_hash,
+                "agent",
+                10_i64
+            ],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, 2);
+
+    let verified = store.verify_api_key(raw_key)?.expect("migrated key");
+    assert_eq!(verified.name, "legacy-agent");
+    assert_eq!(verified.actor.id, "actor-key-legacy");
+    assert_eq!(verified.actor.display_name, "legacy-agent");
+    assert_eq!(verified.actor.kind.as_str(), "agent");
+
+    let created = store.create_api_key("new-agent", ApiKeyScope::Agent, 20)?;
+    let verified = store
+        .verify_api_key(&created.raw_key)?
+        .expect("new key after migration");
+    assert_eq!(verified.actor.display_name, "new-agent");
+    assert_eq!(verified.actor.kind.as_str(), "agent");
     Ok(())
 }

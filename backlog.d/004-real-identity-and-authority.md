@@ -20,3 +20,6 @@ of trusting an `agent` field in the request body.
 - Thread actor context through store transactions and activity writes.
 - Enforce claim-holder ownership for status, progress, input, and completion.
 - Add key-management/admin routes only if they preserve the one-deployable shape.
+
+## Progress
+- 2026-07-01 slice: API keys create and verify durable `Actor` records, v1 keys migrate to actor-bound keys without regenerating secrets, and HTTP claim rejects a request-body `agent` that does not match the authenticated API-key actor. Remaining oracle surface: ownership checks for non-claim mutations, admin-only operations, and equivalent CLI/MCP authority errors.

@@ -2,7 +2,6 @@
 
 use std::{fs, path::Path};
 
-use bcrypt::verify;
 use powder_core::{
     Activity, ActivityId, ActivityType, Card, CardId, CardSource, CardStatus, Claim, ClaimReceipt,
     DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
@@ -11,19 +10,20 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
 
 mod answer_loop;
+mod identity;
 mod schema;
 #[cfg(test)]
 mod tests;
 
+pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, VerifiedApiKey};
+
 use schema::{
-    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, RUN_SELECT_SQL, SCHEMA,
+    SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-const API_KEY_PREFIX_LEN: usize = 12;
-const BOOTSTRAP_SEED: &str = "initial_config_v1";
-const DUMMY_BCRYPT_HASH: &str = "$2b$12$C6UzMDM.H6dfI/f/IKcEeO6H9G7Qe0eeDVF2.oTu.2R4z.0/t6j2K";
 const API_KEY_ALPHABET: [char; 64] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
     'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B',
@@ -47,50 +47,6 @@ pub enum StoreError {
     UnsupportedSchema(u32),
     #[error("stored {field} value is invalid: {value}")]
     InvalidStoredValue { field: &'static str, value: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiKeyScope {
-    Admin,
-    Agent,
-}
-
-impl ApiKeyScope {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "admin" => Some(Self::Admin),
-            "agent" => Some(Self::Agent),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Admin => "admin",
-            Self::Agent => "agent",
-        }
-    }
-
-    pub fn allows_agent(self) -> bool {
-        matches!(self, Self::Admin | Self::Agent)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiKeyCreated {
-    pub id: String,
-    pub name: String,
-    pub scope: ApiKeyScope,
-    pub key_prefix: String,
-    pub raw_key: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedApiKey {
-    pub id: String,
-    pub name: String,
-    pub scope: ApiKeyScope,
 }
 
 pub struct Store {
@@ -133,10 +89,19 @@ impl Store {
         if current == SCHEMA_VERSION {
             return Ok(());
         }
-
-        self.connection.execute_batch(SCHEMA)?;
-        self.connection
-            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        match current {
+            0 => {
+                self.connection.execute_batch(SCHEMA)?;
+                self.connection
+                    .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+            }
+            1 => {
+                self.connection.execute_batch(MIGRATE_1_TO_2)?;
+                self.connection
+                    .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+            }
+            _ => return Err(StoreError::UnsupportedSchema(current)),
+        }
         Ok(())
     }
 
@@ -155,90 +120,6 @@ impl Store {
         Ok(self
             .connection
             .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?)
-    }
-
-    pub fn apply_initial_seed(&mut self, now: i64) -> Result<Option<ApiKeyCreated>> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let already_applied = transaction
-            .query_row(
-                "SELECT 1 FROM seed_runs WHERE seed_name = ?1 LIMIT 1",
-                [BOOTSTRAP_SEED],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-
-        if already_applied {
-            transaction.commit()?;
-            return Ok(None);
-        }
-
-        let key = new_api_key("bootstrap", ApiKeyScope::Admin, now)?;
-        insert_api_key(&transaction, &key)?;
-        transaction.execute(
-            "INSERT INTO seed_runs (seed_name, applied_at) VALUES (?1, ?2)",
-            params![BOOTSTRAP_SEED, now],
-        )?;
-        transaction.commit()?;
-        Ok(Some(key))
-    }
-
-    pub fn create_api_key(
-        &mut self,
-        name: &str,
-        scope: ApiKeyScope,
-        now: i64,
-    ) -> Result<ApiKeyCreated> {
-        let name = non_empty("name", name)?;
-        let key = new_api_key(&name, scope, now)?;
-        insert_api_key(&self.connection, &key)?;
-        Ok(key)
-    }
-
-    pub fn verify_api_key(&self, raw_key: &str) -> Result<Option<VerifiedApiKey>> {
-        let prefix = key_prefix(raw_key);
-        let mut statement = self.connection.prepare(
-            "SELECT id, name, scope, key_hash
-             FROM api_keys
-             WHERE key_prefix = ?1 AND revoked_at IS NULL
-             ORDER BY created_at ASC, id ASC",
-        )?;
-        let candidates = statement
-            .query_map([prefix], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        if candidates.is_empty() {
-            let _ = verify(raw_key, DUMMY_BCRYPT_HASH);
-            return Ok(None);
-        }
-
-        for (id, name, scope, key_hash) in candidates {
-            if matches!(verify(raw_key, &key_hash), Ok(true)) {
-                let scope = ApiKeyScope::parse(&scope).ok_or(StoreError::InvalidStoredValue {
-                    field: "api_keys.scope",
-                    value: scope,
-                })?;
-                return Ok(Some(VerifiedApiKey { id, name, scope }));
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn active_api_key_count(&self) -> Result<u64> {
-        Ok(self.connection.query_row(
-            "SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL",
-            [],
-            |row| row.get::<_, u64>(0),
-        )?)
     }
 
     pub fn import_cards(&mut self, cards: Vec<Card>) -> Result<usize> {
@@ -757,39 +638,6 @@ fn load_card(connection: &Connection, card_id: &CardId) -> Result<Card> {
         .optional()?
         .ok_or_else(|| DomainError::not_found("card", card_id.to_string()).into())
         .and_then(CardRecord::into_card)
-}
-
-fn new_api_key(name: &str, scope: ApiKeyScope, now: i64) -> Result<ApiKeyCreated> {
-    let raw_key = format!("sk_powder_{}", nanoid::nanoid!(32, &API_KEY_ALPHABET));
-    Ok(ApiKeyCreated {
-        id: format!("key-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)),
-        name: name.to_owned(),
-        scope,
-        key_prefix: key_prefix(&raw_key),
-        raw_key,
-        created_at: now,
-    })
-}
-
-fn insert_api_key(connection: &Connection, key: &ApiKeyCreated) -> Result<()> {
-    let key_hash = bcrypt::hash(&key.raw_key, bcrypt::DEFAULT_COST)?;
-    connection.execute(
-        "INSERT INTO api_keys (id, name, key_prefix, key_hash, scope, created_at, revoked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-        params![
-            key.id,
-            key.name,
-            key.key_prefix,
-            key_hash,
-            key.scope.as_str(),
-            key.created_at
-        ],
-    )?;
-    Ok(())
-}
-
-fn key_prefix(raw_key: &str) -> String {
-    raw_key.chars().take(API_KEY_PREFIX_LEN).collect()
 }
 
 fn to_json(value: &impl Serialize) -> Result<String> {

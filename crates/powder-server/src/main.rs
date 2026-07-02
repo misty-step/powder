@@ -182,7 +182,7 @@ struct CreateCardRequest {
 
 #[derive(Debug, Deserialize)]
 struct ClaimRequest {
-    agent: String,
+    agent: Option<String>,
     ttl_seconds: Option<u64>,
 }
 
@@ -398,11 +398,17 @@ async fn claim_card(
     Path(id): Path<String>,
     Json(request): Json<ClaimRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
+    let requested_agent = request.agent.as_deref().unwrap_or(&actor.display_name);
+    if actor.enforces_identity && requested_agent != actor.display_name {
+        return Err(ApiError::forbidden(
+            "claim agent must match authenticated actor",
+        ));
+    }
     let receipt = lock_store(&state)?.claim_card(
         &card_id,
-        &request.agent,
+        requested_agent,
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
     )?;
@@ -540,12 +546,24 @@ async fn complete_card(
     Ok(Json(card))
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+#[derive(Debug, Clone)]
+struct AuthorizedActor {
+    display_name: String,
+    enforces_identity: bool,
+}
+
+fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
     match state.config.auth_mode {
-        AuthMode::None => Ok(()),
+        AuthMode::None => Ok(AuthorizedActor {
+            display_name: "anonymous".to_string(),
+            enforces_identity: false,
+        }),
         AuthMode::TailscaleHeader => {
-            if trusted_tailnet_identity(headers).is_some() {
-                Ok(())
+            if let Some(identity) = trusted_tailnet_identity(headers) {
+                Ok(AuthorizedActor {
+                    display_name: identity.to_string(),
+                    enforces_identity: true,
+                })
             } else {
                 Err(ApiError::unauthorized(
                     "missing trusted tailnet identity header",
@@ -560,7 +578,10 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
                 return Err(ApiError::unauthorized("invalid bearer token"));
             };
             if key.scope.allows_agent() {
-                Ok(())
+                Ok(AuthorizedActor {
+                    display_name: key.actor.display_name,
+                    enforces_identity: true,
+                })
             } else {
                 Err(ApiError::forbidden(
                     "api key scope cannot access agent routes",

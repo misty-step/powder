@@ -87,7 +87,7 @@ async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
             Method::POST,
             "/api/v1/cards/api-test/claim",
             Some(&raw_key),
-            r#"{"agent":"codex","ttl_seconds":3600}"#,
+            r#"{"agent":"bootstrap","ttl_seconds":3600}"#,
         ))
         .await
         .unwrap();
@@ -147,6 +147,49 @@ async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
 }
 
 #[tokio::test]
+async fn api_key_claim_rejects_cross_agent_impersonation() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"api-identity","title":"API identity","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let impersonated = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/api-identity/claim",
+            Some(&raw_key),
+            r#"{"agent":"codex","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(impersonated.status(), StatusCode::FORBIDDEN);
+
+    let claimed = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/api-identity/claim",
+            Some(&raw_key),
+            r#"{"agent":"bootstrap","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed = response_json(claimed).await;
+    assert_eq!(claimed["agent"], "bootstrap");
+}
+
+#[tokio::test]
 async fn api_key_auth_allows_claim_renew_heartbeat_and_release() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -169,7 +212,7 @@ async fn api_key_auth_allows_claim_renew_heartbeat_and_release() {
             Method::POST,
             "/api/v1/cards/api-lease/claim",
             Some(&raw_key),
-            r#"{"agent":"codex","ttl_seconds":3600}"#,
+            r#"{"agent":"bootstrap","ttl_seconds":3600}"#,
         ))
         .await
         .unwrap();
@@ -252,7 +295,7 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
             Method::POST,
             "/api/v1/cards/api-answer/claim",
             Some(&raw_key),
-            r#"{"agent":"codex","ttl_seconds":3600}"#,
+            r#"{"agent":"bootstrap","ttl_seconds":3600}"#,
         ))
         .await
         .unwrap();

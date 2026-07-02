@@ -71,6 +71,10 @@ Agent routes require `Authorization: Bearer <key>` in `api-key` mode. Use
 supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.
 
+API keys are bound to actor records. In `api-key` mode, claiming work uses the
+authenticated actor; a request-body `agent` value is accepted only when it
+matches that actor.
+
 Fly instance shape:
 
 ```sh
