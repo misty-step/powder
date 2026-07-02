@@ -187,6 +187,53 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
 }
 
 #[tokio::test]
+async fn add_comment_appears_in_get_card_immediately() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"commented","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let comment = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/commented/comments",
+            Some(&raw_key),
+            r#"{"author":"operator","body":"looks good"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(comment.status(), StatusCode::OK);
+    let comment = response_json(comment).await;
+    assert_eq!(comment["author"], "operator");
+    assert_eq!(comment["body"], "looks good");
+
+    let card = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/commented")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let card = response_json(card).await;
+    assert_eq!(card["comments"][0]["body"], "looks good");
+}
+
+#[tokio::test]
 async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

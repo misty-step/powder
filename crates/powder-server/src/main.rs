@@ -236,6 +236,12 @@ struct LinkRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CommentRequest {
+    author: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct InputRequest {
     question: String,
 }
@@ -311,6 +317,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/heartbeat", post(heartbeat_claim))
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/links", post(add_link))
+        .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
         .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
         .route("/api/v1/runs/{id}", get(get_run))
@@ -587,6 +594,19 @@ async fn add_link(
     let card_id = CardId::new(id)?;
     let link = lock_store(&state)?.add_link(&card_id, &request.label, &request.url, unix_now())?;
     Ok(Json(json!(link)))
+}
+
+async fn add_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<CommentRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let comment =
+        lock_store(&state)?.add_comment(&card_id, &request.author, &request.body, unix_now())?;
+    Ok(Json(json!(comment)))
 }
 
 async fn request_input(

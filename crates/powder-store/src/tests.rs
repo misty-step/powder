@@ -177,6 +177,40 @@ fn blockers_resolve_against_terminality_not_mere_presence() -> Result<()> {
 }
 
 #[test]
+fn add_comment_appears_in_get_card_detail_in_creation_order() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let first = store.add_comment(&card_id, "operator", "first note", 10)?;
+    assert_eq!(first.author, "operator");
+    assert_eq!(first.body, "first note");
+    let second = store.add_comment(&card_id, "codex", "second note", 20)?;
+
+    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    assert_eq!(detail.comments.len(), 2);
+    assert_eq!(detail.comments[0].body, "first note");
+    assert_eq!(detail.comments[1].body, "second note");
+    assert_eq!(detail.comments[1].author, "codex");
+    let _ = second;
+
+    let missing = CardId::new("does-not-exist")?;
+    let err = store.add_comment(&missing, "operator", "note", 30);
+    assert!(matches!(
+        err,
+        Err(StoreError::Domain(DomainError::NotFound { .. }))
+    ));
+
+    let empty_body = store.add_comment(&card_id, "operator", "", 40);
+    assert!(matches!(
+        empty_body,
+        Err(StoreError::Domain(DomainError::Validation { .. }))
+    ));
+    Ok(())
+}
+
+#[test]
 fn bootstrap_seed_only_discloses_once() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

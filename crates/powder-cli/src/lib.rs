@@ -27,6 +27,7 @@ pub const COMMANDS: &[&str] = &[
     "answer-input",
     "update-status",
     "add-link",
+    "add-comment",
     "request-input",
     "complete-card",
 ];
@@ -55,6 +56,7 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "answer-input" => answer_input(rest),
         [command, rest @ ..] if command == "update-status" => update_status(rest),
         [command, rest @ ..] if command == "add-link" => add_link(rest),
+        [command, rest @ ..] if command == "add-comment" => add_comment(rest),
         [command, rest @ ..] if command == "request-input" => request_input(rest),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest),
         [command, ..] => Err(ShellError::Invalid(format!("unknown command: {command}"))),
@@ -97,6 +99,9 @@ pub fn help() -> String {
         "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
     );
     help.push_str("  powder update-status 001 --db ./data/powder.db --status running\n");
+    help.push_str(
+        "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
+    );
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof\n",
     );
@@ -548,6 +553,21 @@ fn add_link(args: &[String]) -> Result<String, ShellError> {
     Ok(format!("link\t{}\t{}\n", link.card_id, link.id))
 }
 
+fn add_comment(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "add-comment")?;
+    let author = required_flag(args, "--author")?;
+    let body = required_flag(args, "--body")?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let comment = store
+        .add_comment(&card_id, author, body, now)
+        .map_err(store_err)?;
+    Ok(format!(
+        "comment\t{}\t{}\t{}\n",
+        comment.card_id, comment.author, comment.body
+    ))
+}
+
 fn request_input(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let run_id = positional(args)
@@ -690,6 +710,7 @@ mod tests {
         assert!(COMMANDS.contains(&"get-run"));
         assert!(COMMANDS.contains(&"list-awaiting-input"));
         assert!(COMMANDS.contains(&"answer-input"));
+        assert!(COMMANDS.contains(&"add-comment"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
     }
@@ -1086,6 +1107,49 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, ShellError::Invalid(_)));
+    }
+
+    #[test]
+    fn cli_add_comment_appears_in_get_card() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-add-comment-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "commented",
+            "--title",
+            "Has a comment",
+        ]))
+        .unwrap();
+
+        let output = run(&args([
+            "add-comment",
+            "commented",
+            "--db",
+            &db,
+            "--author",
+            "operator",
+            "--body",
+            "looks good",
+        ]))
+        .unwrap();
+        assert!(output.contains("commented"));
+        assert!(output.contains("operator"));
+        assert!(output.contains("looks good"));
+
+        let card = run(&args(["get-card", "commented", "--db", &db])).unwrap();
+        assert!(card.contains("\"author\": \"operator\""));
+        assert!(card.contains("\"body\": \"looks good\""));
     }
 
     #[test]
