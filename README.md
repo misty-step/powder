@@ -67,7 +67,10 @@ cp .env.example .env
 POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 ```
 
-Agent routes require `Authorization: Bearer <key>` in `api-key` mode. Use
+Board read routes are reachable without a key in `api-key` mode; the private
+Flycast/Tailscale network is the read perimeter. Mutations, claim lifecycle,
+card authoring, imports, comments, links, answer-loop writes, and key
+management require `Authorization: Bearer <key>` in `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
 supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.

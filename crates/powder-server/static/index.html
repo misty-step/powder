@@ -81,10 +81,15 @@
   </header>
 
   <section id="auth-panel" class="auth-panel" hidden>
+    <div class="auth-copy">
+      <p class="ae-item">Board reads use the private Powder network.</p>
+      <p class="ae-chrome">Save an API key only for write controls. Mint one on the instance with:</p>
+      <code class="auth-command">powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
+    </div>
     <form id="api-key-form" class="auth-form">
       <label class="filter-field">
         <span class="ae-chrome">API key</span>
-        <input id="api-key-input" class="ae-input" type="password" autocomplete="off" placeholder="Bearer token">
+        <input id="api-key-input" class="ae-input" type="password" autocomplete="off" placeholder="paste key">
       </label>
       <button class="ae-button ae-button-compact" type="submit">save</button>
       <button id="clear-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button">clear</button>

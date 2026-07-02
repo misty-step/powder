@@ -442,7 +442,7 @@ async fn list_ready(
     headers: HeaderMap,
     Query(params): Query<ReadyParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
     let cards = lock_store(&state)?.list_ready(ReadyQuery::new(unix_now(), limit))?;
     Ok(Json(json!({ "cards": cards })))
@@ -456,7 +456,7 @@ async fn list_cards(
     headers: HeaderMap,
     Query(params): Query<ListCardsParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let status = params
         .status
         .as_deref()
@@ -521,7 +521,7 @@ async fn get_card(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let detail = lock_store(&state)?
         .get_card_detail(&card_id)?
@@ -714,7 +714,7 @@ async fn get_run(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let run_id = RunId::new(id)?;
     let detail = lock_store(&state)?
         .get_run_detail(&run_id)?
@@ -727,7 +727,7 @@ async fn list_awaiting_input(
     headers: HeaderMap,
     Query(params): Query<ReadyParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
     let awaiting = lock_store(&state)?.list_awaiting_input(limit)?;
     Ok(Json(json!({ "awaiting": awaiting })))
@@ -854,6 +854,16 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                 ))
             }
         }
+    }
+}
+
+/// Allow keyless reads when the deployment perimeter is the private Flycast
+/// network, while preserving trusted-ingress identity checks for tailnet mode.
+fn authorize_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if matches!(state.config.auth_mode, AuthMode::TailscaleHeader) {
+        authorize(state, headers).map(|_| ())
+    } else {
+        Ok(())
     }
 }
 
