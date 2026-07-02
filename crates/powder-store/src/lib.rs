@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
     Activity, ActivityId, ActivityType, Authority, Card, CardId, CardSource, CardStatus, Claim,
@@ -206,12 +206,21 @@ impl Store {
         let records = statement
             .query_map([], CardRecord::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut cards = records
+        let all_cards = records
             .into_iter()
             .map(CardRecord::into_card)
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>>>()?;
+        // reuses the same full scan already loaded above, rather than a
+        // second query per blocker: a blocker missing from this map is
+        // treated as still blocking (fail closed).
+        let statuses: HashMap<_, _> = all_cards.iter().map(|c| (c.id.clone(), c.status)).collect();
+        let mut cards = all_cards
             .into_iter()
-            .filter(|card| card.is_ready_at(query.now))
+            .filter(|card| {
+                card.is_ready_at(query.now, |id| {
+                    statuses.get(id).is_some_and(|status| status.is_terminal())
+                })
+            })
             .collect::<Vec<_>>();
 
         cards.sort_by(|left, right| {
@@ -297,8 +306,19 @@ impl Store {
             params![card_id.as_str(), now],
         )?;
 
+        let mut terminal_blockers = std::collections::HashSet::new();
+        for id in &card.blocked_by {
+            if let Some(blocker) = load_card_optional(&transaction, id)? {
+                if blocker.status.is_terminal() {
+                    terminal_blockers.insert(id.clone());
+                }
+            }
+        }
+
         let run_id = RunId::new(format!("run-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?;
-        let claim = card.apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds)?;
+        let claim = card.apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds, |id| {
+            terminal_blockers.contains(id)
+        })?;
         persist_card(&transaction, &card)?;
 
         let run = Run {

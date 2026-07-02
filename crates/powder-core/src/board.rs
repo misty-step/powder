@@ -122,7 +122,7 @@ impl Board {
         let mut cards = self
             .cards
             .values()
-            .filter(|card| card.is_ready_at(query.now))
+            .filter(|card| card.is_ready_at(query.now, |id| self.blocker_is_terminal(id)))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -169,12 +169,29 @@ impl Board {
 
         self.mark_expired_runs_stale(card_id, now);
 
+        // computed before the mutable borrow below: `apply_claim` needs an
+        // immutable lookup into `self.cards` for each blocker, which can't
+        // coexist with a `get_mut` on the same map.
+        let blocked_by = self
+            .cards
+            .get(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .blocked_by
+            .clone();
+        let terminal_blockers = blocked_by
+            .iter()
+            .filter(|id| self.blocker_is_terminal(id))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+
         let run_id = self.next_run_id();
         let claim = self
             .cards
             .get_mut(card_id)
             .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
-            .apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds)?;
+            .apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds, |id| {
+                terminal_blockers.contains(id)
+            })?;
 
         let run = Run {
             id: run_id.clone(),
@@ -512,6 +529,15 @@ impl Board {
         }
     }
 
+    /// A blocker that doesn't exist in this board is treated as still
+    /// blocking (fail closed) rather than silently unblocking the card that
+    /// references it.
+    fn blocker_is_terminal(&self, id: &CardId) -> bool {
+        self.cards
+            .get(id)
+            .is_some_and(|card| card.status.is_terminal())
+    }
+
     fn append_activity(
         &mut self,
         run_id: RunId,
@@ -673,6 +699,29 @@ mod tests {
         board.import_cards(vec![blocked, oracleless]);
 
         assert!(board.list_ready(ReadyQuery::new(1, 10)).is_empty());
+    }
+
+    #[test]
+    fn board_blocker_resolves_against_terminality_powering_the_cli_path_preview() {
+        let blocker_id = CardId::new("blocker").unwrap();
+        let mut blocked = ready_card("blocked", Priority::P0, 0);
+        blocked.blocked_by.push(blocker_id.clone());
+
+        let mut board = Board::default();
+        board.import_cards(vec![ready_card("blocker", Priority::P0, 0), blocked]);
+
+        let ready = board.list_ready(ReadyQuery::new(1, 10));
+        assert!(!ready.iter().any(|card| card.id.as_str() == "blocked"));
+        let claim_while_blocked =
+            board.claim_card(&CardId::new("blocked").unwrap(), "agent-a", 1, 60);
+        assert!(matches!(claim_while_blocked, Err(DomainError::Conflict(_))));
+
+        let mut blocker = board.get_card(&blocker_id).unwrap().clone();
+        blocker.status = CardStatus::Done;
+        board.upsert_card(blocker);
+
+        let ready = board.list_ready(ReadyQuery::new(2, 10));
+        assert!(ready.iter().any(|card| card.id.as_str() == "blocked"));
     }
 
     #[test]
