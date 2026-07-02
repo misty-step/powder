@@ -15,7 +15,7 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
-pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, VerifiedApiKey};
+pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, RUN_SELECT_SQL, SCHEMA,

@@ -83,6 +83,16 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/complete",
         intent: "complete a card with proof",
     },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/keys",
+        intent: "list api key metadata (admin scope only, never secrets)",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/keys/{id}/revoke",
+        intent: "revoke an api key so it immediately fails auth (admin scope only)",
+    },
 ];
 
 pub fn route_summary() -> String {
@@ -114,5 +124,7 @@ mod tests {
         assert!(paths.contains(&"/api/v1/runs/awaiting-input"));
         assert!(paths.contains(&"/api/v1/runs/{id}/input"));
         assert!(paths.contains(&"/api/v1/runs/{id}/answer"));
+        assert!(paths.contains(&"/api/v1/keys"));
+        assert!(paths.contains(&"/api/v1/keys/{id}/revoke"));
     }
 }

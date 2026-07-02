@@ -7,6 +7,8 @@ use powder_store::{ApiKeyScope, Store, StoreError};
 pub const COMMANDS: &[&str] = &[
     "init-db",
     "key-create",
+    "key-list",
+    "key-revoke",
     "import",
     "import-repo",
     "create-card",
@@ -31,6 +33,8 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
         [command, rest @ ..] if command == "init-db" => init_db(rest),
         [command, rest @ ..] if command == "key-create" => key_create(rest),
+        [command, rest @ ..] if command == "key-list" => key_list(rest),
+        [command, rest @ ..] if command == "key-revoke" => key_revoke(rest),
         [command, rest @ ..] if command == "import" => import(rest),
         [command, rest @ ..] if command == "import-repo" => import_repo(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest),
@@ -60,6 +64,9 @@ pub fn help() -> String {
     }
     help.push_str("\nexamples:\n");
     help.push_str("  powder init-db --db ./data/powder.db --show-secret\n");
+    help.push_str("  powder key-create --db ./data/powder.db --name codex --scope agent\n");
+    help.push_str("  powder key-list --db ./data/powder.db\n");
+    help.push_str("  powder key-revoke key-id --db ./data/powder.db\n");
     help.push_str("  powder import backlog.d --db ./data/powder.db\n");
     help.push_str(
         "  powder import-repo ../bitterblossom/backlog.d --repo misty-step/bitterblossom --db ./data/powder.db\n",
@@ -138,6 +145,36 @@ fn key_create(args: &[String]) -> Result<String, ShellError> {
             key.scope.as_str()
         ))
     }
+}
+
+fn key_list(args: &[String]) -> Result<String, ShellError> {
+    let store = open_store(required_flag(args, "--db")?)?;
+    let keys = store.list_api_keys().map_err(store_err)?;
+    let mut out = String::new();
+    for key in keys {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            key.id,
+            key.name,
+            key.scope.as_str(),
+            key.created_at,
+            key.revoked_at
+                .map(|at| at.to_string())
+                .unwrap_or_else(|| "active".to_string())
+        ));
+    }
+    Ok(out)
+}
+
+fn key_revoke(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let key_id = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("key-revoke requires a key id".to_string()))?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    store.revoke_api_key(key_id, now).map_err(store_err)?;
+    Ok(format!("revoked\t{key_id}\n"))
 }
 
 fn import(args: &[String]) -> Result<String, ShellError> {
@@ -542,6 +579,8 @@ mod tests {
     #[test]
     fn cli_names_the_instance_workflow() {
         assert!(COMMANDS.contains(&"init-db"));
+        assert!(COMMANDS.contains(&"key-list"));
+        assert!(COMMANDS.contains(&"key-revoke"));
         assert!(COMMANDS.contains(&"import"));
         assert!(COMMANDS.contains(&"import-repo"));
         assert!(COMMANDS.contains(&"list-ready"));
@@ -819,6 +858,60 @@ mod tests {
         assert!(card_a.contains("Repo A ticket one"));
         let card_b = run(&args(["get-card", "repo-b-001", "--db", &db])).unwrap();
         assert!(card_b.contains("Repo B ticket one"));
+    }
+
+    #[test]
+    fn cli_key_lifecycle_lists_and_revokes() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-key-lifecycle-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        let created = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex",
+            "--scope",
+            "agent",
+            "--show-secret",
+        ]))
+        .unwrap();
+        let key_id = created.split('\t').nth(1).expect("key id").to_owned();
+
+        let listed = run(&args(["key-list", "--db", &db])).unwrap();
+        assert!(listed.contains(&key_id));
+        assert!(listed.contains("codex"));
+        assert!(listed.contains("active"));
+        assert!(
+            !listed.contains("sk_powder_"),
+            "key-list must never print raw secrets"
+        );
+
+        let revoked = run(&args(["key-revoke", &key_id, "--db", &db])).unwrap();
+        assert_eq!(revoked, format!("revoked\t{key_id}\n"));
+
+        let listed_after = run(&args(["key-list", "--db", &db])).unwrap();
+        let revoked_line = listed_after
+            .lines()
+            .find(|line| line.contains(&key_id))
+            .expect("revoked key still listed");
+        assert!(
+            !revoked_line.ends_with("active"),
+            "revoked key must not report active: {revoked_line}"
+        );
+
+        // idempotent: revoking again does not error.
+        run(&args(["key-revoke", &key_id, "--db", &db])).unwrap();
+
+        let missing = run(&args(["key-revoke", "key-does-not-exist", "--db", &db])).unwrap_err();
+        assert!(matches!(missing, ShellError::NotFound(_)));
     }
 
     #[test]
