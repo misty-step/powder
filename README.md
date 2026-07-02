@@ -79,6 +79,15 @@ API keys are bound to actor records. In `api-key` mode, claiming work uses the
 authenticated actor; a request-body `agent` value is accepted only when it
 matches that actor.
 
+Canary self-report: `crates/powder-server/src/canary.rs` posts a `powder`
+check-in every 60s and ad hoc error reports to canary-obs, gated on two Fly
+secrets — `CANARY_ENDPOINT` (e.g. `https://canary-obs.fly.dev`) and
+`CANARY_INGEST_KEY` (a scoped `ingest-only` key bound to service `powder`,
+minted via canary's `POST /api/v1/keys`). Both must be set or
+`canary::enabled()` silently no-ops. The check-in name is `powder`; canary
+needs a matching monitor (`POST /api/v1/monitors` with `"name":"powder"`) or
+check-ins 404.
+
 Fly instance shape:
 
 ```sh
