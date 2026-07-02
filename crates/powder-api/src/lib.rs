@@ -16,7 +16,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/import",
-        intent: "import user-supplied backlog.d markdown into the instance database",
+        intent: "import backlog.d markdown into the instance database, from a server-local path or raw file contents in the body, optionally namespaced by repo",
     },
     ApiRoute {
         method: "GET",
