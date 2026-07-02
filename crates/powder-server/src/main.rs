@@ -28,6 +28,8 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
+mod canary;
+
 const DEFAULT_DB_PATH: &str = "/data/powder.db";
 const DEFAULT_PORT: u16 = 4000;
 
@@ -267,12 +269,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let config = Config::from_env().map_err(|err| {
-        tracing::error!("{err}");
-        err
+    let config = Config::from_env().inspect_err(|err| {
+        let msg = err.to_string();
+        tracing::error!("{msg}");
+        canary::report_error("powder.config", &msg);
     })?;
-    let mut store = Store::open(&config.db_path)?;
-    store.migrate()?;
+    let mut store = Store::open(&config.db_path).inspect_err(|err| {
+        let msg = format!("store open {}: {err:#}", config.db_path.display());
+        tracing::error!("{msg}");
+        canary::report_error("powder.store.open", &msg);
+    })?;
+    store.migrate().inspect_err(|err| {
+        let msg = format!("store migrate: {err:#}");
+        tracing::error!("{msg}");
+        canary::report_error("powder.store.migrate", &msg);
+    })?;
     if let Some(key) = store.apply_initial_seed(unix_now())? {
         if config.disclose_bootstrap_key {
             eprintln!("Powder bootstrap API key: {}", key.raw_key);
@@ -299,10 +310,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reachability gap. Don't switch to `0.0.0.0` to silence it: that binds
     // v4-only and breaks the private (Flycast/`.internal`) path instead.
     tracing::info!("starting powder-server on {addr}");
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr).await.inspect_err(|err| {
+        let msg = format!("bind {addr}: {err:#}");
+        tracing::error!("{msg}");
+        canary::report_error("powder.bind", &msg);
+    })?;
+
+    canary::check_in();
+    canary::start_health_loop();
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await
+        .inspect_err(|err| {
+            let msg = format!("server: {err:#}");
+            tracing::error!("{msg}");
+            canary::report_error("powder.serve", &msg);
+        })?;
     Ok(())
 }
 
