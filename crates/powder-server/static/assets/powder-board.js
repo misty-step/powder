@@ -128,10 +128,16 @@ async function loadBoard({ keepSelection = false } = {}) {
     state.loading = false;
     updateConnection("ok", "connected");
     refreshSourceOptions();
-    reconcileSelection(keepSelection);
+    const hashMatched = selectHashCard();
+    if (!hashMatched) {
+      reconcileSelection(keepSelection);
+    }
     renderBoard();
-    if (state.selectedId && shouldOpenDrawerByDefault()) {
+    if (state.selectedId && (hashMatched || shouldOpenDrawerByDefault())) {
       await loadDetail(state.selectedId, { silent: true });
+      if (hashMatched) {
+        scrollToSelectedCard();
+      }
     } else {
       state.detail = null;
       renderDrawer();
@@ -334,7 +340,7 @@ function renderCard(card) {
     ? `<span class="metric"><svg class="ae-icon" aria-hidden="true"><use href="#i-user"></use></svg>${escapeHtml(card.claim.agent)}</span><span class="metric"><svg class="ae-icon" aria-hidden="true"><use href="#i-clock"></use></svg>${formatShortTime(card.claim.expires_at)}</span>`
     : "";
   return `
-    <button class="card-button${selected}" type="button" data-card-id="${escapeHtml(card.id)}" aria-pressed="${card.id === state.selectedId}">
+    <button id="${escapeHtml(anchorId(card.id))}" class="card-button${selected}" type="button" data-card-id="${escapeHtml(card.id)}" aria-pressed="${card.id === state.selectedId}">
       <div class="card-id">${escapeHtml(card.id)}</div>
       <div class="card-title">${escapeHtml(card.title)}</div>
       <div class="card-metrics">
@@ -595,6 +601,51 @@ function focusSelectedCard(options = {}) {
   }
 }
 
+function anchorId(cardId) {
+  return `card-${cardId}`;
+}
+
+function cardIdFromHash() {
+  const prefix = "#card-";
+  if (!window.location.hash.startsWith(prefix)) return null;
+  try {
+    return decodeURIComponent(window.location.hash.slice(prefix.length));
+  } catch (_err) {
+    return window.location.hash.slice(prefix.length);
+  }
+}
+
+function selectHashCard() {
+  const cardId = cardIdFromHash();
+  if (!cardId) return false;
+  const visible = visibleCards();
+  if (!visible.some((card) => card.id === cardId)) return false;
+  state.selectedId = cardId;
+  state.selectedIndex = visible.findIndex((card) => card.id === cardId);
+  els.app.dataset.drawer = "open";
+  return true;
+}
+
+function applyHashSelection() {
+  const selected = selectHashCard();
+  if (!selected) return false;
+  renderBoard();
+  loadDetail(state.selectedId, { silent: true });
+  scrollToSelectedCard();
+  return true;
+}
+
+function scrollToSelectedCard() {
+  const cardId = state.selectedId;
+  if (!cardId) return;
+  requestAnimationFrame(() => {
+    document.getElementById(anchorId(cardId))?.scrollIntoView({
+      block: "nearest",
+      inline: "center",
+    });
+  });
+}
+
 function shouldOpenDrawerByDefault() {
   return window.matchMedia("(min-width: 981px)").matches;
 }
@@ -633,6 +684,9 @@ function toggleMode() {
 els.board.addEventListener("click", (event) => {
   const button = event.target.closest("[data-card-id]");
   if (!button) return;
+  if (window.location.hash !== `#${anchorId(button.dataset.cardId)}`) {
+    history.replaceState(null, "", `#${anchorId(button.dataset.cardId)}`);
+  }
   loadDetail(button.dataset.cardId);
 });
 
@@ -718,6 +772,10 @@ document.addEventListener("keydown", (event) => {
   } else if (event.key === "Escape") {
     els.app.dataset.drawer = "closed";
   }
+});
+
+window.addEventListener("hashchange", () => {
+  applyHashSelection();
 });
 
 loadBoard();
