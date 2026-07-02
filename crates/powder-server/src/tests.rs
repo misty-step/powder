@@ -456,6 +456,142 @@ async fn agent_scoped_key_cannot_author_or_import_cards() {
 }
 
 #[tokio::test]
+async fn agent_scoped_key_cannot_list_or_revoke_keys() {
+    let (state, _admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/keys")
+                .header(AUTHORIZATION, format!("Bearer {agent_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::FORBIDDEN);
+
+    let revoked = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/keys/some-id/revoke",
+            Some(&agent_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_can_list_and_revoke_a_key_which_then_loses_access_immediately() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key_raw = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/keys")
+                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    let keys = listed["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2, "bootstrap admin key + the new agent key");
+    let agent_entry = keys
+        .iter()
+        .find(|key| key["name"] == "codex")
+        .expect("agent key listed");
+    assert_eq!(agent_entry["scope"], "agent");
+    assert!(agent_entry["revoked_at"].is_null());
+    let agent_key_id = agent_entry["id"].as_str().unwrap().to_string();
+
+    // the agent key still works before revocation.
+    let still_works = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header(AUTHORIZATION, format!("Bearer {agent_key_raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_works.status(), StatusCode::OK);
+
+    let revoked = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/keys/{agent_key_id}/revoke"),
+            Some(&admin_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header(AUTHORIZATION, format!("Bearer {agent_key_raw}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected.status(),
+        StatusCode::UNAUTHORIZED,
+        "a revoked key must fail auth immediately"
+    );
+}
+
+#[tokio::test]
+async fn revoking_an_unknown_key_id_returns_not_found() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/keys/does-not-exist/revoke",
+            Some(&admin_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let holder_key = state

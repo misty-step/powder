@@ -1,7 +1,7 @@
 use bcrypt::verify;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-use super::{non_empty, Result, Store, StoreError, API_KEY_ALPHABET};
+use super::{non_empty, DomainError, Result, Store, StoreError, API_KEY_ALPHABET};
 
 const API_KEY_PREFIX_LEN: usize = 12;
 const BOOTSTRAP_SEED: &str = "initial_config_v1";
@@ -82,6 +82,17 @@ pub struct VerifiedApiKey {
     pub actor: Actor,
     pub name: String,
     pub scope: ApiKeyScope,
+}
+
+/// Key metadata for listing: never the hash or the raw secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeySummary {
+    pub id: String,
+    pub actor: Actor,
+    pub name: String,
+    pub scope: ApiKeyScope,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
 }
 
 impl Store {
@@ -190,6 +201,94 @@ impl Store {
             [],
             |row| row.get::<_, u64>(0),
         )?)
+    }
+
+    /// Every key's metadata, oldest first. Never returns the hash or raw
+    /// secret -- only what an operator needs to decide what to revoke.
+    pub fn list_api_keys(&self) -> Result<Vec<ApiKeySummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT api_keys.id, api_keys.name, api_keys.scope, api_keys.created_at, api_keys.revoked_at,
+                    actors.id, actors.kind, actors.display_name, actors.created_at
+             FROM api_keys
+             JOIN actors ON actors.id = api_keys.actor_id
+             ORDER BY api_keys.created_at ASC, api_keys.id ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    name,
+                    scope,
+                    created_at,
+                    revoked_at,
+                    actor_id,
+                    actor_kind,
+                    actor_name,
+                    actor_created_at,
+                )| {
+                    let scope =
+                        ApiKeyScope::parse(&scope).ok_or(StoreError::InvalidStoredValue {
+                            field: "api_keys.scope",
+                            value: scope,
+                        })?;
+                    let actor_kind =
+                        ActorKind::parse(&actor_kind).ok_or(StoreError::InvalidStoredValue {
+                            field: "actors.kind",
+                            value: actor_kind,
+                        })?;
+                    Ok(ApiKeySummary {
+                        id,
+                        actor: Actor {
+                            id: actor_id,
+                            kind: actor_kind,
+                            display_name: actor_name,
+                            created_at: actor_created_at,
+                        },
+                        name,
+                        scope,
+                        created_at,
+                        revoked_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Revoke a key so it immediately fails `verify_api_key`. Idempotent: a
+    /// key that is already revoked stays revoked at its original timestamp
+    /// (no double-write, no error). Errors only if `key_id` does not exist.
+    pub fn revoke_api_key(&mut self, key_id: &str, now: i64) -> Result<()> {
+        let updated = self.connection.execute(
+            "UPDATE api_keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![key_id, now],
+        )?;
+        if updated == 0 {
+            let exists = self
+                .connection
+                .query_row("SELECT 1 FROM api_keys WHERE id = ?1", [key_id], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !exists {
+                return Err(DomainError::not_found("api_key", key_id.to_string()).into());
+            }
+        }
+        Ok(())
     }
 }
 

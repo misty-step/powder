@@ -437,6 +437,85 @@ fn created_agent_key_verifies_with_agent_scope() -> Result<()> {
 }
 
 #[test]
+fn list_api_keys_reports_metadata_never_secrets() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let bootstrap = store.apply_initial_seed(1)?.expect("bootstrap key");
+    let agent = store.create_api_key("codex", ApiKeyScope::Agent, 2)?;
+
+    let keys = store.list_api_keys()?;
+
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].id, bootstrap.id);
+    assert_eq!(keys[0].scope, ApiKeyScope::Admin);
+    assert_eq!(keys[0].revoked_at, None);
+    assert_eq!(keys[1].id, agent.id);
+    assert_eq!(keys[1].name, "codex");
+    assert_eq!(keys[1].actor.display_name, "codex");
+    assert_eq!(keys[1].revoked_at, None);
+    Ok(())
+}
+
+#[test]
+fn revoke_api_key_fails_verification_immediately() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let key = store.create_api_key("codex", ApiKeyScope::Agent, 1)?;
+    assert!(store.verify_api_key(&key.raw_key)?.is_some());
+
+    store.revoke_api_key(&key.id, 10)?;
+
+    assert!(store.verify_api_key(&key.raw_key)?.is_none());
+    let listed = store.list_api_keys()?;
+    assert_eq!(listed[0].revoked_at, Some(10));
+    Ok(())
+}
+
+#[test]
+fn revoke_api_key_is_idempotent_and_does_not_move_the_timestamp() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let key = store.create_api_key("codex", ApiKeyScope::Agent, 1)?;
+
+    store.revoke_api_key(&key.id, 10)?;
+    store.revoke_api_key(&key.id, 20)?;
+
+    let listed = store.list_api_keys()?;
+    assert_eq!(
+        listed[0].revoked_at,
+        Some(10),
+        "re-revoking must not move the original revocation timestamp"
+    );
+    Ok(())
+}
+
+#[test]
+fn revoke_api_key_errors_for_an_unknown_id() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let err = store.revoke_api_key("key-does-not-exist", 10);
+
+    assert!(matches!(
+        err,
+        Err(StoreError::Domain(DomainError::NotFound { .. }))
+    ));
+    Ok(())
+}
+
+#[test]
+fn the_bootstrap_key_can_be_revoked_like_any_other() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let bootstrap = store.apply_initial_seed(1)?.expect("bootstrap key");
+
+    store.revoke_api_key(&bootstrap.id, 5)?;
+
+    assert!(store.verify_api_key(&bootstrap.raw_key)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
     let path = temp_db("v1-identity");
     let raw_key = "sk_powder_legacy_agent_key_for_identity_migration";

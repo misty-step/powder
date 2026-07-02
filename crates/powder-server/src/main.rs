@@ -285,6 +285,8 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/input", post(request_input))
         .route("/api/v1/runs/{id}/answer", post(answer_input))
+        .route("/api/v1/keys", get(list_keys))
+        .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .with_state(state)
 }
 
@@ -573,6 +575,52 @@ async fn complete_card(
         &actor.authority(),
     )?;
     Ok(Json(card))
+}
+
+#[derive(Debug, Serialize)]
+struct KeySummaryResponse {
+    id: String,
+    name: String,
+    scope: &'static str,
+    actor: String,
+    created_at: i64,
+    revoked_at: Option<i64>,
+}
+
+impl From<powder_store::ApiKeySummary> for KeySummaryResponse {
+    fn from(key: powder_store::ApiKeySummary) -> Self {
+        Self {
+            id: key.id,
+            name: key.name,
+            scope: key.scope.as_str(),
+            actor: key.actor.display_name,
+            created_at: key.created_at,
+            revoked_at: key.revoked_at,
+        }
+    }
+}
+
+async fn list_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let keys = lock_store(&state)?
+        .list_api_keys()?
+        .into_iter()
+        .map(KeySummaryResponse::from)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "keys": keys })))
+}
+
+async fn revoke_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    lock_store(&state)?.revoke_api_key(&id, unix_now())?;
+    Ok(Json(json!({ "id": id, "revoked": true })))
 }
 
 #[derive(Debug, Clone)]
