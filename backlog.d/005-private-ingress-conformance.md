@@ -11,7 +11,7 @@ deployed instance rather than local-only database files.
 ## Oracle
 - [x] The deployment has a conformance check that proves whether public IPs are absent or intentionally declared.
 - [x] A private ingress smoke test reaches health/readiness and an authenticated agent route from the operator network.
-- [ ] Unauthenticated onboarding/health exposure is reviewed and either minimized or explicitly documented as safe.
+- [x] Unauthenticated onboarding/health exposure is reviewed and either minimized or explicitly documented as safe.
 - [x] MCP works against the deployed instance through an HTTP or hosted MCP transport; it no longer silently falls back to evaporating in-memory state for real work.
 - [ ] Litestream restore and required-backup behavior are documented and tested for the deployment profile.
 
@@ -56,6 +56,36 @@ deployed instance rather than local-only database files.
   new `remote::tests::*` covering auth header, GET query params, and
   Forbidden-error passthrough). Residual: no API-key revoke path exists yet,
   so the two verification keys minted for this proof persist in the deployed
-  instance (agent + admin scope, clearly named `mcp-verification-*`);
-  unauthenticated-onboarding review and the Litestream restore-drill writeup
-  remain open for a follow-up slice.
+  instance (agent + admin scope, clearly named `mcp-verification-*` --
+  now revocable via backlog.d/009's `key-revoke`); unauthenticated-onboarding
+  review and the Litestream restore-drill writeup remain open for a
+  follow-up slice.
+- 2026-07-02 slice (overnight autonomous): reviewed the three
+  unauthenticated routes (`GET /healthz`, `GET /readyz`,
+  `GET /api/v1/onboarding`). All three are *intentionally* unauthenticated
+  by design, not an oversight: Fly's own health checker probes `/healthz`
+  and `/readyz` without a bearer token, and `/api/v1/onboarding` must be
+  reachable before any API key exists so a fresh deploy can tell an
+  operator it needs first-run setup. That contract stands. What was
+  reviewed and fixed: both `Ready` and `Onboarding` response bodies
+  included `db_path`, the server's local database file path -- a pure
+  implementation detail with no operational value to a caller (a client
+  doesn't need to know the deployed instance's filesystem layout to decide
+  whether it's healthy or needs onboarding) and no reason to be legible to
+  an unauthenticated caller. Removed from both response shapes;
+  `schema_version` alone already proves the database is open and migrated,
+  which is all `/readyz` needs to demonstrate. `auth_mode` and
+  `public_base_url` stay: an operator deciding how to authenticate against
+  a fresh instance needs to know the configured auth mode, and neither
+  value is sensitive (the auth mode is a public deployment fact, not a
+  secret; `public_base_url` is meant to be public by name). This closes
+  the review now that the deployment is flycast-only (backlog.d/005's
+  first slice) -- these routes are reachable only over the private network
+  in the first place, so the residual exposure the original groom report
+  flagged (public internet) no longer applies; the `db_path` fix is
+  defense-in-depth on top of that, not a response to an active public leak.
+  Proof: new `healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db_path`
+  test asserts all three routes stay reachable with no bearer token
+  (proving the by-design contract didn't regress) and that none of their
+  response bodies contain `db_path` or the actual configured path. 92
+  workspace tests green (fmt/clippy/test).

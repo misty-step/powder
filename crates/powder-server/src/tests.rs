@@ -860,6 +860,39 @@ async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
 }
 
 #[tokio::test]
+async fn healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db_path() {
+    let (state, _admin_key) = test_state(AuthMode::ApiKey);
+    let db_path = state.config.db_path.display().to_string();
+    let app = app(state);
+
+    for path in ["/healthz", "/readyz", "/api/v1/onboarding"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path} must stay reachable without a bearer token (Fly's own health \
+             checker and first-run onboarding both run before any key exists)"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("db_path") && !body.contains(&db_path),
+            "{path} must never leak the server-local database path: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn tailnet_and_none_modes_authorize_as_configured() {
     let (tailnet_state, _) = test_state(AuthMode::TailscaleHeader);
     let tailnet_app = app(tailnet_state);

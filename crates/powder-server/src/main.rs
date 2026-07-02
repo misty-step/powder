@@ -145,10 +145,15 @@ struct Health {
     service: &'static str,
 }
 
+// `Ready` and `Onboarding` are served unauthenticated (Fly's own health
+// checker and first-run onboarding both run before any API key exists), so
+// neither includes `db_path`: it is a server-filesystem implementation
+// detail with no operational value to a caller and no reason to be legible
+// to an unauthenticated request. `schema_version` alone already proves the
+// database is open and migrated.
 #[derive(Debug, Serialize)]
 struct Ready {
     ok: bool,
-    db_path: String,
     auth_mode: AuthMode,
     schema_version: Option<u32>,
 }
@@ -157,7 +162,6 @@ struct Ready {
 struct Onboarding {
     needs_setup: bool,
     bootstrap_key_configured: bool,
-    db_path: String,
     auth_mode: AuthMode,
     public_base_url: Option<String>,
 }
@@ -329,7 +333,6 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::OK,
             Json(Ready {
                 ok: true,
-                db_path: state.config.db_path.display().to_string(),
                 auth_mode: state.config.auth_mode,
                 schema_version: Some(schema_version),
             }),
@@ -338,7 +341,6 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(Ready {
                 ok: false,
-                db_path: state.config.db_path.display().to_string(),
                 auth_mode: state.config.auth_mode,
                 schema_version: None,
             }),
@@ -351,7 +353,6 @@ async fn onboarding(State(state): State<AppState>) -> Result<Json<Onboarding>, A
     Ok(Json(Onboarding {
         needs_setup: matches!(state.config.auth_mode, AuthMode::ApiKey) && active_keys == 0,
         bootstrap_key_configured: active_keys > 0,
-        db_path: state.config.db_path.display().to_string(),
         auth_mode: state.config.auth_mode,
         public_base_url: state.config.public_base_url.clone(),
     }))
