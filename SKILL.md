@@ -28,6 +28,8 @@ For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
   and status transitions.
 - Release the claim when stopping voluntarily so another worker can pick the
   card up immediately.
+- In API-key mode, claim as the authenticated key actor; do not supply another
+  agent name to impersonate a different worker.
 - Use `get_card`, `get_run`, and `list_awaiting_input` to read timelines before
   answering or completing work.
 - Use `request_input` when a human decision is needed; do not invent approvals.
