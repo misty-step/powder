@@ -61,6 +61,17 @@ fn fly_config_is_flycast_only_and_can_never_re_expose_a_public_ip() {
         fly.contains(r#"handlers = ["http"]"#) && !fly.contains(r#"handlers = ["tls""#),
         "fly.toml services.ports must use a plain http handler, never a public tls handler"
     );
+    // `[::]` is required, not `0.0.0.0`: this app's private-network path
+    // (Flycast/`.internal`) is IPv6-only, and a `0.0.0.0` bind cannot answer
+    // it (confirmed live: `fly proxy` reset every request against a
+    // `0.0.0.0`-bound deploy, and worked immediately once switched to `[::]`).
+    // `fly deploy` prints a "not listening on 0.0.0.0" warning for `[::]`
+    // regardless; that is a confirmed cosmetic false positive (health
+    // checks stay 2/2 passing) — see the comment in fly.toml.
+    assert!(
+        fly.contains(r#"POWDER_BIND_ADDR = "[::]:4000""#),
+        "fly.toml must bind [::] so the private Flycast/.internal path stays reachable"
+    );
 }
 
 #[test]

@@ -247,6 +247,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = app(state);
 
+    // `[::]` is a single dual-stack socket on Fly's guest kernel (confirmed
+    // live: it accepts both a literal IPv4-loopback connection and traffic
+    // over `fly proxy`/`.internal`, which is IPv6-only private networking).
+    // `fly deploy` prints a "not listening on 0.0.0.0" warning for this bind
+    // regardless, because its scanner only checks `/proc/net/tcp` (the v4
+    // table) and dual-stack v6 sockets never appear there even though they
+    // serve v4 traffic fine — a known cosmetic false positive, not a real
+    // reachability gap. Don't switch to `0.0.0.0` to silence it: that binds
+    // v4-only and breaks the private (Flycast/`.internal`) path instead.
     tracing::info!("starting powder-server on {addr}");
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app)
