@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 
 use powder_core::{Authority, Board, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
-use powder_shell::{load_backlog_dir, unix_now, ShellError};
+use powder_shell::{load_backlog_dir, load_backlog_dir_for_repo, unix_now, ShellError};
 use powder_store::{ApiKeyScope, Store, StoreError};
 
 pub const COMMANDS: &[&str] = &[
     "init-db",
     "key-create",
     "import",
+    "import-repo",
     "create-card",
     "list-ready",
     "claim",
@@ -31,6 +32,7 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "init-db" => init_db(rest),
         [command, rest @ ..] if command == "key-create" => key_create(rest),
         [command, rest @ ..] if command == "import" => import(rest),
+        [command, rest @ ..] if command == "import-repo" => import_repo(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest),
         [command, rest @ ..] if command == "claim" => claim(rest),
@@ -59,6 +61,9 @@ pub fn help() -> String {
     help.push_str("\nexamples:\n");
     help.push_str("  powder init-db --db ./data/powder.db --show-secret\n");
     help.push_str("  powder import backlog.d --db ./data/powder.db\n");
+    help.push_str(
+        "  powder import-repo ../bitterblossom/backlog.d --repo misty-step/bitterblossom --db ./data/powder.db\n",
+    );
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
     help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
@@ -182,6 +187,43 @@ fn outcome_line(outcome: &powder_store::ImportOutcome) -> String {
         outcome.preserved,
         outcome.unchanged
     )
+}
+
+/// Import one Factory repo's backlog.d into a shared instance database: card
+/// ids are namespaced `{repo-slug}-{original-id}` and tagged with `--repo`
+/// so cards from independently numbered repos (every repo's backlog.d
+/// starts its own `001-*.md`) can coexist without id collisions. Run once
+/// per repo to migrate the fleet's backlog into one Powder instance.
+fn import_repo(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let path = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("import-repo requires a backlog.d path".to_string()))?;
+    let repo = required_flag(args, "--repo")?;
+    let cards = load_backlog_dir_for_repo(path, repo, now)?;
+    let mut out = String::new();
+
+    if has_flag(args, "--dry-run") {
+        let store = open_store(required_flag(args, "--db")?)?;
+        let outcome = store.preview_import(&cards).map_err(store_err)?;
+        out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
+    } else {
+        let mut store = open_store(required_flag(args, "--db")?)?;
+        let outcome = store.import_cards(cards.clone()).map_err(store_err)?;
+        out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
+    }
+
+    for card in cards {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            card.id,
+            card.priority.as_str(),
+            card.status.as_str(),
+            card.title
+        ));
+    }
+    Ok(out)
 }
 
 fn create_card(args: &[String]) -> Result<String, ShellError> {
@@ -500,6 +542,8 @@ mod tests {
     #[test]
     fn cli_names_the_instance_workflow() {
         assert!(COMMANDS.contains(&"init-db"));
+        assert!(COMMANDS.contains(&"import"));
+        assert!(COMMANDS.contains(&"import-repo"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
@@ -720,6 +764,61 @@ mod tests {
             card, card_after_dry_run,
             "dry-run must not mutate the store"
         );
+    }
+
+    #[test]
+    fn cli_import_repo_namespaces_ids_so_two_repos_never_collide() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db = std::env::temp_dir().join(format!("powder-cli-import-repo-{nanos}.db"));
+        let db = db.to_string_lossy().to_string();
+
+        let repo_a = std::env::temp_dir().join(format!("powder-cli-repo-a-{nanos}"));
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::write(
+            repo_a.join("001-first.md"),
+            "# Repo A ticket one\n\nPriority: P0 | Status: ready\n\n## Goal\nA.\n\n## Oracle\n- [ ] a\n",
+        )
+        .unwrap();
+
+        let repo_b = std::env::temp_dir().join(format!("powder-cli-repo-b-{nanos}"));
+        std::fs::create_dir_all(&repo_b).unwrap();
+        std::fs::write(
+            repo_b.join("001-first.md"),
+            "# Repo B ticket one\n\nPriority: P0 | Status: ready\n\n## Goal\nB.\n\n## Oracle\n- [ ] b\n",
+        )
+        .unwrap();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        let import_a = run(&args([
+            "import-repo",
+            repo_a.to_str().unwrap(),
+            "--repo",
+            "misty-step/repo-a",
+            "--db",
+            &db,
+        ]))
+        .unwrap();
+        assert!(import_a.contains("repo-a-001"));
+        let import_b = run(&args([
+            "import-repo",
+            repo_b.to_str().unwrap(),
+            "--repo",
+            "misty-step/repo-b",
+            "--db",
+            &db,
+        ]))
+        .unwrap();
+        assert!(import_b.contains("repo-b-001"));
+
+        // both survive independently: no id collision even though both
+        // repos number their tickets starting from 001.
+        let card_a = run(&args(["get-card", "repo-a-001", "--db", &db])).unwrap();
+        assert!(card_a.contains("Repo A ticket one"));
+        let card_b = run(&args(["get-card", "repo-b-001", "--db", &db])).unwrap();
+        assert!(card_b.contains("Repo B ticket one"));
     }
 
     #[test]
