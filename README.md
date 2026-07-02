@@ -6,7 +6,8 @@ human-in-loop pauses.
 
 The repo ships the application. A deployment owns the data.
 
-Read the project direction in [`VISION.md`](VISION.md).
+Read the project direction in [`VISION.md`](VISION.md) and the repo contract
+(architecture boundaries, gates, red lines) in [`AGENTS.md`](AGENTS.md).
 
 The first milestone is intentionally small:
 
