@@ -735,6 +735,9 @@ name = "powder-shell"
 version = "0.1.0"
 dependencies = [
  "powder-core",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

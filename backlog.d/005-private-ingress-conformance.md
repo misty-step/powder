@@ -1,6 +1,6 @@
 # Private ingress conformance
 
-Priority: P1 | Status: backlog | Type: Epic
+Priority: P1 | Status: done | Type: Epic
 
 ## Goal
 Make the deployment match Powder's private-instance promise. Product code stays

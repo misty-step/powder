@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use powder_core::{Authority, Board, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
-use powder_shell::{load_backlog_dir, load_backlog_dir_for_repo, unix_now, ShellError};
+use powder_shell::{
+    load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
+};
 use powder_store::{ApiKeyScope, Store, StoreError};
 
 pub const COMMANDS: &[&str] = &[
@@ -11,6 +13,7 @@ pub const COMMANDS: &[&str] = &[
     "key-revoke",
     "import",
     "import-repo",
+    "import-github-issues",
     "create-card",
     "list-ready",
     "claim",
@@ -37,6 +40,7 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "key-revoke" => key_revoke(rest),
         [command, rest @ ..] if command == "import" => import(rest),
         [command, rest @ ..] if command == "import-repo" => import_repo(rest),
+        [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest),
         [command, rest @ ..] if command == "claim" => claim(rest),
@@ -70,6 +74,12 @@ pub fn help() -> String {
     help.push_str("  powder import backlog.d --db ./data/powder.db\n");
     help.push_str(
         "  powder import-repo ../bitterblossom/backlog.d --repo misty-step/bitterblossom --db ./data/powder.db\n",
+    );
+    help.push_str(
+        "  gh issue list --json number,title,body,labels,state,url --repo misty-step/bitterblossom > issues.json\n",
+    );
+    help.push_str(
+        "  powder import-github-issues issues.json --repo misty-step/bitterblossom --db ./data/powder.db\n",
     );
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
@@ -239,6 +249,41 @@ fn import_repo(args: &[String]) -> Result<String, ShellError> {
         .ok_or_else(|| ShellError::Invalid("import-repo requires a backlog.d path".to_string()))?;
     let repo = required_flag(args, "--repo")?;
     let cards = load_backlog_dir_for_repo(path, repo, now)?;
+    let mut out = String::new();
+
+    if has_flag(args, "--dry-run") {
+        let store = open_store(required_flag(args, "--db")?)?;
+        let outcome = store.preview_import(&cards).map_err(store_err)?;
+        out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
+    } else {
+        let mut store = open_store(required_flag(args, "--db")?)?;
+        let outcome = store.import_cards(cards.clone()).map_err(store_err)?;
+        out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
+    }
+
+    for card in cards {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            card.id,
+            card.priority.as_str(),
+            card.status.as_str(),
+            card.title
+        ));
+    }
+    Ok(out)
+}
+
+/// Import a GitHub repo's issues from a local JSON file (the shape produced
+/// by `gh issue list --json number,title,body,labels,state,url`). Powder
+/// never talks to the GitHub API itself; fetching is the operator's own
+/// step, this only maps and imports what's already on disk.
+fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let path = positional(args).first().copied().ok_or_else(|| {
+        ShellError::Invalid("import-github-issues requires a JSON file path".to_string())
+    })?;
+    let repo = required_flag(args, "--repo")?;
+    let cards = load_github_issues_file(path, repo, now)?;
     let mut out = String::new();
 
     if has_flag(args, "--dry-run") {
@@ -583,6 +628,7 @@ mod tests {
         assert!(COMMANDS.contains(&"key-revoke"));
         assert!(COMMANDS.contains(&"import"));
         assert!(COMMANDS.contains(&"import-repo"));
+        assert!(COMMANDS.contains(&"import-github-issues"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
@@ -858,6 +904,105 @@ mod tests {
         assert!(card_a.contains("Repo A ticket one"));
         let card_b = run(&args(["get-card", "repo-b-001", "--db", &db])).unwrap();
         assert!(card_b.contains("Repo B ticket one"));
+    }
+
+    #[test]
+    fn cli_import_github_issues_maps_open_and_closed_issues_and_survives_reimport() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db = std::env::temp_dir().join(format!("powder-cli-gh-issues-{nanos}.db"));
+        let db = db.to_string_lossy().to_string();
+        let issues_file = std::env::temp_dir().join(format!("powder-cli-gh-issues-{nanos}.json"));
+        std::fs::write(
+            &issues_file,
+            r#"[
+              {"number": 1, "title": "Open issue", "body": "needs work", "labels": [{"name": "bug"}], "state": "OPEN", "url": "https://github.com/misty-step/example/issues/1"},
+              {"number": 2, "title": "Closed issue", "body": "done", "labels": [], "state": "CLOSED", "url": "https://github.com/misty-step/example/issues/2"}
+            ]"#,
+        )
+        .unwrap();
+        let issues_file = issues_file.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        let imported = run(&args([
+            "import-github-issues",
+            &issues_file,
+            "--repo",
+            "misty-step/example",
+            "--db",
+            &db,
+        ]))
+        .unwrap();
+        assert!(imported.contains("imported\ttotal=2\tcreated=2"));
+
+        let open_card = run(&args(["get-card", "example-1", "--db", &db])).unwrap();
+        assert!(open_card.contains("\"status\": \"backlog\""));
+        assert!(
+            open_card.contains("\"acceptance\": []"),
+            "no fabricated acceptance"
+        );
+
+        let closed_card = run(&args(["get-card", "example-2", "--db", &db])).unwrap();
+        assert!(closed_card.contains("\"status\": \"done\""));
+
+        // status alone doesn't make it claimable: moving Backlog -> Ready is
+        // a legal transition, but with no real acceptance criteria the card
+        // still never shows up as ready ("ready is a query, not vibes").
+        run(&args([
+            "update-status",
+            "example-1",
+            "--db",
+            &db,
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let ready = run(&args(["list-ready", "--db", &db])).unwrap();
+        assert!(
+            !ready.contains("example-1"),
+            "no acceptance criteria means never claimable, regardless of status: {ready}"
+        );
+
+        // reimport-safety carries through the GitHub path too: the closed
+        // issue is a terminal (Done) card, so its *status* is protected from
+        // a stale reimport the same way a claim is -- even if the issue is
+        // reopened on GitHub afterward (content like title/body still
+        // refreshes on reimport, same as backlog.d; only status/claim are
+        // frozen, per Card::merge_reimport -- reopening can't silently
+        // revert a card Powder already recorded as done).
+        std::fs::write(
+            &issues_file,
+            r#"[
+              {"number": 1, "title": "Open issue", "body": "needs work", "labels": [{"name": "bug"}], "state": "OPEN", "url": "https://github.com/misty-step/example/issues/1"},
+              {"number": 2, "title": "Reopened issue", "body": "done", "labels": [], "state": "OPEN", "url": "https://github.com/misty-step/example/issues/2"}
+            ]"#,
+        )
+        .unwrap();
+        let reimport = run(&args([
+            "import-github-issues",
+            &issues_file,
+            "--repo",
+            "misty-step/example",
+            "--db",
+            &db,
+        ]))
+        .unwrap();
+        assert!(
+            reimport.contains("preserved=1"),
+            "the terminal (closed) issue must be reported preserved: {reimport}"
+        );
+
+        let closed_card_after = run(&args(["get-card", "example-2", "--db", &db])).unwrap();
+        assert!(
+            closed_card_after.contains("\"status\": \"done\""),
+            "reopening on GitHub must not revert Powder's done status: {closed_card_after}"
+        );
+        assert!(
+            closed_card_after.contains("\"title\": \"Reopened issue\""),
+            "content still refreshes on reimport, same as backlog.d: {closed_card_after}"
+        );
     }
 
     #[test]
