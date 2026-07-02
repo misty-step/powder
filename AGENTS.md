@@ -11,8 +11,11 @@ boundary, or the self-hosting/deployment shape.
 
 - `powder-core` owns domain rules and imports no adapter, shell, runtime, DB,
   network, filesystem, or process-launching crates.
-- `powder-shell` owns effect traits and ports. Concrete stores and clients
-  implement those traits outside the core.
+- `powder-shell` owns filesystem-facing import/parsing helpers (backlog.d
+  loading, repo id-namespacing, the GitHub issue adapter) and the shared
+  adapter error type. `powder-store::Store` is called concretely by every
+  face; there is no effect-trait/port indirection layer, so do not
+  reintroduce one without a concrete second implementation that needs it.
 - `powder-store` owns SQLite schema, migrations, WAL pragmas, API keys, and
   transactional persistence. Adapters do not assemble lifecycle SQL directly.
 - `powder-api`, `powder-cli`, and `powder-mcp` are thin faces over the same
