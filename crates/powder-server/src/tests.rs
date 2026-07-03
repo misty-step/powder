@@ -303,7 +303,7 @@ async fn board_assets_are_served_with_specific_content_types() {
         .to_str()
         .unwrap()
         .starts_with("text/css"));
-    assert!(response_text(aesthetic).await.contains("aesthetic v2.8.1"));
+    assert!(response_text(aesthetic).await.contains("aesthetic v2.16.0"));
 
     let script = app
         .clone()
