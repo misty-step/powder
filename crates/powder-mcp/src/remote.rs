@@ -1,8 +1,9 @@
 //! MCP-over-HTTP: translate JSON-RPC tool calls into REST calls against a
 //! deployed `powder-server` instance instead of opening a local SQLite file.
-//! Identity comes from the bearer key (`POWDER_API_KEY`), so claim-holder
-//! and admin-scope authority is enforced by the deployed instance exactly as
-//! it is for any other HTTP caller — no `actor`/`admin` tool arguments needed.
+//! Identity comes from the bearer key (`POWDER_API_KEY`), so audit identity,
+//! lease ownership, and admin-scope authority are enforced by the deployed
+//! instance exactly as they are for any other HTTP caller -- no
+//! `actor`/`admin` tool arguments needed.
 
 use serde_json::{json, Value};
 
@@ -141,6 +142,17 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 json!({"status": status}),
             )?
         }
+        "update_relations" => {
+            let id = card_id(args, "card_id")?;
+            client.post(
+                &format!("/api/v1/cards/{id}/relations"),
+                json!({
+                    "related": args["related"].as_array().cloned().unwrap_or_default(),
+                    "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
+                    "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
+                }),
+            )?
+        }
         "add_link" => {
             let id = card_id(args, "card_id")?;
             let label = required_str(args, "label")?;
@@ -169,11 +181,11 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "complete_card" => {
             let id = card_id(args, "card_id")?;
-            let proof = required_str(args, "proof")?;
-            client.post(
-                &format!("/api/v1/cards/{id}/complete"),
-                json!({"proof": proof}),
-            )?
+            let mut body = json!({});
+            if let Some(proof) = args["proof"].as_str() {
+                body["proof"] = json!(proof);
+            }
+            client.post(&format!("/api/v1/cards/{id}/complete"), body)?
         }
         other => return Err(format!("unknown tool: {other}")),
     };
@@ -395,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn non_holder_forbidden_response_surfaces_the_deployed_error_message() {
+    fn lease_owner_forbidden_response_surfaces_the_deployed_error_message() {
         let (base_url, _recorded) = spawn_test_server(vec![(
             403,
             json!({"error": "actor intruder does not hold the active claim"}),
@@ -404,8 +416,8 @@ mod tests {
 
         let err = call_tool_remote(
             &client,
-            "complete_card",
-            &json!({"card_id": "001", "proof": "https://example.test/proof"}),
+            "release_claim",
+            &json!({"card_id": "001", "run_id": "run-001"}),
         )
         .unwrap_err();
 

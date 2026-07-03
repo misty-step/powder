@@ -514,6 +514,30 @@ body {
   color: var(--ae-ink-muted);
 }
 
+.pw-rel-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35em;
+  margin-top: 0.45em;
+}
+
+.pw-rel-badge,
+.pw-rel-id {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.55em;
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius);
+  padding: 0.05em 0.45em;
+  font-family: var(--ae-font-mono);
+  font-size: 11px;
+  color: var(--ae-ink-muted);
+}
+
+.pw-rel-id {
+  margin: 0 0.2em 0.25em 0;
+}
+
 .pw-g {
   display: inline-flex;
   flex: none;

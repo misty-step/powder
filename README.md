@@ -1,8 +1,8 @@
 # Powder
 
 Powder is a public, self-hostable work-management app for agent-driven teams: a
-durable board for cards, claims, runs, activity, links, comments, and
-human-in-loop pauses.
+durable board for cards, claims, runs, audit events, relations, links,
+comments, and human-in-loop pauses.
 
 The repo ships the application. A deployment owns the data.
 
@@ -36,13 +36,14 @@ printf "%s" "$CLAIM"
 RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
 cargo run -q -p powder-cli -- heartbeat 001 --db "$DB" --run "$RUN_ID"
 cargo run -q -p powder-cli -- renew-claim 001 --db "$DB" --run "$RUN_ID" --ttl 3600
+cargo run -q -p powder-cli -- update-relations 001 --db "$DB" --related 002 --blocks 003 --blocked-by 000
 cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status running
 cargo run -q -p powder-cli -- request-input "$RUN_ID" --db "$DB" --question "Approve completion?"
 cargo run -q -p powder-cli -- list-awaiting-input --db "$DB"
 cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator --answer approved
 cargo run -q -p powder-cli -- get-card 001 --db "$DB"
 cargo run -q -p powder-cli -- get-run "$RUN_ID" --db "$DB"
-cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --proof https://example.test/proof
+cargo run -q -p powder-cli -- complete-card 001 --db "$DB"
 POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```
 
@@ -57,6 +58,7 @@ Powder follows the Canary-style deployment pattern:
 - optional Litestream replication to Fly Tigris
 - `/healthz`, `/readyz`, and `/api/v1/onboarding`
 - auth configured by env (`api-key`, `tailscale-header`, or `none`)
+- change webhooks configured by `POWDER_WEBHOOK_URLS` (comma- or newline-separated)
 - first-run bootstrap API key, printed once unless
   `POWDER_DISCLOSE_BOOTSTRAP_KEY=false`
 
@@ -68,9 +70,10 @@ POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 ```
 
 Board read routes are reachable without a key in `api-key` mode; the private
-Flycast/Tailscale network is the read perimeter. Mutations, claim lifecycle,
-card authoring, imports, comments, links, answer-loop writes, and key
-management require `Authorization: Bearer <key>` in `api-key` mode. Use
+Flycast/Tailscale network is the read perimeter. Mutations, card status and
+relation changes, claim lifecycle, card authoring, imports, comments, links,
+answer-loop writes, and key management require `Authorization: Bearer <key>` in
+`api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
 supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.
@@ -78,6 +81,12 @@ headers. Use `none` only for local development.
 API keys are bound to actor records. In `api-key` mode, claiming work uses the
 authenticated actor; a request-body `agent` value is accepted only when it
 matches that actor.
+
+Powder is audit-first, not lifecycle-enforcing: any authorized actor may set any
+card status in one call. Claims remain useful leases for coordination, but
+status correction and completion do not require the actor to hold the claim or
+provide proof. When configured, card create/update/status changes POST
+`{"event":"card.*","card":{...}}` to each URL in `POWDER_WEBHOOK_URLS`.
 
 Canary self-report: `crates/powder-server/src/canary.rs` posts a `powder`
 check-in every 60s and ad hoc error reports to canary-obs, gated on two Fly

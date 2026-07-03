@@ -191,6 +191,9 @@ function dedupeCards(cards) {
 function normalizeCard(card) {
   return {
     ...card,
+    related: card.related || [],
+    blocks: card.blocks || [],
+    blocked_by: card.blocked_by || [],
     repoKey: cardRepo(card),
     displayStatus: displayStatus(card.status),
   };
@@ -374,6 +377,9 @@ function passes(card) {
     card.status,
     card.repo,
     card.source?.path,
+    ...(card.related || []),
+    ...(card.blocks || []),
+    ...(card.blocked_by || []),
     ...(card.labels || []),
   ]
     .filter(Boolean)
@@ -506,6 +512,7 @@ function cardHTML(card) {
   const claim = card.claim?.agent
     ? `${chip(card.claim.agent)}<span class="pw-card-st">${statusText(card.status)}${card.claim.expires_at ? ` · ${formatShortTime(card.claim.expires_at)}` : ""}</span>`
     : `<span class="pw-card-st">${statusText(card.status)}</span>`;
+  const relations = relationBadges(card);
   return `
     <button id="${escapeHtml(anchorId(card.id))}" class="pw-card" type="button" data-id="${escapeHtml(card.id)}">
       <span class="pw-card-top">${repoIcon(card.repoKey, `ae-cat-${meta.cat}`)}
@@ -513,8 +520,17 @@ function cardHTML(card) {
       </span>
       <span class="pw-card-t">${escapeHtml(card.title)}</span>
       <p class="pw-card-meta">${statusGlyph(card.status)}${claim}</p>
+      ${relations ? `<p class="pw-rel-badges">${relations}</p>` : ""}
     </button>
   `;
+}
+
+function relationBadges(card) {
+  const badges = [];
+  if ((card.blocked_by || []).length) badges.push(`blocked by ${card.blocked_by.length}`);
+  if ((card.blocks || []).length) badges.push(`blocks ${card.blocks.length}`);
+  if ((card.related || []).length) badges.push(`related ${card.related.length}`);
+  return badges.map((text) => `<span class="pw-rel-badge">${escapeHtml(text)}</span>`).join("");
 }
 
 function doneRowHTML(card) {
@@ -605,6 +621,7 @@ function sheetHTML(card, detail = {}) {
   }
   parts.push(section("DESCRIPTION", bodyHTML(normalized.body)));
   parts.push(section("ACCEPTANCE", acceptanceHTML(normalized.acceptance || [])));
+  parts.push(section("RELATIONS", relationsHTML(normalized)));
   parts.push(section("COMMENTS", trailHTML((detail.comments || []).map((comment) => ({
     head: `${comment.author} · ${formatDate(comment.created_at)}`,
     body: comment.body,
@@ -645,6 +662,16 @@ function bodyHTML(text) {
 function acceptanceHTML(items) {
   if (!items.length) return empty("No acceptance oracle.");
   return `<ul class="pw-acc-list">${items.map((item) => `<li class="pw-acc-item"><span class="pw-g"><svg class="ae-icon" aria-hidden="true"><use href="#i-check"></use></svg></span><span>${escapeHtml(item)}</span></li>`).join("")}</ul>`;
+}
+
+function relationsHTML(card) {
+  const rows = [
+    ["Blocked by", card.blocked_by || []],
+    ["Blocks", card.blocks || []],
+    ["Related", card.related || []],
+  ];
+  if (rows.every(([, ids]) => ids.length === 0)) return empty("No relations.");
+  return `<dl>${rows.map(([term, ids]) => `<div class="pw-def-row"><dt>${escapeHtml(term)}</dt><dd>${ids.length ? ids.map((id) => `<span class="pw-rel-id">${escapeHtml(id)}</span>`).join(" ") : "none"}</dd></div>`).join("")}</dl>`;
 }
 
 function trailHTML(items, fallback) {

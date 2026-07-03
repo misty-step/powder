@@ -1,6 +1,7 @@
 use powder_core::{
-    Activity, ActivityId, ActivityType, Authority, AwaitingInput, CardDetail, CardId, CardStatus,
-    Comment, DomainError, Link, LinkId, Run, RunDetail, RunId, RunState,
+    Activity, ActivityId, ActivityType, Authority, AwaitingInput, CardDetail, CardEvent,
+    CardEventId, CardId, CardStatus, Comment, DomainError, Link, LinkId, Run, RunDetail, RunId,
+    RunState,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -17,6 +18,7 @@ impl Store {
         Ok(Some(CardDetail {
             runs: load_runs_for_card(&self.connection, card_id)?,
             activities: load_activities_for_card(&self.connection, card_id)?,
+            events: load_events_for_card(&self.connection, card_id)?,
             links: load_links_for_card(&self.connection, card_id)?,
             comments: load_comments_for_card(&self.connection, card_id)?,
             card,
@@ -161,6 +163,22 @@ fn load_activities_for_run(connection: &Connection, run_id: &RunId) -> Result<Ve
         .collect()
 }
 
+fn load_events_for_card(connection: &Connection, card_id: &CardId) -> Result<Vec<CardEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT id, card_id, event_type, actor, payload, created_at
+         FROM card_events
+         WHERE card_id = ?1
+         ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let records = statement
+        .query_map([card_id.as_str()], CardEventRecord::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    records
+        .into_iter()
+        .map(CardEventRecord::into_event)
+        .collect()
+}
+
 fn latest_elicitation(connection: &Connection, run_id: &RunId) -> Result<Option<Activity>> {
     connection
         .query_row(
@@ -212,6 +230,39 @@ struct ActivityRecord {
     activity_type: String,
     payload: String,
     created_at: i64,
+}
+
+struct CardEventRecord {
+    id: String,
+    card_id: String,
+    event_type: String,
+    actor: String,
+    payload: String,
+    created_at: i64,
+}
+
+impl CardEventRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            card_id: row.get(1)?,
+            event_type: row.get(2)?,
+            actor: row.get(3)?,
+            payload: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    }
+
+    fn into_event(self) -> Result<CardEvent> {
+        Ok(CardEvent {
+            id: CardEventId::new(self.id)?,
+            card_id: CardId::new(self.card_id)?,
+            event_type: self.event_type,
+            actor: self.actor,
+            payload: self.payload,
+            created_at: self.created_at,
+        })
+    }
 }
 
 impl ActivityRecord {

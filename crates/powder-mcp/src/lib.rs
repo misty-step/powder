@@ -68,8 +68,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "update_status",
-        description: "Move a card through an allowed status transition when external progress changes. Optional actor/admin are checked against the claim holder.",
+        description: "Set a card to any status in one call and record an audit event.",
         input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "update_relations",
+        description: "Replace a card's related, blocks, and blocked_by relation lists.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "add_link",
@@ -88,8 +93,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "complete_card",
-        description: "Complete a card only after attaching a proof artifact or URL. Optional actor/admin are checked against the claim holder.",
-        input_schema: r#"{"type":"object","required":["card_id","proof"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Set a card done, optionally recording a proof artifact or URL.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
 ];
 
@@ -272,6 +277,19 @@ pub fn call_tool_store(
                 .update_status(&card_id, status, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
+        "update_relations" => {
+            let card_id = card_id(args, "card_id")?;
+            json!(store
+                .update_relations(
+                    &card_id,
+                    card_ids_array(args, "related")?,
+                    card_ids_array(args, "blocks")?,
+                    card_ids_array(args, "blocked_by")?,
+                    now,
+                    &authority_arg(args),
+                )
+                .map_err(to_string)?)
+        }
         "add_link" => {
             let card_id = card_id(args, "card_id")?;
             let label = required_str(args, "label")?;
@@ -297,9 +315,13 @@ pub fn call_tool_store(
         }
         "complete_card" => {
             let card_id = card_id(args, "card_id")?;
-            let proof = required_str(args, "proof")?;
             json!(store
-                .complete_card(&card_id, proof, now, &authority_arg(args))
+                .complete_card(
+                    &card_id,
+                    optional_str(args, "proof"),
+                    now,
+                    &authority_arg(args)
+                )
                 .map_err(to_string)?)
         }
         other => return Err(format!("unknown tool: {other}")),
@@ -317,12 +339,35 @@ fn run_id(args: &Value, key: &'static str) -> Result<RunId, String> {
     RunId::new(required_str(args, key)?).map_err(to_string)
 }
 
+fn card_ids_array(args: &Value, key: &'static str) -> Result<Vec<CardId>, String> {
+    args[key]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| format!("{key} entries must be strings"))
+                        .and_then(|value| CardId::new(value).map_err(to_string))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
 fn required_str<'a>(args: &'a Value, key: &'static str) -> Result<&'a str, String> {
     args[key]
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("missing required argument: {key}"))
+}
+
+fn optional_str<'a>(args: &'a Value, key: &'static str) -> Option<&'a str> {
+    args[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Build the `Authority` a mutation is checked against from the optional
@@ -354,9 +399,10 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 15);
+        assert_eq!(TOOLS.len(), 16);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
+        assert!(names.contains(&"update_relations"));
         assert!(names.contains(&"add_comment"));
         assert!(names.contains(&"claim_card"));
         assert!(names.contains(&"release_claim"));
@@ -524,7 +570,7 @@ Expose tools against the DB.
     }
 
     #[test]
-    fn mcp_actor_argument_enforces_claim_holder_like_http_and_cli() {
+    fn mcp_updates_relations_and_non_holder_can_set_status() {
         let text = r#"# Holder enforcement
 Priority: P0 | Status: ready | Estimate: M
 
@@ -553,30 +599,36 @@ Expose tools against the DB.
         )
         .unwrap();
 
-        let denied = call_tool_store(
+        let relations = call_tool_store(
+            &mut store,
+            "update_relations",
+            &json!({
+                "card_id": "006",
+                "related": ["peer"],
+                "blocks": ["child"],
+                "blocked_by": ["parent"],
+                "actor": "operator"
+            }),
+            10,
+        )
+        .unwrap();
+        let relation_payload = tool_payload(&relations);
+        assert_eq!(relation_payload["related"][0], "peer");
+        assert_eq!(relation_payload["blocks"][0], "child");
+        assert_eq!(relation_payload["blocked_by"][0], "parent");
+
+        call_tool_store(
             &mut store,
             "update_status",
             &json!({"card_id": "006", "status": "running", "actor": "intruder"}),
             11,
         )
-        .unwrap_err();
-        assert!(denied.contains("intruder"));
-        assert!(denied.contains("does not hold the active claim"));
-
-        // an admin actor bypasses claim ownership.
-        call_tool_store(
-            &mut store,
-            "update_status",
-            &json!({"card_id": "006", "status": "running", "actor": "operator", "admin": true}),
-            12,
-        )
         .unwrap();
 
-        // the real holder is unaffected by the rejected intrusion.
         call_tool_store(
             &mut store,
             "complete_card",
-            &json!({"card_id": "006", "proof": "https://example.test/proof", "actor": "codex"}),
+            &json!({"card_id": "006", "actor": "intruder"}),
             13,
         )
         .unwrap();
@@ -586,6 +638,11 @@ Expose tools against the DB.
             .as_str()
             .unwrap()
             .contains("\"done\""));
+        assert!(tool_payload(&card)["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["actor"] == "intruder"));
     }
 
     fn tool_payload(response: &Value) -> Value {

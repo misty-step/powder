@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS cards (
   priority TEXT NOT NULL,
   labels_json TEXT NOT NULL,
   assignee TEXT,
+  related_json TEXT NOT NULL,
+  blocks_json TEXT NOT NULL,
   blocked_by_json TEXT NOT NULL,
   repo TEXT,
   workspace_path TEXT,
@@ -70,6 +72,16 @@ CREATE TABLE IF NOT EXISTS activities (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_activities_run_created ON activities(run_id, created_at);
+
+CREATE TABLE IF NOT EXISTS card_events (
+  id TEXT PRIMARY KEY,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);
 
 CREATE TABLE IF NOT EXISTS links (
   id TEXT PRIMARY KEY,
@@ -137,18 +149,33 @@ ALTER TABLE runs DROP COLUMN last_error;
 ALTER TABLE runs DROP COLUMN result;
 "#;
 
+pub const MIGRATE_4_TO_5: &str = r#"
+ALTER TABLE cards ADD COLUMN related_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE cards ADD COLUMN blocks_json TEXT NOT NULL DEFAULT '[]';
+
+CREATE TABLE IF NOT EXISTS card_events (
+  id TEXT PRIMARY KEY,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);
+"#;
+
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, status, priority, labels_json,
-assignee, blocked_by_json, repo, workspace_path, branch_name, source_path,
+assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
 created_at, updated_at";
 
 pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, status, priority,
-labels_json, assignee, blocked_by_json, repo, workspace_path, branch_name,
+labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards WHERE id = ?1";
 
 pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, status, priority,
-labels_json, assignee, blocked_by_json, repo, workspace_path, branch_name,
+labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards";
 
