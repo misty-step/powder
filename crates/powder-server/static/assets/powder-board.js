@@ -19,7 +19,7 @@ const KEY_MINT_COMMAND =
 
 const KNOWN_REPO_META = {
   crucible: { icon: "i-flask", cat: 0 },
-  powder: { icon: "i-kanban", cat: 1 },
+  powder: { icon: "i-snowflake", cat: 1 },
   bitterblossom: { icon: "i-flower", cat: 2 },
   weave: { icon: "i-network", cat: 3 },
   canary: { icon: "i-bird", cat: 4 },
