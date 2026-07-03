@@ -239,16 +239,45 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .clone()
         .oneshot(json_request(
             Method::GET,
+            "/api/v1/cards?repo=other",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let other_repo = response_json(other_repo).await;
+    assert_eq!(ids_from(&other_repo), vec!["other-001".to_string()]);
+    assert_eq!(other_repo["cards"][0]["repo"], "other");
+
+    let other_repo_alias = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
             "/api/v1/cards?repo=misty-step/other",
             Some(&raw_key),
             "",
         ))
         .await
         .unwrap();
-    assert_eq!(
-        ids_from(&response_json(other_repo).await),
-        vec!["other-001".to_string()]
-    );
+    let other_repo_alias = response_json(other_repo_alias).await;
+    assert_eq!(ids_from(&other_repo_alias), vec!["other-001".to_string()]);
+    assert_eq!(other_repo_alias["cards"][0]["repo"], "other");
+
+    let repositories = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/repositories",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(repositories.status(), StatusCode::OK);
+    let repositories = response_json(repositories).await;
+    assert_eq!(repositories["repositories"][0]["repo"], "other");
+    assert_eq!(repositories["repositories"][0]["aliases"], json!([]));
+    assert_eq!(repositories["repositories"][0]["card_count"], 1);
 
     let invalid_status = app
         .oneshot(json_request(
@@ -390,6 +419,7 @@ async fn board_shell_serves_from_root_and_board_without_auth() {
     assert!(root.contains("This instance only accepts writes from inside its private network."));
     assert!(root.contains("powder key-create --db /data/powder.db --name operator"));
     assert!(root.contains(r#"id="settings-toggle""#));
+    assert!(root.contains(r#"id="repo-settings-list""#));
     assert!(!root.contains(r#"id="api-key-toggle""#));
     assert!(!root.contains(r#"id="refresh-board""#));
 
@@ -464,6 +494,8 @@ async fn board_assets_are_served_with_specific_content_types() {
     );
     assert!(script.contains("function classifyFailure("));
     assert!(script.contains("function relationsHTML("));
+    assert!(script.contains("function renderRepositorySettings("));
+    assert!(script.contains("function canonicalRepoLabel("));
     assert!(script.contains("function relationBadges("));
     assert!(script.contains("function animateRailShare("));
     assert!(script.contains("cancelAnimationFrame(viewAnimation);"));
@@ -486,6 +518,7 @@ async fn board_assets_are_served_with_specific_content_types() {
         "grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));"
     ));
     assert!(css.contains(".pw-auth[hidden]"));
+    assert!(css.contains(".pw-repo-row"));
     assert!(css.contains(".pw-rel-badge"));
     assert!(css.contains("display: none;"));
 }
@@ -1022,6 +1055,8 @@ async fn import_with_repo_namespaces_card_ids_over_http() {
         StatusCode::OK,
         "card id must be namespaced bitterblossom-001"
     );
+    let card = response_json(card).await;
+    assert_eq!(card["card"]["repo"], "bitterblossom");
 }
 
 #[tokio::test]

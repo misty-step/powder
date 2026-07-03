@@ -3,20 +3,23 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
-    Activity, ActivityId, ActivityType, Authority, Card, CardEvent, CardEventId, CardId,
-    CardSource, CardStatus, Claim, ClaimReceipt, Comment, DomainError, Link, LinkId, Priority,
-    ReadyQuery, Run, RunId, RunState,
+    canonical_repo_label, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
+    CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, DomainError, Link,
+    LinkId, Priority, ReadyQuery, Run, RunId, RunState,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
 
 mod answer_loop;
 mod identity;
+mod repositories;
 mod schema;
 #[cfg(test)]
 mod tests;
 
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
+pub use repositories::RepositorySummary;
+use repositories::{summarize_repository_rows, RepositoryRow};
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
@@ -190,8 +193,9 @@ impl Store {
     }
 
     pub fn upsert_card(&mut self, card: Card) -> Result<Card> {
+        let card_id = card.id.clone();
         persist_card(&self.connection, &card)?;
-        Ok(card)
+        load_card(&self.connection, &card_id)
     }
 
     pub fn record_card_event(
@@ -262,6 +266,8 @@ impl Store {
     /// cards no other surface can enumerate without opening the database
     /// file directly. Same sort as `list_ready` (priority, age, id).
     pub fn list_cards(&self, filter: &CardFilter, limit: usize) -> Result<Vec<Card>> {
+        let repo_filter_requested = filter.repo.is_some();
+        let repo_filter = filter.repo.as_deref().and_then(canonical_repo_label);
         let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
         let records = statement
             .query_map([], CardRecord::from_row)?
@@ -272,12 +278,9 @@ impl Store {
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter(|card| filter.status.map(|s| card.status == s).unwrap_or(true))
-            .filter(|card| {
-                filter
-                    .repo
-                    .as_deref()
-                    .map(|repo| card.repo.as_deref() == Some(repo))
-                    .unwrap_or(true)
+            .filter(|card| match repo_filter.as_deref() {
+                Some(repo) => card.repo.as_deref() == Some(repo),
+                None => !repo_filter_requested,
             })
             .collect::<Vec<_>>();
 
@@ -289,6 +292,17 @@ impl Store {
         });
         cards.truncate(limit.max(1));
         Ok(cards)
+    }
+
+    pub fn list_repositories(&self) -> Result<Vec<RepositorySummary>> {
+        let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
+        let records = statement
+            .query_map([], CardRecord::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        summarize_repository_rows(records.into_iter().map(|record| RepositoryRow {
+            repo: record.repo,
+            status: record.status,
+        }))
     }
 
     pub fn claim_card(
@@ -684,6 +698,7 @@ impl Store {
 fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     let source_path = card.source.as_ref().map(|source| source.path.as_str());
     let source_digest = card.source.as_ref().map(|source| source.digest.as_str());
+    let repo = card.repo.as_deref().and_then(canonical_repo_label);
     let claim_agent = card.claim.as_ref().map(|claim| claim.agent.as_str());
     let claim_run_id = card.claim.as_ref().map(|claim| claim.run_id.as_str());
     let claim_acquired_at = card.claim.as_ref().map(|claim| claim.acquired_at);
@@ -728,7 +743,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             to_json(&card.related)?,
             to_json(&card.blocks)?,
             to_json(&card.blocked_by)?,
-            card.repo,
+            repo,
             card.workspace_path,
             card.branch_name,
             source_path,
@@ -1045,7 +1060,7 @@ impl CardRecord {
         card.related = from_json("cards.related_json", self.related_json)?;
         card.blocks = from_json("cards.blocks_json", self.blocks_json)?;
         card.blocked_by = from_json("cards.blocked_by_json", self.blocked_by_json)?;
-        card.repo = self.repo;
+        card.repo = self.repo.as_deref().and_then(canonical_repo_label);
         card.workspace_path = self.workspace_path;
         card.branch_name = self.branch_name;
         card.source = match (self.source_path, self.source_digest) {

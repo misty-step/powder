@@ -24,6 +24,11 @@ The first milestone is intentionally small:
 The dispatch daemon is not part of the core. It will consume the board through
 the API/MCP/CLI surfaces and run agents elsewhere.
 
+Repository identity is operator-facing and canonicalized to the short repo
+name. Imports may still pass full slugs such as `misty-step/canary`; card JSON,
+board filters, and `/api/v1/repositories` return `canary`, while repo filters
+accept either spelling.
+
 Current local smoke paths:
 
 ```sh
