@@ -279,19 +279,11 @@ body {
 }
 
 .pw-main {
+  --pw-rail-share: 24%;
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 24%) minmax(0, 76%);
-  transition: grid-template-columns 190ms var(--ae-ease);
-}
-
-.pw-main[data-view='board'] {
-  grid-template-columns: minmax(0, 0%) minmax(0, 100%);
-}
-
-.pw-main[data-view='backlog'] {
-  grid-template-columns: minmax(0, 100%) minmax(0, 0%);
+  grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));
 }
 
 .pw-rail-wrap {

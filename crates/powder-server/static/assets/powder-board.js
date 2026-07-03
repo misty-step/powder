@@ -87,6 +87,9 @@ const state = {
   },
 };
 
+let railShare = 24;
+let viewAnimation = 0;
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -707,6 +710,7 @@ function toggleFilters(force) {
 }
 
 function setView(view) {
+  const targetShare = { backlog: 100, both: 24, board: 0 }[view] ?? 24;
   els.main.dataset.view = view;
   const tabs = {
     backlog: els.tabBacklog,
@@ -716,7 +720,36 @@ function setView(view) {
   for (const [key, tab] of Object.entries(tabs)) {
     tab.setAttribute("aria-selected", String(key === view));
   }
+  animateRailShare(targetShare);
   placeIndicator();
+}
+
+function animateRailShare(targetShare) {
+  cancelAnimationFrame(viewAnimation);
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    setRailShare(targetShare);
+    return;
+  }
+  const startShare = railShare;
+  const delta = targetShare - startShare;
+  const startedAt = performance.now();
+  const duration = 190;
+  const step = (now) => {
+    const t = Math.min(1, (now - startedAt) / duration);
+    const eased = 1 - Math.pow(1 - t, 3);
+    setRailShare(startShare + delta * eased);
+    if (t < 1) {
+      viewAnimation = requestAnimationFrame(step);
+    } else {
+      setRailShare(targetShare);
+    }
+  };
+  viewAnimation = requestAnimationFrame(step);
+}
+
+function setRailShare(value) {
+  railShare = value;
+  els.main.style.setProperty("--pw-rail-share", `${value}%`);
 }
 
 function placeIndicator() {
@@ -811,5 +844,6 @@ window.addEventListener("resize", placeIndicator);
 window.addEventListener("hashchange", selectFromHash);
 
 buildFilters();
+setRailShare(railShare);
 placeIndicator();
 loadBoard();
