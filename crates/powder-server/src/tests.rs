@@ -335,6 +335,8 @@ async fn board_assets_are_served_with_specific_content_types() {
         "async board rendering must select cards from card hashes after API load"
     );
     assert!(script.contains("function classifyFailure("));
+    assert!(script.contains("function animateRailShare("));
+    assert!(script.contains("cancelAnimationFrame(viewAnimation);"));
     assert!(script.contains("write key needed"));
     assert!(!script.contains("read-only"));
 
@@ -349,10 +351,10 @@ async fn board_assets_are_served_with_specific_content_types() {
         .await
         .unwrap();
     let css = response_text(css).await;
-    assert!(css.contains("grid-template-columns: minmax(0, 24%) minmax(0, 76%);"));
-    assert!(css.contains("transition: grid-template-columns 190ms var(--ae-ease);"));
-    assert!(css.contains(r#".pw-main[data-view='board']"#));
-    assert!(css.contains(r#".pw-main[data-view='backlog']"#));
+    assert!(css.contains("--pw-rail-share: 24%;"));
+    assert!(css.contains(
+        "grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));"
+    ));
 }
 
 #[tokio::test]
