@@ -306,6 +306,7 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(response_text(aesthetic).await.contains("aesthetic v2.8.1"));
 
     let script = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -336,6 +337,22 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(script.contains("function classifyFailure("));
     assert!(script.contains("write key needed"));
     assert!(!script.contains("read-only"));
+
+    let css = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/assets/powder-board.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let css = response_text(css).await;
+    assert!(css.contains("grid-template-columns: minmax(0, 24%) minmax(0, 76%);"));
+    assert!(css.contains("transition: grid-template-columns 190ms var(--ae-ease);"));
+    assert!(css.contains(r#".pw-main[data-view='board']"#));
+    assert!(css.contains(r#".pw-main[data-view='backlog']"#));
 }
 
 #[tokio::test]
