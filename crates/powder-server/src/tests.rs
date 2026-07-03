@@ -321,14 +321,14 @@ async fn board_assets_are_served_with_specific_content_types() {
         .unwrap()
         .starts_with("text/javascript"));
     let script = response_text(script).await;
-    assert!(script.contains("const CARD_STATUSES"));
+    assert!(script.contains("const RAW_STATUSES"));
     assert!(
         script.contains(r#"id="${escapeHtml(anchorId(card.id))}""#),
         "card buttons must expose id=\"card-{{card_id}}\" anchors for Bridge deep links"
     );
     assert!(
-        script.contains("function cardIdFromHash()"),
-        "async board rendering must select cards from #card-* hashes after API load"
+        script.contains("function selectFromHash()"),
+        "async board rendering must select cards from card hashes after API load"
     );
     assert!(script.contains("function classifyFailure("));
     assert!(script.contains("read-only"));
