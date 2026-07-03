@@ -130,9 +130,9 @@ body {
 .pw-auth {
   flex: none;
   display: grid;
-  grid-template-columns: minmax(16rem, 1fr) auto;
+  grid-template-columns: minmax(16rem, 1fr) minmax(18rem, 1.1fr) auto;
   gap: 1em;
-  align-items: center;
+  align-items: start;
   padding: 0.8em 2em;
   border-bottom: 1px solid var(--ae-line);
   background: var(--ae-wash);
@@ -165,6 +165,74 @@ body {
 
 .pw-auth-form .ae-chrome {
   display: block;
+}
+
+.pw-settings-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1em;
+}
+
+.pw-settings-head .ae-h {
+  margin: 0 0 0.45em;
+}
+
+.pw-repo-list {
+  max-height: 9.5rem;
+  overflow-y: auto;
+}
+
+.pw-repo-row {
+  border-top: 1px solid var(--ae-line);
+  padding: 0.5em 0;
+  font-size: 13px;
+}
+
+.pw-repo-row:first-child {
+  border-top: 0;
+}
+
+.pw-repo-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1em;
+}
+
+.pw-repo-name {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.45em;
+  font-family: var(--ae-font-mono);
+  font-size: 12px;
+  color: var(--ae-ink);
+}
+
+.pw-repo-name .ae-icon {
+  width: 1em;
+  height: 1em;
+  flex: none;
+}
+
+.pw-repo-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35em;
+  margin: 0.35em 0 0;
+}
+
+.pw-repo-counts .ae-chip {
+  font-size: 11px;
+  color: var(--ae-ink-muted);
+}
+
+.pw-repo-alias {
+  margin: 0.35em 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  color: var(--ae-ink-faint);
 }
 
 .pw-filters {

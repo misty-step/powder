@@ -27,6 +27,7 @@ const KNOWN_REPO_META = {
   aesthetic: { icon: "i-palette", cat: 6 },
   cerberus: { icon: "i-shield", cat: 7 },
   landmark: { icon: "i-landmark", cat: 0 },
+  session: { icon: "i-factory", cat: 1 },
   "factory/session": { icon: "i-factory", cat: 1 },
   bastion: { icon: "i-db", cat: 2 },
 };
@@ -35,6 +36,8 @@ const els = {
   app: document.getElementById("powder-board-app"),
   connection: document.getElementById("connection-status"),
   authPanel: document.getElementById("auth-panel"),
+  repoSettingsCount: document.getElementById("repo-settings-count"),
+  repoSettingsList: document.getElementById("repo-settings-list"),
   settingsToggle: document.getElementById("settings-toggle"),
   apiKeyForm: document.getElementById("api-key-form"),
   apiKeyInput: document.getElementById("api-key-input"),
@@ -74,6 +77,7 @@ const state = {
   authMode: "unknown",
   needsSetup: false,
   cards: [],
+  repositories: [],
   detailCache: new Map(),
   selectedId: null,
   loading: true,
@@ -154,23 +158,28 @@ async function loadBoard() {
   render();
   try {
     await loadOnboarding();
-    const groups = await Promise.all(
-      RAW_STATUSES.map(async (status) => {
-        try {
-          const data = await apiJson(
-            `/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`,
-          );
-          return data.cards || [];
-        } catch (err) {
-          throw err;
-        }
-      }),
-    );
+    const [groups, repositoryData] = await Promise.all([
+      Promise.all(
+        RAW_STATUSES.map(async (status) => {
+          try {
+            const data = await apiJson(
+              `/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`,
+            );
+            return data.cards || [];
+          } catch (err) {
+            throw err;
+          }
+        }),
+      ),
+      apiJson("/api/v1/repositories"),
+    ]);
     state.cards = dedupeCards(groups.flat()).map(normalizeCard);
+    state.repositories = normalizeRepositories(repositoryData.repositories || []);
     state.loading = false;
     state.detailCache.clear();
     updateSuccessConnection();
     buildFilters();
+    renderRepositorySettings();
     selectFromHash();
     render();
   } catch (err) {
@@ -178,6 +187,7 @@ async function loadBoard() {
     const failure = classifyFailure(err);
     state.error = failure.message;
     state.errorKind = failure.kind;
+    state.repositories = [];
     updateConnection(failure.connectionKind, failure.connectionLabel);
     if (failure.kind === "auth") showAuth(failure.action);
     render();
@@ -284,9 +294,95 @@ function renderAuthState(message = "") {
 }
 
 function cardRepo(card) {
-  if (card.repo) return card.repo;
-  if (card.source?.path) return card.source.path.replace(/\.md$/, "");
+  if (card.repo) return canonicalRepoLabel(card.repo) || "local";
+  if (card.source?.path) {
+    return canonicalRepoLabel(card.source.path.replace(/\.md$/, "")) || "local";
+  }
   return "local";
+}
+
+function canonicalRepoLabel(value) {
+  const trimmed = String(value || "")
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\.git$/, "");
+  if (!trimmed) return "";
+  const parts = trimmed.split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
+function normalizeRepositories(repositories) {
+  return repositories
+    .map((summary) => ({
+      repo: canonicalRepoLabel(summary.repo),
+      aliases: Array.isArray(summary.aliases) ? summary.aliases : [],
+      card_count: Number(summary.card_count || 0),
+      status_counts: summary.status_counts || {},
+    }))
+    .filter((summary) => summary.repo)
+    .sort((left, right) => left.repo.localeCompare(right.repo));
+}
+
+function deriveRepositoriesFromCards() {
+  const summaries = new Map();
+  for (const card of state.cards) {
+    const repo = card.repoKey || "local";
+    const summary = summaries.get(repo) || {
+      repo,
+      aliases: [],
+      card_count: 0,
+      status_counts: {},
+    };
+    summary.card_count += 1;
+    summary.status_counts[card.status] = (summary.status_counts[card.status] || 0) + 1;
+    summaries.set(repo, summary);
+  }
+  return [...summaries.values()].sort((left, right) => left.repo.localeCompare(right.repo));
+}
+
+function renderRepositorySettings() {
+  const repositories = state.repositories.length
+    ? state.repositories
+    : deriveRepositoriesFromCards();
+  els.repoSettingsCount.textContent = repositories.length;
+  els.repoSettingsList.innerHTML =
+    repositories.map(repositoryRowHTML).join("") || empty("No repositories.");
+}
+
+function repositoryRowHTML(summary) {
+  const meta = repoMeta(summary.repo);
+  const counts = statusCountsHTML(summary.status_counts);
+  const aliases = summary.aliases.length
+    ? `<p class="pw-repo-alias">alias ${escapeHtml(summary.aliases.join(", "))}</p>`
+    : "";
+  return `
+    <div class="pw-repo-row">
+      <div class="pw-repo-main">
+        <span class="pw-repo-name">${repoIcon(summary.repo, `ae-cat-${meta.cat}`)}${escapeHtml(summary.repo)}</span>
+        <span class="ae-num">${summary.card_count}</span>
+      </div>
+      ${counts}
+      ${aliases}
+    </div>
+  `;
+}
+
+function statusCountsHTML(counts) {
+  const order = [
+    "backlog",
+    "ready",
+    "blocked",
+    "claimed",
+    "running",
+    "awaiting_input",
+    "done",
+    "shipped",
+    "abandoned",
+  ];
+  const chips = order
+    .filter((status) => counts[status])
+    .map((status) => `<span class="ae-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`);
+  return chips.length ? `<p class="pw-repo-counts">${chips.join("")}</p>` : "";
 }
 
 function repoMeta(repo) {

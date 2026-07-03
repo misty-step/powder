@@ -86,6 +86,13 @@
       <p class="ae-chrome">Need a key? Mint one on the instance with:</p>
       <code>powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
     </div>
+    <section class="pw-repo-settings" aria-label="repository settings">
+      <div class="pw-settings-head">
+        <p class="ae-h">REPOSITORIES</p>
+        <span id="repo-settings-count" class="ae-num">0</span>
+      </div>
+      <div id="repo-settings-list" class="pw-repo-list" aria-live="polite"></div>
+    </section>
     <form id="api-key-form" class="pw-auth-form">
       <label>
         <span class="ae-chrome">API key</span>

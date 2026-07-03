@@ -30,6 +30,11 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/api/v1/repositories",
+        intent: "list canonical repositories with folded aliases and status counts",
+    },
+    ApiRoute {
+        method: "GET",
         path: "/api/v1/cards/{id}",
         intent: "read one card with runs, activity, links, comments, and claim state",
     },

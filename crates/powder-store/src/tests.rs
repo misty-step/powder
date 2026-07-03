@@ -85,6 +85,10 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     done.status = CardStatus::Done;
     done.repo = Some("misty-step/other".to_string());
     store.import_cards(vec![done])?;
+    store.connection.execute(
+        "UPDATE cards SET repo = 'misty-step/other' WHERE id = 'done-1'",
+        [],
+    )?;
 
     store.import_cards(vec![ready_card("ready-1", 30)])?;
 
@@ -104,16 +108,29 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     assert_eq!(blocked_only.len(), 1);
     assert_eq!(blocked_only[0].id.as_str(), "blocked-1");
 
-    // repo filter alone.
+    // repo filter alone. Operator-facing repo identity is canonicalized to the
+    // short repo name, but old full-slug filters remain accepted aliases.
     let other_repo = store.list_cards(
+        &CardFilter {
+            status: None,
+            repo: Some("other".to_string()),
+        },
+        20,
+    )?;
+    assert_eq!(other_repo.len(), 1);
+    assert_eq!(other_repo[0].id.as_str(), "done-1");
+    assert_eq!(other_repo[0].repo.as_deref(), Some("other"));
+
+    let other_repo_alias = store.list_cards(
         &CardFilter {
             status: None,
             repo: Some("misty-step/other".to_string()),
         },
         20,
     )?;
-    assert_eq!(other_repo.len(), 1);
-    assert_eq!(other_repo[0].id.as_str(), "done-1");
+    assert_eq!(other_repo_alias.len(), 1);
+    assert_eq!(other_repo_alias[0].id.as_str(), "done-1");
+    assert_eq!(other_repo_alias[0].repo.as_deref(), Some("other"));
 
     // both filters together, and a limit that truncates.
     let done_in_other = store.list_cards(
@@ -125,8 +142,38 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     )?;
     assert_eq!(done_in_other.len(), 1);
 
+    let repositories = store.list_repositories()?;
+    let other_summary = repositories
+        .iter()
+        .find(|summary| summary.repo == "other")
+        .expect("other repository summary");
+    assert_eq!(other_summary.aliases, vec!["misty-step/other".to_string()]);
+    assert_eq!(other_summary.card_count, 1);
+    assert_eq!(other_summary.status_counts.get("done"), Some(&1));
+
     let limited = store.list_cards(&CardFilter::default(), 1)?;
     assert_eq!(limited.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn upsert_card_returns_the_canonical_repo_label_it_persists() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("repo-card", 10);
+    card.repo = Some("misty-step/canary".to_string());
+
+    let saved = store.upsert_card(card)?;
+
+    assert_eq!(saved.repo.as_deref(), Some("canary"));
+    assert_eq!(
+        store
+            .get_card(&CardId::new("repo-card")?)?
+            .expect("stored card")
+            .repo
+            .as_deref(),
+        Some("canary")
+    );
     Ok(())
 }
 

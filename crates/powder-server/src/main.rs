@@ -356,6 +356,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
+        .route("/api/v1/repositories", get(list_repositories))
         .route("/api/v1/cards/{id}", get(get_card))
         .route("/api/v1/cards/{id}/claim", post(claim_card))
         .route("/api/v1/cards/{id}/release", post(release_claim))
@@ -486,6 +487,15 @@ async fn list_cards(
     };
     let cards = lock_store(&state)?.list_cards(&filter, limit)?;
     Ok(Json(json!({ "cards": cards })))
+}
+
+async fn list_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_read(&state, &headers)?;
+    let repositories = lock_store(&state)?.list_repositories()?;
+    Ok(Json(json!({ "repositories": repositories })))
 }
 
 async fn import_cards(
