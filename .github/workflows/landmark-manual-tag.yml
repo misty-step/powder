@@ -26,3 +26,5 @@ jobs:
           github-token: ${{ secrets.GH_RELEASE_TOKEN }}
           llm-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           changelog-source: auto
+          webhook-url: ${{ secrets.LANDMARK_WEBHOOK_URL }}
+          webhook-secret: ${{ secrets.LANDMARK_WEBHOOK_SECRET }}
