@@ -355,6 +355,8 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(css.contains(
         "grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));"
     ));
+    assert!(css.contains(".pw-auth[hidden]"));
+    assert!(css.contains("display: none;"));
 }
 
 #[tokio::test]
