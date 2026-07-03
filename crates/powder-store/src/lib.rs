@@ -3,8 +3,9 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
-    Activity, ActivityId, ActivityType, Authority, Card, CardId, CardSource, CardStatus, Claim,
-    ClaimReceipt, Comment, DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
+    Activity, ActivityId, ActivityType, Authority, Card, CardEvent, CardEventId, CardId,
+    CardSource, CardStatus, Claim, ClaimReceipt, Comment, DomainError, Link, LinkId, Priority,
+    ReadyQuery, Run, RunId, RunState,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -19,7 +20,7 @@ pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, 
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    MIGRATE_3_TO_4, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_3_TO_4, MIGRATE_4_TO_5, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -119,6 +120,10 @@ impl Store {
                     self.connection.execute_batch(MIGRATE_3_TO_4)?;
                     4
                 }
+                4 => {
+                    self.connection.execute_batch(MIGRATE_4_TO_5)?;
+                    5
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -187,6 +192,20 @@ impl Store {
     pub fn upsert_card(&mut self, card: Card) -> Result<Card> {
         persist_card(&self.connection, &card)?;
         Ok(card)
+    }
+
+    pub fn record_card_event(
+        &mut self,
+        card_id: &CardId,
+        event_type: &str,
+        actor: &str,
+        payload: &str,
+        now: i64,
+    ) -> Result<CardEvent> {
+        if self.get_card(card_id)?.is_none() {
+            return Err(DomainError::not_found("card", card_id.to_string()).into());
+        }
+        append_card_event(&self.connection, card_id, event_type, actor, payload, now)
     }
 
     pub fn get_card(&self, card_id: &CardId) -> Result<Option<Card>> {
@@ -364,19 +383,57 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_holder())?;
+        let previous = card.status;
         let released_claim = card.apply_status(status, now)?;
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
-            release_run(&transaction, &claim.run_id, now)?;
+            close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
             append_activity(
                 &transaction,
                 &claim.run_id,
                 ActivityType::Action,
-                &format!("released {card_id}"),
+                &format!("status set {card_id} to {}", status.as_str()),
                 now,
             )?;
         }
+        append_card_event(
+            &transaction,
+            card_id,
+            "status",
+            &authority.actor_label(),
+            &format!("{} -> {}", previous.as_str(), status.as_str()),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(card)
+    }
+
+    pub fn update_relations(
+        &mut self,
+        card_id: &CardId,
+        related: Vec<CardId>,
+        blocks: Vec<CardId>,
+        blocked_by: Vec<CardId>,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<Card> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        card.apply_relations(related, blocks, blocked_by, now);
+        persist_card(&transaction, &card)?;
+        append_card_event(
+            &transaction,
+            card_id,
+            "relations",
+            &authority.actor_label(),
+            &format!(
+                "related={:?} blocks={:?} blocked_by={:?}",
+                card.related, card.blocks, card.blocked_by
+            ),
+            now,
+        )?;
         transaction.commit()?;
         Ok(card)
     }
@@ -574,61 +631,49 @@ impl Store {
     pub fn complete_card(
         &mut self,
         card_id: &CardId,
-        proof: &str,
+        proof: Option<&str>,
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
-        let proof = non_empty("proof", proof)?;
+        let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
 
-        if !card.status.can_complete() {
-            return Err(DomainError::conflict(format!(
-                "card {card_id} cannot complete from {}",
-                card.status.as_str()
-            ))
-            .into());
-        }
-        if card
-            .claim
-            .as_ref()
-            .is_none_or(|claim| claim.is_expired(now))
-        {
-            return Err(DomainError::conflict(format!(
-                "card {card_id} requires an active claim before completion"
-            ))
-            .into());
-        }
-        authority.require_holder(card.claim_holder())?;
-
-        let run_id = card
-            .claim
-            .as_ref()
-            .map(|claim| claim.run_id.clone())
-            .ok_or_else(|| {
-                DomainError::conflict(format!("card {card_id} has no run to complete"))
-            })?;
+        let previous = card.status;
+        let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
 
         card.status = CardStatus::Done;
         card.claim = None;
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET state = 'complete', proof = ?2, updated_at = ?3
-             WHERE id = ?1",
-            params![run_id.as_str(), proof, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
+        if let Some(run_id) = run_id {
+            close_run_for_status(
+                &transaction,
+                &run_id,
+                CardStatus::Done,
+                now,
+                proof.as_deref(),
+            )?;
+            append_activity(
+                &transaction,
+                &run_id,
+                ActivityType::Response,
+                proof
+                    .as_deref()
+                    .map(|proof| format!("completed: {proof}"))
+                    .unwrap_or_else(|| "completed without proof".to_string())
+                    .as_str(),
+                now,
+            )?;
         }
-        append_activity(
+        append_card_event(
             &transaction,
-            &run_id,
-            ActivityType::Response,
-            &format!("completed: {proof}"),
+            card_id,
+            "status",
+            &authority.actor_label(),
+            &format!("{} -> done", previous.as_str()),
             now,
         )?;
         transaction.commit()?;
@@ -647,7 +692,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -656,6 +701,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                priority = excluded.priority,
                labels_json = excluded.labels_json,
                assignee = excluded.assignee,
+               related_json = excluded.related_json,
+               blocks_json = excluded.blocks_json,
                blocked_by_json = excluded.blocked_by_json,
                repo = excluded.repo,
                workspace_path = excluded.workspace_path,
@@ -678,6 +725,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             card.priority.as_str(),
             to_json(&card.labels)?,
             card.assignee,
+            to_json(&card.related)?,
+            to_json(&card.blocks)?,
             to_json(&card.blocked_by)?,
             card.repo,
             card.workspace_path,
@@ -754,12 +803,70 @@ fn append_activity(
     Ok(activity)
 }
 
+fn append_card_event(
+    connection: &Connection,
+    card_id: &CardId,
+    event_type: &str,
+    actor: &str,
+    payload: &str,
+    now: i64,
+) -> Result<CardEvent> {
+    let event = CardEvent {
+        id: CardEventId::new(format!("event-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
+        card_id: card_id.clone(),
+        event_type: non_empty("event_type", event_type)?,
+        actor: non_empty("actor", actor)?,
+        payload: payload.to_owned(),
+        created_at: now,
+    };
+    connection.execute(
+        "INSERT INTO card_events (id, card_id, event_type, actor, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event.id.as_str(),
+            event.card_id.as_str(),
+            event.event_type.as_str(),
+            event.actor.as_str(),
+            event.payload.as_str(),
+            event.created_at
+        ],
+    )?;
+    Ok(event)
+}
+
 fn release_run(connection: &Connection, run_id: &RunId, now: i64) -> Result<()> {
     let updated = connection.execute(
         "UPDATE runs
          SET state = 'released', claim_expires_at = ?2, updated_at = ?2
          WHERE id = ?1",
         params![run_id.as_str(), now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    Ok(())
+}
+
+fn close_run_for_status(
+    connection: &Connection,
+    run_id: &RunId,
+    status: CardStatus,
+    now: i64,
+    proof: Option<&str>,
+) -> Result<()> {
+    let state = if status.is_terminal() {
+        RunState::Complete
+    } else {
+        RunState::Released
+    };
+    let updated = connection.execute(
+        "UPDATE runs
+         SET state = ?2,
+             claim_expires_at = CASE WHEN ?2 = 'released' THEN ?3 ELSE claim_expires_at END,
+             proof = COALESCE(?4, proof),
+             updated_at = ?3
+         WHERE id = ?1",
+        params![run_id.as_str(), state.as_str(), now, proof],
     )?;
     if updated == 0 {
         return Err(DomainError::not_found("run", run_id.to_string()).into());
@@ -870,6 +977,8 @@ struct CardRecord {
     priority: String,
     labels_json: String,
     assignee: Option<String>,
+    related_json: String,
+    blocks_json: String,
     blocked_by_json: String,
     repo: Option<String>,
     workspace_path: Option<String>,
@@ -895,18 +1004,20 @@ impl CardRecord {
             priority: row.get(5)?,
             labels_json: row.get(6)?,
             assignee: row.get(7)?,
-            blocked_by_json: row.get(8)?,
-            repo: row.get(9)?,
-            workspace_path: row.get(10)?,
-            branch_name: row.get(11)?,
-            source_path: row.get(12)?,
-            source_digest: row.get(13)?,
-            claim_agent: row.get(14)?,
-            claim_run_id: row.get(15)?,
-            claim_acquired_at: row.get(16)?,
-            claim_expires_at: row.get(17)?,
-            created_at: row.get(18)?,
-            updated_at: row.get(19)?,
+            related_json: row.get(8)?,
+            blocks_json: row.get(9)?,
+            blocked_by_json: row.get(10)?,
+            repo: row.get(11)?,
+            workspace_path: row.get(12)?,
+            branch_name: row.get(13)?,
+            source_path: row.get(14)?,
+            source_digest: row.get(15)?,
+            claim_agent: row.get(16)?,
+            claim_run_id: row.get(17)?,
+            claim_acquired_at: row.get(18)?,
+            claim_expires_at: row.get(19)?,
+            created_at: row.get(20)?,
+            updated_at: row.get(21)?,
         })
     }
 
@@ -931,6 +1042,8 @@ impl CardRecord {
             .with_created_at(self.created_at);
         card.labels = from_json("cards.labels_json", self.labels_json)?;
         card.assignee = self.assignee;
+        card.related = from_json("cards.related_json", self.related_json)?;
+        card.blocks = from_json("cards.blocks_json", self.blocks_json)?;
         card.blocked_by = from_json("cards.blocked_by_json", self.blocked_by_json)?;
         card.repo = self.repo;
         card.workspace_path = self.workspace_path;

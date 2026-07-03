@@ -69,8 +69,8 @@ fn run_persistent(db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Work against a deployed Powder instance's HTTP API instead of a local
-/// SQLite file, so MCP tool calls carry the identity and claim-holder
-/// authority of `POWDER_API_KEY` all the way to the deployed instance.
+/// SQLite file, so MCP tool calls carry the identity, lease ownership, and
+/// admin authority of `POWDER_API_KEY` all the way to the deployed instance.
 fn run_remote(base_url: String, api_key: Option<String>) {
     let client = RemoteClient::new(base_url, api_key);
     let stdin = io::stdin();

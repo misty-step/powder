@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 use axum::{
@@ -46,6 +47,7 @@ struct Config {
     public_base_url: Option<String>,
     bind_addr: SocketAddr,
     disclose_bootstrap_key: bool,
+    webhook_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -118,6 +120,7 @@ impl Config {
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
             bind_addr,
             disclose_bootstrap_key,
+            webhook_urls: parse_url_list(env_value(&vars, "POWDER_WEBHOOK_URLS")),
         })
     }
 }
@@ -216,6 +219,9 @@ struct CreateCardRequest {
     acceptance: Vec<String>,
     status: Option<String>,
     priority: Option<String>,
+    related: Option<Vec<String>>,
+    blocks: Option<Vec<String>>,
+    blocked_by: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +239,13 @@ struct LeaseRequest {
 #[derive(Debug, Deserialize)]
 struct StatusRequest {
     status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelationsRequest {
+    related: Option<Vec<String>>,
+    blocks: Option<Vec<String>>,
+    blocked_by: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,7 +273,7 @@ struct AnswerRequest {
 
 #[derive(Debug, Deserialize)]
 struct CompleteRequest {
-    proof: String,
+    proof: Option<String>,
 }
 
 #[tokio::main]
@@ -349,6 +362,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/renew", post(renew_claim))
         .route("/api/v1/cards/{id}/heartbeat", post(heartbeat_claim))
         .route("/api/v1/cards/{id}/status", post(update_status))
+        .route("/api/v1/cards/{id}/relations", post(update_relations))
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
@@ -479,7 +493,7 @@ async fn import_cards(
     headers: HeaderMap,
     Json(request): Json<ImportRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
+    let actor = require_admin(&state, &headers)?;
     let now = unix_now();
     let mut cards = match (&request.path, request.files) {
         (Some(_), Some(_)) => {
@@ -508,11 +522,46 @@ async fn import_cards(
         cards = namespace_cards_for_repo(cards, repo)
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
     }
-    let outcome = if request.dry_run.unwrap_or(false) {
-        lock_store(&state)?.preview_import(&cards)?
+    let dry_run = request.dry_run.unwrap_or(false);
+    let (outcome, webhook_cards) = if dry_run {
+        let outcome = lock_store(&state)?.preview_import(&cards)?;
+        (outcome, Vec::new())
     } else {
-        lock_store(&state)?.import_cards(cards)?
+        let mut store = lock_store(&state)?;
+        let mut events = Vec::new();
+        for card in &cards {
+            let event = match store.get_card(&card.id)? {
+                None => Some("card.create"),
+                Some(current) => {
+                    let current_digest =
+                        current.source.as_ref().map(|source| source.digest.as_str());
+                    let incoming_digest = card.source.as_ref().map(|source| source.digest.as_str());
+                    (current_digest != incoming_digest).then_some("card.update")
+                }
+            };
+            if let Some(event) = event {
+                events.push((event, card.id.clone()));
+            }
+        }
+        let outcome = store.import_cards(cards)?;
+        let mut webhook_cards = Vec::new();
+        for (event, card_id) in events {
+            if let Some(card) = store.get_card(&card_id)? {
+                store.record_card_event(
+                    &card_id,
+                    event.strip_prefix("card.").unwrap_or(event),
+                    &actor.display_name,
+                    "imported card",
+                    now,
+                )?;
+                webhook_cards.push((event, card));
+            }
+        }
+        (outcome, webhook_cards)
     };
+    for (event, card) in webhook_cards {
+        emit_card_webhooks(&state, event, &card).await;
+    }
     Ok(Json(json!(outcome)))
 }
 
@@ -534,7 +583,7 @@ async fn create_card(
     headers: HeaderMap,
     Json(request): Json<CreateCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    require_admin(&state, &headers)?;
+    let actor = require_admin(&state, &headers)?;
     let now = unix_now();
     // Default status reflects whether a real oracle exists: empty
     // acceptance can never default to `ready` ("ready is a query, not
@@ -555,8 +604,9 @@ async fn create_card(
         .as_deref()
         .and_then(Priority::parse)
         .unwrap_or_default();
-    let card = Card::new(
-        CardId::new(request.id)?,
+    let card_id = CardId::new(request.id)?;
+    let mut card = Card::new(
+        card_id.clone(),
         request.title,
         request.body.unwrap_or_default(),
     )?
@@ -564,7 +614,31 @@ async fn create_card(
     .with_priority(priority)
     .with_acceptance(request.acceptance)
     .with_created_at(now);
-    let card = lock_store(&state)?.upsert_card(card)?;
+    card.related = card_ids(request.related)?;
+    card.blocks = card_ids(request.blocks)?;
+    card.blocked_by = card_ids(request.blocked_by)?;
+    let (card, event) = {
+        let mut store = lock_store(&state)?;
+        let event = if store.get_card(&card_id)?.is_some() {
+            "card.update"
+        } else {
+            "card.create"
+        };
+        let card = store.upsert_card(card)?;
+        store.record_card_event(
+            &card.id,
+            event.strip_prefix("card.").unwrap_or(event),
+            &actor.display_name,
+            if event == "card.create" {
+                "created card"
+            } else {
+                "updated card"
+            },
+            now,
+        )?;
+        (card, event)
+    };
+    emit_card_webhooks(&state, event, &card).await;
     Ok(Json(card))
 }
 
@@ -646,6 +720,27 @@ async fn update_status(
         .ok_or_else(|| ApiError::bad_request("invalid status"))?;
     let card =
         lock_store(&state)?.update_status(&card_id, status, unix_now(), &actor.authority())?;
+    emit_card_webhooks(&state, "card.status", &card).await;
+    Ok(Json(card))
+}
+
+async fn update_relations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<RelationsRequest>,
+) -> Result<Json<Card>, ApiError> {
+    let actor = authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let card = lock_store(&state)?.update_relations(
+        &card_id,
+        card_ids(request.related)?,
+        card_ids(request.blocks)?,
+        card_ids(request.blocked_by)?,
+        unix_now(),
+        &actor.authority(),
+    )?;
+    emit_card_webhooks(&state, "card.update", &card).await;
     Ok(Json(card))
 }
 
@@ -743,10 +838,11 @@ async fn complete_card(
     let card_id = CardId::new(id)?;
     let card = lock_store(&state)?.complete_card(
         &card_id,
-        &request.proof,
+        request.proof.as_deref(),
         unix_now(),
         &actor.authority(),
     )?;
+    emit_card_webhooks(&state, "card.status", &card).await;
     Ok(Json(card))
 }
 
@@ -906,6 +1002,45 @@ fn trusted_tailnet_identity(headers: &HeaderMap) -> Option<&str> {
     })
 }
 
+fn card_ids(raw: Option<Vec<String>>) -> Result<Vec<CardId>, ApiError> {
+    raw.unwrap_or_default()
+        .into_iter()
+        .map(CardId::new)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(ApiError::from)
+}
+
+async fn emit_card_webhooks(state: &AppState, event: &'static str, card: &Card) {
+    if state.config.webhook_urls.is_empty() {
+        return;
+    }
+
+    let payload = json!({
+        "event": event,
+        "card": card,
+    });
+    for url in &state.config.webhook_urls {
+        let url = url.clone();
+        let payload = payload.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .post(&url)
+                .send_json(payload)
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!("card webhook delivery failed for {event}: {err}"),
+            Err(err) => tracing::warn!("card webhook task failed for {event}: {err}"),
+        }
+    }
+}
+
 fn lock_store(state: &AppState) -> Result<MutexGuard<'_, Store>, ApiError> {
     state
         .store
@@ -994,6 +1129,15 @@ fn env_value<'a>(vars: &'a BTreeMap<String, String>, key: &str) -> Option<&'a st
     vars.get(key)
         .map(String::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn parse_url_list(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_bool(variable: &'static str, value: Option<&str>) -> Result<Option<bool>, ConfigError> {

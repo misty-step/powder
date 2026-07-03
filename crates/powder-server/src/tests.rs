@@ -3,6 +3,12 @@ use axum::{
     body::{to_bytes, Body},
     http::{Method, Request},
 };
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpListener,
+    sync::mpsc,
+    time::Duration,
+};
 use tower::ServiceExt;
 
 #[test]
@@ -51,6 +57,23 @@ fn config_accepts_explicit_bind_addr() {
     assert_eq!(err.variable, "POWDER_BIND_ADDR");
 }
 
+#[test]
+fn config_accepts_webhook_url_list() {
+    let config = Config::from_pairs([(
+        "POWDER_WEBHOOK_URLS",
+        "http://127.0.0.1:9001/hooks/powder, http://127.0.0.1:9002/other",
+    )])
+    .unwrap();
+
+    assert_eq!(
+        config.webhook_urls,
+        vec![
+            "http://127.0.0.1:9001/hooks/powder".to_string(),
+            "http://127.0.0.1:9002/other".to_string()
+        ]
+    );
+}
+
 #[tokio::test]
 async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -84,6 +107,59 @@ async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
         .unwrap();
     let ready = response_json(ready).await;
     assert!(!ready.to_string().contains("no-acceptance"));
+}
+
+#[tokio::test]
+async fn card_relations_round_trip_through_http_api() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"rel-root","title":"Relation root","acceptance":["proof"],"status":"ready","related":["rel-peer"],"blocks":["rel-child"],"blocked_by":["rel-parent"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(created["related"][0], "rel-peer");
+    assert_eq!(created["blocks"][0], "rel-child");
+    assert_eq!(created["blocked_by"][0], "rel-parent");
+
+    let updated = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/rel-root/relations",
+            Some(&raw_key),
+            r#"{"related":["rel-peer","rel-note"],"blocks":[],"blocked_by":["rel-parent"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = response_json(updated).await;
+    assert_eq!(updated["related"][1], "rel-note");
+    assert_eq!(updated["blocks"].as_array().unwrap().len(), 0);
+
+    let detail = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/rel-root")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["event_type"] == "relations" && event["payload"].to_string().contains("rel-note")
+    }));
 }
 
 #[tokio::test]
@@ -184,6 +260,58 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn webhooks_receive_card_create_update_and_status_payloads() {
+    let (webhook_url, receiver) = spawn_webhook_capture(3);
+    let (state, raw_key) = test_state_with_webhooks(AuthMode::ApiKey, vec![webhook_url]);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"hooked","title":"Hooked","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let relations = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/hooked/relations",
+            Some(&raw_key),
+            r#"{"related":["neighbor"],"blocks":[],"blocked_by":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(relations.status(), StatusCode::OK);
+
+    let status = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/hooked/status",
+            Some(&raw_key),
+            r#"{"status":"done"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+
+    let first = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    let second = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    let third = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(first["event"], "card.create");
+    assert_eq!(first["card"]["id"], "hooked");
+    assert_eq!(second["event"], "card.update");
+    assert_eq!(second["card"]["related"][0], "neighbor");
+    assert_eq!(third["event"], "card.status");
+    assert_eq!(third["card"]["status"], "done");
 }
 
 #[tokio::test]
@@ -335,6 +463,8 @@ async fn board_assets_are_served_with_specific_content_types() {
         "async board rendering must select cards from card hashes after API load"
     );
     assert!(script.contains("function classifyFailure("));
+    assert!(script.contains("function relationsHTML("));
+    assert!(script.contains("function relationBadges("));
     assert!(script.contains("function animateRailShare("));
     assert!(script.contains("cancelAnimationFrame(viewAnimation);"));
     assert!(script.contains("write key needed"));
@@ -356,6 +486,7 @@ async fn board_assets_are_served_with_specific_content_types() {
         "grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));"
     ));
     assert!(css.contains(".pw-auth[hidden]"));
+    assert!(css.contains(".pw-rel-badge"));
     assert!(css.contains("display: none;"));
 }
 
@@ -1108,7 +1239,7 @@ async fn revoking_an_unknown_key_id_returns_not_found() {
 }
 
 #[tokio::test]
-async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
+async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let holder_key = state
         .store
@@ -1152,7 +1283,7 @@ async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
     let claimed = response_json(claimed).await;
     let run_id = claimed["run_id"].as_str().unwrap().to_owned();
 
-    let status_denied = app
+    let status_ok = app
         .clone()
         .oneshot(json_request(
             Method::POST,
@@ -1162,7 +1293,7 @@ async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
         ))
         .await
         .unwrap();
-    assert_eq!(status_denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(status_ok.status(), StatusCode::OK);
 
     let heartbeat_denied = app
         .clone()
@@ -1200,17 +1331,17 @@ async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
         .unwrap();
     assert_eq!(input_denied.status(), StatusCode::FORBIDDEN);
 
-    let complete_denied = app
+    let complete_ok = app
         .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards/contested/complete",
             Some(&intruder_key),
-            r#"{"proof":"https://example.test/proof"}"#,
+            "{}",
         ))
         .await
         .unwrap();
-    assert_eq!(complete_denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(complete_ok.status(), StatusCode::OK);
 
     let release_denied = app
         .clone()
@@ -1224,29 +1355,23 @@ async fn non_holder_agent_key_cannot_mutate_anothers_claim() {
         .unwrap();
     assert_eq!(release_denied.status(), StatusCode::FORBIDDEN);
 
-    // the actual holder is unaffected by the rejected intrusions.
-    let status_ok = app
+    let detail = app
         .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/contested/status",
-            Some(&holder_key),
-            r#"{"status":"running"}"#,
-        ))
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/contested")
+                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(status_ok.status(), StatusCode::OK);
-
-    let complete_ok = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/contested/complete",
-            Some(&holder_key),
-            r#"{"proof":"https://example.test/proof"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(complete_ok.status(), StatusCode::OK);
+    let detail = response_json(detail).await;
+    assert_eq!(detail["card"]["status"], "done");
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["actor"] == "intruder" && event["payload"].to_string().contains("done")
+    }));
 }
 
 #[tokio::test]
@@ -1378,6 +1503,10 @@ async fn every_request_triggers_the_trace_layer_without_leaking_the_bearer_token
 }
 
 fn test_state(auth_mode: AuthMode) -> (AppState, String) {
+    test_state_with_webhooks(auth_mode, Vec::new())
+}
+
+fn test_state_with_webhooks(auth_mode: AuthMode, webhook_urls: Vec<String>) -> (AppState, String) {
     let mut store = Store::open_in_memory().unwrap();
     store.migrate().unwrap();
     let key = store.apply_initial_seed(1).unwrap().unwrap();
@@ -1388,10 +1517,45 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
             public_base_url: None,
             bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
             disclose_bootstrap_key: false,
+            webhook_urls,
         }),
         store: Arc::new(Mutex::new(store)),
     };
     (state, key.raw_key)
+}
+
+fn spawn_webhook_capture(count: usize) -> (String, mpsc::Receiver<serde_json::Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(count) {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header == "\r\n" || header.is_empty() {
+                    break;
+                }
+                if let Some(value) = header.strip_prefix("Content-Length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            sender.send(serde_json::from_slice(&body).unwrap()).unwrap();
+
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    (url, receiver)
 }
 
 fn json_request(method: Method, uri: &str, raw_key: Option<&str>, body: &str) -> Request<Body> {
