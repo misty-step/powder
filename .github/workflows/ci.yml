@@ -27,6 +27,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check aesthetic kit currency
+        run: bash scripts/check-aesthetic-currency.sh
+
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
