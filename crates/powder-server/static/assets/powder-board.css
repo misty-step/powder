@@ -89,34 +89,6 @@ body {
   padding-bottom: 0.65em;
 }
 
-.pw-stats {
-  display: inline-flex;
-  align-items: center;
-}
-
-.pw-stat {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45em;
-  padding: 0 0.95em;
-  border-left: 1px solid var(--ae-line);
-  color: var(--ae-ink-muted);
-}
-
-.pw-stat:first-child {
-  border-left: 0;
-}
-
-.pw-stat .ae-icon {
-  width: 1em;
-  height: 1em;
-}
-
-.pw-stat .ae-num {
-  color: var(--ae-ink);
-  font-weight: var(--ae-w-medium);
-}
-
 .pw-filter-btn,
 .pw-icon-btn {
   display: inline-flex;
@@ -139,7 +111,8 @@ body {
 
 .pw-filter-btn:hover,
 .pw-filter-btn[aria-expanded='true'],
-.pw-icon-btn:hover {
+.pw-icon-btn:hover,
+.pw-icon-btn[aria-expanded='true'] {
   color: var(--ae-ink);
 }
 
@@ -309,16 +282,16 @@ body {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 19rem) minmax(0, 1fr);
-  transition: grid-template-columns var(--ae-soft) var(--ae-ease);
+  grid-template-columns: minmax(0, 24%) minmax(0, 76%);
+  transition: grid-template-columns 190ms var(--ae-ease);
 }
 
 .pw-main[data-view='board'] {
-  grid-template-columns: minmax(0, 0rem) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 0%) minmax(0, 100%);
 }
 
 .pw-main[data-view='backlog'] {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 0rem);
+  grid-template-columns: minmax(0, 100%) minmax(0, 0%);
 }
 
 .pw-rail-wrap {
@@ -344,12 +317,16 @@ body {
   font-size: 13px;
   opacity: 1;
   transform: translateX(0);
-  transition: opacity var(--ae-soft) var(--ae-ease), transform var(--ae-soft) var(--ae-ease);
+  transition:
+    opacity 150ms var(--ae-ease),
+    transform 190ms var(--ae-ease),
+    padding 190ms var(--ae-ease),
+    width 190ms var(--ae-ease);
 }
 
 .pw-main[data-view='board'] .pw-rail-inner {
   opacity: 0;
-  transform: translateX(-1.1rem);
+  transform: translateX(-0.75rem);
   pointer-events: none;
 }
 
@@ -418,22 +395,26 @@ body {
 }
 
 .pw-board {
+  --pw-board-pad-inline: 2.2em;
   min-width: 0;
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(3, minmax(15rem, 1fr));
   gap: 0 2.6em;
-  padding: 1.5em 2.2em 0;
+  padding: 1.5em var(--pw-board-pad-inline) 0;
   overflow-x: auto;
   opacity: 1;
   transform: translateX(0);
-  transition: padding var(--ae-soft) var(--ae-ease), opacity var(--ae-soft) var(--ae-ease), transform var(--ae-soft) var(--ae-ease);
+  transition:
+    padding 190ms var(--ae-ease),
+    opacity 150ms var(--ae-ease),
+    transform 190ms var(--ae-ease);
 }
 
 .pw-main[data-view='backlog'] .pw-board {
-  padding-inline: 0;
+  --pw-board-pad-inline: 0;
   opacity: 0;
-  transform: translateX(1.1rem);
+  transform: translateX(0.75rem);
   pointer-events: none;
 }
 

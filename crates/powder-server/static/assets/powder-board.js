@@ -14,7 +14,6 @@ const RAW_STATUSES = [
 
 const PAGE_LIMIT = 1000;
 const STORAGE_KEY = "powder-api-key";
-const MODE_KEY = "ae-mode";
 const KEY_MINT_COMMAND =
   "powder key-create --db /data/powder.db --name operator --scope admin --show-secret";
 
@@ -35,15 +34,12 @@ const KNOWN_REPO_META = {
 const els = {
   app: document.getElementById("powder-board-app"),
   connection: document.getElementById("connection-status"),
-  apiMode: document.getElementById("api-mode"),
   authPanel: document.getElementById("auth-panel"),
-  apiKeyToggle: document.getElementById("api-key-toggle"),
+  settingsToggle: document.getElementById("settings-toggle"),
   apiKeyForm: document.getElementById("api-key-form"),
   apiKeyInput: document.getElementById("api-key-input"),
   clearApiKey: document.getElementById("clear-api-key"),
   authMessage: document.getElementById("auth-message"),
-  refresh: document.getElementById("refresh-board"),
-  mode: document.getElementById("mode-toggle"),
   filters: document.getElementById("filters"),
   filterButton: document.getElementById("filter-btn"),
   filterN: document.getElementById("filter-n"),
@@ -67,9 +63,6 @@ const els = {
   readyCount: document.getElementById("rd-count"),
   inProgressCount: document.getElementById("ip-count"),
   doneCount: document.getElementById("dn-count"),
-  statCards: document.getElementById("stat-cards"),
-  statRepos: document.getElementById("stat-repos"),
-  statAwaiting: document.getElementById("stat-awaiting"),
   scrim: document.getElementById("scrim"),
   sheet: document.getElementById("sheet"),
   sheetBody: document.getElementById("sheet-body"),
@@ -139,7 +132,6 @@ async function loadOnboarding() {
     const data = await response.json();
     state.authMode = data.auth_mode || "unknown";
     state.needsSetup = Boolean(data.needs_setup);
-    els.apiMode.textContent = state.authMode;
     renderAuthState();
     if (state.authMode === "api_key" && state.needsSetup && !state.apiKey) {
       showAuth("No write keys exist yet. Mint one on the instance, then paste it here.");
@@ -147,7 +139,6 @@ async function loadOnboarding() {
   } catch (_err) {
     state.authMode = "unknown";
     state.needsSetup = false;
-    els.apiMode.textContent = "unknown";
     renderAuthState();
   }
 }
@@ -215,7 +206,7 @@ function displayStatus(status) {
 
 function updateSuccessConnection() {
   if (state.authMode === "api_key" && !state.apiKey) {
-    updateConnection("readonly", "read-only");
+    updateConnection("readonly", "write key needed");
   } else {
     updateConnection("ok", "connected");
   }
@@ -258,12 +249,14 @@ function classifyFailure(err) {
 
 function showAuth(message) {
   els.authPanel.hidden = false;
+  els.settingsToggle.setAttribute("aria-expanded", "true");
   els.apiKeyInput.value = state.apiKey;
   renderAuthState(message);
 }
 
 function hideAuth() {
   els.authPanel.hidden = true;
+  els.settingsToggle.setAttribute("aria-expanded", "false");
   renderAuthState();
 }
 
@@ -272,15 +265,15 @@ function renderAuthState(message = "") {
     els.authMessage.textContent = message;
   } else if (state.apiKey) {
     els.authMessage.textContent =
-      "Key saved. Reads still use the private network; write controls will send this key.";
+      "Key saved. Write actions will use it from this browser.";
   } else if (state.needsSetup) {
     els.authMessage.textContent = `No write keys exist yet. Mint one with: ${KEY_MINT_COMMAND}`;
   } else if (state.authMode === "api_key") {
     els.authMessage.textContent =
-      "No key saved. The board is readable here; save a key before using write controls.";
+      "No key saved. Paste a key here when you need write actions.";
   } else {
     els.authMessage.textContent =
-      "This deployment does not require a stored API key for the board.";
+      "This deployment does not require a stored API key.";
   }
 }
 
@@ -492,15 +485,10 @@ function renderRail(cards) {
 }
 
 function renderCounts(buckets) {
-  const repoCount = new Set(state.cards.map((card) => card.repoKey)).size;
-  const awaiting = state.cards.filter((card) => card.status === "awaiting_input").length;
   els.backlogCount.textContent = buckets.backlog.length;
   els.readyCount.textContent = buckets.ready.length + (buckets.blocked.length ? ` + ${buckets.blocked.length}` : "");
   els.inProgressCount.textContent = buckets.inProgress.length;
   els.doneCount.textContent = buckets.done.length;
-  els.statCards.textContent = state.cards.length;
-  els.statRepos.textContent = repoCount;
-  els.statAwaiting.textContent = awaiting;
   const activeFilterCount =
     state.filters.repos.size + state.filters.prios.size + (state.filters.search.trim() ? 1 : 0);
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
@@ -755,7 +743,6 @@ function anchorId(cardId) {
 }
 
 els.filterButton.addEventListener("click", () => toggleFilters());
-els.refresh.addEventListener("click", () => loadBoard());
 els.repoAll.addEventListener("click", () => {
   state.filters.repos.clear();
   buildFilters();
@@ -782,7 +769,7 @@ els.tabBoth.addEventListener("click", () => setView("both"));
 els.tabBoard.addEventListener("click", () => setView("board"));
 els.sheetClose.addEventListener("click", closeSheet);
 els.scrim.addEventListener("click", closeSheet);
-els.apiKeyToggle.addEventListener("click", () => {
+els.settingsToggle.addEventListener("click", () => {
   if (els.authPanel.hidden) showAuth();
   else hideAuth();
 });
@@ -798,7 +785,7 @@ els.clearApiKey.addEventListener("click", () => {
   state.apiKey = "";
   els.apiKeyInput.value = "";
   localStorage.removeItem(STORAGE_KEY);
-  renderAuthState("API key cleared. The board remains readable on the private network.");
+  renderAuthState("API key cleared. Paste a key when you need write actions.");
   loadBoard();
 });
 document.addEventListener("click", (event) => {
@@ -822,32 +809,6 @@ document.addEventListener("keydown", (event) => {
 });
 window.addEventListener("resize", placeIndicator);
 window.addEventListener("hashchange", selectFromHash);
-
-(function wireMode() {
-  const root = document.documentElement;
-  const set = (mode) => {
-    root.classList.toggle("dark", mode === "dark");
-    root.classList.toggle("light", mode === "light");
-    root.setAttribute("data-ae-mode", mode);
-    root.style.colorScheme = mode;
-    try {
-      localStorage.setItem(MODE_KEY, mode);
-    } catch (_err) {}
-  };
-  els.mode.addEventListener("click", () => {
-    const dark =
-      root.classList.contains("dark") ||
-      (!root.classList.contains("light") && matchMedia("(prefers-color-scheme: dark)").matches);
-    const next = dark ? "light" : "dark";
-    const apply = () => set(next);
-    if (document.startViewTransition && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      root.classList.add("ae-vt-mode");
-      document.startViewTransition(apply).finished.finally(() => root.classList.remove("ae-vt-mode"));
-    } else {
-      apply();
-    }
-  });
-})();
 
 buildFilters();
 placeIndicator();
