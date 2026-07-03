@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    non_empty, Activity, ActivityId, ActivityType, AwaitingInput, Card, CardDetail, CardId,
-    CardStatus, Comment, DomainError, Link, LinkId, Run, RunDetail, RunId, RunState,
+    non_empty, Activity, ActivityId, ActivityType, AwaitingInput, Card, CardDetail, CardEvent,
+    CardEventId, CardId, CardStatus, Comment, DomainError, Link, LinkId, Run, RunDetail, RunId,
+    RunState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ pub struct Board {
     cards: BTreeMap<CardId, Card>,
     runs: BTreeMap<RunId, Run>,
     activities: Vec<Activity>,
+    events: Vec<CardEvent>,
     links: Vec<Link>,
     comments: Vec<Comment>,
     next_run: u64,
@@ -69,6 +71,7 @@ impl Board {
             card,
             runs: self.runs_for_card(card_id),
             activities: self.activities_for_card(card_id),
+            events: self.events_for_card(card_id),
             links: self.links_for_card(card_id),
             comments: self.comments_for_card(card_id),
         })
@@ -250,6 +253,35 @@ impl Board {
                 now,
             )?;
         }
+        Ok(card)
+    }
+
+    pub fn update_relations(
+        &mut self,
+        card_id: &CardId,
+        related: Vec<CardId>,
+        blocks: Vec<CardId>,
+        blocked_by: Vec<CardId>,
+        now: i64,
+        actor: &str,
+    ) -> Result<Card, DomainError> {
+        let mut card = self
+            .cards
+            .get(card_id)
+            .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
+            .clone();
+        card.apply_relations(related, blocks, blocked_by, now);
+        self.cards.insert(card_id.clone(), card.clone());
+        self.append_card_event(
+            card_id.clone(),
+            "relations",
+            actor,
+            format!(
+                "relations related={:?} blocks={:?} blocked_by={:?}",
+                card.related, card.blocks, card.blocked_by
+            ),
+            now,
+        )?;
         Ok(card)
     }
 
@@ -449,56 +481,46 @@ impl Board {
     pub fn complete_card(
         &mut self,
         card_id: &CardId,
-        proof: &str,
+        proof: Option<&str>,
         now: i64,
     ) -> Result<Card, DomainError> {
-        let proof = non_empty("proof", proof.to_owned())?;
+        let proof = proof
+            .map(|value| non_empty("proof", value.to_owned()))
+            .transpose()?;
         let mut card = self
             .cards
             .get(card_id)
             .ok_or_else(|| DomainError::not_found("card", card_id.to_string()))?
             .clone();
 
-        if !card.status.can_complete() {
-            return Err(DomainError::conflict(format!(
-                "card {card_id} cannot complete from {}",
-                card.status.as_str()
-            )));
+        let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
+        if let Some(run_id) = &run_id {
+            self.require_run(run_id)?;
         }
-        if card
-            .claim
-            .as_ref()
-            .is_none_or(|claim| claim.is_expired(now))
-        {
-            return Err(DomainError::conflict(format!(
-                "card {card_id} requires an active claim before completion"
-            )));
-        }
-
-        let run_id = card
-            .claim
-            .as_ref()
-            .map(|claim| claim.run_id.clone())
-            .expect("active claim checked above");
-        self.require_run(&run_id)?;
         card.status = CardStatus::Done;
         card.claim = None;
         card.updated_at = now;
 
         self.cards.insert(card_id.clone(), card.clone());
-        let run = self
-            .runs
-            .get_mut(&run_id)
-            .expect("run existence checked before card update");
-        run.state = RunState::Complete;
-        run.proof = Some(proof.clone());
-        run.updated_at = now;
-        self.append_activity(
-            run_id,
-            ActivityType::Response,
-            format!("completed: {proof}"),
-            now,
-        )?;
+        if let Some(run_id) = run_id {
+            let run = self
+                .runs
+                .get_mut(&run_id)
+                .expect("run existence checked before card update");
+            run.state = RunState::Complete;
+            if let Some(proof) = proof.clone() {
+                run.proof = Some(proof);
+            }
+            run.updated_at = now;
+            self.append_activity(
+                run_id,
+                ActivityType::Response,
+                proof
+                    .map(|proof| format!("completed: {proof}"))
+                    .unwrap_or_else(|| "completed without proof".to_string()),
+                now,
+            )?;
+        }
 
         Ok(card)
     }
@@ -550,6 +572,26 @@ impl Board {
         Ok(activity)
     }
 
+    fn append_card_event(
+        &mut self,
+        card_id: CardId,
+        event_type: &str,
+        actor: &str,
+        payload: String,
+        now: i64,
+    ) -> Result<CardEvent, DomainError> {
+        let event = CardEvent {
+            id: self.next_card_event_id(),
+            card_id,
+            event_type: non_empty("event_type", event_type.to_string())?,
+            actor: non_empty("actor", actor.to_string())?,
+            payload,
+            created_at: now,
+        };
+        self.events.push(event.clone());
+        Ok(event)
+    }
+
     fn next_run_id(&mut self) -> RunId {
         self.next_run += 1;
         RunId::new(format!("run-{}", self.next_run)).expect("generated run id is valid")
@@ -559,6 +601,12 @@ impl Board {
         self.next_activity += 1;
         ActivityId::new(format!("activity-{}", self.next_activity))
             .expect("generated activity id is valid")
+    }
+
+    fn next_card_event_id(&mut self) -> CardEventId {
+        self.next_activity += 1;
+        CardEventId::new(format!("event-{}", self.next_activity))
+            .expect("generated event id is valid")
     }
 
     fn next_link_id(&mut self) -> LinkId {
@@ -599,6 +647,14 @@ impl Board {
             .filter(|activity| &activity.run_id == run_id)
             .cloned()
             .collect::<Vec<_>>()
+    }
+
+    fn events_for_card(&self, card_id: &CardId) -> Vec<CardEvent> {
+        self.events
+            .iter()
+            .filter(|event| &event.card_id == card_id)
+            .cloned()
+            .collect()
     }
 
     fn links_for_card(&self, card_id: &CardId) -> Vec<Link> {
@@ -752,7 +808,11 @@ mod tests {
         );
 
         let card = board
-            .complete_card(&card_id, "https://github.com/misty-step/powder/pull/1", 30)
+            .complete_card(
+                &card_id,
+                Some("https://github.com/misty-step/powder/pull/1"),
+                30,
+            )
             .unwrap();
         assert_eq!(card.status, CardStatus::Done);
         assert_eq!(
@@ -762,31 +822,27 @@ mod tests {
     }
 
     #[test]
-    fn update_status_rejects_invalid_transition_to_done_without_proof() {
+    fn update_status_accepts_any_transition_without_proof() {
         let mut board = Board::default();
         let card_id = CardId::new("001").unwrap();
         board.import_cards(vec![ready_card("001", Priority::P0, 0)]);
 
-        let err = board
-            .update_status(&card_id, CardStatus::Done, 10)
-            .unwrap_err();
+        let card = board.update_status(&card_id, CardStatus::Done, 10).unwrap();
 
-        assert!(matches!(err, DomainError::Conflict(_)));
-        assert_eq!(board.get_card(&card_id).unwrap().status, CardStatus::Ready);
+        assert_eq!(card.status, CardStatus::Done);
+        assert_eq!(board.get_card(&card_id).unwrap().status, CardStatus::Done);
     }
 
     #[test]
-    fn complete_card_requires_claimed_work() {
+    fn complete_card_without_claim_or_proof_marks_done() {
         let mut board = Board::default();
         let card_id = CardId::new("001").unwrap();
         board.import_cards(vec![ready_card("001", Priority::P0, 0)]);
 
-        let err = board
-            .complete_card(&card_id, "https://example.test/proof", 10)
-            .unwrap_err();
+        let card = board.complete_card(&card_id, None, 10).unwrap();
 
-        assert!(matches!(err, DomainError::Conflict(_)));
-        assert_eq!(board.get_card(&card_id).unwrap().status, CardStatus::Ready);
+        assert_eq!(card.status, CardStatus::Done);
+        assert!(card.claim.is_none());
     }
 
     #[test]
@@ -796,7 +852,7 @@ mod tests {
         board.import_cards(vec![card_with_orphan_claim("001")]);
 
         let err = board
-            .complete_card(&card_id, "https://example.test/proof", 20)
+            .complete_card(&card_id, Some("https://example.test/proof"), 20)
             .unwrap_err();
 
         assert!(matches!(err, DomainError::NotFound { entity: "run", .. }));
@@ -842,7 +898,7 @@ mod tests {
             .update_status(&card_id, CardStatus::Running, 10)
             .unwrap();
         board
-            .complete_card(&card_id, "https://example.test/proof", 10)
+            .complete_card(&card_id, Some("https://example.test/proof"), 10)
             .unwrap();
 
         assert_eq!(

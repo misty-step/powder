@@ -56,7 +56,12 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/status",
-        intent: "move a card through an allowed status transition",
+        intent: "set a card to any status in one call and record an audit event",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/cards/{id}/relations",
+        intent: "replace a card's related, blocks, and blocked_by relation lists",
     },
     ApiRoute {
         method: "POST",
@@ -91,7 +96,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/complete",
-        intent: "complete a card with proof",
+        intent: "mark a card done, optionally recording proof",
     },
     ApiRoute {
         method: "GET",
@@ -129,6 +134,7 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards/{id}/renew"));
         assert!(paths.contains(&"/api/v1/cards/{id}/heartbeat"));
         assert!(paths.contains(&"/api/v1/cards/{id}/links"));
+        assert!(paths.contains(&"/api/v1/cards/{id}/relations"));
         assert!(paths.contains(&"/api/v1/cards/{id}"));
         assert!(paths.contains(&"/api/v1/runs/{id}"));
         assert!(paths.contains(&"/api/v1/runs/awaiting-input"));
