@@ -138,6 +138,10 @@ body {
   background: var(--ae-wash);
 }
 
+.pw-auth[hidden] {
+  display: none;
+}
+
 .pw-auth code {
   display: inline-block;
   max-width: 100%;
