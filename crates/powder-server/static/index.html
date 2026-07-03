@@ -34,6 +34,7 @@
   <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5Z"></path><path d="m2 12 10 5 10-5"></path><path d="m2 17 10 5 10-5"></path></symbol>
   <symbol id="i-folders" viewBox="0 0 24 24"><path d="M20 17a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.9a2 2 0 0 1-1.69-.9l-.81-1.2a2 2 0 0 0-1.67-.9H8a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2Z"></path><path d="M2 8v11a2 2 0 0 0 2 2h14"></path></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"></circle><path d="M11 12 21 2"></path><path d="m16 7 2 2"></path><path d="m19 4 2 2"></path></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M9.67 2h4.66l.71 2.13c.44.16.86.34 1.25.57l2.02-1 3.3 3.3-1 2.02c.23.4.42.81.57 1.25L23.31 11v4.66l-2.13.71c-.15.44-.34.86-.57 1.25l1 2.02-3.3 3.3-2.02-1c-.4.23-.81.42-1.25.57l-.71 2.13H9.67l-.71-2.13a7.8 7.8 0 0 1-1.25-.57l-2.02 1-3.3-3.3 1-2.02a7.8 7.8 0 0 1-.57-1.25L.69 15.66V11l2.13-.71c.15-.44.34-.85.57-1.25l-1-2.02 3.3-3.3 2.02 1c.4-.23.81-.42 1.25-.57L9.67 2Z"></path><circle cx="12" cy="13.33" r="3"></circle></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.4"></path><path d="M3 12A9 9 0 0 1 18.5 5.6"></path><path d="M3 3v6h6"></path><path d="M21 21v-6h-6"></path></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></symbol>
@@ -59,7 +60,6 @@
     <div class="pw-brand">
       <span class="pw-mark" aria-hidden="true"><svg class="ae-icon"><use href="#i-kanban"></use></svg></span>
       <span class="ae-name">POWDER</span>
-      <span id="connection-status" class="ae-tag pw-connection" data-kind="loading">loading</span>
     </div>
     <nav class="ae-tabs" id="tabs" role="tablist" aria-label="views">
       <button id="tab-backlog" type="button" role="tab" aria-selected="false">Backlog</button>
@@ -68,32 +68,21 @@
       <span class="ae-nav-ind" id="ind"></span>
     </nav>
     <div class="pw-top-right">
-      <span class="pw-stats">
-        <span class="pw-stat" data-ae-tip="cards across the instance"><svg class="ae-icon" aria-hidden="true"><use href="#i-layers"></use></svg><span id="stat-cards" class="ae-num">0</span></span>
-        <span class="pw-stat" data-ae-tip="repositories"><svg class="ae-icon" aria-hidden="true"><use href="#i-folders"></use></svg><span id="stat-repos" class="ae-num">0</span></span>
-        <span class="pw-stat" data-ae-tip="awaiting input"><svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg><span id="stat-awaiting" class="ae-num">0</span></span>
-      </span>
       <button class="pw-filter-btn" id="filter-btn" type="button" aria-expanded="false" aria-controls="filters">
         <svg class="ae-icon" aria-hidden="true"><use href="#i-filter"></use></svg>
         filter<span class="pw-filter-n" id="filter-n"></span>
       </button>
-      <button id="refresh-board" class="pw-icon-btn" type="button" aria-label="refresh board">
-        <svg class="ae-icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
-      </button>
-      <button id="api-key-toggle" class="pw-icon-btn" type="button" aria-label="API key">
-        <svg class="ae-icon" aria-hidden="true"><use href="#i-key"></use></svg>
-      </button>
-      <button class="ae-mode" id="mode-toggle" type="button" aria-label="toggle color mode">
-        <svg class="ae-icon ae-sun" aria-hidden="true"><use href="#i-sun"></use></svg>
-        <svg class="ae-icon ae-moon" aria-hidden="true"><use href="#i-moon"></use></svg>
+      <button id="settings-toggle" class="pw-icon-btn" type="button" aria-label="connection and API key settings" aria-expanded="false" aria-controls="auth-panel">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-gear"></use></svg>
       </button>
     </div>
   </header>
 
   <section id="auth-panel" class="pw-auth" hidden>
     <div>
-      <p class="ae-item">Board reads use the private Powder network.</p>
-      <p class="ae-chrome">Save an API key only for write controls. Mint one on the instance with:</p>
+      <p class="ae-item">This instance only accepts writes from inside its private network. Paste an API key to enable write actions.</p>
+      <p class="ae-chrome">Connection: <span id="connection-status" class="pw-connection" data-kind="loading">loading</span></p>
+      <p class="ae-chrome">Need a key? Mint one on the instance with:</p>
       <code>powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
     </div>
     <form id="api-key-form" class="pw-auth-form">
@@ -159,7 +148,7 @@
 
   <footer class="pw-foot">
     <span><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · click away or <kbd>x</kbd> closes the sheet</span>
-    <span>powder · <span id="api-mode">unknown</span></span>
+    <span>powder</span>
   </footer>
 </div>
 

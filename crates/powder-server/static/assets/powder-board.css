@@ -89,34 +89,6 @@ body {
   padding-bottom: 0.65em;
 }
 
-.pw-stats {
-  display: inline-flex;
-  align-items: center;
-}
-
-.pw-stat {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45em;
-  padding: 0 0.95em;
-  border-left: 1px solid var(--ae-line);
-  color: var(--ae-ink-muted);
-}
-
-.pw-stat:first-child {
-  border-left: 0;
-}
-
-.pw-stat .ae-icon {
-  width: 1em;
-  height: 1em;
-}
-
-.pw-stat .ae-num {
-  color: var(--ae-ink);
-  font-weight: var(--ae-w-medium);
-}
-
 .pw-filter-btn,
 .pw-icon-btn {
   display: inline-flex;
@@ -139,7 +111,8 @@ body {
 
 .pw-filter-btn:hover,
 .pw-filter-btn[aria-expanded='true'],
-.pw-icon-btn:hover {
+.pw-icon-btn:hover,
+.pw-icon-btn[aria-expanded='true'] {
   color: var(--ae-ink);
 }
 
