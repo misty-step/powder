@@ -9,8 +9,10 @@ use powder_core::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::json;
 
 mod answer_loop;
+mod events;
 mod identity;
 mod repositories;
 mod schema;
@@ -18,13 +20,17 @@ pub mod status_model_020;
 #[cfg(test)]
 mod tests;
 
+pub use events::{
+    CardEventEnvelope, DeadLetterDelivery, EventSubscription, EventSubscriptionCreated,
+    EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
+};
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 pub use repositories::RepositorySummary;
 use repositories::{summarize_repository_rows, RepositoryRow};
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    MIGRATE_3_TO_4, MIGRATE_4_TO_5, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -128,6 +134,10 @@ impl Store {
                     self.connection.execute_batch(MIGRATE_4_TO_5)?;
                     5
                 }
+                5 => {
+                    self.connection.execute_batch(MIGRATE_5_TO_6)?;
+                    6
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -179,6 +189,76 @@ impl Store {
         Ok(outcome)
     }
 
+    pub fn import_cards_with_events(
+        &mut self,
+        cards: Vec<Card>,
+        actor: &str,
+        now: i64,
+    ) -> Result<ImportOutcome> {
+        let actor = non_empty("actor", actor)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut outcome = ImportOutcome::default();
+        for incoming in cards {
+            match load_card_optional(&transaction, &incoming.id)? {
+                None => {
+                    persist_card(&transaction, &incoming)?;
+                    append_card_event(
+                        &transaction,
+                        &incoming.id,
+                        "create",
+                        &actor,
+                        "imported card",
+                        now,
+                    )?;
+                    events::append_outbound_card_event(
+                        &transaction,
+                        &incoming,
+                        "card-created",
+                        &actor,
+                        json!({"source": "import"}),
+                        now,
+                    )?;
+                    outcome.created += 1;
+                }
+                Some(current) => {
+                    let class = classify_reimport(&current, &incoming);
+                    let merged = current.merge_reimport(incoming);
+                    let previous = current.status;
+                    persist_card(&transaction, &merged)?;
+                    outcome.record(class);
+                    if let Some(event_type) =
+                        events::outbound_event_for_status_change(previous, merged.status)
+                    {
+                        append_card_event(
+                            &transaction,
+                            &merged.id,
+                            "status",
+                            &actor,
+                            &format!("{} -> {}", previous.as_str(), merged.status.as_str()),
+                            now,
+                        )?;
+                        events::append_outbound_card_event(
+                            &transaction,
+                            &merged,
+                            event_type,
+                            &actor,
+                            json!({
+                                "previous_status": previous.as_str(),
+                                "status": merged.status.as_str(),
+                                "source": "import"
+                            }),
+                            now,
+                        )?;
+                    }
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
     /// Compute what [`Store::import_cards`] would do to `cards` without
     /// writing anything, so a caller can show a create/update/preserve/
     /// unchanged report before committing to the import.
@@ -197,6 +277,41 @@ impl Store {
         let card_id = card.id.clone();
         persist_card(&self.connection, &card)?;
         load_card(&self.connection, &card_id)
+    }
+
+    pub fn upsert_card_with_events(&mut self, card: Card, actor: &str, now: i64) -> Result<Card> {
+        let actor = non_empty("actor", actor)?;
+        let card_id = card.id.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existed = load_card_optional(&transaction, &card_id)?.is_some();
+        persist_card(&transaction, &card)?;
+        let saved = load_card(&transaction, &card_id)?;
+        append_card_event(
+            &transaction,
+            &saved.id,
+            if existed { "update" } else { "create" },
+            &actor,
+            if existed {
+                "updated card"
+            } else {
+                "created card"
+            },
+            now,
+        )?;
+        if !existed {
+            events::append_outbound_card_event(
+                &transaction,
+                &saved,
+                "card-created",
+                &actor,
+                json!({"source": "create-card"}),
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(saved)
     }
 
     pub fn record_card_event(
@@ -343,6 +458,20 @@ impl Store {
                AND claim_expires_at <= ?2",
             params![card_id.as_str(), now],
         )?;
+        if let Some(expired) = card.claim.as_ref().filter(|claim| claim.is_expired(now)) {
+            events::append_outbound_card_event(
+                &transaction,
+                &card,
+                "claim-expired",
+                &expired.agent,
+                json!({
+                    "run_id": expired.run_id.as_str(),
+                    "agent": expired.agent.as_str(),
+                    "expired_at": expired.expires_at
+                }),
+                now,
+            )?;
+        }
 
         let mut terminal_blockers = std::collections::HashSet::new();
         for id in &card.blocked_by {
@@ -419,6 +548,19 @@ impl Store {
             &format!("{} -> {}", previous.as_str(), status.as_str()),
             now,
         )?;
+        if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
+            events::append_outbound_card_event(
+                &transaction,
+                &card,
+                event_type,
+                &authority.actor_label(),
+                json!({
+                    "previous_status": previous.as_str(),
+                    "status": status.as_str()
+                }),
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(card)
     }
@@ -473,6 +615,14 @@ impl Store {
             run_id,
             ActivityType::Action,
             &format!("released {card_id}"),
+            now,
+        )?;
+        events::append_outbound_card_event(
+            &transaction,
+            &card,
+            "moved-to-ready",
+            &authority.actor_label(),
+            json!({"source": "release_claim", "run_id": run_id.as_str()}),
             now,
         )?;
         transaction.commit()?;
@@ -583,9 +733,10 @@ impl Store {
         body: &str,
         now: i64,
     ) -> Result<Comment> {
-        if self.get_card(card_id)?.is_none() {
-            return Err(DomainError::not_found("card", card_id.to_string()).into());
-        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let card = load_card(&transaction, card_id)?;
         let comment = Comment {
             card_id: card_id.clone(),
             author: non_empty("author", author)?,
@@ -593,7 +744,7 @@ impl Store {
             created_at: now,
         };
         let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO comments (id, card_id, author, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -604,6 +755,15 @@ impl Store {
                 comment.created_at
             ],
         )?;
+        events::append_outbound_card_event(
+            &transaction,
+            &card,
+            "comment-added",
+            &comment.author,
+            json!({"author": comment.author.as_str(), "body": comment.body.as_str()}),
+            now,
+        )?;
+        transaction.commit()?;
         Ok(comment)
     }
 
@@ -637,6 +797,22 @@ impl Store {
             run_id,
             ActivityType::Elicitation,
             &question,
+            now,
+        )?;
+        append_card_event(
+            &transaction,
+            &card.id,
+            "status",
+            &authority.actor_label(),
+            "awaiting input",
+            now,
+        )?;
+        events::append_outbound_card_event(
+            &transaction,
+            &card,
+            "awaiting-input",
+            &authority.actor_label(),
+            json!({"run_id": run_id.as_str(), "question": question}),
             now,
         )?;
         transaction.commit()?;
@@ -691,6 +867,20 @@ impl Store {
             &format!("{} -> done", previous.as_str()),
             now,
         )?;
+        if !previous.is_terminal() {
+            events::append_outbound_card_event(
+                &transaction,
+                &card,
+                "completed",
+                &authority.actor_label(),
+                json!({
+                    "previous_status": previous.as_str(),
+                    "status": card.status.as_str(),
+                    "proof": proof
+                }),
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(card)
     }

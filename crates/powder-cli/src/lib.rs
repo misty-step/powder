@@ -31,6 +31,11 @@ pub const COMMANDS: &[&str] = &[
     "add-comment",
     "request-input",
     "complete-card",
+    "subscription-create",
+    "subscription-list",
+    "subscription-disable",
+    "dead-letter-list",
+    "event-tail",
 ];
 
 pub fn run(args: &[String]) -> Result<String, ShellError> {
@@ -61,6 +66,11 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "add-comment" => add_comment(rest),
         [command, rest @ ..] if command == "request-input" => request_input(rest),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest),
+        [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
+        [command, rest @ ..] if command == "subscription-list" => subscription_list(rest),
+        [command, rest @ ..] if command == "subscription-disable" => subscription_disable(rest),
+        [command, rest @ ..] if command == "dead-letter-list" => dead_letter_list(rest),
+        [command, rest @ ..] if command == "event-tail" => event_tail(rest),
         [command, ..] => Err(ShellError::Invalid(format!("unknown command: {command}"))),
     }
 }
@@ -110,6 +120,13 @@ pub fn help() -> String {
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof]\n",
     );
+    help.push_str(
+        "  powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret\n",
+    );
+    help.push_str("  powder subscription-list --db ./data/powder.db\n");
+    help.push_str("  powder subscription-disable sub-id --db ./data/powder.db\n");
+    help.push_str("  powder dead-letter-list --db ./data/powder.db\n");
+    help.push_str("  powder event-tail --db ./data/powder.db --after 0 --limit 20\n");
     help.push_str(
         "  powder update-status 001 --db ./data/powder.db --status running --actor codex\n\n",
     );
@@ -223,7 +240,9 @@ fn import(args: &[String]) -> Result<String, ShellError> {
         }
         (false, _) => {
             let mut store = open_store(required_flag(args, "--db")?)?;
-            let outcome = store.import_cards(cards.clone()).map_err(store_err)?;
+            let outcome = store
+                .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
+                .map_err(store_err)?;
             out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
         }
     }
@@ -272,7 +291,9 @@ fn import_repo(args: &[String]) -> Result<String, ShellError> {
         out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
     } else {
         let mut store = open_store(required_flag(args, "--db")?)?;
-        let outcome = store.import_cards(cards.clone()).map_err(store_err)?;
+        let outcome = store
+            .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
+            .map_err(store_err)?;
         out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
     }
 
@@ -307,7 +328,9 @@ fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
         out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
     } else {
         let mut store = open_store(required_flag(args, "--db")?)?;
-        let outcome = store.import_cards(cards.clone()).map_err(store_err)?;
+        let outcome = store
+            .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
+            .map_err(store_err)?;
         out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
     }
 
@@ -357,15 +380,8 @@ fn create_card(args: &[String]) -> Result<String, ShellError> {
     card.related = card_ids_flag(args, "--related")?;
     card.blocks = card_ids_flag(args, "--blocks")?;
     card.blocked_by = card_ids_flag(args, "--blocked-by")?;
-    let card = store.upsert_card(card).map_err(store_err)?;
-    store
-        .record_card_event(
-            &card.id,
-            "create",
-            &authority(args).actor_label(),
-            "created card",
-            now,
-        )
+    let card = store
+        .upsert_card_with_events(card, &authority(args).actor_label(), now)
         .map_err(store_err)?;
     Ok(format!(
         "created\t{}\t{}\t{}\n",
@@ -632,6 +648,74 @@ fn complete_card(args: &[String]) -> Result<String, ShellError> {
     ))
 }
 
+fn subscription_create(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let url = required_flag(args, "--url")?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let created = store
+        .create_event_subscription(url, event_filter_flag(args)?, now)
+        .map_err(store_err)?;
+    if has_flag(args, "--show-secret") {
+        Ok(format!(
+            "subscription\t{}\t{}\t{}\n",
+            created.subscription.id, created.subscription.url, created.signing_secret
+        ))
+    } else {
+        Ok(format!(
+            "subscription\t{}\t{}\tredacted\n",
+            created.subscription.id, created.subscription.url
+        ))
+    }
+}
+
+fn subscription_list(args: &[String]) -> Result<String, ShellError> {
+    let store = open_store(required_flag(args, "--db")?)?;
+    to_pretty_json(&serde_json::json!({
+        "subscriptions": store.list_event_subscriptions().map_err(store_err)?
+    }))
+}
+
+fn subscription_disable(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let subscription_id = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("subscription-disable requires an id".to_string()))?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let subscription = store
+        .disable_event_subscription(subscription_id, now)
+        .map_err(store_err)?;
+    Ok(format!(
+        "disabled\t{}\t{}\n",
+        subscription.id,
+        subscription
+            .disabled_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "active".to_string())
+    ))
+}
+
+fn dead_letter_list(args: &[String]) -> Result<String, ShellError> {
+    let store = open_store(required_flag(args, "--db")?)?;
+    to_pretty_json(&serde_json::json!({
+        "dead_letters": store
+            .list_dead_letter_deliveries(parse_limit(args).unwrap_or(20))
+            .map_err(store_err)?
+    }))
+}
+
+fn event_tail(args: &[String]) -> Result<String, ShellError> {
+    let store = open_store(required_flag(args, "--db")?)?;
+    let after = flag_value(args, "--after")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    to_pretty_json(&serde_json::json!({
+        "events": store
+            .list_event_tail(after, parse_limit(args).unwrap_or(20))
+            .map_err(store_err)?
+    }))
+}
+
 fn open_store(path: &str) -> Result<Store, ShellError> {
     let mut store = Store::open(path).map_err(store_err)?;
     store.migrate().map_err(store_err)?;
@@ -658,6 +742,16 @@ fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, She
         .filter(|value| !value.is_empty())
         .map(|value| CardId::new(value).map_err(ShellError::from))
         .collect()
+}
+
+fn event_filter_flag(args: &[String]) -> Result<Vec<String>, ShellError> {
+    Ok(flag_value(args, "--event-filter")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Build the `Authority` a mutation is checked against from `--actor` (and
@@ -758,6 +852,11 @@ mod tests {
         assert!(COMMANDS.contains(&"add-comment"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
+        assert!(COMMANDS.contains(&"subscription-create"));
+        assert!(COMMANDS.contains(&"subscription-list"));
+        assert!(COMMANDS.contains(&"subscription-disable"));
+        assert!(COMMANDS.contains(&"dead-letter-list"));
+        assert!(COMMANDS.contains(&"event-tail"));
     }
 
     #[test]
@@ -1195,6 +1294,71 @@ mod tests {
         let card = run(&args(["get-card", "commented", "--db", &db])).unwrap();
         assert!(card.contains("\"author\": \"operator\""));
         assert!(card.contains("\"body\": \"looks good\""));
+    }
+
+    #[test]
+    fn cli_manages_event_subscriptions_and_tails_events() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-events-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        let created = run(&args([
+            "subscription-create",
+            "--db",
+            &db,
+            "--url",
+            "http://127.0.0.1:9000/webhook",
+            "--event-filter",
+            "moved-to-ready,completed",
+            "--show-secret",
+        ]))
+        .unwrap();
+        let parts = created.trim().split('\t').collect::<Vec<_>>();
+        assert_eq!(parts[0], "subscription");
+        assert!(parts[3].starts_with("whsec_powder_"));
+
+        let listed = run(&args(["subscription-list", "--db", &db])).unwrap();
+        assert!(listed.contains("moved-to-ready"));
+        assert!(
+            !listed.contains(parts[3]),
+            "subscription-list must not disclose signing secrets"
+        );
+
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "tail-cli",
+            "--title",
+            "Tail CLI",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "backlog",
+        ]))
+        .unwrap();
+        run(&args([
+            "update-status",
+            "tail-cli",
+            "--db",
+            &db,
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let events = run(&args(["event-tail", "--db", &db])).unwrap();
+        assert!(events.contains("\"event_type\": \"card-created\""));
+        assert!(events.contains("\"event_type\": \"moved-to-ready\""));
+
+        let disabled = run(&args(["subscription-disable", parts[1], "--db", &db])).unwrap();
+        assert!(disabled.contains(parts[1]));
     }
 
     #[test]

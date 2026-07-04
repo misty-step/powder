@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -98,6 +98,53 @@ CREATE TABLE IF NOT EXISTS comments (
   body TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS event_subscriptions (
+  id TEXT PRIMARY KEY,
+  url TEXT NOT NULL,
+  event_filter_json TEXT NOT NULL,
+  signing_secret_hash TEXT NOT NULL,
+  signing_secret TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  disabled_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_event_subscriptions_active ON event_subscriptions(disabled_at, created_at, id);
+
+CREATE TABLE IF NOT EXISTS outbound_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  payload_json TEXT NOT NULL,
+  occurred_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_events_card_created ON outbound_events(card_id, sequence);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id TEXT PRIMARY KEY,
+  subscription_id TEXT NOT NULL REFERENCES event_subscriptions(id) ON DELETE CASCADE,
+  event_id TEXT NOT NULL REFERENCES outbound_events(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL,
+  last_attempt_at INTEGER,
+  last_status INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(subscription_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due ON webhook_deliveries(status, next_attempt_at, id);
+
+CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
+  id TEXT PRIMARY KEY,
+  delivery_id TEXT NOT NULL REFERENCES webhook_deliveries(id) ON DELETE CASCADE,
+  attempt_number INTEGER NOT NULL,
+  status_code INTEGER,
+  error TEXT,
+  attempted_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_delivery_attempts(delivery_id, attempt_number);
 "#;
 
 pub const MIGRATE_1_TO_2: &str = r#"
@@ -162,6 +209,55 @@ CREATE TABLE IF NOT EXISTS card_events (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);
+"#;
+
+pub const MIGRATE_5_TO_6: &str = r#"
+CREATE TABLE IF NOT EXISTS event_subscriptions (
+  id TEXT PRIMARY KEY,
+  url TEXT NOT NULL,
+  event_filter_json TEXT NOT NULL,
+  signing_secret_hash TEXT NOT NULL,
+  signing_secret TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  disabled_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_event_subscriptions_active ON event_subscriptions(disabled_at, created_at, id);
+
+CREATE TABLE IF NOT EXISTS outbound_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  payload_json TEXT NOT NULL,
+  occurred_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_events_card_created ON outbound_events(card_id, sequence);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id TEXT PRIMARY KEY,
+  subscription_id TEXT NOT NULL REFERENCES event_subscriptions(id) ON DELETE CASCADE,
+  event_id TEXT NOT NULL REFERENCES outbound_events(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL,
+  last_attempt_at INTEGER,
+  last_status INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(subscription_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due ON webhook_deliveries(status, next_attempt_at, id);
+
+CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
+  id TEXT PRIMARY KEY,
+  delivery_id TEXT NOT NULL REFERENCES webhook_deliveries(id) ON DELETE CASCADE,
+  attempt_number INTEGER NOT NULL,
+  status_code INTEGER,
+  error TEXT,
+  attempted_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_delivery_attempts(delivery_id, attempt_number);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, status, priority, labels_json,
