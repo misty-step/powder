@@ -558,7 +558,7 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
 }
 
 #[tokio::test]
-async fn board_shell_serves_from_root_and_board_without_auth() {
+async fn board_shell_serves_from_root_board_and_card_routes_without_auth() {
     let (state, _) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
@@ -588,10 +588,13 @@ async fn board_shell_serves_from_root_and_board_without_auth() {
     assert!(root.contains("powder key-create --db /data/powder.db --name operator"));
     assert!(root.contains(r#"id="settings-toggle""#));
     assert!(root.contains(r#"id="repo-settings-list""#));
+    assert!(root.contains(r#"id="powder-card-app""#));
+    assert!(root.contains(r#"data-pw-route"#));
     assert!(!root.contains(r#"id="api-key-toggle""#));
     assert!(!root.contains(r#"id="refresh-board""#));
 
     let board = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -603,6 +606,26 @@ async fn board_shell_serves_from_root_and_board_without_auth() {
         .unwrap();
     assert_eq!(board.status(), StatusCode::OK);
     assert_eq!(response_text(board).await, root);
+
+    let card = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/c/board-readable")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(card.status(), StatusCode::OK);
+    assert!(card
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert_eq!(response_text(card).await, root);
 }
 
 #[tokio::test]
@@ -653,15 +676,18 @@ async fn board_assets_are_served_with_specific_content_types() {
     let script = response_text(script).await;
     assert!(script.contains("const RAW_STATUSES"));
     assert!(
-        script.contains(r#"id="${escapeHtml(anchorId(card.id))}""#),
-        "card buttons must expose id=\"card-{{card_id}}\" anchors for Bridge deep links"
+        script.contains(r#"href="${escapeHtml(cardHref(card.id))}""#),
+        "card rows must link to /c/{{card_id}} for Bridge deep links"
     );
     assert!(
-        script.contains("function selectFromHash()"),
-        "async board rendering must select cards from card hashes after API load"
+        script.contains("function loadCardRoute()"),
+        "card detail routes must render from the same static asset"
     );
     assert!(script.contains("function classifyFailure("));
     assert!(script.contains("function relationsHTML("));
+    assert!(script.contains("function markdownHTML("));
+    assert!(script.contains("function timelineItems("));
+    assert!(script.contains("BOARD_STATE_KEY"));
     assert!(script.contains("function renderRepositorySettings("));
     assert!(script.contains("function canonicalRepoLabel("));
     assert!(script.contains("function relationBadges("));
@@ -688,6 +714,8 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(css.contains(".pw-auth[hidden]"));
     assert!(css.contains(".pw-repo-row"));
     assert!(css.contains(".pw-rel-badge"));
+    assert!(css.contains(".pw-detail-app"));
+    assert!(css.contains(".pw-detail-grid"));
     assert!(css.contains("display: none;"));
 }
 

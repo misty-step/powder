@@ -14,6 +14,7 @@ const RAW_STATUSES = [
 
 const PAGE_LIMIT = 1000;
 const STORAGE_KEY = "powder-api-key";
+const BOARD_STATE_KEY = "powder-board-state";
 const KEY_MINT_COMMAND =
   "powder key-create --db /data/powder.db --name operator --scope admin --show-secret";
 
@@ -34,6 +35,10 @@ const KNOWN_REPO_META = {
 
 const els = {
   app: document.getElementById("powder-board-app"),
+  cardApp: document.getElementById("powder-card-app"),
+  detailBody: document.getElementById("detail-body"),
+  detailConnection: document.getElementById("detail-connection-status"),
+  detailBoardLink: document.getElementById("detail-board-link"),
   connection: document.getElementById("connection-status"),
   authPanel: document.getElementById("auth-panel"),
   repoSettingsCount: document.getElementById("repo-settings-count"),
@@ -66,10 +71,6 @@ const els = {
   readyCount: document.getElementById("rd-count"),
   inProgressCount: document.getElementById("ip-count"),
   doneCount: document.getElementById("dn-count"),
-  scrim: document.getElementById("scrim"),
-  sheet: document.getElementById("sheet"),
-  sheetBody: document.getElementById("sheet-body"),
-  sheetClose: document.getElementById("sheet-close"),
 };
 
 const state = {
@@ -80,6 +81,7 @@ const state = {
   repositories: [],
   detailCache: new Map(),
   selectedId: null,
+  view: "both",
   loading: true,
   error: "",
   errorKind: "",
@@ -105,6 +107,19 @@ function escapeHtml(value) {
 
 function encodePath(value) {
   return encodeURIComponent(String(value));
+}
+
+function cardRouteId() {
+  const match = window.location.pathname.match(/^\/c\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function cardHref(cardId) {
+  return `/c/${encodePath(cardId)}`;
+}
+
+function boardRoute() {
+  return sessionStorage.getItem("powder-board-path") || "/board";
 }
 
 function apiHeaders(extra = {}) {
@@ -180,7 +195,6 @@ async function loadBoard() {
     updateSuccessConnection();
     buildFilters();
     renderRepositorySettings();
-    selectFromHash();
     render();
   } catch (err) {
     state.loading = false;
@@ -229,8 +243,11 @@ function updateSuccessConnection() {
 }
 
 function updateConnection(kind, label) {
-  els.connection.dataset.kind = kind;
-  els.connection.textContent = label;
+  for (const node of [els.connection, els.detailConnection]) {
+    if (!node) continue;
+    node.dataset.kind = kind;
+    node.textContent = label;
+  }
 }
 
 function classifyFailure(err) {
@@ -580,10 +597,10 @@ function renderRail(cards) {
       last = card.repoKey;
     }
     groups.push(
-      `<button id="${escapeHtml(anchorId(card.id))}" class="pw-rail-row" type="button" data-id="${escapeHtml(card.id)}">
+      `<a id="${escapeHtml(anchorId(card.id))}" class="pw-rail-row" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
         <span class="pw-rail-id">${escapeHtml(card.id)} · ${escapeHtml(cleanPriority(card.priority))}</span>
         ${escapeHtml(card.title)}
-      </button>`,
+      </a>`,
     );
   }
   els.railList.innerHTML = groups.join("") || empty("Nothing queued under this filter.");
@@ -599,6 +616,46 @@ function renderCounts(buckets) {
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
 }
 
+function saveBoardState() {
+  try {
+    sessionStorage.setItem("powder-board-path", `${window.location.pathname}${window.location.search}`);
+    sessionStorage.setItem(
+      BOARD_STATE_KEY,
+      JSON.stringify({
+        view: state.view,
+        railShare,
+        filters: {
+          repos: [...state.filters.repos],
+          prios: [...state.filters.prios],
+          search: state.filters.search,
+          sort: state.filters.sort,
+        },
+      }),
+    );
+  } catch (_err) {}
+}
+
+function restoreBoardState() {
+  try {
+    const raw = sessionStorage.getItem(BOARD_STATE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (["backlog", "both", "board"].includes(saved.view)) {
+      state.view = saved.view;
+    }
+    if (Number.isFinite(saved.railShare)) {
+      railShare = saved.railShare;
+    }
+    const filters = saved.filters || {};
+    state.filters.repos = new Set(Array.isArray(filters.repos) ? filters.repos : []);
+    state.filters.prios = new Set(Array.isArray(filters.prios) ? filters.prios : []);
+    state.filters.search = String(filters.search || "");
+    state.filters.sort = ["repo", "prio", "id"].includes(filters.sort) ? filters.sort : "repo";
+    els.textFilter.value = state.filters.search;
+    els.sort.value = state.filters.sort;
+  } catch (_err) {}
+}
+
 function empty(text) {
   return `<p class="pw-empty">${escapeHtml(text)}</p>`;
 }
@@ -610,14 +667,14 @@ function cardHTML(card) {
     : `<span class="pw-card-st">${statusText(card.status)}</span>`;
   const relations = relationBadges(card);
   return `
-    <button id="${escapeHtml(anchorId(card.id))}" class="pw-card" type="button" data-id="${escapeHtml(card.id)}">
+    <a id="${escapeHtml(anchorId(card.id))}" class="pw-card" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
       <span class="pw-card-top">${repoIcon(card.repoKey, `ae-cat-${meta.cat}`)}
         <span class="pw-id">${escapeHtml(card.id)}</span><span>${escapeHtml(cleanPriority(card.priority))}</span>
       </span>
       <span class="pw-card-t">${escapeHtml(card.title)}</span>
       <p class="pw-card-meta">${statusGlyph(card.status)}${claim}</p>
       ${relations ? `<p class="pw-rel-badges">${relations}</p>` : ""}
-    </button>
+    </a>
   `;
 }
 
@@ -631,11 +688,11 @@ function relationBadges(card) {
 
 function doneRowHTML(card) {
   return `
-    <button id="${escapeHtml(anchorId(card.id))}" class="pw-done-row" type="button" data-id="${escapeHtml(card.id)}">
+    <a id="${escapeHtml(anchorId(card.id))}" class="pw-done-row" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
       <span class="pw-g"><svg class="ae-icon ae-ok" aria-hidden="true"><use href="#i-check"></use></svg></span>
       <span class="pw-done-t">${escapeHtml(card.title)}</span>
       <span class="pw-done-id ae-num">${escapeHtml(card.id)}</span>
-    </button>
+    </a>
   `;
 }
 
@@ -662,97 +719,83 @@ function chip(text) {
   return `<span class="ae-trail-who">${escapeHtml(text)}</span>`;
 }
 
-async function openSheet(cardId) {
-  state.selectedId = cardId;
-  const card = state.cards.find((candidate) => candidate.id === cardId);
-  if (!card) return;
-  window.location.hash = `card=${encodeURIComponent(cardId)}`;
-  els.sheetBody.innerHTML = sheetLoading(card);
-  showSheet();
+async function loadCardRoute() {
+  const cardId = cardRouteId();
+  if (!cardId) return;
+  document.documentElement.setAttribute("data-pw-route", "card");
+  els.detailBoardLink.href = boardRoute();
+  els.detailBody.innerHTML = detailLoading(cardId);
+  updateConnection("loading", "loading");
   try {
-    const detail = state.detailCache.get(cardId) || (await apiJson(`/api/v1/cards/${encodePath(cardId)}`));
-    state.detailCache.set(cardId, detail);
-    els.sheetBody.innerHTML = sheetHTML(detail.card || card, detail);
+    await loadOnboarding();
+    const detail = await apiJson(`/api/v1/cards/${encodePath(cardId)}`);
+    updateSuccessConnection();
+    document.title = `${detail.card?.id || cardId} · Powder`;
+    els.detailBody.innerHTML = detailHTML(detail.card, detail);
   } catch (err) {
-    els.sheetBody.innerHTML = sheetError(card, err);
+    const failure = classifyFailure(err);
+    updateConnection(failure.connectionKind, failure.connectionLabel);
+    document.title = `${cardId} · Powder`;
+    els.detailBody.innerHTML = detailError(cardId, failure.message);
   }
 }
 
-function showSheet() {
-  els.sheet.classList.add("is-open");
-  els.scrim.classList.add("is-open");
-  els.sheet.removeAttribute("inert");
-  els.sheet.setAttribute("aria-hidden", "false");
-  els.sheetClose.focus();
+function detailLoading(cardId) {
+  return `<section class="pw-detail-hero"><p class="ae-chrome">CARD</p><p class="pw-detail-title ae-strong">${escapeHtml(cardId)}</p><p class="pw-empty">Loading card detail.</p></section>`;
 }
 
-function closeSheet() {
-  els.sheet.classList.remove("is-open");
-  els.scrim.classList.remove("is-open");
-  els.sheet.setAttribute("inert", "");
-  els.sheet.setAttribute("aria-hidden", "true");
-  if (window.location.hash.startsWith("#card=")) history.replaceState(null, "", window.location.pathname);
+function detailError(cardId, message) {
+  return `<section class="pw-detail-hero"><p class="ae-chrome">CARD</p><p class="pw-detail-title ae-strong">${escapeHtml(cardId)}</p><p class="pw-empty">${escapeHtml(message)}</p></section>`;
 }
 
-function sheetLoading(card) {
-  return `<p class="pw-sheet-title ae-strong">${escapeHtml(card.title)}</p><p class="pw-empty">Loading card detail.</p>`;
-}
-
-function sheetError(card, err) {
-  return `<p class="pw-sheet-title ae-strong">${escapeHtml(card.title)}</p><p class="pw-empty">${escapeHtml(err?.message || err)}</p>`;
-}
-
-function sheetHTML(card, detail = {}) {
+function detailHTML(card, detail = {}) {
   const normalized = normalizeCard(card);
   const meta = repoMeta(normalized.repoKey);
   const latestRun = latestRunFor(normalized, detail.runs || []);
-  const parts = [
-    `<nav class="ae-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `ae-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li></ol></nav>`,
-    `<p class="pw-sheet-title ae-strong">${escapeHtml(normalized.title)}</p>`,
-    `<p class="pw-sheet-meta"><span class="pw-st">${statusGlyph(normalized.status)}${escapeHtml(statusText(normalized.status))}</span><span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}</p>`,
-  ];
+  const timeline = timelineItems(detail);
+  const parts = [];
+  parts.push(`
+    <section class="pw-detail-hero">
+      <nav class="ae-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `ae-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li></ol></nav>
+      <p class="pw-detail-title ae-strong">${escapeHtml(normalized.title)}</p>
+      <p class="pw-detail-meta"><span class="pw-st">${statusGlyph(normalized.status)}${escapeHtml(statusText(normalized.status))}</span><span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}</p>
+    </section>
+  `);
   const awaiting = (detail.activities || []).filter((activity) => activity.activity_type === "elicitation");
   if (normalized.status === "awaiting_input" && awaiting[0]) {
     parts.push(`<div class="pw-ask"><p class="pw-ask-cap"><svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg>INPUT REQUESTED</p><p>${escapeHtml(awaiting[0].payload)}</p></div>`);
   }
-  parts.push(section("DESCRIPTION", bodyHTML(normalized.body)));
-  parts.push(section("ACCEPTANCE", acceptanceHTML(normalized.acceptance || [])));
-  parts.push(section("RELATIONS", relationsHTML(normalized)));
-  parts.push(section("COMMENTS", trailHTML((detail.comments || []).map((comment) => ({
-    head: `${comment.author} · ${formatDate(comment.created_at)}`,
-    body: comment.body,
-  })), "No comments yet.")));
-  parts.push(section("Q/A", trailHTML((detail.activities || []).filter((activity) => ["elicitation", "response", "prompt"].includes(activity.activity_type)).map((activity) => ({
-    head: `${activity.activity_type} · ${formatDate(activity.created_at)}`,
-    body: activity.payload,
-  })), "No questions yet.")));
-  parts.push(section("CLAIM / RUN", definitionHTML([
-    ["Claim holder", normalized.claim?.agent || "unclaimed"],
-    ["Run ID", normalized.claim?.run_id || latestRun?.id || "none"],
-    ["Lease expiry", normalized.claim?.expires_at ? formatDate(normalized.claim.expires_at) : "none"],
-    ["Run state", latestRun?.state || "none"],
-    ["Run updated", latestRun?.updated_at ? formatDate(latestRun.updated_at) : "none"],
-  ])));
-  parts.push(section("LINKS", linksHTML(detail.links || [], latestRun)));
-  parts.push(section("SOURCE", definitionHTML([
-    ["Repo / Source", normalized.repo || normalized.source?.path || "local"],
-    ["Digest", normalized.source?.digest || "none"],
-    ["Workspace", normalized.workspace_path || "none"],
-    ["Branch", normalized.branch_name || "none"],
-    ["Created", formatDate(normalized.created_at)],
-    ["Updated", formatDate(normalized.updated_at)],
-  ])));
+  parts.push(`
+    <div class="pw-detail-grid">
+      <div class="pw-detail-primary">
+        ${section("DESCRIPTION", markdownHTML(normalized.body))}
+        ${section("ACCEPTANCE", acceptanceHTML(normalized.acceptance || []))}
+        ${section("PROOF PLAN / EVIDENCE", linksHTML(detail.links || [], detail.runs || []))}
+        ${section("COMMENTS", trailHTML((detail.comments || []).map((comment) => ({
+          head: `${comment.author} · ${formatDate(comment.created_at)}`,
+          body: comment.body,
+        })), "No comments yet."))}
+        ${section("TIMELINE", timelineHTML(timeline))}
+      </div>
+      <aside class="pw-detail-side">
+        ${section("RELATIONS", relationsHTML(normalized))}
+        ${section("CLAIM / RUN HISTORY", runHistoryHTML(normalized, detail.runs || [], latestRun))}
+        ${section("SOURCE", definitionHTML([
+          ["Repo / Source", normalized.repo || normalized.source?.path || "local"],
+          ["Digest", normalized.source?.digest || "none"],
+          ["Workspace", normalized.workspace_path || "none"],
+          ["Branch", normalized.branch_name || "none"],
+          ["Created", formatDate(normalized.created_at)],
+          ["Updated", formatDate(normalized.updated_at)],
+        ]))}
+      </aside>
+    </div>
+  `);
   return parts.join("");
 }
 
 function section(title, body) {
   return `<section class="pw-sec"><p class="ae-h">${title}</p>${body}</section>`;
-}
-
-function bodyHTML(text) {
-  const paragraphs = String(text || "").trim().split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
-  if (!paragraphs.length) return empty("No description.");
-  return `<div class="pw-body">${paragraphs.map((part) => `<p>${escapeHtml(part)}</p>`).join("")}</div>`;
 }
 
 function acceptanceHTML(items) {
@@ -767,7 +810,7 @@ function relationsHTML(card) {
     ["Related", card.related || []],
   ];
   if (rows.every(([, ids]) => ids.length === 0)) return empty("No relations.");
-  return `<dl>${rows.map(([term, ids]) => `<div class="pw-def-row"><dt>${escapeHtml(term)}</dt><dd>${ids.length ? ids.map((id) => `<span class="pw-rel-id">${escapeHtml(id)}</span>`).join(" ") : "none"}</dd></div>`).join("")}</dl>`;
+  return `<dl>${rows.map(([term, ids]) => `<div class="pw-def-row"><dt>${escapeHtml(term)}</dt><dd>${ids.length ? ids.map((id) => `<a class="pw-rel-id" href="${escapeHtml(cardHref(id))}">${escapeHtml(id)}</a>`).join(" ") : "none"}</dd></div>`).join("")}</dl>`;
 }
 
 function trailHTML(items, fallback) {
@@ -779,8 +822,10 @@ function definitionHTML(rows) {
   return `<dl>${rows.map(([term, value]) => `<div class="pw-def-row"><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>`;
 }
 
-function linksHTML(links, latestRun) {
-  const proof = latestRun?.proof ? [{ label: "run proof", url: latestRun.proof }] : [];
+function linksHTML(links, runs) {
+  const proof = runs
+    .filter((run) => run.proof)
+    .map((run) => ({ label: `run proof · ${run.id}`, url: run.proof }));
   const allLinks = [...links, ...proof];
   if (!allLinks.length) return empty("No proof links.");
   return allLinks.map((link) => {
@@ -790,6 +835,122 @@ function linksHTML(links, latestRun) {
       : `<span>${escapeHtml(link.url)}</span>`;
     return `<p class="pw-link-row"><svg class="ae-icon" aria-hidden="true"><use href="#i-link"></use></svg><span><span class="ae-item">${escapeHtml(link.label)}</span><br>${target}</span></p>`;
   }).join("");
+}
+
+function runHistoryHTML(card, runs, latestRun) {
+  const summary = definitionHTML([
+    ["Claim holder", card.claim?.agent || "unclaimed"],
+    ["Active run", card.claim?.run_id || latestRun?.id || "none"],
+    ["Lease expiry", card.claim?.expires_at ? formatDate(card.claim.expires_at) : "none"],
+    ["Latest state", latestRun?.state || "none"],
+    ["Latest update", latestRun?.updated_at ? formatDate(latestRun.updated_at) : "none"],
+  ]);
+  if (!runs.length) return summary + empty("No runs recorded.");
+  const rows = [...runs]
+    .sort((left, right) => (right.updated_at || 0) - (left.updated_at || 0))
+    .map((run) => `
+      <li>
+        <p class="pw-trail-head">${escapeHtml(run.id)} · ${escapeHtml(run.state)} · ${formatDate(run.updated_at)}</p>
+        <p>${escapeHtml(run.agent)}${run.proof ? ` · ${linkOrText(run.proof)}` : ""}</p>
+      </li>
+    `);
+  return `${summary}<ul class="pw-trail pw-run-list">${rows.join("")}</ul>`;
+}
+
+function timelineItems(detail) {
+  const activities = (detail.activities || []).map((activity) => ({
+    time: Number(activity.created_at || 0),
+    head: `${activity.activity_type} · ${formatDate(activity.created_at)}`,
+    body: activity.payload,
+  }));
+  const events = (detail.events || []).map((event) => ({
+    time: Number(event.created_at || 0),
+    head: `${event.event_type} · ${event.actor} · ${formatDate(event.created_at)}`,
+    body: event.payload,
+  }));
+  return [...activities, ...events].sort((left, right) => right.time - left.time);
+}
+
+function timelineHTML(items) {
+  return trailHTML(items, "No timeline activity yet.");
+}
+
+function markdownHTML(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const html = [];
+  let paragraph = [];
+  let list = [];
+  let inCode = false;
+  let code = [];
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    html.push(`<p>${inlineMarkdown(paragraph.join(" "))}</p>`);
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!list.length) return;
+    html.push(`<ul>${list.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ul>`);
+    list = [];
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (line.trim().startsWith("```")) {
+      if (inCode) {
+        html.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+        code = [];
+        inCode = false;
+      } else {
+        flushParagraph();
+        flushList();
+        inCode = true;
+      }
+      continue;
+    }
+    if (inCode) {
+      code.push(raw);
+      continue;
+    }
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    const heading = line.match(/^#{1,4}\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      html.push(`<p class="pw-md-head ae-h">${inlineMarkdown(heading[1])}</p>`);
+      continue;
+    }
+    const bullet = line.match(/^[-*]\s+(?:\[[ xX]\]\s*)?(.+)$/);
+    if (bullet) {
+      flushParagraph();
+      list.push(bullet[1]);
+      continue;
+    }
+    paragraph.push(line.trim());
+  }
+  if (inCode) html.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+  flushParagraph();
+  flushList();
+  return html.length ? `<div class="pw-body pw-md">${html.join("")}</div>` : empty("No description.");
+}
+
+function inlineMarkdown(text) {
+  return escapeHtml(text)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_match, label, url) => {
+      const safe = safeUrl(url);
+      if (!safe) return label;
+      return `<a href="${escapeHtml(safe)}" target="_blank" rel="noreferrer">${label}</a>`;
+    });
+}
+
+function linkOrText(raw) {
+  const safe = safeUrl(raw);
+  if (!safe) return escapeHtml(raw);
+  return `<a href="${escapeHtml(safe)}" target="_blank" rel="noreferrer">${escapeHtml(raw)}</a>`;
 }
 
 function latestRunFor(card, runs) {
@@ -834,6 +995,7 @@ function toggleFilters(force) {
 
 function setView(view) {
   const targetShare = { backlog: 100, both: 24, board: 0 }[view] ?? 24;
+  state.view = ["backlog", "both", "board"].includes(view) ? view : "both";
   els.main.dataset.view = view;
   const tabs = {
     backlog: els.tabBacklog,
@@ -882,18 +1044,6 @@ function placeIndicator() {
   els.indicator.style.width = `${active.offsetWidth}px`;
 }
 
-function selectFromHash() {
-  const raw = window.location.hash;
-  let id = "";
-  if (raw.startsWith("#card=")) {
-    id = decodeURIComponent(raw.slice("#card=".length));
-  } else if (raw.startsWith("#card-")) {
-    id = decodeURIComponent(raw.slice("#card-".length));
-  }
-  if (!id) return;
-  if (state.cards.some((card) => card.id === id)) openSheet(id);
-}
-
 function anchorId(cardId) {
   return `card-${cardId}`;
 }
@@ -923,8 +1073,6 @@ els.sort.addEventListener("change", (event) => {
 els.tabBacklog.addEventListener("click", () => setView("backlog"));
 els.tabBoth.addEventListener("click", () => setView("both"));
 els.tabBoard.addEventListener("click", () => setView("board"));
-els.sheetClose.addEventListener("click", closeSheet);
-els.scrim.addEventListener("click", closeSheet);
 els.settingsToggle.addEventListener("click", () => {
   if (els.authPanel.hidden) showAuth();
   else hideAuth();
@@ -945,10 +1093,11 @@ els.clearApiKey.addEventListener("click", () => {
   loadBoard();
 });
 document.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-id]");
-  if (button) openSheet(button.dataset.id);
+  const link = event.target.closest("[data-card-link]");
+  if (link) saveBoardState();
 });
 document.addEventListener("keydown", (event) => {
+  if (cardRouteId()) return;
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const tag = (event.target.tagName || "").toLowerCase();
   if (tag === "input" || tag === "textarea" || tag === "select") return;
@@ -956,7 +1105,6 @@ document.addEventListener("keydown", (event) => {
   else if (event.key === "2") setView("both");
   else if (event.key === "3") setView("board");
   else if (event.key.toLowerCase() === "f") toggleFilters();
-  else if (event.key === "Escape" || event.key.toLowerCase() === "x") closeSheet();
   else if (event.key === "/") {
     toggleFilters(true);
     event.preventDefault();
@@ -964,9 +1112,14 @@ document.addEventListener("keydown", (event) => {
   }
 });
 window.addEventListener("resize", placeIndicator);
-window.addEventListener("hashchange", selectFromHash);
 
-buildFilters();
-setRailShare(railShare);
-placeIndicator();
-loadBoard();
+if (cardRouteId()) {
+  loadCardRoute();
+} else {
+  restoreBoardState();
+  buildFilters();
+  setRailShare(railShare);
+  setView(state.view);
+  placeIndicator();
+  loadBoard();
+}

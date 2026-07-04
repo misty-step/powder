@@ -367,6 +367,7 @@ fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(board_index))
         .route("/board", get(board_index))
+        .route("/c/{id}", get(board_index))
         .route("/assets/aesthetic.css", get(aesthetic_css))
         .route("/assets/powder-board.css", get(board_css))
         .route("/assets/powder-board.js", get(board_js))
