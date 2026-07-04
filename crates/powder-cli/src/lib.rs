@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use powder_api::{urlencode, RemoteClient};
 use powder_core::{Authority, Board, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
@@ -7,6 +8,7 @@ use powder_shell::{
 use powder_store::{
     ApiKeyScope, CardFilter, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
 };
+use serde_json::{json, Value};
 
 pub const COMMANDS: &[&str] = &[
     "init-db",
@@ -45,7 +47,48 @@ pub const COMMANDS: &[&str] = &[
     "event-tail",
 ];
 
+#[derive(Debug, Clone, Default)]
+struct RemoteEnv {
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+impl RemoteEnv {
+    fn from_pairs<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut env = Self::default();
+        for (key, value) in pairs {
+            let key = key.into();
+            let value = value.into();
+            if value.trim().is_empty() {
+                continue;
+            }
+            match key.as_str() {
+                "POWDER_API_BASE_URL" => env.base_url = Some(value.trim().to_string()),
+                "POWDER_API_KEY" => env.api_key = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+        env
+    }
+
+    fn client(&self) -> Option<RemoteClient> {
+        self.base_url
+            .as_ref()
+            .map(|base_url| RemoteClient::new(base_url.clone(), self.api_key.clone()))
+    }
+}
+
 pub fn run(args: &[String]) -> Result<String, ShellError> {
+    let remote_env = RemoteEnv::from_pairs(std::env::vars());
+    run_with_remote_env(args, &remote_env)
+}
+
+fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     match args {
         [] => Ok(help()),
         [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
@@ -56,26 +99,26 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "import" => import(rest),
         [command, rest @ ..] if command == "import-repo" => import_repo(rest),
         [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
-        [command, rest @ ..] if command == "create-card" => create_card(rest),
+        [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
         [command, rest @ ..] if command == "update-relations" => update_relations(rest),
-        [command, rest @ ..] if command == "list-ready" => list_ready(rest),
-        [command, rest @ ..] if command == "list-cards" => list_cards(rest),
+        [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
+        [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
         [command, rest @ ..] if command == "repository-list" => repository_list(rest),
         [command, rest @ ..] if command == "repository-get" => repository_get(rest),
         [command, rest @ ..] if command == "repository-upsert" => repository_upsert(rest),
         [command, rest @ ..] if command == "repository-merge-alias" => repository_merge_alias(rest),
         [command, rest @ ..] if command == "repository-delete" => repository_delete(rest),
-        [command, rest @ ..] if command == "claim" => claim(rest),
+        [command, rest @ ..] if command == "claim" => claim(rest, remote_env),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest),
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest),
-        [command, rest @ ..] if command == "get-card" => get_card(rest),
+        [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
         [command, rest @ ..] if command == "get-run" => get_run(rest),
         [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
         [command, rest @ ..] if command == "answer-input" => answer_input(rest),
-        [command, rest @ ..] if command == "update-status" => update_status(rest),
+        [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
         [command, rest @ ..] if command == "add-link" => add_link(rest),
-        [command, rest @ ..] if command == "add-comment" => add_comment(rest),
+        [command, rest @ ..] if command == "add-comment" => add_comment(rest, remote_env),
         [command, rest @ ..] if command == "request-input" => request_input(rest),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest),
         [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
@@ -368,11 +411,11 @@ fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
     Ok(out)
 }
 
-fn create_card(args: &[String]) -> Result<String, ShellError> {
+fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let id = required_flag(args, "--id")?;
     let title = required_flag(args, "--title")?;
-    let body = flag_value(args, "--body").unwrap_or_default();
+    let body = flag_value(args, "--body");
     // No fabricated acceptance: an omitted --acceptance means empty, not a
     // placeholder oracle that would falsely make the card look claimable
     // ("ready is a query, not vibes", VISION.md). An explicit --status is
@@ -392,25 +435,58 @@ fn create_card(args: &[String]) -> Result<String, ShellError> {
     let priority = flag_value(args, "--priority")
         .and_then(Priority::parse)
         .unwrap_or_default();
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let mut card = Card::new(CardId::new(id).map_err(ShellError::from)?, title, body)
+
+    let related = card_ids_flag(args, "--related")?;
+    let blocks = card_ids_flag(args, "--blocks")?;
+    let blocked_by = card_ids_flag(args, "--blocked-by")?;
+    let repo = flag_value(args, "--repo").map(str::to_string);
+
+    let card = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let mut card = Card::new(
+            CardId::new(id).map_err(ShellError::from)?,
+            title,
+            body.unwrap_or_default(),
+        )
         .map_err(ShellError::from)?
         .with_status(status)
         .with_priority(priority)
         .with_acceptance(acceptance)
         .with_created_at(now);
-    card.related = card_ids_flag(args, "--related")?;
-    card.blocks = card_ids_flag(args, "--blocks")?;
-    card.blocked_by = card_ids_flag(args, "--blocked-by")?;
-    card.repo = flag_value(args, "--repo").map(str::to_string);
-    let card = store
-        .create_card_with_events(card, &authority(args).actor_label(), now)
-        .map_err(store_err)?;
+        card.related = related;
+        card.blocks = blocks;
+        card.blocked_by = blocked_by;
+        card.repo = repo;
+        json!(store
+            .create_card_with_events(card, &authority(args).actor_label(), now)
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        let mut payload = json!({
+            "id": id,
+            "title": title,
+            "acceptance": acceptance,
+            "status": status.as_str(),
+            "priority": priority.as_str(),
+            "related": card_id_values(&related),
+            "blocks": card_id_values(&blocks),
+            "blocked_by": card_id_values(&blocked_by),
+        });
+        if let Some(body) = body {
+            payload["body"] = json!(body);
+        }
+        if let Some(repo) = repo {
+            payload["repo"] = json!(repo);
+        }
+        client.post("/api/v1/cards", payload).map_err(remote_err)?
+    } else {
+        return Err(missing_transport("create-card"));
+    };
+
     Ok(format!(
         "created\t{}\t{}\t{}\n",
-        card.id,
-        card.priority.as_str(),
-        card.status.as_str()
+        json_string(&card, "id")?,
+        json_priority(&card)?,
+        json_string(&card, "status")?
     ))
 }
 
@@ -431,31 +507,37 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
     Ok(format!("relations\t{}\n", card.id))
 }
 
-fn list_ready(args: &[String]) -> Result<String, ShellError> {
+fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
     let now = unix_now();
     let ready = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
-        store
+        json!(store
             .list_ready(ReadyQuery::new(now, limit))
-            .map_err(store_err)?
-    } else {
-        let path = positional(args).first().copied().ok_or_else(|| {
-            ShellError::Invalid("list-ready requires --db or a backlog.d path".to_string())
-        })?;
+            .map_err(store_err)?)
+    } else if let Some(path) = positional(args).first().copied() {
         let cards = load_backlog_dir(path, now)?;
         let mut board = Board::default();
         board.import_cards(cards);
-        board.list_ready(ReadyQuery::new(now, limit))
+        json!(board.list_ready(ReadyQuery::new(now, limit)))
+    } else if let Some(client) = remote_env.client() {
+        client
+            .get(&format!("/api/v1/cards/ready?limit={limit}"))
+            .map_err(remote_err)?["cards"]
+            .clone()
+    } else {
+        return Err(ShellError::Invalid(
+            "list-ready requires --db, POWDER_API_BASE_URL, or a backlog.d path".to_string(),
+        ));
     };
 
     let mut out = String::new();
-    for card in ready {
+    for card in json_array(&ready)? {
         out.push_str(&format!(
             "{}\t{}\t{}\n",
-            card.id,
-            card.priority.as_str(),
-            card.title
+            json_string(card, "id")?,
+            json_priority(card)?,
+            json_string(card, "title")?
         ));
     }
     if out.is_empty() {
@@ -467,29 +549,46 @@ fn list_ready(args: &[String]) -> Result<String, ShellError> {
 /// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
 /// `review`, and `done` cards are otherwise invisible without opening the
 /// database file directly.
-fn list_cards(args: &[String]) -> Result<String, ShellError> {
+fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
-    let store = open_store(required_flag(args, "--db")?)?;
     let status = flag_value(args, "--status")
         .map(|raw| {
             CardStatus::parse(raw)
                 .ok_or_else(|| ShellError::Invalid(format!("invalid status: {raw}")))
         })
         .transpose()?;
-    let filter = CardFilter {
-        status,
-        repo: flag_value(args, "--repo").map(str::to_string),
+    let repo = flag_value(args, "--repo").map(str::to_string);
+    let cards = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        let filter = CardFilter {
+            status,
+            repo: repo.clone(),
+        };
+        json!(store.list_cards(&filter, limit).map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        let mut query = format!("limit={limit}");
+        if let Some(status) = status {
+            query.push_str(&format!("&status={}", status.as_str()));
+        }
+        if let Some(repo) = &repo {
+            query.push_str(&format!("&repo={}", urlencode(repo)));
+        }
+        client
+            .get(&format!("/api/v1/cards?{query}"))
+            .map_err(remote_err)?["cards"]
+            .clone()
+    } else {
+        return Err(missing_transport("list-cards"));
     };
-    let cards = store.list_cards(&filter, limit).map_err(store_err)?;
 
     let mut out = String::new();
-    for card in cards {
+    for card in json_array(&cards)? {
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\n",
-            card.id,
-            card.priority.as_str(),
-            card.status.as_str(),
-            card.title
+            json_string(card, "id")?,
+            json_priority(card)?,
+            json_string(card, "status")?,
+            json_string(card, "title")?
         ));
     }
     if out.is_empty() {
@@ -567,18 +666,31 @@ fn repository_delete(args: &[String]) -> Result<String, ShellError> {
     Ok(format!("deleted\t{name}\n"))
 }
 
-fn claim(args: &[String]) -> Result<String, ShellError> {
+fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "claim")?;
     let agent = required_flag(args, "--agent")?;
     let ttl_seconds = optional_ttl(args)?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let claim = store
-        .claim_card(&card_id, agent, now, ttl_seconds, &authority(args))
-        .map_err(store_err)?;
+    let claim = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .claim_card(&card_id, agent, now, ttl_seconds, &authority(args))
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/claim"),
+                json!({"agent": agent, "ttl_seconds": ttl_seconds}),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("claim"));
+    };
     Ok(format!(
         "claimed\t{}\t{}\t{}\n",
-        claim.card_id, claim.run_id, claim.expires_at
+        json_string(&claim, "card_id")?,
+        json_string(&claim, "run_id")?,
+        json_i64(&claim, "expires_at")?
     ))
 }
 
@@ -622,14 +734,23 @@ fn heartbeat(args: &[String]) -> Result<String, ShellError> {
     ))
 }
 
-fn get_card(args: &[String]) -> Result<String, ShellError> {
+fn get_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let card_id = positional_card_id(args, "get-card")?;
-    let store = open_store(required_flag(args, "--db")?)?;
-    let detail = store
-        .get_card_detail(&card_id)
-        .map_err(store_err)?
-        .ok_or_else(|| ShellError::NotFound(format!("card not found: {card_id}")))?;
-    to_pretty_json(&detail)
+    if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        let detail = store
+            .get_card_detail(&card_id)
+            .map_err(store_err)?
+            .ok_or_else(|| ShellError::NotFound(format!("card not found: {card_id}")))?;
+        to_pretty_json(&detail)
+    } else if let Some(client) = remote_env.client() {
+        let detail = client
+            .get(&format!("/api/v1/cards/{card_id}"))
+            .map_err(remote_err)?;
+        to_pretty_json(&detail)
+    } else {
+        Err(missing_transport("get-card"))
+    }
 }
 
 fn get_run(args: &[String]) -> Result<String, ShellError> {
@@ -670,17 +791,32 @@ fn answer_input(args: &[String]) -> Result<String, ShellError> {
     Ok(format!("answered-input\t{}\t{}\n", run.id, run.card_id))
 }
 
-fn update_status(args: &[String]) -> Result<String, ShellError> {
+fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "update-status")?;
     let status = flag_value(args, "--status")
         .and_then(CardStatus::parse)
         .ok_or_else(|| ShellError::Invalid("update-status requires --status".to_string()))?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let card = store
-        .update_status(&card_id, status, now, &authority(args))
-        .map_err(store_err)?;
-    Ok(format!("status\t{}\t{}\n", card.id, card.status.as_str()))
+    let card = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .update_status(&card_id, status, now, &authority(args))
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/status"),
+                json!({"status": status.as_str()}),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("update-status"));
+    };
+    Ok(format!(
+        "status\t{}\t{}\n",
+        json_string(&card, "id")?,
+        json_string(&card, "status")?
+    ))
 }
 
 fn add_link(args: &[String]) -> Result<String, ShellError> {
@@ -695,18 +831,31 @@ fn add_link(args: &[String]) -> Result<String, ShellError> {
     Ok(format!("link\t{}\t{}\n", link.card_id, link.id))
 }
 
-fn add_comment(args: &[String]) -> Result<String, ShellError> {
+fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "add-comment")?;
     let author = required_flag(args, "--author")?;
     let body = required_flag(args, "--body")?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let comment = store
-        .add_comment(&card_id, author, body, now)
-        .map_err(store_err)?;
+    let comment = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .add_comment(&card_id, author, body, now)
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/comments"),
+                json!({"author": author, "body": body}),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("add-comment"));
+    };
     Ok(format!(
         "comment\t{}\t{}\t{}\n",
-        comment.card_id, comment.author, comment.body
+        json_string(&comment, "card_id")?,
+        json_string(&comment, "author")?,
+        json_string(&comment, "body")?
     ))
 }
 
@@ -814,6 +963,26 @@ fn open_store(path: &str) -> Result<Store, ShellError> {
     Ok(store)
 }
 
+fn missing_transport(command: &str) -> ShellError {
+    ShellError::Invalid(format!(
+        "{command} requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments"
+    ))
+}
+
+fn remote_err(message: String) -> ShellError {
+    if let Some(rest) = message.strip_prefix("http 400: ") {
+        ShellError::Invalid(rest.to_string())
+    } else if let Some(rest) = message.strip_prefix("http 403: ") {
+        ShellError::Forbidden(rest.to_string())
+    } else if let Some(rest) = message.strip_prefix("http 404: ") {
+        ShellError::NotFound(rest.to_string())
+    } else if let Some(rest) = message.strip_prefix("http 409: ") {
+        ShellError::Conflict(rest.to_string())
+    } else {
+        ShellError::Store(message)
+    }
+}
+
 fn positional_card_id(args: &[String], command: &str) -> Result<CardId, ShellError> {
     positional(args)
         .first()
@@ -865,6 +1034,44 @@ fn authority(args: &[String]) -> Authority {
         Some(name) => Authority::actor(name, has_flag(args, "--admin")),
         None => Authority::unchecked(),
     }
+}
+
+fn card_id_values(ids: &[CardId]) -> Vec<String> {
+    ids.iter().map(ToString::to_string).collect()
+}
+
+fn json_array(value: &Value) -> Result<&[Value], ShellError> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| ShellError::Store("remote response expected an array".to_string()))
+}
+
+fn json_string(value: &Value, field: &'static str) -> Result<String, ShellError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| ShellError::Store(format!("remote response missing string field: {field}")))
+}
+
+fn json_priority(value: &Value) -> Result<&'static str, ShellError> {
+    let raw = value
+        .get("priority")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ShellError::Store("remote response missing string field: priority".to_string())
+        })?;
+    Priority::parse(raw)
+        .map(|priority| priority.as_str())
+        .ok_or_else(|| ShellError::Store(format!("remote response invalid priority: {raw}")))
+}
+
+fn json_i64(value: &Value, field: &'static str) -> Result<i64, ShellError> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ShellError::Store(format!("remote response missing integer field: {field}")))
 }
 
 fn optional_ttl(args: &[String]) -> Result<u64, ShellError> {
@@ -935,6 +1142,12 @@ fn to_pretty_json(value: &impl serde::Serialize) -> Result<String, ShellError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::VecDeque,
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+    };
 
     #[test]
     fn cli_names_the_instance_workflow() {
@@ -1946,7 +2159,336 @@ mod tests {
         assert!(run_detail.contains("Approved"));
     }
 
+    #[test]
+    fn cli_remote_mode_uses_http_for_the_accepted_card_commands() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"cards": [{"id": "remote-1", "priority": "p0", "title": "Remote ready"}]}),
+            ),
+            (
+                200,
+                json!({"cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "title": "Blocked"}]}),
+            ),
+            (
+                200,
+                json!({"card": {"id": "remote-1", "title": "Remote ready"}, "runs": [], "activities": [], "events": [], "links": [], "comments": []}),
+            ),
+            (
+                200,
+                json!({"id": "remote-created", "priority": "p1", "status": "ready", "title": "Remote created"}),
+            ),
+            (
+                200,
+                json!({"card_id": "remote-created", "run_id": "run-remote", "agent": "codex", "expires_at": 100}),
+            ),
+            (
+                200,
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
+            ),
+            (
+                200,
+                json!({"card_id": "remote-created", "author": "operator", "body": "looks good", "created_at": 101}),
+            ),
+        ]);
+
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+        let ready = run_with_env(&args(["list-ready", "--limit", "1"]), &env).unwrap();
+        assert_eq!(ready, "remote-1\tP0\tRemote ready\n");
+
+        let cards = run_with_env(
+            &args([
+                "list-cards",
+                "--limit",
+                "2",
+                "--status",
+                "blocked",
+                "--repo",
+                "misty-step/powder",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(cards, "blocked-1\tP2\tblocked\tBlocked\n");
+
+        let detail = run_with_env(&args(["get-card", "remote-1"]), &env).unwrap();
+        assert!(detail.contains("\"id\": \"remote-1\""));
+
+        let created = run_with_env(
+            &args([
+                "create-card",
+                "--id",
+                "remote-created",
+                "--title",
+                "Remote created",
+                "--body",
+                "body",
+                "--acceptance",
+                "proof exists",
+                "--status",
+                "ready",
+                "--priority",
+                "p1",
+                "--repo",
+                "misty-step/powder",
+                "--related",
+                "remote-1",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(created, "created\tremote-created\tP1\tready\n");
+
+        let claimed = run_with_env(
+            &args(["claim", "remote-created", "--agent", "codex", "--ttl", "60"]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(claimed, "claimed\tremote-created\trun-remote\t100\n");
+
+        let status = run_with_env(
+            &args(["update-status", "remote-created", "--status", "running"]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(status, "status\tremote-created\trunning\n");
+
+        let comment = run_with_env(
+            &args([
+                "add-comment",
+                "remote-created",
+                "--author",
+                "operator",
+                "--body",
+                "looks good",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(comment, "comment\tremote-created\toperator\tlooks good\n");
+
+        let requests = recorded.lock().unwrap();
+        let paths = requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "GET /api/v1/cards/ready?limit=1",
+                "GET /api/v1/cards?limit=2&status=blocked&repo=misty-step%2Fpowder",
+                "GET /api/v1/cards/remote-1",
+                "POST /api/v1/cards",
+                "POST /api/v1/cards/remote-created/claim",
+                "POST /api/v1/cards/remote-created/status",
+                "POST /api/v1/cards/remote-created/comments",
+            ]
+        );
+        assert!(requests
+            .iter()
+            .all(|request| { request.authorization.as_deref() == Some("Bearer sk_powder_test") }));
+        assert_eq!(
+            requests[3].body,
+            Some(json!({
+                "id": "remote-created",
+                "title": "Remote created",
+                "body": "body",
+                "acceptance": ["proof exists"],
+                "status": "ready",
+                "priority": "P1",
+                "related": ["remote-1"],
+                "blocks": [],
+                "blocked_by": [],
+                "repo": "misty-step/powder",
+            }))
+        );
+        assert_eq!(
+            requests[4].body,
+            Some(json!({"agent": "codex", "ttl_seconds": 60}))
+        );
+        assert_eq!(requests[5].body, Some(json!({"status": "running"})));
+        assert_eq!(
+            requests[6].body,
+            Some(json!({"author": "operator", "body": "looks good"}))
+        );
+    }
+
+    #[test]
+    fn cli_db_flag_wins_over_remote_environment() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"id": "wrong-remote", "priority": "p2", "status": "ready"}),
+        )]);
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-db-wins-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+        run_with_env(&args(["init-db", "--db", &db]), &env).unwrap();
+        let output = run_with_env(
+            &args([
+                "create-card",
+                "--db",
+                &db,
+                "--id",
+                "local-card",
+                "--title",
+                "Local card",
+                "--acceptance",
+                "proof exists",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(output, "created\tlocal-card\tP2\tready\n");
+
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "--db must use SQLite and must not contact POWDER_API_BASE_URL"
+        );
+    }
+
+    #[test]
+    fn cli_list_ready_path_preview_wins_over_remote_environment() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"cards": [{"id": "wrong-remote", "priority": "p0", "title": "Wrong remote"}]}),
+        )]);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backlog_dir = std::env::temp_dir().join(format!("powder-cli-preview-{nanos}"));
+        std::fs::create_dir_all(&backlog_dir).unwrap();
+        std::fs::write(
+            backlog_dir.join("001-preview.md"),
+            "# Preview card\n\nPriority: P0 | Status: ready\n\n## Goal\nPreview locally.\n\n## Oracle\n- [ ] local preview wins\n",
+        )
+        .unwrap();
+        let backlog_dir = backlog_dir.to_string_lossy().to_string();
+
+        let output = run_with_env(
+            &args(["list-ready", &backlog_dir]),
+            &remote_env(Some(&base_url), Some("sk_powder_test")),
+        )
+        .unwrap();
+
+        assert_eq!(output, "001\tP0\tPreview card\n");
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "positional backlog.d preview must not contact POWDER_API_BASE_URL"
+        );
+    }
+
+    #[test]
+    fn cli_remote_capable_commands_error_clearly_without_db_or_api_env() {
+        let err = run_with_env(&args(["list-cards"]), &remote_env(None, None)).unwrap_err();
+        assert!(matches!(
+            err,
+            ShellError::Invalid(message)
+                if message == "list-cards requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments"
+        ));
+    }
+
     fn args<const N: usize>(items: [&str; N]) -> Vec<String> {
         items.into_iter().map(ToOwned::to_owned).collect()
+    }
+
+    fn remote_env(base_url: Option<&str>, api_key: Option<&str>) -> RemoteEnv {
+        let mut pairs = Vec::new();
+        if let Some(base_url) = base_url {
+            pairs.push(("POWDER_API_BASE_URL", base_url));
+        }
+        if let Some(api_key) = api_key {
+            pairs.push(("POWDER_API_KEY", api_key));
+        }
+        RemoteEnv::from_pairs(pairs)
+    }
+
+    fn run_with_env(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+        run_with_remote_env(args, remote_env)
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        body: Option<Value>,
+    }
+
+    fn spawn_test_server(
+        responses: Vec<(u16, Value)>,
+    ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let mut queue: VecDeque<(u16, Value)> = responses.into();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Some((status, canned_body)) = queue.pop_front() else {
+                    break;
+                };
+                let mut stream = stream.expect("accept connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+
+                let mut request_line = String::new();
+                reader
+                    .read_line(&mut request_line)
+                    .expect("read request line");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+
+                let mut content_length = 0usize;
+                let mut authorization = None;
+                loop {
+                    let mut header_line = String::new();
+                    reader.read_line(&mut header_line).expect("read header");
+                    if header_line == "\r\n" || header_line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header_line.strip_prefix("Content-Length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(value) = header_line.strip_prefix("Authorization:") {
+                        authorization = Some(value.trim().to_string());
+                    }
+                }
+
+                let mut body_bytes = vec![0u8; content_length];
+                if content_length > 0 {
+                    reader.read_exact(&mut body_bytes).expect("read body");
+                }
+                let request_body = (!body_bytes.is_empty())
+                    .then(|| serde_json::from_slice(&body_bytes).expect("parse request body"));
+
+                recorded_clone.lock().unwrap().push(RecordedRequest {
+                    method,
+                    path,
+                    authorization,
+                    body: request_body,
+                });
+
+                let response_body = serde_json::to_vec(&canned_body).unwrap_or_default();
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write status");
+                stream.write_all(&response_body).expect("write body");
+                stream.flush().expect("flush");
+            }
+        });
+
+        (format!("http://{addr}"), recorded)
     }
 }

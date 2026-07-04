@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
+pub use powder_api::RemoteClient;
 use powder_core::{Authority, CardId, CardStatus, ReadyQuery, RunId};
 use powder_store::{CardFilter, RepositoryUpsert, RepositoryVisibility, Store};
 use serde_json::{json, Value};
 
 mod remote;
 
-pub use remote::{call_tool_remote, RemoteClient};
+pub use remote::call_tool_remote;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolDef {

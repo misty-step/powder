@@ -719,6 +719,8 @@ version = "0.1.0"
 dependencies = [
  "powder-core",
  "powder-shell",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]
@@ -745,11 +747,11 @@ dependencies = [
 name = "powder-mcp"
 version = "0.1.0"
 dependencies = [
+ "powder-api",
  "powder-core",
  "powder-shell",
  "powder-store",
  "serde_json",
- "ureq",
 ]
 
 [[package]]
