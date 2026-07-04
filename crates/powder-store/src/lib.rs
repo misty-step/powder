@@ -3,10 +3,10 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
-    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix, Activity,
-    ActivityId, ActivityType, Authority, Card, CardEvent, CardEventId, CardId, CardSource,
-    CardStatus, Claim, ClaimReceipt, Comment, DomainError, Link, LinkId, Priority, ReadyQuery, Run,
-    RunId, RunState,
+    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
+    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
+    CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, CriterionProof,
+    DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -34,8 +34,8 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, RUN_SELECT_SQL,
-    SCHEMA, SCHEMA_VERSION,
+    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
+    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -85,9 +85,16 @@ pub struct CardPatch {
     pub title: Option<String>,
     pub body: Option<String>,
     pub acceptance: Option<Vec<String>>,
+    pub proof_plan: Option<Vec<String>>,
     pub status: Option<CardStatus>,
     pub priority: Option<Priority>,
     pub labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionProofInput {
+    pub criterion: usize,
+    pub url: String,
 }
 
 impl Store {
@@ -166,6 +173,10 @@ impl Store {
                     self.connection.execute_batch(MIGRATE_7_TO_8)?;
                     self.apply_ratified_repository_tier_seed()?;
                     8
+                }
+                8 => {
+                    self.connection.execute_batch(MIGRATE_8_TO_9)?;
+                    9
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -415,8 +426,12 @@ impl Store {
             patched_fields.push("body");
         }
         if let Some(acceptance) = patch.acceptance {
-            card.acceptance = clean_string_list(acceptance);
+            card = card.with_acceptance(acceptance);
             patched_fields.push("acceptance");
+        }
+        if let Some(proof_plan) = patch.proof_plan {
+            card = card.with_proof_plan(proof_plan);
+            patched_fields.push("proof_plan");
         }
         if let Some(priority) = patch.priority {
             card.priority = priority;
@@ -451,6 +466,45 @@ impl Store {
             now,
         )?;
 
+        transaction.commit()?;
+        Ok(card)
+    }
+
+    pub fn check_criterion(
+        &mut self,
+        card_id: &CardId,
+        criterion: usize,
+        actor: &str,
+        checked: bool,
+        now: i64,
+    ) -> Result<Card> {
+        let actor = non_empty("actor", actor)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        let criterion_state = criterion_mut(&mut card, criterion)?;
+        if checked {
+            criterion_state.checked_by = Some(actor.clone());
+            criterion_state.checked_at = Some(now);
+        } else {
+            criterion_state.checked_by = None;
+            criterion_state.checked_at = None;
+        }
+        card.updated_at = now;
+        persist_card(&transaction, &card)?;
+        append_card_event(
+            &transaction,
+            card_id,
+            "criterion",
+            &actor,
+            &format!(
+                "criterion {} {}",
+                criterion,
+                if checked { "checked" } else { "unchecked" }
+            ),
+            now,
+        )?;
         transaction.commit()?;
         Ok(card)
     }
@@ -976,10 +1030,12 @@ impl Store {
         &mut self,
         card_id: &CardId,
         proof: Option<&str>,
+        criterion_proofs: Vec<CriterionProofInput>,
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
         let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
+        let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -990,6 +1046,14 @@ impl Store {
 
         card.status = CardStatus::Done;
         card.claim = None;
+        for criterion_proof in criterion_proofs {
+            let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
+            criterion.proof_links.push(CriterionProof {
+                url: criterion_proof.url,
+                actor: authority.actor_label(),
+                created_at: now,
+            });
+        }
         card.updated_at = now;
         persist_card(&transaction, &card)?;
         if let Some(run_id) = run_id {
@@ -1029,7 +1093,8 @@ impl Store {
                 json!({
                     "previous_status": previous.as_str(),
                     "status": card.status.as_str(),
-                    "proof": proof
+                    "proof": proof,
+                    "criteria": card.criteria
                 }),
                 now,
             )?;
@@ -1056,11 +1121,13 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
                acceptance_json = excluded.acceptance_json,
+               criteria_json = excluded.criteria_json,
+               proof_plan_json = excluded.proof_plan_json,
                status = excluded.status,
                priority = excluded.priority,
                labels_json = excluded.labels_json,
@@ -1085,6 +1152,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             card.title,
             card.body,
             to_json(&card.acceptance)?,
+            to_json(&card.criteria)?,
+            to_json(&card.proof_plan)?,
             card.status.as_str(),
             card.priority.as_str(),
             to_json(&card.labels)?,
@@ -1371,11 +1440,43 @@ fn clean_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+fn criterion_mut(card: &mut Card, criterion: usize) -> Result<&mut AcceptanceCriterion> {
+    if card.criteria.is_empty() && !card.acceptance.is_empty() {
+        let refreshed = card
+            .acceptance
+            .iter()
+            .filter_map(|item| AcceptanceCriterion::new(item.clone()).ok())
+            .collect::<Vec<_>>();
+        card.criteria = refreshed;
+    }
+    card.criteria.get_mut(criterion).ok_or_else(|| {
+        DomainError::validation(
+            "criterion",
+            format!("criterion index {criterion} not found"),
+        )
+        .into()
+    })
+}
+
+fn clean_criterion_proofs(inputs: Vec<CriterionProofInput>) -> Result<Vec<CriterionProofInput>> {
+    inputs
+        .into_iter()
+        .map(|input| {
+            Ok(CriterionProofInput {
+                criterion: input.criterion,
+                url: non_empty("criterion_proof.url", &input.url)?,
+            })
+        })
+        .collect()
+}
+
 struct CardRecord {
     id: String,
     title: String,
     body: String,
     acceptance_json: String,
+    criteria_json: String,
+    proof_plan_json: String,
     status: String,
     priority: String,
     labels_json: String,
@@ -1403,24 +1504,26 @@ impl CardRecord {
             title: row.get(1)?,
             body: row.get(2)?,
             acceptance_json: row.get(3)?,
-            status: row.get(4)?,
-            priority: row.get(5)?,
-            labels_json: row.get(6)?,
-            assignee: row.get(7)?,
-            related_json: row.get(8)?,
-            blocks_json: row.get(9)?,
-            blocked_by_json: row.get(10)?,
-            repo: row.get(11)?,
-            workspace_path: row.get(12)?,
-            branch_name: row.get(13)?,
-            source_path: row.get(14)?,
-            source_digest: row.get(15)?,
-            claim_agent: row.get(16)?,
-            claim_run_id: row.get(17)?,
-            claim_acquired_at: row.get(18)?,
-            claim_expires_at: row.get(19)?,
-            created_at: row.get(20)?,
-            updated_at: row.get(21)?,
+            criteria_json: row.get(4)?,
+            proof_plan_json: row.get(5)?,
+            status: row.get(6)?,
+            priority: row.get(7)?,
+            labels_json: row.get(8)?,
+            assignee: row.get(9)?,
+            related_json: row.get(10)?,
+            blocks_json: row.get(11)?,
+            blocked_by_json: row.get(12)?,
+            repo: row.get(13)?,
+            workspace_path: row.get(14)?,
+            branch_name: row.get(15)?,
+            source_path: row.get(16)?,
+            source_digest: row.get(17)?,
+            claim_agent: row.get(18)?,
+            claim_run_id: row.get(19)?,
+            claim_acquired_at: row.get(20)?,
+            claim_expires_at: row.get(21)?,
+            created_at: row.get(22)?,
+            updated_at: row.get(23)?,
         })
     }
 
@@ -1443,6 +1546,15 @@ impl CardRecord {
                 },
             )?)
             .with_created_at(self.created_at);
+        let criteria =
+            from_json::<Vec<AcceptanceCriterion>>("cards.criteria_json", self.criteria_json)?;
+        if !criteria.is_empty() {
+            card = card.with_criteria(criteria);
+        }
+        card = card.with_proof_plan(from_json::<Vec<String>>(
+            "cards.proof_plan_json",
+            self.proof_plan_json,
+        )?);
         card.labels = from_json("cards.labels_json", self.labels_json)?;
         card.assignee = self.assignee;
         card.related = from_json("cards.related_json", self.related_json)?;

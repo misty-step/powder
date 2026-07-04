@@ -57,6 +57,7 @@ fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
         let complete = store.complete_card(
             &card_id,
             Some("https://example.test/proof"),
+            Vec::new(),
             30,
             &Authority::unchecked(),
         )?;
@@ -217,6 +218,44 @@ fn upsert_card_returns_the_canonical_repo_label_it_persists() -> Result<()> {
             .as_deref(),
         Some("canary")
     );
+    Ok(())
+}
+
+#[test]
+fn criteria_check_and_completion_proofs_are_persisted_and_audited() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("criteria-card")?;
+    let card = ready_card("criteria-card", 10).with_proof_plan(["PR link".to_string()]);
+    store.create_card_with_events(card, "operator", 10)?;
+
+    let checked = store.check_criterion(&card_id, 0, "operator", true, 20)?;
+    assert_eq!(checked.criteria[0].checked_by.as_deref(), Some("operator"));
+    assert_eq!(checked.criteria[0].checked_at, Some(20));
+
+    let completed = store.complete_card(
+        &card_id,
+        None,
+        vec![crate::CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/pr".to_string(),
+        }],
+        30,
+        &Authority::actor("operator", true),
+    )?;
+
+    assert_eq!(completed.status, CardStatus::Done);
+    assert_eq!(completed.proof_plan, vec!["PR link".to_string()]);
+    assert_eq!(
+        completed.criteria[0].proof_links[0].url,
+        "https://example.test/pr"
+    );
+    let detail = store.get_card_detail(&card_id)?.expect("detail");
+    assert!(detail.events.iter().any(|event| {
+        event.event_type == "criterion"
+            && event.actor == "operator"
+            && event.payload.contains("checked")
+    }));
     Ok(())
 }
 
@@ -636,7 +675,13 @@ fn webhook_failures_retry_then_move_to_dead_letter() -> Result<()> {
     )?;
     let card_id = CardId::new("dlq-card")?;
     store.import_cards(vec![ready_card("dlq-card", 10)])?;
-    store.complete_card(&card_id, None, 20, &Authority::actor("operator", true))?;
+    store.complete_card(
+        &card_id,
+        None,
+        Vec::new(),
+        20,
+        &Authority::actor("operator", true),
+    )?;
 
     let first = store.due_webhook_deliveries(20, 10)?;
     assert_eq!(first.len(), 1);
@@ -1102,6 +1147,7 @@ fn completion_after_same_second_release_reclaim_completes_current_run() -> Resul
     store.complete_card(
         &card_id,
         Some("https://example.test/proof"),
+        Vec::new(),
         10,
         &Authority::unchecked(),
     )?;
@@ -1604,7 +1650,7 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
     // audit-over-enforcement: any actor may set status/complete, but not
     // mutate another actor's lease heartbeat/renew/release path.
     store.update_status(&card_id, CardStatus::Running, 20, &intruder)?;
-    let completed = store.complete_card(&card_id, None, 21, &intruder)?;
+    let completed = store.complete_card(&card_id, None, Vec::new(), 21, &intruder)?;
     assert_eq!(completed.status, CardStatus::Done);
     let card = store.get_card(&card_id)?.expect("card");
     assert!(card.claim.is_none());
@@ -1630,8 +1676,13 @@ fn admin_authority_bypasses_claim_ownership() -> Result<()> {
     store.update_status(&card_id, CardStatus::Running, 20, &admin)?;
     store.request_input(&claim.run_id, "Approve?", 21, &admin)?;
     store.answer_input(&claim.run_id, "operator", "Approved", 22, &admin)?;
-    let completed =
-        store.complete_card(&card_id, Some("https://example.test/proof"), 23, &admin)?;
+    let completed = store.complete_card(
+        &card_id,
+        Some("https://example.test/proof"),
+        Vec::new(),
+        23,
+        &admin,
+    )?;
     assert_eq!(completed.status, CardStatus::Done);
     Ok(())
 }
@@ -1773,6 +1824,7 @@ fn reimport_over_a_terminal_card_keeps_its_outcome() -> Result<()> {
     store.complete_card(
         &card_id,
         Some("https://example.test/proof"),
+        Vec::new(),
         12,
         &Authority::unchecked(),
     )?;
