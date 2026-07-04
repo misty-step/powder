@@ -6,7 +6,8 @@ use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
 };
 use powder_store::{
-    ApiKeyScope, CardFilter, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
+    ApiKeyScope, CardFilter, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store,
+    StoreError,
 };
 use serde_json::{json, Value};
 
@@ -161,7 +162,7 @@ pub fn help() -> String {
     );
     help.push_str("  powder repository-list --db ./data/powder.db --include-hidden\n");
     help.push_str(
-        "  powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary,legacy-canary --visibility visible --import-provenance manual\n",
+        "  powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary,legacy-canary --visibility visible --tier active --import-provenance manual\n",
     );
     help.push_str(
         "  powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator\n",
@@ -629,6 +630,12 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
                 .ok_or_else(|| ShellError::Invalid(format!("invalid --visibility: {raw}")))
         })
         .transpose()?;
+    let tier = flag_value(args, "--tier")
+        .map(|raw| {
+            RepositoryTier::parse(raw)
+                .ok_or_else(|| ShellError::Invalid(format!("invalid --tier: {raw}")))
+        })
+        .transpose()?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let repository = store
         .upsert_repository(
@@ -636,6 +643,7 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
                 name,
                 aliases: aliases_flag(args),
                 visibility,
+                tier,
                 import_provenance: flag_value(args, "--import-provenance").map(str::to_string),
             },
             now,
@@ -1786,6 +1794,16 @@ mod tests {
             open_card.contains("\"acceptance\": []"),
             "no fabricated acceptance"
         );
+        run(&args([
+            "repository-upsert",
+            "--db",
+            &db,
+            "--name",
+            "example",
+            "--tier",
+            "active",
+        ]))
+        .unwrap();
 
         let closed_card = run(&args(["get-card", "example-2", "--db", &db])).unwrap();
         assert!(closed_card.contains("\"status\": \"done\""));

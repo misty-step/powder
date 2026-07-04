@@ -418,12 +418,15 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .unwrap();
     assert_eq!(repositories.status(), StatusCode::OK);
     let repositories = response_json(repositories).await;
-    assert_eq!(repositories["repositories"][0]["repo"], "other");
-    assert_eq!(
-        repositories["repositories"][0]["aliases"],
-        json!(["misty-step/other"])
-    );
-    assert_eq!(repositories["repositories"][0]["card_count"], 1);
+    let other = repositories["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|repository| repository["repo"] == "other")
+        .expect("other repository summary");
+    assert_eq!(other["repo"], "other");
+    assert_eq!(other["aliases"], json!(["misty-step/other"]));
+    assert_eq!(other["card_count"], 1);
 
     let invalid_status = app
         .oneshot(json_request(
@@ -491,7 +494,12 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
         .oneshot(json_request(Method::GET, "/api/v1/repositories", None, ""))
         .await
         .unwrap();
-    assert_eq!(response_json(visible_list).await["repositories"], json!([]));
+    let visible_list = response_json(visible_list).await;
+    assert!(!visible_list["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|repository| repository["name"] == "canary"));
 
     let hidden_list = app
         .clone()
@@ -503,10 +511,14 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
         ))
         .await
         .unwrap();
-    assert_eq!(
-        response_json(hidden_list).await["repositories"][0]["visibility"],
-        "hidden"
-    );
+    let hidden_list = response_json(hidden_list).await;
+    let canary = hidden_list["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|repository| repository["name"] == "canary")
+        .expect("hidden canary repository");
+    assert_eq!(canary["visibility"], "hidden");
 
     let legacy = app
         .clone()
@@ -582,6 +594,40 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
         StatusCode::CONFLICT,
         "aliases resolve to the canonical repository, so delete stays card-count safe"
     );
+}
+
+#[tokio::test]
+async fn ready_promotion_in_backburner_repository_returns_conflict() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"sploot-freeze","title":"Freeze","acceptance":["proof"],"status":"backlog","repo":"sploot"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let promoted = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/sploot-freeze/status",
+            Some(&admin_key),
+            r#"{"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), StatusCode::CONFLICT);
+    let promoted = response_json(promoted).await;
+    assert!(promoted["error"]
+        .as_str()
+        .unwrap()
+        .contains("repository sploot is backburner"));
 }
 
 #[tokio::test]

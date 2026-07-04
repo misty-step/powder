@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -55,11 +55,13 @@ CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, 
 CREATE TABLE IF NOT EXISTS repositories (
   name TEXT PRIMARY KEY,
   visibility TEXT NOT NULL DEFAULT 'visible',
+  tier TEXT NOT NULL DEFAULT 'backburner',
   import_provenance TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_repositories_visibility ON repositories(visibility, name);
+CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories(tier, name);
 
 CREATE TABLE IF NOT EXISTS repository_aliases (
   alias TEXT PRIMARY KEY,
@@ -292,6 +294,11 @@ CREATE TABLE IF NOT EXISTS repository_aliases (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_repository_aliases_repository ON repository_aliases(repository_name, alias);
+"#;
+
+pub const MIGRATE_7_TO_8: &str = r#"
+ALTER TABLE repositories ADD COLUMN tier TEXT NOT NULL DEFAULT 'backburner';
+CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories(tier, name);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, status, priority, labels_json,

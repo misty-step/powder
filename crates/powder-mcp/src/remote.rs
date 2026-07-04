@@ -41,6 +41,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                     "name": name,
                     "aliases": args["aliases"].as_array().cloned(),
                     "visibility": args["visibility"].as_str(),
+                    "tier": args["tier"].as_str(),
                     "import_provenance": args["import_provenance"].as_str(),
                 }),
             )?
@@ -432,6 +433,7 @@ mod tests {
                 "name": "misty-step/canary",
                 "aliases": ["misty-step/canary"],
                 "visibility": "visible",
+                "tier": "active",
                 "import_provenance": "manual"
             }),
         )
@@ -455,6 +457,7 @@ mod tests {
                 "name": "misty-step/canary",
                 "aliases": ["misty-step/canary"],
                 "visibility": "visible",
+                "tier": "active",
                 "import_provenance": "manual"
             }))
         );

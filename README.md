@@ -25,13 +25,15 @@ The dispatch daemon is not part of the core. It will consume the board through
 the API/MCP/CLI surfaces and run agents elsewhere.
 
 Repository identity is operator-facing entity data, not loose card strings.
-Each repository has a canonical short name, aliases, visibility, import
-provenance, status counts, and card counts. Imports may still pass full slugs
-such as `misty-step/canary`; card JSON, board filters, and
-`/api/v1/repositories` return `canary`, while repo filters accept either
-spelling. Operators can merge an alias into a canonical repository; Powder
-re-homes matching cards and writes `card_events` entries with the old and new
-repository names.
+Each repository has a canonical short name, aliases, visibility, tier
+(`active`, `backburner`, or `archived`), import provenance, status counts, and
+card counts. Imports may still pass full slugs such as `misty-step/canary`;
+card JSON, board filters, and `/api/v1/repositories` return `canary`, while
+repo filters accept either spelling. Operators can merge an alias into a
+canonical repository; Powder re-homes matching cards and writes `card_events`
+entries with the old and new repository names. Ready queues only expose active
+repositories, and attempts to move backburner or archived repository cards to
+`ready` return a conflict instead of silently reactivating them.
 
 Current local smoke paths:
 
@@ -54,7 +56,7 @@ cargo run -q -p powder-cli -- get-card 001 --db "$DB"
 cargo run -q -p powder-cli -- get-run "$RUN_ID" --db "$DB"
 cargo run -q -p powder-cli -- complete-card 001 --db "$DB"
 cargo run -q -p powder-cli -- repository-list --db "$DB" --include-hidden
-cargo run -q -p powder-cli -- repository-upsert --db "$DB" --name canary --aliases misty-step/canary
+cargo run -q -p powder-cli -- repository-upsert --db "$DB" --name canary --aliases misty-step/canary --tier active
 cargo run -q -p powder-cli -- repository-merge-alias --db "$DB" --alias misty-step/canary --into canary --actor operator
 POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```

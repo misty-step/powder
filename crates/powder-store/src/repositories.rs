@@ -30,6 +30,37 @@ impl RepositoryVisibility {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryTier {
+    Active,
+    Backburner,
+    Archived,
+}
+
+impl RepositoryTier {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "active" => Some(Self::Active),
+            "backburner" => Some(Self::Backburner),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Backburner => "backburner",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn allows_ready(self) -> bool {
+        self == Self::Active
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepositorySummary {
     pub name: String,
@@ -37,6 +68,7 @@ pub struct RepositorySummary {
     pub repo: String,
     pub aliases: Vec<String>,
     pub visibility: RepositoryVisibility,
+    pub tier: RepositoryTier,
     pub import_provenance: Option<String>,
     pub card_count: usize,
     pub status_counts: BTreeMap<String, usize>,
@@ -49,6 +81,7 @@ pub struct RepositoryUpsert {
     pub name: String,
     pub aliases: Option<Vec<String>>,
     pub visibility: Option<RepositoryVisibility>,
+    pub tier: Option<RepositoryTier>,
     pub import_provenance: Option<String>,
 }
 
@@ -60,6 +93,30 @@ pub struct RepositoryMergeOutcome {
 }
 
 impl Store {
+    pub(crate) fn apply_ratified_repository_tier_seed(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seed_time = 0_i64;
+        for (name, tier) in RATIFIED_REPOSITORY_TIERS {
+            upsert_repository_row(
+                &transaction,
+                RepositoryRowUpsert {
+                    name,
+                    visibility: RepositoryVisibility::Visible,
+                    tier: *tier,
+                    import_provenance: Some("powder-916 ratified tier seed"),
+                    now: seed_time,
+                    replace_visibility: false,
+                    replace_tier: true,
+                },
+            )?;
+        }
+        insert_repository_alias(&transaction, "bastion", "sanctum/bastion", seed_time, false)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn backfill_repositories_from_cards(&mut self) -> Result<()> {
         let rows = {
             let mut statement = self.connection.prepare(
@@ -132,6 +189,8 @@ impl Store {
         let name = canonical_repo_label(&raw_name)
             .ok_or_else(|| DomainError::validation("repository.name", "value cannot be empty"))?;
         let visibility = upsert.visibility.unwrap_or(RepositoryVisibility::Visible);
+        let tier = upsert.tier.unwrap_or(RepositoryTier::Backburner);
+        let replace_tier = upsert.tier.is_some();
         let aliases = upsert
             .aliases
             .map(|aliases| {
@@ -152,11 +211,15 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_repository_row(
             &transaction,
-            &name,
-            visibility,
-            import_provenance.as_deref(),
-            now,
-            true,
+            RepositoryRowUpsert {
+                name: &name,
+                visibility,
+                tier,
+                import_provenance: import_provenance.as_deref(),
+                now,
+                replace_visibility: true,
+                replace_tier,
+            },
         )?;
         let mut alias_set = BTreeSet::new();
         if raw_name != name {
@@ -220,11 +283,15 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         upsert_repository_row(
             &transaction,
-            &target_name,
-            RepositoryVisibility::Visible,
-            Some("manual alias merge"),
-            now,
-            false,
+            RepositoryRowUpsert {
+                name: &target_name,
+                visibility: RepositoryVisibility::Visible,
+                tier: RepositoryTier::Backburner,
+                import_provenance: Some("manual alias merge"),
+                now,
+                replace_visibility: false,
+                replace_tier: false,
+            },
         )?;
 
         let source_name =
@@ -300,11 +367,15 @@ impl Store {
 
     fn list_repositories_inner(&self, include_hidden: bool) -> Result<Vec<RepositorySummary>> {
         let mut statement = if include_hidden {
-            self.connection
-                .prepare("SELECT name FROM repositories ORDER BY name ASC")?
+            self.connection.prepare(
+                "SELECT name FROM repositories
+                 ORDER BY CASE tier WHEN 'active' THEN 0 WHEN 'backburner' THEN 1 ELSE 2 END, name ASC",
+            )?
         } else {
             self.connection.prepare(
-                "SELECT name FROM repositories WHERE visibility = 'visible' ORDER BY name ASC",
+                "SELECT name FROM repositories
+                 WHERE visibility = 'visible'
+                 ORDER BY CASE tier WHEN 'active' THEN 0 WHEN 'backburner' THEN 1 ELSE 2 END, name ASC",
             )?
         };
         let names = statement
@@ -323,7 +394,7 @@ impl Store {
         let Some(record) = self
             .connection
             .query_row(
-                "SELECT name, visibility, import_provenance, created_at, updated_at
+                "SELECT name, visibility, tier, import_provenance, created_at, updated_at
                  FROM repositories
                  WHERE name = ?1",
                 [name],
@@ -341,6 +412,7 @@ impl Store {
             name: record.name,
             aliases,
             visibility: record.visibility,
+            tier: record.tier,
             import_provenance: record.import_provenance,
             card_count,
             status_counts,
@@ -363,11 +435,15 @@ pub(crate) fn ensure_repository_entity(
     let name = resolve_repository_name(connection, &raw_alias)?.unwrap_or(default_name);
     upsert_repository_row(
         connection,
-        &name,
-        RepositoryVisibility::Visible,
-        import_provenance,
-        now,
-        false,
+        RepositoryRowUpsert {
+            name: &name,
+            visibility: RepositoryVisibility::Visible,
+            tier: RepositoryTier::Backburner,
+            import_provenance,
+            now,
+            replace_visibility: false,
+            replace_tier: false,
+        },
     )?;
     if raw_alias != name {
         insert_repository_alias(connection, &name, &raw_alias, now, false)?;
@@ -420,6 +496,26 @@ pub(crate) fn resolve_repository_name(
     Ok(Some(canonical))
 }
 
+pub(crate) fn repository_tier(connection: &Connection, raw_repo: &str) -> Result<RepositoryTier> {
+    let Some(name) = resolve_repository_name(connection, raw_repo)? else {
+        return Ok(RepositoryTier::Backburner);
+    };
+    let raw_tier = connection
+        .query_row(
+            "SELECT tier FROM repositories WHERE name = ?1",
+            [name.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(raw_tier) = raw_tier else {
+        return Ok(RepositoryTier::Backburner);
+    };
+    RepositoryTier::parse(&raw_tier).ok_or_else(|| StoreError::InvalidStoredValue {
+        field: "repositories.tier",
+        value: raw_tier,
+    })
+}
+
 pub(crate) fn normalize_repository_token(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('/').trim();
     let without_git = trimmed.strip_suffix(".git").unwrap_or(trimmed).trim();
@@ -430,28 +526,34 @@ pub(crate) fn normalize_repository_token(raw: &str) -> Result<String> {
     }
 }
 
-fn upsert_repository_row(
-    connection: &Connection,
-    name: &str,
+struct RepositoryRowUpsert<'a> {
+    name: &'a str,
     visibility: RepositoryVisibility,
-    import_provenance: Option<&str>,
+    tier: RepositoryTier,
+    import_provenance: Option<&'a str>,
     now: i64,
     replace_visibility: bool,
-) -> Result<()> {
-    let name = normalize_repository_token(name)?;
+    replace_tier: bool,
+}
+
+fn upsert_repository_row(connection: &Connection, upsert: RepositoryRowUpsert<'_>) -> Result<()> {
+    let name = normalize_repository_token(upsert.name)?;
     connection.execute(
-        "INSERT INTO repositories (name, visibility, import_provenance, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?4)
+        "INSERT INTO repositories (name, visibility, tier, import_provenance, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
          ON CONFLICT(name) DO UPDATE SET
-           visibility = CASE WHEN ?5 THEN excluded.visibility ELSE repositories.visibility END,
+           visibility = CASE WHEN ?6 THEN excluded.visibility ELSE repositories.visibility END,
+           tier = CASE WHEN ?7 THEN excluded.tier ELSE repositories.tier END,
            import_provenance = COALESCE(excluded.import_provenance, repositories.import_provenance),
-           updated_at = excluded.updated_at",
+           updated_at = MAX(repositories.updated_at, excluded.updated_at)",
         params![
             name,
-            visibility.as_str(),
-            import_provenance,
-            now,
-            replace_visibility
+            upsert.visibility.as_str(),
+            upsert.tier.as_str(),
+            upsert.import_provenance,
+            upsert.now,
+            upsert.replace_visibility,
+            upsert.replace_tier
         ],
     )?;
     Ok(())
@@ -622,6 +724,7 @@ fn append_repository_card_event(
 struct RepositoryRecord {
     name: String,
     visibility: RepositoryVisibility,
+    tier: RepositoryTier,
     import_provenance: Option<String>,
     created_at: i64,
     updated_at: i64,
@@ -637,12 +740,43 @@ impl RepositoryRecord {
                 format!("invalid repository visibility: {visibility}").into(),
             )
         })?;
+        let tier = row.get::<_, String>(2)?;
+        let tier = RepositoryTier::parse(&tier).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                format!("invalid repository tier: {tier}").into(),
+            )
+        })?;
         Ok(Self {
             name: row.get(0)?,
             visibility,
-            import_provenance: row.get(2)?,
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
+            tier,
+            import_provenance: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
         })
     }
 }
+
+const RATIFIED_REPOSITORY_TIERS: &[(&str, RepositoryTier)] = &[
+    ("roster", RepositoryTier::Active),
+    ("bitterblossom", RepositoryTier::Active),
+    ("powder", RepositoryTier::Active),
+    ("canary", RepositoryTier::Active),
+    ("weave", RepositoryTier::Active),
+    ("glass", RepositoryTier::Active),
+    ("glance", RepositoryTier::Active),
+    ("exocortex", RepositoryTier::Active),
+    ("crucible", RepositoryTier::Active),
+    ("aesthetic", RepositoryTier::Active),
+    ("landmark", RepositoryTier::Active),
+    ("bridge", RepositoryTier::Active),
+    ("bastion", RepositoryTier::Active),
+    ("linejam", RepositoryTier::Active),
+    ("sploot", RepositoryTier::Backburner),
+    ("doomscrum", RepositoryTier::Backburner),
+    ("gradient", RepositoryTier::Archived),
+    ("gradient-quarantine-20260516", RepositoryTier::Archived),
+    ("atlas", RepositoryTier::Archived),
+];

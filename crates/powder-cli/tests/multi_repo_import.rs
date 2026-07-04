@@ -86,6 +86,16 @@ fn multi_repo_import_avoids_collisions_resolves_duplicates_and_survives_reimport
 
     // --- reimport safety carries through the multi-repo path too ---
     powder_cli::run(&args([
+        "repository-upsert",
+        "--db",
+        &db,
+        "--name",
+        "repo-a",
+        "--tier",
+        "active",
+    ]))
+    .unwrap();
+    powder_cli::run(&args([
         "claim",
         "repo-a-001",
         "--db",

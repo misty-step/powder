@@ -48,6 +48,7 @@ const els = {
   repoCreateAliases: document.getElementById("repo-create-aliases"),
   repoCreateProvenance: document.getElementById("repo-create-provenance"),
   repoCreateVisibility: document.getElementById("repo-create-visibility"),
+  repoCreateTier: document.getElementById("repo-create-tier"),
   settingsToggle: document.getElementById("settings-toggle"),
   apiKeyForm: document.getElementById("api-key-form"),
   apiKeyInput: document.getElementById("api-key-input"),
@@ -57,6 +58,7 @@ const els = {
   filterButton: document.getElementById("filter-btn"),
   filterN: document.getElementById("filter-n"),
   repoFilters: document.getElementById("fg-repo"),
+  tierToggle: document.getElementById("tier-toggle"),
   prioFilters: document.getElementById("fg-prio"),
   repoAll: document.getElementById("repo-all"),
   filterClear: document.getElementById("filter-clear"),
@@ -87,6 +89,7 @@ const state = {
   detailCache: new Map(),
   selectedId: null,
   view: "both",
+  showAllTiers: false,
   loading: true,
   error: "",
   errorKind: "",
@@ -223,6 +226,7 @@ function normalizeCard(card) {
     related: card.related || [],
     blocks: card.blocks || [],
     blocked_by: card.blocked_by || [],
+    explicitRepo: Boolean(card.repo),
     repoKey: cardRepo(card),
     displayStatus: displayStatus(card.status),
   };
@@ -340,6 +344,9 @@ function normalizeRepositories(repositories) {
       name: canonicalRepoLabel(summary.name || summary.repo),
       aliases: Array.isArray(summary.aliases) ? summary.aliases : [],
       visibility: summary.visibility || "visible",
+      tier: ["active", "backburner", "archived"].includes(summary.tier)
+        ? summary.tier
+        : "backburner",
       import_provenance: summary.import_provenance || "",
       card_count: Number(summary.card_count || 0),
       status_counts: summary.status_counts || {},
@@ -359,6 +366,7 @@ function deriveRepositoriesFromCards() {
       name: repo,
       aliases: [],
       visibility: "visible",
+      tier: "active",
       import_provenance: "",
       card_count: 0,
       status_counts: {},
@@ -398,6 +406,11 @@ function repositoryRowHTML(summary) {
         <label><span class="ae-chrome">Visibility</span><select class="pw-sort" name="visibility">
           <option value="visible"${summary.visibility === "visible" ? " selected" : ""}>visible</option>
           <option value="hidden"${summary.visibility === "hidden" ? " selected" : ""}>hidden</option>
+        </select></label>
+        <label><span class="ae-chrome">Tier</span><select class="pw-sort" name="tier">
+          <option value="active"${summary.tier === "active" ? " selected" : ""}>active</option>
+          <option value="backburner"${summary.tier === "backburner" ? " selected" : ""}>backburner</option>
+          <option value="archived"${summary.tier === "archived" ? " selected" : ""}>archived</option>
         </select></label>
         <button class="ae-button ae-button-compact" type="submit">save</button>
         <button class="ae-button ae-button-quiet ae-button-compact" type="button" data-repo-delete="${escapeHtml(summary.repo)}">delete</button>
@@ -442,13 +455,21 @@ function repoIcon(repo, extraClass = "") {
 }
 
 function buildFilters() {
+  renderTierToggle();
+  const repositories = state.repositories.length ? state.repositories : deriveRepositoriesFromCards();
   const visibleRepositorySet = new Set(
-    (state.repositories.length ? state.repositories : deriveRepositoriesFromCards())
-      .filter((repository) => repository.visibility !== "hidden")
+    repositories
+      .filter(repositoryPassesScope)
       .map((repository) => repository.repo),
   );
-  const repos = [...new Set(state.cards.map((card) => card.repoKey))]
-    .filter((repo) => !visibleRepositorySet.size || visibleRepositorySet.has(repo))
+  const hasRepositoryScope = repositories.length > 0;
+  const repos = [
+    ...new Set(
+      state.cards
+        .filter((card) => !card.explicitRepo || !hasRepositoryScope || visibleRepositorySet.has(card.repoKey))
+        .map((card) => card.repoKey),
+    ),
+  ]
     .sort();
   const prios = [...new Set(state.cards.map((card) => cleanPriority(card.priority)))].sort(
     (left, right) => priorityIndex(left) - priorityIndex(right),
@@ -507,6 +528,26 @@ function buildFilters() {
   }
 }
 
+function repositoryPassesScope(summary) {
+  return summary.visibility !== "hidden" && (state.showAllTiers || summary.tier === "active");
+}
+
+function summaryForRepo(repo) {
+  const repositories = state.repositories.length ? state.repositories : deriveRepositoriesFromCards();
+  return repositories.find((summary) => summary.repo === repo) || null;
+}
+
+function repoPassesScope(repo) {
+  const summary = summaryForRepo(repo);
+  if (!summary) return repo === "local" || state.showAllTiers;
+  return repositoryPassesScope(summary);
+}
+
+function renderTierToggle() {
+  els.tierToggle.textContent = state.showAllTiers ? "all tiers" : "active only";
+  els.tierToggle.setAttribute("aria-pressed", String(state.showAllTiers));
+}
+
 function parseAliases(raw) {
   return String(raw || "")
     .split(",")
@@ -521,6 +562,7 @@ function repositoryPayload(form) {
     name: String(data.get("name") || "").trim(),
     aliases: parseAliases(data.get("aliases")),
     visibility: String(data.get("visibility") || "visible"),
+    tier: String(data.get("tier") || "backburner"),
     ...(provenance ? { import_provenance: provenance } : {}),
   };
 }
@@ -546,6 +588,7 @@ async function createRepository(form) {
     name: els.repoCreateName.value.trim(),
     aliases: parseAliases(els.repoCreateAliases.value),
     visibility: els.repoCreateVisibility.value,
+    tier: els.repoCreateTier.value,
     ...(provenance ? { import_provenance: provenance } : {}),
   };
   if (!payload.name) {
@@ -593,6 +636,7 @@ function cleanPriority(priority) {
 }
 
 function passes(card) {
+  if (card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
   if (state.filters.repos.size && !state.filters.repos.has(card.repoKey)) return false;
   if (state.filters.prios.size && !state.filters.prios.has(cleanPriority(card.priority))) return false;
   const query = state.filters.search.trim().toLowerCase();
@@ -727,7 +771,10 @@ function renderCounts(buckets) {
   els.inProgressCount.textContent = buckets.inProgress.length;
   els.doneCount.textContent = buckets.done.length;
   const activeFilterCount =
-    state.filters.repos.size + state.filters.prios.size + (state.filters.search.trim() ? 1 : 0);
+    state.filters.repos.size +
+    state.filters.prios.size +
+    (state.filters.search.trim() ? 1 : 0) +
+    (state.showAllTiers ? 1 : 0);
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
 }
 
@@ -739,6 +786,7 @@ function saveBoardState() {
       JSON.stringify({
         view: state.view,
         railShare,
+        showAllTiers: state.showAllTiers,
         filters: {
           repos: [...state.filters.repos],
           prios: [...state.filters.prios],
@@ -761,6 +809,7 @@ function restoreBoardState() {
     if (Number.isFinite(saved.railShare)) {
       railShare = saved.railShare;
     }
+    state.showAllTiers = Boolean(saved.showAllTiers);
     const filters = saved.filters || {};
     state.filters.repos = new Set(Array.isArray(filters.repos) ? filters.repos : []);
     state.filters.prios = new Set(Array.isArray(filters.prios) ? filters.prios : []);
@@ -1173,7 +1222,13 @@ els.filterClear.addEventListener("click", () => {
   state.filters.repos.clear();
   state.filters.prios.clear();
   state.filters.search = "";
+  state.showAllTiers = false;
   els.textFilter.value = "";
+  buildFilters();
+  render();
+});
+els.tierToggle.addEventListener("click", () => {
+  state.showAllTiers = !state.showAllTiers;
   buildFilters();
   render();
 });
