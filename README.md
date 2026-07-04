@@ -24,10 +24,14 @@ The first milestone is intentionally small:
 The dispatch daemon is not part of the core. It will consume the board through
 the API/MCP/CLI surfaces and run agents elsewhere.
 
-Repository identity is operator-facing and canonicalized to the short repo
-name. Imports may still pass full slugs such as `misty-step/canary`; card JSON,
-board filters, and `/api/v1/repositories` return `canary`, while repo filters
-accept either spelling.
+Repository identity is operator-facing entity data, not loose card strings.
+Each repository has a canonical short name, aliases, visibility, import
+provenance, status counts, and card counts. Imports may still pass full slugs
+such as `misty-step/canary`; card JSON, board filters, and
+`/api/v1/repositories` return `canary`, while repo filters accept either
+spelling. Operators can merge an alias into a canonical repository; Powder
+re-homes matching cards and writes `card_events` entries with the old and new
+repository names.
 
 Current local smoke paths:
 
@@ -49,7 +53,56 @@ cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator
 cargo run -q -p powder-cli -- get-card 001 --db "$DB"
 cargo run -q -p powder-cli -- get-run "$RUN_ID" --db "$DB"
 cargo run -q -p powder-cli -- complete-card 001 --db "$DB"
+cargo run -q -p powder-cli -- repository-list --db "$DB" --include-hidden
+cargo run -q -p powder-cli -- repository-upsert --db "$DB" --name canary --aliases misty-step/canary
+cargo run -q -p powder-cli -- repository-merge-alias --db "$DB" --alias misty-step/canary --into canary --actor operator
 POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
+```
+
+MCP can also run against a local or deployed `powder-server` over HTTP instead
+of opening SQLite directly:
+
+```sh
+DB=/tmp/powder-http-smoke/powder.db
+mkdir -p "$(dirname "$DB")"
+KEY=$(cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret | awk -F '\t' '/bootstrap-key/ {print $4}')
+cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
+POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 cargo run -q -p powder-server
+
+# in another shell
+export POWDER_API_BASE_URL=http://127.0.0.1:4017
+export POWDER_API_KEY="$KEY"
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_ready","arguments":{"limit":1}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"claim_card","arguments":{"card_id":"001","agent":"codex","ttl_seconds":60}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"complete_card","arguments":{"card_id":"001","proof":"http://example.test/proof"}}}' \
+  | cargo run -q -p powder-mcp
+```
+
+Harness Kit's `factory-mcps` materializer expects Powder's remote MCP entry to
+provide the HTTP environment rather than a local DB when used by factory
+profiles:
+
+```yaml
+- id: powder
+  app: Powder
+  source_repo: misty-step/powder
+  product_skill: misty-powder
+  status: available
+  required_env_any:
+    - [POWDER_API_BASE_URL, POWDER_API_KEY]
+    - [POWDER_DB_PATH]
+  env_sources:
+    - name: POWDER_API_BASE_URL
+      op_ref: op://Agents/POWDER_ENDPOINT/URL
+    - name: POWDER_API_KEY
+      op_ref: op://Agents/POWDER_API_KEY__bridge/credential
+  codex:
+    server_name: powder
+    command: bash
+    args:
+      - -lc
+      - cd /Users/phaedrus/Development/powder && exec cargo run --locked -q -p powder-mcp
 ```
 
 ## Self-Hosting

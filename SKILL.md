@@ -47,6 +47,12 @@ must never silently evaporate on process exit.
 - `list_ready`: return claimable cards sorted by priority, age, and identifier.
 - `list_cards`: enumerate cards by optional status/repo filter, including
   `blocked`, `review`, and `done` cards `list_ready` never surfaces.
+- `list_repositories`: list repository entities with aliases, visibility,
+  import provenance, and status counts.
+- `upsert_repository`: create or update repository settings.
+- `merge_repository_alias`: merge duplicate repo strings into one canonical
+  repository and audit re-homed cards.
+- `delete_repository`: delete an unused repository entity.
 - `claim_card`: acquire an expiring lock for one card and open a run.
 - `release_claim`: clear an active claim by run id and make the card ready.
 - `renew_claim`: extend an active claim lease by run id.
@@ -70,6 +76,9 @@ must never silently evaporate on process exit.
 powder init-db --db ./data/powder.db --show-secret
 powder import backlog.d --db ./data/powder.db
 powder list-ready --db ./data/powder.db --limit 10
+powder repository-list --db ./data/powder.db --include-hidden
+powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary --visibility visible --import-provenance manual
+powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator
 powder claim 001 --db ./data/powder.db --agent codex
 powder heartbeat 001 --db ./data/powder.db --run run-id
 powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600
@@ -83,6 +92,26 @@ powder answer-input run-id --db ./data/powder.db --actor operator --answer appro
 powder get-run run-id --db ./data/powder.db
 powder complete-card 001 --db ./data/powder.db
 ```
+
+## MCP Over HTTP
+
+Set `POWDER_API_BASE_URL` and `POWDER_API_KEY` to run `powder-mcp` against a
+live `powder-server` instead of a local SQLite file. A minimal local smoke is:
+
+```sh
+DB=/tmp/powder-http-smoke/powder.db
+mkdir -p "$(dirname "$DB")"
+KEY=$(powder init-db --db "$DB" --show-secret | awk -F '\t' '/bootstrap-key/ {print $4}')
+powder import backlog.d --db "$DB"
+POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 powder-server
+
+POWDER_API_BASE_URL=http://127.0.0.1:4017 POWDER_API_KEY="$KEY" powder-mcp
+```
+
+For Harness Kit `factory-mcps`, the remote entry shape is `required_env_any:
+[[POWDER_API_BASE_URL, POWDER_API_KEY], [POWDER_DB_PATH]]`; the factory remote
+variant should populate `POWDER_API_BASE_URL` and `POWDER_API_KEY` from the
+Agents vault and run `powder-mcp`.
 
 ## Local Gate
 
