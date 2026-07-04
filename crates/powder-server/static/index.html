@@ -14,6 +14,10 @@
         document.documentElement.style.colorScheme = mode;
       }
     } catch (_err) {}
+    document.documentElement.setAttribute(
+      "data-pw-route",
+      /^\/c\/[^/]+$/.test(window.location.pathname) ? "card" : "board",
+    );
   </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -155,21 +159,26 @@
   </div>
 
   <footer class="pw-foot">
-    <span><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · click away or <kbd>x</kbd> closes the sheet</span>
+    <span><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · open cards for full detail</span>
     <span>powder</span>
   </footer>
 </div>
 
-<button class="pw-scrim" id="scrim" tabindex="-1" aria-label="close card detail"></button>
-<aside class="pw-sheet" id="sheet" aria-hidden="true" aria-label="card detail" inert>
-  <div class="pw-sheet-head">
-    <span>card detail</span>
-    <button class="pw-sheet-close" id="sheet-close" type="button" aria-label="close">
-      <svg class="ae-icon" aria-hidden="true"><use href="#i-x"></use></svg>
-    </button>
+<div id="powder-card-app" class="pw-detail-app" aria-live="polite">
+  <header class="pw-detail-top ae-chrome">
+    <a class="pw-board-link" id="detail-board-link" href="/board">board</a>
+    <div class="pw-brand">
+      <span class="pw-mark" aria-hidden="true"><svg class="ae-icon"><use href="#i-snowflake"></use></svg></span>
+      <span class="ae-name">POWDER</span>
+    </div>
+    <p class="pw-detail-connection">Connection: <span id="detail-connection-status" class="pw-connection" data-kind="loading">loading</span></p>
+  </header>
+  <div class="pw-detail-scroll">
+    <main id="detail-body" class="pw-detail-body">
+      <p class="pw-empty">Loading card detail.</p>
+    </main>
   </div>
-  <div class="pw-sheet-body" id="sheet-body"></div>
-</aside>
+</div>
 
 <script src="/assets/powder-board.js" defer></script>
 </body>

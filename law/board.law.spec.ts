@@ -17,11 +17,15 @@ import {
    real card rather than an empty shell. */
 
 const MODES = ["light", "dark"] as const;
+const CARD_ROUTE_VIEWPORTS = [
+  { name: "desktop", size: { width: 1280, height: 900 } },
+  { name: "mobile-390", size: { width: 390, height: 900 } },
+] as const;
 
-async function boot(page: Page, mode: (typeof MODES)[number]) {
+async function boot(page: Page, mode: (typeof MODES)[number], path = "/board") {
   const errors = collectConsoleErrors(page);
   await page.addInitScript((m) => localStorage.setItem("ae-mode", m), mode);
-  await page.goto("/board");
+  await page.goto(path);
   await page.waitForLoadState("networkidle");
   return errors;
 }
@@ -39,14 +43,36 @@ for (const mode of MODES) {
     await assertLaw(page, { consoleErrors: errors });
   });
 
-  test(`board card sheet · ${mode} · the law holds`, async ({ page }) => {
+  test(`board card link · ${mode} · opens the detail route and back returns`, async ({ page }) => {
     const errors = await boot(page, mode);
-    const card = page.locator("[data-id]").first();
+    await page.locator("#tab-board").click();
+    await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
+    const card = page.locator("[data-card-link]").first();
     await card.waitFor({ state: "visible" });
+    await expect(card).toHaveAttribute("href", "/c/001");
     await card.click();
-    await expect(page.locator("#sheet")).toBeVisible();
+    await expect(page).toHaveURL(/\/c\/001$/);
+    await expect(page.locator("#powder-card-app")).toBeVisible();
+    await expect(page.locator("#detail-body")).toContainText("Import example backlog ticket");
     await assertLaw(page, { consoleErrors: errors });
+    await page.goBack();
+    await expect(page).toHaveURL(/\/board$/);
+    await expect(page.locator("#powder-board-app")).toBeVisible();
+    await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
   });
+}
+
+for (const mode of MODES) {
+  for (const viewport of CARD_ROUTE_VIEWPORTS) {
+    test(`card route · ${mode} · ${viewport.name} · the law holds`, async ({ page }) => {
+      await page.setViewportSize(viewport.size);
+      const errors = await boot(page, mode, "/c/001");
+      await expect(page.locator("#powder-card-app")).toBeVisible();
+      await expect(page.locator("#detail-body")).toContainText("Import example backlog ticket");
+      await expect(page.locator("#detail-body")).toContainText("ACCEPTANCE");
+      await assertLaw(page, { consoleErrors: errors });
+    });
+  }
 }
 
 test("the gate catches a planted off-law element (not theater)", async ({
