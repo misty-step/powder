@@ -20,6 +20,17 @@ pub fn canonical_repo_matches(left: &str, right: &str) -> bool {
         .is_some_and(|(left, right)| left == right)
 }
 
+pub fn repo_from_numeric_card_id_prefix(card_id: &str) -> Option<String> {
+    let (prefix, suffix) = card_id.trim().rsplit_once('-')?;
+    if prefix.trim().is_empty() || suffix.is_empty() {
+        return None;
+    }
+    if !suffix.chars().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    canonical_repo_label(prefix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,5 +54,19 @@ mod tests {
         assert!(canonical_repo_matches("misty-step/canary", "canary"));
         assert!(canonical_repo_matches("canary", "misty-step/canary"));
         assert!(!canonical_repo_matches("canary", "powder"));
+    }
+
+    #[test]
+    fn repo_from_numeric_card_id_prefix_uses_the_last_dash_before_a_numeric_suffix() {
+        assert_eq!(
+            repo_from_numeric_card_id_prefix("misty-step-906").as_deref(),
+            Some("misty-step")
+        );
+        assert_eq!(
+            repo_from_numeric_card_id_prefix("bitterblossom-001").as_deref(),
+            Some("bitterblossom")
+        );
+        assert_eq!(repo_from_numeric_card_id_prefix("remote-created"), None);
+        assert_eq!(repo_from_numeric_card_id_prefix("906"), None);
     }
 }

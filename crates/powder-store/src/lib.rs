@@ -3,9 +3,10 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
-    canonical_repo_label, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
-    CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, DomainError, Link,
-    LinkId, Priority, ReadyQuery, Run, RunId, RunState,
+    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix, Activity,
+    ActivityId, ActivityType, Authority, Card, CardEvent, CardEventId, CardId, CardSource,
+    CardStatus, Claim, ClaimReceipt, Comment, DomainError, Link, LinkId, Priority, ReadyQuery, Run,
+    RunId, RunState,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -342,9 +343,27 @@ impl Store {
         Ok(saved)
     }
 
-    pub fn create_card_with_events(&mut self, card: Card, actor: &str, now: i64) -> Result<Card> {
+    pub fn create_card_with_events(
+        &mut self,
+        mut card: Card,
+        actor: &str,
+        now: i64,
+    ) -> Result<Card> {
         let actor = non_empty("actor", actor)?;
         let card_id = card.id.clone();
+        if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
+            match card.repo.as_deref() {
+                Some(repo) if !canonical_repo_matches(repo, &derived_repo) => {
+                    return Err(DomainError::validation(
+                        "repo",
+                        format!("repo {repo} does not match numeric card id prefix {derived_repo}"),
+                    )
+                    .into());
+                }
+                None => card.repo = Some(derived_repo),
+                Some(_) => {}
+            }
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -511,12 +530,14 @@ impl Store {
     /// file directly. Same sort as `list_ready` (priority, age, id).
     pub fn list_cards(&self, filter: &CardFilter, limit: usize) -> Result<Vec<Card>> {
         let repo_filter_requested = filter.repo.is_some();
+        let requested_repo_label = filter.repo.as_deref().and_then(canonical_repo_label);
         let repo_filter = filter
             .repo
             .as_deref()
             .map(|repo| resolve_repository_name(&self.connection, repo))
             .transpose()?
-            .flatten();
+            .flatten()
+            .or(requested_repo_label);
         let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
         let records = statement
             .query_map([], CardRecord::from_row)?
@@ -528,7 +549,12 @@ impl Store {
             .into_iter()
             .filter(|card| filter.status.map(|s| card.status == s).unwrap_or(true))
             .filter(|card| match repo_filter.as_deref() {
-                Some(repo) => card.repo.as_deref() == Some(repo),
+                Some(repo) => {
+                    card.repo.as_deref() == Some(repo)
+                        || (card.repo.is_none()
+                            && repo_from_numeric_card_id_prefix(card.id.as_str()).as_deref()
+                                == Some(repo))
+                }
                 None => !repo_filter_requested,
             })
             .collect::<Vec<_>>();

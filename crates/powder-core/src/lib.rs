@@ -12,4 +12,6 @@ pub use model::{
     CardEventId, CardId, CardSource, CardStatus, Claim, Comment, DomainError, Link, LinkId,
     Priority, Run, RunDetail, RunId, RunState,
 };
-pub use repository::{canonical_repo_label, canonical_repo_matches};
+pub use repository::{
+    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
+};

@@ -160,6 +160,46 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
 }
 
 #[test]
+fn list_cards_repo_filter_surfaces_legacy_repo_null_cards_with_numeric_id_prefix() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    store.import_cards(vec![ready_card("misty-step-905", 10)])?;
+
+    let filtered = store.list_cards(
+        &CardFilter {
+            status: None,
+            repo: Some("misty-step".to_string()),
+        },
+        20,
+    )?;
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].id.as_str(), "misty-step-905");
+    assert_eq!(filtered[0].repo, None);
+    Ok(())
+}
+
+#[test]
+fn create_card_with_events_rejects_repo_that_conflicts_with_numeric_id_prefix() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("misty-step-906", 10);
+    card.repo = Some("bitterblossom".to_string());
+
+    let err = store
+        .create_card_with_events(card, "operator", 10)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StoreError::Domain(DomainError::Validation { field: "repo", .. })
+    ));
+    assert!(store.get_card(&CardId::new("misty-step-906")?)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn upsert_card_returns_the_canonical_repo_label_it_persists() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

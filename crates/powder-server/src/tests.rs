@@ -93,6 +93,69 @@ async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
 }
 
 #[tokio::test]
+async fn create_card_derives_repo_from_numeric_id_prefix_for_repo_filtered_lists() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"misty-step-906","title":"Filed from API","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(created["repo"], "misty-step");
+
+    let listed = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?repo=misty-step",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    assert_eq!(listed["cards"][0]["id"], "misty-step-906");
+}
+
+#[tokio::test]
+async fn create_card_rejects_repo_conflicting_with_numeric_id_prefix() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"misty-step-906","title":"Filed from API","acceptance":["proof"],"status":"ready","repo":"bitterblossom"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let listed = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?repo=bitterblossom",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let listed = response_json(listed).await;
+    assert_eq!(listed["cards"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn create_card_rejects_an_existing_id_without_replacing_the_card() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
