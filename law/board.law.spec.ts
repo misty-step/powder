@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-// vendored from @misty-step/aesthetic v2.16.0 — see vendor/aesthetic-law/README.md
+// vendored from @misty-step/aesthetic v2.17.1 — see vendor/aesthetic-law/README.md
 // for why this is a vendored copy rather than a package import.
 import {
   assertLaw,
