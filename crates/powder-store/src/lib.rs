@@ -75,6 +75,19 @@ pub struct CardFilter {
     pub repo: Option<String>,
 }
 
+/// Explicit partial update for mutable card fields. Fields left as `None`
+/// are preserved from the stored row; lifecycle/source/workspace fields are
+/// intentionally absent from this shape.
+#[derive(Debug, Clone, Default)]
+pub struct CardPatch {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub acceptance: Option<Vec<String>>,
+    pub status: Option<CardStatus>,
+    pub priority: Option<Priority>,
+    pub labels: Option<Vec<String>>,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -320,6 +333,97 @@ impl Store {
         }
         transaction.commit()?;
         Ok(saved)
+    }
+
+    pub fn create_card_with_events(&mut self, card: Card, actor: &str, now: i64) -> Result<Card> {
+        let actor = non_empty("actor", actor)?;
+        let card_id = card.id.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if load_card_optional(&transaction, &card_id)?.is_some() {
+            return Err(DomainError::conflict(format!("card already exists: {card_id}")).into());
+        }
+        persist_card(&transaction, &card)?;
+        let saved = load_card(&transaction, &card_id)?;
+        append_card_event(
+            &transaction,
+            &saved.id,
+            "create",
+            &actor,
+            "created card",
+            now,
+        )?;
+        events::append_outbound_card_event(
+            &transaction,
+            &saved,
+            "card-created",
+            &actor,
+            json!({"source": "create-card"}),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(saved)
+    }
+
+    pub fn patch_card(
+        &mut self,
+        card_id: &CardId,
+        patch: CardPatch,
+        actor: &str,
+        now: i64,
+    ) -> Result<Card> {
+        let actor = non_empty("actor", actor)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        let mut patched_fields = Vec::new();
+
+        if let Some(title) = patch.title {
+            card.title = non_empty("title", &title)?;
+            patched_fields.push("title");
+        }
+        if let Some(body) = patch.body {
+            card.body = body;
+            patched_fields.push("body");
+        }
+        if let Some(acceptance) = patch.acceptance {
+            card.acceptance = clean_string_list(acceptance);
+            patched_fields.push("acceptance");
+        }
+        if let Some(priority) = patch.priority {
+            card.priority = priority;
+            patched_fields.push("priority");
+        }
+        if let Some(labels) = patch.labels {
+            card.labels = clean_string_list(labels);
+            patched_fields.push("labels");
+        }
+        if let Some(status) = patch.status {
+            card.status.validate_transition(status)?;
+            card.status = status;
+            patched_fields.push("status");
+        }
+
+        if patched_fields.is_empty() {
+            transaction.commit()?;
+            return Ok(card);
+        }
+
+        card.updated_at = now;
+        persist_card(&transaction, &card)?;
+        append_card_event(
+            &transaction,
+            card_id,
+            "patch",
+            &actor,
+            &format!("patched {}", patched_fields.join(", ")),
+            now,
+        )?;
+
+        transaction.commit()?;
+        Ok(card)
     }
 
     pub fn record_card_event(
@@ -1189,6 +1293,14 @@ fn non_empty(field: &'static str, value: &str) -> Result<String> {
     } else {
         Ok(trimmed.to_owned())
     }
+}
+
+fn clean_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 struct CardRecord {

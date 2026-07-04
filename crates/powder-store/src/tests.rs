@@ -4,8 +4,8 @@ use powder_core::{
 };
 
 use crate::{
-    ApiKeyScope, CardFilter, ImportOutcome, RepositoryUpsert, RepositoryVisibility, Result, Store,
-    StoreError, API_KEY_ALPHABET,
+    ApiKeyScope, CardFilter, CardPatch, ImportOutcome, RepositoryUpsert, RepositoryVisibility,
+    Result, Store, StoreError, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -517,6 +517,70 @@ fn create_card_with_events_enqueues_card_created_transactionally() -> Result<()>
     assert_eq!(tail[0].event.event_type, "card-created");
     assert_eq!(tail[0].event.card.id.as_str(), "created-event");
     assert_eq!(store.due_webhook_deliveries(10, 10)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("patch-protected")?;
+    let mut card = backlog_card("patch-protected", 2, "sha256:v1");
+    card.branch_name = Some("codex/powder-901".to_string());
+    card.workspace_path = Some("/tmp/powder-workspace".to_string());
+    store.import_cards(vec![card])?;
+    let claim = store.claim_card(
+        &card_id,
+        "agent-a",
+        10,
+        3600,
+        &Authority::actor("agent-a", false),
+    )?;
+
+    let patched = store.patch_card(
+        &card_id,
+        CardPatch {
+            title: Some("Patched title".to_string()),
+            status: Some(CardStatus::Blocked),
+            labels: Some(vec![
+                "api".to_string(),
+                " ".to_string(),
+                "safe-update".to_string(),
+            ]),
+            ..Default::default()
+        },
+        "operator",
+        20,
+    )?;
+
+    assert_eq!(patched.title, "Patched title");
+    assert_eq!(patched.status, CardStatus::Blocked);
+    assert_eq!(patched.labels, vec!["api", "safe-update"]);
+    assert_eq!(patched.created_at, 2);
+    assert_eq!(
+        patched.source.as_ref().map(|source| source.digest.as_str()),
+        Some("sha256:v1")
+    );
+    assert_eq!(patched.branch_name.as_deref(), Some("codex/powder-901"));
+    assert_eq!(
+        patched.workspace_path.as_deref(),
+        Some("/tmp/powder-workspace")
+    );
+    assert_eq!(
+        patched.claim.as_ref().map(|claim| &claim.run_id),
+        Some(&claim.run_id)
+    );
+    assert_eq!(
+        store.get_run(&claim.run_id)?.expect("run").state,
+        RunState::Active
+    );
+    let detail = store.get_card_detail(&card_id)?.expect("detail");
+    assert!(detail.events.iter().any(|event| {
+        event.event_type == "patch"
+            && event.actor == "operator"
+            && event.payload.contains("title")
+            && event.payload.contains("status")
+    }));
     Ok(())
 }
 
