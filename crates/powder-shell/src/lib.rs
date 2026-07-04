@@ -85,13 +85,14 @@ pub fn load_backlog_dir(path: impl AsRef<Path>, now: i64) -> ShellResult<Vec<Car
     Ok(cards)
 }
 
-/// Load one repo's backlog.d for a multi-repo import: cards are tagged with
-/// the canonical short repo label and their id is namespaced
+/// Load one repo's backlog.d for a multi-repo import: cards carry the raw repo
+/// slug until persistence can record it as repository import provenance and an
+/// alias, while their id is namespaced
 /// `{repo-slug}-{original-id}` so cards from independently numbered repos
 /// (every repo's backlog.d starts its own `001-*.md`) can share one Powder
 /// instance without id collisions. `repo` may be the full slug (e.g.
 /// `misty-step/bitterblossom`); only the part after the last `/` is used as
-/// the id prefix and stored repo label.
+/// the id prefix.
 pub fn load_backlog_dir_for_repo(
     path: impl AsRef<Path>,
     repo: &str,
@@ -104,18 +105,19 @@ pub fn load_backlog_dir_for_repo(
     namespace_cards_for_repo(load_backlog_dir(path, now)?, repo)
 }
 
-/// Tag `cards` with a canonical repo label and namespace each id
+/// Tag `cards` with the raw repo slug and namespace each id
 /// `{repo-slug}-{original-id}`. Shared by [`load_backlog_dir_for_repo`] and by
 /// callers (e.g. an HTTP import route) that parse cards from a source other
 /// than a local directory but still need the same collision-free multi-repo
 /// id scheme.
 pub fn namespace_cards_for_repo(mut cards: Vec<Card>, repo: &str) -> ShellResult<Vec<Card>> {
     let id_prefix = validate_repo_slug(repo)?;
-    let canonical_repo = canonical_repo_label(repo)
+    let repo = repo.trim().trim_end_matches('/').to_string();
+    canonical_repo_label(&repo)
         .ok_or_else(|| ShellError::Invalid(format!("invalid repo slug: {repo}")))?;
     for card in &mut cards {
         card.id = CardId::new(format!("{id_prefix}-{}", card.id)).map_err(ShellError::from)?;
-        card.repo = Some(canonical_repo.clone());
+        card.repo = Some(repo.clone());
     }
     Ok(cards)
 }
@@ -216,7 +218,7 @@ mod tests {
 
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].id.as_str(), "bitterblossom-001");
-        assert_eq!(cards[0].repo.as_deref(), Some("bitterblossom"));
+        assert_eq!(cards[0].repo.as_deref(), Some("misty-step/bitterblossom"));
     }
 
     #[test]
@@ -232,7 +234,7 @@ mod tests {
         let namespaced = namespace_cards_for_repo(vec![card], "misty-step/crucible").unwrap();
 
         assert_eq!(namespaced[0].id.as_str(), "crucible-001");
-        assert_eq!(namespaced[0].repo.as_deref(), Some("crucible"));
+        assert_eq!(namespaced[0].repo.as_deref(), Some("misty-step/crucible"));
     }
 
     #[test]

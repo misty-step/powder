@@ -43,6 +43,11 @@ const els = {
   authPanel: document.getElementById("auth-panel"),
   repoSettingsCount: document.getElementById("repo-settings-count"),
   repoSettingsList: document.getElementById("repo-settings-list"),
+  repoCreateForm: document.getElementById("repo-create-form"),
+  repoCreateName: document.getElementById("repo-create-name"),
+  repoCreateAliases: document.getElementById("repo-create-aliases"),
+  repoCreateProvenance: document.getElementById("repo-create-provenance"),
+  repoCreateVisibility: document.getElementById("repo-create-visibility"),
   settingsToggle: document.getElementById("settings-toggle"),
   apiKeyForm: document.getElementById("api-key-form"),
   apiKeyInput: document.getElementById("api-key-input"),
@@ -186,7 +191,7 @@ async function loadBoard() {
           }
         }),
       ),
-      apiJson("/api/v1/repositories"),
+      apiJson("/api/v1/repositories?include_hidden=true"),
     ]);
     state.cards = dedupeCards(groups.flat()).map(normalizeCard);
     state.repositories = normalizeRepositories(repositoryData.repositories || []);
@@ -331,10 +336,15 @@ function canonicalRepoLabel(value) {
 function normalizeRepositories(repositories) {
   return repositories
     .map((summary) => ({
-      repo: canonicalRepoLabel(summary.repo),
+      repo: canonicalRepoLabel(summary.name || summary.repo),
+      name: canonicalRepoLabel(summary.name || summary.repo),
       aliases: Array.isArray(summary.aliases) ? summary.aliases : [],
+      visibility: summary.visibility || "visible",
+      import_provenance: summary.import_provenance || "",
       card_count: Number(summary.card_count || 0),
       status_counts: summary.status_counts || {},
+      created_at: Number(summary.created_at || 0),
+      updated_at: Number(summary.updated_at || 0),
     }))
     .filter((summary) => summary.repo)
     .sort((left, right) => left.repo.localeCompare(right.repo));
@@ -346,7 +356,10 @@ function deriveRepositoriesFromCards() {
     const repo = card.repoKey || "local";
     const summary = summaries.get(repo) || {
       repo,
+      name: repo,
       aliases: [],
+      visibility: "visible",
+      import_provenance: "",
       card_count: 0,
       status_counts: {},
     };
@@ -369,17 +382,31 @@ function renderRepositorySettings() {
 function repositoryRowHTML(summary) {
   const meta = repoMeta(summary.repo);
   const counts = statusCountsHTML(summary.status_counts);
-  const aliases = summary.aliases.length
-    ? `<p class="pw-repo-alias">alias ${escapeHtml(summary.aliases.join(", "))}</p>`
-    : "";
+  const aliases = summary.aliases.join(", ");
+  const provenance = summary.import_provenance || "";
   return `
-    <div class="pw-repo-row">
+    <div class="pw-repo-row" data-repo-name="${escapeHtml(summary.repo)}">
       <div class="pw-repo-main">
         <span class="pw-repo-name">${repoIcon(summary.repo, `ae-cat-${meta.cat}`)}${escapeHtml(summary.repo)}</span>
         <span class="ae-num">${summary.card_count}</span>
       </div>
       ${counts}
-      ${aliases}
+      <form class="pw-repo-edit" data-repo-action="save">
+        <input type="hidden" name="name" value="${escapeHtml(summary.repo)}">
+        <label><span class="ae-chrome">Aliases</span><input class="ae-input" name="aliases" type="text" value="${escapeHtml(aliases)}" autocomplete="off"></label>
+        <label><span class="ae-chrome">Provenance</span><input class="ae-input" name="import_provenance" type="text" value="${escapeHtml(provenance)}" autocomplete="off"></label>
+        <label><span class="ae-chrome">Visibility</span><select class="pw-sort" name="visibility">
+          <option value="visible"${summary.visibility === "visible" ? " selected" : ""}>visible</option>
+          <option value="hidden"${summary.visibility === "hidden" ? " selected" : ""}>hidden</option>
+        </select></label>
+        <button class="ae-button ae-button-compact" type="submit">save</button>
+        <button class="ae-button ae-button-quiet ae-button-compact" type="button" data-repo-delete="${escapeHtml(summary.repo)}">delete</button>
+      </form>
+      <form class="pw-repo-merge" data-repo-action="merge">
+        <input type="hidden" name="target" value="${escapeHtml(summary.repo)}">
+        <label><span class="ae-chrome">Merge alias</span><input class="ae-input" name="alias" type="text" autocomplete="off" placeholder="owner/repo"></label>
+        <button class="ae-button ae-button-quiet ae-button-compact" type="submit">merge</button>
+      </form>
     </div>
   `;
 }
@@ -415,7 +442,14 @@ function repoIcon(repo, extraClass = "") {
 }
 
 function buildFilters() {
-  const repos = [...new Set(state.cards.map((card) => card.repoKey))].sort();
+  const visibleRepositorySet = new Set(
+    (state.repositories.length ? state.repositories : deriveRepositoriesFromCards())
+      .filter((repository) => repository.visibility !== "hidden")
+      .map((repository) => repository.repo),
+  );
+  const repos = [...new Set(state.cards.map((card) => card.repoKey))]
+    .filter((repo) => !visibleRepositorySet.size || visibleRepositorySet.has(repo))
+    .sort();
   const prios = [...new Set(state.cards.map((card) => cleanPriority(card.priority)))].sort(
     (left, right) => priorityIndex(left) - priorityIndex(right),
   );
@@ -471,6 +505,87 @@ function buildFilters() {
     });
     els.prioFilters.appendChild(button);
   }
+}
+
+function parseAliases(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((alias) => alias.trim())
+    .filter(Boolean);
+}
+
+function repositoryPayload(form) {
+  const data = new FormData(form);
+  const provenance = String(data.get("import_provenance") || "").trim();
+  return {
+    name: String(data.get("name") || "").trim(),
+    aliases: parseAliases(data.get("aliases")),
+    visibility: String(data.get("visibility") || "visible"),
+    ...(provenance ? { import_provenance: provenance } : {}),
+  };
+}
+
+async function saveRepository(form) {
+  const payload = repositoryPayload(form);
+  if (!payload.name) {
+    renderAuthState("Repository name is required.");
+    return;
+  }
+  await apiJson(`/api/v1/repositories/${encodePath(payload.name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  renderAuthState(`Repository ${payload.name} saved.`);
+  await loadBoard();
+}
+
+async function createRepository(form) {
+  const provenance = els.repoCreateProvenance.value.trim();
+  const payload = {
+    name: els.repoCreateName.value.trim(),
+    aliases: parseAliases(els.repoCreateAliases.value),
+    visibility: els.repoCreateVisibility.value,
+    ...(provenance ? { import_provenance: provenance } : {}),
+  };
+  if (!payload.name) {
+    renderAuthState("Repository name is required.");
+    return;
+  }
+  await apiJson("/api/v1/repositories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  form.reset();
+  renderAuthState(`Repository ${payload.name} saved.`);
+  await loadBoard();
+}
+
+async function mergeRepositoryAlias(form) {
+  const data = new FormData(form);
+  const target = String(data.get("target") || "").trim();
+  const alias = String(data.get("alias") || "").trim();
+  if (!target || !alias) {
+    renderAuthState("Merge alias and repository are required.");
+    return;
+  }
+  const result = await apiJson(`/api/v1/repositories/${encodePath(target)}/merge-alias`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ alias, actor: "board-settings" }),
+  });
+  form.reset();
+  renderAuthState(`Merged ${alias}; re-homed ${result.rehomed_cards || 0} cards.`);
+  await loadBoard();
+}
+
+async function deleteRepository(name) {
+  await apiJson(`/api/v1/repositories/${encodePath(name)}`, {
+    method: "DELETE",
+  });
+  renderAuthState(`Repository ${name} deleted.`);
+  await loadBoard();
 }
 
 function cleanPriority(priority) {
@@ -1076,6 +1191,31 @@ els.tabBoard.addEventListener("click", () => setView("board"));
 els.settingsToggle.addEventListener("click", () => {
   if (els.authPanel.hidden) showAuth();
   else hideAuth();
+});
+els.repoCreateForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  createRepository(event.currentTarget).catch((err) => {
+    renderAuthState(`Repository save failed: ${err.message || err}`);
+  });
+});
+els.repoSettingsList.addEventListener("submit", (event) => {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement)) return;
+  event.preventDefault();
+  const action = form.dataset.repoAction;
+  const task = action === "merge" ? mergeRepositoryAlias(form) : saveRepository(form);
+  task.catch((err) => {
+    renderAuthState(`Repository ${action || "save"} failed: ${err.message || err}`);
+  });
+});
+els.repoSettingsList.addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  const button = target?.closest("[data-repo-delete]");
+  if (!button) return;
+  event.preventDefault();
+  deleteRepository(button.dataset.repoDelete).catch((err) => {
+    renderAuthState(`Repository delete failed: ${err.message || err}`);
+  });
 });
 els.apiKeyForm.addEventListener("submit", (event) => {
   event.preventDefault();

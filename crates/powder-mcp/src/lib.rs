@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use powder_core::{Authority, CardId, CardStatus, ReadyQuery, RunId};
-use powder_store::{CardFilter, Store};
+use powder_store::{CardFilter, RepositoryUpsert, RepositoryVisibility, Store};
 use serde_json::{json, Value};
 
 mod remote;
@@ -25,6 +25,26 @@ pub const TOOLS: &[ToolDef] = &[
         name: "list_cards",
         description: "List cards by optional status/repo filter, not just ready-eligible ones -- enumerate blocked, in-review, or done cards.",
         input_schema: r#"{"type":"object","properties":{"status":{"type":"string"},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "list_repositories",
+        description: "List repository entities with aliases, visibility, import provenance, and status counts.",
+        input_schema: r#"{"type":"object","properties":{"include_hidden":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "upsert_repository",
+        description: "Create or update one repository entity with canonical name, aliases, visibility, and import provenance.",
+        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"import_provenance":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "merge_repository_alias",
+        description: "Merge an alias or duplicate repository string into a canonical repository and audit every re-homed card.",
+        input_schema: r#"{"type":"object","required":["alias","into"],"properties":{"alias":{"type":"string"},"into":{"type":"string"},"actor":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "delete_repository",
+        description: "Delete an unused repository entity and its aliases.",
+        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "claim_card",
@@ -238,6 +258,41 @@ pub fn call_tool_store(
                 .list_cards(&CardFilter { status, repo }, limit)
                 .map_err(to_string)?)
         }
+        "list_repositories" => {
+            if args["include_hidden"].as_bool().unwrap_or(false) {
+                json!({"repositories": store.list_repositories_with_hidden().map_err(to_string)?})
+            } else {
+                json!({"repositories": store.list_repositories().map_err(to_string)?})
+            }
+        }
+        "upsert_repository" => {
+            let name = required_str(args, "name")?.to_string();
+            json!(store
+                .upsert_repository(
+                    RepositoryUpsert {
+                        name,
+                        aliases: optional_string_array(args, "aliases")?,
+                        visibility: optional_repository_visibility(args)?,
+                        import_provenance: optional_str(args, "import_provenance")
+                            .map(str::to_string),
+                    },
+                    now,
+                )
+                .map_err(to_string)?)
+        }
+        "merge_repository_alias" => {
+            let alias = required_str(args, "alias")?;
+            let target = required_str(args, "into")?;
+            let actor = optional_str(args, "actor").unwrap_or("operator");
+            json!(store
+                .merge_repository_alias(alias, target, actor, now)
+                .map_err(to_string)?)
+        }
+        "delete_repository" => {
+            let name = required_str(args, "name")?;
+            store.delete_repository(name).map_err(to_string)?;
+            json!({"deleted": true, "repository": name})
+        }
         "claim_card" => {
             let card_id = card_id(args, "card_id")?;
             let agent = required_str(args, "agent")?;
@@ -420,6 +475,21 @@ fn string_array(args: &Value, key: &'static str) -> Result<Vec<String>, String> 
         .unwrap_or_else(|| Ok(Vec::new()))
 }
 
+fn optional_string_array(args: &Value, key: &'static str) -> Result<Option<Vec<String>>, String> {
+    if args.get(key).is_none_or(Value::is_null) {
+        return Ok(None);
+    }
+    string_array(args, key).map(Some)
+}
+
+fn optional_repository_visibility(args: &Value) -> Result<Option<RepositoryVisibility>, String> {
+    optional_str(args, "visibility")
+        .map(|raw| {
+            RepositoryVisibility::parse(raw).ok_or_else(|| format!("invalid visibility: {raw}"))
+        })
+        .transpose()
+}
+
 fn required_str<'a>(args: &'a Value, key: &'static str) -> Result<&'a str, String> {
     args[key]
         .as_str()
@@ -464,9 +534,13 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 21);
+        assert_eq!(TOOLS.len(), 25);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
+        assert!(names.contains(&"list_repositories"));
+        assert!(names.contains(&"upsert_repository"));
+        assert!(names.contains(&"merge_repository_alias"));
+        assert!(names.contains(&"delete_repository"));
         assert!(names.contains(&"update_relations"));
         assert!(names.contains(&"add_comment"));
         assert!(names.contains(&"claim_card"));
@@ -608,6 +682,77 @@ Expose tools against the DB.
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
         assert!(invalid.contains("invalid status"));
+    }
+
+    #[test]
+    fn mcp_repository_settings_merge_alias_and_audit_rehomed_card() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let repository = call_tool_store(
+            &mut store,
+            "upsert_repository",
+            &json!({
+                "name": "misty-step/canary",
+                "aliases": ["misty-step/canary", "canary-app"],
+                "visibility": "visible",
+                "import_provenance": "manual"
+            }),
+            10,
+        )
+        .unwrap();
+        let repository = tool_payload(&repository);
+        assert_eq!(repository["name"], "canary");
+        assert_eq!(repository["import_provenance"], "manual");
+
+        store
+            .import_cards(vec![parse_backlog_card(
+                "legacy.md",
+                "# Legacy\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+                11,
+            )
+            .unwrap()])
+            .unwrap();
+        let mut card = store
+            .get_card(&CardId::new("legacy").unwrap())
+            .unwrap()
+            .unwrap();
+        card.repo = Some("legacy-canary".to_string());
+        store.upsert_card(card).unwrap();
+
+        let merged = call_tool_store(
+            &mut store,
+            "merge_repository_alias",
+            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator"}),
+            12,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&merged)["rehomed_cards"], 1);
+
+        let repositories = call_tool_store(
+            &mut store,
+            "list_repositories",
+            &json!({"include_hidden": true}),
+            13,
+        )
+        .unwrap();
+        assert!(tool_payload(&repositories)["repositories"][0]["aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|alias| alias == "legacy-canary"));
+
+        let card =
+            call_tool_store(&mut store, "get_card", &json!({"card_id": "legacy"}), 14).unwrap();
+        let card = tool_payload(&card);
+        assert_eq!(card["card"]["repo"], "canary");
+        assert!(card["events"].as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "repository"
+                && event["payload"]
+                    .as_str()
+                    .unwrap()
+                    .contains("legacy-canary -> canary")
+        }));
     }
 
     #[test]

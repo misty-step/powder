@@ -31,7 +31,32 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/repositories",
-        intent: "list canonical repositories with folded aliases and status counts",
+        intent: "list repository entities with aliases, visibility, import provenance, and status counts",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/repositories",
+        intent: "create or update a repository entity with aliases, visibility, and import provenance",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/repositories/{name}",
+        intent: "read one repository entity resolved by canonical name or alias",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/repositories/{name}",
+        intent: "update one repository entity resolved by canonical name",
+    },
+    ApiRoute {
+        method: "DELETE",
+        path: "/api/v1/repositories/{name}",
+        intent: "delete an unused repository entity and its aliases",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/repositories/{name}/merge-alias",
+        intent: "merge an alias or duplicate repository string into a canonical repository and audit re-homed cards",
     },
     ApiRoute {
         method: "GET",
@@ -159,6 +184,9 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards"));
         assert!(paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
+        assert!(paths.contains(&"/api/v1/repositories"));
+        assert!(paths.contains(&"/api/v1/repositories/{name}"));
+        assert!(paths.contains(&"/api/v1/repositories/{name}/merge-alias"));
         assert!(paths.contains(&"/api/v1/cards/{id}/claim"));
         assert!(paths.contains(&"/api/v1/cards/{id}/release"));
         assert!(paths.contains(&"/api/v1/cards/{id}/renew"));

@@ -4,7 +4,9 @@ use powder_core::{Authority, Board, Card, CardId, CardStatus, Priority, ReadyQue
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
 };
-use powder_store::{ApiKeyScope, CardFilter, Store, StoreError};
+use powder_store::{
+    ApiKeyScope, CardFilter, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
+};
 
 pub const COMMANDS: &[&str] = &[
     "init-db",
@@ -18,6 +20,11 @@ pub const COMMANDS: &[&str] = &[
     "update-relations",
     "list-ready",
     "list-cards",
+    "repository-list",
+    "repository-get",
+    "repository-upsert",
+    "repository-merge-alias",
+    "repository-delete",
     "claim",
     "release-claim",
     "renew-claim",
@@ -53,6 +60,11 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "update-relations" => update_relations(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest),
+        [command, rest @ ..] if command == "repository-list" => repository_list(rest),
+        [command, rest @ ..] if command == "repository-get" => repository_get(rest),
+        [command, rest @ ..] if command == "repository-upsert" => repository_upsert(rest),
+        [command, rest @ ..] if command == "repository-merge-alias" => repository_merge_alias(rest),
+        [command, rest @ ..] if command == "repository-delete" => repository_delete(rest),
         [command, rest @ ..] if command == "claim" => claim(rest),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest),
@@ -99,7 +111,17 @@ pub fn help() -> String {
     );
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str(
+        "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary\n",
+    );
+    help.push_str(
         "  powder list-cards --db ./data/powder.db --status blocked --repo misty-step/example\n",
+    );
+    help.push_str("  powder repository-list --db ./data/powder.db --include-hidden\n");
+    help.push_str(
+        "  powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary,legacy-canary --visibility visible --import-provenance manual\n",
+    );
+    help.push_str(
+        "  powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator\n",
     );
     help.push_str(
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000\n",
@@ -380,6 +402,7 @@ fn create_card(args: &[String]) -> Result<String, ShellError> {
     card.related = card_ids_flag(args, "--related")?;
     card.blocks = card_ids_flag(args, "--blocks")?;
     card.blocked_by = card_ids_flag(args, "--blocked-by")?;
+    card.repo = flag_value(args, "--repo").map(str::to_string);
     let card = store
         .upsert_card_with_events(card, &authority(args).actor_label(), now)
         .map_err(store_err)?;
@@ -473,6 +496,75 @@ fn list_cards(args: &[String]) -> Result<String, ShellError> {
         out.push_str("no-cards\n");
     }
     Ok(out)
+}
+
+fn repository_list(args: &[String]) -> Result<String, ShellError> {
+    let store = open_store(required_flag(args, "--db")?)?;
+    let repositories = if has_flag(args, "--include-hidden") {
+        store.list_repositories_with_hidden().map_err(store_err)?
+    } else {
+        store.list_repositories().map_err(store_err)?
+    };
+    to_pretty_json(&serde_json::json!({ "repositories": repositories }))
+}
+
+fn repository_get(args: &[String]) -> Result<String, ShellError> {
+    let name = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("repository-get requires a name".to_string()))?;
+    let store = open_store(required_flag(args, "--db")?)?;
+    let repository = store
+        .get_repository(name)
+        .map_err(store_err)?
+        .ok_or_else(|| ShellError::NotFound(format!("repository not found: {name}")))?;
+    to_pretty_json(&repository)
+}
+
+fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let name = required_flag(args, "--name")?.to_string();
+    let visibility = flag_value(args, "--visibility")
+        .map(|raw| {
+            RepositoryVisibility::parse(raw)
+                .ok_or_else(|| ShellError::Invalid(format!("invalid --visibility: {raw}")))
+        })
+        .transpose()?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let repository = store
+        .upsert_repository(
+            RepositoryUpsert {
+                name,
+                aliases: aliases_flag(args),
+                visibility,
+                import_provenance: flag_value(args, "--import-provenance").map(str::to_string),
+            },
+            now,
+        )
+        .map_err(store_err)?;
+    to_pretty_json(&repository)
+}
+
+fn repository_merge_alias(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let alias = required_flag(args, "--alias")?;
+    let target = required_flag(args, "--into")?;
+    let actor = flag_value(args, "--actor").unwrap_or("operator");
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let outcome = store
+        .merge_repository_alias(alias, target, actor, now)
+        .map_err(store_err)?;
+    to_pretty_json(&outcome)
+}
+
+fn repository_delete(args: &[String]) -> Result<String, ShellError> {
+    let name = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("repository-delete requires a name".to_string()))?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    store.delete_repository(name).map_err(store_err)?;
+    Ok(format!("deleted\t{name}\n"))
 }
 
 fn claim(args: &[String]) -> Result<String, ShellError> {
@@ -744,6 +836,17 @@ fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, She
         .collect()
 }
 
+fn aliases_flag(args: &[String]) -> Option<Vec<String>> {
+    flag_value(args, "--aliases").map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
 fn event_filter_flag(args: &[String]) -> Result<Vec<String>, ShellError> {
     Ok(flag_value(args, "--event-filter")
         .unwrap_or_default()
@@ -810,7 +913,10 @@ fn positional(args: &[String]) -> Vec<&str> {
 }
 
 fn flag_takes_value(flag: &str) -> bool {
-    !matches!(flag, "--dry-run" | "--show-secret" | "--admin")
+    !matches!(
+        flag,
+        "--dry-run" | "--show-secret" | "--admin" | "--include-hidden"
+    )
 }
 
 fn store_err(err: StoreError) -> ShellError {
@@ -840,6 +946,11 @@ mod tests {
         assert!(COMMANDS.contains(&"import-github-issues"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"list-cards"));
+        assert!(COMMANDS.contains(&"repository-list"));
+        assert!(COMMANDS.contains(&"repository-get"));
+        assert!(COMMANDS.contains(&"repository-upsert"));
+        assert!(COMMANDS.contains(&"repository-merge-alias"));
+        assert!(COMMANDS.contains(&"repository-delete"));
         assert!(COMMANDS.contains(&"update-relations"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
@@ -1251,6 +1362,70 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, ShellError::Invalid(_)));
+    }
+
+    #[test]
+    fn cli_repository_settings_merge_alias_and_audit_rehomed_card() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-repositories-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        let repository = run(&args([
+            "repository-upsert",
+            "--db",
+            &db,
+            "--name",
+            "misty-step/canary",
+            "--aliases",
+            "canary-app,misty-step/canary",
+            "--visibility",
+            "visible",
+            "--import-provenance",
+            "manual",
+        ]))
+        .unwrap();
+        assert!(repository.contains("\"name\": \"canary\""));
+        assert!(repository.contains("canary-app"));
+
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "legacy-canary",
+            "--title",
+            "Legacy canary",
+            "--acceptance",
+            "proof exists",
+            "--repo",
+            "legacy-canary",
+        ]))
+        .unwrap();
+
+        let merged = run(&args([
+            "repository-merge-alias",
+            "--db",
+            &db,
+            "--alias",
+            "legacy-canary",
+            "--into",
+            "canary",
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert!(merged.contains("\"rehomed_cards\": 1"));
+
+        let card = run(&args(["get-card", "legacy-canary", "--db", &db])).unwrap();
+        assert!(card.contains("\"repo\": \"canary\""));
+        assert!(card.contains("\"event_type\": \"repository\""));
+        assert!(card.contains("legacy-canary -> canary"));
     }
 
     #[test]

@@ -3,7 +3,10 @@ use powder_core::{
     RunState,
 };
 
-use crate::{ApiKeyScope, CardFilter, ImportOutcome, Result, Store, StoreError, API_KEY_ALPHABET};
+use crate::{
+    ApiKeyScope, CardFilter, ImportOutcome, RepositoryUpsert, RepositoryVisibility, Result, Store,
+    StoreError, API_KEY_ALPHABET,
+};
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -174,6 +177,92 @@ fn upsert_card_returns_the_canonical_repo_label_it_persists() -> Result<()> {
             .as_deref(),
         Some("canary")
     );
+    Ok(())
+}
+
+#[test]
+fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let mut short = ready_card("short-canary", 10);
+    short.repo = Some("canary".to_string());
+    let mut stale_slug = ready_card("slug-canary", 11);
+    stale_slug.repo = Some("misty-step/canary".to_string());
+    store.import_cards(vec![short, stale_slug])?;
+
+    store.connection.execute(
+        "UPDATE cards SET repo = 'misty-step/canary' WHERE id = 'slug-canary'",
+        [],
+    )?;
+
+    let merged = store.merge_repository_alias("misty-step/canary", "canary", "operator", 20)?;
+
+    assert_eq!(merged.alias, "misty-step/canary");
+    assert_eq!(merged.repository.name, "canary");
+    assert_eq!(merged.rehomed_cards, 1);
+    assert_eq!(merged.repository.card_count, 2);
+    assert_eq!(
+        merged.repository.aliases,
+        vec!["misty-step/canary".to_string()]
+    );
+
+    let cards = store.list_cards(
+        &CardFilter {
+            status: None,
+            repo: Some("misty-step/canary".to_string()),
+        },
+        20,
+    )?;
+    assert_eq!(cards.len(), 2);
+    assert!(cards
+        .iter()
+        .all(|card| card.repo.as_deref() == Some("canary")));
+
+    let detail = store
+        .get_card_detail(&CardId::new("slug-canary")?)?
+        .expect("rehomed card detail");
+    assert!(detail.events.iter().any(|event| {
+        event.event_type == "repository"
+            && event.actor == "operator"
+            && event.payload.contains("misty-step/canary -> canary")
+    }));
+    Ok(())
+}
+
+#[test]
+fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let repository = store.upsert_repository(
+        RepositoryUpsert {
+            name: "misty-step/powder".to_string(),
+            aliases: Some(vec!["powder-app".to_string()]),
+            visibility: Some(RepositoryVisibility::Hidden),
+            import_provenance: Some("manual settings".to_string()),
+        },
+        10,
+    )?;
+
+    assert_eq!(repository.name, "powder");
+    assert_eq!(repository.visibility, RepositoryVisibility::Hidden);
+    assert_eq!(
+        repository.import_provenance.as_deref(),
+        Some("manual settings")
+    );
+    assert_eq!(
+        repository.aliases,
+        vec!["misty-step/powder".to_string(), "powder-app".to_string()]
+    );
+
+    let visible = store.list_repositories()?;
+    assert_eq!(visible.len(), 0);
+    let all = store.list_repositories_with_hidden()?;
+    assert_eq!(all.len(), 1);
+
+    store.delete_repository("powder")?;
+    assert!(store.get_repository("powder")?.is_none());
     Ok(())
 }
 
@@ -978,7 +1067,7 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 6);
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
 
     // a v1 database steps through every intermediate migration (1->2->3->4),
     // not just straight to current: the legacy bcrypt-hashed key must still
@@ -1084,7 +1173,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 6);
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
 
     // the pre-existing bcrypt key keeps authenticating after the migration
     // adds hash_algorithm (defaulted to 'bcrypt' for existing rows) --
@@ -1191,7 +1280,7 @@ fn migrating_a_v3_database_drops_the_dead_run_columns() -> Result<()> {
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 6);
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
 
     let columns: Vec<String> = {
         let mut statement = store

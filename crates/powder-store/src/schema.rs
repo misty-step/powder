@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -51,6 +51,22 @@ CREATE TABLE IF NOT EXISTS cards (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, created_at, id);
+
+CREATE TABLE IF NOT EXISTS repositories (
+  name TEXT PRIMARY KEY,
+  visibility TEXT NOT NULL DEFAULT 'visible',
+  import_provenance TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repositories_visibility ON repositories(visibility, name);
+
+CREATE TABLE IF NOT EXISTS repository_aliases (
+  alias TEXT PRIMARY KEY,
+  repository_name TEXT NOT NULL REFERENCES repositories(name) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repository_aliases_repository ON repository_aliases(repository_name, alias);
 
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
@@ -258,6 +274,24 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
   attempted_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_delivery_attempts(delivery_id, attempt_number);
+"#;
+
+pub const MIGRATE_6_TO_7: &str = r#"
+CREATE TABLE IF NOT EXISTS repositories (
+  name TEXT PRIMARY KEY,
+  visibility TEXT NOT NULL DEFAULT 'visible',
+  import_provenance TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repositories_visibility ON repositories(visibility, name);
+
+CREATE TABLE IF NOT EXISTS repository_aliases (
+  alias TEXT PRIMARY KEY,
+  repository_name TEXT NOT NULL REFERENCES repositories(name) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repository_aliases_repository ON repository_aliases(repository_name, alias);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, status, priority, labels_json,
