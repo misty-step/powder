@@ -17,11 +17,25 @@ fn config_defaults_to_api_key_auth_and_data_path() {
 
     assert_eq!(config.db_path, PathBuf::from(DEFAULT_DB_PATH));
     assert_eq!(
+        config.import_files_dir,
+        PathBuf::from("/data/imported-backlog.d")
+    );
+    assert_eq!(
         config.bind_addr,
         SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT))
     );
     assert_eq!(config.auth_mode, AuthMode::ApiKey);
     assert!(config.disclose_bootstrap_key);
+}
+
+#[test]
+fn config_accepts_explicit_import_files_dir() {
+    let config = Config::from_pairs([("POWDER_IMPORT_FILES_DIR", "/tmp/powder-imports")]).unwrap();
+
+    assert_eq!(
+        config.import_files_dir,
+        PathBuf::from("/tmp/powder-imports")
+    );
 }
 
 #[test]
@@ -1583,6 +1597,7 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
 #[tokio::test]
 async fn import_accepts_raw_file_contents_body_for_a_remote_client() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let import_files_dir = state.config.import_files_dir.clone();
     let app = app(state);
 
     let ticket = r#"# Body-content import test
@@ -1628,6 +1643,65 @@ Prove a remote client can push parsed cards without server filesystem access.
     assert_eq!(card.status(), StatusCode::OK);
     let card = response_json(card).await;
     assert_eq!(card["card"]["title"], "Body-content import test");
+    assert_eq!(
+        card["card"]["source"]["path"],
+        "backlog.d/001-body-import.md"
+    );
+    assert_eq!(
+        std::fs::read_to_string(import_files_dir.join("backlog.d/001-body-import.md")).unwrap(),
+        ticket
+    );
+}
+
+#[tokio::test]
+async fn import_files_dry_run_does_not_write_inline_markdown_to_disk() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let import_files_dir = state.config.import_files_dir.clone();
+    let app = app(state);
+
+    let ticket = "# Dry run\n\nPriority: P2 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n";
+    let body = json!({
+        "dry_run": true,
+        "files": [{"path": "backlog.d/001-dry-run.md", "contents": ticket}],
+    })
+    .to_string();
+
+    let imported = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&admin_key),
+            &body,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(imported.status(), StatusCode::OK);
+    assert!(!import_files_dir.join("backlog.d/001-dry-run.md").exists());
+}
+
+#[tokio::test]
+async fn import_rejects_inline_file_paths_outside_the_import_directory() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let ticket = "# Escape\n\nPriority: P2 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n";
+    let body = json!({
+        "files": [{"path": "../escape.md", "contents": ticket}],
+    })
+    .to_string();
+
+    let imported = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&admin_key),
+            &body,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(imported.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -2156,9 +2230,17 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
     let mut store = Store::open_in_memory().unwrap();
     store.migrate().unwrap();
     let key = store.apply_initial_seed(1).unwrap().unwrap();
+    let import_files_dir = std::env::temp_dir().join(format!(
+        "powder-server-import-files-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let state = AppState {
         config: Arc::new(Config {
             db_path: PathBuf::from(":memory:"),
+            import_files_dir,
             auth_mode,
             public_base_url: None,
             bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),

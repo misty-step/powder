@@ -79,6 +79,16 @@ When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
 falling back to ephemeral state.
 
+Remote `POST /api/v1/cards/import` calls may submit inline markdown through
+the `files` request body when the server cannot see the caller's checkout. A
+successful non-dry-run inline import writes those files into the instance-owned
+`POWDER_IMPORT_FILES_DIR` before importing them into SQLite, preserving the
+same relative `card.source.path` returned by `GET /api/v1/cards/{id}`. By
+default this directory is `imported-backlog.d` beside `POWDER_DB_PATH`; on Fly
+with the default `/data/powder.db`, that means `/data/imported-backlog.d`.
+To edit existing card content, edit the markdown file under that directory and
+reimport it, rather than patching reconstructed JSON back into the database.
+
 MCP can also run against a local or deployed `powder-server` over HTTP instead
 of opening SQLite directly:
 
@@ -131,6 +141,7 @@ Powder follows the Canary-style deployment pattern:
 
 - one Rust service image
 - SQLite database at `POWDER_DB_PATH`
+- inline import markdown persisted at `POWDER_IMPORT_FILES_DIR`
 - dual-stack/private-Fly listener at `POWDER_BIND_ADDR`
 - Fly volume mounted at `/data`
 - optional Litestream replication to Fly Tigris

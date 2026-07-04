@@ -3,9 +3,9 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
-    env,
+    env, fs,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Component, Path as StdPath, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -54,6 +54,7 @@ struct AppState {
 #[derive(Debug, Clone)]
 struct Config {
     db_path: PathBuf,
+    import_files_dir: PathBuf,
     auth_mode: AuthMode,
     public_base_url: Option<String>,
     bind_addr: SocketAddr,
@@ -97,6 +98,9 @@ impl Config {
         let db_path = env_value(&vars, "POWDER_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
+        let import_files_dir = env_value(&vars, "POWDER_IMPORT_FILES_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_import_files_dir(&db_path));
         let port = match env_value(&vars, "PORT") {
             Some(value) => value
                 .parse::<u16>()
@@ -126,12 +130,21 @@ impl Config {
 
         Ok(Self {
             db_path,
+            import_files_dir,
             auth_mode,
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
             bind_addr,
             disclose_bootstrap_key,
         })
     }
+}
+
+fn default_import_files_dir(db_path: &StdPath) -> PathBuf {
+    db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| StdPath::new("."))
+        .join("imported-backlog.d")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +214,7 @@ struct ListRepositoriesParams {
     include_hidden: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ImportFile {
     path: String,
     contents: String,
@@ -684,6 +697,7 @@ async fn import_cards(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = require_admin(&state, &headers)?;
     let now = unix_now();
+    let mut inline_files = None;
     let mut cards = match (&request.path, request.files) {
         (Some(_), Some(_)) => {
             return Err(ApiError::bad_request(
@@ -695,13 +709,15 @@ async fn import_cards(
         }
         (None, Some(mut files)) => {
             files.sort_by(|left, right| left.path.cmp(&right.path));
-            files
-                .into_iter()
+            let cards = files
+                .iter()
                 .map(|file| {
                     parse_backlog_card(&file.path, &file.contents, now)
                         .map_err(|err| ApiError::bad_request(err.to_string()))
                 })
-                .collect::<std::result::Result<Vec<_>, _>>()?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            inline_files = Some(files);
+            cards
         }
         (None, None) => {
             return Err(ApiError::bad_request("import requires path or files"));
@@ -716,10 +732,63 @@ async fn import_cards(
         let outcome = lock_store(&state)?.preview_import(&cards)?;
         outcome
     } else {
+        if let Some(files) = inline_files.as_deref() {
+            persist_inline_import_files(&state.config.import_files_dir, files)?;
+        }
         let mut store = lock_store(&state)?;
         store.import_cards_with_events(cards, &actor.display_name, now)?
     };
     Ok(Json(json!(outcome)))
+}
+
+fn persist_inline_import_files(root: &StdPath, files: &[ImportFile]) -> Result<(), ApiError> {
+    for file in files {
+        let relative = safe_inline_import_path(&file.path)?;
+        let destination = root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                ApiError::internal(format!(
+                    "could not create import file directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::write(&destination, file.contents.as_bytes()).map_err(|err| {
+            ApiError::internal(format!(
+                "could not write import file {}: {err}",
+                destination.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn safe_inline_import_path(raw: &str) -> Result<PathBuf, ApiError> {
+    let path = StdPath::new(raw);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(ApiError::bad_request(format!(
+            "invalid import file path: {raw}"
+        )));
+    }
+
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "invalid import file path: {raw}"
+                )));
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "invalid import file path: {raw}"
+        )));
+    }
+    Ok(relative)
 }
 
 async fn get_card(
