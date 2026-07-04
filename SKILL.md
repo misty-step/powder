@@ -44,11 +44,12 @@ must never silently evaporate on process exit.
 
 ## Expected MCP Tools
 
-- `list_ready`: return claimable cards sorted by priority, age, and identifier.
+- `list_ready`: return claimable cards from active repositories sorted by
+  priority, age, and identifier.
 - `list_cards`: enumerate cards by optional status/repo filter, including
   `blocked`, `review`, and `done` cards `list_ready` never surfaces.
 - `list_repositories`: list repository entities with aliases, visibility,
-  import provenance, and status counts.
+  tier, import provenance, and status counts.
 - `upsert_repository`: create or update repository settings.
 - `merge_repository_alias`: merge duplicate repo strings into one canonical
   repository and audit re-homed cards.
@@ -83,7 +84,7 @@ powder init-db --db ./data/powder.db --show-secret
 powder import backlog.d --db ./data/powder.db
 powder list-ready --db ./data/powder.db --limit 10
 powder repository-list --db ./data/powder.db --include-hidden
-powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary --visibility visible --import-provenance manual
+powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary --visibility visible --tier active --import-provenance manual
 powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator
 powder claim 001 --db ./data/powder.db --agent codex
 powder heartbeat 001 --db ./data/powder.db --run run-id

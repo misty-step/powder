@@ -29,7 +29,8 @@ use powder_core::{
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
+    Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -282,6 +283,7 @@ struct RepositoryRequest {
     name: Option<String>,
     aliases: Option<Vec<String>>,
     visibility: Option<String>,
+    tier: Option<String>,
     import_provenance: Option<String>,
 }
 
@@ -1267,10 +1269,19 @@ fn repository_upsert(
                 .ok_or_else(|| ApiError::bad_request(format!("invalid visibility: {raw}")))
         })
         .transpose()?;
+    let tier = request
+        .tier
+        .as_deref()
+        .map(|raw| {
+            RepositoryTier::parse(raw)
+                .ok_or_else(|| ApiError::bad_request(format!("invalid tier: {raw}")))
+        })
+        .transpose()?;
     Ok(RepositoryUpsert {
         name,
         aliases: request.aliases,
         visibility,
+        tier,
         import_provenance: request.import_provenance,
     })
 }

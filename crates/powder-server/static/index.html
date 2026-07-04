@@ -115,6 +115,14 @@
             <option value="hidden">hidden</option>
           </select>
         </label>
+        <label>
+          <span class="ae-chrome">Tier</span>
+          <select id="repo-create-tier" class="pw-sort">
+            <option value="active">active</option>
+            <option value="backburner" selected>backburner</option>
+            <option value="archived">archived</option>
+          </select>
+        </label>
         <button class="ae-button ae-button-compact" type="submit">save</button>
       </form>
       <div id="repo-settings-list" class="pw-repo-list" aria-live="polite"></div>
@@ -133,6 +141,10 @@
   <div class="pw-filters" id="filters">
     <span class="pw-filter-group" id="fg-repo" role="group" aria-label="filter by repository">
       <span class="ae-plate-cap">REPO</span>
+    </span>
+    <span class="pw-filter-group" aria-label="repository tier scope">
+      <span class="ae-plate-cap">TIER</span>
+      <button class="pw-filter-clear" id="tier-toggle" type="button" aria-pressed="false">active only</button>
     </span>
     <span class="pw-filter-group" id="fg-prio" role="group" aria-label="filter by priority">
       <span class="ae-plate-cap">PRIORITY</span>

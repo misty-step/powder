@@ -25,15 +25,16 @@ pub use events::{
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
-use repositories::{ensure_repository_entity, resolve_repository_name};
+use repositories::{ensure_repository_entity, repository_tier, resolve_repository_name};
 pub use repositories::{
-    RepositoryMergeOutcome, RepositorySummary, RepositoryUpsert, RepositoryVisibility,
+    RepositoryMergeOutcome, RepositorySummary, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility,
 };
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, RUN_SELECT_SQL, SCHEMA,
-    SCHEMA_VERSION,
+    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, RUN_SELECT_SQL,
+    SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -132,6 +133,7 @@ impl Store {
             let next = match current {
                 0 => {
                     self.connection.execute_batch(SCHEMA)?;
+                    self.apply_ratified_repository_tier_seed()?;
                     SCHEMA_VERSION
                 }
                 1 => {
@@ -158,6 +160,11 @@ impl Store {
                     self.connection.execute_batch(MIGRATE_6_TO_7)?;
                     self.backfill_repositories_from_cards()?;
                     7
+                }
+                7 => {
+                    self.connection.execute_batch(MIGRATE_7_TO_8)?;
+                    self.apply_ratified_repository_tier_seed()?;
+                    8
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -401,6 +408,9 @@ impl Store {
             patched_fields.push("labels");
         }
         if let Some(status) = patch.status {
+            if status == CardStatus::Ready {
+                ensure_ready_repository_allowed(&transaction, &card)?;
+            }
             card.status.validate_transition(status)?;
             card.status = status;
             patched_fields.push("status");
@@ -471,14 +481,18 @@ impl Store {
         // second query per blocker: a blocker missing from this map is
         // treated as still blocking (fail closed).
         let statuses: HashMap<_, _> = all_cards.iter().map(|c| (c.id.clone(), c.status)).collect();
-        let mut cards = all_cards
-            .into_iter()
-            .filter(|card| {
-                card.is_ready_at(query.now, |id| {
-                    statuses.get(id).is_some_and(|status| status.is_terminal())
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut cards = Vec::new();
+        for card in all_cards {
+            if !card.is_ready_at(query.now, |id| {
+                statuses.get(id).is_some_and(|status| status.is_terminal())
+            }) {
+                continue;
+            }
+            if !card_repository_allows_ready(&self.connection, &card)? {
+                continue;
+            }
+            cards.push(card);
+        }
 
         cards.sort_by(|left, right| {
             left.priority
@@ -591,6 +605,7 @@ impl Store {
         }
 
         let run_id = RunId::new(format!("run-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?;
+        ensure_ready_repository_allowed(&transaction, &card)?;
         let claim = card.apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds, |id| {
             terminal_blockers.contains(id)
         })?;
@@ -636,6 +651,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         let previous = card.status;
+        if status == CardStatus::Ready {
+            ensure_ready_repository_allowed(&transaction, &card)?;
+        }
         let released_claim = card.apply_status(status, now)?;
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
@@ -715,6 +733,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         authority.require_holder(card.claim_holder())?;
+        ensure_ready_repository_allowed(&transaction, &card)?;
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
@@ -1224,6 +1243,29 @@ fn card_from_record(connection: &Connection, record: CardRecord) -> Result<Card>
         card.repo = resolve_repository_name(connection, repo)?;
     }
     Ok(card)
+}
+
+fn card_repository_allows_ready(connection: &Connection, card: &Card) -> Result<bool> {
+    let Some(repo) = card.repo.as_deref() else {
+        return Ok(true);
+    };
+    Ok(repository_tier(connection, repo)?.allows_ready())
+}
+
+fn ensure_ready_repository_allowed(connection: &Connection, card: &Card) -> Result<()> {
+    let Some(repo) = card.repo.as_deref() else {
+        return Ok(());
+    };
+    let tier = repository_tier(connection, repo)?;
+    if tier.allows_ready() {
+        Ok(())
+    } else {
+        Err(DomainError::conflict(format!(
+            "repository {repo} is {}; only active repositories may move cards to ready",
+            tier.as_str()
+        ))
+        .into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

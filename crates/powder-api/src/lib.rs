@@ -35,12 +35,12 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/repositories",
-        intent: "list repository entities with aliases, visibility, import provenance, and status counts",
+        intent: "list repository entities with aliases, visibility, tier, import provenance, and status counts",
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/repositories",
-        intent: "create or update a repository entity with aliases, visibility, and import provenance",
+        intent: "create or update a repository entity with aliases, visibility, tier, and import provenance",
     },
     ApiRoute {
         method: "GET",

@@ -4,8 +4,8 @@ use powder_core::{
 };
 
 use crate::{
-    ApiKeyScope, CardFilter, CardPatch, ImportOutcome, RepositoryUpsert, RepositoryVisibility,
-    Result, Store, StoreError, API_KEY_ALPHABET,
+    ApiKeyScope, CardFilter, CardPatch, ImportOutcome, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility, Result, Store, StoreError, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -240,6 +240,7 @@ fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
             name: "misty-step/powder".to_string(),
             aliases: Some(vec!["powder-app".to_string()]),
             visibility: Some(RepositoryVisibility::Hidden),
+            tier: Some(RepositoryTier::Active),
             import_provenance: Some("manual settings".to_string()),
         },
         10,
@@ -247,6 +248,7 @@ fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
 
     assert_eq!(repository.name, "powder");
     assert_eq!(repository.visibility, RepositoryVisibility::Hidden);
+    assert_eq!(repository.tier, RepositoryTier::Active);
     assert_eq!(
         repository.import_provenance.as_deref(),
         Some("manual settings")
@@ -257,12 +259,132 @@ fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
     );
 
     let visible = store.list_repositories()?;
-    assert_eq!(visible.len(), 0);
+    assert!(!visible.iter().any(|summary| summary.name == "powder"));
     let all = store.list_repositories_with_hidden()?;
-    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all.iter()
+            .find(|summary| summary.name == "powder")
+            .expect("hidden powder repository")
+            .visibility,
+        RepositoryVisibility::Hidden
+    );
 
     store.delete_repository("powder")?;
     assert!(store.get_repository("powder")?.is_none());
+    Ok(())
+}
+
+#[test]
+fn ratified_repository_tier_seed_marks_active_backburner_and_archived_repos() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let powder = store.get_repository("powder")?.expect("powder seed");
+    assert_eq!(powder.tier, RepositoryTier::Active);
+    let sploot = store.get_repository("sploot")?.expect("sploot seed");
+    assert_eq!(sploot.tier, RepositoryTier::Backburner);
+    let atlas = store.get_repository("atlas")?.expect("atlas seed");
+    assert_eq!(atlas.tier, RepositoryTier::Archived);
+    let bastion = store
+        .get_repository("sanctum/bastion")?
+        .expect("bastion alias seed");
+    assert_eq!(bastion.name, "bastion");
+    assert_eq!(bastion.tier, RepositoryTier::Active);
+    Ok(())
+}
+
+#[test]
+fn repository_upsert_without_tier_preserves_existing_tier() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let updated = store.upsert_repository(
+        RepositoryUpsert {
+            name: "powder".to_string(),
+            aliases: None,
+            visibility: Some(RepositoryVisibility::Visible),
+            tier: None,
+            import_provenance: Some("old client".to_string()),
+        },
+        10,
+    )?;
+
+    assert_eq!(updated.tier, RepositoryTier::Active);
+    Ok(())
+}
+
+#[test]
+fn list_ready_excludes_ready_cards_from_non_active_repositories() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let mut active = ready_card("powder-ready", 10);
+    active.repo = Some("powder".to_string());
+    let mut backburner = ready_card("sploot-ready", 11);
+    backburner.repo = Some("sploot".to_string());
+    let mut archived = ready_card("atlas-ready", 12);
+    archived.repo = Some("atlas".to_string());
+    store.import_cards(vec![active, backburner, archived])?;
+
+    let ready = store.list_ready(ReadyQuery::new(20, 10))?;
+    let ids = ready
+        .iter()
+        .map(|card| card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["powder-ready"]);
+    Ok(())
+}
+
+#[test]
+fn ready_promotion_is_rejected_for_backburner_repositories() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("sploot-freeze")?;
+    let mut card = ready_card("sploot-freeze", 10);
+    card.repo = Some("sploot".to_string());
+    card.status = CardStatus::Backlog;
+    store.import_cards(vec![card])?;
+
+    let err = store.update_status(&card_id, CardStatus::Ready, 20, &Authority::unchecked());
+    let message = match err {
+        Err(StoreError::Domain(DomainError::Conflict(message))) => message,
+        other => panic!("expected repository tier conflict, got {other:?}"),
+    };
+    assert!(message.contains("repository sploot is backburner"));
+    assert_eq!(
+        store.get_card(&card_id)?.expect("card").status,
+        CardStatus::Backlog
+    );
+    Ok(())
+}
+
+#[test]
+fn release_claim_cannot_make_a_backburner_card_ready() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("claimed-sploot")?;
+    let mut card = ready_card("claimed-sploot", 10);
+    card.repo = Some("sploot".to_string());
+    store.import_cards(vec![card])?;
+    store.connection.execute(
+        "UPDATE repositories SET tier = 'active' WHERE name = 'sploot'",
+        [],
+    )?;
+    let claim = store.claim_card(&card_id, "agent-a", 20, 60, &Authority::unchecked())?;
+    store.connection.execute(
+        "UPDATE repositories SET tier = 'backburner' WHERE name = 'sploot'",
+        [],
+    )?;
+
+    let err = store.release_claim(&card_id, &claim.run_id, 30, &Authority::unchecked());
+    assert!(matches!(
+        err,
+        Err(StoreError::Domain(DomainError::Conflict(_)))
+    ));
+    assert_eq!(
+        store.get_card(&card_id)?.expect("card").status,
+        CardStatus::Claimed
+    );
     Ok(())
 }
 

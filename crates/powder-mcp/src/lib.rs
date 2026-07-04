@@ -2,7 +2,7 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{Authority, CardId, CardStatus, ReadyQuery, RunId};
-use powder_store::{CardFilter, RepositoryUpsert, RepositoryVisibility, Store};
+use powder_store::{CardFilter, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store};
 use serde_json::{json, Value};
 
 mod remote;
@@ -29,13 +29,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_repositories",
-        description: "List repository entities with aliases, visibility, import provenance, and status counts.",
+        description: "List repository entities with aliases, visibility, tier, import provenance, and status counts.",
         input_schema: r#"{"type":"object","properties":{"include_hidden":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "upsert_repository",
-        description: "Create or update one repository entity with canonical name, aliases, visibility, and import provenance.",
-        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"import_provenance":{"type":"string"}}}"#,
+        description: "Create or update one repository entity with canonical name, aliases, visibility, tier, and import provenance.",
+        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"tier":{"type":"string","enum":["active","backburner","archived"]},"import_provenance":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "merge_repository_alias",
@@ -274,6 +274,7 @@ pub fn call_tool_store(
                         name,
                         aliases: optional_string_array(args, "aliases")?,
                         visibility: optional_repository_visibility(args)?,
+                        tier: optional_repository_tier(args)?,
                         import_provenance: optional_str(args, "import_provenance")
                             .map(str::to_string),
                     },
@@ -488,6 +489,12 @@ fn optional_repository_visibility(args: &Value) -> Result<Option<RepositoryVisib
         .map(|raw| {
             RepositoryVisibility::parse(raw).ok_or_else(|| format!("invalid visibility: {raw}"))
         })
+        .transpose()
+}
+
+fn optional_repository_tier(args: &Value) -> Result<Option<RepositoryTier>, String> {
+    optional_str(args, "tier")
+        .map(|raw| RepositoryTier::parse(raw).ok_or_else(|| format!("invalid tier: {raw}")))
         .transpose()
 }
 
@@ -737,7 +744,14 @@ Expose tools against the DB.
             13,
         )
         .unwrap();
-        assert!(tool_payload(&repositories)["repositories"][0]["aliases"]
+        let repositories = tool_payload(&repositories);
+        let canary = repositories["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|repository| repository["name"] == "canary")
+            .expect("canary repository");
+        assert!(canary["aliases"]
             .as_array()
             .unwrap()
             .iter()
@@ -754,6 +768,45 @@ Expose tools against the DB.
                     .unwrap()
                     .contains("legacy-canary -> canary")
         }));
+    }
+
+    #[test]
+    fn mcp_list_ready_excludes_non_active_repositories() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![
+                parse_backlog_card(
+                    "powder.md",
+                    "# Powder\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+                    1,
+                )
+                .unwrap(),
+                parse_backlog_card(
+                    "sploot.md",
+                    "# Sploot\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+                    2,
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        let mut powder = store
+            .get_card(&CardId::new("powder").unwrap())
+            .unwrap()
+            .unwrap();
+        powder.repo = Some("powder".to_string());
+        store.upsert_card(powder).unwrap();
+        let mut sploot = store
+            .get_card(&CardId::new("sploot").unwrap())
+            .unwrap()
+            .unwrap();
+        sploot.repo = Some("sploot".to_string());
+        store.upsert_card(sploot).unwrap();
+
+        let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 10}), 10).unwrap();
+        let text = ready["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("powder"));
+        assert!(!text.contains("sploot"));
     }
 
     #[test]
