@@ -1,0 +1,12 @@
+{
+  "name": "powder-law",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "law": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
+  }
+}
