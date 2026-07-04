@@ -59,6 +59,24 @@ cargo run -q -p powder-cli -- repository-merge-alias --db "$DB" --alias misty-st
 POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```
 
+The CLI can target either SQLite directly or a deployed `powder-server`. For
+remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
+`POWDER_API_KEY`; `--db` always wins when supplied.
+
+| Command | `--db` transport | Remote env transport | Output shape |
+| --- | --- | --- | --- |
+| `list-ready` | SQLite query, or backlog.d preview when a path is supplied | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
+| `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\ttitle` or `no-cards` |
+| `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
+| `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus` |
+| `claim` | SQLite claim lifecycle | `POST /api/v1/cards/{id}/claim` | `claimed\tcard_id\trun_id\texpires_at` |
+| `update-status` | SQLite status lifecycle | `POST /api/v1/cards/{id}/status` | `status\tid\tstatus` |
+| `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
+
+When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
+command, the CLI exits with a one-line transport error instead of silently
+falling back to ephemeral state.
+
 MCP can also run against a local or deployed `powder-server` over HTTP instead
 of opening SQLite directly:
 

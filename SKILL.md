@@ -72,6 +72,12 @@ must never silently evaporate on process exit.
 
 ## Instance CLI
 
+`powder` is remote-capable for the common card workflow: with
+`POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`, `list-cards`,
+`get-card`, `create-card`, `claim`, `update-status`, and `add-comment` operate
+against the deployed instance when `--db` is omitted. `--db` always wins when
+supplied, so a local smoke cannot accidentally mutate the deployed board.
+
 ```sh
 powder init-db --db ./data/powder.db --show-secret
 powder import backlog.d --db ./data/powder.db

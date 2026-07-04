@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod remote;
+
+pub use remote::{urlencode, RemoteClient};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiRoute {
     pub method: &'static str,
