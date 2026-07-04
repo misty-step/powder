@@ -96,6 +96,31 @@ pub const TOOLS: &[ToolDef] = &[
         description: "Set a card done, optionally recording a proof artifact or URL.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
+    ToolDef {
+        name: "create_event_subscription",
+        description: "Create a signed webhook subscription with a URL and event filter. Returns the signing secret once.",
+        input_schema: r#"{"type":"object","required":["url"],"properties":{"url":{"type":"string"},"event_filter":{"type":"array","items":{"type":"string"}}}}"#,
+    },
+    ToolDef {
+        name: "list_event_subscriptions",
+        description: "List webhook subscriptions without disclosing signing secrets.",
+        input_schema: r#"{"type":"object","properties":{}}"#,
+    },
+    ToolDef {
+        name: "disable_event_subscription",
+        description: "Disable a webhook subscription while preserving delivery history.",
+        input_schema: r#"{"type":"object","required":["subscription_id"],"properties":{"subscription_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "list_dead_letters",
+        description: "List webhook deliveries that exhausted retry attempts.",
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "tail_events",
+        description: "Read durable card events after an optional sequence cursor.",
+        input_schema: r#"{"type":"object","properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}}}"#,
+    },
 ];
 
 pub fn tools() -> &'static [ToolDef] {
@@ -324,6 +349,30 @@ pub fn call_tool_store(
                 )
                 .map_err(to_string)?)
         }
+        "create_event_subscription" => {
+            let url = required_str(args, "url")?;
+            json!(store
+                .create_event_subscription(url, string_array(args, "event_filter")?, now)
+                .map_err(to_string)?)
+        }
+        "list_event_subscriptions" => {
+            json!({"subscriptions": store.list_event_subscriptions().map_err(to_string)?})
+        }
+        "disable_event_subscription" => {
+            let subscription_id = required_str(args, "subscription_id")?;
+            json!(store
+                .disable_event_subscription(subscription_id, now)
+                .map_err(to_string)?)
+        }
+        "list_dead_letters" => {
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            json!({"dead_letters": store.list_dead_letter_deliveries(limit).map_err(to_string)?})
+        }
+        "tail_events" => {
+            let after = args["after"].as_i64().unwrap_or(0);
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            json!({"events": store.list_event_tail(after, limit).map_err(to_string)?})
+        }
         other => return Err(format!("unknown tool: {other}")),
     };
 
@@ -349,6 +398,22 @@ fn card_ids_array(args: &Value, key: &'static str) -> Result<Vec<CardId>, String
                     item.as_str()
                         .ok_or_else(|| format!("{key} entries must be strings"))
                         .and_then(|value| CardId::new(value).map_err(to_string))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn string_array(args: &Value, key: &'static str) -> Result<Vec<String>, String> {
+    args[key]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("{key} entries must be strings"))
                 })
                 .collect()
         })
@@ -399,7 +464,7 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 16);
+        assert_eq!(TOOLS.len(), 21);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
         assert!(names.contains(&"update_relations"));
@@ -414,6 +479,11 @@ mod tests {
         assert!(names.contains(&"answer_input"));
         assert!(names.contains(&"add_link"));
         assert!(names.contains(&"request_input"));
+        assert!(names.contains(&"create_event_subscription"));
+        assert!(names.contains(&"list_event_subscriptions"));
+        assert!(names.contains(&"disable_event_subscription"));
+        assert!(names.contains(&"list_dead_letters"));
+        assert!(names.contains(&"tail_events"));
     }
 
     #[test]
@@ -643,6 +713,66 @@ Expose tools against the DB.
             .unwrap()
             .iter()
             .any(|event| event["actor"] == "intruder"));
+    }
+
+    #[test]
+    fn mcp_manages_event_subscriptions_and_tails_events() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let created = call_tool_store(
+            &mut store,
+            "create_event_subscription",
+            &json!({
+                "url": "http://127.0.0.1:9000/webhook",
+                "event_filter": ["moved-to-ready"]
+            }),
+            10,
+        )
+        .unwrap();
+        let created_payload = tool_payload(&created);
+        let subscription_id = created_payload["subscription"]["id"].as_str().unwrap();
+        assert!(created_payload["signing_secret"]
+            .as_str()
+            .unwrap()
+            .starts_with("whsec_powder_"));
+
+        let listed =
+            call_tool_store(&mut store, "list_event_subscriptions", &json!({}), 11).unwrap();
+        assert_eq!(
+            tool_payload(&listed)["subscriptions"][0]["id"],
+            subscription_id
+        );
+
+        store
+            .import_cards(vec![parse_backlog_card(
+                "event.md",
+                "# Event\n\nPriority: P0 | Status: backlog\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+        call_tool_store(
+            &mut store,
+            "update_status",
+            &json!({"card_id": "event", "status": "ready"}),
+            12,
+        )
+        .unwrap();
+        let tail = call_tool_store(&mut store, "tail_events", &json!({"after": 0}), 13).unwrap();
+        assert_eq!(
+            tool_payload(&tail)["events"][0]["event"]["event_type"],
+            "moved-to-ready"
+        );
+
+        let disabled = call_tool_store(
+            &mut store,
+            "disable_event_subscription",
+            &json!({"subscription_id": subscription_id}),
+            14,
+        )
+        .unwrap();
+        assert!(tool_payload(&disabled)["disabled_at"].is_number());
     }
 
     fn tool_payload(response: &Value) -> Value {

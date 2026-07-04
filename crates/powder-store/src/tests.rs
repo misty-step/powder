@@ -333,6 +333,118 @@ fn any_status_transition_is_audited_without_matrix_enforcement() -> Result<()> {
 }
 
 #[test]
+fn moved_to_ready_event_is_durable_and_filters_to_matching_subscription() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let subscription = store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["moved-to-ready".to_string()],
+        5,
+    )?;
+    assert!(subscription.signing_secret.starts_with("whsec_powder_"));
+    assert_eq!(store.list_event_subscriptions()?.len(), 1);
+
+    let card_id = CardId::new("event-ready")?;
+    let mut card = ready_card("event-ready", 10);
+    card.status = CardStatus::Backlog;
+    store.import_cards(vec![card])?;
+
+    store.update_status(
+        &card_id,
+        CardStatus::Ready,
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    let tail = store.list_event_tail(0, 10)?;
+    assert_eq!(tail.len(), 1);
+    assert_eq!(
+        tail[0].event.schema_version,
+        crate::CARD_EVENT_SCHEMA_VERSION
+    );
+    assert_eq!(tail[0].event.event_type, "moved-to-ready");
+    assert_eq!(tail[0].event.card.status.as_str(), "ready");
+    assert_eq!(tail[0].event.change["previous_status"], "backlog");
+
+    let due = store.due_webhook_deliveries(20, 10)?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].event_type, "moved-to-ready");
+    assert_eq!(due[0].url, "http://127.0.0.1:9000/hooks/powder");
+    assert_eq!(due[0].signing_secret, subscription.signing_secret);
+    Ok(())
+}
+
+#[test]
+fn webhook_failures_retry_then_move_to_dead_letter() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["completed".to_string()],
+        5,
+    )?;
+    let card_id = CardId::new("dlq-card")?;
+    store.import_cards(vec![ready_card("dlq-card", 10)])?;
+    store.complete_card(&card_id, None, 20, &Authority::actor("operator", true))?;
+
+    let first = store.due_webhook_deliveries(20, 10)?;
+    assert_eq!(first.len(), 1);
+    store.record_webhook_delivery_failure(&first[0].id, Some(500), "forced failure", 20)?;
+    assert!(store.due_webhook_deliveries(20, 10)?.is_empty());
+
+    let second = store.due_webhook_deliveries(21, 10)?;
+    assert_eq!(second.len(), 1);
+    store.record_webhook_delivery_failure(&second[0].id, Some(500), "forced failure", 21)?;
+
+    let third = store.due_webhook_deliveries(23, 10)?;
+    assert_eq!(third.len(), 1);
+    store.record_webhook_delivery_failure(&third[0].id, Some(500), "forced failure", 23)?;
+
+    let dead = store.list_dead_letter_deliveries(10)?;
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].event_type, "completed");
+    assert_eq!(dead[0].attempt_count, 3);
+    assert_eq!(dead[0].last_status, Some(500));
+    assert_eq!(dead[0].payload.event_type, "completed");
+    Ok(())
+}
+
+#[test]
+fn create_card_with_events_enqueues_card_created_transactionally() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["card-created".to_string()],
+        5,
+    )?;
+
+    let card = ready_card("created-event", 10);
+    let saved = store.upsert_card_with_events(card, "operator", 10)?;
+    assert_eq!(saved.id.as_str(), "created-event");
+
+    let tail = store.list_event_tail(0, 10)?;
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].event.event_type, "card-created");
+    assert_eq!(tail[0].event.card.id.as_str(), "created-event");
+    assert_eq!(store.due_webhook_deliveries(10, 10)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn card_event_v1_fixture_matches_the_documented_schema() {
+    let fixture = include_str!("../tests/fixtures/card_event_v1.json");
+    let raw: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    let event: crate::CardEventEnvelope = serde_json::from_str(fixture).unwrap();
+
+    assert_eq!(event.schema_version, crate::CARD_EVENT_SCHEMA_VERSION);
+    assert!(crate::EVENT_TYPES.contains(&event.event_type.as_str()));
+    assert_eq!(event.card.id.as_str(), "powder-911");
+    assert_eq!(event.card.status.as_str(), "ready");
+    assert!(raw["card"]["status"].is_string());
+}
+
+#[test]
 fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -866,7 +978,7 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 5);
+    assert_eq!(store.schema_version()?, 6);
 
     // a v1 database steps through every intermediate migration (1->2->3->4),
     // not just straight to current: the legacy bcrypt-hashed key must still
@@ -972,7 +1084,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 5);
+    assert_eq!(store.schema_version()?, 6);
 
     // the pre-existing bcrypt key keeps authenticating after the migration
     // adds hash_algorithm (defaulted to 'bcrypt' for existing rows) --
@@ -1079,7 +1191,7 @@ fn migrating_a_v3_database_drops_the_dead_run_columns() -> Result<()> {
 
     let mut store = Store::open(&path)?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 5);
+    assert_eq!(store.schema_version()?, 6);
 
     let columns: Vec<String> = {
         let mut statement = store

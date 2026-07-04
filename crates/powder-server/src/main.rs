@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     env,
     net::SocketAddr,
     path::PathBuf,
@@ -15,10 +16,14 @@ use axum::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, StatusCode,
     },
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
+use hmac::{Hmac, Mac};
 use powder_core::{
     parse_backlog_card, Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId,
 };
@@ -26,6 +31,7 @@ use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{ApiKeyScope, CardFilter, Store, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::Sha256;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
@@ -33,6 +39,8 @@ mod canary;
 
 const DEFAULT_DB_PATH: &str = "/data/powder.db";
 const DEFAULT_PORT: u16 = 4000;
+const SIGNATURE_HEADER: &str = "X-Signature-256";
+const DELIVERY_BATCH_LIMIT: usize = 25;
 
 #[derive(Clone)]
 struct AppState {
@@ -47,7 +55,6 @@ struct Config {
     public_base_url: Option<String>,
     bind_addr: SocketAddr,
     disclose_bootstrap_key: bool,
-    webhook_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -120,7 +127,6 @@ impl Config {
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
             bind_addr,
             disclose_bootstrap_key,
-            webhook_urls: parse_url_list(env_value(&vars, "POWDER_WEBHOOK_URLS")),
         })
     }
 }
@@ -276,6 +282,19 @@ struct CompleteRequest {
     proof: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EventSubscriptionRequest {
+    url: String,
+    event_filter: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailParams {
+    after: Option<i64>,
+    limit: Option<usize>,
+    live: Option<bool>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -311,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::new(config),
         store: Arc::new(Mutex::new(store)),
     };
+    tokio::spawn(delivery_loop(state.clone()));
     let app = app(state);
 
     // `[::]` is a single dual-stack socket on Fly's guest kernel (confirmed
@@ -371,6 +391,16 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/input", post(request_input))
         .route("/api/v1/runs/{id}/answer", post(answer_input))
+        .route(
+            "/api/v1/events/subscriptions",
+            post(create_event_subscription).get(list_event_subscriptions),
+        )
+        .route(
+            "/api/v1/events/subscriptions/{id}/disable",
+            post(disable_event_subscription),
+        )
+        .route("/api/v1/events/dead-letter", get(list_dead_letters))
+        .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .with_state(state)
@@ -533,45 +563,13 @@ async fn import_cards(
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
     }
     let dry_run = request.dry_run.unwrap_or(false);
-    let (outcome, webhook_cards) = if dry_run {
+    let outcome = if dry_run {
         let outcome = lock_store(&state)?.preview_import(&cards)?;
-        (outcome, Vec::new())
+        outcome
     } else {
         let mut store = lock_store(&state)?;
-        let mut events = Vec::new();
-        for card in &cards {
-            let event = match store.get_card(&card.id)? {
-                None => Some("card.create"),
-                Some(current) => {
-                    let current_digest =
-                        current.source.as_ref().map(|source| source.digest.as_str());
-                    let incoming_digest = card.source.as_ref().map(|source| source.digest.as_str());
-                    (current_digest != incoming_digest).then_some("card.update")
-                }
-            };
-            if let Some(event) = event {
-                events.push((event, card.id.clone()));
-            }
-        }
-        let outcome = store.import_cards(cards)?;
-        let mut webhook_cards = Vec::new();
-        for (event, card_id) in events {
-            if let Some(card) = store.get_card(&card_id)? {
-                store.record_card_event(
-                    &card_id,
-                    event.strip_prefix("card.").unwrap_or(event),
-                    &actor.display_name,
-                    "imported card",
-                    now,
-                )?;
-                webhook_cards.push((event, card));
-            }
-        }
-        (outcome, webhook_cards)
+        store.import_cards_with_events(cards, &actor.display_name, now)?
     };
-    for (event, card) in webhook_cards {
-        emit_card_webhooks(&state, event, &card).await;
-    }
     Ok(Json(json!(outcome)))
 }
 
@@ -627,28 +625,10 @@ async fn create_card(
     card.related = card_ids(request.related)?;
     card.blocks = card_ids(request.blocks)?;
     card.blocked_by = card_ids(request.blocked_by)?;
-    let (card, event) = {
+    let card = {
         let mut store = lock_store(&state)?;
-        let event = if store.get_card(&card_id)?.is_some() {
-            "card.update"
-        } else {
-            "card.create"
-        };
-        let card = store.upsert_card(card)?;
-        store.record_card_event(
-            &card.id,
-            event.strip_prefix("card.").unwrap_or(event),
-            &actor.display_name,
-            if event == "card.create" {
-                "created card"
-            } else {
-                "updated card"
-            },
-            now,
-        )?;
-        (card, event)
+        store.upsert_card_with_events(card, &actor.display_name, now)?
     };
-    emit_card_webhooks(&state, event, &card).await;
     Ok(Json(card))
 }
 
@@ -730,7 +710,6 @@ async fn update_status(
         .ok_or_else(|| ApiError::bad_request("invalid status"))?;
     let card =
         lock_store(&state)?.update_status(&card_id, status, unix_now(), &actor.authority())?;
-    emit_card_webhooks(&state, "card.status", &card).await;
     Ok(Json(card))
 }
 
@@ -750,7 +729,6 @@ async fn update_relations(
         unix_now(),
         &actor.authority(),
     )?;
-    emit_card_webhooks(&state, "card.update", &card).await;
     Ok(Json(card))
 }
 
@@ -852,8 +830,99 @@ async fn complete_card(
         unix_now(),
         &actor.authority(),
     )?;
-    emit_card_webhooks(&state, "card.status", &card).await;
     Ok(Json(card))
+}
+
+async fn create_event_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EventSubscriptionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let created = lock_store(&state)?.create_event_subscription(
+        &request.url,
+        request.event_filter.unwrap_or_default(),
+        unix_now(),
+    )?;
+    Ok(Json(json!(created)))
+}
+
+async fn list_event_subscriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let subscriptions = lock_store(&state)?.list_event_subscriptions()?;
+    Ok(Json(json!({ "subscriptions": subscriptions })))
+}
+
+async fn disable_event_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let subscription = lock_store(&state)?.disable_event_subscription(&id, unix_now())?;
+    Ok(Json(json!(subscription)))
+}
+
+async fn list_dead_letters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReadyParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let dead_letters =
+        lock_store(&state)?.list_dead_letter_deliveries(params.limit.unwrap_or(20))?;
+    Ok(Json(json!({ "dead_letters": dead_letters })))
+}
+
+async fn tail_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<TailParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_read(&state, &headers)?;
+    let mut cursor = params.after.unwrap_or(0);
+    let limit = params.limit.unwrap_or(100).max(1);
+    let live = params.live.unwrap_or(false);
+    let stream_state = state.clone();
+    let stream = async_stream::stream! {
+        loop {
+            let events = match lock_store(&stream_state)
+                .and_then(|store| store.list_event_tail(cursor, limit).map_err(ApiError::from))
+            {
+                Ok(events) => events,
+                Err(err) => {
+                    let body = json!({"error": err.message}).to_string();
+                    yield Ok::<_, Infallible>(Event::default().event("error").data(body));
+                    break;
+                }
+            };
+            let empty = events.is_empty();
+            for item in events {
+                cursor = item.sequence;
+                let event_type = item.event.event_type.clone();
+                let data = match serde_json::to_string(&item.event) {
+                    Ok(data) => data,
+                    Err(err) => json!({"error": err.to_string()}).to_string(),
+                };
+                yield Ok::<_, Infallible>(
+                    Event::default()
+                        .id(item.sequence.to_string())
+                        .event(event_type)
+                        .data(data),
+                );
+            }
+            if !live {
+                break;
+            }
+            if empty {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 #[derive(Debug, Serialize)]
@@ -1020,35 +1089,100 @@ fn card_ids(raw: Option<Vec<String>>) -> Result<Vec<CardId>, ApiError> {
         .map_err(ApiError::from)
 }
 
-async fn emit_card_webhooks(state: &AppState, event: &'static str, card: &Card) {
-    if state.config.webhook_urls.is_empty() {
-        return;
-    }
-
-    let payload = json!({
-        "event": event,
-        "card": card,
-    });
-    for url in &state.config.webhook_urls {
-        let url = url.clone();
-        let payload = payload.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .post(&url)
-                .send_json(payload)
-                .map(|_| ())
-                .map_err(|err| err.to_string())
-        })
-        .await;
-
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => tracing::warn!("card webhook delivery failed for {event}: {err}"),
-            Err(err) => tracing::warn!("card webhook task failed for {event}: {err}"),
+async fn delivery_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        if let Err(err) = deliver_due_webhooks_once(&state, unix_now()).await {
+            tracing::warn!("webhook delivery loop failed: {}", err.message);
         }
     }
+}
+
+async fn deliver_due_webhooks_once(state: &AppState, now: i64) -> Result<usize, ApiError> {
+    let deliveries = {
+        let store = lock_store(state)?;
+        store.due_webhook_deliveries(now, DELIVERY_BATCH_LIMIT)?
+    };
+    let mut attempted = 0;
+    for delivery in deliveries {
+        attempted += 1;
+        let delivery_id = delivery.id.clone();
+        match send_webhook_delivery(delivery).await {
+            DeliveryResult::Success(status) => {
+                lock_store(state)?.record_webhook_delivery_success(&delivery_id, status, now)?;
+            }
+            DeliveryResult::Failure { status, error } => {
+                tracing::warn!("webhook delivery failed: {error}");
+                lock_store(state)?.record_webhook_delivery_failure(
+                    &delivery_id,
+                    status,
+                    &error,
+                    now,
+                )?;
+            }
+        }
+    }
+    Ok(attempted)
+}
+
+enum DeliveryResult {
+    Success(u16),
+    Failure { status: Option<u16>, error: String },
+}
+
+async fn send_webhook_delivery(delivery: powder_store::WebhookDelivery) -> DeliveryResult {
+    let result = tokio::task::spawn_blocking(move || {
+        let signature =
+            compute_signature(&delivery.signing_secret, delivery.payload_json.as_bytes())?;
+        let response = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .post(&delivery.url)
+            .set("Content-Type", "application/json")
+            .set(SIGNATURE_HEADER, &signature)
+            .send_string(&delivery.payload_json);
+        match response {
+            Ok(response) if (200..=299).contains(&response.status()) => {
+                Ok(DeliveryResult::Success(response.status()))
+            }
+            Ok(response) => Ok(DeliveryResult::Failure {
+                status: Some(response.status()),
+                error: format!("http {}", response.status()),
+            }),
+            Err(ureq::Error::Status(status, _)) => Ok(DeliveryResult::Failure {
+                status: Some(status),
+                error: format!("http {status}"),
+            }),
+            Err(ureq::Error::Transport(err)) => Ok(DeliveryResult::Failure {
+                status: None,
+                error: err.to_string(),
+            }),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => DeliveryResult::Failure {
+            status: None,
+            error,
+        },
+        Err(error) => DeliveryResult::Failure {
+            status: None,
+            error: error.to_string(),
+        },
+    }
+}
+
+fn compute_signature(secret: &str, body: &[u8]) -> Result<String, String> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|err| err.to_string())?;
+    mac.update(body);
+    Ok(format!(
+        "sha256={}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
 }
 
 fn lock_store(state: &AppState) -> Result<MutexGuard<'_, Store>, ApiError> {
@@ -1139,15 +1273,6 @@ fn env_value<'a>(vars: &'a BTreeMap<String, String>, key: &str) -> Option<&'a st
     vars.get(key)
         .map(String::as_str)
         .filter(|value| !value.is_empty())
-}
-
-fn parse_url_list(raw: Option<&str>) -> Vec<String> {
-    raw.unwrap_or_default()
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn parse_bool(variable: &'static str, value: Option<&str>) -> Result<Option<bool>, ConfigError> {

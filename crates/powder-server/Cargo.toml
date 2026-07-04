@@ -10,12 +10,16 @@ name = "powder-server"
 path = "src/main.rs"
 
 [dependencies]
+async-stream = "0.3"
 axum = "0.8"
+hex = "0.4"
+hmac = "0.12"
 powder-core = { path = "../powder-core" }
 powder-shell = { path = "../powder-shell" }
 powder-store = { path = "../powder-store" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"

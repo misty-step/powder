@@ -1,0 +1,31 @@
+{
+  "schema_version": "powder.card_event.v1",
+  "event_id": "evt-fixture",
+  "event_type": "moved-to-ready",
+  "occurred_at": 1783137600,
+  "actor": "operator",
+  "card": {
+    "id": "powder-911",
+    "title": "Programmable outbound event face",
+    "body": "Emit durable card events.",
+    "acceptance": ["subscriber receives moved-to-ready"],
+    "status": "ready",
+    "priority": "p1",
+    "labels": ["events"],
+    "assignee": null,
+    "related": [],
+    "blocks": [],
+    "blocked_by": [],
+    "repo": "powder",
+    "workspace_path": null,
+    "branch_name": null,
+    "source": null,
+    "claim": null,
+    "created_at": 1783137000,
+    "updated_at": 1783137600
+  },
+  "change": {
+    "previous_status": "backlog",
+    "status": "ready"
+  }
+}

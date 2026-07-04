@@ -187,6 +187,33 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             client.post(&format!("/api/v1/cards/{id}/complete"), body)?
         }
+        "create_event_subscription" => {
+            let url = required_str(args, "url")?;
+            client.post(
+                "/api/v1/events/subscriptions",
+                json!({
+                    "url": url,
+                    "event_filter": args["event_filter"].as_array().cloned().unwrap_or_default(),
+                }),
+            )?
+        }
+        "list_event_subscriptions" => client.get("/api/v1/events/subscriptions")?,
+        "disable_event_subscription" => {
+            let subscription_id = required_str(args, "subscription_id")?;
+            client.post(
+                &format!("/api/v1/events/subscriptions/{subscription_id}/disable"),
+                json!({}),
+            )?
+        }
+        "list_dead_letters" => {
+            let limit = args["limit"].as_u64().unwrap_or(20);
+            client.get(&format!("/api/v1/events/dead-letter?limit={limit}"))?
+        }
+        "tail_events" => {
+            let after = args["after"].as_i64().unwrap_or(0);
+            let limit = args["limit"].as_u64().unwrap_or(20);
+            client.get(&format!("/api/v1/events/tail?after={after}&limit={limit}"))?
+        }
         other => return Err(format!("unknown tool: {other}")),
     };
 
@@ -403,6 +430,49 @@ mod tests {
         assert_eq!(
             requests[0].path,
             "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
+        );
+    }
+
+    #[test]
+    fn create_event_subscription_posts_url_and_filter() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "subscription": {
+                    "id": "sub-1",
+                    "url": "http://127.0.0.1:9000/webhook",
+                    "event_filter": ["moved-to-ready"],
+                    "created_at": 10,
+                    "disabled_at": null
+                },
+                "signing_secret": "whsec_powder_test"
+            }),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "create_event_subscription",
+            &json!({
+                "url": "http://127.0.0.1:9000/webhook",
+                "event_filter": ["moved-to-ready"]
+            }),
+        )
+        .unwrap();
+
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("whsec_powder_test"));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/events/subscriptions");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({
+                "url": "http://127.0.0.1:9000/webhook",
+                "event_filter": ["moved-to-ready"]
+            }))
         );
     }
 

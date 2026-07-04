@@ -104,6 +104,31 @@ pub const ROUTES: &[ApiRoute] = &[
         intent: "mark a card done, optionally recording proof",
     },
     ApiRoute {
+        method: "POST",
+        path: "/api/v1/events/subscriptions",
+        intent: "create a signed webhook subscription with a URL and event filter",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/events/subscriptions",
+        intent: "list webhook subscriptions without disclosing signing secrets",
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/events/subscriptions/{id}/disable",
+        intent: "disable a webhook subscription while preserving delivery history",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/events/dead-letter",
+        intent: "list webhook deliveries that exhausted retry attempts",
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/events/tail",
+        intent: "tail durable card events as Server-Sent Events",
+    },
+    ApiRoute {
         method: "GET",
         path: "/api/v1/keys",
         intent: "list api key metadata (admin scope only, never secrets)",
@@ -145,6 +170,10 @@ mod tests {
         assert!(paths.contains(&"/api/v1/runs/awaiting-input"));
         assert!(paths.contains(&"/api/v1/runs/{id}/input"));
         assert!(paths.contains(&"/api/v1/runs/{id}/answer"));
+        assert!(paths.contains(&"/api/v1/events/subscriptions"));
+        assert!(paths.contains(&"/api/v1/events/subscriptions/{id}/disable"));
+        assert!(paths.contains(&"/api/v1/events/dead-letter"));
+        assert!(paths.contains(&"/api/v1/events/tail"));
         assert!(paths.contains(&"/api/v1/keys"));
         assert!(paths.contains(&"/api/v1/keys/{id}/revoke"));
     }

@@ -57,23 +57,6 @@ fn config_accepts_explicit_bind_addr() {
     assert_eq!(err.variable, "POWDER_BIND_ADDR");
 }
 
-#[test]
-fn config_accepts_webhook_url_list() {
-    let config = Config::from_pairs([(
-        "POWDER_WEBHOOK_URLS",
-        "http://127.0.0.1:9001/hooks/powder, http://127.0.0.1:9002/other",
-    )])
-    .unwrap();
-
-    assert_eq!(
-        config.webhook_urls,
-        vec![
-            "http://127.0.0.1:9001/hooks/powder".to_string(),
-            "http://127.0.0.1:9002/other".to_string()
-        ]
-    );
-}
-
 #[tokio::test]
 async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -292,9 +275,104 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
 }
 
 #[tokio::test]
-async fn webhooks_receive_card_create_update_and_status_payloads() {
-    let (webhook_url, receiver) = spawn_webhook_capture(3);
-    let (state, raw_key) = test_state_with_webhooks(AuthMode::ApiKey, vec![webhook_url]);
+async fn subscriptions_manage_signed_moved_to_ready_delivery() {
+    let (webhook_url, receiver) = spawn_webhook_capture(1, 200);
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state.clone());
+
+    let created_subscription = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/events/subscriptions",
+            Some(&raw_key),
+            &format!(r#"{{"url":"{webhook_url}","event_filter":["moved-to-ready"]}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created_subscription.status(), StatusCode::OK);
+    let created_subscription = response_json(created_subscription).await;
+    let signing_secret = created_subscription["signing_secret"].as_str().unwrap();
+    assert!(signing_secret.starts_with("whsec_powder_"));
+    let subscription_id = created_subscription["subscription"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let listed = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/events/subscriptions",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = response_json(listed).await;
+    assert_eq!(listed["subscriptions"][0]["id"], subscription_id);
+    assert!(
+        !listed.to_string().contains(signing_secret),
+        "list response must not disclose the signing secret"
+    );
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"hooked","title":"Hooked","acceptance":["proof"],"status":"backlog"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let status = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/hooked/status",
+            Some(&raw_key),
+            r#"{"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+
+    let attempted = deliver_due_webhooks_once(&state, unix_now() + 10)
+        .await
+        .unwrap();
+    assert_eq!(attempted, 1);
+
+    let received = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    let expected_signature = compute_signature(signing_secret, received.body.as_bytes()).unwrap();
+    assert_eq!(
+        received.signature.as_deref(),
+        Some(expected_signature.as_str())
+    );
+    assert_eq!(received.json["schema_version"], "powder.card_event.v1");
+    assert_eq!(received.json["event_type"], "moved-to-ready");
+    assert_eq!(received.json["card"]["status"], "ready");
+
+    let disabled = app
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/events/subscriptions/{subscription_id}/disable"),
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let disabled = response_json(disabled).await;
+    assert!(disabled["disabled_at"].is_number());
+}
+
+#[tokio::test]
+async fn sse_tail_replays_card_events_as_event_stream() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
     let created = app
@@ -303,44 +381,134 @@ async fn webhooks_receive_card_create_update_and_status_payloads() {
             Method::POST,
             "/api/v1/cards",
             Some(&raw_key),
-            r#"{"id":"hooked","title":"Hooked","acceptance":["proof"],"status":"ready"}"#,
+            r#"{"id":"tail-card","title":"Tail Card","acceptance":["proof"],"status":"backlog"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
 
-    let relations = app
+    let status = app
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/cards/hooked/relations",
+            "/api/v1/cards/tail-card/status",
             Some(&raw_key),
-            r#"{"related":["neighbor"],"blocks":[],"blocked_by":[]}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(relations.status(), StatusCode::OK);
-
-    let status = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/hooked/status",
-            Some(&raw_key),
-            r#"{"status":"done"}"#,
+            r#"{"status":"ready"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
 
-    let first = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    let second = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    let third = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(first["event"], "card.create");
-    assert_eq!(first["card"]["id"], "hooked");
-    assert_eq!(second["event"], "card.update");
-    assert_eq!(second["card"]["related"][0], "neighbor");
-    assert_eq!(third["event"], "card.status");
-    assert_eq!(third["card"]["status"], "done");
+    let response = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/events/tail",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = response_text(response).await;
+    assert!(content_type.starts_with("text/event-stream"));
+    assert!(body.contains("event: moved-to-ready"));
+    assert!(body.contains(r#""schema_version":"powder.card_event.v1""#));
+}
+
+#[tokio::test]
+async fn forced_webhook_failures_retry_to_dead_letter_view() {
+    let (webhook_url, receiver) = spawn_webhook_capture(3, 500);
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state.clone());
+
+    let created_subscription = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/events/subscriptions",
+            Some(&raw_key),
+            &format!(r#"{{"url":"{webhook_url}","event_filter":["completed"]}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created_subscription.status(), StatusCode::OK);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"dlq-card","title":"DLQ Card","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let completed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/dlq-card/complete",
+            Some(&raw_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+
+    let base = unix_now() + 10;
+    assert_eq!(deliver_due_webhooks_once(&state, base).await.unwrap(), 1);
+    assert_eq!(
+        deliver_due_webhooks_once(&state, base + 1).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        deliver_due_webhooks_once(&state, base + 3).await.unwrap(),
+        1
+    );
+    for _ in 0..3 {
+        let received = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(received.json["event_type"], "completed");
+    }
+
+    let dead = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/events/dead-letter",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), StatusCode::OK);
+    let dead = response_json(dead).await;
+    assert_eq!(dead["dead_letters"][0]["event_type"], "completed");
+    assert_eq!(dead["dead_letters"][0]["attempt_count"], 3);
+    assert_eq!(dead["dead_letters"][0]["last_status"], 500);
+}
+
+#[test]
+fn demo_style_receiver_rejects_bad_signature() {
+    let (url, receiver) = spawn_verifying_webhook("receiver-secret");
+    let err = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set(SIGNATURE_HEADER, "sha256=bad")
+        .send_string(r#"{"schema_version":"powder.card_event.v1"}"#)
+        .unwrap_err();
+    match err {
+        ureq::Error::Status(status, _) => assert_eq!(status, 401),
+        other => panic!("expected 401 rejection, got {other}"),
+    }
+    let received = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(received.signature.as_deref(), Some("sha256=bad"));
 }
 
 #[tokio::test]
@@ -1538,10 +1706,6 @@ async fn every_request_triggers_the_trace_layer_without_leaking_the_bearer_token
 }
 
 fn test_state(auth_mode: AuthMode) -> (AppState, String) {
-    test_state_with_webhooks(auth_mode, Vec::new())
-}
-
-fn test_state_with_webhooks(auth_mode: AuthMode, webhook_urls: Vec<String>) -> (AppState, String) {
     let mut store = Store::open_in_memory().unwrap();
     store.migrate().unwrap();
     let key = store.apply_initial_seed(1).unwrap().unwrap();
@@ -1552,14 +1716,23 @@ fn test_state_with_webhooks(auth_mode: AuthMode, webhook_urls: Vec<String>) -> (
             public_base_url: None,
             bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
             disclose_bootstrap_key: false,
-            webhook_urls,
         }),
         store: Arc::new(Mutex::new(store)),
     };
     (state, key.raw_key)
 }
 
-fn spawn_webhook_capture(count: usize) -> (String, mpsc::Receiver<serde_json::Value>) {
+#[derive(Debug)]
+struct CapturedWebhook {
+    signature: Option<String>,
+    body: String,
+    json: serde_json::Value,
+}
+
+fn spawn_webhook_capture(
+    count: usize,
+    response_status: u16,
+) -> (String, mpsc::Receiver<CapturedWebhook>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/webhook", listener.local_addr().unwrap());
     let (sender, receiver) = mpsc::channel();
@@ -1571,6 +1744,7 @@ fn spawn_webhook_capture(count: usize) -> (String, mpsc::Receiver<serde_json::Va
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
             let mut content_length = 0usize;
+            let mut signature = None;
             loop {
                 let mut header = String::new();
                 reader.read_line(&mut header).unwrap();
@@ -1580,14 +1754,85 @@ fn spawn_webhook_capture(count: usize) -> (String, mpsc::Receiver<serde_json::Va
                 if let Some(value) = header.strip_prefix("Content-Length:") {
                     content_length = value.trim().parse().unwrap();
                 }
+                let lower = header.to_ascii_lowercase();
+                if lower.starts_with("x-signature-256:") {
+                    signature = header
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().to_string());
+                }
             }
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
-            sender.send(serde_json::from_slice(&body).unwrap()).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            sender
+                .send(CapturedWebhook {
+                    signature,
+                    json: serde_json::from_str(&body).unwrap(),
+                    body,
+                })
+                .unwrap();
 
-            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            let reason = if response_status == 200 {
+                "OK"
+            } else {
+                "Error"
+            };
+            let response = format!(
+                "HTTP/1.1 {response_status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
             stream.write_all(response.as_bytes()).unwrap();
         }
+    });
+
+    (url, receiver)
+}
+
+fn spawn_verifying_webhook(secret: &'static str) -> (String, mpsc::Receiver<CapturedWebhook>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut content_length = 0usize;
+        let mut signature = None;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).unwrap();
+            if header == "\r\n" || header.is_empty() {
+                break;
+            }
+            if let Some(value) = header.strip_prefix("Content-Length:") {
+                content_length = value.trim().parse().unwrap();
+            }
+            let lower = header.to_ascii_lowercase();
+            if lower.starts_with("x-signature-256:") {
+                signature = header
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().to_string());
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        let expected = compute_signature(secret, &body).unwrap();
+        let accepted = signature.as_deref() == Some(expected.as_str());
+        let body = String::from_utf8(body).unwrap();
+        sender
+            .send(CapturedWebhook {
+                signature,
+                json: serde_json::from_str(&body).unwrap_or_else(|_| json!({})),
+                body,
+            })
+            .unwrap();
+        let status = if accepted { 200 } else { 401 };
+        let reason = if accepted { "OK" } else { "Unauthorized" };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
     });
 
     (url, receiver)
