@@ -23,7 +23,7 @@
    On failure, assertLaw throws with named offenders — which invariant
    broke and which elements caused it. No silent pass/fail. */
 
-import { expect, type Page } from '@playwright/test';
+import type { Page } from '@playwright/test';
 import {
   checkAll,
   collectConsoleErrors,
@@ -54,7 +54,7 @@ export async function assertLaw(
         `✗ law violation: ${v.invariant}\n  offenders:\n    ${v.offenders.join('\n    ')}`,
     )
     .join('\n');
-  expect.fail(`\n${message}\n`);
+  throw new Error(`\n${message}\n`);
 }
 
 /** Returns a Playwright test function that navigates to a route, optionally

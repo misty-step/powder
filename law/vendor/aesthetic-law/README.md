@@ -1,9 +1,25 @@
 # Vendored: @misty-step/aesthetic law gate
 
 `index.ts` and `invariants.ts` are byte-identical copies of
-`misty-step/aesthetic`'s `law/` directory at tag **v2.16.0** — the same tag
-`crates/powder-server/static/assets/aesthetic.css` already vendors, so the
-law and the CSS it checks are pinned together.
+`misty-step/aesthetic`'s `law/` directory at tag **v2.17.1**.
+
+**Note:** `crates/powder-server/static/assets/aesthetic.css` is still
+vendored at v2.16.0 as of this law refresh. The law-gate bump to v2.17.1 was
+a targeted bugfix pull (see below) done ahead of the next CSS refresh, so the
+two are temporarily unpinned from each other; `invariants.ts` did not change
+between the two tags, so the law the gate checks is unaffected. Bump the CSS
+asset to v2.17.1 in a follow-up change to re-pin them, per "Upgrading" below.
+
+### Why this refresh (v2.16.0 → v2.17.1)
+
+v2.16.0's `index.ts` had `assertLaw`'s failure branch call
+`expect.fail(...)`, importing `expect` from `@playwright/test` — but
+Playwright's `expect` has no `.fail()` method (that's a Jest/Vitest API).
+Every real law violation threw a raw `TypeError: expect.fail is not a
+function` instead of the intended named-offender `Error`. Fixed upstream in
+`misty-step/aesthetic` v2.17.1 (commit 9dd7ac0, fix at 00fb5b9):
+`assertLaw` now does `throw new Error(...)` directly and no longer imports
+`expect` at all. `invariants.ts` was not touched by this fix.
 
 ## Why vendored instead of a package dependency
 
