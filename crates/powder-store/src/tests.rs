@@ -33,7 +33,7 @@ fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
         store.migrate()?;
         assert_eq!(store.journal_mode()?.to_ascii_lowercase(), "wal");
         let bootstrap = store.apply_initial_seed(1)?.expect("first seed");
-        assert!(store.verify_api_key(&bootstrap.raw_key)?.is_some());
+        assert!(store.verify_api_key(&bootstrap.raw_key, 2)?.is_some());
         store.import_cards(vec![ready_card("001", 2)])?;
         store.claim_card(&card_id, "agent-a", 10, 60, &Authority::unchecked())?
     };
@@ -1170,7 +1170,9 @@ fn created_agent_key_verifies_with_agent_scope() -> Result<()> {
     store.migrate()?;
 
     let key = store.create_api_key("agent", ApiKeyScope::Agent, 1)?;
-    let verified = store.verify_api_key(&key.raw_key)?.expect("verified key");
+    let verified = store
+        .verify_api_key(&key.raw_key, 2)?
+        .expect("verified key");
 
     assert_eq!(verified.scope, ApiKeyScope::Agent);
     assert_eq!(verified.name, "agent");
@@ -1192,10 +1194,39 @@ fn list_api_keys_reports_metadata_never_secrets() -> Result<()> {
     assert_eq!(keys[0].id, bootstrap.id);
     assert_eq!(keys[0].scope, ApiKeyScope::Admin);
     assert_eq!(keys[0].revoked_at, None);
+    assert_eq!(keys[0].key_prefix, bootstrap.key_prefix);
+    assert_eq!(keys[0].last_used_at, None);
     assert_eq!(keys[1].id, agent.id);
     assert_eq!(keys[1].name, "codex");
     assert_eq!(keys[1].actor.display_name, "codex");
     assert_eq!(keys[1].revoked_at, None);
+    assert_eq!(keys[1].key_prefix, agent.key_prefix);
+    assert_eq!(keys[1].last_used_at, None);
+    Ok(())
+}
+
+#[test]
+fn verify_api_key_records_last_used_at_on_success_only() -> Result<()> {
+    // powder-931: last_used_at is the mechanical signal a key-hygiene audit
+    // needs -- must move on a real verify, never move on a failed one, and
+    // never touch keys that weren't the one presented.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let used = store.create_api_key("used", ApiKeyScope::Agent, 1)?;
+    let unused = store.create_api_key("unused", ApiKeyScope::Agent, 1)?;
+
+    assert!(store
+        .verify_api_key("sk_powder_not_a_real_key", 5)?
+        .is_none());
+    let before = store.list_api_keys()?;
+    assert!(before.iter().all(|key| key.last_used_at.is_none()));
+
+    assert!(store.verify_api_key(&used.raw_key, 10)?.is_some());
+    let after = store.list_api_keys()?;
+    let used_summary = after.iter().find(|key| key.id == used.id).unwrap();
+    let unused_summary = after.iter().find(|key| key.id == unused.id).unwrap();
+    assert_eq!(used_summary.last_used_at, Some(10));
+    assert_eq!(unused_summary.last_used_at, None);
     Ok(())
 }
 
@@ -1204,11 +1235,11 @@ fn revoke_api_key_fails_verification_immediately() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let key = store.create_api_key("codex", ApiKeyScope::Agent, 1)?;
-    assert!(store.verify_api_key(&key.raw_key)?.is_some());
+    assert!(store.verify_api_key(&key.raw_key, 2)?.is_some());
 
     store.revoke_api_key(&key.id, 10)?;
 
-    assert!(store.verify_api_key(&key.raw_key)?.is_none());
+    assert!(store.verify_api_key(&key.raw_key, 11)?.is_none());
     let listed = store.list_api_keys()?;
     assert_eq!(listed[0].revoked_at, Some(10));
     Ok(())
@@ -1254,7 +1285,7 @@ fn the_bootstrap_key_can_be_revoked_like_any_other() -> Result<()> {
 
     store.revoke_api_key(&bootstrap.id, 5)?;
 
-    assert!(store.verify_api_key(&bootstrap.raw_key)?.is_none());
+    assert!(store.verify_api_key(&bootstrap.raw_key, 6)?.is_none());
     Ok(())
 }
 
@@ -1345,7 +1376,7 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
     // not just straight to current: the legacy bcrypt-hashed key must still
     // verify after picking up hash_algorithm (defaulted to 'bcrypt' for
     // pre-existing rows), proving the loop didn't skip a step.
-    let verified = store.verify_api_key(raw_key)?.expect("migrated key");
+    let verified = store.verify_api_key(raw_key, 21)?.expect("migrated key");
     assert_eq!(verified.name, "legacy-agent");
     assert_eq!(verified.actor.id, "actor-key-legacy");
     assert_eq!(verified.actor.display_name, "legacy-agent");
@@ -1353,7 +1384,7 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
 
     let created = store.create_api_key("new-agent", ApiKeyScope::Agent, 20)?;
     let verified = store
-        .verify_api_key(&created.raw_key)?
+        .verify_api_key(&created.raw_key, 22)?
         .expect("new key after migration");
     assert_eq!(verified.actor.display_name, "new-agent");
     assert_eq!(verified.actor.kind.as_str(), "agent");
@@ -1451,7 +1482,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
     // adds hash_algorithm (defaulted to 'bcrypt' for existing rows) --
     // switching new keys to sha256 must never break a key that already
     // exists in the wild on a deployed instance.
-    let verified = store.verify_api_key(raw_key)?.expect("legacy v2 key");
+    let verified = store.verify_api_key(raw_key, 21)?.expect("legacy v2 key");
     assert_eq!(verified.actor.display_name, "v2-agent");
 
     // a key created after the migration is hashed with sha256, not bcrypt.
@@ -1463,7 +1494,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
     )?;
     assert_eq!(stored_algorithm, "sha256");
     let verified = store
-        .verify_api_key(&created.raw_key)?
+        .verify_api_key(&created.raw_key, 31)?
         .expect("new sha256 key");
     assert_eq!(verified.actor.display_name, "post-migration-agent");
     Ok(())
@@ -1610,7 +1641,7 @@ fn verify_api_key_fails_closed_for_an_unrecognized_hash_algorithm() -> Result<()
         [&created.id],
     )?;
 
-    assert!(store.verify_api_key(&created.raw_key)?.is_none());
+    assert!(store.verify_api_key(&created.raw_key, 11)?.is_none());
     Ok(())
 }
 

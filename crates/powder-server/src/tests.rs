@@ -2023,6 +2023,110 @@ async fn admin_can_list_and_revoke_a_key_which_then_loses_access_immediately() {
 }
 
 #[tokio::test]
+async fn list_keys_surfaces_key_prefix_and_last_used_at_over_http() {
+    // powder-931: an operator auditing key hygiene over the API needs the
+    // same last_used_at/key_prefix signal the store already tracks -- not
+    // just a raw DB query.
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key_raw = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let before = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/keys",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let before = response_json(before).await;
+    let agent_before = before["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["name"] == "codex")
+        .expect("agent key listed");
+    assert!(agent_before["last_used_at"].is_null());
+    let prefix = agent_before["key_prefix"].as_str().unwrap().to_string();
+    assert!(
+        agent_key_raw.starts_with(&prefix),
+        "key_prefix must be a genuine prefix of the raw key"
+    );
+    assert!(
+        !agent_key_raw.eq(&prefix),
+        "key_prefix must not be the full raw secret"
+    );
+
+    // authorize_read (GET /api/v1/cards/ready and friends) never calls
+    // verify_api_key under ApiKey mode -- see the read-posture finding on
+    // powder-931 -- so last_used_at only moves for routes that go through
+    // authorize(), like claim.
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"key-usage-proof","title":"Key usage proof","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let claim_call = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/key-usage-proof/claim",
+            Some(&agent_key_raw),
+            r#"{"agent":"codex","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim_call.status(), StatusCode::OK);
+
+    let after = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/keys",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let after = response_json(after).await;
+    let agent_after = after["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["name"] == "codex")
+        .expect("agent key listed");
+    assert!(
+        agent_after["last_used_at"].as_i64().is_some(),
+        "using the key must set last_used_at"
+    );
+
+    let admin_after = after["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["scope"] == "admin")
+        .expect("admin key listed");
+    assert!(
+        admin_after["last_used_at"].as_i64().is_some(),
+        "the admin key that made these calls must show its own last_used_at too"
+    );
+}
+
+#[tokio::test]
 async fn revoking_an_unknown_key_id_returns_not_found() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

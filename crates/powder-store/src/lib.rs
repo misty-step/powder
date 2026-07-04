@@ -35,7 +35,7 @@ pub use repositories::{
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
     MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
-    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -177,6 +177,10 @@ impl Store {
                 8 => {
                     self.connection.execute_batch(MIGRATE_8_TO_9)?;
                     9
+                }
+                9 => {
+                    self.connection.execute_batch(MIGRATE_9_TO_10)?;
+                    10
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };

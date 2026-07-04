@@ -84,15 +84,21 @@ pub struct VerifiedApiKey {
     pub scope: ApiKeyScope,
 }
 
-/// Key metadata for listing: never the hash or the raw secret.
+/// Key metadata for listing: never the hash or the raw secret. `key_prefix`
+/// is the same non-secret lookup prefix `verify_api_key` already indexes
+/// on (12 of the ~42 raw-key characters) -- exposing it lets an operator
+/// who holds one physical key locally identify which row it is without
+/// ever transmitting the secret itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiKeySummary {
     pub id: String,
     pub actor: Actor,
     pub name: String,
     pub scope: ApiKeyScope,
+    pub key_prefix: String,
     pub created_at: i64,
     pub revoked_at: Option<i64>,
+    pub last_used_at: Option<i64>,
 }
 
 impl Store {
@@ -136,7 +142,10 @@ impl Store {
         Ok(key)
     }
 
-    pub fn verify_api_key(&self, raw_key: &str) -> Result<Option<VerifiedApiKey>> {
+    /// `now` records the successful verification's timestamp against the
+    /// matched key (powder-931: `last_used_at` is the mechanical signal an
+    /// orphaned-key audit needs instead of guessing from config greps).
+    pub fn verify_api_key(&mut self, raw_key: &str, now: i64) -> Result<Option<VerifiedApiKey>> {
         let prefix = key_prefix(raw_key);
         let mut statement = self.connection.prepare(
             "SELECT api_keys.id, api_keys.name, api_keys.scope, api_keys.key_hash,
@@ -190,6 +199,10 @@ impl Store {
                         field: "actors.kind",
                         value: actor_kind,
                     })?;
+                self.connection.execute(
+                    "UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )?;
                 return Ok(Some(VerifiedApiKey {
                     id,
                     actor: Actor {
@@ -219,6 +232,7 @@ impl Store {
     pub fn list_api_keys(&self) -> Result<Vec<ApiKeySummary>> {
         let mut statement = self.connection.prepare(
             "SELECT api_keys.id, api_keys.name, api_keys.scope, api_keys.created_at, api_keys.revoked_at,
+                    api_keys.key_prefix, api_keys.last_used_at,
                     actors.id, actors.kind, actors.display_name, actors.created_at
              FROM api_keys
              JOIN actors ON actors.id = api_keys.actor_id
@@ -233,9 +247,11 @@ impl Store {
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -248,6 +264,8 @@ impl Store {
                     scope,
                     created_at,
                     revoked_at,
+                    key_prefix,
+                    last_used_at,
                     actor_id,
                     actor_kind,
                     actor_name,
@@ -273,8 +291,10 @@ impl Store {
                         },
                         name,
                         scope,
+                        key_prefix,
                         created_at,
                         revoked_at,
+                        last_used_at,
                     })
                 },
             )

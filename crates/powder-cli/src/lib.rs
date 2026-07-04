@@ -266,14 +266,18 @@ fn key_list(args: &[String]) -> Result<String, ShellError> {
     let mut out = String::new();
     for key in keys {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             key.id,
             key.name,
             key.scope.as_str(),
+            key.key_prefix,
             key.created_at,
             key.revoked_at
                 .map(|at| at.to_string())
-                .unwrap_or_else(|| "active".to_string())
+                .unwrap_or_else(|| "active".to_string()),
+            key.last_used_at
+                .map(|at| at.to_string())
+                .unwrap_or_else(|| "never".to_string())
         ));
     }
     Ok(out)
@@ -2034,14 +2038,34 @@ mod tests {
         ]))
         .unwrap();
         let key_id = created.split('\t').nth(1).expect("key id").to_owned();
+        let raw_key = created
+            .split('\t')
+            .nth(3)
+            .expect("raw key")
+            .trim()
+            .to_owned();
 
         let listed = run(&args(["key-list", "--db", &db])).unwrap();
         assert!(listed.contains(&key_id));
         assert!(listed.contains("codex"));
         assert!(listed.contains("active"));
         assert!(
-            !listed.contains("sk_powder_"),
-            "key-list must never print raw secrets"
+            !listed.contains(&raw_key),
+            "key-list must never print the raw secret"
+        );
+        let listed_line = listed
+            .lines()
+            .find(|line| line.contains(&key_id))
+            .expect("created key listed");
+        let listed_fields: Vec<&str> = listed_line.split('\t').collect();
+        assert_eq!(listed_fields[5], "active");
+        assert_eq!(
+            listed_fields[6], "never",
+            "unused key must report never used"
+        );
+        assert!(
+            raw_key.starts_with(listed_fields[3]),
+            "key-list's key_prefix must be a real prefix of the raw key"
         );
 
         let revoked = run(&args(["key-revoke", &key_id, "--db", &db])).unwrap();
@@ -2052,8 +2076,9 @@ mod tests {
             .lines()
             .find(|line| line.contains(&key_id))
             .expect("revoked key still listed");
-        assert!(
-            !revoked_line.ends_with("active"),
+        let revoked_fields: Vec<&str> = revoked_line.split('\t').collect();
+        assert_ne!(
+            revoked_fields[5], "active",
             "revoked key must not report active: {revoked_line}"
         );
 

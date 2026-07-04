@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
   hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
   scope TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  revoked_at INTEGER
+  revoked_at INTEGER,
+  last_used_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
 
@@ -306,6 +307,14 @@ CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories(tier, name);
 pub const MIGRATE_8_TO_9: &str = r#"
 ALTER TABLE cards ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE cards ADD COLUMN proof_plan_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
+/// powder-931: key hygiene is currently a manual, error-prone audit against
+/// a list with no signal for "is anything still using this". Recording the
+/// last successful `verify_api_key` per key makes an orphaned-key inventory
+/// mechanical instead of archaeological.
+pub const MIGRATE_9_TO_10: &str = r#"
+ALTER TABLE api_keys ADD COLUMN last_used_at INTEGER;
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, labels_json,
