@@ -37,6 +37,7 @@ pub const COMMANDS: &[&str] = &[
     "list-awaiting-input",
     "answer-input",
     "update-status",
+    "check-criterion",
     "add-link",
     "add-comment",
     "request-input",
@@ -118,6 +119,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
         [command, rest @ ..] if command == "answer-input" => answer_input(rest),
         [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
+        [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
         [command, rest @ ..] if command == "add-link" => add_link(rest),
         [command, rest @ ..] if command == "add-comment" => add_comment(rest, remote_env),
         [command, rest @ ..] if command == "request-input" => request_input(rest),
@@ -155,7 +157,7 @@ pub fn help() -> String {
     );
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str(
-        "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary\n",
+        "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary [--proof-plan \"CI + PR\"]\n",
     );
     help.push_str(
         "  powder list-cards --db ./data/powder.db --status blocked --repo misty-step/example\n",
@@ -180,6 +182,9 @@ pub fn help() -> String {
         "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
     );
     help.push_str("  powder update-status 001 --db ./data/powder.db --status running\n");
+    help.push_str(
+        "  powder check-criterion 001 --db ./data/powder.db --criterion 0 --actor operator [--unchecked]\n",
+    );
     help.push_str(
         "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
     );
@@ -426,6 +431,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let acceptance: Vec<String> = flag_value(args, "--acceptance")
         .map(|value| vec![value.to_string()])
         .unwrap_or_default();
+    let proof_plan: Vec<String> = flag_value(args, "--proof-plan")
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
     let status = flag_value(args, "--status")
         .and_then(CardStatus::parse)
         .unwrap_or(if acceptance.is_empty() {
@@ -453,6 +461,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .with_status(status)
         .with_priority(priority)
         .with_acceptance(acceptance)
+        .with_proof_plan(proof_plan.clone())
         .with_created_at(now);
         card.related = related;
         card.blocks = blocks;
@@ -474,6 +483,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         });
         if let Some(body) = body {
             payload["body"] = json!(body);
+        }
+        if !proof_plan.is_empty() {
+            payload["proof_plan"] = json!(proof_plan);
         }
         if let Some(repo) = repo {
             payload["repo"] = json!(repo);
@@ -827,6 +839,35 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     ))
 }
 
+fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "check-criterion")?;
+    let criterion = criterion_flag(args)?;
+    let actor = required_flag(args, "--actor")?;
+    let checked = !has_flag(args, "--unchecked");
+    let card = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .check_criterion(&card_id, criterion, actor, checked, now)
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/criteria/check"),
+                json!({"criterion": criterion, "actor": actor, "checked": checked}),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("check-criterion"));
+    };
+    Ok(format!(
+        "criterion\t{}\t{}\t{}\n",
+        json_string(&card, "id")?,
+        criterion,
+        if checked { "checked" } else { "unchecked" }
+    ))
+}
+
 fn add_link(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "add-link")?;
@@ -886,9 +927,10 @@ fn complete_card(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "complete-card")?;
     let proof = flag_value(args, "--proof");
+    let criterion_proofs = criterion_proofs_flag(args)?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .complete_card(&card_id, proof, now, &authority(args))
+        .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "completed\t{}\t{}\n",
@@ -1034,6 +1076,36 @@ fn event_filter_flag(args: &[String]) -> Result<Vec<String>, ShellError> {
         .collect())
 }
 
+fn criterion_proofs_flag(
+    args: &[String],
+) -> Result<Vec<powder_store::CriterionProofInput>, ShellError> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_str() == "--criterion-proof")
+        .filter_map(|(index, _)| args.get(index + 1))
+        .map(|raw| {
+            let (criterion, url) = raw.split_once('=').ok_or_else(|| {
+                ShellError::Invalid(
+                    "--criterion-proof must be formatted as <criterion-index>=<url>".to_string(),
+                )
+            })?;
+            let criterion = criterion.parse::<usize>().map_err(|err| {
+                ShellError::Invalid(format!("invalid criterion index {criterion}: {err}"))
+            })?;
+            Ok(powder_store::CriterionProofInput {
+                criterion,
+                url: url.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn criterion_flag(args: &[String]) -> Result<usize, ShellError> {
+    let raw = required_flag(args, "--criterion")?;
+    raw.parse::<usize>()
+        .map_err(|err| ShellError::Invalid(format!("invalid --criterion {raw}: {err}")))
+}
+
 /// Build the `Authority` a mutation is checked against from `--actor` (and
 /// `--admin`). Omitting `--actor` preserves prior CLI behavior exactly: a
 /// direct-DB-access operator is trusted and no ownership check runs.
@@ -1130,7 +1202,7 @@ fn positional(args: &[String]) -> Vec<&str> {
 fn flag_takes_value(flag: &str) -> bool {
     !matches!(
         flag,
-        "--dry-run" | "--show-secret" | "--admin" | "--include-hidden"
+        "--dry-run" | "--show-secret" | "--admin" | "--include-hidden" | "--unchecked"
     )
 }
 
@@ -1182,6 +1254,7 @@ mod tests {
         assert!(COMMANDS.contains(&"list-awaiting-input"));
         assert!(COMMANDS.contains(&"answer-input"));
         assert!(COMMANDS.contains(&"add-comment"));
+        assert!(COMMANDS.contains(&"check-criterion"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
         assert!(COMMANDS.contains(&"subscription-create"));
@@ -1525,6 +1598,77 @@ mod tests {
         let with_acceptance = run(&args(["get-card", "with-acceptance", "--db", &db])).unwrap();
         assert!(with_acceptance.contains("\"acceptance\": [\n      \"the tests pass\"\n    ]"));
         assert!(with_acceptance.contains("\"status\": \"ready\""));
+    }
+
+    #[test]
+    fn cli_round_trips_proof_plan_and_criterion_proof_links() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-proof-plan-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "proof-plan",
+            "--title",
+            "Proof plan",
+            "--acceptance",
+            "HTTP smoke proves the card detail",
+            "--proof-plan",
+            "PR link plus HTTP smoke transcript",
+        ]))
+        .unwrap();
+        let checked = run(&args([
+            "check-criterion",
+            "proof-plan",
+            "--db",
+            &db,
+            "--criterion",
+            "0",
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert_eq!(checked, "criterion\tproof-plan\t0\tchecked\n");
+
+        run(&args([
+            "complete-card",
+            "proof-plan",
+            "--db",
+            &db,
+            "--criterion-proof",
+            "0=https://example.test/pr",
+        ]))
+        .unwrap();
+
+        let card = run(&args(["get-card", "proof-plan", "--db", &db])).unwrap();
+        let detail: Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(
+            detail["card"]["proof_plan"][0],
+            "PR link plus HTTP smoke transcript"
+        );
+        assert_eq!(
+            detail["card"]["criteria"][0]["text"],
+            "HTTP smoke proves the card detail"
+        );
+        assert_eq!(detail["card"]["criteria"][0]["checked_by"], "operator");
+        assert_eq!(
+            detail["card"]["criteria"][0]["proof_links"][0]["url"],
+            "https://example.test/pr"
+        );
+        assert!(detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| { event["event_type"] == "criterion" && event["actor"] == "operator" }));
     }
 
     #[test]
@@ -2206,6 +2350,10 @@ mod tests {
             ),
             (
                 200,
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
+            ),
+            (
+                200,
                 json!({"card_id": "remote-created", "author": "operator", "body": "looks good", "created_at": 101}),
             ),
         ]);
@@ -2243,6 +2391,8 @@ mod tests {
                 "body",
                 "--acceptance",
                 "proof exists",
+                "--proof-plan",
+                "PR plus smoke",
                 "--status",
                 "ready",
                 "--priority",
@@ -2270,6 +2420,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status, "status\tremote-created\trunning\n");
+
+        let criterion = run_with_env(
+            &args([
+                "check-criterion",
+                "remote-created",
+                "--criterion",
+                "0",
+                "--actor",
+                "operator",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(criterion, "criterion\tremote-created\t0\tchecked\n");
 
         let comment = run_with_env(
             &args([
@@ -2299,6 +2463,7 @@ mod tests {
                 "POST /api/v1/cards",
                 "POST /api/v1/cards/remote-created/claim",
                 "POST /api/v1/cards/remote-created/status",
+                "POST /api/v1/cards/remote-created/criteria/check",
                 "POST /api/v1/cards/remote-created/comments",
             ]
         );
@@ -2312,6 +2477,7 @@ mod tests {
                 "title": "Remote created",
                 "body": "body",
                 "acceptance": ["proof exists"],
+                "proof_plan": ["PR plus smoke"],
                 "status": "ready",
                 "priority": "P1",
                 "related": ["remote-1"],
@@ -2327,6 +2493,10 @@ mod tests {
         assert_eq!(requests[5].body, Some(json!({"status": "running"})));
         assert_eq!(
             requests[6].body,
+            Some(json!({"criterion": 0, "actor": "operator", "checked": true}))
+        );
+        assert_eq!(
+            requests[7].body,
             Some(json!({"author": "operator", "body": "looks good"}))
         );
     }

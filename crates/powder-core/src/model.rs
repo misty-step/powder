@@ -349,6 +349,33 @@ pub struct CardSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CriterionProof {
+    pub url: String,
+    pub actor: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceCriterion {
+    pub text: String,
+    pub checked_by: Option<String>,
+    pub checked_at: Option<i64>,
+    #[serde(default)]
+    pub proof_links: Vec<CriterionProof>,
+}
+
+impl AcceptanceCriterion {
+    pub fn new(text: impl Into<String>) -> Result<Self, DomainError> {
+        Ok(Self {
+            text: non_empty("criterion", text.into())?,
+            checked_by: None,
+            checked_at: None,
+            proof_links: Vec::new(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub agent: String,
     pub run_id: RunId,
@@ -368,6 +395,10 @@ pub struct Card {
     pub title: String,
     pub body: String,
     pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub criteria: Vec<AcceptanceCriterion>,
+    #[serde(default)]
+    pub proof_plan: Vec<String>,
     pub status: CardStatus,
     pub priority: Priority,
     pub labels: Vec<String>,
@@ -396,6 +427,8 @@ impl Card {
             title,
             body: body.into(),
             acceptance: Vec::new(),
+            criteria: Vec::new(),
+            proof_plan: Vec::new(),
             status: CardStatus::Backlog,
             priority: Priority::default(),
             labels: Vec::new(),
@@ -415,6 +448,34 @@ impl Card {
 
     pub fn with_acceptance(mut self, acceptance: impl IntoIterator<Item = String>) -> Self {
         self.acceptance = clean_list(acceptance);
+        self.criteria = self
+            .acceptance
+            .iter()
+            .filter_map(|item| AcceptanceCriterion::new(item.clone()).ok())
+            .collect();
+        self
+    }
+
+    pub fn with_criteria(
+        mut self,
+        criteria: impl IntoIterator<Item = AcceptanceCriterion>,
+    ) -> Self {
+        let criteria = criteria
+            .into_iter()
+            .filter(|criterion| !criterion.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !criteria.is_empty() {
+            self.acceptance = criteria
+                .iter()
+                .map(|criterion| criterion.text.clone())
+                .collect();
+            self.criteria = criteria;
+        }
+        self
+    }
+
+    pub fn with_proof_plan(mut self, proof_plan: impl IntoIterator<Item = String>) -> Self {
+        self.proof_plan = clean_list(proof_plan);
         self
     }
 

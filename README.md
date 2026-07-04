@@ -40,6 +40,7 @@ Current local smoke paths:
 ```sh
 DB=/tmp/powder-smoke/powder.db
 cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret
+cargo run -q -p powder-cli -- create-card --db "$DB" --id smoke-proof --title "Proof plan smoke" --acceptance "detail renders" --proof-plan "PR + HTTP smoke"
 cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
 cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
 CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex)
@@ -52,9 +53,10 @@ cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status running
 cargo run -q -p powder-cli -- request-input "$RUN_ID" --db "$DB" --question "Approve completion?"
 cargo run -q -p powder-cli -- list-awaiting-input --db "$DB"
 cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator --answer approved
+cargo run -q -p powder-cli -- check-criterion 001 --db "$DB" --criterion 0 --actor operator
 cargo run -q -p powder-cli -- get-card 001 --db "$DB"
 cargo run -q -p powder-cli -- get-run "$RUN_ID" --db "$DB"
-cargo run -q -p powder-cli -- complete-card 001 --db "$DB"
+cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --criterion-proof 0=https://example.test/proof
 cargo run -q -p powder-cli -- repository-list --db "$DB" --include-hidden
 cargo run -q -p powder-cli -- repository-upsert --db "$DB" --name canary --aliases misty-step/canary --tier active
 cargo run -q -p powder-cli -- repository-merge-alias --db "$DB" --alias misty-step/canary --into canary --actor operator

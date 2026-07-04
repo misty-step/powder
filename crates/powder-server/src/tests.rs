@@ -330,6 +330,77 @@ async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_
 }
 
 #[tokio::test]
+async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completion() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"criteria-card","title":"Criteria Card","acceptance":["ship it","prove it"],"proof_plan":["PR link","CI link"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(created["proof_plan"], json!(["PR link", "CI link"]));
+    assert_eq!(created["criteria"][0]["text"], "ship it");
+    assert!(created["criteria"][0]["checked_at"].is_null());
+
+    let checked = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/criteria-card/criteria/check",
+            Some(&raw_key),
+            r#"{"criterion":0,"actor":"operator"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(checked.status(), StatusCode::OK);
+    let checked = response_json(checked).await;
+    assert_eq!(checked["criteria"][0]["checked_by"], "operator");
+    assert!(checked["criteria"][0]["checked_at"].as_i64().unwrap() > 0);
+
+    let complete = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/criteria-card/complete",
+            Some(&raw_key),
+            r#"{"criterion_proofs":[{"criterion":0,"url":"https://example.test/pr"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete.status(), StatusCode::OK);
+    let complete = response_json(complete).await;
+    assert_eq!(complete["status"], "done");
+    assert_eq!(
+        complete["criteria"][0]["proof_links"][0]["url"],
+        "https://example.test/pr"
+    );
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/criteria-card",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["event_type"] == "criterion"
+            && event["actor"] == "operator"
+            && event["payload"].as_str().unwrap().contains("checked")
+    }));
+}
+
+#[tokio::test]
 async fn card_relations_round_trip_through_http_api() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -1023,6 +1094,8 @@ async fn board_shell_serves_from_root_board_and_card_routes_without_auth() {
     assert!(root.contains(r#"id="repo-settings-list""#));
     assert!(root.contains(r#"id="powder-card-app""#));
     assert!(root.contains(r#"data-pw-route"#));
+    assert!(root.contains(r#"id="i-dot""#));
+    assert!(root.contains(r#"id="i-proof""#));
     assert!(!root.contains(r#"id="api-key-toggle""#));
     assert!(!root.contains(r#"id="refresh-board""#));
 
@@ -1120,6 +1193,10 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(script.contains("function relationsHTML("));
     assert!(script.contains("function markdownHTML("));
     assert!(script.contains("function timelineItems("));
+    assert!(script.contains("function acceptanceHTML("));
+    assert!(script.contains("function proofEvidenceHTML("));
+    assert!(script.contains("proof_plan"));
+    assert!(script.contains("proof_links"));
     assert!(script.contains("BOARD_STATE_KEY"));
     assert!(script.contains("function renderRepositorySettings("));
     assert!(script.contains("function canonicalRepoLabel("));

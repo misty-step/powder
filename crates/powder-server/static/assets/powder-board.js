@@ -933,8 +933,8 @@ function detailHTML(card, detail = {}) {
     <div class="pw-detail-grid">
       <div class="pw-detail-primary">
         ${section("DESCRIPTION", markdownHTML(normalized.body))}
-        ${section("ACCEPTANCE", acceptanceHTML(normalized.acceptance || []))}
-        ${section("PROOF PLAN / EVIDENCE", linksHTML(detail.links || [], detail.runs || []))}
+        ${section("ACCEPTANCE", acceptanceHTML(normalized))}
+        ${section("PROOF PLAN / EVIDENCE", proofEvidenceHTML(normalized, detail.links || [], detail.runs || []))}
         ${section("COMMENTS", trailHTML((detail.comments || []).map((comment) => ({
           head: `${comment.author} · ${formatDate(comment.created_at)}`,
           body: comment.body,
@@ -962,9 +962,16 @@ function section(title, body) {
   return `<section class="pw-sec"><p class="ae-h">${title}</p>${body}</section>`;
 }
 
-function acceptanceHTML(items) {
-  if (!items.length) return empty("No acceptance oracle.");
-  return `<ul class="pw-acc-list">${items.map((item) => `<li class="pw-acc-item"><span class="pw-g"><svg class="ae-icon" aria-hidden="true"><use href="#i-check"></use></svg></span><span>${escapeHtml(item)}</span></li>`).join("")}</ul>`;
+function acceptanceHTML(card) {
+  const criteria = Array.isArray(card.criteria) && card.criteria.length
+    ? card.criteria
+    : (card.acceptance || []).map((item) => ({ text: item, checked_at: null, checked_by: null, proof_links: [] }));
+  if (!criteria.length) return empty("No acceptance oracle.");
+  return `<ul class="pw-acc-list">${criteria.map((criterion) => {
+    const checked = Boolean(criterion.checked_at);
+    const proofLinks = Array.isArray(criterion.proof_links) ? criterion.proof_links : [];
+    return `<li class="pw-acc-item${checked ? " is-checked" : ""}"><span class="pw-g"><svg class="ae-icon" aria-hidden="true"><use href="#${checked ? "i-check" : "i-dot"}"></use></svg></span><span>${escapeHtml(criterion.text)}${checked ? `<br><span class="ae-muted">checked by ${escapeHtml(criterion.checked_by || "unknown")} · ${formatDate(criterion.checked_at)}</span>` : ""}${proofLinks.length ? `<br>${proofLinks.map((proof) => linkOrText(proof.url)).join(" ")}` : ""}</span></li>`;
+  }).join("")}</ul>`;
 }
 
 function relationsHTML(card) {
@@ -986,12 +993,22 @@ function definitionHTML(rows) {
   return `<dl>${rows.map(([term, value]) => `<div class="pw-def-row"><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>`;
 }
 
+function proofEvidenceHTML(card, links, runs) {
+  const plan = Array.isArray(card.proof_plan) ? card.proof_plan : [];
+  const proofLinks = linksHTML(links, runs);
+  const planHTML = plan.length
+    ? `<ul class="pw-acc-list">${plan.map((item) => `<li class="pw-acc-item"><span class="pw-g"><svg class="ae-icon" aria-hidden="true"><use href="#i-proof"></use></svg></span><span>${escapeHtml(item)}</span></li>`).join("")}</ul>`
+    : "";
+  if (!planHTML && !proofLinks) return empty("No proof plan or proof links.");
+  return `${planHTML}${proofLinks}`;
+}
+
 function linksHTML(links, runs) {
   const proof = runs
     .filter((run) => run.proof)
     .map((run) => ({ label: `run proof · ${run.id}`, url: run.proof }));
   const allLinks = [...links, ...proof];
-  if (!allLinks.length) return empty("No proof links.");
+  if (!allLinks.length) return "";
   return allLinks.map((link) => {
     const safe = safeUrl(link.url);
     const target = safe

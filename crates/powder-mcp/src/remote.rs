@@ -27,6 +27,37 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             client.get(&format!("/api/v1/cards?{query}"))?["cards"].clone()
         }
+        "create_card" => {
+            let id = required_str(args, "id")?;
+            let title = required_str(args, "title")?;
+            let mut body = json!({
+                "id": id,
+                "title": title,
+                "acceptance": args["acceptance"].as_array().cloned().unwrap_or_default(),
+                "related": args["related"].as_array().cloned().unwrap_or_default(),
+                "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
+                "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
+            });
+            if let Some(value) = args["body"].as_str() {
+                body["body"] = json!(value);
+            }
+            if let Some(value) = args["proof_plan"].as_array() {
+                body["proof_plan"] = json!(value);
+            }
+            if let Some(value) = args["status"].as_str() {
+                body["status"] = json!(value);
+            }
+            if let Some(value) = args["priority"].as_str() {
+                body["priority"] = json!(value);
+            }
+            if let Some(value) = args["labels"].as_array() {
+                body["labels"] = json!(value);
+            }
+            if let Some(value) = args["repo"].as_str() {
+                body["repo"] = json!(value);
+            }
+            client.post("/api/v1/cards", body)?
+        }
         "list_repositories" => {
             let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
             client.get(&format!(
@@ -125,6 +156,18 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 json!({"status": status}),
             )?
         }
+        "check_criterion" => {
+            let id = card_id(args, "card_id")?;
+            let criterion = args["criterion"]
+                .as_u64()
+                .ok_or_else(|| "criterion is required".to_string())?;
+            let actor = required_str(args, "actor")?;
+            let checked = args["checked"].as_bool().unwrap_or(true);
+            client.post(
+                &format!("/api/v1/cards/{id}/criteria/check"),
+                json!({"criterion": criterion, "actor": actor, "checked": checked}),
+            )?
+        }
         "update_relations" => {
             let id = card_id(args, "card_id")?;
             client.post(
@@ -167,6 +210,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let mut body = json!({});
             if let Some(proof) = args["proof"].as_str() {
                 body["proof"] = json!(proof);
+            }
+            if let Some(criterion_proofs) = args["criterion_proofs"].as_array() {
+                body["criterion_proofs"] = json!(criterion_proofs);
             }
             client.post(&format!("/api/v1/cards/{id}/complete"), body)?
         }
@@ -399,6 +445,93 @@ mod tests {
             requests[0].path,
             "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
         );
+    }
+
+    #[test]
+    fn card_structure_tools_send_remote_http_requests() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"id": "proof-plan", "priority": "p0", "status": "ready", "proof_plan": ["PR plus smoke"]}),
+            ),
+            (
+                200,
+                json!({"id": "proof-plan", "criteria": [{"text": "proof exists", "checked_by": "operator"}]}),
+            ),
+            (
+                200,
+                json!({"id": "proof-plan", "status": "done", "criteria": [{"proof_links": [{"url": "https://example.test/pr"}]}]}),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        call_tool_remote(
+            &client,
+            "create_card",
+            &json!({
+                "id": "proof-plan",
+                "title": "Proof plan",
+                "body": "body",
+                "acceptance": ["proof exists"],
+                "proof_plan": ["PR plus smoke"],
+                "status": "ready",
+                "priority": "p0",
+                "repo": "misty-step/powder"
+            }),
+        )
+        .unwrap();
+        call_tool_remote(
+            &client,
+            "check_criterion",
+            &json!({"card_id": "proof-plan", "criterion": 0, "actor": "operator"}),
+        )
+        .unwrap();
+        call_tool_remote(
+            &client,
+            "complete_card",
+            &json!({
+                "card_id": "proof-plan",
+                "criterion_proofs": [{"criterion": 0, "url": "https://example.test/pr"}]
+            }),
+        )
+        .unwrap();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({
+                "id": "proof-plan",
+                "title": "Proof plan",
+                "body": "body",
+                "acceptance": ["proof exists"],
+                "proof_plan": ["PR plus smoke"],
+                "status": "ready",
+                "priority": "p0",
+                "related": [],
+                "blocks": [],
+                "blocked_by": [],
+                "repo": "misty-step/powder"
+            }))
+        );
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/api/v1/cards/proof-plan/criteria/check");
+        assert_eq!(
+            requests[1].body,
+            Some(json!({"criterion": 0, "actor": "operator", "checked": true}))
+        );
+        assert_eq!(requests[2].method, "POST");
+        assert_eq!(requests[2].path, "/api/v1/cards/proof-plan/complete");
+        assert_eq!(
+            requests[2].body,
+            Some(json!({
+                "criterion_proofs": [{"criterion": 0, "url": "https://example.test/pr"}]
+            }))
+        );
+        assert!(requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some("Bearer sk_powder_test")));
     }
 
     #[test]

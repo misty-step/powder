@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 pub use powder_api::RemoteClient;
-use powder_core::{Authority, CardId, CardStatus, ReadyQuery, RunId};
-use powder_store::{CardFilter, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store};
+use powder_core::{Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
+use powder_store::{
+    CardFilter, CriterionProofInput, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store,
+};
 use serde_json::{json, Value};
 
 mod remote;
@@ -26,6 +28,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "list_cards",
         description: "List cards by optional status/repo filter, not just ready-eligible ones -- enumerate blocked, in-review, or done cards.",
         input_schema: r#"{"type":"object","properties":{"status":{"type":"string"},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "create_card",
+        description: "Create one card with optional acceptance criteria, proof plan, relations, repository, and initial status.",
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -93,6 +100,11 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
+        name: "check_criterion",
+        description: "Mark one acceptance criterion checked or unchecked and audit actor/time.",
+        input_schema: r#"{"type":"object","required":["card_id","criterion","actor"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
         name: "update_relations",
         description: "Replace a card's related, blocks, and blocked_by relation lists.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
@@ -114,8 +126,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "complete_card",
-        description: "Set a card done, optionally recording a proof artifact or URL.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Set a card done, optionally recording a proof artifact or URL and proof links attached to criteria.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "create_event_subscription",
@@ -259,6 +271,37 @@ pub fn call_tool_store(
                 .list_cards(&CardFilter { status, repo }, limit)
                 .map_err(to_string)?)
         }
+        "create_card" => {
+            let id = CardId::new(required_str(args, "id")?).map_err(to_string)?;
+            let title = required_str(args, "title")?;
+            let acceptance = string_array(args, "acceptance")?;
+            let status = match optional_str(args, "status") {
+                Some(raw) => {
+                    CardStatus::parse(raw).ok_or_else(|| format!("invalid status: {raw}"))?
+                }
+                None if acceptance.is_empty() => CardStatus::Backlog,
+                None => CardStatus::Ready,
+            };
+            let priority = optional_str(args, "priority")
+                .map(|raw| Priority::parse(raw).ok_or_else(|| format!("invalid priority: {raw}")))
+                .transpose()?
+                .unwrap_or_default();
+            let mut card = Card::new(id, title, optional_str(args, "body").unwrap_or_default())
+                .map_err(to_string)?
+                .with_acceptance(acceptance)
+                .with_proof_plan(string_array(args, "proof_plan")?)
+                .with_status(status)
+                .with_priority(priority)
+                .with_created_at(now);
+            card.labels = string_array(args, "labels")?;
+            card.related = card_ids_array(args, "related")?;
+            card.blocks = card_ids_array(args, "blocks")?;
+            card.blocked_by = card_ids_array(args, "blocked_by")?;
+            card.repo = optional_str(args, "repo").map(str::to_string);
+            json!(store
+                .create_card_with_events(card, &authority_arg(args).actor_label(), now)
+                .map_err(to_string)?)
+        }
         "list_repositories" => {
             if args["include_hidden"].as_bool().unwrap_or(false) {
                 json!({"repositories": store.list_repositories_with_hidden().map_err(to_string)?})
@@ -359,6 +402,15 @@ pub fn call_tool_store(
                 .update_status(&card_id, status, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
+        "check_criterion" => {
+            let card_id = card_id(args, "card_id")?;
+            let criterion = criterion_arg(args)?;
+            let actor = required_str(args, "actor")?;
+            let checked = args["checked"].as_bool().unwrap_or(true);
+            json!(store
+                .check_criterion(&card_id, criterion, actor, checked, now)
+                .map_err(to_string)?)
+        }
         "update_relations" => {
             let card_id = card_id(args, "card_id")?;
             json!(store
@@ -401,6 +453,7 @@ pub fn call_tool_store(
                 .complete_card(
                     &card_id,
                     optional_str(args, "proof"),
+                    criterion_proofs_arg(args)?,
                     now,
                     &authority_arg(args)
                 )
@@ -484,6 +537,33 @@ fn optional_string_array(args: &Value, key: &'static str) -> Result<Option<Vec<S
     string_array(args, key).map(Some)
 }
 
+fn criterion_proofs_arg(args: &Value) -> Result<Vec<CriterionProofInput>, String> {
+    let Some(values) = args["criterion_proofs"].as_array() else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let criterion = value["criterion"]
+                .as_u64()
+                .ok_or_else(|| "criterion_proofs[].criterion is required".to_string())?
+                as usize;
+            let url = value["url"]
+                .as_str()
+                .ok_or_else(|| "criterion_proofs[].url is required".to_string())?
+                .to_string();
+            Ok(CriterionProofInput { criterion, url })
+        })
+        .collect()
+}
+
+fn criterion_arg(args: &Value) -> Result<usize, String> {
+    args["criterion"]
+        .as_u64()
+        .map(|value| value as usize)
+        .ok_or_else(|| "criterion is required".to_string())
+}
+
 fn optional_repository_visibility(args: &Value) -> Result<Option<RepositoryVisibility>, String> {
     optional_str(args, "visibility")
         .map(|raw| {
@@ -542,9 +622,10 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 25);
+        assert_eq!(TOOLS.len(), 27);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
+        assert!(names.contains(&"create_card"));
         assert!(names.contains(&"list_repositories"));
         assert!(names.contains(&"upsert_repository"));
         assert!(names.contains(&"merge_repository_alias"));
@@ -560,6 +641,7 @@ mod tests {
         assert!(names.contains(&"list_awaiting_input"));
         assert!(names.contains(&"answer_input"));
         assert!(names.contains(&"add_link"));
+        assert!(names.contains(&"check_criterion"));
         assert!(names.contains(&"request_input"));
         assert!(names.contains(&"create_event_subscription"));
         assert!(names.contains(&"list_event_subscriptions"));
@@ -690,6 +772,85 @@ Expose tools against the DB.
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
         assert!(invalid.contains("invalid status"));
+    }
+
+    #[test]
+    fn mcp_round_trips_proof_plan_and_criterion_proofs() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let created = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "proof-plan",
+                "title": "Proof plan",
+                "acceptance": ["HTTP smoke proves detail rendering"],
+                "proof_plan": ["PR link plus smoke transcript"],
+                "status": "ready",
+                "priority": "p0",
+                "actor": "operator"
+            }),
+            10,
+        )
+        .unwrap();
+        let created = tool_payload(&created);
+        assert_eq!(created["proof_plan"][0], "PR link plus smoke transcript");
+        assert_eq!(
+            created["criteria"][0]["text"],
+            "HTTP smoke proves detail rendering"
+        );
+
+        let checked = call_tool_store(
+            &mut store,
+            "check_criterion",
+            &json!({
+                "card_id": "proof-plan",
+                "criterion": 0,
+                "actor": "operator"
+            }),
+            11,
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&checked)["criteria"][0]["checked_by"],
+            "operator"
+        );
+
+        call_tool_store(
+            &mut store,
+            "complete_card",
+            &json!({
+                "card_id": "proof-plan",
+                "criterion_proofs": [{"criterion": 0, "url": "https://example.test/pr"}],
+                "actor": "operator",
+                "admin": true
+            }),
+            12,
+        )
+        .unwrap();
+
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "proof-plan"}),
+            13,
+        )
+        .unwrap();
+        let detail = tool_payload(&detail);
+        assert_eq!(
+            detail["card"]["proof_plan"][0],
+            "PR link plus smoke transcript"
+        );
+        assert_eq!(
+            detail["card"]["criteria"][0]["proof_links"][0]["url"],
+            "https://example.test/pr"
+        );
+        assert!(detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| { event["event_type"] == "criterion" && event["actor"] == "operator" }));
     }
 
     #[test]

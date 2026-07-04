@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS cards (
   title TEXT NOT NULL,
   body TEXT NOT NULL,
   acceptance_json TEXT NOT NULL,
+  criteria_json TEXT NOT NULL DEFAULT '[]',
+  proof_plan_json TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL,
   priority TEXT NOT NULL,
   labels_json TEXT NOT NULL,
@@ -301,17 +303,22 @@ ALTER TABLE repositories ADD COLUMN tier TEXT NOT NULL DEFAULT 'backburner';
 CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories(tier, name);
 "#;
 
-pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, status, priority, labels_json,
+pub const MIGRATE_8_TO_9: &str = r#"
+ALTER TABLE cards ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE cards ADD COLUMN proof_plan_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
+pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
 created_at, updated_at";
 
-pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, status, priority,
+pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards WHERE id = ?1";
 
-pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, status, priority,
+pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards";

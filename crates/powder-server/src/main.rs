@@ -29,8 +29,8 @@ use powder_core::{
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
-    Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -244,6 +244,7 @@ struct CreateCardRequest {
     title: String,
     body: Option<String>,
     acceptance: Vec<String>,
+    proof_plan: Option<Vec<String>>,
     status: Option<String>,
     priority: Option<String>,
     labels: Option<Vec<String>>,
@@ -258,6 +259,7 @@ struct PatchCardRequest {
     title: Option<String>,
     body: Option<String>,
     acceptance: Option<Vec<String>>,
+    proof_plan: Option<Vec<String>>,
     status: Option<String>,
     priority: Option<String>,
     labels: Option<Vec<String>>,
@@ -284,11 +286,19 @@ impl PatchCardRequest {
             title: self.title,
             body: self.body,
             acceptance: self.acceptance,
+            proof_plan: self.proof_plan,
             status,
             priority,
             labels: self.labels,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CriterionRequest {
+    criterion: usize,
+    actor: String,
+    checked: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +366,13 @@ struct AnswerRequest {
 #[derive(Debug, Deserialize)]
 struct CompleteRequest {
     proof: Option<String>,
+    criterion_proofs: Option<Vec<CriterionProofRequest>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CriterionProofRequest {
+    criterion: usize,
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,6 +491,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/heartbeat", post(heartbeat_claim))
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/relations", post(update_relations))
+        .route("/api/v1/cards/{id}/criteria/check", post(check_criterion))
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
@@ -839,6 +857,7 @@ async fn create_card(
     .with_status(status)
     .with_priority(priority)
     .with_acceptance(request.acceptance)
+    .with_proof_plan(request.proof_plan.unwrap_or_default())
     .with_created_at(now);
     card.labels = request.labels.unwrap_or_default();
     card.related = card_ids(request.related)?;
@@ -969,6 +988,24 @@ async fn update_relations(
     Ok(Json(card))
 }
 
+async fn check_criterion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<CriterionRequest>,
+) -> Result<Json<Card>, ApiError> {
+    authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let card = lock_store(&state)?.check_criterion(
+        &card_id,
+        request.criterion,
+        &request.actor,
+        request.checked.unwrap_or(true),
+        unix_now(),
+    )?;
+    Ok(Json(card))
+}
+
 async fn add_link(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1064,6 +1101,15 @@ async fn complete_card(
     let card = lock_store(&state)?.complete_card(
         &card_id,
         request.proof.as_deref(),
+        request
+            .criterion_proofs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|proof| CriterionProofInput {
+                criterion: proof.criterion,
+                url: proof.url,
+            })
+            .collect(),
         unix_now(),
         &actor.authority(),
     )?;
