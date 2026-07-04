@@ -36,12 +36,21 @@ pub fn parse_backlog_card(
         .as_deref()
         .and_then(Priority::parse)
         .unwrap_or_default();
+    let goal = section(contents, "Goal").unwrap_or_default();
+    let oracle = oracle_items(contents);
+    // No fabricated acceptance: an omitted/unparseable Status must default
+    // the same way CLI create-card, REST POST /cards, and MCP create_card
+    // all do -- Ready when a real oracle exists, Backlog only when it
+    // doesn't (powder-929; "ready is a query, not vibes", VISION.md). An
+    // explicit Status: line is still honored regardless, case-insensitively.
     let status = parse_field(contents, "Status")
         .as_deref()
         .and_then(CardStatus::parse)
-        .unwrap_or(CardStatus::Backlog);
-    let goal = section(contents, "Goal").unwrap_or_default();
-    let oracle = oracle_items(contents);
+        .unwrap_or(if oracle.is_empty() {
+            CardStatus::Backlog
+        } else {
+            CardStatus::Ready
+        });
 
     let mut card = Card::new(
         CardId::new(id).map_err(|err| BacklogParseError::new(path, err.to_string()))?,
@@ -187,6 +196,43 @@ Turn tickets into cards.
         assert_eq!(card.acceptance.len(), 2);
         assert_eq!(card.created_at, 42);
         assert!(card.source.unwrap().digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn defaults_to_ready_when_oracle_exists_but_status_is_omitted() {
+        // powder-929: a plain Goal/Oracle card with no explicit Status
+        // line must default the same way CLI create-card, REST
+        // POST /cards, and MCP create_card do -- Ready when a real oracle
+        // exists, not unconditionally Backlog.
+        let text = r#"# Plain Goal/Oracle ticket
+
+Priority: P1
+
+## Goal
+Ship the thing.
+
+## Oracle
+- [ ] the thing ships
+"#;
+
+        let card = parse_backlog_card("backlog.d/002-plain.md", text, 10).unwrap();
+
+        assert_eq!(card.status, CardStatus::Ready);
+        assert_eq!(card.acceptance, vec!["the thing ships"]);
+    }
+
+    #[test]
+    fn defaults_to_backlog_when_oracle_and_status_are_both_absent() {
+        let text = r#"# No oracle yet
+
+## Goal
+Figure out what done looks like.
+"#;
+
+        let card = parse_backlog_card("backlog.d/003-no-oracle.md", text, 10).unwrap();
+
+        assert_eq!(card.status, CardStatus::Backlog);
+        assert!(card.acceptance.is_empty());
     }
 
     #[test]
