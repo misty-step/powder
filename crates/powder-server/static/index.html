@@ -178,16 +178,21 @@
       </div>
     </aside>
 
-    <main class="pw-board" id="board">
-      <section class="pw-lane" aria-label="ready">
+    <main class="pw-board" id="board" data-lane="ready">
+      <nav class="ae-tabs pw-lane-switch" id="lane-switch" role="tablist" aria-label="board column">
+        <button type="button" role="tab" data-lane="ready" aria-selected="true">Ready</button>
+        <button type="button" role="tab" data-lane="inprogress" aria-selected="false">In Progress</button>
+        <button type="button" role="tab" data-lane="done" aria-selected="false">Done</button>
+      </nav>
+      <section class="pw-lane" data-lane="ready" aria-label="ready">
         <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-zap"></use></svg>READY</span><span class="pw-lane-n ae-num" id="rd-count">0</span></header>
         <div class="pw-lane-scroll" id="lane-ready"></div>
       </section>
-      <section class="pw-lane" aria-label="in progress">
+      <section class="pw-lane" data-lane="inprogress" aria-label="in progress">
         <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-play"></use></svg>IN PROGRESS</span><span class="pw-lane-n ae-num" id="ip-count">0</span></header>
         <div class="pw-lane-scroll" id="lane-inprog"></div>
       </section>
-      <section class="pw-lane" aria-label="done">
+      <section class="pw-lane" data-lane="done" aria-label="done">
         <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-check"></use></svg>DONE</span><span class="pw-lane-n ae-num" id="dn-count">0</span></header>
         <div class="pw-lane-scroll" id="lane-done"></div>
       </section>

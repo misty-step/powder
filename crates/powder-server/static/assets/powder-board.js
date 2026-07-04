@@ -70,6 +70,8 @@ const els = {
   tabBacklog: document.getElementById("tab-backlog"),
   tabBoth: document.getElementById("tab-both"),
   tabBoard: document.getElementById("tab-board"),
+  board: document.getElementById("board"),
+  laneSwitch: document.getElementById("lane-switch"),
   railList: document.getElementById("rail-list"),
   laneReady: document.getElementById("lane-ready"),
   laneInProgress: document.getElementById("lane-inprog"),
@@ -1190,6 +1192,16 @@ function setView(view) {
   placeIndicator();
 }
 
+const BOARD_LANES = ["ready", "inprogress", "done"];
+
+function setLane(lane) {
+  const target = BOARD_LANES.includes(lane) ? lane : "ready";
+  els.board.dataset.lane = target;
+  for (const button of els.laneSwitch.querySelectorAll("button[data-lane]")) {
+    button.setAttribute("aria-selected", String(button.dataset.lane === target));
+  }
+}
+
 function animateRailShare(targetShare) {
   cancelAnimationFrame(viewAnimation);
   if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
@@ -1260,6 +1272,11 @@ els.sort.addEventListener("change", (event) => {
 els.tabBacklog.addEventListener("click", () => setView("backlog"));
 els.tabBoth.addEventListener("click", () => setView("both"));
 els.tabBoard.addEventListener("click", () => setView("board"));
+els.laneSwitch.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-lane]");
+  if (!button) return;
+  setLane(button.dataset.lane);
+});
 els.settingsToggle.addEventListener("click", () => {
   if (els.authPanel.hidden) showAuth();
   else hideAuth();

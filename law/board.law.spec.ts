@@ -82,6 +82,24 @@ for (const mode of MODES) {
     await assertLaw(page, { consoleErrors: errors });
   });
 
+  test(`board · mobile-390 · ${mode} · lane switcher reaches every column without horizontal scroll (powder-930)`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 900 });
+    const errors = await boot(page, mode);
+    await page.locator("#tab-both").click();
+    const board = page.locator("#board");
+    await expect(page.locator("#lane-switch")).toBeVisible();
+    for (const lane of ["ready", "inprogress", "done"] as const) {
+      await page.locator(`#lane-switch button[data-lane='${lane}']`).click();
+      await expect(board).toHaveAttribute("data-lane", lane);
+      await expect(page.locator(`.pw-lane[data-lane='${lane}']`)).toBeVisible();
+      const overflows = await board.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+      expect(overflows, `${lane} lane must not force horizontal scroll on the board`).toBe(false);
+    }
+    await assertLaw(page, { consoleErrors: errors });
+  });
+
   test(`board card link · ${mode} · opens the detail route and back returns`, async ({ page }) => {
     const errors = await boot(page, mode);
     await page.locator("#tab-board").click();
@@ -123,6 +141,26 @@ for (const mode of MODES) {
     });
   }
 }
+
+test("board · touch device · keyboard-shortcut footer is hidden (powder-930)", async ({
+  browser,
+}) => {
+  // pointer:coarse is the touch signal the CSS keys off, not viewport width
+  // (a narrowed desktop window should keep the hint) -- hasTouch is how
+  // Chromium reports a coarse primary pointer under Playwright.
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 900 },
+    hasTouch: true,
+  });
+  const page = await context.newPage();
+  const errors = collectConsoleErrors(page);
+  await page.addInitScript(() => localStorage.setItem("ae-mode", "light"));
+  await page.goto("/board");
+  await page.waitForLoadState("networkidle");
+  await expect(page.locator(".pw-foot")).toBeHidden();
+  await assertLaw(page, { consoleErrors: errors });
+  await context.close();
+});
 
 test("the gate catches a planted off-law element (not theater)", async ({
   page,

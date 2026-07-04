@@ -546,6 +546,15 @@ html:not([data-pw-route='card']) .pw-detail-app {
   pointer-events: none;
 }
 
+/* column switcher for the stacked mobile board (below 640px) — a plain
+   .ae-tabs instrument, hidden here because the 3-column grid has room for
+   every lane at this width already. */
+.pw-lane-switch {
+  display: none;
+  grid-column: 1 / -1;
+  margin-bottom: 0.5em;
+}
+
 .pw-lane {
   display: flex;
   flex-direction: column;
@@ -1036,5 +1045,39 @@ html:not([data-pw-route='card']) .pw-detail-app {
   .pw-detail-side {
     border-left: 0;
     padding-left: 0;
+  }
+}
+
+/* below 640px the 3-column kanban no longer has room for even two lanes
+   at a legible width (powder-930) — stack to one column and swap the
+   lane in view with an explicit switcher instead of letting the grid
+   crop columns and force horizontal panning. */
+@media (max-width: 640px) {
+  .pw-board {
+    grid-template-columns: minmax(0, 1fr);
+    overflow-x: hidden;
+  }
+
+  .pw-lane-switch {
+    display: flex;
+  }
+
+  .pw-lane {
+    display: none;
+  }
+
+  .pw-board[data-lane='ready'] .pw-lane[data-lane='ready'],
+  .pw-board[data-lane='inprogress'] .pw-lane[data-lane='inprogress'],
+  .pw-board[data-lane='done'] .pw-lane[data-lane='done'] {
+    display: flex;
+  }
+}
+
+/* the keyboard-shortcut hint is dead weight with no keyboard (powder-930):
+   coarse pointer is the touch signal, not viewport width, since a tablet
+   or a narrowed desktop window should keep the hint. */
+@media (pointer: coarse) {
+  .pw-foot {
+    display: none;
   }
 }
