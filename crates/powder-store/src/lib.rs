@@ -14,6 +14,7 @@ mod answer_loop;
 mod identity;
 mod repositories;
 mod schema;
+pub mod status_model_020;
 #[cfg(test)]
 mod tests;
 
