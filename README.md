@@ -186,7 +186,7 @@ minted via canary's `POST /api/v1/keys`). Both must be set or
 needs a matching monitor (`POST /api/v1/monitors` with `"name":"powder"`) or
 check-ins 404.
 
-Fly instance shape:
+Fly instance shape for a self-hosted deployment:
 
 ```sh
 fly apps create powder --org misty-step
@@ -199,9 +199,12 @@ The default `fly.toml` keeps one machine warm, mounts `/data`, listens on
 `POWDER_PUBLIC_BASE_URL` to `https://powder.internal` for a tailnet-fronted
 instance. The companion bastion lane can expose `http://powder.internal:4000`
 through Tailscale Serve while Powder keeps its own database and secrets on its
-Fly volume. The Fly profile redacts the first bootstrap key in logs; create an
-operator-held key over SSH with `powder key-create --db /data/powder.db --name
-operator --scope admin --show-secret` and store it in a secret manager.
+Fly volume. Misty Step's current operator instance is fronted by Bastion rather
+than the checked-in `powder` Fly app; verify the active deployment with
+`POWDER_API_BASE_URL` before treating the template app name as live. The Fly
+profile redacts the first bootstrap key in logs; create an operator-held key
+over SSH with `powder key-create --db /data/powder.db --name operator --scope
+admin --show-secret` and store it in a secret manager.
 
 ## Gate
 
