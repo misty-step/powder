@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Powder release notes</title>
+    <meta
+      name="description"
+      content="User-facing release notes for Powder."
+    />
+    <script>
+      try {
+        var m = localStorage.getItem('ae-mode');
+        if (m === 'dark' || m === 'light') {
+          document.documentElement.classList.add(m);
+          document.documentElement.style.colorScheme = m;
+        }
+      } catch (e) {}
+    </script>
+    <link rel="stylesheet" href="aesthetic.css" />
+    <link rel="stylesheet" href="marketing.css" />
+  </head>
+  <body>
+    <svg aria-hidden="true" width="0" height="0" style="position: absolute">
+      <symbol id="i-snowflake" viewBox="0 0 24 24">
+        <path d="m10 20-1.25-2.5L6 18" />
+        <path d="M10 4 8.75 6.5 6 6" />
+        <path d="m14 20 1.25-2.5L18 18" />
+        <path d="m14 4 1.25 2.5L18 6" />
+        <path d="m17 21-3-6h-4" />
+        <path d="m17 3-3 6 1.5 3" />
+        <path d="M2 12h6.5L10 9" />
+        <path d="m20 10-1.5 2 1.5 2" />
+        <path d="M22 12h-6.5L14 15" />
+        <path d="m4 10 1.5 2L4 14" />
+        <path d="m7 21 3-6-1.5-3" />
+        <path d="m7 3 3 6h4" />
+      </symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2" />
+        <path d="M12 20v2" />
+        <path d="m4.93 4.93 1.41 1.41" />
+        <path d="m17.66 17.66 1.41 1.41" />
+        <path d="M2 12h2" />
+        <path d="M20 12h2" />
+        <path d="m6.34 17.66-1.41 1.41" />
+        <path d="m19.07 4.93-1.41 1.41" />
+      </symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24">
+        <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+      </symbol>
+      <symbol id="i-circle-check" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="10" />
+        <path d="m9 12 2 2 4-4" />
+      </symbol>
+    </svg>
+
+    <div class="ae-screen ae-wide">
+      <header class="ae-bar msk-bar">
+        <a class="ae-logo" href="./" aria-label="Powder home">
+          <span class="ae-app-mark" aria-hidden="true">
+            <svg class="ae-icon" data-lucide="snowflake">
+              <use href="#i-snowflake" />
+            </svg>
+          </span>
+          <span class="ae-name">Powder</span>
+        </a>
+        <span class="msk-actions">
+          <nav class="ae-chrome msk-nav" aria-label="Site">
+            <a href="./">home</a>
+            <a href="changelog.html" aria-current="page">release notes</a>
+          </nav>
+          <button class="ae-mode" aria-label="toggle color mode">
+            <svg class="ae-icon ae-sun"><use href="#i-sun" /></svg>
+            <svg class="ae-icon ae-moon"><use href="#i-moon" /></svg>
+          </button>
+        </span>
+      </header>
+
+      <main class="ae-stage ae-stage-scroll">
+        <article class="ae-doc msk-page" aria-labelledby="release-notes-title">
+          <h1 id="release-notes-title">Release notes</h1>
+          <p class="ae-lede">
+            User-facing notes for people deciding whether Powder is alive,
+            trustworthy, and worth trying.
+          </p>
+
+          <section class="msk-release">
+            <p class="ae-chrome">2026-07-04 - v-current</p>
+            <h2>Public site and board proof</h2>
+            <ul>
+              <li>
+                Added a public Powder site built from the Misty Step site kit,
+                with GitHub Pages deployment as the public proof surface.
+              </li>
+              <li>
+                The screenshot gallery uses the real Powder board running
+                against seeded demo data, including a blocked edge state.
+              </li>
+            </ul>
+            <p class="ae-status">
+              <svg class="ae-icon ae-ok" data-lucide="circle-check">
+                <use href="#i-circle-check" />
+              </svg>
+              <span class="ae-status-label"
+                >Evidence: local board screenshots, PR checks, and Pages
+                deploy.</span
+              >
+            </p>
+          </section>
+        </article>
+      </main>
+
+      <footer class="ae-bar msk-footer">
+        <p class="ae-chrome">
+          Powder release notes are public by default.
+        </p>
+        <nav class="ae-foot-links ae-chrome" aria-label="Footer">
+          <a
+            data-footer-link="github"
+            href="https://github.com/misty-step/powder"
+            >GitHub</a
+          >
+          <a data-footer-link="misty-step" href="https://mistystep.io"
+            >Misty Step</a
+          >
+        </nav>
+      </footer>
+    </div>
+
+    <script src="mode.js"></script>
+  </body>
+</html>

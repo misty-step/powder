@@ -1,4 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 // vendored from @misty-step/aesthetic v2.17.1 — see vendor/aesthetic-law/README.md
 // for why this is a vendored copy rather than a package import.
 import {
@@ -21,11 +23,37 @@ const CARD_ROUTE_VIEWPORTS = [
   { name: "desktop", size: { width: 1280, height: 900 } },
   { name: "mobile-390", size: { width: 390, height: 900 } },
 ] as const;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SITE_ROOT = path.resolve(__dirname, "..", "site");
+const SITE_ROUTES = [
+  {
+    name: "marketing home",
+    path: "index.html",
+    expected: "Keep agent work claimed, visible, and auditable.",
+  },
+  {
+    name: "release notes",
+    path: "changelog.html",
+    expected: "Public site and board proof",
+  },
+] as const;
 
 async function boot(page: Page, mode: (typeof MODES)[number], path = "/board") {
   const errors = collectConsoleErrors(page);
   await page.addInitScript((m) => localStorage.setItem("ae-mode", m), mode);
   await page.goto(path);
+  await page.waitForLoadState("networkidle");
+  return errors;
+}
+
+async function bootSite(
+  page: Page,
+  mode: (typeof MODES)[number],
+  route: (typeof SITE_ROUTES)[number],
+) {
+  const errors = collectConsoleErrors(page);
+  await page.addInitScript((m) => localStorage.setItem("ae-mode", m), mode);
+  await page.goto(pathToFileURL(path.join(SITE_ROOT, route.path)).href);
   await page.waitForLoadState("networkidle");
   return errors;
 }
@@ -71,6 +99,16 @@ for (const mode of MODES) {
     await expect(page.locator("#powder-board-app")).toBeVisible();
     await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
   });
+}
+
+for (const mode of MODES) {
+  for (const route of SITE_ROUTES) {
+    test(`site ${route.name} · ${mode} · the law holds`, async ({ page }) => {
+      const errors = await bootSite(page, mode, route);
+      await expect(page.locator("body")).toContainText(route.expected);
+      await assertLaw(page, { consoleErrors: errors });
+    });
+  }
 }
 
 for (const mode of MODES) {
