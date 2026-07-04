@@ -1214,8 +1214,10 @@ struct KeySummaryResponse {
     name: String,
     scope: &'static str,
     actor: String,
+    key_prefix: String,
     created_at: i64,
     revoked_at: Option<i64>,
+    last_used_at: Option<i64>,
 }
 
 impl From<powder_store::ApiKeySummary> for KeySummaryResponse {
@@ -1225,8 +1227,10 @@ impl From<powder_store::ApiKeySummary> for KeySummaryResponse {
             name: key.name,
             scope: key.scope.as_str(),
             actor: key.actor.display_name,
+            key_prefix: key.key_prefix,
             created_at: key.created_at,
             revoked_at: key.revoked_at,
+            last_used_at: key.last_used_at,
         }
     }
 }
@@ -1296,7 +1300,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
         AuthMode::ApiKey => {
             let token = bearer_token(headers)
                 .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
-            let verified = lock_store(state)?.verify_api_key(token)?;
+            let verified = lock_store(state)?.verify_api_key(token, unix_now())?;
             let Some(key) = verified else {
                 return Err(ApiError::unauthorized("invalid bearer token"));
             };
