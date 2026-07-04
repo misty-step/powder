@@ -11,7 +11,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards",
-        intent: "create or upsert one card in the instance database",
+        intent: "create one new card in the instance database, rejecting duplicate ids",
     },
     ApiRoute {
         method: "POST",
@@ -62,6 +62,11 @@ pub const ROUTES: &[ApiRoute] = &[
         method: "GET",
         path: "/api/v1/cards/{id}",
         intent: "read one card with runs, activity, links, comments, and claim state",
+    },
+    ApiRoute {
+        method: "PATCH",
+        path: "/api/v1/cards/{id}",
+        intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
     },
     ApiRoute {
         method: "POST",

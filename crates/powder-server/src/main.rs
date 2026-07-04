@@ -29,7 +29,7 @@ use powder_core::{
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
-    ApiKeyScope, CardFilter, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -232,10 +232,49 @@ struct CreateCardRequest {
     acceptance: Vec<String>,
     status: Option<String>,
     priority: Option<String>,
+    labels: Option<Vec<String>>,
     repo: Option<String>,
     related: Option<Vec<String>>,
     blocks: Option<Vec<String>>,
     blocked_by: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchCardRequest {
+    title: Option<String>,
+    body: Option<String>,
+    acceptance: Option<Vec<String>>,
+    status: Option<String>,
+    priority: Option<String>,
+    labels: Option<Vec<String>>,
+}
+
+impl PatchCardRequest {
+    fn into_patch(self) -> Result<CardPatch, ApiError> {
+        let status = self
+            .status
+            .as_deref()
+            .map(|raw| {
+                CardStatus::parse(raw).ok_or_else(|| ApiError::bad_request("invalid status"))
+            })
+            .transpose()?;
+        let priority = self
+            .priority
+            .as_deref()
+            .map(|raw| {
+                Priority::parse(raw).ok_or_else(|| ApiError::bad_request("invalid priority"))
+            })
+            .transpose()?;
+
+        Ok(CardPatch {
+            title: self.title,
+            body: self.body,
+            acceptance: self.acceptance,
+            status,
+            priority,
+            labels: self.labels,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,7 +452,7 @@ fn app(state: AppState) -> Router {
             "/api/v1/repositories/{name}/merge-alias",
             post(merge_repository_alias),
         )
-        .route("/api/v1/cards/{id}", get(get_card))
+        .route("/api/v1/cards/{id}", get(get_card).patch(patch_card))
         .route("/api/v1/cards/{id}/claim", post(claim_card))
         .route("/api/v1/cards/{id}/release", post(release_claim))
         .route("/api/v1/cards/{id}/renew", post(renew_claim))
@@ -730,14 +769,32 @@ async fn create_card(
     .with_priority(priority)
     .with_acceptance(request.acceptance)
     .with_created_at(now);
+    card.labels = request.labels.unwrap_or_default();
     card.related = card_ids(request.related)?;
     card.blocks = card_ids(request.blocks)?;
     card.blocked_by = card_ids(request.blocked_by)?;
     card.repo = request.repo;
     let card = {
         let mut store = lock_store(&state)?;
-        store.upsert_card_with_events(card, &actor.display_name, now)?
+        store.create_card_with_events(card, &actor.display_name, now)?
     };
+    Ok(Json(card))
+}
+
+async fn patch_card(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<PatchCardRequest>,
+) -> Result<Json<Card>, ApiError> {
+    let actor = require_admin(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let card = lock_store(&state)?.patch_card(
+        &card_id,
+        request.into_patch()?,
+        &actor.display_name,
+        unix_now(),
+    )?;
     Ok(Json(card))
 }
 

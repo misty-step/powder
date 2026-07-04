@@ -93,6 +93,166 @@ async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
 }
 
 #[tokio::test]
+async fn create_card_rejects_an_existing_id_without_replacing_the_card() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"duplicate","title":"Original","body":"keep me","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"duplicate","title":"Replacement","body":"drop me","acceptance":["different"],"status":"blocked"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/duplicate",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(detail["card"]["title"], "Original");
+    assert_eq!(detail["card"]["body"], "keep me");
+    assert_eq!(detail["card"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_and_claim() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let imported = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            Some(&raw_key),
+            &json!({
+                "files": [{
+                    "path": "patchable-card.md",
+                    "contents": "# Patchable card\n\nPriority: P1 | Status: ready\n\n## Goal\nKeep this body.\n\n## Oracle\n- [ ] keep the source\n"
+                }]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::OK);
+
+    let before = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/patchable",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let before = response_json(before).await;
+
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/patchable/claim",
+            Some(&raw_key),
+            r#"{"agent":"operator","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+
+    let claimed_detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/patchable",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let claimed_detail = response_json(claimed_detail).await;
+    let claim = claimed_detail["card"]["claim"].clone();
+    assert!(claim.is_object());
+
+    let patched = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/patchable",
+            Some(&raw_key),
+            r#"{"title":"Patched card"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched = response_json(patched).await;
+    assert_eq!(patched["title"], "Patched card");
+    assert_eq!(patched["body"], "Keep this body.");
+    assert_eq!(patched["created_at"], before["card"]["created_at"]);
+    assert_eq!(patched["source"], before["card"]["source"]);
+    assert_eq!(patched["claim"], claim);
+
+    let patched_many = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/patchable",
+            Some(&raw_key),
+            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","labels":["api","safe-update"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched_many.status(), StatusCode::OK);
+    let patched_many = response_json(patched_many).await;
+    assert_eq!(patched_many["title"], "Patched card");
+    assert_eq!(patched_many["body"], "Updated body");
+    assert_eq!(patched_many["acceptance"], json!(["new proof"]));
+    assert_eq!(patched_many["priority"], "p0");
+    assert_eq!(patched_many["status"], "blocked");
+    assert_eq!(patched_many["labels"], json!(["api", "safe-update"]));
+    assert_eq!(patched_many["created_at"], before["card"]["created_at"]);
+    assert_eq!(patched_many["source"], before["card"]["source"]);
+    assert_eq!(patched_many["claim"], claim);
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/patchable",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["event_type"] == "patch" && event["payload"].as_str().unwrap().contains("title")
+    }));
+}
+
+#[tokio::test]
 async fn card_relations_round_trip_through_http_api() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

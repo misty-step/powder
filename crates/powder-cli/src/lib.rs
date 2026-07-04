@@ -404,7 +404,7 @@ fn create_card(args: &[String]) -> Result<String, ShellError> {
     card.blocked_by = card_ids_flag(args, "--blocked-by")?;
     card.repo = flag_value(args, "--repo").map(str::to_string);
     let card = store
-        .upsert_card_with_events(card, &authority(args).actor_label(), now)
+        .create_card_with_events(card, &authority(args).actor_label(), now)
         .map_err(store_err)?;
     Ok(format!(
         "created\t{}\t{}\t{}\n",
