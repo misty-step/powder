@@ -35,3 +35,46 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  law-gate:
+    name: aesthetic law gate (board UI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build powder-server and powder-cli
+        run: cargo build -p powder-server -p powder-cli
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: law/package-lock.json
+
+      - name: Install law-gate dependencies
+        run: npm ci
+        working-directory: law
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+        working-directory: law
+
+      - name: Run the law gate against the board UI
+        run: npm run law
+        working-directory: law
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: law-gate-report
+          path: law/playwright-report/
+          if-no-files-found: ignore
