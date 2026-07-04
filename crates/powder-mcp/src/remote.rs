@@ -40,6 +40,14 @@ impl RemoteClient {
             .map_err(to_string)
     }
 
+    fn delete(&self, path: &str) -> Result<Value, String> {
+        self.attach_auth(self.agent.delete(&format!("{}{path}", self.base_url)))
+            .call()
+            .map_err(Self::request_error)?
+            .into_json()
+            .map_err(to_string)
+    }
+
     fn attach_auth(&self, request: ureq::Request) -> ureq::Request {
         match &self.api_key {
             Some(key) => request.set("Authorization", &format!("Bearer {key}")),
@@ -78,6 +86,40 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 query.push_str(&format!("&repo={}", urlencode(repo)));
             }
             client.get(&format!("/api/v1/cards?{query}"))?["cards"].clone()
+        }
+        "list_repositories" => {
+            let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
+            client.get(&format!(
+                "/api/v1/repositories?include_hidden={include_hidden}"
+            ))?
+        }
+        "upsert_repository" => {
+            let name = required_str(args, "name")?;
+            client.post(
+                "/api/v1/repositories",
+                json!({
+                    "name": name,
+                    "aliases": args["aliases"].as_array().cloned(),
+                    "visibility": args["visibility"].as_str(),
+                    "import_provenance": args["import_provenance"].as_str(),
+                }),
+            )?
+        }
+        "merge_repository_alias" => {
+            let target = required_str(args, "into")?;
+            let alias = required_str(args, "alias")?;
+            let mut body = json!({"alias": alias});
+            if let Some(actor) = args["actor"].as_str() {
+                body["actor"] = json!(actor);
+            }
+            client.post(
+                &format!("/api/v1/repositories/{}/merge-alias", urlencode(target)),
+                body,
+            )?
+        }
+        "delete_repository" => {
+            let name = required_str(args, "name")?;
+            client.delete(&format!("/api/v1/repositories/{}", urlencode(name)))?
         }
         "claim_card" => {
             let id = card_id(args, "card_id")?;
@@ -431,6 +473,77 @@ mod tests {
             requests[0].path,
             "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
         );
+    }
+
+    #[test]
+    fn repository_tools_send_remote_http_requests() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"repositories": [{"name": "canary", "repo": "canary"}]}),
+            ),
+            (
+                200,
+                json!({"name": "canary", "repo": "canary", "aliases": ["misty-step/canary"]}),
+            ),
+            (
+                200,
+                json!({"alias": "legacy-canary", "rehomed_cards": 1, "repository": {"name": "canary"}}),
+            ),
+            (200, json!({"deleted": true, "repository": "unused"})),
+        ]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        call_tool_remote(
+            &client,
+            "list_repositories",
+            &json!({"include_hidden": true}),
+        )
+        .unwrap();
+        call_tool_remote(
+            &client,
+            "upsert_repository",
+            &json!({
+                "name": "misty-step/canary",
+                "aliases": ["misty-step/canary"],
+                "visibility": "visible",
+                "import_provenance": "manual"
+            }),
+        )
+        .unwrap();
+        call_tool_remote(
+            &client,
+            "merge_repository_alias",
+            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator"}),
+        )
+        .unwrap();
+        call_tool_remote(&client, "delete_repository", &json!({"name": "unused"})).unwrap();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v1/repositories?include_hidden=true");
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/api/v1/repositories");
+        assert_eq!(
+            requests[1].body,
+            Some(json!({
+                "name": "misty-step/canary",
+                "aliases": ["misty-step/canary"],
+                "visibility": "visible",
+                "import_provenance": "manual"
+            }))
+        );
+        assert_eq!(requests[2].method, "POST");
+        assert_eq!(requests[2].path, "/api/v1/repositories/canary/merge-alias");
+        assert_eq!(
+            requests[2].body,
+            Some(json!({"alias": "legacy-canary", "actor": "operator"}))
+        );
+        assert_eq!(requests[3].method, "DELETE");
+        assert_eq!(requests[3].path, "/api/v1/repositories/unused");
+        assert!(requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some("Bearer sk_powder_test")));
     }
 
     #[test]

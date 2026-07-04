@@ -57,7 +57,8 @@ pub struct GitHubIssue {
 /// closed-then-reopened issue can never clobber an in-flight Powder claim.
 pub fn github_issue_to_card(issue: &GitHubIssue, repo: &str, now: i64) -> ShellResult<Card> {
     let id_prefix = validate_repo_slug(repo)?;
-    let canonical_repo = canonical_repo_label(repo)
+    let repo = repo.trim().trim_end_matches('/').to_string();
+    canonical_repo_label(&repo)
         .ok_or_else(|| ShellError::Invalid(format!("invalid repo slug: {repo}")))?;
     let id = CardId::new(format!("{id_prefix}-{}", issue.number))?;
     let labels = issue
@@ -76,7 +77,7 @@ pub fn github_issue_to_card(issue: &GitHubIssue, repo: &str, now: i64) -> ShellR
         .with_status(status)
         .with_created_at(now);
     card.labels = labels.clone();
-    card.repo = Some(canonical_repo);
+    card.repo = Some(repo);
     card.source = Some(CardSource {
         path: issue.url.clone(),
         digest: format!(
@@ -161,7 +162,7 @@ mod tests {
         assert_eq!(card.body, "It's broken");
         assert_eq!(card.status, CardStatus::Backlog);
         assert_eq!(card.labels, vec!["bug".to_string(), "P1".to_string()]);
-        assert_eq!(card.repo.as_deref(), Some("example"));
+        assert_eq!(card.repo.as_deref(), Some("misty-step/example"));
         assert!(
             card.acceptance.is_empty(),
             "acceptance must never be fabricated for an imported issue"

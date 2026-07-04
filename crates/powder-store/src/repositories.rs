@@ -1,63 +1,648 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use powder_core::{canonical_repo_label, CardStatus};
-use serde::Serialize;
+use powder_core::{canonical_repo_label, CardStatus, DomainError};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 
-use crate::{Result, StoreError};
+use crate::{non_empty, Result, Store, StoreError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryVisibility {
+    Visible,
+    Hidden,
+}
+
+impl RepositoryVisibility {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "visible" => Some(Self::Visible),
+            "hidden" => Some(Self::Hidden),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepositorySummary {
+    pub name: String,
+    /// Compatibility alias for older consumers that still render `repo`.
     pub repo: String,
     pub aliases: Vec<String>,
+    pub visibility: RepositoryVisibility,
+    pub import_provenance: Option<String>,
     pub card_count: usize,
     pub status_counts: BTreeMap<String, usize>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
-pub(crate) struct RepositoryRow {
-    pub repo: Option<String>,
-    pub status: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryUpsert {
+    pub name: String,
+    pub aliases: Option<Vec<String>>,
+    pub visibility: Option<RepositoryVisibility>,
+    pub import_provenance: Option<String>,
 }
 
-pub(crate) fn summarize_repository_rows(
-    rows: impl IntoIterator<Item = RepositoryRow>,
-) -> Result<Vec<RepositorySummary>> {
-    let mut repositories = BTreeMap::<String, RepositoryAccumulator>::new();
-    for row in rows {
-        let Some(raw_repo) = row.repo.as_deref() else {
-            continue;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryMergeOutcome {
+    pub repository: RepositorySummary,
+    pub alias: String,
+    pub rehomed_cards: usize,
+}
+
+impl Store {
+    pub(crate) fn backfill_repositories_from_cards(&mut self) -> Result<()> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT repo, MIN(created_at), MAX(updated_at)
+                 FROM cards
+                 WHERE repo IS NOT NULL
+                 GROUP BY repo",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
         };
-        let Some(repo) = canonical_repo_label(raw_repo) else {
-            continue;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (raw_repo, created_at, updated_at) in rows {
+            let Some(canonical) = ensure_repository_entity(
+                &transaction,
+                &raw_repo,
+                created_at,
+                Some("existing card import"),
+            )?
+            else {
+                continue;
+            };
+            transaction.execute(
+                "UPDATE cards SET repo = ?2 WHERE repo = ?1",
+                params![raw_repo, canonical],
+            )?;
+            transaction.execute(
+                "UPDATE repositories
+                 SET updated_at = MAX(updated_at, ?2)
+                 WHERE name = ?1",
+                params![canonical, updated_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_repositories(&self) -> Result<Vec<RepositorySummary>> {
+        self.list_repositories_inner(false)
+    }
+
+    pub fn list_repositories_with_hidden(&self) -> Result<Vec<RepositorySummary>> {
+        self.list_repositories_inner(true)
+    }
+
+    pub fn get_repository(&self, name: &str) -> Result<Option<RepositorySummary>> {
+        let Some(repository_name) = resolve_repository_name(&self.connection, name)? else {
+            return Ok(None);
         };
-        let status = CardStatus::parse(&row.status).ok_or(StoreError::InvalidStoredValue {
-            field: "cards.status",
-            value: row.status,
-        })?;
-        let accumulator = repositories.entry(repo.clone()).or_default();
-        accumulator.card_count += 1;
-        *accumulator
-            .status_counts
-            .entry(status.as_str().to_string())
-            .or_insert(0) += 1;
-        let raw_repo = raw_repo.trim();
-        if raw_repo != repo {
-            accumulator.aliases.insert(raw_repo.to_string());
+        self.repository_summary(&repository_name)
+    }
+
+    pub fn upsert_repository(
+        &mut self,
+        upsert: RepositoryUpsert,
+        now: i64,
+    ) -> Result<RepositorySummary> {
+        let raw_name = normalize_repository_token(&upsert.name)?;
+        let name = canonical_repo_label(&raw_name)
+            .ok_or_else(|| DomainError::validation("repository.name", "value cannot be empty"))?;
+        let visibility = upsert.visibility.unwrap_or(RepositoryVisibility::Visible);
+        let aliases = upsert
+            .aliases
+            .map(|aliases| {
+                aliases
+                    .into_iter()
+                    .map(|alias| normalize_repository_token(&alias))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let import_provenance = upsert
+            .import_provenance
+            .as_deref()
+            .map(|value| non_empty("import_provenance", value))
+            .transpose()?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_repository_row(
+            &transaction,
+            &name,
+            visibility,
+            import_provenance.as_deref(),
+            now,
+            true,
+        )?;
+        let mut alias_set = BTreeSet::new();
+        if raw_name != name {
+            alias_set.insert(raw_name);
+        }
+        if let Some(aliases) = aliases {
+            for alias in aliases {
+                if alias != name {
+                    alias_set.insert(alias);
+                }
+            }
+            replace_repository_aliases(&transaction, &name, alias_set.into_iter().collect(), now)?;
+        } else {
+            for alias in alias_set {
+                insert_repository_alias(&transaction, &name, &alias, now, false)?;
+            }
+        }
+        transaction.commit()?;
+        self.repository_summary(&name)?
+            .ok_or_else(|| DomainError::not_found("repository", name).into())
+    }
+
+    pub fn delete_repository(&mut self, name: &str) -> Result<()> {
+        let Some(repository_name) = resolve_repository_name(&self.connection, name)? else {
+            return Err(DomainError::not_found("repository", name).into());
+        };
+        let card_count = resolved_repository_card_count(&self.connection, &repository_name)?;
+        if card_count > 0 {
+            return Err(DomainError::conflict(format!(
+                "repository {repository_name} still has {card_count} cards"
+            ))
+            .into());
+        }
+        let deleted = self.connection.execute(
+            "DELETE FROM repositories WHERE name = ?1",
+            [repository_name.as_str()],
+        )?;
+        if deleted == 0 {
+            return Err(DomainError::not_found("repository", repository_name).into());
+        }
+        Ok(())
+    }
+
+    pub fn merge_repository_alias(
+        &mut self,
+        alias: &str,
+        target: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<RepositoryMergeOutcome> {
+        let actor = non_empty("actor", actor)?;
+        let alias = normalize_repository_token(alias)?;
+        let target = normalize_repository_token(target)?;
+        let target_name = canonical_repo_label(&target)
+            .ok_or_else(|| DomainError::validation("repository.target", "value cannot be empty"))?;
+        let alias_canonical = canonical_repo_label(&alias)
+            .ok_or_else(|| DomainError::validation("repository.alias", "value cannot be empty"))?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_repository_row(
+            &transaction,
+            &target_name,
+            RepositoryVisibility::Visible,
+            Some("manual alias merge"),
+            now,
+            false,
+        )?;
+
+        let source_name =
+            resolve_repository_name(&transaction, &alias)?.unwrap_or(alias_canonical.clone());
+        if source_name != target_name {
+            move_repository_aliases(&transaction, &source_name, &target_name, now)?;
+        }
+        insert_repository_alias(&transaction, &target_name, &alias, now, true)?;
+        if source_name != target_name {
+            insert_repository_alias(&transaction, &target_name, &source_name, now, true)?;
+        }
+
+        let card_rows = {
+            let mut statement =
+                transaction.prepare("SELECT id, repo FROM cards WHERE repo IS NOT NULL")?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut rehomed_cards = 0usize;
+        for (card_id, raw_repo) in card_rows {
+            let row_canonical = canonical_repo_label(&raw_repo);
+            let matches_alias = raw_repo == alias
+                || raw_repo == source_name
+                || row_canonical.as_deref() == Some(alias_canonical.as_str());
+            if matches_alias && raw_repo != target_name {
+                transaction.execute(
+                    "UPDATE cards SET repo = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![card_id, target_name, now],
+                )?;
+                append_repository_card_event(
+                    &transaction,
+                    &card_id,
+                    &actor,
+                    &format!("{raw_repo} -> {target_name}; alias {alias} merged"),
+                    now,
+                )?;
+                rehomed_cards += 1;
+            }
+        }
+
+        if source_name != target_name {
+            let remaining_cards: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM cards WHERE repo = ?1",
+                [source_name.as_str()],
+                |row| row.get(0),
+            )?;
+            if remaining_cards == 0 {
+                transaction.execute(
+                    "DELETE FROM repositories WHERE name = ?1",
+                    [source_name.as_str()],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE repositories SET updated_at = ?2 WHERE name = ?1",
+            params![target_name, now],
+        )?;
+        transaction.commit()?;
+
+        let repository = self
+            .repository_summary(&target_name)?
+            .ok_or_else(|| DomainError::not_found("repository", target_name.clone()))?;
+        Ok(RepositoryMergeOutcome {
+            repository,
+            alias,
+            rehomed_cards,
+        })
+    }
+
+    fn list_repositories_inner(&self, include_hidden: bool) -> Result<Vec<RepositorySummary>> {
+        let mut statement = if include_hidden {
+            self.connection
+                .prepare("SELECT name FROM repositories ORDER BY name ASC")?
+        } else {
+            self.connection.prepare(
+                "SELECT name FROM repositories WHERE visibility = 'visible' ORDER BY name ASC",
+            )?
+        };
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        names
+            .into_iter()
+            .map(|name| {
+                self.repository_summary(&name)?
+                    .ok_or_else(|| DomainError::not_found("repository", name).into())
+            })
+            .collect()
+    }
+
+    fn repository_summary(&self, name: &str) -> Result<Option<RepositorySummary>> {
+        let Some(record) = self
+            .connection
+            .query_row(
+                "SELECT name, visibility, import_provenance, created_at, updated_at
+                 FROM repositories
+                 WHERE name = ?1",
+                [name],
+                RepositoryRecord::from_row,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let aliases = repository_aliases(&self.connection, &record.name)?;
+        let status_counts = repository_status_counts(&self.connection, &record.name)?;
+        let card_count = status_counts.values().sum();
+        Ok(Some(RepositorySummary {
+            repo: record.name.clone(),
+            name: record.name,
+            aliases,
+            visibility: record.visibility,
+            import_provenance: record.import_provenance,
+            card_count,
+            status_counts,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }))
+    }
+}
+
+pub(crate) fn ensure_repository_entity(
+    connection: &Connection,
+    raw_repo: &str,
+    now: i64,
+    import_provenance: Option<&str>,
+) -> Result<Option<String>> {
+    let raw_alias = normalize_repository_token(raw_repo)?;
+    let Some(default_name) = canonical_repo_label(&raw_alias) else {
+        return Ok(None);
+    };
+    let name = resolve_repository_name(connection, &raw_alias)?.unwrap_or(default_name);
+    upsert_repository_row(
+        connection,
+        &name,
+        RepositoryVisibility::Visible,
+        import_provenance,
+        now,
+        false,
+    )?;
+    if raw_alias != name {
+        insert_repository_alias(connection, &name, &raw_alias, now, false)?;
+    }
+    Ok(Some(name))
+}
+
+pub(crate) fn resolve_repository_name(
+    connection: &Connection,
+    raw_repo: &str,
+) -> Result<Option<String>> {
+    let raw = normalize_repository_token(raw_repo)?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Some(name) = connection
+        .query_row(
+            "SELECT repository_name FROM repository_aliases WHERE alias = ?1",
+            [raw.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(name));
+    }
+    if connection
+        .query_row(
+            "SELECT 1 FROM repositories WHERE name = ?1",
+            [raw.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Ok(Some(raw));
+    }
+    let Some(canonical) = canonical_repo_label(&raw) else {
+        return Ok(None);
+    };
+    if let Some(name) = connection
+        .query_row(
+            "SELECT repository_name FROM repository_aliases WHERE alias = ?1",
+            [canonical.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(name));
+    }
+    Ok(Some(canonical))
+}
+
+pub(crate) fn normalize_repository_token(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/').trim();
+    let without_git = trimmed.strip_suffix(".git").unwrap_or(trimmed).trim();
+    if without_git.is_empty() {
+        Err(DomainError::validation("repository", "value cannot be empty").into())
+    } else {
+        Ok(without_git.to_string())
+    }
+}
+
+fn upsert_repository_row(
+    connection: &Connection,
+    name: &str,
+    visibility: RepositoryVisibility,
+    import_provenance: Option<&str>,
+    now: i64,
+    replace_visibility: bool,
+) -> Result<()> {
+    let name = normalize_repository_token(name)?;
+    connection.execute(
+        "INSERT INTO repositories (name, visibility, import_provenance, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(name) DO UPDATE SET
+           visibility = CASE WHEN ?5 THEN excluded.visibility ELSE repositories.visibility END,
+           import_provenance = COALESCE(excluded.import_provenance, repositories.import_provenance),
+           updated_at = excluded.updated_at",
+        params![
+            name,
+            visibility.as_str(),
+            import_provenance,
+            now,
+            replace_visibility
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_repository_aliases(
+    connection: &Connection,
+    repository_name: &str,
+    aliases: Vec<String>,
+    now: i64,
+) -> Result<()> {
+    for alias in &aliases {
+        if let Some(existing) = connection
+            .query_row(
+                "SELECT repository_name FROM repository_aliases WHERE alias = ?1",
+                [alias.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if existing != repository_name {
+                return Err(DomainError::conflict(format!(
+                    "alias {alias} already belongs to repository {existing}; use alias merge"
+                ))
+                .into());
+            }
         }
     }
-    Ok(repositories
-        .into_iter()
-        .map(|(repo, accumulator)| RepositorySummary {
-            repo,
-            aliases: accumulator.aliases.into_iter().collect(),
-            card_count: accumulator.card_count,
-            status_counts: accumulator.status_counts,
-        })
-        .collect())
+    connection.execute(
+        "DELETE FROM repository_aliases WHERE repository_name = ?1",
+        [repository_name],
+    )?;
+    for alias in aliases {
+        insert_repository_alias(connection, repository_name, &alias, now, false)?;
+    }
+    Ok(())
 }
 
-#[derive(Default)]
-struct RepositoryAccumulator {
-    aliases: BTreeSet<String>,
-    card_count: usize,
-    status_counts: BTreeMap<String, usize>,
+fn insert_repository_alias(
+    connection: &Connection,
+    repository_name: &str,
+    alias: &str,
+    now: i64,
+    replace: bool,
+) -> Result<()> {
+    let alias = normalize_repository_token(alias)?;
+    if alias == repository_name {
+        return Ok(());
+    }
+    if replace {
+        connection.execute(
+            "INSERT INTO repository_aliases (alias, repository_name, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(alias) DO UPDATE SET repository_name = excluded.repository_name",
+            params![alias, repository_name, now],
+        )?;
+    } else {
+        let existing = connection
+            .query_row(
+                "SELECT repository_name FROM repository_aliases WHERE alias = ?1",
+                [alias.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match existing {
+            Some(existing) if existing == repository_name => {}
+            Some(existing) => {
+                return Err(DomainError::conflict(format!(
+                    "alias {alias} already belongs to repository {existing}; use alias merge"
+                ))
+                .into());
+            }
+            None => {
+                connection.execute(
+                    "INSERT INTO repository_aliases (alias, repository_name, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![alias, repository_name, now],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn move_repository_aliases(
+    connection: &Connection,
+    source_name: &str,
+    target_name: &str,
+    now: i64,
+) -> Result<()> {
+    let aliases = repository_aliases(connection, source_name)?;
+    for alias in aliases {
+        insert_repository_alias(connection, target_name, &alias, now, true)?;
+    }
+    Ok(())
+}
+
+fn repository_aliases(connection: &Connection, repository_name: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT alias
+         FROM repository_aliases
+         WHERE repository_name = ?1
+         ORDER BY alias ASC",
+    )?;
+    let aliases = statement
+        .query_map([repository_name], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(aliases)
+}
+
+fn repository_status_counts(
+    connection: &Connection,
+    repository_name: &str,
+) -> Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    let mut statement =
+        connection.prepare("SELECT repo, status FROM cards WHERE repo IS NOT NULL")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (repo, status) in rows {
+        if resolve_repository_name(connection, &repo)?.as_deref() != Some(repository_name) {
+            continue;
+        }
+        let status = CardStatus::parse(&status).ok_or(StoreError::InvalidStoredValue {
+            field: "cards.status",
+            value: status,
+        })?;
+        *counts.entry(status.as_str().to_string()).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+fn resolved_repository_card_count(connection: &Connection, repository_name: &str) -> Result<usize> {
+    let mut statement = connection.prepare("SELECT repo FROM cards WHERE repo IS NOT NULL")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().try_fold(0usize, |count, repo| {
+        let resolved = resolve_repository_name(connection, &repo)?;
+        Ok(count + usize::from(resolved.as_deref() == Some(repository_name)))
+    })
+}
+
+fn append_repository_card_event(
+    connection: &Connection,
+    card_id: &str,
+    actor: &str,
+    payload: &str,
+    now: i64,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO card_events (id, card_id, event_type, actor, payload, created_at)
+         VALUES (?1, ?2, 'repository', ?3, ?4, ?5)",
+        params![
+            format!("event-{}", nanoid::nanoid!(12, &crate::API_KEY_ALPHABET)),
+            card_id,
+            actor,
+            payload,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+struct RepositoryRecord {
+    name: String,
+    visibility: RepositoryVisibility,
+    import_provenance: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl RepositoryRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let visibility = row.get::<_, String>(1)?;
+        let visibility = RepositoryVisibility::parse(&visibility).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                format!("invalid repository visibility: {visibility}").into(),
+            )
+        })?;
+        Ok(Self {
+            name: row.get(0)?,
+            visibility,
+            import_provenance: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    }
 }

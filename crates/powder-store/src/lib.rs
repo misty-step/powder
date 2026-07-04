@@ -25,12 +25,15 @@ pub use events::{
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
-pub use repositories::RepositorySummary;
-use repositories::{summarize_repository_rows, RepositoryRow};
+use repositories::{ensure_repository_entity, resolve_repository_name};
+pub use repositories::{
+    RepositoryMergeOutcome, RepositorySummary, RepositoryUpsert, RepositoryVisibility,
+};
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, RUN_SELECT_SQL, SCHEMA,
+    SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -137,6 +140,11 @@ impl Store {
                 5 => {
                     self.connection.execute_batch(MIGRATE_5_TO_6)?;
                     6
+                }
+                6 => {
+                    self.connection.execute_batch(MIGRATE_6_TO_7)?;
+                    self.backfill_repositories_from_cards()?;
+                    7
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -333,7 +341,9 @@ impl Store {
             .connection
             .query_row(CARD_SELECT_SQL, [card_id.as_str()], CardRecord::from_row)
             .optional()?;
-        record.map(CardRecord::into_card).transpose()
+        record
+            .map(|record| card_from_record(&self.connection, record))
+            .transpose()
     }
 
     pub fn get_run(&self, run_id: &RunId) -> Result<Option<Run>> {
@@ -351,7 +361,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let all_cards = records
             .into_iter()
-            .map(CardRecord::into_card)
+            .map(|record| card_from_record(&self.connection, record))
             .collect::<Result<Vec<_>>>()?;
         // reuses the same full scan already loaded above, rather than a
         // second query per blocker: a blocker missing from this map is
@@ -383,14 +393,19 @@ impl Store {
     /// file directly. Same sort as `list_ready` (priority, age, id).
     pub fn list_cards(&self, filter: &CardFilter, limit: usize) -> Result<Vec<Card>> {
         let repo_filter_requested = filter.repo.is_some();
-        let repo_filter = filter.repo.as_deref().and_then(canonical_repo_label);
+        let repo_filter = filter
+            .repo
+            .as_deref()
+            .map(|repo| resolve_repository_name(&self.connection, repo))
+            .transpose()?
+            .flatten();
         let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
         let records = statement
             .query_map([], CardRecord::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut cards = records
             .into_iter()
-            .map(CardRecord::into_card)
+            .map(|record| card_from_record(&self.connection, record))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter(|card| filter.status.map(|s| card.status == s).unwrap_or(true))
@@ -408,17 +423,6 @@ impl Store {
         });
         cards.truncate(limit.max(1));
         Ok(cards)
-    }
-
-    pub fn list_repositories(&self) -> Result<Vec<RepositorySummary>> {
-        let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
-        let records = statement
-            .query_map([], CardRecord::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        summarize_repository_rows(records.into_iter().map(|record| RepositoryRow {
-            repo: record.repo,
-            status: record.status,
-        }))
     }
 
     pub fn claim_card(
@@ -889,7 +893,12 @@ impl Store {
 fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     let source_path = card.source.as_ref().map(|source| source.path.as_str());
     let source_digest = card.source.as_ref().map(|source| source.digest.as_str());
-    let repo = card.repo.as_deref().and_then(canonical_repo_label);
+    let repo = card
+        .repo
+        .as_deref()
+        .map(|repo| ensure_repository_entity(connection, repo, card.updated_at, Some("card repo")))
+        .transpose()?
+        .flatten();
     let claim_agent = card.claim.as_ref().map(|claim| claim.agent.as_str());
     let claim_run_id = card.claim.as_ref().map(|claim| claim.run_id.as_str());
     let claim_acquired_at = card.claim.as_ref().map(|claim| claim.acquired_at);
@@ -1094,15 +1103,23 @@ fn load_card(connection: &Connection, card_id: &CardId) -> Result<Card> {
         .query_row(CARD_SELECT_SQL, [card_id.as_str()], CardRecord::from_row)
         .optional()?
         .ok_or_else(|| DomainError::not_found("card", card_id.to_string()).into())
-        .and_then(CardRecord::into_card)
+        .and_then(|record| card_from_record(connection, record))
 }
 
 fn load_card_optional(connection: &Connection, card_id: &CardId) -> Result<Option<Card>> {
     connection
         .query_row(CARD_SELECT_SQL, [card_id.as_str()], CardRecord::from_row)
         .optional()?
-        .map(CardRecord::into_card)
+        .map(|record| card_from_record(connection, record))
         .transpose()
+}
+
+fn card_from_record(connection: &Connection, record: CardRecord) -> Result<Card> {
+    let mut card = record.into_card()?;
+    if let Some(repo) = card.repo.as_deref() {
+        card.repo = resolve_repository_name(connection, repo)?;
+    }
+    Ok(card)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -43,6 +43,16 @@ for (const mode of MODES) {
     await assertLaw(page, { consoleErrors: errors });
   });
 
+  test(`board settings page · ${mode} · the law holds`, async ({ page }) => {
+    const errors = await boot(page, mode);
+    await page.locator("#settings-toggle").click();
+    await expect(page.locator("#auth-panel")).toBeVisible();
+    await expect(page.locator("#repo-create-form")).toBeVisible();
+    await expect(page.locator("#repo-settings-list .pw-repo-row")).toHaveCount(1);
+    await expect(page.locator("#repo-settings-list")).toContainText("Merge alias");
+    await assertLaw(page, { consoleErrors: errors });
+  });
+
   test(`board card link · ${mode} · opens the detail route and back returns`, async ({ page }) => {
     const errors = await boot(page, mode);
     await page.locator("#tab-board").click();

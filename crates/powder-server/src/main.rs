@@ -28,7 +28,9 @@ use powder_core::{
     parse_backlog_card, Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
-use powder_store::{ApiKeyScope, CardFilter, Store, StoreError};
+use powder_store::{
+    ApiKeyScope, CardFilter, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
@@ -194,6 +196,11 @@ struct ListCardsParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListRepositoriesParams {
+    include_hidden: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ImportFile {
     path: String,
     contents: String,
@@ -225,9 +232,24 @@ struct CreateCardRequest {
     acceptance: Vec<String>,
     status: Option<String>,
     priority: Option<String>,
+    repo: Option<String>,
     related: Option<Vec<String>>,
     blocks: Option<Vec<String>>,
     blocked_by: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryRequest {
+    name: Option<String>,
+    aliases: Option<Vec<String>>,
+    visibility: Option<String>,
+    import_provenance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositoryMergeRequest {
+    alias: String,
+    actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,7 +399,20 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
-        .route("/api/v1/repositories", get(list_repositories))
+        .route(
+            "/api/v1/repositories",
+            post(upsert_repository).get(list_repositories),
+        )
+        .route(
+            "/api/v1/repositories/{name}",
+            get(get_repository)
+                .post(update_repository)
+                .delete(delete_repository),
+        )
+        .route(
+            "/api/v1/repositories/{name}/merge-alias",
+            post(merge_repository_alias),
+        )
         .route("/api/v1/cards/{id}", get(get_card))
         .route("/api/v1/cards/{id}/claim", post(claim_card))
         .route("/api/v1/cards/{id}/release", post(release_claim))
@@ -523,10 +558,82 @@ async fn list_cards(
 async fn list_repositories(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(params): Query<ListRepositoriesParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
-    let repositories = lock_store(&state)?.list_repositories()?;
+    let repositories = if params.include_hidden.unwrap_or(false) {
+        lock_store(&state)?.list_repositories_with_hidden()?
+    } else {
+        lock_store(&state)?.list_repositories()?
+    };
     Ok(Json(json!({ "repositories": repositories })))
+}
+
+async fn get_repository(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_read(&state, &headers)?;
+    let repository = lock_store(&state)?
+        .get_repository(&name)?
+        .ok_or_else(|| powder_core::DomainError::not_found("repository", name))?;
+    Ok(Json(json!(repository)))
+}
+
+async fn upsert_repository(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RepositoryRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let name = request
+        .name
+        .clone()
+        .ok_or_else(|| ApiError::bad_request("repository name is required"))?;
+    let repository =
+        lock_store(&state)?.upsert_repository(repository_upsert(name, request)?, unix_now())?;
+    Ok(Json(json!(repository)))
+}
+
+async fn update_repository(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<RepositoryRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let repository_name = request.name.clone().unwrap_or(name);
+    let repository = lock_store(&state)?
+        .upsert_repository(repository_upsert(repository_name, request)?, unix_now())?;
+    Ok(Json(json!(repository)))
+}
+
+async fn delete_repository(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    lock_store(&state)?.delete_repository(&name)?;
+    Ok(Json(json!({ "deleted": true, "repository": name })))
+}
+
+async fn merge_repository_alias(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<RepositoryMergeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = require_admin(&state, &headers)?;
+    let merge_actor = request.actor.unwrap_or(actor.display_name);
+    let outcome = lock_store(&state)?.merge_repository_alias(
+        &request.alias,
+        &name,
+        &merge_actor,
+        unix_now(),
+    )?;
+    Ok(Json(json!(outcome)))
 }
 
 async fn import_cards(
@@ -626,6 +733,7 @@ async fn create_card(
     card.related = card_ids(request.related)?;
     card.blocks = card_ids(request.blocks)?;
     card.blocked_by = card_ids(request.blocked_by)?;
+    card.repo = request.repo;
     let card = {
         let mut store = lock_store(&state)?;
         store.upsert_card_with_events(card, &actor.display_name, now)?
@@ -1088,6 +1196,26 @@ fn card_ids(raw: Option<Vec<String>>) -> Result<Vec<CardId>, ApiError> {
         .map(CardId::new)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(ApiError::from)
+}
+
+fn repository_upsert(
+    name: String,
+    request: RepositoryRequest,
+) -> Result<RepositoryUpsert, ApiError> {
+    let visibility = request
+        .visibility
+        .as_deref()
+        .map(|raw| {
+            RepositoryVisibility::parse(raw)
+                .ok_or_else(|| ApiError::bad_request(format!("invalid visibility: {raw}")))
+        })
+        .transpose()?;
+    Ok(RepositoryUpsert {
+        name,
+        aliases: request.aliases,
+        visibility,
+        import_provenance: request.import_provenance,
+    })
 }
 
 async fn delivery_loop(state: AppState) {

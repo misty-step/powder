@@ -259,7 +259,10 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     assert_eq!(repositories.status(), StatusCode::OK);
     let repositories = response_json(repositories).await;
     assert_eq!(repositories["repositories"][0]["repo"], "other");
-    assert_eq!(repositories["repositories"][0]["aliases"], json!([]));
+    assert_eq!(
+        repositories["repositories"][0]["aliases"],
+        json!(["misty-step/other"])
+    );
     assert_eq!(repositories["repositories"][0]["card_count"], 1);
 
     let invalid_status = app
@@ -272,6 +275,153 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/repositories",
+            Some(&admin_key),
+            r#"{"name":"misty-step/canary","aliases":["canary-app"],"visibility":"visible","import_provenance":"manual"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(created["name"], "canary");
+    assert_eq!(
+        created["aliases"],
+        json!(["canary-app", "misty-step/canary"])
+    );
+    assert_eq!(created["import_provenance"], "manual");
+
+    let read_by_alias = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/repositories/canary-app",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_by_alias.status(), StatusCode::OK);
+    assert_eq!(response_json(read_by_alias).await["name"], "canary");
+
+    let hidden = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/repositories/canary",
+            Some(&admin_key),
+            r#"{"aliases":["canary-app","misty-step/canary"],"visibility":"hidden"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::OK);
+
+    let visible_list = app
+        .clone()
+        .oneshot(json_request(Method::GET, "/api/v1/repositories", None, ""))
+        .await
+        .unwrap();
+    assert_eq!(response_json(visible_list).await["repositories"], json!([]));
+
+    let hidden_list = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/repositories?include_hidden=true",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(hidden_list).await["repositories"][0]["visibility"],
+        "hidden"
+    );
+
+    let legacy = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"legacy-canary","title":"Legacy canary","acceptance":["proof"],"status":"ready","repo":"legacy-canary"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), StatusCode::OK);
+
+    let merged = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/repositories/canary/merge-alias",
+            Some(&admin_key),
+            r#"{"alias":"legacy-canary","actor":"operator"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(merged.status(), StatusCode::OK);
+    let merged = response_json(merged).await;
+    assert_eq!(merged["rehomed_cards"], 1);
+
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/legacy-canary",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail = response_json(detail).await;
+    assert_eq!(detail["card"]["repo"], "canary");
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["event_type"] == "repository"
+            && event["actor"] == "operator"
+            && event["payload"]
+                .as_str()
+                .unwrap()
+                .contains("legacy-canary -> canary")
+    }));
+
+    let delete_used = app
+        .clone()
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/v1/repositories/canary",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete_used.status(), StatusCode::CONFLICT);
+
+    let deleted_unused = app
+        .oneshot(json_request(
+            Method::DELETE,
+            "/api/v1/repositories/canary-app",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_unused.status(),
+        StatusCode::CONFLICT,
+        "aliases resolve to the canonical repository, so delete stays card-count safe"
+    );
 }
 
 #[tokio::test]
