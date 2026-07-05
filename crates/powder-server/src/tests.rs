@@ -1860,7 +1860,11 @@ async fn import_rejects_neither_path_nor_files() {
 }
 
 #[tokio::test]
-async fn agent_scoped_key_cannot_author_or_import_cards() {
+async fn agent_scoped_key_can_author_a_card_but_not_bulk_import() {
+    // powder-925: single-card authoring moved to authorize() so a scoped
+    // (non-admin) key can carry the operator's mobile quick-add flow.
+    // Bulk import stays admin-only -- many cards land with no per-card
+    // review, unlike one deliberate quick-add.
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state
         .store
@@ -1881,7 +1885,7 @@ async fn agent_scoped_key_cannot_author_or_import_cards() {
         ))
         .await
         .unwrap();
-    assert_eq!(created.status(), StatusCode::FORBIDDEN);
+    assert_eq!(created.status(), StatusCode::OK);
 
     let imported = app
         .oneshot(json_request(

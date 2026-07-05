@@ -32,6 +32,7 @@
   <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"></circle></symbol>
   <symbol id="i-proof" viewBox="0 0 24 24"><path d="M4 12.5 8.5 17 20 5.5"></path><path d="M4 19h16"></path></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"></polygon></symbol>
   <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.06 12.35a1 1 0 0 1 0-.7 10.75 10.75 0 0 1 19.88 0 1 1 0 0 1 0 .7 10.75 10.75 0 0 1-19.88 0"></path><circle cx="12" cy="12" r="3"></circle></symbol>
   <symbol id="i-ask" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path><path d="M12 17h.01"></path></symbol>
@@ -75,6 +76,10 @@
       <span class="ae-nav-ind" id="ind"></span>
     </nav>
     <div class="pw-top-right">
+      <button class="pw-filter-btn" id="quick-add-toggle" type="button" aria-expanded="false" aria-controls="quick-add-panel">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+        file card
+      </button>
       <button class="pw-filter-btn" id="filter-btn" type="button" aria-expanded="false" aria-controls="filters">
         <svg class="ae-icon" aria-hidden="true"><use href="#i-filter"></use></svg>
         filter<span class="pw-filter-n" id="filter-n"></span>
@@ -84,6 +89,28 @@
       </button>
     </div>
   </header>
+
+  <section id="quick-add-panel" class="pw-quick-add" hidden>
+    <form id="quick-add-form" class="pw-quick-add-form">
+      <label>
+        <span class="ae-chrome">Title</span>
+        <input id="quick-add-title" class="ae-input" type="text" autocomplete="off" required placeholder="What needs doing?">
+      </label>
+      <label>
+        <span class="ae-chrome">Notes</span>
+        <textarea id="quick-add-body" class="ae-input" rows="3" placeholder="Optional details"></textarea>
+      </label>
+      <label>
+        <span class="ae-chrome">Repo</span>
+        <select id="quick-add-repo" class="pw-sort"></select>
+      </label>
+      <div class="pw-quick-add-actions">
+        <button class="ae-button ae-button-compact" type="submit">File card</button>
+        <button class="ae-button ae-button-quiet ae-button-compact" type="button" id="quick-add-cancel">Cancel</button>
+      </div>
+      <p id="quick-add-message" class="ae-chrome" aria-live="polite"></p>
+    </form>
+  </section>
 
   <section id="auth-panel" class="pw-auth" hidden>
     <div>

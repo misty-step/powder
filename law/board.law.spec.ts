@@ -117,6 +117,7 @@ for (const mode of MODES) {
     await expect(page.locator("#powder-board-app")).toBeVisible();
     await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
   });
+
 }
 
 for (const mode of MODES) {
@@ -182,4 +183,71 @@ test("the gate catches a planted off-law element (not theater)", async ({
 
   expect((await checkRadius(page)).pass).toBe(false);
   expect((await checkFontSize(page)).pass).toBe(false);
+});
+
+// powder-925: the operator's mobile write path. These run once each,
+// standalone (not mode-looped), and last in the file -- the quick-add test
+// creates a persistent card in the shared fixture DB, which would break
+// board-card-link's "first rail card is 001" assumption if it ran earlier.
+// The status-change test restores 001's status before finishing, so it's
+// safe regardless of order, but is kept alongside its sibling for clarity.
+
+test("board · mobile-390 · operator can change a card's status with no CLI (powder-925)", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 900 });
+  const errors = await boot(page, "light", "/c/001");
+  await expect(page.locator("#detail-status-change")).toHaveValue("ready");
+
+  const updated = page.waitForResponse(
+    (response) =>
+      /\/api\/v1\/cards\/001\/status$/.test(response.url()) && response.request().method() === "POST",
+  );
+  await page.locator("#detail-status-change").selectOption("blocked");
+  const response = await updated;
+  expect(response.status()).toBe(200);
+  await expect(page.locator("#detail-status-change")).toHaveValue("blocked");
+  await expect(page.locator(".pw-st")).toContainText("blocked");
+
+  // restore the fixture card's status so a later local run against the
+  // same reused DB still finds 001 ready.
+  const restored = page.waitForResponse(
+    (response) =>
+      /\/api\/v1\/cards\/001\/status$/.test(response.url()) && response.request().method() === "POST",
+  );
+  await page.locator("#detail-status-change").selectOption("ready");
+  await restored;
+
+  await assertLaw(page, { consoleErrors: errors });
+});
+
+test("board · mobile-390 · operator can quick-add a card with no CLI (powder-925)", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 900 });
+  const errors = await boot(page, "light");
+  await expect(page.locator("#quick-add-panel")).toBeHidden();
+  await page.locator("#quick-add-toggle").click();
+  await expect(page.locator("#quick-add-panel")).toBeVisible();
+
+  await page.locator("#quick-add-title").fill("powder-925 law-gate quick add");
+  await page.locator("#quick-add-body").fill("Filed touch-first, no CLI, from a 390px viewport.");
+  const repoBeforeSubmit = await page.locator("#quick-add-repo").inputValue();
+  expect(repoBeforeSubmit.length, "repo picker must have a selected default").toBeGreaterThan(0);
+
+  const created = page.waitForResponse(
+    (response) => response.url().endsWith("/api/v1/cards") && response.request().method() === "POST",
+  );
+  await page.locator("#quick-add-form button[type=submit]").click();
+  const response = await created;
+  expect(response.status()).toBe(200);
+  const card = await response.json();
+  expect(card.title).toBe("powder-925 law-gate quick add");
+  expect(card.status).toBe("backlog");
+
+  await expect(page.locator("#quick-add-panel")).toBeHidden();
+  const board = page.locator("#board");
+  const overflows = await board.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+  expect(overflows, "quick-add panel must not force horizontal scroll at 390px").toBe(false);
+  await assertLaw(page, { consoleErrors: errors });
 });

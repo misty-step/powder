@@ -827,7 +827,11 @@ async fn create_card(
     headers: HeaderMap,
     Json(request): Json<CreateCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let actor = require_admin(&state, &headers)?;
+    // powder-925: single-card authoring is agent-accessible, same as
+    // claim/status/comment/complete -- a scoped (non-admin) key can carry
+    // the operator's mobile quick-add flow without holding admin. Bulk
+    // import (many cards, no per-card review) stays admin-only below.
+    let actor = authorize(&state, &headers)?;
     let now = unix_now();
     // Default status reflects whether a real oracle exists: empty
     // acceptance can never default to `ready` ("ready is a query, not
@@ -1329,10 +1333,12 @@ fn authorize_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError>
     }
 }
 
-/// Gate operator/admin-only routes (card authoring, bulk import) that are
-/// not scoped to any single claim and so cannot be checked via claim
-/// ownership. Agent-scoped API keys are rejected; trusted tailnet callers
-/// and disabled auth pass through.
+/// Gate operator/admin-only routes (bulk import, repository management, key
+/// management) that are not scoped to any single claim and so cannot be
+/// checked via claim ownership. Agent-scoped API keys are rejected; trusted
+/// tailnet callers and disabled auth pass through. Single-card authoring
+/// moved to `authorize()` (powder-925) -- it's reviewable one card at a
+/// time, unlike bulk import.
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
     let actor = authorize(state, headers)?;
     if !actor.enforces_identity || actor.is_admin {

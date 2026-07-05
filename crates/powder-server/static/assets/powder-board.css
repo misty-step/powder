@@ -298,6 +298,40 @@ html:not([data-pw-route='card']) .pw-detail-app {
   color: var(--ae-ink-faint);
 }
 
+/* powder-925: the operator's mobile write path -- a single-purpose panel,
+   same toggle mechanics as .pw-auth (hidden attribute, not a modal), so it
+   works identically at 390px and on desktop with no separate mobile path. */
+.pw-quick-add {
+  flex: none;
+  padding: 0.8em 2em;
+  border-bottom: 1px solid var(--ae-line);
+  background: var(--ae-wash);
+}
+
+.pw-quick-add[hidden] {
+  display: none;
+}
+
+.pw-quick-add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8em;
+  max-width: 32rem;
+}
+
+.pw-quick-add-form label {
+  display: block;
+}
+
+.pw-quick-add-actions {
+  display: flex;
+  gap: 0.8em;
+}
+
+.pw-status-change {
+  width: auto;
+}
+
 .pw-filters {
   flex: none;
   display: none;
