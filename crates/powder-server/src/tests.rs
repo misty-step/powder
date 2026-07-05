@@ -1567,6 +1567,125 @@ async fn api_key_claim_rejects_cross_agent_impersonation() {
     assert_eq!(claimed["agent"], "codex");
 }
 
+/// linejam-906: a claim response being `200 OK` is not itself proof the
+/// claim is visible to a subsequent reader. This pins the full
+/// claim -> get-card -> renew path, asserting the readback in the middle
+/// actually exposes the claim (status, run id, and agent) before the renew
+/// that depends on it.
+#[tokio::test]
+async fn claim_then_get_card_then_renew_round_trips_for_same_identity() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"claim-roundtrip","title":"t","body":"","acceptance":["x"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/claim-roundtrip/claim",
+            Some(&raw_key),
+            r#"{"agent":"lane-x","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed = response_json(claimed).await;
+    let run_id = claimed["run_id"].as_str().unwrap().to_string();
+
+    // Immediate readback must expose the active claim -- no silent gap.
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/claim-roundtrip",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(detail["card"]["status"], "claimed");
+    assert_eq!(detail["card"]["claim"]["run_id"], run_id);
+    assert_eq!(detail["card"]["claim"]["agent"], "lane-x");
+
+    let renewed = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/claim-roundtrip/renew",
+            Some(&raw_key),
+            &format!(r#"{{"run_id":"{run_id}","ttl_seconds":3600}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(renewed.status(), StatusCode::OK);
+}
+
+/// linejam-906's actual root cause: a claim request that omits `agent`
+/// entirely (the exact shape of the raw-curl repro that triggered this
+/// card) must be rejected, not silently recorded under the authenticated
+/// actor's own display name. Before the fix this was a silent 200 with
+/// `agent == "operator-admin"` for the shared admin-scoped seed key --
+/// `Authority::require_identity` already refuses this same silent-
+/// substitution shape for non-admin callers
+/// (`api_key_claim_rejects_cross_agent_impersonation`, above), but was a
+/// no-op for admin authority.
+#[tokio::test]
+async fn admin_key_claim_without_explicit_agent_is_rejected_not_silently_self_assigned() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey); // seed key is admin-scoped
+    let app = app(state);
+
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"claim-no-agent","title":"t","body":"","acceptance":["x"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/claim-no-agent/claim",
+            Some(&admin_key),
+            r#"{"ttl_seconds":3600}"#, // no "agent" field, matching the raw-curl repro
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "claim without an explicit agent must not silently fall back to the caller's own identity \
+         (422 is axum's default rejection for a missing required JSON field, same as any other \
+         required field on this API -- e.g. create-card without acceptance)"
+    );
+
+    // And the card itself must be untouched -- no claim recorded under any name.
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/claim-no-agent",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(detail["card"]["status"], "ready");
+    assert!(detail["card"]["claim"].is_null());
+}
+
 #[tokio::test]
 async fn api_key_auth_allows_claim_renew_heartbeat_and_release() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);

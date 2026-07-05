@@ -369,7 +369,19 @@ struct RepositoryMergeRequest {
 
 #[derive(Debug, Deserialize)]
 struct ClaimRequest {
-    agent: Option<String>,
+    // Required, not `Option`: a caller that omits `agent` (linejam-906 --
+    // a raw curl claim with no `agent` field) must get a deserialize error,
+    // not a silent fallback to the *authenticated actor's own* display
+    // name. For a shared admin-scoped key that fallback recorded the claim
+    // under "operator-admin" with no validation error at all, so the
+    // caller's later renew (as its own real identity) correctly 409'd
+    // against a claim it never actually held -- a claim recorded under the
+    // wrong identity, not a lock-ordering race. `Authority::require_identity`
+    // already refuses this same silent-substitution shape for non-admin
+    // callers (api_key_claim_rejects_cross_agent_impersonation); this closes
+    // the same gap for admin-scoped keys, who can still claim as anyone --
+    // they just have to say who.
+    agent: String,
     ttl_seconds: Option<u64>,
 }
 
@@ -962,10 +974,9 @@ async fn claim_card(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let requested_agent = request.agent.as_deref().unwrap_or(&actor.display_name);
     let receipt = lock_store(&state)?.claim_card(
         &card_id,
-        requested_agent,
+        &request.agent,
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
         &actor.authority(),
