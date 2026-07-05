@@ -12,6 +12,7 @@ use powder_store::{
 use serde_json::{json, Value};
 
 pub const COMMANDS: &[&str] = &[
+    "version",
     "init-db",
     "key-create",
     "key-list",
@@ -94,6 +95,9 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
     match args {
         [] => Ok(help()),
         [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
+        [command] if command == "version" || command == "--version" || command == "-v" => {
+            Ok(version())
+        }
         [command, rest @ ..] if command == "init-db" => init_db(rest),
         [command, rest @ ..] if command == "key-create" => key_create(rest),
         [command, rest @ ..] if command == "key-list" => key_list(rest),
@@ -111,19 +115,19 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "repository-merge-alias" => repository_merge_alias(rest),
         [command, rest @ ..] if command == "repository-delete" => repository_delete(rest),
         [command, rest @ ..] if command == "claim" => claim(rest, remote_env),
-        [command, rest @ ..] if command == "release-claim" => release_claim(rest),
-        [command, rest @ ..] if command == "renew-claim" => renew_claim(rest),
-        [command, rest @ ..] if command == "heartbeat" => heartbeat(rest),
+        [command, rest @ ..] if command == "release-claim" => release_claim(rest, remote_env),
+        [command, rest @ ..] if command == "renew-claim" => renew_claim(rest, remote_env),
+        [command, rest @ ..] if command == "heartbeat" => heartbeat(rest, remote_env),
         [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
         [command, rest @ ..] if command == "get-run" => get_run(rest),
         [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
         [command, rest @ ..] if command == "answer-input" => answer_input(rest),
         [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
         [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
-        [command, rest @ ..] if command == "add-link" => add_link(rest),
+        [command, rest @ ..] if command == "add-link" => add_link(rest, remote_env),
         [command, rest @ ..] if command == "add-comment" => add_comment(rest, remote_env),
-        [command, rest @ ..] if command == "request-input" => request_input(rest),
-        [command, rest @ ..] if command == "complete-card" => complete_card(rest),
+        [command, rest @ ..] if command == "request-input" => request_input(rest, remote_env),
+        [command, rest @ ..] if command == "complete-card" => complete_card(rest, remote_env),
         [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
         [command, rest @ ..] if command == "subscription-list" => subscription_list(rest),
         [command, rest @ ..] if command == "subscription-disable" => subscription_disable(rest),
@@ -131,6 +135,22 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "event-tail" => event_tail(rest),
         [command, ..] => Err(ShellError::Invalid(format!("unknown command: {command}"))),
     }
+}
+
+/// Reports the installed binary's build provenance so a lane can catch a
+/// stale `~/.cargo/bin/powder` (built from an old commit that predates a
+/// command's API-mode support) before it starts a claim, instead of hitting
+/// a bare `missing --db` on a command the checkout has long since covered.
+/// Compare against `git -C <checkout> rev-parse --short=12 HEAD`; a mismatch
+/// means `cargo install --path crates/powder-cli` is due.
+pub fn version() -> String {
+    let dirty = env!("POWDER_CLI_GIT_DIRTY") == "true";
+    format!(
+        "powder {} (git {}{})\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("POWDER_CLI_GIT_SHA"),
+        if dirty { ", dirty" } else { "" }
+    )
 }
 
 pub fn help() -> String {
@@ -141,6 +161,9 @@ pub fn help() -> String {
         help.push('\n');
     }
     help.push_str("\nexamples:\n");
+    help.push_str(
+        "  powder version   # confirm the installed binary's build against `git rev-parse --short=12 HEAD` before starting a lane\n",
+    );
     help.push_str("  powder init-db --db ./data/powder.db --show-secret\n");
     help.push_str("  powder key-create --db ./data/powder.db --name codex --scope agent\n");
     help.push_str("  powder key-list --db ./data/powder.db\n");
@@ -718,43 +741,99 @@ fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> 
     ))
 }
 
-fn release_claim(args: &[String]) -> Result<String, ShellError> {
+fn release_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "release-claim")?;
     let run_id = required_run_flag(args)?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let claim = store
-        .release_claim(&card_id, &run_id, now, &authority(args))
-        .map_err(store_err)?;
-    Ok(format!("released\t{}\t{}\n", claim.card_id, claim.run_id))
+    let (released_card_id, released_run_id) = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let claim = store
+            .release_claim(&card_id, &run_id, now, &authority(args))
+            .map_err(store_err)?;
+        (claim.card_id.to_string(), claim.run_id.to_string())
+    } else if let Some(client) = remote_env.client() {
+        let released = client
+            .post(
+                &format!("/api/v1/cards/{card_id}/release"),
+                json!({"run_id": run_id.as_str()}),
+            )
+            .map_err(remote_err)?;
+        (
+            json_string(&released, "card_id")?,
+            json_string(&released, "run_id")?,
+        )
+    } else {
+        return Err(missing_transport("release-claim"));
+    };
+    Ok(format!("released\t{released_card_id}\t{released_run_id}\n"))
 }
 
-fn renew_claim(args: &[String]) -> Result<String, ShellError> {
+fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "renew-claim")?;
     let run_id = required_run_flag(args)?;
     let ttl_seconds = optional_ttl(args)?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let claim = store
-        .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
-        .map_err(store_err)?;
+    let (renewed_card_id, renewed_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let claim = store
+            .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
+            .map_err(store_err)?;
+        (
+            claim.card_id.to_string(),
+            claim.run_id.to_string(),
+            claim.expires_at,
+        )
+    } else if let Some(client) = remote_env.client() {
+        let renewed = client
+            .post(
+                &format!("/api/v1/cards/{card_id}/renew"),
+                json!({"run_id": run_id.as_str(), "ttl_seconds": ttl_seconds}),
+            )
+            .map_err(remote_err)?;
+        (
+            json_string(&renewed, "card_id")?,
+            json_string(&renewed, "run_id")?,
+            json_i64(&renewed, "expires_at")?,
+        )
+    } else {
+        return Err(missing_transport("renew-claim"));
+    };
     Ok(format!(
-        "renewed\t{}\t{}\t{}\n",
-        claim.card_id, claim.run_id, claim.expires_at
+        "renewed\t{renewed_card_id}\t{renewed_run_id}\t{expires_at}\n"
     ))
 }
 
-fn heartbeat(args: &[String]) -> Result<String, ShellError> {
+fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "heartbeat")?;
     let run_id = required_run_flag(args)?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let claim = store
-        .heartbeat_claim(&card_id, &run_id, now, &authority(args))
-        .map_err(store_err)?;
+    let (beat_card_id, beat_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let claim = store
+            .heartbeat_claim(&card_id, &run_id, now, &authority(args))
+            .map_err(store_err)?;
+        (
+            claim.card_id.to_string(),
+            claim.run_id.to_string(),
+            claim.expires_at,
+        )
+    } else if let Some(client) = remote_env.client() {
+        let beat = client
+            .post(
+                &format!("/api/v1/cards/{card_id}/heartbeat"),
+                json!({"run_id": run_id.as_str()}),
+            )
+            .map_err(remote_err)?;
+        (
+            json_string(&beat, "card_id")?,
+            json_string(&beat, "run_id")?,
+            json_i64(&beat, "expires_at")?,
+        )
+    } else {
+        return Err(missing_transport("heartbeat"));
+    };
     Ok(format!(
-        "heartbeat\t{}\t{}\t{}\n",
-        claim.card_id, claim.run_id, claim.expires_at
+        "heartbeat\t{beat_card_id}\t{beat_run_id}\t{expires_at}\n"
     ))
 }
 
@@ -872,16 +951,29 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     ))
 }
 
-fn add_link(args: &[String]) -> Result<String, ShellError> {
+fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "add-link")?;
     let label = required_flag(args, "--label")?;
     let url = required_flag(args, "--url")?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let link = store
-        .add_link(&card_id, label, url, now)
-        .map_err(store_err)?;
-    Ok(format!("link\t{}\t{}\n", link.card_id, link.id))
+    let (link_card_id, link_id) = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let link = store
+            .add_link(&card_id, label, url, now)
+            .map_err(store_err)?;
+        (link.card_id.to_string(), link.id.to_string())
+    } else if let Some(client) = remote_env.client() {
+        let link = client
+            .post(
+                &format!("/api/v1/cards/{card_id}/links"),
+                json!({"label": label, "url": url}),
+            )
+            .map_err(remote_err)?;
+        (json_string(&link, "card_id")?, json_string(&link, "id")?)
+    } else {
+        return Err(missing_transport("add-link"));
+    };
+    Ok(format!("link\t{link_card_id}\t{link_id}\n"))
 }
 
 fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -912,7 +1004,7 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     ))
 }
 
-fn request_input(args: &[String]) -> Result<String, ShellError> {
+fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let run_id = positional(args)
         .first()
@@ -920,26 +1012,59 @@ fn request_input(args: &[String]) -> Result<String, ShellError> {
         .ok_or_else(|| ShellError::Invalid("request-input requires a run id".to_string()))
         .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
     let question = required_flag(args, "--question")?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let run = store
-        .request_input(&run_id, question, now, &authority(args))
-        .map_err(store_err)?;
-    Ok(format!("awaiting-input\t{}\t{}\n", run.id, run.card_id))
+    let (awaiting_run_id, awaiting_card_id) = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let run = store
+            .request_input(&run_id, question, now, &authority(args))
+            .map_err(store_err)?;
+        (run.id.to_string(), run.card_id.to_string())
+    } else if let Some(client) = remote_env.client() {
+        let run = client
+            .post(
+                &format!("/api/v1/runs/{run_id}/input"),
+                json!({"question": question}),
+            )
+            .map_err(remote_err)?;
+        (json_string(&run, "id")?, json_string(&run, "card_id")?)
+    } else {
+        return Err(missing_transport("request-input"));
+    };
+    Ok(format!(
+        "awaiting-input\t{awaiting_run_id}\t{awaiting_card_id}\n"
+    ))
 }
 
-fn complete_card(args: &[String]) -> Result<String, ShellError> {
+fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "complete-card")?;
     let proof = flag_value(args, "--proof");
     let criterion_proofs = criterion_proofs_flag(args)?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let card = store
-        .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
-        .map_err(store_err)?;
+    let card = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        let mut body = json!({});
+        if let Some(proof) = proof {
+            body["proof"] = json!(proof);
+        }
+        if !criterion_proofs.is_empty() {
+            body["criterion_proofs"] = json!(criterion_proofs
+                .iter()
+                .map(|proof| json!({"criterion": proof.criterion, "url": proof.url}))
+                .collect::<Vec<_>>());
+        }
+        client
+            .post(&format!("/api/v1/cards/{card_id}/complete"), body)
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("complete-card"));
+    };
     Ok(format!(
         "completed\t{}\t{}\n",
-        card.id,
-        card.status.as_str()
+        json_string(&card, "id")?,
+        json_string(&card, "status")?
     ))
 }
 
@@ -1235,6 +1360,7 @@ mod tests {
 
     #[test]
     fn cli_names_the_instance_workflow() {
+        assert!(COMMANDS.contains(&"version"));
         assert!(COMMANDS.contains(&"init-db"));
         assert!(COMMANDS.contains(&"key-list"));
         assert!(COMMANDS.contains(&"key-revoke"));
@@ -1266,6 +1392,20 @@ mod tests {
         assert!(COMMANDS.contains(&"subscription-disable"));
         assert!(COMMANDS.contains(&"dead-letter-list"));
         assert!(COMMANDS.contains(&"event-tail"));
+    }
+
+    /// The whole point of `version` is catching a stale installed binary
+    /// before a lane starts (powder-924): it must report the exact commit
+    /// this build compiled from, not just an unchanging crate version that
+    /// has sat at 0.1.0 since inception.
+    #[test]
+    fn cli_version_reports_the_build_commit() {
+        let output = run(&args(["version"])).unwrap();
+        assert!(output.starts_with("powder 0.1.0 (git "));
+        assert!(!output.contains("(git )"), "must not embed an empty sha");
+
+        assert_eq!(run(&args(["--version"])).unwrap(), output);
+        assert_eq!(run(&args(["-v"])).unwrap(), output);
     }
 
     #[test]
@@ -2523,6 +2663,153 @@ mod tests {
         assert_eq!(
             requests[7].body,
             Some(json!({"author": "operator", "body": "looks good"}))
+        );
+    }
+
+    /// A lane maintaining a claim lease against a deployed instance (no
+    /// local SQLite file at all) must be able to heartbeat, renew, and
+    /// release without ever passing `--db` -- the stale-binary friction this
+    /// covers was `heartbeat` returning verbatim `missing --db` even with
+    /// `POWDER_API_BASE_URL` set (powder-924).
+    #[test]
+    fn cli_remote_mode_maintains_a_claim_lease_without_db() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"card_id": "lease-1", "run_id": "run-lease", "expires_at": 200}),
+            ),
+            (
+                200,
+                json!({"card_id": "lease-1", "run_id": "run-lease", "expires_at": 260}),
+            ),
+            (200, json!({"card_id": "lease-1", "run_id": "run-lease"})),
+        ]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let beat =
+            run_with_env(&args(["heartbeat", "lease-1", "--run", "run-lease"]), &env).unwrap();
+        assert_eq!(beat, "heartbeat\tlease-1\trun-lease\t200\n");
+
+        let renewed = run_with_env(
+            &args([
+                "renew-claim",
+                "lease-1",
+                "--run",
+                "run-lease",
+                "--ttl",
+                "3600",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(renewed, "renewed\tlease-1\trun-lease\t260\n");
+
+        let released = run_with_env(
+            &args(["release-claim", "lease-1", "--run", "run-lease"]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(released, "released\tlease-1\trun-lease\n");
+
+        let requests = recorded.lock().unwrap();
+        let paths = requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "POST /api/v1/cards/lease-1/heartbeat",
+                "POST /api/v1/cards/lease-1/renew",
+                "POST /api/v1/cards/lease-1/release",
+            ]
+        );
+        assert_eq!(requests[0].body, Some(json!({"run_id": "run-lease"})));
+        assert_eq!(
+            requests[1].body,
+            Some(json!({"run_id": "run-lease", "ttl_seconds": 3600}))
+        );
+        assert_eq!(requests[2].body, Some(json!({"run_id": "run-lease"})));
+    }
+
+    /// A lane closing out a card against a deployed instance needs
+    /// request-input, add-link, and complete-card without `--db` too
+    /// (powder-924, powder-926): the closeout path a campaign lane actually
+    /// walks -- pause for a question, attach the PR/proof link, mark done.
+    #[test]
+    fn cli_remote_mode_closes_out_a_card_without_db() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (200, json!({"id": "run-closeout", "card_id": "closeout-1"})),
+            (
+                200,
+                json!({"card_id": "closeout-1", "id": "link-1", "label": "pr", "url": "https://example.test/pr"}),
+            ),
+            (200, json!({"id": "closeout-1", "status": "done"})),
+        ]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let awaiting = run_with_env(
+            &args([
+                "request-input",
+                "run-closeout",
+                "--question",
+                "Approve completion?",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(awaiting, "awaiting-input\trun-closeout\tcloseout-1\n");
+
+        let link = run_with_env(
+            &args([
+                "add-link",
+                "closeout-1",
+                "--label",
+                "pr",
+                "--url",
+                "https://example.test/pr",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(link, "link\tcloseout-1\tlink-1\n");
+
+        let completed = run_with_env(
+            &args([
+                "complete-card",
+                "closeout-1",
+                "--proof",
+                "https://example.test/pr",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(completed, "completed\tcloseout-1\tdone\n");
+
+        let requests = recorded.lock().unwrap();
+        let paths = requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "POST /api/v1/runs/run-closeout/input",
+                "POST /api/v1/cards/closeout-1/links",
+                "POST /api/v1/cards/closeout-1/complete",
+            ]
+        );
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"question": "Approve completion?"}))
+        );
+        assert_eq!(
+            requests[1].body,
+            Some(json!({"label": "pr", "url": "https://example.test/pr"}))
+        );
+        assert_eq!(
+            requests[2].body,
+            Some(json!({"proof": "https://example.test/pr"}))
         );
     }
 

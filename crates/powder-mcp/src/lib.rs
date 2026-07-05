@@ -3,7 +3,8 @@
 pub use powder_api::RemoteClient;
 use powder_core::{Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
 use powder_store::{
-    CardFilter, CriterionProofInput, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store,
+    CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility, Store,
 };
 use serde_json::{json, Value};
 
@@ -33,6 +34,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, repository, and initial status.",
         input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "update_card",
+        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, labels) on one existing card without replacing protected lifecycle or source metadata. In remote mode the deployed instance requires an admin-scope key.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -221,7 +227,11 @@ pub fn handle_json_rpc_remote(client: &RemoteClient, request: &Value) -> Option<
             "protocolVersion": request["params"]["protocolVersion"]
                 .as_str()
                 .unwrap_or("2024-11-05"),
-            "serverInfo": {"name": "powder", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {
+                "name": "powder",
+                "version": env!("CARGO_PKG_VERSION"),
+                "baseUrl": client.base_url(),
+            },
             "capabilities": {"tools": {"listChanged": false}},
         })),
         "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
@@ -300,6 +310,29 @@ pub fn call_tool_store(
             card.repo = optional_str(args, "repo").map(str::to_string);
             json!(store
                 .create_card_with_events(card, &authority_arg(args).actor_label(), now)
+                .map_err(to_string)?)
+        }
+        "update_card" => {
+            let card_id = card_id(args, "card_id")?;
+            let patch = CardPatch {
+                title: optional_str(args, "title").map(str::to_string),
+                body: optional_str(args, "body").map(str::to_string),
+                acceptance: optional_string_array(args, "acceptance")?,
+                proof_plan: optional_string_array(args, "proof_plan")?,
+                status: optional_str(args, "status")
+                    .map(|raw| {
+                        CardStatus::parse(raw).ok_or_else(|| format!("invalid status: {raw}"))
+                    })
+                    .transpose()?,
+                priority: optional_str(args, "priority")
+                    .map(|raw| {
+                        Priority::parse(raw).ok_or_else(|| format!("invalid priority: {raw}"))
+                    })
+                    .transpose()?,
+                labels: optional_string_array(args, "labels")?,
+            };
+            json!(store
+                .patch_card(&card_id, patch, &authority_arg(args).actor_label(), now)
                 .map_err(to_string)?)
         }
         "list_repositories" => {
@@ -622,10 +655,11 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 27);
+        assert_eq!(TOOLS.len(), 28);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
         assert!(names.contains(&"create_card"));
+        assert!(names.contains(&"update_card"));
         assert!(names.contains(&"list_repositories"));
         assert!(names.contains(&"upsert_repository"));
         assert!(names.contains(&"merge_repository_alias"));
@@ -851,6 +885,48 @@ Expose tools against the DB.
             .unwrap()
             .iter()
             .any(|event| { event["event_type"] == "criterion" && event["actor"] == "operator" }));
+    }
+
+    #[test]
+    fn mcp_update_card_patches_title_body_and_acceptance() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![parse_backlog_card(
+                "backlog.d/007-editable.md",
+                "# Editable\n\nPriority: P0 | Status: ready\n\n## Goal\nOriginal.\n\n## Oracle\n- [ ] g\n",
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+
+        let patched = call_tool_store(
+            &mut store,
+            "update_card",
+            &json!({
+                "card_id": "007",
+                "title": "Edited via MCP",
+                "body": "Edited body",
+                "acceptance": ["new oracle"],
+                "actor": "operator"
+            }),
+            10,
+        )
+        .unwrap();
+        let patched = tool_payload(&patched);
+        assert_eq!(patched["title"], "Edited via MCP");
+        assert_eq!(patched["body"], "Edited body");
+        assert_eq!(patched["criteria"][0]["text"], "new oracle");
+
+        let detail =
+            call_tool_store(&mut store, "get_card", &json!({"card_id": "007"}), 11).unwrap();
+        let detail = tool_payload(&detail);
+        assert_eq!(detail["card"]["title"], "Edited via MCP");
+        assert!(detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_type"] == "patch" && event["actor"] == "operator"));
     }
 
     #[test]
@@ -1137,5 +1213,24 @@ Expose tools against the DB.
 
     fn tool_payload(response: &Value) -> Value {
         serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// A caller with a shell `POWDER_API_BASE_URL` that disagrees with what
+    /// the registered MCP subprocess actually resolved (e.g. a stale export
+    /// vs. `~/.secrets`) has no way to tell the two faces have drifted apart
+    /// short of comparing intermittent connection errors. `initialize` now
+    /// answers that directly.
+    #[test]
+    fn remote_initialize_reports_the_deployment_it_is_actually_bound_to() {
+        let client = RemoteClient::new("http://127.0.0.1:4017".to_string(), None);
+        let response = handle_json_rpc_remote(
+            &client,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        )
+        .unwrap();
+        assert_eq!(
+            response["result"]["serverInfo"]["baseUrl"],
+            "http://127.0.0.1:4017"
+        );
     }
 }

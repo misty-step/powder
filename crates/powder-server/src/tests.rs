@@ -2317,6 +2317,50 @@ async fn healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db
 }
 
 #[tokio::test]
+async fn api_v1_routes_is_unauthenticated_and_documents_required_fields() {
+    let (state, _admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/routes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an agent must be able to read the API contract before it holds a key"
+    );
+    let routes = response_json(response).await;
+    let routes = routes.as_array().unwrap();
+
+    // The two routes powder-900 recorded agents guessing at (create-card's
+    // `acceptance` array, add-link's `label` vs. `title`) must name their
+    // required fields up front instead of leaving it to deserialize-error
+    // trial-and-error.
+    let create_card = routes
+        .iter()
+        .find(|route| route["method"] == "POST" && route["path"] == "/api/v1/cards")
+        .expect("POST /api/v1/cards documented");
+    let body_shape = create_card["body_shape"].as_str().unwrap();
+    assert!(body_shape.contains("\"acceptance\":[]"));
+    assert!(body_shape.contains("required"));
+
+    let add_link = routes
+        .iter()
+        .find(|route| route["method"] == "POST" && route["path"] == "/api/v1/cards/{id}/links")
+        .expect("POST /api/v1/cards/{id}/links documented");
+    let body_shape = add_link["body_shape"].as_str().unwrap();
+    assert!(body_shape.contains("\"label\""));
+    assert!(body_shape.contains("not \"title\""));
+}
+
+#[tokio::test]
 async fn tailnet_and_none_modes_authorize_as_configured() {
     let (tailnet_state, _) = test_state(AuthMode::TailscaleHeader);
     let tailnet_app = app(tailnet_state);

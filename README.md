@@ -65,7 +65,12 @@ POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 
 The CLI can target either SQLite directly or a deployed `powder-server`. For
 remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
-`POWDER_API_KEY`; `--db` always wins when supplied.
+`POWDER_API_KEY`; `--db` always wins when supplied. Run `powder version`
+before a lane starts: it reports the exact git commit the installed binary
+was built from (`cargo install --path crates/powder-cli` after every pull
+keeps it current), so a stale `~/.cargo/bin/powder` that predates a
+command's remote-mode support is obvious up front instead of surfacing mid-lane
+as a bare `missing --db` on a command the checkout has long since covered.
 
 | Command | `--db` transport | Remote env transport | Output shape |
 | --- | --- | --- | --- |
@@ -74,12 +79,23 @@ remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
 | `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
 | `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus` |
 | `claim` | SQLite claim lifecycle | `POST /api/v1/cards/{id}/claim` | `claimed\tcard_id\trun_id\texpires_at` |
+| `heartbeat` | SQLite lease liveness | `POST /api/v1/cards/{id}/heartbeat` | `heartbeat\tcard_id\trun_id\texpires_at` |
+| `renew-claim` | SQLite lease extension | `POST /api/v1/cards/{id}/renew` | `renewed\tcard_id\trun_id\texpires_at` |
+| `release-claim` | SQLite lease release | `POST /api/v1/cards/{id}/release` | `released\tcard_id\trun_id` |
 | `update-status` | SQLite status lifecycle | `POST /api/v1/cards/{id}/status` | `status\tid\tstatus` |
+| `check-criterion` | SQLite criterion write | `POST /api/v1/cards/{id}/criteria/check` | `criterion\tid\tindex\tchecked|unchecked` |
+| `add-link` | SQLite link write | `POST /api/v1/cards/{id}/links` | `link\tcard_id\tid` |
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
+| `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
+| `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
-falling back to ephemeral state.
+falling back to ephemeral state. `update-relations`, `get-run`,
+`list-awaiting-input`, `answer-input`, `repository-*`, `import*`, `key-*`, and
+`subscription-*` remain `--db`-only (bulk/admin operations or reads with no
+remote-mode demand yet); omitting `--db` on those still fails with a bare
+`missing --db`.
 
 Remote `POST /api/v1/cards/import` calls may submit inline markdown through
 the `files` request body when the server cannot see the caller's checkout. A
@@ -110,6 +126,23 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"complete_card","arguments":{"card_id":"001","proof":"http://example.test/proof"}}}' \
   | cargo run -q -p powder-mcp
 ```
+
+A registered MCP subprocess resolves `POWDER_API_BASE_URL` from its own launch
+environment (e.g. sourced from `~/.secrets` in a `bash -lc` wrapper), which can
+silently diverge from an operator's interactive shell. `initialize` reports
+`result.serverInfo.baseUrl`, so a caller can confirm the two faces agree
+instead of guessing at deployment drift from intermittent connection errors.
+
+Agents that talk to the HTTP API directly, without the CLI or MCP, can read
+`GET /api/v1/routes` for the full route contract with example request bodies
+naming required fields -- `POST /api/v1/cards` and
+`POST /api/v1/cards/{id}/links` are two routes agents have previously had to
+trial-and-error against raw serde deserialize errors.
+
+`update_card`/`PATCH /api/v1/cards/{id}` patches title, body, acceptance,
+proof_plan, status, priority, or labels on an existing card without
+replacing protected lifecycle or source metadata; it requires an admin-scope
+key.
 
 Harness Kit's `factory-mcps` materializer expects Powder's remote MCP entry to
 provide the HTTP environment rather than a local DB when used by factory

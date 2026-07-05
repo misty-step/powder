@@ -467,6 +467,7 @@ fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/v1/onboarding", get(onboarding))
+        .route("/api/v1/routes", get(routes))
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
@@ -588,6 +589,14 @@ async fn onboarding(State(state): State<AppState>) -> Result<Json<Onboarding>, A
         auth_mode: state.config.auth_mode,
         public_base_url: state.config.public_base_url.clone(),
     }))
+}
+
+/// Self-documents the API contract, including example request bodies for
+/// routes an agent would otherwise trial-and-error against raw deserialize
+/// errors (powder-900). Unauthenticated like `onboarding` and `healthz`:
+/// it names nothing but the shape of the API itself.
+async fn routes() -> Json<serde_json::Value> {
+    Json(powder_api::routes_json())
 }
 
 async fn list_ready(

@@ -9,6 +9,12 @@ pub struct ApiRoute {
     pub method: &'static str,
     pub path: &'static str,
     pub intent: &'static str,
+    /// An example JSON request body naming which fields are required, for
+    /// routes where trial-and-error against serde's default deserialize
+    /// errors is expensive (powder-900: agents guessed at `acceptance` and
+    /// `label` before landing on the right shape). `None` for GET/DELETE
+    /// routes and POST routes whose body is self-evident from `intent`.
+    pub body_shape: Option<&'static str>,
 }
 
 pub const ROUTES: &[ApiRoute] = &[
@@ -16,173 +22,239 @@ pub const ROUTES: &[ApiRoute] = &[
         method: "POST",
         path: "/api/v1/cards",
         intent: "create one new card in the instance database, rejecting duplicate ids",
+        body_shape: Some(
+            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely"#,
+        ),
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/import",
         intent: "import backlog.d markdown into the instance database, from a server-local path or raw file contents in the body, optionally namespaced by repo",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
         intent: "list ready cards for an agent to claim",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards",
         intent: "list cards by optional status/repo filter, including blocked, review, and done cards list_ready never surfaces",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/repositories",
         intent: "list repository entities with aliases, visibility, tier, import provenance, and status counts",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/repositories",
         intent: "create or update a repository entity with aliases, visibility, tier, and import provenance",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/repositories/{name}",
         intent: "read one repository entity resolved by canonical name or alias",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/repositories/{name}",
         intent: "update one repository entity resolved by canonical name",
+        body_shape: None,
     },
     ApiRoute {
         method: "DELETE",
         path: "/api/v1/repositories/{name}",
         intent: "delete an unused repository entity and its aliases",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/repositories/{name}/merge-alias",
         intent: "merge an alias or duplicate repository string into a canonical repository and audit re-homed cards",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/{id}",
         intent: "read one card with runs, activity, links, comments, and claim state",
+        body_shape: None,
     },
     ApiRoute {
         method: "PATCH",
         path: "/api/v1/cards/{id}",
         intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
+        body_shape: Some(
+            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"labels":null} -- every field is optional; only the fields present in the body are changed, admin scope required"#,
+        ),
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/claim",
         intent: "claim one card and open a run",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/release",
         intent: "release an active claim and make the card ready",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/renew",
         intent: "extend an active claim lease",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/heartbeat",
         intent: "record liveness for an active claim",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/status",
         intent: "set a card to any status in one call and record an audit event",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/relations",
         intent: "replace a card's related, blocks, and blocked_by relation lists",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/criteria/check",
         intent: "mark one acceptance criterion checked or unchecked and audit actor/time",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/links",
         intent: "attach proof, PRs, CI, or reference links to a card",
+        body_shape: Some(
+            r#"{"label":"...","url":"..."} -- both fields are required; the field is "label", not "title""#,
+        ),
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/comments",
         intent: "attach an actor-attributed comment to a card, visible immediately via get_card/get_run",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/runs/{id}/input",
         intent: "pause a run for human input",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/runs/{id}/answer",
         intent: "answer an awaiting-input run and resume it",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/{id}",
         intent: "read one run with activity, card, links, and comments",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/awaiting-input",
         intent: "list runs waiting on human or agent input",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/complete",
         intent: "mark a card done, optionally recording proof and criterion proof links",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/events/subscriptions",
         intent: "create a signed webhook subscription with a URL and event filter",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/events/subscriptions",
         intent: "list webhook subscriptions without disclosing signing secrets",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/events/subscriptions/{id}/disable",
         intent: "disable a webhook subscription while preserving delivery history",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/events/dead-letter",
         intent: "list webhook deliveries that exhausted retry attempts",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/events/tail",
         intent: "tail durable card events as Server-Sent Events",
+        body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/keys",
         intent: "list api key metadata (admin scope only, never secrets)",
+        body_shape: None,
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/keys/{id}/revoke",
         intent: "revoke an api key so it immediately fails auth (admin scope only)",
+        body_shape: None,
     },
 ];
+
+/// The same route contract as [`route_summary`], structured for a `GET
+/// /api/v1/routes` response: an agent hitting the HTTP API directly (the
+/// surface where powder-900's trial-and-error actually happened) can fetch
+/// this before its first `POST` instead of guessing at required fields from
+/// deserialize-error text alone.
+pub fn routes_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        ROUTES
+            .iter()
+            .map(|route| {
+                serde_json::json!({
+                    "method": route.method,
+                    "path": route.path,
+                    "intent": route.intent,
+                    "body_shape": route.body_shape,
+                })
+            })
+            .collect(),
+    )
+}
 
 pub fn route_summary() -> String {
     ROUTES
         .iter()
-        .map(|route| format!("{} {} - {}", route.method, route.path, route.intent))
+        .map(|route| match route.body_shape {
+            Some(body_shape) => format!(
+                "{} {} - {}\n    body: {body_shape}",
+                route.method, route.path, route.intent
+            ),
+            None => format!("{} {} - {}", route.method, route.path, route.intent),
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -219,5 +291,32 @@ mod tests {
         assert!(paths.contains(&"/api/v1/events/tail"));
         assert!(paths.contains(&"/api/v1/keys"));
         assert!(paths.contains(&"/api/v1/keys/{id}/revoke"));
+    }
+
+    #[test]
+    fn route_summary_and_routes_json_surface_the_documented_body_shapes() {
+        let summary = route_summary();
+        assert!(summary.contains("POST /api/v1/cards -"));
+        assert!(summary.contains("body: {\"id\""));
+
+        let json = routes_json();
+        let create_card = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["method"] == "POST" && route["path"] == "/api/v1/cards")
+            .unwrap();
+        assert!(create_card["body_shape"]
+            .as_str()
+            .unwrap()
+            .contains("acceptance"));
+
+        let healthz_shaped = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["path"] == "/api/v1/cards/ready")
+            .unwrap();
+        assert!(healthz_shaped["body_shape"].is_null());
     }
 }

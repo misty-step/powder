@@ -70,14 +70,44 @@ must never silently evaporate on process exit.
   `get_card`/`get_run`.
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
+- `update_card`: patch title, body, acceptance, proof_plan, status, priority,
+  or labels on an existing card. Requires an admin-scope key in remote mode
+  (`PATCH /api/v1/cards/{id}`); grooming and editing card content from an
+  agent harness no longer requires falling back to raw HTTP.
 
 ## Instance CLI
 
-`powder` is remote-capable for the common card workflow: with
-`POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`, `list-cards`,
-`get-card`, `create-card`, `claim`, `update-status`, and `add-comment` operate
-against the deployed instance when `--db` is omitted. `--db` always wins when
-supplied, so a local smoke cannot accidentally mutate the deployed board.
+`powder` is remote-capable for the full card and claim-lifecycle workflow:
+with `POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`,
+`list-cards`, `get-card`, `create-card`, `claim`, `heartbeat`, `renew-claim`,
+`release-claim`, `update-status`, `check-criterion`, `add-link`,
+`add-comment`, `request-input`, and `complete-card` all operate against the
+deployed instance when `--db` is omitted -- there is no separate "remote
+closeout" wrapper to reach for; the same commands used against `--db` work
+unchanged against a deployed instance. `--db` always wins when supplied, so a
+local smoke cannot accidentally mutate the deployed board. Run `powder
+version` before a lane starts: it reports the git commit the installed
+binary was built from, so a stale `~/.cargo/bin/powder` (one that predates a
+command's remote-mode support) is obvious instead of surfacing as a bare
+`missing --db` error on a command the checkout has long since covered.
+
+A lane closing out a card against a deployed instance -- no local database at
+all -- looks like:
+
+```sh
+export POWDER_API_BASE_URL=https://powder.internal
+export POWDER_API_KEY=sk_powder_...
+powder get-card 001
+powder add-link 001 --label pr --url https://github.com/misty-step/example/pull/1
+powder add-comment 001 --author codex --body "shipped, PR linked above"
+powder complete-card 001 --proof https://github.com/misty-step/example/pull/1
+```
+
+`update-relations`, `get-run`, `list-awaiting-input`, `answer-input`,
+`repository-*`, `import*`, `key-*`, and `subscription-*` remain `--db`-only:
+they are either bulk/admin operations or read paths with no remote-mode
+demand yet. Omitting `--db` on those fails with a bare `missing --db`, not
+yet the command-specific transport error the remote-capable commands give.
 
 ```sh
 powder init-db --db ./data/powder.db --show-secret
@@ -119,6 +149,20 @@ For Harness Kit `factory-mcps`, the remote entry shape is `required_env_any:
 [[POWDER_API_BASE_URL, POWDER_API_KEY], [POWDER_DB_PATH]]`; the factory remote
 variant should populate `POWDER_API_BASE_URL` and `POWDER_API_KEY` from the
 Agents vault and run `powder-mcp`.
+
+Registered MCP subprocesses (e.g. a `bash -lc 'source ~/.secrets && exec
+powder-mcp'` server entry) resolve `POWDER_API_BASE_URL` from their own
+launch environment, which can silently diverge from the value in an
+operator's interactive shell (a stale manual export is enough). Send an
+`initialize` call and compare `result.serverInfo.baseUrl` against your own
+`POWDER_API_BASE_URL` before assuming an add-comment failure is a bug in
+Powder rather than two faces pointed at different deployments.
+
+Agents hitting the HTTP API directly, without the CLI or MCP, can read
+`GET /api/v1/routes` for the full route contract including example request
+bodies -- it names the fields `POST /api/v1/cards` and
+`POST /api/v1/cards/{id}/links` actually require instead of leaving that to
+deserialize-error trial-and-error.
 
 ## Local Gate
 
