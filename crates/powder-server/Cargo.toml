@@ -14,6 +14,7 @@ async-stream = "0.3"
 axum = "0.8"
 hex = "0.4"
 hmac = "0.12"
+powder-api = { path = "../powder-api" }
 powder-core = { path = "../powder-core" }
 powder-shell = { path = "../powder-shell" }
 powder-store = { path = "../powder-store" }

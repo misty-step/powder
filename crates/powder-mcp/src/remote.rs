@@ -58,6 +58,32 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             client.post("/api/v1/cards", body)?
         }
+        "update_card" => {
+            let id = card_id(args, "card_id")?;
+            let mut body = json!({});
+            if let Some(value) = args["title"].as_str() {
+                body["title"] = json!(value);
+            }
+            if let Some(value) = args["body"].as_str() {
+                body["body"] = json!(value);
+            }
+            if let Some(value) = args["acceptance"].as_array() {
+                body["acceptance"] = json!(value);
+            }
+            if let Some(value) = args["proof_plan"].as_array() {
+                body["proof_plan"] = json!(value);
+            }
+            if let Some(value) = args["status"].as_str() {
+                body["status"] = json!(value);
+            }
+            if let Some(value) = args["priority"].as_str() {
+                body["priority"] = json!(value);
+            }
+            if let Some(value) = args["labels"].as_array() {
+                body["labels"] = json!(value);
+            }
+            client.patch(&format!("/api/v1/cards/{id}"), body)?
+        }
         "list_repositories" => {
             let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
             client.get(&format!(
@@ -444,6 +470,34 @@ mod tests {
         assert_eq!(
             requests[0].path,
             "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
+        );
+    }
+
+    #[test]
+    fn update_card_sends_patch_with_only_the_supplied_fields() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"id": "proof-plan", "title": "Edited title", "status": "blocked"}),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "update_card",
+            &json!({"card_id": "proof-plan", "title": "Edited title", "status": "blocked"}),
+        )
+        .unwrap();
+
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Edited title"));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "PATCH");
+        assert_eq!(requests[0].path, "/api/v1/cards/proof-plan");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"title": "Edited title", "status": "blocked"}))
         );
     }
 

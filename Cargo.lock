@@ -762,6 +762,7 @@ dependencies = [
  "axum",
  "hex",
  "hmac",
+ "powder-api",
  "powder-core",
  "powder-shell",
  "powder-store",

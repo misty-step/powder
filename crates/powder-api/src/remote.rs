@@ -16,6 +16,14 @@ impl RemoteClient {
         }
     }
 
+    /// The deployment this client talks to. Surfaced through MCP's
+    /// `initialize` response so a caller can compare it against their own
+    /// `POWDER_API_BASE_URL` and prove the two faces agree, instead of
+    /// guessing at deployment drift from intermittent connection errors.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn get(&self, path: &str) -> Result<Value, String> {
         self.attach_auth(self.agent.get(&format!("{}{path}", self.base_url)))
             .call()
