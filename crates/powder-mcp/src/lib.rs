@@ -133,7 +133,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "complete_card",
         description: "Set a card done, optionally recording a proof artifact or URL and proof links attached to criteria.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "create_event_subscription",
@@ -650,6 +650,40 @@ mod tests {
     use super::*;
     use powder_core::parse_backlog_card;
     use powder_store::Store;
+
+    /// `complete_card`'s hand-written `input_schema` string had a missing
+    /// closing brace that made every `tool_defs_json()` call -- and
+    /// therefore every `tools/list` request, the first call any MCP client
+    /// makes -- panic. No existing test exercised `tools/list` or
+    /// `tool_defs_json()` directly (every other test calls specific tools
+    /// by name), so this shipped silently until a reinstalled binary was
+    /// smoke-tested by hand. This test parses every tool's schema the way a
+    /// real `tools/list` response would, and locks a couple of schemas'
+    /// shape so a future hand-edit can't quietly nest a sibling field one
+    /// level too deep again.
+    #[test]
+    fn every_tool_schema_is_valid_json_and_tools_list_does_not_panic() {
+        for tool in TOOLS {
+            serde_json::from_str::<Value>(tool.input_schema)
+                .unwrap_or_else(|err| panic!("{}: invalid input_schema JSON: {err}", tool.name));
+        }
+
+        let listed = tool_defs_json();
+        let tools = listed.as_array().unwrap();
+        assert_eq!(tools.len(), TOOLS.len());
+
+        let complete_card = tools
+            .iter()
+            .find(|tool| tool["name"] == "complete_card")
+            .unwrap();
+        let properties = &complete_card["inputSchema"]["properties"];
+        assert!(
+            properties["actor"].is_object(),
+            "actor must be a top-level property, not nested inside criterion_proofs"
+        );
+        assert!(properties["admin"].is_object());
+        assert!(properties["criterion_proofs"]["items"]["properties"]["url"].is_object());
+    }
 
     #[test]
     fn mcp_tools_are_agent_intents_not_rest_routes() {
