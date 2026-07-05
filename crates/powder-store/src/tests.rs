@@ -1951,8 +1951,10 @@ fn reimport_through_a_malformed_backlog_file_neither_wipes_content_nor_corrupts_
     );
     assert_eq!(
         card.status,
-        CardStatus::Backlog,
-        "Status: in-progress must not promote an unclaimed card to Running"
+        CardStatus::Ready,
+        "Status: in-progress must not promote an unclaimed card to Running, and restoring \
+         the real acceptance must re-derive Ready rather than leaving it at the malformed \
+         file's own empty-oracle default of Backlog"
     );
     assert!(card.claim.is_none());
     Ok(())

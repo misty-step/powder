@@ -592,6 +592,21 @@ impl Card {
         if merged.acceptance.is_empty() && !self.acceptance.is_empty() {
             merged.acceptance = self.acceptance.clone();
             merged.criteria = self.criteria.clone();
+            // The incoming file's own oracle was empty, so any status it
+            // landed on came from parse_backlog_card's empty-oracle default
+            // (Backlog) -- never an explicit Blocked/Done/Shipped/Abandoned,
+            // none of which that default ever produces. Restoring real
+            // acceptance above makes that default stale; re-derive it now
+            // that the card genuinely has an oracle again. Gating this
+            // inside the restore branch (not a bare `status == Backlog`
+            // check against the final merged acceptance) is what keeps this
+            // from overriding a file that deliberately declares
+            // `Status: backlog` alongside real Oracle items -- that case
+            // never enters this branch, since its incoming acceptance was
+            // already non-empty and needed no restoring.
+            if merged.status == CardStatus::Backlog {
+                merged.status = CardStatus::Ready;
+            }
         }
         merged.created_at = self.created_at;
         merged
@@ -906,7 +921,7 @@ mod tests {
         // keep what's stored instead of wiping it.
         let current = Card::new(CardId::new("001").unwrap(), "Title", "the real body")
             .unwrap()
-            .with_status(CardStatus::Backlog)
+            .with_status(CardStatus::Ready)
             .with_acceptance(["real oracle item".to_string()])
             .with_created_at(10);
 
@@ -921,6 +936,12 @@ mod tests {
         assert_eq!(merged.acceptance, vec!["real oracle item".to_string()]);
         assert_eq!(merged.criteria.len(), 1);
         assert_eq!(merged.criteria[0].text, "real oracle item");
+        assert_eq!(
+            merged.status,
+            CardStatus::Ready,
+            "restoring real acceptance must re-derive Ready, not leave the card stuck at \
+             the malformed file's own empty-oracle default of Backlog"
+        );
     }
 
     #[test]
@@ -943,6 +964,14 @@ mod tests {
 
         assert_eq!(merged.body, "new body");
         assert_eq!(merged.acceptance, vec!["new oracle item".to_string()]);
+        assert_eq!(
+            merged.status,
+            CardStatus::Backlog,
+            "an incoming file that deliberately keeps Status: backlog alongside real \
+             acceptance must not get silently promoted to Ready -- the Backlog->Ready \
+             re-derivation only fires when this reimport had to restore acceptance from \
+             the stored card, not whenever the final acceptance happens to be non-empty"
+        );
     }
 
     #[test]
