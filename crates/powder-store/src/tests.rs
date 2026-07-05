@@ -4,8 +4,8 @@ use powder_core::{
 };
 
 use crate::{
-    ApiKeyScope, CardFilter, CardPatch, ImportOutcome, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, Result, Store, StoreError, API_KEY_ALPHABET,
+    ApiKeyScope, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome, RepositoryTier,
+    RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -2039,5 +2039,394 @@ fn preview_import_reports_without_mutating_the_store() -> Result<()> {
     let card = store.get_card(&card_id)?.expect("card");
     assert_eq!(card.status, CardStatus::Running);
     assert!(card.claim.is_some());
+    Ok(())
+}
+
+// -- powder-921: field-note seed generator --------------------------------
+
+fn allowlisted_card(id: &str, repo: &str, created_at: i64) -> Card {
+    let mut card = Card::new(CardId::new(id).unwrap(), format!("Card {id}"), "do it")
+        .unwrap()
+        .with_status(CardStatus::Running)
+        .with_priority(Priority::P1)
+        .with_acceptance(["proof exists".to_string()])
+        .with_created_at(created_at);
+    card.repo = Some(repo.to_string());
+    card
+}
+
+fn substantive_proof() -> &'static str {
+    "Shipped the remote lease-maintenance commands end to end: heartbeat, \
+     renew-claim, and release-claim now thread RemoteEnv the same way claim \
+     and update-status already did, closing the exact gap the campaign lane \
+     hit live against POWDER_API_BASE_URL."
+}
+
+#[test]
+fn field_note_generator_spawns_exactly_one_draft_for_a_qualifying_completion() -> Result<()> {
+    let mut store = Store::open_in_memory()?.with_field_note_config(FieldNoteConfig {
+        repo_allowlist: vec!["misty-step/powder".to_string()],
+        proof_min_chars: 50,
+        weekly_budget: 7,
+    });
+    store.migrate()?;
+    let card_id = CardId::new("source-alpha")?;
+    store.create_card_with_events(
+        allowlisted_card("source-alpha", "misty-step/powder", 10),
+        "operator",
+        10,
+    )?;
+
+    let completed = store.complete_card(
+        &card_id,
+        Some(substantive_proof()),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+    assert_eq!(completed.status, CardStatus::Done);
+
+    let draft_id = CardId::new("field-note-source-alpha")?;
+    let draft = store.get_card(&draft_id)?.expect("draft card spawned");
+    assert_eq!(draft.status, CardStatus::Backlog);
+    assert!(draft.acceptance.is_empty());
+    assert_eq!(draft.repo.as_deref(), Some("content"));
+    assert!(draft.labels.iter().any(|label| label == "field-note-draft"));
+    assert_eq!(draft.related, vec![card_id.clone()]);
+    assert!(draft.body.contains(substantive_proof()));
+    assert!(draft.body.contains("source-alpha"));
+
+    // Exactly one draft: re-running the spawn check (e.g. via a second
+    // completion attempt) must never produce a second card at a colliding id.
+    let all_content_drafts = store.list_cards(
+        &CardFilter {
+            status: None,
+            repo: Some("content".to_string()),
+        },
+        50,
+    )?;
+    assert_eq!(all_content_drafts.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn field_note_generator_embeds_evidence_links_in_the_draft() -> Result<()> {
+    let mut store = Store::open_in_memory()?.with_field_note_config(FieldNoteConfig {
+        repo_allowlist: vec!["misty-step/powder".to_string()],
+        proof_min_chars: 10,
+        weekly_budget: 7,
+    });
+    store.migrate()?;
+    let card_id = CardId::new("source-beta")?;
+    store.create_card_with_events(
+        allowlisted_card("source-beta", "misty-step/powder", 10),
+        "operator",
+        10,
+    )?;
+    store.add_link(
+        &card_id,
+        "pr",
+        "https://github.com/misty-step/powder/pull/71",
+        11,
+    )?;
+
+    store.complete_card(
+        &card_id,
+        Some(substantive_proof()),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+
+    let draft_id = CardId::new("field-note-source-beta")?;
+    let draft_detail = store
+        .get_card_detail(&draft_id)?
+        .expect("draft card detail");
+    assert!(draft_detail
+        .card
+        .body
+        .contains("https://github.com/misty-step/powder/pull/71"));
+    assert_eq!(draft_detail.links.len(), 1);
+    assert_eq!(
+        draft_detail.links[0].url,
+        "https://github.com/misty-step/powder/pull/71"
+    );
+    Ok(())
+}
+
+#[test]
+fn field_note_generator_skips_repos_outside_the_allowlist() -> Result<()> {
+    let mut store = Store::open_in_memory()?.with_field_note_config(FieldNoteConfig {
+        repo_allowlist: vec!["misty-step/powder".to_string()],
+        proof_min_chars: 10,
+        weekly_budget: 7,
+    });
+    store.migrate()?;
+    let card_id = CardId::new("chore-alpha")?;
+    store.create_card_with_events(
+        allowlisted_card("chore-alpha", "misty-step/some-chore-repo", 10),
+        "operator",
+        10,
+    )?;
+
+    store.complete_card(
+        &card_id,
+        Some(substantive_proof()),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+
+    assert!(store
+        .get_card(&CardId::new("field-note-chore-alpha")?)?
+        .is_none());
+    Ok(())
+}
+
+#[test]
+fn field_note_generator_skips_thin_proofs_and_missing_proofs() -> Result<()> {
+    let mut store = Store::open_in_memory()?.with_field_note_config(FieldNoteConfig {
+        repo_allowlist: vec!["misty-step/powder".to_string()],
+        proof_min_chars: 200,
+        weekly_budget: 7,
+    });
+    store.migrate()?;
+
+    let thin_id = CardId::new("thin-alpha")?;
+    store.create_card_with_events(
+        allowlisted_card("thin-alpha", "misty-step/powder", 10),
+        "operator",
+        10,
+    )?;
+    store.complete_card(
+        &thin_id,
+        Some("shipped it"),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+    assert!(store
+        .get_card(&CardId::new("field-note-thin-alpha")?)?
+        .is_none());
+
+    let no_proof_id = CardId::new("no-proof-alpha")?;
+    store.create_card_with_events(
+        allowlisted_card("no-proof-alpha", "misty-step/powder", 10),
+        "operator",
+        10,
+    )?;
+    store.complete_card(&no_proof_id, None, Vec::new(), 21, &Authority::unchecked())?;
+    assert!(store
+        .get_card(&CardId::new("field-note-no-proof-alpha")?)?
+        .is_none());
+    Ok(())
+}
+
+#[test]
+fn field_note_generator_honors_the_weekly_budget_across_multiple_qualifying_completions(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?.with_field_note_config(FieldNoteConfig {
+        repo_allowlist: vec!["misty-step/powder".to_string()],
+        proof_min_chars: 10,
+        weekly_budget: 1,
+    });
+    store.migrate()?;
+
+    for id in ["budget-alpha", "budget-beta"] {
+        store.create_card_with_events(
+            allowlisted_card(id, "misty-step/powder", 10),
+            "operator",
+            10,
+        )?;
+    }
+    store.complete_card(
+        &CardId::new("budget-alpha")?,
+        Some(substantive_proof()),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+    store.complete_card(
+        &CardId::new("budget-beta")?,
+        Some(substantive_proof()),
+        Vec::new(),
+        21,
+        &Authority::unchecked(),
+    )?;
+
+    assert!(store
+        .get_card(&CardId::new("field-note-budget-alpha")?)?
+        .is_some());
+    assert!(
+        store
+            .get_card(&CardId::new("field-note-budget-beta")?)?
+            .is_none(),
+        "the second qualifying completion must produce nothing once the weekly budget is spent"
+    );
+    Ok(())
+}
+
+#[test]
+fn field_note_drafts_never_appear_in_list_ready() -> Result<()> {
+    let mut store = Store::open_in_memory()?.with_field_note_config(FieldNoteConfig {
+        repo_allowlist: vec!["misty-step/powder".to_string()],
+        proof_min_chars: 10,
+        weekly_budget: 7,
+    });
+    store.migrate()?;
+    let card_id = CardId::new("source-gamma")?;
+    store.create_card_with_events(
+        allowlisted_card("source-gamma", "misty-step/powder", 10),
+        "operator",
+        10,
+    )?;
+    store.complete_card(
+        &card_id,
+        Some(substantive_proof()),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+
+    let ready = store.list_ready(ReadyQuery::new(1_000_000, 50))?;
+    assert!(
+        !ready
+            .iter()
+            .any(|card| card.id.as_str() == "field-note-source-gamma"),
+        "a draft with no acceptance criteria must never be ready-eligible, at any time"
+    );
+    Ok(())
+}
+
+#[test]
+fn field_note_generator_is_inert_when_the_store_never_opts_in() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("source-delta")?;
+    store.create_card_with_events(
+        allowlisted_card("source-delta", "misty-step/powder", 10),
+        "operator",
+        10,
+    )?;
+
+    store.complete_card(
+        &card_id,
+        Some(substantive_proof()),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+
+    assert!(store
+        .get_card(&CardId::new("field-note-source-delta")?)?
+        .is_none());
+    Ok(())
+}
+
+/// powder-921 acceptance item 4 ("non-qualifying completions produce
+/// nothing -- verified with real fleet traffic") replayed against genuinely
+/// real data pulled live from tonight's production Powder instance via
+/// `powder get-card`, rather than synthetic fixtures: the campaign is
+/// completing real cards constantly, and this is what that traffic
+/// actually looks like. A live deploy of this generator was judged too
+/// risky mid-campaign (`complete_card` is the hot path for every fleet
+/// completion tonight); this replay is the documented fallback.
+#[test]
+fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()> {
+    let mut store = Store::open_in_memory()?.with_field_note_config(FieldNoteConfig {
+        repo_allowlist: vec!["powder".to_string(), "crucible".to_string()],
+        proof_min_chars: 120,
+        weekly_budget: 7,
+    });
+    store.migrate()?;
+
+    // Real, substantive text: the actual comment this lane posted to the
+    // live `powder-922` card tonight (pulled via `powder get-card
+    // powder-922`), 1167 characters of genuine drafting material -- exactly
+    // the shape the design law wants a lane to eventually pass as `proof`.
+    let real_substantive_proof =
+        "Shipped in PR #71 (merged 626a1f1). Added `update_card` MCP tool (store + \
+        remote), parity with existing `POST/PATCH /api/v1/cards/{id}`: title, body, \
+        acceptance, proof_plan, status, priority, labels all editable. `create_card` \
+        already existed pre-lane. `initialize` now returns `serverInfo.baseUrl` in \
+        remote mode so a caller can diff it against their own POWDER_API_BASE_URL -- \
+        root cause of the observed divergence is that a registered MCP subprocess \
+        resolves POWDER_API_BASE_URL from its own launch env (e.g. `~/.secrets`), \
+        which can differ from an interactive shell's export; documented in SKILL.md \
+        and README.md. Tests: crates/powder-mcp/src/lib.rs \
+        (mcp_update_card_patches_title_body_and_acceptance, \
+        remote_initialize_reports_the_deployment_it_is_actually_bound_to), \
+        crates/powder-mcp/src/remote.rs \
+        (update_card_sends_patch_with_only_the_supplied_fields). Full groom \
+        (create+relate+comment) is provable via the existing \
+        create_card/update_relations/add_comment tools plus the new update_card; all \
+        exercised in the test suite. Full gate green: cargo fmt --all -- --check, \
+        cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace \
+        (191 tests).";
+    assert_eq!(real_substantive_proof.len(), 1167);
+
+    let qualifying_id = CardId::new("replay-real-substantive")?;
+    store.create_card_with_events(
+        allowlisted_card("replay-real-substantive", "powder", 10),
+        "operator",
+        10,
+    )?;
+    store.complete_card(
+        &qualifying_id,
+        Some(real_substantive_proof),
+        Vec::new(),
+        20,
+        &Authority::unchecked(),
+    )?;
+    assert!(
+        store
+            .get_card(&CardId::new("field-note-replay-real-substantive")?)?
+            .is_some(),
+        "real, rich proof text on an allowlisted repo must spawn a draft"
+    );
+
+    // Real, thin: the exact `proof` value actually stored on the live
+    // `powder-922`/`powder-924`/`powder-900` cards right now -- a bare PR
+    // URL, which is what most real completions carry today.
+    let real_thin_proof = "https://github.com/misty-step/powder/pull/71";
+    assert_eq!(real_thin_proof.len(), 44);
+
+    let thin_id = CardId::new("replay-real-thin")?;
+    store.create_card_with_events(
+        allowlisted_card("replay-real-thin", "powder", 11),
+        "operator",
+        11,
+    )?;
+    store.complete_card(
+        &thin_id,
+        Some(real_thin_proof),
+        Vec::new(),
+        21,
+        &Authority::unchecked(),
+    )?;
+    assert!(
+        store
+            .get_card(&CardId::new("field-note-replay-real-thin")?)?
+            .is_none(),
+        "a bare URL -- most real completions' actual proof shape tonight -- must not qualify"
+    );
+
+    // Real, no proof at all: `crucible-010`'s actual completion shape live
+    // right now -- imported from backlog.d, moved straight to done with no
+    // `proof` ever recorded on the run.
+    let no_proof_id = CardId::new("replay-real-no-proof")?;
+    store.create_card_with_events(
+        allowlisted_card("replay-real-no-proof", "crucible", 12),
+        "operator",
+        12,
+    )?;
+    store.complete_card(&no_proof_id, None, Vec::new(), 22, &Authority::unchecked())?;
+    assert!(
+        store
+            .get_card(&CardId::new("field-note-replay-real-no-proof")?)?
+            .is_none(),
+        "backlog-imported cards completed with no proof (crucible-010's real shape) must not qualify"
+    );
+
     Ok(())
 }

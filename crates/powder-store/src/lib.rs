@@ -67,7 +67,52 @@ pub enum StoreError {
 
 pub struct Store {
     connection: Connection,
+    field_note_config: Option<FieldNoteConfig>,
 }
+
+/// Config for the field-note seed generator (powder-921, content-harness
+/// epic misty-step-912, generator #1): on a qualifying completion, spawn
+/// exactly one draft card carrying the `proof` field verbatim as raw
+/// drafting material. `None` (the default for every `Store` unless a
+/// deployment opts in via [`Store::with_field_note_config`]) means the
+/// generator never runs -- self-hosters of Powder who never configure this
+/// see no behavior change from completing a card.
+///
+/// Both gates are deterministic per the content-harness design law
+/// (misty-step-912): eligibility is never a model judgment call, only
+/// `repo_allowlist` membership, a proof length floor, and a hard weekly cap.
+#[derive(Debug, Clone, Default)]
+pub struct FieldNoteConfig {
+    /// Canonical repo names (as returned by `card.repo`) eligible to spawn
+    /// drafts. A card with no repo, or a repo not in this list, never
+    /// qualifies -- there is no "surprise" way to start narrating a repo.
+    pub repo_allowlist: Vec<String>,
+    /// Minimum trimmed character count of the `proof` field for it to count
+    /// as substantive raw material rather than a bare link or "done".
+    pub proof_min_chars: usize,
+    /// Hard cap on drafts spawned by this generator in the trailing 7 days.
+    /// Once reached, further qualifying completions produce nothing until
+    /// the window rolls forward -- the discard-unseen half of the design
+    /// law's weekly budget, enforced here rather than left to the review
+    /// queue to triage after the fact.
+    pub weekly_budget: usize,
+}
+
+/// One week in seconds, for the field-note weekly budget window.
+const FIELD_NOTE_BUDGET_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// The dedicated pseudo-repo every content-harness generator's drafts land
+/// in, regardless of the source card's own repo -- "one review queue every
+/// generator feeds" (misty-step-912) is implemented as one shared, filterable
+/// repo tag rather than a bespoke queue table.
+const FIELD_NOTE_REVIEW_REPO: &str = "content";
+
+/// The label that marks a card as a content-harness draft. Combined with
+/// always-empty `acceptance`, this is what keeps drafts out of `list_ready`:
+/// [`Card::is_ready_at`] already refuses any card with no acceptance
+/// criteria, so a draft can never be claimed or dispatched without a second
+/// exclusion mechanism to keep in sync.
+const FIELD_NOTE_DRAFT_LABEL: &str = "field-note-draft";
 
 /// Filter for [`Store::list_cards`]: `None` on either field means
 /// unfiltered on that dimension.
@@ -113,7 +158,10 @@ impl Store {
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
-        let store = Self { connection };
+        let store = Self {
+            connection,
+            field_note_config: None,
+        };
         store.connection.pragma_update(None, "foreign_keys", "ON")?;
         store.connection.pragma_update(None, "busy_timeout", 5000)?;
         let _mode: String = store
@@ -187,6 +235,15 @@ impl Store {
             self.connection
                 .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
+    }
+
+    /// Opts this `Store` into the field-note seed generator (see
+    /// [`FieldNoteConfig`]). A deployment calls this once at startup, from
+    /// its own env-driven config; nothing else about `Store` changes for
+    /// callers who never call it.
+    pub fn with_field_note_config(mut self, config: FieldNoteConfig) -> Self {
+        self.field_note_config = Some(config);
+        self
     }
 
     pub fn readiness_check(&self) -> Result<()> {
@@ -913,25 +970,7 @@ impl Store {
         if self.get_card(card_id)?.is_none() {
             return Err(DomainError::not_found("card", card_id.to_string()).into());
         }
-        let link = Link {
-            id: LinkId::new(format!("link-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
-            card_id: card_id.clone(),
-            label: non_empty("label", label)?,
-            url: non_empty("url", url)?,
-            created_at: now,
-        };
-        self.connection.execute(
-            "INSERT INTO links (id, card_id, label, url, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                link.id.as_str(),
-                link.card_id.as_str(),
-                link.label,
-                link.url,
-                link.created_at
-            ],
-        )?;
-        Ok(link)
+        insert_link(&self.connection, card_id, label, url, now)
     }
 
     /// Not claim-holder-gated, matching `add_link`: attaching a comment is
@@ -1040,6 +1079,7 @@ impl Store {
     ) -> Result<Card> {
         let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
         let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+        let field_note_config = self.field_note_config.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1102,10 +1142,159 @@ impl Store {
                 }),
                 now,
             )?;
+            if let Some(config) = &field_note_config {
+                maybe_spawn_field_note_draft(&transaction, &card, proof.as_deref(), config, now)?;
+            }
         }
         transaction.commit()?;
         Ok(card)
     }
+}
+
+/// The field-note seed generator's actual eligibility check and draft spawn
+/// (powder-921). Runs inside `complete_card`'s own transaction, so a draft
+/// either exists durably alongside the completion it came from or not at
+/// all -- never a dangling side effect from a completion that itself rolled
+/// back. Every gate is deterministic per the content-harness design law: no
+/// model call decides eligibility here, only repo membership, a length
+/// floor, and a hard weekly count.
+fn maybe_spawn_field_note_draft(
+    transaction: &rusqlite::Transaction,
+    completed_card: &Card,
+    proof: Option<&str>,
+    config: &FieldNoteConfig,
+    now: i64,
+) -> Result<Option<Card>> {
+    let Some(proof) = proof else {
+        return Ok(None);
+    };
+    let proof = proof.trim();
+    if proof.chars().count() < config.proof_min_chars {
+        return Ok(None);
+    }
+
+    let Some(repo) = completed_card.repo.as_deref() else {
+        return Ok(None);
+    };
+    // `card.repo` is already canonicalized to its short name (e.g. "powder",
+    // not "misty-step/powder") by the time it's stored; canonicalize the
+    // configured allowlist entries the same way `canonical_repo_matches` does
+    // everywhere else in this crate, so an operator can list either spelling.
+    if !config
+        .repo_allowlist
+        .iter()
+        .any(|allowed| canonical_repo_matches(allowed, repo))
+    {
+        return Ok(None);
+    }
+
+    let cutoff = now - FIELD_NOTE_BUDGET_WINDOW_SECONDS;
+    if count_field_note_drafts_since(transaction, cutoff)? >= config.weekly_budget {
+        return Ok(None);
+    }
+
+    // Deterministic id from the source card: a card completes exactly once
+    // (status only ever moves forward to a terminal state), so this can
+    // never collide under normal operation. The existence check is a
+    // defensive idempotency guard, not the primary uniqueness mechanism.
+    let draft_id = CardId::new(format!("field-note-{}", completed_card.id))?;
+    if load_card_optional(transaction, &draft_id)?.is_some() {
+        return Ok(None);
+    }
+
+    let source_links = answer_loop::load_links_for_card(transaction, &completed_card.id)?;
+
+    let mut body = format!(
+        "Seed proof captured verbatim from {} ({repo}) for drafting in the operator voice. \
+         Machine-drafted; not for autopost.\n\n---\n\n{proof}",
+        completed_card.id
+    );
+    if !source_links.is_empty() {
+        body.push_str("\n\n---\nEvidence links:\n");
+        for link in &source_links {
+            body.push_str(&format!("- {}: {}\n", link.label, link.url));
+        }
+    }
+
+    let mut draft = Card::new(
+        draft_id.clone(),
+        format!("Field note seed: {}", completed_card.title),
+        body,
+    )?
+    .with_status(CardStatus::Backlog)
+    .with_created_at(now);
+    draft.labels = vec![FIELD_NOTE_DRAFT_LABEL.to_string()];
+    draft.related = vec![completed_card.id.clone()];
+    draft.repo = Some(FIELD_NOTE_REVIEW_REPO.to_string());
+    draft.updated_at = now;
+
+    persist_card(transaction, &draft)?;
+    append_card_event(
+        transaction,
+        &draft_id,
+        "create",
+        "field-note-generator",
+        &format!("spawned field-note draft from {}", completed_card.id),
+        now,
+    )?;
+    for link in &source_links {
+        insert_link(transaction, &draft_id, &link.label, &link.url, now)?;
+    }
+
+    Ok(Some(draft))
+}
+
+/// How many field-note drafts (identified by [`FIELD_NOTE_REVIEW_REPO`] +
+/// [`FIELD_NOTE_DRAFT_LABEL`]) were created at or after `cutoff`. A full
+/// table scan mirrors the existing `list_ready`/`list_cards` pattern --
+/// Powder's card counts don't warrant a dedicated indexed query for this.
+fn count_field_note_drafts_since(connection: &Connection, cutoff: i64) -> Result<usize> {
+    let mut statement = connection.prepare(CARD_SELECT_ALL_SQL)?;
+    let records = statement
+        .query_map([], CardRecord::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut count = 0;
+    for record in records {
+        let card = card_from_record(connection, record)?;
+        if card.created_at >= cutoff
+            && card.repo.as_deref() == Some(FIELD_NOTE_REVIEW_REPO)
+            && card
+                .labels
+                .iter()
+                .any(|label| label == FIELD_NOTE_DRAFT_LABEL)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn insert_link(
+    connection: &Connection,
+    card_id: &CardId,
+    label: &str,
+    url: &str,
+    now: i64,
+) -> Result<Link> {
+    let link = Link {
+        id: LinkId::new(format!("link-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
+        card_id: card_id.clone(),
+        label: non_empty("label", label)?,
+        url: non_empty("url", url)?,
+        created_at: now,
+    };
+    connection.execute(
+        "INSERT INTO links (id, card_id, label, url, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            link.id.as_str(),
+            link.card_id.as_str(),
+            link.label,
+            link.url,
+            link.created_at
+        ],
+    )?;
+    Ok(link)
 }
 
 fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
