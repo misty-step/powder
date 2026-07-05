@@ -233,6 +233,17 @@ impl CardStatus {
         matches!(self, Self::Done | Self::Shipped | Self::Abandoned)
     }
 
+    /// Whether this status can only be true while an agent actually holds a
+    /// live claim on the card. A backlog.d file has no way to express a real
+    /// claim -- claims are runtime-only, minted by `claim_card` -- so a
+    /// `Status:` field parsed out of a file can never honestly assert one of
+    /// these; the importer must not let a source file unilaterally promote a
+    /// card into a claim-bound state it doesn't actually hold (crucible-905:
+    /// 13 cards landed `running` with `claim: null` this way).
+    pub fn requires_active_claim(self) -> bool {
+        matches!(self, Self::Claimed | Self::Running | Self::AwaitingInput)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Backlog => "backlog",
@@ -561,11 +572,26 @@ impl Card {
     /// [`protects_lifecycle_on_reimport`](Self::protects_lifecycle_on_reimport)
     /// is true, this card's live `status`/`claim` survive too instead of
     /// being clobbered by the source file's (necessarily claim-less) values.
+    ///
+    /// A reimport refreshes content, but must never destroy it: if the
+    /// freshly parsed file produced nothing where real content already
+    /// existed -- a heading-convention mismatch, a parser regression, a
+    /// truncated read -- keep what's stored rather than silently wiping it
+    /// (crucible-905: two cards lost their full body/acceptance this way).
+    /// A genuine edit that legitimately shrinks content without emptying it
+    /// still goes through untouched; this only guards the empty case.
     pub fn merge_reimport(&self, incoming: Card) -> Card {
         let mut merged = incoming;
         if self.protects_lifecycle_on_reimport() {
             merged.status = self.status;
             merged.claim = self.claim.clone();
+        }
+        if merged.body.trim().is_empty() && !self.body.trim().is_empty() {
+            merged.body = self.body.clone();
+        }
+        if merged.acceptance.is_empty() && !self.acceptance.is_empty() {
+            merged.acceptance = self.acceptance.clone();
+            merged.criteria = self.criteria.clone();
         }
         merged.created_at = self.created_at;
         merged
@@ -869,6 +895,54 @@ mod tests {
 
         assert_eq!(merged.status, CardStatus::Done);
         assert_eq!(merged.title, "Refreshed title");
+    }
+
+    #[test]
+    fn reimport_never_shrinks_body_or_acceptance_to_empty() {
+        // crucible-905: a heading-convention mismatch made parse_backlog_card
+        // produce an empty body and empty acceptance for two real cards on
+        // reimport, silently destroying 60+ lines of existing content. A
+        // reimport that finds nothing where something already existed must
+        // keep what's stored instead of wiping it.
+        let current = Card::new(CardId::new("001").unwrap(), "Title", "the real body")
+            .unwrap()
+            .with_status(CardStatus::Backlog)
+            .with_acceptance(["real oracle item".to_string()])
+            .with_created_at(10);
+
+        let empty_reimport = Card::new(CardId::new("001").unwrap(), "Title", "")
+            .unwrap()
+            .with_status(CardStatus::Backlog)
+            .with_created_at(999);
+
+        let merged = current.merge_reimport(empty_reimport);
+
+        assert_eq!(merged.body, "the real body");
+        assert_eq!(merged.acceptance, vec!["real oracle item".to_string()]);
+        assert_eq!(merged.criteria.len(), 1);
+        assert_eq!(merged.criteria[0].text, "real oracle item");
+    }
+
+    #[test]
+    fn reimport_still_refreshes_body_and_acceptance_when_the_new_content_is_non_empty() {
+        // the no-shrink guard must not turn every reimport into a no-op --
+        // a genuine edit to non-empty content still goes through.
+        let current = Card::new(CardId::new("001").unwrap(), "Title", "old body")
+            .unwrap()
+            .with_status(CardStatus::Backlog)
+            .with_acceptance(["old oracle item".to_string()])
+            .with_created_at(10);
+
+        let real_reimport = Card::new(CardId::new("001").unwrap(), "Title", "new body")
+            .unwrap()
+            .with_status(CardStatus::Backlog)
+            .with_acceptance(["new oracle item".to_string()])
+            .with_created_at(999);
+
+        let merged = current.merge_reimport(real_reimport);
+
+        assert_eq!(merged.body, "new body");
+        assert_eq!(merged.acceptance, vec!["new oracle item".to_string()]);
     }
 
     #[test]
