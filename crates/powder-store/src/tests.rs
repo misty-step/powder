@@ -1908,6 +1908,59 @@ fn reimport_over_a_quiescent_card_refreshes_content_and_status() -> Result<()> {
 }
 
 #[test]
+fn reimport_through_a_malformed_backlog_file_neither_wipes_content_nor_corrupts_status(
+) -> Result<()> {
+    // end-to-end reproduction of crucible-905 through the real import path
+    // (powder_core::parse_backlog_card -> Store::import_cards), not just the
+    // isolated merge_reimport unit: an epic card with 60+ lines of real
+    // content gets reimported from a file using non-standard headings
+    // ("## Premise"/"## Acceptance" instead of "## Goal"/"## Oracle", the
+    // exact convention crucible-034/035 used) and an inline
+    // "Status: in-progress" label meant as a project-management note, not a
+    // claim assertion. Neither the content nor the status corruption from
+    // the real incident should be reproducible after the fix.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("034")?;
+    store.import_cards(vec![powder_core::parse_backlog_card(
+        "backlog.d/034-harbor-task-runner-seam.md",
+        "# 034 - Harbor task runner seam\n\nPriority: P1\n\n## Goal\nCrucible should own the benchmark run ledger.\n\n## Oracle\n- [ ] harbor runner family exists\n- [ ] result.json is parsed into run records\n",
+        1,
+    ).unwrap()])?;
+
+    let malformed_reimport = powder_core::parse_backlog_card(
+        "backlog.d/034-harbor-task-runner-seam.md",
+        "# 034 - Harbor task runner seam\n\nPriority: P1 \u{b7} Status: in-progress \u{b7} Estimate: XL\n\n## Premise\nHarbor is now the official harness for a broader benchmark framework.\n\n## Acceptance\n- Add a harbor_task runner family.\n- Parse job/trial result.json into run records.\n",
+        999,
+    )
+    .unwrap();
+    store.import_cards(vec![malformed_reimport])?;
+
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(
+        card.body, "Crucible should own the benchmark run ledger.",
+        "the malformed file's missing ## Goal section must not wipe the real body"
+    );
+    assert_eq!(
+        card.acceptance,
+        vec![
+            "harbor runner family exists".to_string(),
+            "result.json is parsed into run records".to_string()
+        ],
+        "the malformed file's missing ## Oracle section must not wipe the real acceptance"
+    );
+    assert_eq!(
+        card.status,
+        CardStatus::Ready,
+        "Status: in-progress must not promote an unclaimed card to Running, and restoring \
+         the real acceptance must re-derive Ready rather than leaving it at the malformed \
+         file's own empty-oracle default of Backlog"
+    );
+    assert!(card.claim.is_none());
+    Ok(())
+}
+
+#[test]
 fn reimport_with_no_content_change_is_reported_unchanged() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

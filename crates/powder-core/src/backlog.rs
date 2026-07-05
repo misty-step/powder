@@ -42,10 +42,15 @@ pub fn parse_backlog_card(
     // the same way CLI create-card, REST POST /cards, and MCP create_card
     // all do -- Ready when a real oracle exists, Backlog only when it
     // doesn't (powder-929; "ready is a query, not vibes", VISION.md). An
-    // explicit Status: line is still honored regardless, case-insensitively.
+    // explicit Status: line is still honored, case-insensitively, UNLESS it
+    // names a claim-bound state (claimed/running/awaiting-input) -- a
+    // backlog.d file has no claim to back that up, so treat it the same as
+    // an unparseable value and fall through to the default instead of
+    // manufacturing an impossible claim:null-but-running card (crucible-905).
     let status = parse_field(contents, "Status")
         .as_deref()
         .and_then(CardStatus::parse)
+        .filter(|status| !status.requires_active_claim())
         .unwrap_or(if oracle.is_empty() {
             CardStatus::Backlog
         } else {
@@ -233,6 +238,29 @@ Figure out what done looks like.
 
         assert_eq!(card.status, CardStatus::Backlog);
         assert!(card.acceptance.is_empty());
+    }
+
+    #[test]
+    fn a_claim_bound_status_in_the_file_is_ignored_not_honored() {
+        // crucible-905: 13 real cards used "Status: in-progress" in their
+        // own header line as a project-management label ("this epic has
+        // active sub-work"), which the importer faithfully parsed into
+        // CardStatus::Running -- a state that requires a live claim a
+        // backlog.d file can never actually hold, landing 13 cards as
+        // running with claim: null. A file can describe Backlog/Ready/
+        // Blocked/Done/Shipped/Abandoned but never Claimed/Running/
+        // AwaitingInput; those must be treated as if the field were absent.
+        for label in ["in-progress", "running", "claimed", "awaiting-input"] {
+            let text = format!(
+                "# Epic in flight\n\nPriority: P1 \u{b7} Status: {label}\n\n## Goal\nShip it.\n\n## Oracle\n- [ ] real work item\n"
+            );
+            let card = parse_backlog_card("backlog.d/001-epic.md", &text, 10).unwrap();
+            assert_eq!(
+                card.status,
+                CardStatus::Ready,
+                "Status: {label} must fall through to the oracle-based default, not be honored"
+            );
+        }
     }
 
     #[test]
