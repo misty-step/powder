@@ -98,7 +98,9 @@ pub const ROUTES: &[ApiRoute] = &[
         method: "POST",
         path: "/api/v1/cards/{id}/claim",
         intent: "claim one card and open a run",
-        body_shape: None,
+        body_shape: Some(
+            r#"{"agent":"...","ttl_seconds":null} -- agent is required and is never inferred from the caller's own identity (linejam-906: an admin-scoped key claiming with agent omitted must not silently record the claim under its own display name)"#,
+        ),
     },
     ApiRoute {
         method: "POST",
