@@ -29,8 +29,8 @@ use powder_core::{
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig, RepositoryTier,
+    RepositoryUpsert, RepositoryVisibility, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -42,6 +42,12 @@ mod canary;
 
 const DEFAULT_DB_PATH: &str = "/data/powder.db";
 const DEFAULT_PORT: u16 = 4000;
+/// Defaults for the field-note seed generator (powder-921): a bare
+/// `POWDER_FIELD_NOTE_REPOS` with no other overrides gets a sane length
+/// floor and the design law's own "~7" weekly budget rather than forcing
+/// every deployment that wants this to also spell out the other two knobs.
+const DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS: usize = 120;
+const DEFAULT_FIELD_NOTE_WEEKLY_BUDGET: usize = 7;
 const SIGNATURE_HEADER: &str = "X-Signature-256";
 const DELIVERY_BATCH_LIMIT: usize = 25;
 
@@ -59,6 +65,7 @@ struct Config {
     public_base_url: Option<String>,
     bind_addr: SocketAddr,
     disclose_bootstrap_key: bool,
+    field_note: FieldNoteConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -127,6 +134,7 @@ impl Config {
             })?,
             None => SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], port)),
         };
+        let field_note = field_note_config_from_env(&vars)?;
 
         Ok(Self {
             db_path,
@@ -135,8 +143,51 @@ impl Config {
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
             bind_addr,
             disclose_bootstrap_key,
+            field_note,
         })
     }
+}
+
+/// Reads the field-note seed generator's three knobs (powder-921). An empty
+/// or absent `POWDER_FIELD_NOTE_REPOS` yields an empty allowlist, which
+/// leaves the generator permanently inert (every completion fails the repo
+/// gate) -- the same "no config, no behavior change" default every other
+/// deployment of Powder gets.
+fn field_note_config_from_env(
+    vars: &BTreeMap<String, String>,
+) -> Result<FieldNoteConfig, ConfigError> {
+    let repo_allowlist = env_value(vars, "POWDER_FIELD_NOTE_REPOS")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let proof_min_chars = match env_value(vars, "POWDER_FIELD_NOTE_PROOF_MIN_CHARS") {
+        Some(value) => value.parse::<usize>().map_err(|err| {
+            ConfigError::new(
+                "POWDER_FIELD_NOTE_PROOF_MIN_CHARS",
+                format!("expected usize: {err}"),
+            )
+        })?,
+        None => DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS,
+    };
+    let weekly_budget = match env_value(vars, "POWDER_FIELD_NOTE_WEEKLY_BUDGET") {
+        Some(value) => value.parse::<usize>().map_err(|err| {
+            ConfigError::new(
+                "POWDER_FIELD_NOTE_WEEKLY_BUDGET",
+                format!("expected usize: {err}"),
+            )
+        })?,
+        None => DEFAULT_FIELD_NOTE_WEEKLY_BUDGET,
+    };
+    Ok(FieldNoteConfig {
+        repo_allowlist,
+        proof_min_chars,
+        weekly_budget,
+    })
 }
 
 fn default_import_files_dir(db_path: &StdPath) -> PathBuf {
@@ -399,11 +450,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("{msg}");
         canary::report_error("powder.config", &msg);
     })?;
-    let mut store = Store::open(&config.db_path).inspect_err(|err| {
-        let msg = format!("store open {}: {err:#}", config.db_path.display());
-        tracing::error!("{msg}");
-        canary::report_error("powder.store.open", &msg);
-    })?;
+    let mut store = Store::open(&config.db_path)
+        .inspect_err(|err| {
+            let msg = format!("store open {}: {err:#}", config.db_path.display());
+            tracing::error!("{msg}");
+            canary::report_error("powder.store.open", &msg);
+        })?
+        .with_field_note_config(config.field_note.clone());
     store.migrate().inspect_err(|err| {
         let msg = format!("store migrate: {err:#}");
         tracing::error!("{msg}");

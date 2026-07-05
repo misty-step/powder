@@ -26,6 +26,43 @@ fn config_defaults_to_api_key_auth_and_data_path() {
     );
     assert_eq!(config.auth_mode, AuthMode::ApiKey);
     assert!(config.disclose_bootstrap_key);
+    assert!(
+        config.field_note.repo_allowlist.is_empty(),
+        "no POWDER_FIELD_NOTE_REPOS means the generator stays inert"
+    );
+    assert_eq!(
+        config.field_note.proof_min_chars,
+        DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS
+    );
+    assert_eq!(
+        config.field_note.weekly_budget,
+        DEFAULT_FIELD_NOTE_WEEKLY_BUDGET
+    );
+}
+
+#[test]
+fn config_parses_field_note_generator_env_vars() {
+    let config = Config::from_pairs([
+        ("POWDER_FIELD_NOTE_REPOS", " misty-step/powder, crucible ,"),
+        ("POWDER_FIELD_NOTE_PROOF_MIN_CHARS", "80"),
+        ("POWDER_FIELD_NOTE_WEEKLY_BUDGET", "3"),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        config.field_note.repo_allowlist,
+        vec!["misty-step/powder".to_string(), "crucible".to_string()],
+        "blank entries from trailing commas/whitespace must not become a spurious allowlist member"
+    );
+    assert_eq!(config.field_note.proof_min_chars, 80);
+    assert_eq!(config.field_note.weekly_budget, 3);
+}
+
+#[test]
+fn config_rejects_a_non_numeric_field_note_proof_min_chars() {
+    let err =
+        Config::from_pairs([("POWDER_FIELD_NOTE_PROOF_MIN_CHARS", "not-a-number")]).unwrap_err();
+    assert_eq!(err.variable, "POWDER_FIELD_NOTE_PROOF_MIN_CHARS");
 }
 
 #[test]
@@ -398,6 +435,88 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
             && event["actor"] == "operator"
             && event["payload"].as_str().unwrap().contains("checked")
     }));
+}
+
+/// powder-921's actual production path: an agent completes a card over the
+/// same HTTP API real fleet lanes use, and -- with the generator configured
+/// -- a draft field-note card appears in the shared review queue (`repo:
+/// content`), excluded from `list_ready`, without ever going through the
+/// `Store` unit tests directly.
+#[tokio::test]
+async fn a_qualifying_http_completion_spawns_a_field_note_draft_in_the_review_queue() {
+    let (state, raw_key) = test_state_with_field_note(
+        AuthMode::ApiKey,
+        FieldNoteConfig {
+            repo_allowlist: vec!["misty-step/powder".to_string()],
+            proof_min_chars: 40,
+            weekly_budget: 7,
+        },
+    );
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"http-field-note-source","title":"Ship the thing","acceptance":["done"],"status":"running","repo":"misty-step/powder"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let complete = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-field-note-source/complete",
+            Some(&raw_key),
+            r#"{"proof":"Shipped remote-mode support for the full claim lifecycle so campaign lanes never fall back to raw curl for lease maintenance again."}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete.status(), StatusCode::OK);
+
+    let queue = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?repo=content",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let queue = response_json(queue).await;
+    let cards = queue["cards"].as_array().unwrap();
+    assert_eq!(
+        cards.len(),
+        1,
+        "exactly one draft for one qualifying completion"
+    );
+    assert_eq!(cards[0]["id"], "field-note-http-field-note-source");
+    assert_eq!(cards[0]["status"], "backlog");
+    assert!(cards[0]["acceptance"].as_array().unwrap().is_empty());
+
+    let ready = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready?limit=50",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let ready = response_json(ready).await;
+    assert!(
+        !ready["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|card| card["id"] == "field-note-http-field-note-source"),
+        "a draft with no acceptance criteria must never reach the ready queue"
+    );
 }
 
 #[tokio::test]
@@ -2474,10 +2593,34 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
             public_base_url: None,
             bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
             disclose_bootstrap_key: false,
+            field_note: FieldNoteConfig::default(),
         }),
         store: Arc::new(Mutex::new(store)),
     };
     (state, key.raw_key)
+}
+
+/// Same as [`test_state`], but with the field-note seed generator opted in --
+/// proves powder-921's HTTP path the same way a real deployed instance would
+/// see it, not just the `Store` unit tests.
+fn test_state_with_field_note(
+    auth_mode: AuthMode,
+    field_note: FieldNoteConfig,
+) -> (AppState, String) {
+    let (state, key) = test_state(auth_mode);
+    let store = Arc::into_inner(state.store)
+        .expect("sole owner before first request")
+        .into_inner()
+        .unwrap()
+        .with_field_note_config(field_note.clone());
+    let state = AppState {
+        config: Arc::new(Config {
+            field_note,
+            ..(*state.config).clone()
+        }),
+        store: Arc::new(Mutex::new(store)),
+    };
+    (state, key)
 }
 
 #[derive(Debug)]

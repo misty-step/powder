@@ -212,6 +212,27 @@ status correction and completion do not require the actor to hold the claim or
 provide proof. When configured, card create/update/status changes POST
 `{"event":"card.*","card":{...}}` to each URL in `POWDER_WEBHOOK_URLS`.
 
+### Field-note seed generator (powder-921)
+
+On a qualifying completion, spawn exactly one draft card carrying the `proof`
+field verbatim as raw drafting material, into a shared review-queue pseudo-repo
+(`repo=content`) every other content generator is meant to feed. Draft cards
+always have empty `acceptance`, so [`Card::is_ready_at`] already excludes them
+from `list_ready` and normal claim dispatch -- no separate exclusion mechanism
+to keep in sync. Disabled by default; every completion behaves exactly as
+before unless `POWDER_FIELD_NOTE_REPOS` is set.
+
+```sh
+POWDER_FIELD_NOTE_REPOS=powder,crucible,bitterblossom   # comma-separated allowlist; unset or empty disables the generator
+POWDER_FIELD_NOTE_PROOF_MIN_CHARS=120                    # default; trimmed proof length floor
+POWDER_FIELD_NOTE_WEEKLY_BUDGET=7                        # default; hard cap on drafts in the trailing 7 days
+```
+
+Both gates are deterministic per the content-harness design law
+(misty-step-912): a repo not on the allowlist, a `proof` shorter than the
+floor, or a weekly budget already spent all produce nothing -- eligibility is
+never a model judgment call.
+
 Canary self-report: `crates/powder-server/src/canary.rs` posts a `powder`
 check-in every 60s and ad hoc error reports to canary-obs, gated on two Fly
 secrets — `CANARY_ENDPOINT` (e.g. `https://canary-obs.fly.dev`) and

@@ -195,7 +195,7 @@ fn latest_elicitation(connection: &Connection, run_id: &RunId) -> Result<Option<
         .transpose()
 }
 
-fn load_links_for_card(connection: &Connection, card_id: &CardId) -> Result<Vec<Link>> {
+pub(super) fn load_links_for_card(connection: &Connection, card_id: &CardId) -> Result<Vec<Link>> {
     let mut statement = connection.prepare(
         "SELECT id, card_id, label, url, created_at
          FROM links
