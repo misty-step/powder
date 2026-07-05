@@ -594,17 +594,21 @@ impl Card {
             merged.criteria = self.criteria.clone();
             // The incoming file's own oracle was empty, so any status it
             // landed on came from parse_backlog_card's empty-oracle default
-            // (Backlog) -- never an explicit Blocked/Done/Shipped/Abandoned,
-            // none of which that default ever produces. Restoring real
-            // acceptance above makes that default stale; re-derive it now
-            // that the card genuinely has an oracle again. Gating this
-            // inside the restore branch (not a bare `status == Backlog`
-            // check against the final merged acceptance) is what keeps this
-            // from overriding a file that deliberately declares
-            // `Status: backlog` alongside real Oracle items -- that case
-            // never enters this branch, since its incoming acceptance was
-            // already non-empty and needed no restoring.
-            if merged.status == CardStatus::Backlog {
+            // (Backlog). Restoring real acceptance above makes that default
+            // stale -- but only correct it back to what this card already
+            // was (Ready) before this reimport, never to any other status.
+            // Gating on `self.status` (the stored value, not the merged/
+            // incoming one) is what keeps this scoped to exactly the
+            // regression it fixes: a Ready card must not silently read as
+            // Backlog just because one reimport had a heading mismatch. It
+            // must not touch a deliberately Blocked card caught by the same
+            // malformed file -- Blocked isn't lifecycle-protected either,
+            // but "was Ready, stays Ready" is a narrower, safer claim than
+            // "any non-empty acceptance implies Ready" (that broader form
+            // was a false positive: a file that deliberately keeps
+            // `Status: backlog` alongside a real Oracle section never needs
+            // this branch at all, since nothing was empty to restore).
+            if self.status == CardStatus::Ready {
                 merged.status = CardStatus::Ready;
             }
         }
@@ -941,6 +945,38 @@ mod tests {
             CardStatus::Ready,
             "restoring real acceptance must re-derive Ready, not leave the card stuck at \
              the malformed file's own empty-oracle default of Backlog"
+        );
+    }
+
+    #[test]
+    fn reimport_restoring_acceptance_never_promotes_a_blocked_card_to_ready() {
+        // Blocked is not lifecycle-protected (see
+        // protects_lifecycle_on_reimport_covers_active_and_terminal_states
+        // below), so a malformed reimport can legitimately change it --
+        // but the Backlog->Ready re-derivation above must not turn a
+        // deliberately Blocked card into Ready just because it also had to
+        // restore real acceptance underneath it. Gating the re-derivation
+        // on `self.status == Ready` specifically (not "any status the
+        // unprotected merge happened to produce") is what keeps this scoped.
+        let current = Card::new(CardId::new("001").unwrap(), "Title", "the real body")
+            .unwrap()
+            .with_status(CardStatus::Blocked)
+            .with_acceptance(["real oracle item".to_string()])
+            .with_created_at(10);
+
+        let empty_reimport = Card::new(CardId::new("001").unwrap(), "Title", "")
+            .unwrap()
+            .with_status(CardStatus::Backlog)
+            .with_created_at(999);
+
+        let merged = current.merge_reimport(empty_reimport);
+
+        assert_eq!(merged.body, "the real body");
+        assert_eq!(merged.acceptance, vec!["real oracle item".to_string()]);
+        assert_ne!(
+            merged.status,
+            CardStatus::Ready,
+            "a Blocked card must never be silently promoted to Ready by the reimport-restore path"
         );
     }
 
