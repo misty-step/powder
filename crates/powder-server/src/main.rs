@@ -827,7 +827,11 @@ async fn create_card(
     headers: HeaderMap,
     Json(request): Json<CreateCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let actor = require_admin(&state, &headers)?;
+    // powder-925: single-card authoring is agent-accessible, same as
+    // claim/status/comment/complete -- a scoped (non-admin) key can carry
+    // the operator's mobile quick-add flow without holding admin. Bulk
+    // import (many cards, no per-card review) stays admin-only below.
+    let actor = authorize(&state, &headers)?;
     let now = unix_now();
     // Default status reflects whether a real oracle exists: empty
     // acceptance can never default to `ready` ("ready is a query, not

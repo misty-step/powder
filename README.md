@@ -208,6 +208,26 @@ profile redacts the first bootstrap key in logs; create an operator-held key
 over SSH with `powder key-create --db /data/powder.db --name operator --scope
 admin --show-secret` and store it in a secret manager.
 
+### A scoped key for the board UI on a phone (powder-925)
+
+The board's write actions (quick-add a card, change a card's status, claim,
+comment, complete) only need `agent` scope, not `admin` -- `admin` is
+reserved for bulk import, repository management, and key management, none
+of which the board UI's phone surface exposes. Mint a dedicated,
+independently-revocable `agent`-scope key for this instead of pasting the
+admin key into Safari:
+
+```sh
+powder key-create --db /data/powder.db --name operator-mobile --scope agent --show-secret
+```
+
+Paste the printed key into the board's settings panel (the gear icon) --
+it's held in the browser's `localStorage`, sent only as a `Bearer` header,
+and never appears in the URL or a QR code. Because it's a distinct key
+(not the admin key), losing the phone or leaking the key only costs a
+`powder key-revoke <id>` against that one key, not against everything the
+admin key can touch.
+
 ## Gate
 
 ```sh

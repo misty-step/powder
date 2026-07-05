@@ -37,6 +37,14 @@ const els = {
   app: document.getElementById("powder-board-app"),
   cardApp: document.getElementById("powder-card-app"),
   detailBody: document.getElementById("detail-body"),
+  quickAddToggle: document.getElementById("quick-add-toggle"),
+  quickAddPanel: document.getElementById("quick-add-panel"),
+  quickAddForm: document.getElementById("quick-add-form"),
+  quickAddTitle: document.getElementById("quick-add-title"),
+  quickAddBody: document.getElementById("quick-add-body"),
+  quickAddRepo: document.getElementById("quick-add-repo"),
+  quickAddCancel: document.getElementById("quick-add-cancel"),
+  quickAddMessage: document.getElementById("quick-add-message"),
   detailConnection: document.getElementById("detail-connection-status"),
   detailBoardLink: document.getElementById("detail-board-link"),
   connection: document.getElementById("connection-status"),
@@ -607,6 +615,80 @@ async function createRepository(form) {
   await loadBoard();
 }
 
+function quickAddRepoOptions() {
+  const repos = state.repositories
+    .filter((repo) => repo.visibility !== "hidden")
+    .map((repo) => repo.repo)
+    .sort((left, right) => {
+      if (left === "inbox") return -1;
+      if (right === "inbox") return 1;
+      return left.localeCompare(right);
+    });
+  return repos.length ? repos : ["inbox"];
+}
+
+function renderQuickAddRepoOptions() {
+  const previous = els.quickAddRepo.value;
+  els.quickAddRepo.innerHTML = quickAddRepoOptions()
+    .map((repo) => `<option value="${escapeHtml(repo)}">${escapeHtml(repo)}</option>`)
+    .join("");
+  if (previous && [...els.quickAddRepo.options].some((option) => option.value === previous)) {
+    els.quickAddRepo.value = previous;
+  }
+}
+
+function showQuickAdd() {
+  renderQuickAddRepoOptions();
+  els.quickAddPanel.hidden = false;
+  els.quickAddToggle.setAttribute("aria-expanded", "true");
+  els.quickAddTitle.focus();
+}
+
+function hideQuickAdd() {
+  els.quickAddPanel.hidden = true;
+  els.quickAddToggle.setAttribute("aria-expanded", "false");
+}
+
+/// A mobile quick-add gets no id to think about: derive one from the
+/// chosen repo and the current second, which is unique enough for one
+/// human filing one card at a time (powder-925).
+function quickAddCardId(repo) {
+  return `${repo}-${Math.floor(Date.now() / 1000)}`;
+}
+
+async function createCardFromQuickAdd(form) {
+  const title = els.quickAddTitle.value.trim();
+  if (!title) {
+    els.quickAddMessage.textContent = "Title is required.";
+    return;
+  }
+  const repo = els.quickAddRepo.value || "inbox";
+  const body = els.quickAddBody.value.trim();
+  const payload = {
+    id: quickAddCardId(repo),
+    title,
+    body,
+    acceptance: [],
+    repo,
+    status: "backlog",
+  };
+  els.quickAddMessage.textContent = "Filing...";
+  try {
+    await apiJson("/api/v1/cards", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    els.quickAddMessage.textContent = `Failed: ${err.message || err}`;
+    return;
+  }
+  form.reset();
+  hideQuickAdd();
+  els.quickAddMessage.textContent = "";
+  await loadBoard();
+}
+
 async function mergeRepositoryAlias(form) {
   const data = new FormData(form);
   const target = String(data.get("target") || "").trim();
@@ -885,6 +967,15 @@ function chip(text) {
   return `<span class="ae-trail-who">${escapeHtml(text)}</span>`;
 }
 
+async function changeCardStatus(cardId, status) {
+  await apiJson(`/api/v1/cards/${encodePath(cardId)}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  await loadCardRoute();
+}
+
 async function loadCardRoute() {
   const cardId = cardRouteId();
   if (!cardId) return;
@@ -924,7 +1015,14 @@ function detailHTML(card, detail = {}) {
     <section class="pw-detail-hero">
       <nav class="ae-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `ae-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li></ol></nav>
       <p class="pw-detail-title ae-strong">${escapeHtml(normalized.title)}</p>
-      <p class="pw-detail-meta"><span class="pw-st">${statusGlyph(normalized.status)}${escapeHtml(statusText(normalized.status))}</span><span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}</p>
+      <p class="pw-detail-meta">
+        <span class="pw-st">${statusGlyph(normalized.status)}${escapeHtml(statusText(normalized.status))}</span>
+        <select class="pw-sort pw-status-change" id="detail-status-change" data-card-id="${escapeHtml(normalized.id)}" aria-label="change status">
+          ${RAW_STATUSES.map((status) => `<option value="${status}"${status === normalized.status ? " selected" : ""}>${escapeHtml(statusText(status))}</option>`).join("")}
+        </select>
+        <span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}
+      </p>
+      <p id="detail-status-message" class="ae-chrome" aria-live="polite"></p>
     </section>
   `);
   const awaiting = (detail.activities || []).filter((activity) => activity.activity_type === "elicitation");
@@ -1285,6 +1383,25 @@ els.repoCreateForm.addEventListener("submit", (event) => {
   event.preventDefault();
   createRepository(event.currentTarget).catch((err) => {
     renderAuthState(`Repository save failed: ${err.message || err}`);
+  });
+});
+els.quickAddToggle.addEventListener("click", () => {
+  if (els.quickAddPanel.hidden) showQuickAdd();
+  else hideQuickAdd();
+});
+els.quickAddCancel.addEventListener("click", () => hideQuickAdd());
+els.quickAddForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  createCardFromQuickAdd(event.currentTarget).catch((err) => {
+    els.quickAddMessage.textContent = `Failed: ${err.message || err}`;
+  });
+});
+els.detailBody.addEventListener("change", (event) => {
+  const select = event.target.closest("#detail-status-change");
+  if (!select) return;
+  changeCardStatus(select.dataset.cardId, select.value).catch((err) => {
+    const message = document.getElementById("detail-status-message");
+    if (message) message.textContent = `Failed: ${err.message || err}`;
   });
 });
 els.repoSettingsList.addEventListener("submit", (event) => {
