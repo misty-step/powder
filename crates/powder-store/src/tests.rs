@@ -1318,9 +1318,20 @@ fn revoke_api_key_fails_verification_immediately() -> Result<()> {
 
     store.revoke_api_key(&key.id, 10)?;
 
+    // powder-940: a revoked key's WHERE-clause exclusion (`revoked_at IS
+    // NULL`) means an attempted verify never reaches the last_used_at
+    // UPDATE -- assert that directly, not just that verification fails.
+    // The key was already used successfully at t=2 before revocation, so
+    // last_used_at must still read that pre-revocation value, not the
+    // post-revocation attempt's timestamp (11).
     assert!(store.verify_api_key(&key.raw_key, 11)?.is_none());
     let listed = store.list_api_keys()?;
     assert_eq!(listed[0].revoked_at, Some(10));
+    assert_eq!(
+        listed[0].last_used_at,
+        Some(2),
+        "a revoked key's last_used_at must not move on a post-revocation attempt"
+    );
     Ok(())
 }
 

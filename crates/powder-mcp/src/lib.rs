@@ -165,6 +165,11 @@ pub const TOOLS: &[ToolDef] = &[
         description: "Read durable card events after an optional sequence cursor.",
         input_schema: r#"{"type":"object","properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}}}"#,
     },
+    ToolDef {
+        name: "list_keys",
+        description: "List API keys with scope, actor, key prefix, creation, revocation, and last-used metadata. Never returns the raw secret or hash. In remote mode the deployed instance requires an admin-scope key.",
+        input_schema: r#"{"type":"object","properties":{}}"#,
+    },
 ];
 
 pub fn tools() -> &'static [ToolDef] {
@@ -537,11 +542,38 @@ pub fn call_tool_store(
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             json!({"events": store.list_event_tail(after, limit).map_err(to_string)?})
         }
+        "list_keys" => {
+            let keys = store
+                .list_api_keys()
+                .map_err(to_string)?
+                .into_iter()
+                .map(key_summary_json)
+                .collect::<Vec<_>>();
+            json!({"keys": keys})
+        }
         other => return Err(format!("unknown tool: {other}")),
     };
 
     let text = serde_json::to_string_pretty(&payload).map_err(to_string)?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
+}
+
+/// Wire shape for one key row, shared by store and remote dispatch so both
+/// faces render `list_keys` identically to `GET /api/v1/keys`. `ApiKeySummary`
+/// itself stays plain-Rust (no `Serialize`) rather than growing a derive for
+/// a shape only one face renders differently than its own fields (actor here
+/// is a display-name string, not the nested `Actor` record).
+fn key_summary_json(key: powder_store::ApiKeySummary) -> Value {
+    json!({
+        "id": key.id,
+        "name": key.name,
+        "scope": key.scope.as_str(),
+        "actor": key.actor.display_name,
+        "key_prefix": key.key_prefix,
+        "created_at": key.created_at,
+        "revoked_at": key.revoked_at,
+        "last_used_at": key.last_used_at,
+    })
 }
 
 fn card_id(args: &Value, key: &'static str) -> Result<CardId, String> {
@@ -710,7 +742,7 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 29);
+        assert_eq!(TOOLS.len(), 30);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
         assert!(names.contains(&"create_card"));
@@ -738,6 +770,35 @@ mod tests {
         assert!(names.contains(&"disable_event_subscription"));
         assert!(names.contains(&"list_dead_letters"));
         assert!(names.contains(&"tail_events"));
+        assert!(names.contains(&"list_keys"));
+    }
+
+    /// powder-940: `last_used_at` already recorded on auth and surfaced via
+    /// the API and CLI, but no MCP tool could see it -- an agent auditing
+    /// key hygiene through MCP had no way to tell an orphaned key from a live
+    /// one. `list_keys` never returns the hash or raw secret.
+    #[test]
+    fn mcp_list_keys_surfaces_last_used_at_and_never_the_secret() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let used = store
+            .create_api_key("codex", powder_store::ApiKeyScope::Agent, 1)
+            .unwrap();
+        store.verify_api_key(&used.raw_key, 5).unwrap();
+
+        let listed = call_tool_store(&mut store, "list_keys", &json!({}), 10).unwrap();
+        let payload = tool_payload(&listed);
+        let keys = payload["keys"].as_array().unwrap();
+        let key = keys.iter().find(|key| key["id"] == used.id).unwrap();
+
+        assert_eq!(key["name"], "codex");
+        assert_eq!(key["scope"], "agent");
+        assert_eq!(key["actor"], "codex");
+        assert_eq!(key["key_prefix"], used.key_prefix);
+        assert_eq!(key["last_used_at"], 5);
+        assert!(key["revoked_at"].is_null());
+        assert!(key.get("raw_key").is_none());
+        assert!(key.get("key_hash").is_none());
     }
 
     #[test]

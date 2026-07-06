@@ -279,6 +279,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let limit = args["limit"].as_u64().unwrap_or(20);
             client.get(&format!("/api/v1/events/tail?after={after}&limit={limit}"))?
         }
+        "list_keys" => client.get("/api/v1/keys")?,
         other => return Err(format!("unknown tool: {other}")),
     };
 
@@ -741,6 +742,29 @@ mod tests {
                 "url": "http://127.0.0.1:9000/webhook",
                 "event_filter": ["moved-to-ready"]
             }))
+        );
+    }
+
+    #[test]
+    fn list_keys_sends_get_with_bearer_auth() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"keys": [{"id": "key-1", "name": "codex", "scope": "agent", "actor": "codex", "key_prefix": "sk_powder_abc", "created_at": 1, "revoked_at": null, "last_used_at": 5}]}),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(&client, "list_keys", &json!({})).unwrap();
+
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("last_used_at"));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v1/keys");
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
         );
     }
 
