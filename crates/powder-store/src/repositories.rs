@@ -759,21 +759,33 @@ impl RepositoryRecord {
     }
 }
 
+// powder-941: reflects the operator's 2026-07-06 "prune-the-leaves" ruling
+// (weave, exocortex -> backburner; coordination-prefix repos -> active) on
+// top of the original powder-916 (2026-07-04) ratification. This is the seed
+// a brand-new database applies on migration, so it must track the current
+// ratified state, not the historical snapshot at the time it was first
+// written -- a fresh install or disaster-recovery restore should not
+// silently regress to a superseded map.
 const RATIFIED_REPOSITORY_TIERS: &[(&str, RepositoryTier)] = &[
     ("roster", RepositoryTier::Active),
     ("bitterblossom", RepositoryTier::Active),
     ("powder", RepositoryTier::Active),
     ("canary", RepositoryTier::Active),
-    ("weave", RepositoryTier::Active),
     ("glass", RepositoryTier::Active),
     ("glance", RepositoryTier::Active),
-    ("exocortex", RepositoryTier::Active),
     ("crucible", RepositoryTier::Active),
     ("aesthetic", RepositoryTier::Active),
     ("landmark", RepositoryTier::Active),
     ("bridge", RepositoryTier::Active),
     ("bastion", RepositoryTier::Active),
     ("linejam", RepositoryTier::Active),
+    ("misty-step", RepositoryTier::Active),
+    ("daybook", RepositoryTier::Active),
+    ("factory-ops", RepositoryTier::Active),
+    ("content", RepositoryTier::Active),
+    ("session", RepositoryTier::Active),
+    ("weave", RepositoryTier::Backburner),
+    ("exocortex", RepositoryTier::Backburner),
     ("sploot", RepositoryTier::Backburner),
     ("doomscrum", RepositoryTier::Backburner),
     ("gradient", RepositoryTier::Archived),

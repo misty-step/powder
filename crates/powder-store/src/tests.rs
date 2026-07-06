@@ -372,6 +372,37 @@ fn ratified_repository_tier_seed_marks_active_backburner_and_archived_repos() ->
     Ok(())
 }
 
+/// powder-941: the operator's 2026-07-06 "prune-the-leaves" ruling moved
+/// weave and exocortex to backburner and promoted the coordination-prefix
+/// repos to active. The seed is the source of truth a brand-new database
+/// (fresh install, disaster-recovery restore, CI fixture) applies on
+/// migration -- if it stays frozen at the 2026-07-04 snapshot, every fresh
+/// environment silently regresses to the superseded map even though the
+/// live deployed instance was updated directly via the admin API.
+#[test]
+fn ratified_repository_tier_seed_reflects_the_2026_07_06_prune_the_leaves_ruling() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    for name in ["weave", "exocortex"] {
+        let repository = store.get_repository(name)?.expect("seeded repository");
+        assert_eq!(
+            repository.tier,
+            RepositoryTier::Backburner,
+            "{name} must be backburner per the 2026-07-06 ruling"
+        );
+    }
+    for name in ["misty-step", "daybook", "factory-ops", "content", "session"] {
+        let repository = store.get_repository(name)?.expect("seeded repository");
+        assert_eq!(
+            repository.tier,
+            RepositoryTier::Active,
+            "{name} must be active per the 2026-07-06 ruling"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn repository_upsert_without_tier_preserves_existing_tier() -> Result<()> {
     let mut store = Store::open_in_memory()?;
