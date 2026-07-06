@@ -202,6 +202,16 @@ answer-loop writes, and key management require `Authorization: Bearer <key>` in
 supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.
 
+**Ratified posture (powder-931, 2026-07-06):** the deployed instance runs
+`api-key` mode with unauthenticated reads, reachable only via
+`bastion.tail5f5eb4.ts.net:10001` on the tailnet — never a public listener.
+This was reviewed as a deliberate tradeoff (it serves the operator's
+read-only phone use case) rather than an oversight, and the operator
+ratified keeping it as-is. If the deployment's network exposure ever
+changes (public listener, non-tailnet ingress), this posture must be
+re-reviewed before that change ships — read routes are not currently
+closed behind read-scope keys.
+
 API keys are bound to actor records. In `api-key` mode, claiming work uses the
 authenticated actor; a request-body `agent` value is accepted only when it
 matches that actor.
