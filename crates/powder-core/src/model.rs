@@ -714,6 +714,28 @@ impl Card {
         Ok(claim)
     }
 
+    /// Atomically hand an active claim to a different agent, same run: no
+    /// release-then-race window for a third party to grab the card in
+    /// between (powder-936). The receiving agent gets a fresh TTL from
+    /// `now` rather than the outgoing agent's remaining time -- they
+    /// haven't had the claim aging on them, so their clock starts clean.
+    pub fn transfer_claim(
+        &mut self,
+        run_id: &RunId,
+        to_agent: impl Into<String>,
+        now: i64,
+        ttl_seconds: u64,
+    ) -> Result<Claim, DomainError> {
+        validate_ttl(ttl_seconds)?;
+        let to_agent = non_empty("agent", to_agent.into())?;
+        let claim = self.matching_active_claim_mut(run_id, now)?;
+        claim.agent = to_agent;
+        claim.expires_at = now + ttl_seconds as i64;
+        let claim = claim.clone();
+        self.updated_at = now;
+        Ok(claim)
+    }
+
     fn matching_active_claim(&self, run_id: &RunId, now: i64) -> Result<&Claim, DomainError> {
         let claim = self.claim.as_ref().ok_or_else(|| {
             DomainError::conflict(format!("card {} has no active claim", self.id))

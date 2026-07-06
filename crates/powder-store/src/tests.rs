@@ -1036,6 +1036,85 @@ fn renew_claim_extends_the_card_and_run_lease() -> Result<()> {
 }
 
 #[test]
+fn transfer_claim_moves_the_lease_to_a_new_agent_with_a_fresh_ttl() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    // Claimed at t=10 with a 3600s ttl (would expire at 3610); transferred
+    // at t=20 with a fresh 60s ttl. The receiving agent's expiry must come
+    // from *its own* fresh window, not the outgoing agent's remaining time.
+    let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
+    let transferred = store.transfer_claim(
+        &card_id,
+        &claim.run_id,
+        "agent-b",
+        20,
+        60,
+        &Authority::unchecked(),
+    )?;
+
+    assert_eq!(transferred.agent, "agent-b");
+    assert_eq!(
+        transferred.run_id, claim.run_id,
+        "handoff on the same run, not a new claim"
+    );
+    assert_eq!(
+        transferred.expires_at, 80,
+        "fresh 60s ttl from t=20, not the old 3610 expiry"
+    );
+
+    let card = store.get_card(&card_id)?.expect("card");
+    let live_claim = card.claim.as_ref().expect("claim survives the transfer");
+    assert_eq!(live_claim.agent, "agent-b");
+    assert_eq!(live_claim.expires_at, 80);
+
+    let run = store.get_run(&claim.run_id)?.expect("run");
+    assert_eq!(
+        run.agent, "agent-b",
+        "the run's own agent column must reflect the new holder"
+    );
+    assert_eq!(run.claim_expires_at, 80);
+
+    // Single handoff event naming both agents, not a release+claim pair.
+    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    assert!(detail.activities.iter().any(|activity| {
+        activity.payload.contains("agent-a") && activity.payload.contains("agent-b")
+    }));
+    Ok(())
+}
+
+#[test]
+fn transfer_then_release_then_reclaim_works_unchanged() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
+    let transferred = store.transfer_claim(
+        &card_id,
+        &claim.run_id,
+        "agent-b",
+        20,
+        3600,
+        &Authority::unchecked(),
+    )?;
+
+    // The new holder can release exactly as if it had claimed normally --
+    // transfer is additive to the lease lifecycle, not a parallel path.
+    store.release_claim(&card_id, &transferred.run_id, 30, &Authority::unchecked())?;
+    let ready_again = store.get_card(&card_id)?.expect("card");
+    assert_eq!(ready_again.status, CardStatus::Ready);
+    assert!(ready_again.claim.is_none());
+
+    let reclaimed = store.claim_card(&card_id, "agent-c", 40, 3600, &Authority::unchecked())?;
+    assert_eq!(reclaimed.agent, "agent-c");
+    Ok(())
+}
+
+#[test]
 fn heartbeat_records_liveness_without_releasing_the_claim() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -1674,6 +1753,10 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
         Err(StoreError::Domain(DomainError::Forbidden(_)))
     ));
     assert!(matches!(
+        store.transfer_claim(&card_id, &claim.run_id, "agent-c", 20, 3600, &intruder),
+        Err(StoreError::Domain(DomainError::Forbidden(_)))
+    ));
+    assert!(matches!(
         store.request_input(&claim.run_id, "Approve?", 20, &intruder),
         Err(StoreError::Domain(DomainError::Forbidden(_)))
     ));
@@ -1705,13 +1788,17 @@ fn admin_authority_bypasses_claim_ownership() -> Result<()> {
     let admin = Authority::actor("operator", true);
 
     store.update_status(&card_id, CardStatus::Running, 20, &admin)?;
-    store.request_input(&claim.run_id, "Approve?", 21, &admin)?;
-    store.answer_input(&claim.run_id, "operator", "Approved", 22, &admin)?;
+    // An admin can transfer a claim it does not hold -- the same "acts as
+    // anyone" authority that already covers status/completion here.
+    let transferred = store.transfer_claim(&card_id, &claim.run_id, "agent-b", 21, 3600, &admin)?;
+    assert_eq!(transferred.agent, "agent-b");
+    store.request_input(&claim.run_id, "Approve?", 22, &admin)?;
+    store.answer_input(&claim.run_id, "operator", "Approved", 23, &admin)?;
     let completed = store.complete_card(
         &card_id,
         Some("https://example.test/proof"),
         Vec::new(),
-        23,
+        24,
         &admin,
     )?;
     assert_eq!(completed.status, CardStatus::Done);

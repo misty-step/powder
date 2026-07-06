@@ -966,6 +966,50 @@ impl Store {
         Ok(claim_receipt(card_id, &claim))
     }
 
+    /// Hand an active claim to a different agent atomically (powder-936):
+    /// no release-then-race window where a third party could grab the card
+    /// between the release and the intended recipient's claim. Invocable by
+    /// the current holder or an admin, same as renew/release/heartbeat.
+    /// Same run id throughout -- this is a handoff on the existing lease,
+    /// not a new claim -- so the activity trail records one transfer event
+    /// naming both agents rather than a release paired with a claim.
+    pub fn transfer_claim(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        to_agent: &str,
+        now: i64,
+        ttl_seconds: u64,
+        authority: &Authority,
+    ) -> Result<ClaimReceipt> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        authority.require_holder(card.claim_holder())?;
+        let from_agent = card.claim_holder().unwrap_or_default().to_string();
+        let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
+        persist_card(&transaction, &card)?;
+        let updated = transaction.execute(
+            "UPDATE runs
+             SET agent = ?2, claim_expires_at = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![run_id.as_str(), to_agent, claim.expires_at, now],
+        )?;
+        if updated == 0 {
+            return Err(DomainError::not_found("run", run_id.to_string()).into());
+        }
+        append_activity(
+            &transaction,
+            run_id,
+            ActivityType::Action,
+            &format!("transferred {card_id} from {from_agent} to {to_agent}"),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(claim_receipt(card_id, &claim))
+    }
+
     pub fn add_link(&mut self, card_id: &CardId, label: &str, url: &str, now: i64) -> Result<Link> {
         if self.get_card(card_id)?.is_none() {
             return Err(DomainError::not_found("card", card_id.to_string()).into());

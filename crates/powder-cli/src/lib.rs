@@ -32,6 +32,7 @@ pub const COMMANDS: &[&str] = &[
     "claim",
     "release-claim",
     "renew-claim",
+    "transfer-claim",
     "heartbeat",
     "get-card",
     "get-run",
@@ -117,6 +118,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "claim" => claim(rest, remote_env),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest, remote_env),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest, remote_env),
+        [command, rest @ ..] if command == "transfer-claim" => transfer_claim(rest, remote_env),
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest, remote_env),
         [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
         [command, rest @ ..] if command == "get-run" => get_run(rest),
@@ -198,6 +200,9 @@ pub fn help() -> String {
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
     help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600\n");
+    help.push_str(
+        "  powder transfer-claim 001 --db ./data/powder.db --run run-id --to-agent codex --ttl 3600\n",
+    );
     help.push_str("  powder release-claim 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder get-card 001 --db ./data/powder.db\n");
     help.push_str("  powder list-awaiting-input --db ./data/powder.db\n");
@@ -803,6 +808,53 @@ fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     ))
 }
 
+fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "transfer-claim")?;
+    let run_id = required_run_flag(args)?;
+    let to_agent = required_flag(args, "--to-agent")?;
+    let ttl_seconds = optional_ttl(args)?;
+    let (transferred_card_id, transferred_run_id, transferred_agent, expires_at) = if let Some(db) =
+        flag_value(args, "--db")
+    {
+        let mut store = open_store(db)?;
+        let claim = store
+            .transfer_claim(
+                &card_id,
+                &run_id,
+                to_agent,
+                now,
+                ttl_seconds,
+                &authority(args),
+            )
+            .map_err(store_err)?;
+        (
+            claim.card_id.to_string(),
+            claim.run_id.to_string(),
+            claim.agent,
+            claim.expires_at,
+        )
+    } else if let Some(client) = remote_env.client() {
+        let transferred = client
+                .post(
+                    &format!("/api/v1/cards/{card_id}/transfer"),
+                    json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
+                )
+                .map_err(remote_err)?;
+        (
+            json_string(&transferred, "card_id")?,
+            json_string(&transferred, "run_id")?,
+            json_string(&transferred, "agent")?,
+            json_i64(&transferred, "expires_at")?,
+        )
+    } else {
+        return Err(missing_transport("transfer-claim"));
+    };
+    Ok(format!(
+        "transferred\t{transferred_card_id}\t{transferred_run_id}\t{transferred_agent}\t{expires_at}\n"
+    ))
+}
+
 fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "heartbeat")?;
@@ -1378,6 +1430,7 @@ mod tests {
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
         assert!(COMMANDS.contains(&"renew-claim"));
+        assert!(COMMANDS.contains(&"transfer-claim"));
         assert!(COMMANDS.contains(&"heartbeat"));
         assert!(COMMANDS.contains(&"get-card"));
         assert!(COMMANDS.contains(&"get-run"));
@@ -2283,6 +2336,89 @@ mod tests {
     }
 
     #[test]
+    fn cli_transfer_claim_hands_off_the_lease_and_release_reclaim_still_works() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-transfer-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "transfer-test",
+            "--title",
+            "Transfer test",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let claimed = run(&args([
+            "claim",
+            "transfer-test",
+            "--db",
+            &db,
+            "--agent",
+            "lane-a",
+            "--ttl",
+            "3600",
+        ]))
+        .unwrap();
+        let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
+
+        let transferred = run(&args([
+            "transfer-claim",
+            "transfer-test",
+            "--db",
+            &db,
+            "--run",
+            &run_id,
+            "--to-agent",
+            "lane-b",
+            "--ttl",
+            "1800",
+        ]))
+        .unwrap();
+        assert!(transferred.starts_with(&format!("transferred\ttransfer-test\t{run_id}\tlane-b\t")));
+
+        let card = run(&args(["get-card", "transfer-test", "--db", &db])).unwrap();
+        assert!(card.contains("\"agent\": \"lane-b\""));
+
+        // Release-then-reclaim still works unchanged after a transfer.
+        let released = run(&args([
+            "release-claim",
+            "transfer-test",
+            "--db",
+            &db,
+            "--run",
+            &run_id,
+        ]))
+        .unwrap();
+        assert!(released.contains("released\ttransfer-test"));
+
+        let reclaimed = run(&args([
+            "claim",
+            "transfer-test",
+            "--db",
+            &db,
+            "--agent",
+            "lane-c",
+            "--ttl",
+            "3600",
+        ]))
+        .unwrap();
+        assert!(reclaimed.starts_with("claimed\ttransfer-test"));
+    }
+
+    #[test]
     fn cli_actor_flag_enforces_claim_holder_like_http_and_mcp() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-holder-{}.db",
@@ -2730,6 +2866,45 @@ mod tests {
             Some(json!({"run_id": "run-lease", "ttl_seconds": 3600}))
         );
         assert_eq!(requests[2].body, Some(json!({"run_id": "run-lease"})));
+    }
+
+    /// powder-936: a holder hands its claim to a fresh agent against a
+    /// deployed instance with no `--db` -- the same remote-mode requirement
+    /// as every other lease-lifecycle command.
+    #[test]
+    fn cli_remote_mode_transfers_a_claim_without_db() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"card_id": "handoff-1", "run_id": "run-handoff", "agent": "lane-b", "expires_at": 1800}),
+        )]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let transferred = run_with_env(
+            &args([
+                "transfer-claim",
+                "handoff-1",
+                "--run",
+                "run-handoff",
+                "--to-agent",
+                "lane-b",
+                "--ttl",
+                "1800",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            transferred,
+            "transferred\thandoff-1\trun-handoff\tlane-b\t1800\n"
+        );
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/handoff-1/transfer");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"run_id": "run-handoff", "to_agent": "lane-b", "ttl_seconds": 1800}))
+        );
     }
 
     /// A lane closing out a card against a deployed instance needs
