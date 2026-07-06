@@ -1769,6 +1769,188 @@ async fn api_key_auth_allows_claim_renew_heartbeat_and_release() {
     assert_eq!(ready["cards"][0]["id"], "api-lease");
 }
 
+/// powder-936, the actual production path: a holder hands its claim to a
+/// named agent over the same HTTP API real fleet lanes use, then the new
+/// holder releases and a third agent reclaims -- proving the handoff is
+/// atomic and additive to the existing lease lifecycle, not a parallel one.
+#[tokio::test]
+async fn http_transfer_claim_hands_off_the_lease_and_release_reclaim_still_works() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"api-transfer","title":"API transfer","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/api-transfer/claim",
+            Some(&raw_key),
+            r#"{"agent":"lane-a","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let claimed = response_json(claimed).await;
+    let run_id = claimed["run_id"].as_str().unwrap().to_string();
+
+    let transferred = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/api-transfer/transfer",
+            Some(&raw_key),
+            &format!(r#"{{"run_id":"{run_id}","to_agent":"lane-b","ttl_seconds":1800}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(transferred.status(), StatusCode::OK);
+    let transferred = response_json(transferred).await;
+    assert_eq!(transferred["agent"], "lane-b");
+    assert_eq!(transferred["run_id"], run_id);
+
+    // Readback confirms the same run now belongs to the new holder.
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/api-transfer",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(detail["card"]["claim"]["agent"], "lane-b");
+    assert_eq!(detail["card"]["claim"]["run_id"], run_id);
+    assert!(detail["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|activity| {
+            let payload = activity["payload"].as_str().unwrap_or_default();
+            payload.contains("lane-a") && payload.contains("lane-b")
+        }));
+
+    // Release-then-reclaim still works unchanged after a transfer.
+    let released = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/api-transfer/release",
+            Some(&raw_key),
+            &format!(r#"{{"run_id":"{run_id}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(released.status(), StatusCode::OK);
+
+    let reclaimed = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/api-transfer/claim",
+            Some(&raw_key),
+            r#"{"agent":"lane-c","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.status(), StatusCode::OK);
+    let reclaimed = response_json(reclaimed).await;
+    assert_eq!(reclaimed["agent"], "lane-c");
+}
+
+/// The transfer verb must not become a backdoor around lease ownership: a
+/// non-holder, non-admin caller can't reassign someone else's claim any
+/// more than it could release or renew it.
+#[tokio::test]
+async fn http_transfer_claim_requires_holder_or_admin() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("agent-a", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("agent-intruder", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"transfer-guard","title":"t","body":"","acceptance":["x"],"status":"ready","priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/transfer-guard/claim",
+            Some(&agent_key),
+            r#"{"agent":"agent-a","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let claimed = response_json(claimed).await;
+    let run_id = claimed["run_id"].as_str().unwrap().to_string();
+
+    let forbidden = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/transfer-guard/transfer",
+            Some(&intruder_key),
+            &format!(r#"{{"run_id":"{run_id}","to_agent":"agent-intruder"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // The actual holder can transfer it away.
+    let ok = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/transfer-guard/transfer",
+            Some(&agent_key),
+            &format!(r#"{{"run_id":"{run_id}","to_agent":"agent-b"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // And an admin key can transfer a claim it never held.
+    let admin_transfer = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/transfer-guard/transfer",
+            Some(&admin_key),
+            &format!(r#"{{"run_id":"{run_id}","to_agent":"agent-c"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(admin_transfer.status(), StatusCode::OK);
+    let admin_transfer = response_json(admin_transfer).await;
+    assert_eq!(admin_transfer["agent"], "agent-c");
+}
+
 #[tokio::test]
 async fn http_answer_loop_reads_and_resumes_awaiting_input() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);

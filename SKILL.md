@@ -57,6 +57,9 @@ must never silently evaporate on process exit.
 - `claim_card`: acquire an expiring lock for one card and open a run.
 - `release_claim`: clear an active claim by run id and make the card ready.
 - `renew_claim`: extend an active claim lease by run id.
+- `transfer_claim`: atomically hand an active claim to a named agent on the
+  same run -- no release-then-race window for a handoff; invocable by the
+  claim holder or admin.
 - `heartbeat`: record liveness for an active claim without changing ownership.
 - `get_card`: read one card with runs, activities, links, comments, and claim state.
 - `get_run`: read one run with its card, activities, links, comments, and run state.
@@ -80,7 +83,7 @@ must never silently evaporate on process exit.
 `powder` is remote-capable for the full card and claim-lifecycle workflow:
 with `POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`,
 `list-cards`, `get-card`, `create-card`, `claim`, `heartbeat`, `renew-claim`,
-`release-claim`, `update-status`, `check-criterion`, `add-link`,
+`transfer-claim`, `release-claim`, `update-status`, `check-criterion`, `add-link`,
 `add-comment`, `request-input`, and `complete-card` all operate against the
 deployed instance when `--db` is omitted -- there is no separate "remote
 closeout" wrapper to reach for; the same commands used against `--db` work
@@ -119,6 +122,7 @@ powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --
 powder claim 001 --db ./data/powder.db --agent codex
 powder heartbeat 001 --db ./data/powder.db --run run-id
 powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600
+powder transfer-claim 001 --db ./data/powder.db --run run-id --to-agent codex --ttl 3600
 powder release-claim 001 --db ./data/powder.db --run run-id
 powder get-card 001 --db ./data/powder.db
 powder update-relations 001 --db ./data/powder.db --related 002 --blocks 003 --blocked-by 000

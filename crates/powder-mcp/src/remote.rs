@@ -145,6 +145,16 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 json!({"run_id": run.as_str(), "ttl_seconds": ttl_seconds}),
             )?
         }
+        "transfer_claim" => {
+            let id = card_id(args, "card_id")?;
+            let run = run_id(args, "run_id")?;
+            let to_agent = required_str(args, "to_agent")?;
+            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
+            client.post(
+                &format!("/api/v1/cards/{id}/transfer"),
+                json!({"run_id": run.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
+            )?
+        }
         "heartbeat" => {
             let id = card_id(args, "card_id")?;
             let run = run_id(args, "run_id")?;
@@ -399,6 +409,36 @@ mod tests {
         assert_eq!(
             requests[0].body,
             Some(json!({"agent": "codex", "ttl_seconds": 60}))
+        );
+    }
+
+    #[test]
+    fn transfer_claim_posts_run_id_to_agent_and_ttl() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"card_id": "001", "run_id": "run-1", "agent": "codex-b", "expires_at": 160}),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "transfer_claim",
+            &json!({"card_id": "001", "run_id": "run-1", "to_agent": "codex-b", "ttl_seconds": 60}),
+        )
+        .unwrap();
+
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("codex-b"));
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/001/transfer");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"run_id": "run-1", "to_agent": "codex-b", "ttl_seconds": 60}))
         );
     }
 

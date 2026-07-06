@@ -392,6 +392,13 @@ struct LeaseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct TransferRequest {
+    run_id: String,
+    to_agent: String,
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct StatusRequest {
     status: String,
 }
@@ -555,6 +562,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/release", post(release_claim))
         .route("/api/v1/cards/{id}/renew", post(renew_claim))
         .route("/api/v1/cards/{id}/heartbeat", post(heartbeat_claim))
+        .route("/api/v1/cards/{id}/transfer", post(transfer_claim))
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/relations", post(update_relations))
         .route("/api/v1/cards/{id}/criteria/check", post(check_criterion))
@@ -1028,6 +1036,30 @@ async fn heartbeat_claim(
     let run_id = RunId::new(request.run_id)?;
     let receipt =
         lock_store(&state)?.heartbeat_claim(&card_id, &run_id, unix_now(), &actor.authority())?;
+    Ok(Json(json!(receipt)))
+}
+
+/// powder-936: an atomic handoff of an active claim to a named agent, so a
+/// holder that needs to hand a card to a fresh builder never has to
+/// release-then-race a third party for the reclaim window. Holder- or
+/// admin-invocable, same authority shape as renew/release/heartbeat.
+async fn transfer_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<TransferRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let run_id = RunId::new(request.run_id)?;
+    let receipt = lock_store(&state)?.transfer_claim(
+        &card_id,
+        &run_id,
+        &request.to_agent,
+        unix_now(),
+        request.ttl_seconds.unwrap_or(3600),
+        &actor.authority(),
+    )?;
     Ok(Json(json!(receipt)))
 }
 

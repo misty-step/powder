@@ -122,6 +122,14 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/cards/{id}/transfer",
+        intent: "atomically hand an active claim to a named agent -- no release-then-race window for a handoff",
+        body_shape: Some(
+            r#"{"run_id":"...","to_agent":"...","ttl_seconds":null} -- run_id and to_agent are required; caller must hold the claim or be admin; the receiving agent gets a fresh ttl from now, not the outgoing agent's remaining time"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/cards/{id}/status",
         intent: "set a card to any status in one call and record an audit event",
         body_shape: None,
@@ -279,6 +287,7 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards/{id}/release"));
         assert!(paths.contains(&"/api/v1/cards/{id}/renew"));
         assert!(paths.contains(&"/api/v1/cards/{id}/heartbeat"));
+        assert!(paths.contains(&"/api/v1/cards/{id}/transfer"));
         assert!(paths.contains(&"/api/v1/cards/{id}/links"));
         assert!(paths.contains(&"/api/v1/cards/{id}/relations"));
         assert!(paths.contains(&"/api/v1/cards/{id}/criteria/check"));

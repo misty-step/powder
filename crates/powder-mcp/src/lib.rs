@@ -76,6 +76,11 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
+        name: "transfer_claim",
+        description: "Atomically hand an active claim to a named agent on the same run -- no release-then-race window for a handoff. Optional actor/admin are checked against the claim holder.",
+        input_schema: r#"{"type":"object","required":["card_id","run_id","to_agent"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"to_agent":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
         name: "heartbeat",
         description: "Record liveness for an active claim without changing ownership. Optional actor/admin are checked against the claim holder.",
         input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
@@ -394,6 +399,22 @@ pub fn call_tool_store(
                 .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority_arg(args))
                 .map_err(to_string)?)
         }
+        "transfer_claim" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            let to_agent = required_str(args, "to_agent")?;
+            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
+            json!(store
+                .transfer_claim(
+                    &card_id,
+                    &run_id,
+                    to_agent,
+                    now,
+                    ttl_seconds,
+                    &authority_arg(args)
+                )
+                .map_err(to_string)?)
+        }
         "heartbeat" => {
             let card_id = card_id(args, "card_id")?;
             let run_id = run_id(args, "run_id")?;
@@ -689,7 +710,7 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 28);
+        assert_eq!(TOOLS.len(), 29);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
         assert!(names.contains(&"create_card"));
@@ -703,6 +724,7 @@ mod tests {
         assert!(names.contains(&"claim_card"));
         assert!(names.contains(&"release_claim"));
         assert!(names.contains(&"renew_claim"));
+        assert!(names.contains(&"transfer_claim"));
         assert!(names.contains(&"heartbeat"));
         assert!(names.contains(&"get_card"));
         assert!(names.contains(&"get_run"));
@@ -773,6 +795,20 @@ Expose tools against the DB.
             13,
         )
         .unwrap();
+        let transferred = call_tool_store(
+            &mut store,
+            "transfer_claim",
+            &json!({"card_id": "005", "run_id": run_id, "to_agent": "codex-b", "ttl_seconds": 60}),
+            13,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&transferred)["agent"], "codex-b");
+        let handed_off =
+            call_tool_store(&mut store, "get_card", &json!({"card_id": "005"}), 13).unwrap();
+        assert!(handed_off["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("codex-b"));
         call_tool_store(
             &mut store,
             "request_input",
