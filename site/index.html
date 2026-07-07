@@ -50,17 +50,17 @@
       <symbol id="i-moon" viewBox="0 0 24 24">
         <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
       </symbol>
-      <symbol id="i-circle-check" viewBox="0 0 24 24">
-        <circle cx="12" cy="12" r="10" />
-        <path d="m9 12 2 2 4-4" />
-      </symbol>
-      <symbol id="i-x" viewBox="0 0 24 24">
-        <path d="M18 6 6 18" />
-        <path d="m6 6 12 12" />
+      <symbol id="i-github" viewBox="0 0 24 24">
+        <path
+          d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"
+        />
+        <path d="M9 18c-4.51 2-5-2-7-2" />
       </symbol>
     </svg>
 
-    <div class="ae-screen ae-wide">
+    <div class="ae-screen ae-wide msk-home">
+      <div class="msk-home-bg" aria-hidden="true"></div>
+
       <header class="ae-bar msk-bar">
         <a class="ae-logo" href="./" aria-label="Powder home">
           <span class="ae-app-mark" aria-hidden="true">
@@ -70,190 +70,39 @@
           </span>
           <span class="ae-name">Powder</span>
         </a>
-        <span class="msk-actions">
-          <nav class="ae-chrome msk-nav" aria-label="Site">
-            <a href="#features">features</a>
-            <a href="#screens">screens</a>
-            <a href="changelog.html">release notes</a>
-          </nav>
-          <button class="ae-mode" aria-label="toggle color mode">
-            <svg class="ae-icon ae-sun"><use href="#i-sun" /></svg>
-            <svg class="ae-icon ae-moon"><use href="#i-moon" /></svg>
-          </button>
-        </span>
+        <nav class="ae-chrome msk-nav" aria-label="Site">
+          <a href="features.html">features</a>
+          <a href="get-started.html">get started</a>
+          <a href="changelog.html">changelog</a>
+          <a href="https://github.com/misty-step/powder">github</a>
+        </nav>
       </header>
 
-      <main class="ae-stage ae-stage-scroll" id="content">
-        <div class="msk-page">
-          <section class="msk-hero" aria-labelledby="hero-title">
-            <p class="ae-chrome">SELF-HOSTED WORK LEDGER</p>
-            <h1 class="ae-h" id="hero-title">
-              Keep agent work claimed, visible, and auditable.
-            </h1>
-            <p class="msk-pitch">
-              Powder is the narrow board between chat-thread tasks and a hosted
-              project manager: cards, runs, comments, proof links, and claims in
-              one SQLite-backed service that operators own.
-            </p>
-            <p class="ae-status">
-              <svg class="ae-icon ae-ok" data-lucide="circle-check">
-                <use href="#i-circle-check" />
-              </svg>
-              <span class="ae-status-label"
-                >API, CLI, MCP, and Kanban board read the same ledger.</span
-              >
-            </p>
-          </section>
-
-          <section
-            class="msk-section"
-            id="features"
-            aria-labelledby="features-title"
-          >
-            <h2 class="ae-h" id="features-title">Why it matters</h2>
-            <div class="ae-list-rows">
-              <div class="ae-list-row">
-                <span class="ae-list-cell">
-                  <span class="ae-list-label">job</span>
-                  <span class="ae-list-value"
-                    >One shared work queue.</span
-                  >
-                </span>
-                <span class="ae-list-cell">
-                  <span class="ae-list-label">proof</span>
-                  <span class="ae-list-value"
-                    >Runs, comments, links, and audit events.</span
-                  >
-                </span>
-              </div>
-              <div class="ae-list-row">
-                <span class="ae-list-cell">
-                  <span class="ae-list-label">shape</span>
-                  <span class="ae-list-value"
-                    >Rust service. SQLite store.</span
-                  >
-                </span>
-                <span class="ae-list-cell">
-                  <span class="ae-list-label">trust</span>
-                  <span class="ae-list-value"
-                    >Public repo. Private instance data.</span
-                  >
-                </span>
-              </div>
-              <div class="ae-list-row">
-                <span class="ae-list-cell">
-                  <span class="ae-list-label">delivery</span>
-                  <span class="ae-list-value"
-                    >Same gate locally and in CI.</span
-                  >
-                </span>
-                <span class="ae-list-cell">
-                  <span class="ae-list-label">fit</span>
-                  <span class="ae-list-value"
-                    >Aesthetic tokens with the Powder mark.</span
-                  >
-                </span>
-              </div>
-            </div>
-          </section>
-
-          <section
-            class="msk-section"
-            id="screens"
-            aria-labelledby="screens-title"
-          >
-            <div class="msk-section-head">
-              <h2 class="ae-h" id="screens-title">Screenshots</h2>
-              <p class="ae-dim">
-                Click a frame to inspect it. These are captures of the real
-                Powder board running against seeded demo data, including a
-                blocked edge state.
-              </p>
-            </div>
-            <div class="msk-gallery" aria-label="Product screenshots">
-              <button
-                class="msk-shot"
-                type="button"
-                data-full="assets/screenshots/01-overview.png"
-                data-title="Live board desktop"
-              >
-                <img
-                  src="assets/screenshots/01-overview.png"
-                  alt="Powder board with backlog, ready, in progress, and done work"
-                />
-                <span class="ae-chrome">Live board desktop</span>
-              </button>
-              <button
-                class="msk-shot"
-                type="button"
-                data-full="assets/screenshots/02-narrow.png"
-                data-title="Narrow board"
-              >
-                <img
-                  src="assets/screenshots/02-narrow.png"
-                  alt="Powder board captured at narrow mobile width"
-                />
-                <span class="ae-chrome">Narrow board</span>
-              </button>
-              <button
-                class="msk-shot"
-                type="button"
-                data-full="assets/screenshots/03-edge.png"
-                data-title="Blocked edge state"
-              >
-                <img
-                  src="assets/screenshots/03-edge.png"
-                  alt="Powder board showing a blocked non-happy-path card"
-                />
-                <span class="ae-chrome">Blocked edge state</span>
-              </button>
-            </div>
-          </section>
-
-          <section
-            class="msk-section msk-release-slot"
-            aria-labelledby="release-title"
-          >
-            <h2 class="ae-h" id="release-title">Release notes</h2>
-            <p>
-              Read the <a href="changelog.html">current release notes</a> for
-              user-facing changes and the evidence behind them.
-            </p>
-          </section>
+      <main class="ae-stage" id="content">
+        <div class="msk-home-copy">
+          <h1 class="ae-h" id="hero-title">A work board built for agents.</h1>
+          <a class="ae-button" href="get-started.html">Get started</a>
         </div>
       </main>
 
       <footer class="ae-bar msk-footer">
-        <p class="ae-chrome">Powder is part of the Misty Step fleet.</p>
-        <nav class="ae-foot-links ae-chrome" aria-label="Footer">
+        <button class="ae-mode" aria-label="toggle color mode">
+          <svg class="ae-icon ae-sun"><use href="#i-sun" /></svg>
+          <svg class="ae-icon ae-moon"><use href="#i-moon" /></svg>
+        </button>
+        <p class="ae-chrome msk-credit">
+          a <a href="https://mistystep.io">Misty Step</a> project
           <a
-            data-footer-link="github"
+            class="msk-gh-link"
             href="https://github.com/misty-step/powder"
-            >GitHub</a
+            aria-label="Powder on GitHub"
           >
-          <a data-footer-link="misty-step" href="https://mistystep.io"
-            >Misty Step</a
-          >
-        </nav>
+            <svg class="ae-icon" aria-hidden="true"><use href="#i-github" /></svg>
+          </a>
+        </p>
       </footer>
     </div>
 
-    <dialog class="ae-dialog msk-zoom" aria-labelledby="zoom-title">
-      <div class="msk-zoom-head">
-        <h2 class="ae-dialog-title" id="zoom-title">Screenshot</h2>
-        <button
-          class="ae-button"
-          type="button"
-          data-zoom-close
-          aria-label="Close screenshot"
-        >
-          <svg class="ae-icon" aria-hidden="true"><use href="#i-x" /></svg>
-        </button>
-      </div>
-      <img class="msk-zoom-img" alt="" />
-    </dialog>
-
     <script src="mode.js"></script>
-    <script src="marketing.js"></script>
   </body>
 </html>

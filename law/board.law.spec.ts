@@ -29,7 +29,7 @@ const SITE_ROUTES = [
   {
     name: "marketing home",
     path: "index.html",
-    expected: "Keep agent work claimed, visible, and auditable.",
+    expected: "A work board built for agents.",
   },
   {
     name: "release notes",
