@@ -63,15 +63,14 @@ cargo run -q -p powder-cli -- repository-merge-alias --db "$DB" --alias misty-st
 POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```
 
-The CLI can target either SQLite directly or a deployed `powder-server`. For
-The production instance lives on the bastion box (`phrazzld-bastion` Fly app,
-`/data/apps/powder/powder.db`, litestream-replicated), served on the tailnet at
-`bastion.tail5f5eb4.ts.net:10001`; the standalone `powder` Fly app was
-decommissioned 2026-07-07. Mint agent keys server-side there:
-`fly ssh console -a phrazzld-bastion -C "powder key-create --db /data/apps/powder/powder.db --name <who> --scope agent --show-secret"`.
+The CLI can target either SQLite directly or a deployed `powder-server`. The
+production instance is run by a companion box, not this repo's own checked-in
+Fly app (destroyed 2026-07-07 after its data was verified migrated) -- see
+[`docs/production-deploy.md`](docs/production-deploy.md) for where it
+actually lives, how a merged PR here reaches it, and how to mint an agent key
+against it.
 
-In
-remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
+In remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
 `POWDER_API_KEY`; `--db` always wins when supplied. Run `powder version`
 before a lane starts: it reports the exact git commit the installed binary
 was built from (`cargo install --path crates/powder-cli` after every pull
@@ -175,7 +174,7 @@ profiles:
     command: bash
     args:
       - -lc
-      - cd /Users/phaedrus/Development/powder && exec cargo run --locked -q -p powder-mcp
+      - cd /path/to/powder && exec cargo run --locked -q -p powder-mcp
 ```
 
 ## Self-Hosting
@@ -211,8 +210,9 @@ supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.
 
 **Ratified posture (powder-931, 2026-07-06):** the deployed instance runs
-`api-key` mode with unauthenticated reads, reachable only via
-`bastion.tail5f5eb4.ts.net:10001` on the tailnet — never a public listener.
+`api-key` mode with unauthenticated reads, reachable only over its private
+tailnet hostname (see [`docs/production-deploy.md`](docs/production-deploy.md))
+— never a public listener.
 This was reviewed as a deliberate tradeoff (it serves the operator's
 read-only phone use case) rather than an oversight, and the operator
 ratified keeping it as-is. If the deployment's network exposure ever
@@ -277,8 +277,10 @@ Fly volume. Misty Step's current operator instance is fronted by Bastion rather
 than the checked-in `powder` Fly app; verify the active deployment with
 `POWDER_API_BASE_URL` before treating the template app name as live -- see
 [`docs/production-deploy.md`](docs/production-deploy.md) for exactly where
-that instance runs, how a merged PR here actually reaches it, and the
-suspended app's disposition. The Fly profile redacts the first bootstrap key
+that instance runs, how a merged PR here actually reaches it, and this app's
+disposition (destroyed 2026-07-07 -- `fly.toml`'s header explains why and
+prevents accidentally re-creating it as a decoy). The Fly profile redacts the
+first bootstrap key
 in logs; create an operator-held key over SSH with `powder key-create --db
 /data/powder.db --name operator --scope admin --show-secret` and store it in
 a secret manager.

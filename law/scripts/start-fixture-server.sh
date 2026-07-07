@@ -15,7 +15,7 @@ export PORT="${PORT:-4100}"
 # powder-942: configured so the law gate exercises the home-affordance link
 # on every existing test, not just a dedicated one -- it's real chrome now,
 # not a special case.
-export POWDER_HOME_URL="https://sanctum.example.ts.net"
+export POWDER_HOME_URL="https://sanctum.example.test"
 
 cargo run -q -p powder-cli -- init-db --db "$DB" >/dev/null
 cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB" >/dev/null
