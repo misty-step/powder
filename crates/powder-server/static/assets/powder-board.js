@@ -1035,6 +1035,7 @@ function detailHTML(card, detail = {}) {
         ${section("DESCRIPTION", markdownHTML(normalized.body))}
         ${section("ACCEPTANCE", acceptanceHTML(normalized))}
         ${section("PROOF PLAN / EVIDENCE", proofEvidenceHTML(normalized, detail.links || [], detail.runs || []))}
+        ${section("WORK LOG", workLogHTML(detail.work_log || []))}
         ${section("COMMENTS", trailHTML((detail.comments || []).map((comment) => ({
           head: `${comment.author} · ${formatDate(comment.created_at)}`,
           body: comment.body,
@@ -1087,6 +1088,20 @@ function relationsHTML(card) {
 function trailHTML(items, fallback) {
   if (!items.length) return empty(fallback);
   return `<ul class="pw-trail">${items.map((item) => `<li><p class="pw-trail-head">${escapeHtml(item.head)}</p><p>${escapeHtml(item.body)}</p></li>`).join("")}</ul>`;
+}
+
+// powder-943: work_log is a high-frequency, fully-attributed context field
+// agents append while actively working a card -- collapsed by default (one
+// entry per turn adds up fast), expandable to the full body on demand.
+function workLogHTML(entries) {
+  if (!entries.length) return empty("No work log entries yet.");
+  return `<ul class="pw-worklog">${entries.map((entry) => {
+    const head = [entry.agent, entry.model, entry.reasoning, entry.harness]
+      .filter(Boolean)
+      .map(escapeHtml)
+      .join(" · ");
+    return `<li class="pw-worklog-item"><details><summary>${escapeHtml(formatDate(entry.created_at))} · ${head}</summary><p>${escapeHtml(entry.body)}</p></details></li>`;
+  }).join("")}</ul>`;
 }
 
 function definitionHTML(rows) {

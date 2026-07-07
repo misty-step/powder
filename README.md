@@ -2,7 +2,7 @@
 
 Powder is a public, self-hostable work-management app for agent-driven teams: a
 durable board for cards, claims, runs, audit events, relations, links,
-comments, and human-in-loop pauses.
+comments, a high-frequency attributed work_log, and human-in-loop pauses.
 
 The repo ships the application. A deployment owns the data.
 
@@ -86,6 +86,7 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `check-criterion` | SQLite criterion write | `POST /api/v1/cards/{id}/criteria/check` | `criterion\tid\tindex\tchecked|unchecked` |
 | `add-link` | SQLite link write | `POST /api/v1/cards/{id}/links` | `link\tcard_id\tid` |
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
+| `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | `work-log\tcard_id\tagent\tbody` |
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
 

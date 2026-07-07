@@ -131,6 +131,11 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["card_id","author","body"],"properties":{"card_id":{"type":"string"},"author":{"type":"string"},"body":{"type":"string"}}}"#,
     },
     ToolDef {
+        name: "append_work_log",
+        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution you can supply. body is scrubbed for known secret shapes server-side before storage.",
+        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
         name: "request_input",
         description: "Pause a run in awaiting_input with the exact operator question. Optional actor/admin are checked against the claim holder.",
         input_schema: r#"{"type":"object","required":["run_id","question"],"properties":{"run_id":{"type":"string"},"question":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
@@ -499,6 +504,20 @@ pub fn call_tool_store(
                 .add_comment(&card_id, author, body, now)
                 .map_err(to_string)?)
         }
+        "append_work_log" => {
+            let card_id = card_id(args, "card_id")?;
+            let agent = required_str(args, "agent")?;
+            let body = required_str(args, "body")?;
+            let attribution = powder_store::WorkLogAttribution {
+                model: optional_str(args, "model"),
+                reasoning: optional_str(args, "reasoning"),
+                harness: optional_str(args, "harness"),
+                run_id: optional_str(args, "run_id"),
+            };
+            json!(store
+                .append_work_log(&card_id, agent, attribution, body, now)
+                .map_err(to_string)?)
+        }
         "request_input" => {
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
             let question = required_str(args, "question")?;
@@ -742,7 +761,7 @@ mod tests {
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 30);
+        assert_eq!(TOOLS.len(), 31);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
         assert!(names.contains(&"create_card"));
@@ -753,6 +772,7 @@ mod tests {
         assert!(names.contains(&"delete_repository"));
         assert!(names.contains(&"update_relations"));
         assert!(names.contains(&"add_comment"));
+        assert!(names.contains(&"append_work_log"));
         assert!(names.contains(&"claim_card"));
         assert!(names.contains(&"release_claim"));
         assert!(names.contains(&"renew_claim"));
@@ -1204,6 +1224,46 @@ Expose tools against the DB.
         let card =
             call_tool_store(&mut store, "get_card", &json!({"card_id": "commented"}), 11).unwrap();
         assert!(tool_payload(&card)["comments"][0]["body"] == "looks good");
+    }
+
+    #[test]
+    fn mcp_append_work_log_appears_in_get_card() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![parse_backlog_card(
+                "worklogged.md",
+                "# Worklogged\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+                1,
+            )
+            .unwrap()])
+            .unwrap();
+
+        let response = call_tool_store(
+            &mut store,
+            "append_work_log",
+            &json!({
+                "card_id": "worklogged",
+                "agent": "codex",
+                "body": "tracing the claim expiry bug",
+                "model": "claude-sonnet-5",
+            }),
+            10,
+        )
+        .unwrap();
+        let entry = tool_payload(&response);
+        assert_eq!(entry["agent"], "codex");
+        assert_eq!(entry["body"], "tracing the claim expiry bug");
+        assert_eq!(entry["model"], "claude-sonnet-5");
+
+        let card = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "worklogged"}),
+            11,
+        )
+        .unwrap();
+        assert!(tool_payload(&card)["work_log"][0]["agent"] == "codex");
     }
 
     #[test]

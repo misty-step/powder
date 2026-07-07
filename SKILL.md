@@ -29,6 +29,12 @@ must never silently evaporate on process exit.
 - Claim exactly one card at a time unless the operator authorizes a batch.
 - Keep the card updated through lease heartbeats, renewals, audit events,
   relations, and status changes.
+- Call `append_work_log` while you work, not only at completion: context,
+  what you are currently doing, issues you hit, chain of thought. This is a
+  first-class, high-frequency field distinct from `add_comment` -- it is the
+  raw material downstream synthesis (e.g. glass, fleet-retro reports) reads.
+  Only `agent` is required; supply `model`/`reasoning`/`harness`/`run_id`
+  whenever your surface knows them so the entry carries full attribution.
 - Release the claim when stopping voluntarily so another worker can pick the
   card up immediately.
 - In API-key mode, claim as the authenticated key actor; do not supply another
@@ -71,6 +77,10 @@ must never silently evaporate on process exit.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `add_comment`: attach an actor-attributed comment, visible immediately via
   `get_card`/`get_run`.
+- `append_work_log`: append a high-frequency, fully-attributed work_log entry
+  (agent, model, reasoning, harness, run_id, body) while actively working a
+  card -- call this often, not just at completion; `body` is scrubbed for
+  known secret shapes server-side before storage.
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
 - `update_card`: patch title, body, acceptance, proof_plan, status, priority,
@@ -84,7 +94,7 @@ must never silently evaporate on process exit.
 with `POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`,
 `list-cards`, `get-card`, `create-card`, `claim`, `heartbeat`, `renew-claim`,
 `transfer-claim`, `release-claim`, `update-status`, `check-criterion`, `add-link`,
-`add-comment`, `request-input`, and `complete-card` all operate against the
+`add-comment`, `append-work-log`, `request-input`, and `complete-card` all operate against the
 deployed instance when `--db` is omitted -- there is no separate "remote
 closeout" wrapper to reach for; the same commands used against `--db` work
 unchanged against a deployed instance. `--db` always wins when supplied, so a
@@ -102,6 +112,7 @@ export POWDER_API_BASE_URL=https://powder.internal
 export POWDER_API_KEY=sk_powder_...
 powder get-card 001
 powder add-link 001 --label pr --url https://github.com/misty-step/example/pull/1
+powder append-work-log 001 --agent codex --body "narrowed the fix to one function" --model claude-sonnet-5
 powder add-comment 001 --author codex --body "shipped, PR linked above"
 powder complete-card 001 --proof https://github.com/misty-step/example/pull/1
 ```

@@ -6,7 +6,7 @@ use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
     CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, CriterionProof,
-    DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
+    DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -17,6 +17,7 @@ mod events;
 mod identity;
 mod repositories;
 mod schema;
+mod secrets;
 pub mod status_model_020;
 #[cfg(test)]
 mod tests;
@@ -33,9 +34,9 @@ pub use repositories::{
 };
 
 use schema::{
-    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
-    MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_1_TO_2,
+    MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8,
+    MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -142,6 +143,19 @@ pub struct CriterionProofInput {
     pub url: String,
 }
 
+/// The optional attribution fields `append_work_log` accepts alongside the
+/// required `agent`: whatever the calling surface (Claude Code, Codex,
+/// a harness) knows about itself. Bundled into one struct rather than four
+/// positional `Option<&str>` parameters so the method stays under clippy's
+/// argument-count lint without losing any field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkLogAttribution<'a> {
+    pub model: Option<&'a str>,
+    pub reasoning: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -229,6 +243,10 @@ impl Store {
                 9 => {
                     self.connection.execute_batch(MIGRATE_9_TO_10)?;
                     10
+                }
+                10 => {
+                    self.connection.execute_batch(MIGRATE_10_TO_11)?;
+                    11
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1059,6 +1077,71 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(comment)
+    }
+
+    /// Not claim-holder-gated, matching `add_comment`/`add_link`: appending
+    /// work_log context is additive, not an exclusive mutation of the
+    /// card's own state -- any authenticated caller may narrate their own
+    /// work. Only `agent` is required attribution; every field on
+    /// `attribution` is whatever the calling surface can supply.
+    /// `body` is scrubbed for known secret shapes before it is ever
+    /// persisted (powder-943 governance ruling: this becomes fleet-retro
+    /// synthesis input, so it gets the same scrub discipline as any other
+    /// agent-output surface, at write time rather than read time).
+    pub fn append_work_log(
+        &mut self,
+        card_id: &CardId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        now: i64,
+    ) -> Result<WorkLogEntry> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let card = load_card(&transaction, card_id)?;
+        let run_id = attribution.run_id.map(RunId::new).transpose()?;
+        let entry = WorkLogEntry {
+            card_id: card_id.clone(),
+            agent: non_empty("agent", agent)?,
+            model: attribution.model.map(str::to_owned),
+            reasoning: attribution.reasoning.map(str::to_owned),
+            harness: attribution.harness.map(str::to_owned),
+            run_id,
+            body: secrets::scrub_secrets(&non_empty("body", body)?),
+            created_at: now,
+        };
+        let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+        transaction.execute(
+            "INSERT INTO work_log_entries
+             (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                entry.card_id.as_str(),
+                entry.agent,
+                entry.model,
+                entry.reasoning,
+                entry.harness,
+                entry.run_id.as_ref().map(RunId::as_str),
+                entry.body,
+                entry.created_at,
+            ],
+        )?;
+        events::append_outbound_card_event(
+            &transaction,
+            &card,
+            "work-log-appended",
+            &entry.agent,
+            json!({
+                "agent": entry.agent.as_str(),
+                "model": entry.model,
+                "harness": entry.harness,
+            }),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(entry)
     }
 
     pub fn request_input(

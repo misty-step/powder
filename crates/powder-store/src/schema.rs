@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -119,6 +119,19 @@ CREATE TABLE IF NOT EXISTS comments (
   body TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS work_log_entries (
+  id TEXT PRIMARY KEY,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  agent TEXT NOT NULL,
+  model TEXT,
+  reasoning TEXT,
+  harness TEXT,
+  run_id TEXT,
+  body TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
 
 CREATE TABLE IF NOT EXISTS event_subscriptions (
   id TEXT PRIMARY KEY,
@@ -315,6 +328,24 @@ ALTER TABLE cards ADD COLUMN proof_plan_json TEXT NOT NULL DEFAULT '[]';
 /// mechanical instead of archaeological.
 pub const MIGRATE_9_TO_10: &str = r#"
 ALTER TABLE api_keys ADD COLUMN last_used_at INTEGER;
+"#;
+
+/// powder-943: work_log is a first-class, high-frequency, fully-attributed
+/// context field agents append while actively working a card -- distinct
+/// from `comments`, which stays low-frequency and human-facing.
+pub const MIGRATE_10_TO_11: &str = r#"
+CREATE TABLE IF NOT EXISTS work_log_entries (
+  id TEXT PRIMARY KEY,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  agent TEXT NOT NULL,
+  model TEXT,
+  reasoning TEXT,
+  harness TEXT,
+  run_id TEXT,
+  body TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, labels_json,

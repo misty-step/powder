@@ -8,7 +8,7 @@
 use powder_api::{urlencode, RemoteClient};
 use serde_json::{json, Value};
 
-use super::{card_id, required_str, run_id, to_string};
+use super::{card_id, optional_str, required_str, run_id, to_string};
 
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
     let payload = match name {
@@ -231,6 +231,22 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.post(
                 &format!("/api/v1/cards/{id}/comments"),
                 json!({"author": author, "body": body}),
+            )?
+        }
+        "append_work_log" => {
+            let id = card_id(args, "card_id")?;
+            let agent = required_str(args, "agent")?;
+            let body = required_str(args, "body")?;
+            client.post(
+                &format!("/api/v1/cards/{id}/work-log"),
+                json!({
+                    "agent": agent,
+                    "body": body,
+                    "model": optional_str(args, "model"),
+                    "reasoning": optional_str(args, "reasoning"),
+                    "harness": optional_str(args, "harness"),
+                    "run_id": optional_str(args, "run_id"),
+                }),
             )?
         }
         "request_input" => {
@@ -468,6 +484,52 @@ mod tests {
         assert_eq!(
             requests[0].body,
             Some(json!({"author": "operator", "body": "looks good"}))
+        );
+    }
+
+    #[test]
+    fn append_work_log_posts_full_attribution() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "card_id": "001",
+                "agent": "codex",
+                "model": "claude-sonnet-5",
+                "body": "tracing the claim expiry bug",
+                "created_at": 10,
+            }),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "append_work_log",
+            &json!({
+                "card_id": "001",
+                "agent": "codex",
+                "body": "tracing the claim expiry bug",
+                "model": "claude-sonnet-5",
+            }),
+        )
+        .unwrap();
+
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("tracing the claim expiry bug"));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/001/work-log");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({
+                "agent": "codex",
+                "body": "tracing the claim expiry bug",
+                "model": "claude-sonnet-5",
+                "reasoning": null,
+                "harness": null,
+                "run_id": null,
+            }))
         );
     }
 

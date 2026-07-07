@@ -5,7 +5,8 @@ use powder_core::{
 
 use crate::{
     ApiKeyScope, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError, API_KEY_ALPHABET,
+    RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError, WorkLogAttribution,
+    API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -612,6 +613,100 @@ fn add_comment_appears_in_get_card_detail_in_creation_order() -> Result<()> {
         empty_body,
         Err(StoreError::Domain(DomainError::Validation { .. }))
     ));
+    Ok(())
+}
+
+#[test]
+fn append_work_log_appears_in_get_card_detail_in_creation_order() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let full_attribution = WorkLogAttribution {
+        model: Some("claude-sonnet-5"),
+        reasoning: Some("high"),
+        harness: Some("Claude Code"),
+        run_id: Some("run-abc123"),
+    };
+    let first = store.append_work_log(
+        &card_id,
+        "sonnet-powder-943",
+        full_attribution,
+        "reading the schema before touching the store layer",
+        10,
+    )?;
+    assert_eq!(first.agent, "sonnet-powder-943");
+    assert_eq!(first.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(first.reasoning.as_deref(), Some("high"));
+    assert_eq!(first.harness.as_deref(), Some("Claude Code"));
+    assert_eq!(first.run_id.as_ref().map(RunId::as_str), Some("run-abc123"));
+
+    // Only `agent` and `body` are required -- every attribution field is
+    // optional so surfaces that cannot supply it still get a first-class
+    // entry rather than being locked out.
+    let second = store.append_work_log(
+        &card_id,
+        "codex",
+        WorkLogAttribution::default(),
+        "second note",
+        20,
+    )?;
+    assert!(second.model.is_none());
+
+    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    assert_eq!(detail.work_log.len(), 2);
+    assert_eq!(
+        detail.work_log[0].body,
+        "reading the schema before touching the store layer"
+    );
+    assert_eq!(detail.work_log[1].agent, "codex");
+
+    let missing = CardId::new("does-not-exist")?;
+    let err = store.append_work_log(&missing, "codex", WorkLogAttribution::default(), "note", 30);
+    assert!(matches!(
+        err,
+        Err(StoreError::Domain(DomainError::NotFound { .. }))
+    ));
+
+    let empty_agent =
+        store.append_work_log(&card_id, "", WorkLogAttribution::default(), "note", 40);
+    assert!(matches!(
+        empty_agent,
+        Err(StoreError::Domain(DomainError::Validation { .. }))
+    ));
+
+    let empty_body =
+        store.append_work_log(&card_id, "codex", WorkLogAttribution::default(), "", 50);
+    assert!(matches!(
+        empty_body,
+        Err(StoreError::Domain(DomainError::Validation { .. }))
+    ));
+    Ok(())
+}
+
+#[test]
+fn append_work_log_scrubs_secrets_from_the_body_before_storage() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let entry = store.append_work_log(
+        &card_id,
+        "codex",
+        WorkLogAttribution::default(),
+        "found the bug: it was reading sk-abcdefghijklmnopqrstuvwxyz123456 from env",
+        10,
+    )?;
+
+    assert!(!entry.body.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(entry.body.contains("[REDACTED:openai-key]"));
+
+    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    assert!(!detail.work_log[0]
+        .body
+        .contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
     Ok(())
 }
 
