@@ -57,7 +57,6 @@
 }
 
 .msk-home-copy {
-  --msk-hero-scale: 4.25;
   width: min(52%, 42rem);
   display: grid;
   gap: var(--ae-space-5);
@@ -66,13 +65,11 @@
 }
 
 .msk-home-copy h1 {
-  width: calc(100% / var(--msk-hero-scale));
-  font-size: 1em;
-  line-height: 1.05;
-  letter-spacing: 0;
-  transform: scale(var(--msk-hero-scale));
-  transform-origin: left top;
-  margin-bottom: 10em;
+  font-weight: var(--ae-w-bold);
+  font-size: clamp(1.7rem, 2.8vw, 2.6rem);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  max-width: 24ch;
 }
 
 .msk-page {
@@ -225,12 +222,7 @@
   }
 
   .msk-home-copy {
-    --msk-hero-scale: 2.2;
     width: min(92%, 20rem);
-  }
-
-  .msk-home-copy h1 {
-    margin-bottom: 4.2em;
   }
 
   .msk-footer {
