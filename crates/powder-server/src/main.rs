@@ -63,6 +63,7 @@ struct Config {
     import_files_dir: PathBuf,
     auth_mode: AuthMode,
     public_base_url: Option<String>,
+    home_url: Option<String>,
     bind_addr: SocketAddr,
     disclose_bootstrap_key: bool,
     field_note: FieldNoteConfig,
@@ -141,6 +142,7 @@ impl Config {
             import_files_dir,
             auth_mode,
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
+            home_url: env_value(&vars, "POWDER_HOME_URL").map(ToOwned::to_owned),
             bind_addr,
             disclose_bootstrap_key,
             field_note,
@@ -246,6 +248,13 @@ struct Onboarding {
     bootstrap_key_configured: bool,
     auth_mode: AuthMode,
     public_base_url: Option<String>,
+    /// A URL the board renders as a plain text link back to a deployment's
+    /// own portal/home surface (powder-942: 6 of 9 Sanctum destinations had
+    /// no route home, and the proxy layer cannot inject one -- vendored
+    /// surfaces get clobbered on pin sync, so the affordance has to live in
+    /// the app's own served UI). Absent by default; self-hosters with no
+    /// portal to link back to see no change. Set via `POWDER_HOME_URL`.
+    home_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -672,6 +681,7 @@ async fn onboarding(State(state): State<AppState>) -> Result<Json<Onboarding>, A
         bootstrap_key_configured: active_keys > 0,
         auth_mode: state.config.auth_mode,
         public_base_url: state.config.public_base_url.clone(),
+        home_url: state.config.home_url.clone(),
     }))
 }
 

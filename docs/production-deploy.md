@@ -111,3 +111,14 @@ block in `~/Development/bastion/platform/bastion.toml` documented above
 (`[[app]] name = "powder"`), then redeploying Bastion per the steps above --
 there is no separate config surface for this repo's own `fly.toml` to carry,
 since that app is not what serves production traffic.
+
+## Home affordance (powder-942)
+
+`POWDER_HOME_URL` (unset by default) makes the board render a plain text
+link back to that URL in its always-visible chrome (footer on the board
+view, header on the card-detail view) -- built for exactly this deployment
+shape, where Powder is its own tailnet origin (`:10001`) and the Sanctum
+portal root lives at a different one (`:443`, no path). Setting it in
+production is the same env-target pattern as the field-note generator
+above: add `POWDER_HOME_URL=https://bastion.tail5f5eb4.ts.net` to the same
+`[app.env]` block, then redeploy Bastion.

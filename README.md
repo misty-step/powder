@@ -64,6 +64,13 @@ POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```
 
 The CLI can target either SQLite directly or a deployed `powder-server`. For
+The production instance lives on the bastion box (`phrazzld-bastion` Fly app,
+`/data/apps/powder/powder.db`, litestream-replicated), served on the tailnet at
+`bastion.tail5f5eb4.ts.net:10001`; the standalone `powder` Fly app was
+decommissioned 2026-07-07. Mint agent keys server-side there:
+`fly ssh console -a phrazzld-bastion -C "powder key-create --db /data/apps/powder/powder.db --name <who> --scope agent --show-secret"`.
+
+In
 remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
 `POWDER_API_KEY`; `--db` always wins when supplied. Run `powder version`
 before a lane starts: it reports the exact git commit the installed binary
@@ -275,6 +282,11 @@ suspended app's disposition. The Fly profile redacts the first bootstrap key
 in logs; create an operator-held key over SSH with `powder key-create --db
 /data/powder.db --name operator --scope admin --show-secret` and store it in
 a secret manager.
+
+Set `POWDER_HOME_URL` (unset by default) to render a plain text link back to
+that URL in the board's always-visible chrome -- for a deployment fronted by
+a portal/home surface Powder itself doesn't own (powder-942). Self-hosters
+with no such portal leave it unset and see no change.
 
 ### A scoped key for the board UI on a phone (powder-925)
 

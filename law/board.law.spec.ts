@@ -61,6 +61,13 @@ async function bootSite(
 for (const mode of MODES) {
   test(`board · ${mode} · the law holds`, async ({ page }) => {
     const errors = await boot(page, mode);
+    // powder-942: the home affordance is real chrome now, present whenever
+    // POWDER_HOME_URL is configured (the fixture server sets it).
+    await expect(page.locator("#footer-home-link")).toBeVisible();
+    await expect(page.locator("#footer-home-link")).toHaveAttribute(
+      "href",
+      "https://sanctum.example.ts.net",
+    );
     await assertLaw(page, { consoleErrors: errors });
   });
 
@@ -138,17 +145,30 @@ for (const mode of MODES) {
       await expect(page.locator("#powder-card-app")).toBeVisible();
       await expect(page.locator("#detail-body")).toContainText("Import example backlog ticket");
       await expect(page.locator("#detail-body")).toContainText("ACCEPTANCE");
+      // powder-942: home affordance present next to the existing "board"
+      // link at every viewport this route is tested at, mobile included.
+      await expect(page.locator("#detail-home-link")).toBeVisible();
+      await expect(page.locator("#detail-home-link")).toHaveAttribute(
+        "href",
+        "https://sanctum.example.ts.net",
+      );
       await assertLaw(page, { consoleErrors: errors });
     });
   }
 }
 
-test("board · touch device · keyboard-shortcut footer is hidden (powder-930)", async ({
+test("board · touch device · keyboard-shortcut hint hides, footer bar and home link stay reachable (powder-930, powder-942)", async ({
   browser,
 }) => {
   // pointer:coarse is the touch signal the CSS keys off, not viewport width
   // (a narrowed desktop window should keep the hint) -- hasTouch is how
   // Chromium reports a coarse primary pointer under Playwright.
+  //
+  // Superseded assertion (powder-942): the whole `.pw-foot` bar used to hide
+  // here, but that also hid the home-affordance link on every touch device --
+  // exactly where it matters most. Only the hint itself (`.pw-foot-hint`,
+  // genuinely dead weight with no keyboard) hides now; the bar and the home
+  // link stay visible.
   const context = await browser.newContext({
     viewport: { width: 390, height: 900 },
     hasTouch: true,
@@ -158,7 +178,13 @@ test("board · touch device · keyboard-shortcut footer is hidden (powder-930)",
   await page.addInitScript(() => localStorage.setItem("ae-mode", "light"));
   await page.goto("/board");
   await page.waitForLoadState("networkidle");
-  await expect(page.locator(".pw-foot")).toBeHidden();
+  await expect(page.locator(".pw-foot")).toBeVisible();
+  await expect(page.locator(".pw-foot-hint")).toBeHidden();
+  await expect(page.locator("#footer-home-link")).toBeVisible();
+  await expect(page.locator("#footer-home-link")).toHaveAttribute(
+    "href",
+    "https://sanctum.example.ts.net",
+  );
   await assertLaw(page, { consoleErrors: errors });
   await context.close();
 });
