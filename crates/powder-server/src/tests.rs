@@ -115,11 +115,10 @@ fn config_home_url_is_absent_by_default_and_configurable() {
     let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
     assert!(config.home_url.is_none());
 
-    let config =
-        Config::from_pairs([("POWDER_HOME_URL", "https://bastion.example.ts.net")]).unwrap();
+    let config = Config::from_pairs([("POWDER_HOME_URL", "https://sanctum.example.test")]).unwrap();
     assert_eq!(
         config.home_url.as_deref(),
-        Some("https://bastion.example.ts.net")
+        Some("https://sanctum.example.test")
     );
 }
 
@@ -2834,7 +2833,7 @@ async fn onboarding_surfaces_configured_home_url_and_omits_it_by_default() {
     let body = response_json(response).await;
     assert!(body["home_url"].is_null());
 
-    let (state, _) = test_state_with_home_url(AuthMode::None, "https://bastion.example.ts.net");
+    let (state, _) = test_state_with_home_url(AuthMode::None, "https://sanctum.example.test");
     let with_home_url = app(state);
     let response = with_home_url
         .oneshot(
@@ -2847,7 +2846,7 @@ async fn onboarding_surfaces_configured_home_url_and_omits_it_by_default() {
         .await
         .unwrap();
     let body = response_json(response).await;
-    assert_eq!(body["home_url"], "https://bastion.example.ts.net");
+    assert_eq!(body["home_url"], "https://sanctum.example.test");
 }
 
 #[tokio::test]

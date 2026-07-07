@@ -66,7 +66,7 @@ for (const mode of MODES) {
     await expect(page.locator("#footer-home-link")).toBeVisible();
     await expect(page.locator("#footer-home-link")).toHaveAttribute(
       "href",
-      "https://sanctum.example.ts.net",
+      "https://sanctum.example.test",
     );
     await assertLaw(page, { consoleErrors: errors });
   });
@@ -150,7 +150,7 @@ for (const mode of MODES) {
       await expect(page.locator("#detail-home-link")).toBeVisible();
       await expect(page.locator("#detail-home-link")).toHaveAttribute(
         "href",
-        "https://sanctum.example.ts.net",
+        "https://sanctum.example.test",
       );
       await assertLaw(page, { consoleErrors: errors });
     });
@@ -183,7 +183,7 @@ test("board · touch device · keyboard-shortcut hint hides, footer bar and home
   await expect(page.locator("#footer-home-link")).toBeVisible();
   await expect(page.locator("#footer-home-link")).toHaveAttribute(
     "href",
-    "https://sanctum.example.ts.net",
+    "https://sanctum.example.test",
   );
   await assertLaw(page, { consoleErrors: errors });
   await context.close();

@@ -1,7 +1,8 @@
 # DECOMMISSIONED (2026-07-07): the standalone `powder` Fly app was a decoy —
 # it was destroyed after its data was verified migrated to the bastion box
-# (phrazzld-bastion, /data/apps/powder/, litestream-replicated; served at
-# bastion.tail5f5eb4.ts.net:10001). Deployment is owned by the bastion repo.
+# (a separate, operator-owned Fly machine, litestream-replicated; see
+# docs/production-deploy.md for where that instance actually runs).
+# Deployment is owned by the bastion repo, not this one.
 # Do NOT `fly deploy` from this file; it is kept only as a config reference.
 app = "powder"
 primary_region = "iad"
