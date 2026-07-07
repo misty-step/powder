@@ -268,10 +268,13 @@ instance. The companion bastion lane can expose `http://powder.internal:4000`
 through Tailscale Serve while Powder keeps its own database and secrets on its
 Fly volume. Misty Step's current operator instance is fronted by Bastion rather
 than the checked-in `powder` Fly app; verify the active deployment with
-`POWDER_API_BASE_URL` before treating the template app name as live. The Fly
-profile redacts the first bootstrap key in logs; create an operator-held key
-over SSH with `powder key-create --db /data/powder.db --name operator --scope
-admin --show-secret` and store it in a secret manager.
+`POWDER_API_BASE_URL` before treating the template app name as live -- see
+[`docs/production-deploy.md`](docs/production-deploy.md) for exactly where
+that instance runs, how a merged PR here actually reaches it, and the
+suspended app's disposition. The Fly profile redacts the first bootstrap key
+in logs; create an operator-held key over SSH with `powder key-create --db
+/data/powder.db --name operator --scope admin --show-secret` and store it in
+a secret manager.
 
 ### A scoped key for the board UI on a phone (powder-925)
 
