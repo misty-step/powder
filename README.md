@@ -283,6 +283,11 @@ in logs; create an operator-held key over SSH with `powder key-create --db
 /data/powder.db --name operator --scope admin --show-secret` and store it in
 a secret manager.
 
+Set `POWDER_HOME_URL` (unset by default) to render a plain text link back to
+that URL in the board's always-visible chrome -- for a deployment fronted by
+a portal/home surface Powder itself doesn't own (powder-942). Self-hosters
+with no such portal leave it unset and see no change.
+
 ### A scoped key for the board UI on a phone (powder-925)
 
 The board's write actions (quick-add a card, change a card's status, claim,

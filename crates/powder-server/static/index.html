@@ -227,14 +227,18 @@
   </div>
 
   <footer class="pw-foot">
-    <span><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · open cards for full detail</span>
+    <span class="pw-foot-hint"><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · open cards for full detail</span>
+    <a id="footer-home-link" class="pw-board-link" href="" hidden>sanctum</a>
     <span>powder</span>
   </footer>
 </div>
 
 <div id="powder-card-app" class="pw-detail-app" aria-live="polite">
   <header class="pw-detail-top ae-chrome">
-    <a class="pw-board-link" id="detail-board-link" href="/board">board</a>
+    <div class="pw-detail-nav">
+      <a class="pw-board-link" id="detail-board-link" href="/board">board</a>
+      <a class="pw-board-link" id="detail-home-link" href="" hidden>sanctum</a>
+    </div>
     <div class="pw-brand">
       <span class="pw-mark" aria-hidden="true"><svg class="ae-icon"><use href="#i-snowflake"></use></svg></span>
       <span class="ae-name">POWDER</span>

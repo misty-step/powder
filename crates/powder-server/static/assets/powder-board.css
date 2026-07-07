@@ -791,8 +791,14 @@ html:not([data-pw-route='card']) .pw-detail-app {
   padding-bottom: 0;
 }
 
-.pw-board-link {
+.pw-detail-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.85em;
   justify-self: start;
+}
+
+.pw-board-link {
   color: var(--ae-ink-muted);
   text-decoration: none;
 }
@@ -1137,9 +1143,12 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 /* the keyboard-shortcut hint is dead weight with no keyboard (powder-930):
    coarse pointer is the touch signal, not viewport width, since a tablet
-   or a narrowed desktop window should keep the hint. */
+   or a narrowed desktop window should keep the hint. Only the hint itself
+   hides -- the footer bar stays up so its home-affordance link (powder-942)
+   remains reachable on touch devices, which is exactly where it matters
+   most. */
 @media (pointer: coarse) {
-  .pw-foot {
+  .pw-foot-hint {
     display: none;
   }
 }

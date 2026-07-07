@@ -108,6 +108,21 @@ fn config_accepts_explicit_bind_addr() {
     assert_eq!(err.variable, "POWDER_BIND_ADDR");
 }
 
+/// powder-942: absent by default so self-hosters with no portal to link
+/// back to see no change; set explicitly when a deployment does have one.
+#[test]
+fn config_home_url_is_absent_by_default_and_configurable() {
+    let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
+    assert!(config.home_url.is_none());
+
+    let config =
+        Config::from_pairs([("POWDER_HOME_URL", "https://bastion.example.ts.net")]).unwrap();
+    assert_eq!(
+        config.home_url.as_deref(),
+        Some("https://bastion.example.ts.net")
+    );
+}
+
 #[tokio::test]
 async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -2799,6 +2814,42 @@ async fn healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db
     }
 }
 
+/// powder-942: the board's home affordance is driven by onboarding's
+/// `home_url`, absent by default and present when `POWDER_HOME_URL` is set --
+/// the board's JS decides whether to render a link at all from this field.
+#[tokio::test]
+async fn onboarding_surfaces_configured_home_url_and_omits_it_by_default() {
+    let (state, _) = test_state(AuthMode::None);
+    let without_home_url = app(state);
+    let response = without_home_url
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/onboarding")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json(response).await;
+    assert!(body["home_url"].is_null());
+
+    let (state, _) = test_state_with_home_url(AuthMode::None, "https://bastion.example.ts.net");
+    let with_home_url = app(state);
+    let response = with_home_url
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/onboarding")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json(response).await;
+    assert_eq!(body["home_url"], "https://bastion.example.ts.net");
+}
+
 #[tokio::test]
 async fn api_v1_routes_is_unauthenticated_and_documents_required_fields() {
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
@@ -2955,6 +3006,7 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
             import_files_dir,
             auth_mode,
             public_base_url: None,
+            home_url: None,
             bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
             disclose_bootstrap_key: false,
             field_note: FieldNoteConfig::default(),
@@ -2983,6 +3035,21 @@ fn test_state_with_field_note(
             ..(*state.config).clone()
         }),
         store: Arc::new(Mutex::new(store)),
+    };
+    (state, key)
+}
+
+/// Same as [`test_state`], but with `POWDER_HOME_URL` configured -- proves
+/// powder-942's onboarding round trip against the HTTP path a real deployed
+/// instance's board JS actually reads.
+fn test_state_with_home_url(auth_mode: AuthMode, home_url: &str) -> (AppState, String) {
+    let (state, key) = test_state(auth_mode);
+    let state = AppState {
+        config: Arc::new(Config {
+            home_url: Some(home_url.to_string()),
+            ..(*state.config).clone()
+        }),
+        store: state.store,
     };
     (state, key)
 }

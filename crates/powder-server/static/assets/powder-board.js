@@ -47,6 +47,8 @@ const els = {
   quickAddMessage: document.getElementById("quick-add-message"),
   detailConnection: document.getElementById("detail-connection-status"),
   detailBoardLink: document.getElementById("detail-board-link"),
+  detailHomeLink: document.getElementById("detail-home-link"),
+  footerHomeLink: document.getElementById("footer-home-link"),
   connection: document.getElementById("connection-status"),
   authPanel: document.getElementById("auth-panel"),
   repoSettingsCount: document.getElementById("repo-settings-count"),
@@ -173,6 +175,7 @@ async function loadOnboarding() {
     state.authMode = data.auth_mode || "unknown";
     state.needsSetup = Boolean(data.needs_setup);
     renderAuthState();
+    renderHomeLink(data.home_url);
     if (state.authMode === "api_key" && state.needsSetup && !state.apiKey) {
       showAuth("No write keys exist yet. Mint one on the instance, then paste it here.");
     }
@@ -180,6 +183,24 @@ async function loadOnboarding() {
     state.authMode = "unknown";
     state.needsSetup = false;
     renderAuthState();
+  }
+}
+
+// powder-942: a plain inked-text link back to a deployment's own portal/home
+// surface, driven entirely by onboarding's `home_url` -- absent by default
+// (self-hosters with no portal see nothing), present the moment a deployment
+// sets POWDER_HOME_URL. Lives in the always-visible footer/header chrome
+// (not the desktop-only keyboard-shortcut hint), so it survives at 390px.
+function renderHomeLink(homeUrl) {
+  for (const link of [els.footerHomeLink, els.detailHomeLink]) {
+    if (!link) continue;
+    if (homeUrl) {
+      link.href = homeUrl;
+      link.hidden = false;
+    } else {
+      link.hidden = true;
+      link.removeAttribute("href");
+    }
   }
 }
 
