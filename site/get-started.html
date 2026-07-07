@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Powder release notes</title>
+    <title>Get started with Powder</title>
     <meta
       name="description"
-      content="User-facing release notes for Powder."
+      content="Install Powder, start a local SQLite-backed board, and register the MCP face."
     />
     <script>
       try {
@@ -50,10 +50,6 @@
       <symbol id="i-moon" viewBox="0 0 24 24">
         <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
       </symbol>
-      <symbol id="i-circle-check" viewBox="0 0 24 24">
-        <circle cx="12" cy="12" r="10" />
-        <path d="m9 12 2 2 4-4" />
-      </symbol>
       <symbol id="i-github" viewBox="0 0 24 24">
         <path
           d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"
@@ -74,41 +70,70 @@
         </a>
         <nav class="ae-chrome msk-nav" aria-label="Site">
           <a href="features.html">features</a>
-          <a href="get-started.html">get started</a>
-          <a href="changelog.html" aria-current="page">changelog</a>
+          <a href="get-started.html" aria-current="page">get started</a>
+          <a href="changelog.html">changelog</a>
           <a href="https://github.com/misty-step/powder">github</a>
         </nav>
       </header>
 
       <main class="ae-stage ae-stage-scroll">
-        <article class="ae-doc msk-page" aria-labelledby="release-notes-title">
-          <h1 id="release-notes-title">Release notes</h1>
+        <article class="ae-doc msk-page" aria-labelledby="get-started-title">
+          <h1 id="get-started-title">Get started</h1>
           <p class="ae-lede">
-            User-facing notes for people deciding whether Powder is alive,
-            trustworthy, and worth trying.
+            Install the CLI and MCP binaries from this checkout, then point them
+            at either a local SQLite database or a deployed Powder server.
           </p>
 
-          <section class="msk-release">
-            <p class="ae-chrome">2026-07-04 - v-current</p>
-            <h2>Public site and board proof</h2>
-            <ul>
-              <li>
-                Added a public Powder site built from the Misty Step site kit,
-                with GitHub Pages deployment as the public proof surface.
-              </li>
-              <li>
-                The screenshot gallery uses the real Powder board running
-                against seeded demo data, including a blocked edge state.
-              </li>
-            </ul>
-            <p class="ae-status">
-              <svg class="ae-icon ae-ok" data-lucide="circle-check">
-                <use href="#i-circle-check" />
-              </svg>
-              <span class="ae-status-label"
-                >Evidence: local board screenshots, PR checks, and Pages
-                deploy.</span
+          <section class="msk-section" aria-labelledby="install-title">
+            <h2 id="install-title">Install the binaries</h2>
+            <pre><code>git clone https://github.com/misty-step/powder.git
+cd powder
+cargo install --path crates/powder-cli
+cargo install --path crates/powder-mcp
+cargo install --path crates/powder-server
+powder version</code></pre>
+          </section>
+
+          <section class="msk-section" aria-labelledby="local-title">
+            <h2 id="local-title">Start a local board</h2>
+            <pre><code>DB=./data/powder.db
+mkdir -p "$(dirname "$DB")"
+powder init-db --db "$DB" --show-secret
+powder import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
+powder list-ready --db "$DB" --limit 10
+POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 powder-server</code></pre>
+          </section>
+
+          <section class="msk-section" aria-labelledby="mcp-title">
+            <h2 id="mcp-title">Register MCP</h2>
+            <p>
+              For local SQLite mode, launch the MCP server with
+              <code>POWDER_DB_PATH</code>. For remote mode, use
+              <code>POWDER_API_BASE_URL</code> and <code>POWDER_API_KEY</code>.
+            </p>
+            <pre><code>POWDER_DB_PATH=./data/powder.db powder-mcp
+
+POWDER_API_BASE_URL=http://127.0.0.1:4017 \
+POWDER_API_KEY=&lt;bootstrap-key&gt; \
+powder-mcp</code></pre>
+          </section>
+
+          <section class="msk-section" aria-labelledby="docs-title">
+            <h2 id="docs-title">Next references</h2>
+            <p>
+              Read
+              <a href="https://github.com/misty-step/powder/blob/main/README.md"
+                >README.md</a
               >
+              for the current CLI route map,
+              <a href="https://github.com/misty-step/powder/blob/main/SKILL.md"
+                >SKILL.md</a
+              >
+              for the agent usage contract, and
+              <a href="https://github.com/misty-step/powder/tree/main/docs"
+                >docs</a
+              >
+              for production deployment notes.
             </p>
           </section>
         </article>

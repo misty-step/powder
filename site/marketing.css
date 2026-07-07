@@ -27,6 +27,49 @@
   text-decoration-color: currentColor;
 }
 
+.msk-home {
+  position: relative;
+  min-height: 100dvh;
+  overflow: hidden;
+}
+
+.msk-home-bg {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-image: url('assets/hero.jpg');
+  background-position: center;
+  background-size: cover;
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.msk-home .msk-bar,
+.msk-home .msk-footer,
+.msk-home .ae-stage {
+  position: relative;
+  z-index: 1;
+}
+
+.msk-home .ae-stage {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.msk-home-copy {
+  width: min(52%, 42rem);
+  display: grid;
+  gap: var(--ae-space-5);
+  align-self: flex-start;
+  justify-items: start;
+}
+
+.msk-home-copy h1 {
+  font-size: clamp(3rem, 5.3vw, 5.75rem);
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
 .msk-page {
   width: min(var(--ae-measure-wide), 100%);
   display: grid;
@@ -101,6 +144,20 @@
 
 .msk-footer {
   align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ae-space-4);
+}
+
+.msk-credit {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ae-space-2);
+  margin: 0;
+}
+
+.msk-gh-link {
+  display: inline-flex;
+  align-items: center;
 }
 
 .msk-zoom {
@@ -154,7 +211,23 @@
     gap: var(--ae-space-3);
   }
 
+  .msk-bar .msk-nav {
+    width: 100%;
+  }
+
   .msk-gallery {
     grid-template-columns: 1fr;
+  }
+
+  .msk-home-copy {
+    width: min(92%, 20rem);
+  }
+
+  .msk-home-copy h1 {
+    font-size: clamp(2rem, 8.8vw, 3rem);
+  }
+
+  .msk-footer {
+    align-items: center;
   }
 }

@@ -15,6 +15,24 @@ inventing a second design system.
 
 `Powder helps operators and agent teams share a self-hosted work ledger without losing claims, context, or proof in chat.`
 
+## Fleet Lock
+
+- Lock: operator lock-in 2026-07-07, `misty-step-936`.
+- Homepage h1: `A work board built for agents.`
+- Layout: Split. The copy block is left-aligned, vertically centered, and sits
+  directly on the page with no panel.
+- Hero image: `site/assets/hero.jpg`, copied from the staged
+  `powder-hero.jpg` production asset generated with `gpt-image-1` in the Misty
+  Step fresco language.
+- Image treatment: whole-viewport background image, `background-size: cover`,
+  `background-position: center`, opacity `0.35`.
+- Homepage content: hero only, no scroll. The CTA text is `Get started` and it
+  links to `get-started.html`.
+- Header nav: `features`, `get started`, `changelog`, `github`.
+- Footer: mode toggle on the left; on the right, `a Misty Step project` with
+  `Misty Step` linked to `https://mistystep.io` and an inline GitHub glyph
+  linked to `https://github.com/misty-step/powder`.
+
 ## Lucide Mark
 
 - Icon: `snowflake`
@@ -54,12 +72,13 @@ spend them on content, never filled pills:
 | `site/assets/screenshots/02-narrow.png`   | Board narrow  | Same demo instance at mobile width     | Narrow board proving the real responsive UI. |
 | `site/assets/screenshots/03-edge.png`     | Board desktop | Blocked/non-happy card visible         | Edge state with blocked work and blockers.   |
 
-## Footer Links
+## Footer Contract
 
-- Misty Step: `https://mistystep.io`
-- GitHub: `https://github.com/misty-step/powder`
-- Weave: omitted; Powder is a Misty Step fleet product, not a Weave-family
-  product surface.
+- Left: the shared `mode.js` dark/light toggle button.
+- Right: `a Misty Step project`, where `Misty Step` links to
+  `https://mistystep.io`, followed by the inline GitHub glyph linking to
+  `https://github.com/misty-step/powder`.
+- No bare URLs, email line, copyright line, or Weave-family footer links.
 
 ## Release Notes Rule
 
