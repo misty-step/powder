@@ -42,6 +42,7 @@ pub const COMMANDS: &[&str] = &[
     "check-criterion",
     "add-link",
     "add-comment",
+    "append-work-log",
     "request-input",
     "complete-card",
     "subscription-create",
@@ -128,6 +129,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
         [command, rest @ ..] if command == "add-link" => add_link(rest, remote_env),
         [command, rest @ ..] if command == "add-comment" => add_comment(rest, remote_env),
+        [command, rest @ ..] if command == "append-work-log" => append_work_log(rest, remote_env),
         [command, rest @ ..] if command == "request-input" => request_input(rest, remote_env),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest, remote_env),
         [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
@@ -215,6 +217,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
+    );
+    help.push_str(
+        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id]\n",
     );
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof]\n",
@@ -1056,6 +1061,51 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     ))
 }
 
+fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "append-work-log")?;
+    let agent = required_flag(args, "--agent")?;
+    let body = required_flag(args, "--body")?;
+    let model = flag_value(args, "--model");
+    let reasoning = flag_value(args, "--reasoning");
+    let harness = flag_value(args, "--harness");
+    let run_id = flag_value(args, "--run-id");
+    let attribution = powder_store::WorkLogAttribution {
+        model,
+        reasoning,
+        harness,
+        run_id,
+    };
+    let entry = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .append_work_log(&card_id, agent, attribution, body, now)
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/work-log"),
+                json!({
+                    "agent": agent,
+                    "body": body,
+                    "model": model,
+                    "reasoning": reasoning,
+                    "harness": harness,
+                    "run_id": run_id,
+                }),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("append-work-log"));
+    };
+    Ok(format!(
+        "work-log\t{}\t{}\t{}\n",
+        json_string(&entry, "card_id")?,
+        json_string(&entry, "agent")?,
+        json_string(&entry, "body")?
+    ))
+}
+
 fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let run_id = positional(args)
@@ -1437,6 +1487,7 @@ mod tests {
         assert!(COMMANDS.contains(&"list-awaiting-input"));
         assert!(COMMANDS.contains(&"answer-input"));
         assert!(COMMANDS.contains(&"add-comment"));
+        assert!(COMMANDS.contains(&"append-work-log"));
         assert!(COMMANDS.contains(&"check-criterion"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
@@ -2031,6 +2082,52 @@ mod tests {
         let card = run(&args(["get-card", "commented", "--db", &db])).unwrap();
         assert!(card.contains("\"author\": \"operator\""));
         assert!(card.contains("\"body\": \"looks good\""));
+    }
+
+    #[test]
+    fn cli_append_work_log_appears_in_get_card() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-work-log-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "worklogged",
+            "--title",
+            "Has a work log",
+        ]))
+        .unwrap();
+
+        let output = run(&args([
+            "append-work-log",
+            "worklogged",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--body",
+            "tracing the claim expiry bug",
+            "--model",
+            "claude-sonnet-5",
+        ]))
+        .unwrap();
+        assert!(output.contains("worklogged"));
+        assert!(output.contains("codex"));
+        assert!(output.contains("tracing the claim expiry bug"));
+
+        let card = run(&args(["get-card", "worklogged", "--db", &db])).unwrap();
+        assert!(card.contains("\"agent\": \"codex\""));
+        assert!(card.contains("\"model\": \"claude-sonnet-5\""));
+        assert!(card.contains("\"body\": \"tracing the claim expiry bug\""));
     }
 
     #[test]

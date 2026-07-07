@@ -423,6 +423,16 @@ struct CommentRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct WorkLogRequest {
+    agent: String,
+    model: Option<String>,
+    reasoning: Option<String>,
+    harness: Option<String>,
+    run_id: Option<String>,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct InputRequest {
     question: String,
 }
@@ -568,6 +578,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/criteria/check", post(check_criterion))
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
+        .route("/api/v1/cards/{id}/work-log", post(append_work_log))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
         .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
         .route("/api/v1/runs/{id}", get(get_run))
@@ -1138,6 +1149,30 @@ async fn add_comment(
     let comment =
         lock_store(&state)?.add_comment(&card_id, &request.author, &request.body, unix_now())?;
     Ok(Json(json!(comment)))
+}
+
+async fn append_work_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<WorkLogRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let attribution = powder_store::WorkLogAttribution {
+        model: request.model.as_deref(),
+        reasoning: request.reasoning.as_deref(),
+        harness: request.harness.as_deref(),
+        run_id: request.run_id.as_deref(),
+    };
+    let entry = lock_store(&state)?.append_work_log(
+        &card_id,
+        &request.agent,
+        attribution,
+        &request.body,
+        unix_now(),
+    )?;
+    Ok(Json(json!(entry)))
 }
 
 async fn request_input(

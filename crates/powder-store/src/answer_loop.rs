@@ -1,7 +1,7 @@
 use powder_core::{
     Activity, ActivityId, ActivityType, Authority, AwaitingInput, CardDetail, CardEvent,
     CardEventId, CardId, CardStatus, Comment, DomainError, Link, LinkId, Run, RunDetail, RunId,
-    RunState,
+    RunState, WorkLogEntry,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -21,6 +21,7 @@ impl Store {
             events: load_events_for_card(&self.connection, card_id)?,
             links: load_links_for_card(&self.connection, card_id)?,
             comments: load_comments_for_card(&self.connection, card_id)?,
+            work_log: load_work_log_for_card(&self.connection, card_id)?,
             card,
         }))
     }
@@ -343,6 +344,61 @@ impl CommentRecord {
         Ok(Comment {
             card_id: CardId::new(self.card_id)?,
             author: self.author,
+            body: self.body,
+            created_at: self.created_at,
+        })
+    }
+}
+
+pub(super) fn load_work_log_for_card(
+    connection: &Connection,
+    card_id: &CardId,
+) -> Result<Vec<WorkLogEntry>> {
+    let mut statement = connection.prepare(
+        "SELECT card_id, agent, model, reasoning, harness, run_id, body, created_at
+         FROM work_log_entries
+         WHERE card_id = ?1
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let records = statement
+        .query_map([card_id.as_str()], WorkLogRecord::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    records.into_iter().map(WorkLogRecord::into_entry).collect()
+}
+
+struct WorkLogRecord {
+    card_id: String,
+    agent: String,
+    model: Option<String>,
+    reasoning: Option<String>,
+    harness: Option<String>,
+    run_id: Option<String>,
+    body: String,
+    created_at: i64,
+}
+
+impl WorkLogRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            card_id: row.get(0)?,
+            agent: row.get(1)?,
+            model: row.get(2)?,
+            reasoning: row.get(3)?,
+            harness: row.get(4)?,
+            run_id: row.get(5)?,
+            body: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    }
+
+    fn into_entry(self) -> Result<WorkLogEntry> {
+        Ok(WorkLogEntry {
+            card_id: CardId::new(self.card_id)?,
+            agent: self.agent,
+            model: self.model,
+            reasoning: self.reasoning,
+            harness: self.harness,
+            run_id: self.run_id.map(RunId::new).transpose()?,
             body: self.body,
             created_at: self.created_at,
         })

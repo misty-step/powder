@@ -16,6 +16,7 @@ pub const EVENT_TYPES: &[&str] = &[
     "claim-expired",
     "completed",
     "comment-added",
+    "work-log-appended",
 ];
 
 const WEBHOOK_MAX_ATTEMPTS: i64 = 3;

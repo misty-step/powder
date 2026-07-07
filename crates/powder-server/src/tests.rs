@@ -1424,6 +1424,69 @@ async fn add_comment_appears_in_get_card_immediately() {
 }
 
 #[tokio::test]
+async fn append_work_log_appears_in_get_card_immediately() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"worklogged","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let entry = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/worklogged/work-log",
+            Some(&raw_key),
+            r#"{"agent":"sonnet-powder-943","model":"claude-sonnet-5","reasoning":"high","harness":"Claude Code","body":"digging into the schema"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(entry.status(), StatusCode::OK);
+    let entry = response_json(entry).await;
+    assert_eq!(entry["agent"], "sonnet-powder-943");
+    assert_eq!(entry["model"], "claude-sonnet-5");
+    assert_eq!(entry["body"], "digging into the schema");
+
+    // Missing the one required attribution field (`agent`) hits the same
+    // 422 legibility bar as any other required JSON field on this API
+    // (powder-943 criterion 2, mirroring the comments route's author/body).
+    let missing_agent = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/worklogged/work-log",
+            Some(&raw_key),
+            r#"{"body":"no agent supplied"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_agent.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let card = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/worklogged")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let card = response_json(card).await;
+    assert_eq!(card["work_log"][0]["agent"], "sonnet-powder-943");
+}
+
+#[tokio::test]
 async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

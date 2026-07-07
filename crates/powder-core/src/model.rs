@@ -820,6 +820,23 @@ pub struct Comment {
     pub created_at: i64,
 }
 
+/// A high-frequency, fully-attributed entry an agent appends while actively
+/// working a card -- context, current activity, encountered issues, chain of
+/// thought -- as a first-class field distinct from `Comment` (powder-943).
+/// Only `agent` is required; `model`/`reasoning`/`harness`/`run_id` are
+/// whatever attribution the calling surface can supply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkLogEntry {
+    pub card_id: CardId,
+    pub agent: String,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub harness: Option<String>,
+    pub run_id: Option<RunId>,
+    pub body: String,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardDetail {
     pub card: Card,
@@ -828,6 +845,7 @@ pub struct CardDetail {
     pub events: Vec<CardEvent>,
     pub links: Vec<Link>,
     pub comments: Vec<Comment>,
+    pub work_log: Vec<WorkLogEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

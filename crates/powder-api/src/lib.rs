@@ -162,6 +162,14 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/cards/{id}/work-log",
+        intent: "append a high-frequency, fully-attributed work_log entry while actively working a card (powder-943) -- context, current activity, issues, chain of thought, distinct from the low-frequency human-facing comments field",
+        body_shape: Some(
+            r#"{"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; body is scrubbed for known secret shapes server-side before storage"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/runs/{id}/input",
         intent: "pause a run for human input",
         body_shape: None,

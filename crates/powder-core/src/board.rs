@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{
     non_empty, Activity, ActivityId, ActivityType, AwaitingInput, Card, CardDetail, CardEvent,
     CardEventId, CardId, CardStatus, Comment, DomainError, Link, LinkId, Run, RunDetail, RunId,
-    RunState,
+    RunState, WorkLogEntry,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +39,7 @@ pub struct Board {
     events: Vec<CardEvent>,
     links: Vec<Link>,
     comments: Vec<Comment>,
+    work_log: Vec<WorkLogEntry>,
     next_run: u64,
     next_activity: u64,
     next_link: u64,
@@ -74,6 +75,7 @@ impl Board {
             events: self.events_for_card(card_id),
             links: self.links_for_card(card_id),
             comments: self.comments_for_card(card_id),
+            work_log: self.work_log_for_card(card_id),
         })
     }
 
@@ -681,6 +683,17 @@ impl Board {
             .collect::<Vec<_>>();
         comments.sort_by_key(|comment| comment.created_at);
         comments
+    }
+
+    fn work_log_for_card(&self, card_id: &CardId) -> Vec<WorkLogEntry> {
+        let mut entries = self
+            .work_log
+            .iter()
+            .filter(|entry| &entry.card_id == card_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.created_at);
+        entries
     }
 
     fn latest_elicitation(&self, run_id: &RunId) -> Option<Activity> {
