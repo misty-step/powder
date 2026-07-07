@@ -64,6 +64,13 @@ POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```
 
 The CLI can target either SQLite directly or a deployed `powder-server`. For
+The production instance lives on the bastion box (`phrazzld-bastion` Fly app,
+`/data/apps/powder/powder.db`, litestream-replicated), served on the tailnet at
+`bastion.tail5f5eb4.ts.net:10001`; the standalone `powder` Fly app was
+decommissioned 2026-07-07. Mint agent keys server-side there:
+`fly ssh console -a phrazzld-bastion -C "powder key-create --db /data/apps/powder/powder.db --name <who> --scope agent --show-secret"`.
+
+In
 remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
 `POWDER_API_KEY`; `--db` always wins when supplied. Run `powder version`
 before a lane starts: it reports the exact git commit the installed binary
