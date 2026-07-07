@@ -41,7 +41,9 @@ impl From<DomainError> for ShellError {
     fn from(value: DomainError) -> Self {
         match value {
             DomainError::NotFound { .. } => Self::NotFound(value.to_string()),
-            DomainError::Conflict(_) => Self::Conflict(value.to_string()),
+            DomainError::Conflict(_) | DomainError::ClaimExpired(_) => {
+                Self::Conflict(value.to_string())
+            }
             DomainError::Validation { .. } => Self::Invalid(value.to_string()),
             DomainError::Forbidden(_) => Self::Forbidden(value.to_string()),
         }

@@ -1684,10 +1684,12 @@ impl From<powder_core::DomainError> for ApiError {
                 status: StatusCode::NOT_FOUND,
                 message: value.to_string(),
             },
-            powder_core::DomainError::Conflict(_) => Self {
-                status: StatusCode::CONFLICT,
-                message: value.to_string(),
-            },
+            powder_core::DomainError::Conflict(_) | powder_core::DomainError::ClaimExpired(_) => {
+                Self {
+                    status: StatusCode::CONFLICT,
+                    message: value.to_string(),
+                }
+            }
             powder_core::DomainError::Forbidden(_) => Self {
                 status: StatusCode::FORBIDDEN,
                 message: value.to_string(),

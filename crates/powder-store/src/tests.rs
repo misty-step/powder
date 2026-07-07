@@ -911,6 +911,78 @@ fn expired_running_claim_can_be_reclaimed_from_sqlite_store() -> Result<()> {
 }
 
 #[test]
+fn release_claim_on_an_already_expired_claim_succeeds_as_a_no_op() -> Result<()> {
+    // powder-938: the original claim holder releasing after its own TTL has
+    // lapsed (but before any other agent has reclaimed the card) must
+    // succeed as a clean no-op, not 409 with validate_claim_run's stale
+    // claim-expired conflict -- that was the bitterblossom-104 dead end.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+
+    let released = store.release_claim(&card_id, &claim.run_id, 30, &Authority::unchecked())?;
+
+    assert_eq!(released.run_id, claim.run_id);
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::Ready);
+    assert!(card.claim.is_none());
+    assert_eq!(
+        store.get_run(&claim.run_id)?.expect("run").state,
+        RunState::Released
+    );
+    Ok(())
+}
+
+#[test]
+fn renew_claim_on_an_already_expired_claim_returns_a_distinct_recoverable_error() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+
+    let renewed = store.renew_claim(&card_id, &claim.run_id, 30, 60, &Authority::unchecked());
+
+    assert!(matches!(
+        renewed,
+        Err(StoreError::Domain(DomainError::ClaimExpired(_)))
+    ));
+    // Distinct from the wrong-run_id conflict text, not just a different type.
+    let message = match renewed {
+        Err(StoreError::Domain(DomainError::ClaimExpired(message))) => message,
+        other => panic!("expected ClaimExpired, got {other:?}"),
+    };
+    assert!(message.contains("claim expired"), "message was: {message}");
+    Ok(())
+}
+
+#[test]
+fn heartbeat_claim_on_an_already_expired_claim_returns_a_distinct_recoverable_error() -> Result<()>
+{
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+
+    let heartbeat = store.heartbeat_claim(&card_id, &claim.run_id, 30, &Authority::unchecked());
+
+    assert!(matches!(
+        heartbeat,
+        Err(StoreError::Domain(DomainError::ClaimExpired(_)))
+    ));
+    Ok(())
+}
+
+#[test]
 fn release_to_ready_clears_claim_immediately() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
