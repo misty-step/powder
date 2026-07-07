@@ -14,6 +14,12 @@ pub enum DomainError {
     },
     Conflict(String),
     Forbidden(String),
+    /// A mutation targeted a claim that has expired but has not yet been
+    /// reclaimed by a new agent. Distinct from `Conflict` (wrong run, wrong
+    /// status) so a caller can tell "your claim went stale, renew failed --
+    /// re-claim or let it go" apart from "you're not allowed to do that"
+    /// without parsing message text (powder-938).
+    ClaimExpired(String),
 }
 
 impl DomainError {
@@ -38,6 +44,10 @@ impl DomainError {
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::Forbidden(message.into())
     }
+
+    pub fn claim_expired(message: impl Into<String>) -> Self {
+        Self::ClaimExpired(message.into())
+    }
 }
 
 impl fmt::Display for DomainError {
@@ -47,6 +57,7 @@ impl fmt::Display for DomainError {
             Self::NotFound { entity, id } => write!(f, "{entity} not found: {id}"),
             Self::Conflict(message) => f.write_str(message),
             Self::Forbidden(message) => f.write_str(message),
+            Self::ClaimExpired(message) => f.write_str(message),
         }
     }
 }
@@ -687,7 +698,11 @@ impl Card {
 
     pub fn release_claim(&mut self, run_id: &RunId, now: i64) -> Result<Claim, DomainError> {
         self.status.validate_transition(CardStatus::Ready)?;
-        let claim = self.matching_active_claim(run_id, now)?.clone();
+        let claim = self.claim.as_ref().ok_or_else(|| {
+            DomainError::conflict(format!("card {} has no active claim", self.id))
+        })?;
+        validate_claim_run_ignoring_expiry(&self.id, claim, run_id)?;
+        let claim = claim.clone();
         self.claim = None;
         self.status = CardStatus::Ready;
         self.updated_at = now;
@@ -871,9 +886,26 @@ fn validate_claim_run(
         )));
     }
     if claim.is_expired(now) {
-        return Err(DomainError::conflict(format!(
+        return Err(DomainError::claim_expired(format!(
             "card {card_id} claim expired at {}",
             claim.expires_at
+        )));
+    }
+    Ok(())
+}
+
+/// Same run-identity check as `validate_claim_run`, but without the expiry
+/// check: release is the one mutation where an already-expired claim held by
+/// the same run should succeed as a no-op rather than 409 (powder-938) --
+/// releasing a claim that's already gone is idempotent, not a conflict.
+fn validate_claim_run_ignoring_expiry(
+    card_id: &CardId,
+    claim: &Claim,
+    run_id: &RunId,
+) -> Result<(), DomainError> {
+    if claim.run_id != *run_id {
+        return Err(DomainError::conflict(format!(
+            "card {card_id} is claimed by a different run"
         )));
     }
     Ok(())
