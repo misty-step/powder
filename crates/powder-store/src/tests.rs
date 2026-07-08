@@ -1,6 +1,6 @@
 use powder_core::{
-    Authority, Card, CardId, CardSource, CardStatus, DomainError, Priority, ReadyQuery, RunId,
-    RunState,
+    AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, DomainError, Priority,
+    ReadyQuery, RunId, RunState,
 };
 
 use crate::{
@@ -73,6 +73,47 @@ fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
     let run = store.get_run(&claim.run_id)?.expect("persisted run");
     assert_eq!(run.state, RunState::Complete);
     assert_eq!(run.proof.as_deref(), Some("https://example.test/proof"));
+    Ok(())
+}
+
+#[test]
+fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()> {
+    let criteria = vec![AcceptanceCriterion::new("proof exists".to_string())?];
+    let criteria_json = serde_json::to_string(&criteria)?;
+    assert!(!criteria_json.contains("checked_by"));
+    assert!(!criteria_json.contains("checked_at"));
+    assert!(!criteria_json.contains("proof_links"));
+    assert_eq!(
+        serde_json::from_str::<Vec<AcceptanceCriterion>>(&criteria_json)?,
+        criteria
+    );
+
+    let card = Card::new(CardId::new("compact-store")?, "Compact store", "do it")?
+        .with_criteria(criteria)
+        .with_created_at(10);
+    let card_json = serde_json::to_string(&card)?;
+    for key in [
+        "proof_plan",
+        "labels",
+        "assignee",
+        "related",
+        "blocks",
+        "blocked_by",
+        "repo",
+        "workspace_path",
+        "branch_name",
+        "source",
+        "claim",
+    ] {
+        assert!(!card_json.contains(&format!("\"{key}\"")));
+    }
+    assert_eq!(serde_json::from_str::<Card>(&card_json)?, card);
+
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let saved = store.upsert_card(card.clone())?;
+    assert_eq!(saved, card);
+    assert_eq!(store.get_card(&card.id)?.expect("stored card"), card);
     Ok(())
 }
 

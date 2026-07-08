@@ -399,7 +399,7 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
     let created = response_json(created).await;
     assert_eq!(created["proof_plan"], json!(["PR link", "CI link"]));
     assert_eq!(created["criteria"][0]["text"], "ship it");
-    assert!(created["criteria"][0]["checked_at"].is_null());
+    assert!(created["criteria"][0].get("checked_at").is_none());
 
     let checked = app
         .clone()
@@ -511,7 +511,7 @@ async fn a_qualifying_http_completion_spawns_a_field_note_draft_in_the_review_qu
     );
     assert_eq!(cards[0]["id"], "field-note-http-field-note-source");
     assert_eq!(cards[0]["status"], "backlog");
-    assert!(cards[0]["acceptance"].as_array().unwrap().is_empty());
+    assert!(cards[0].get("acceptance").is_none());
 
     let ready = app
         .oneshot(json_request(
@@ -567,7 +567,7 @@ async fn card_relations_round_trip_through_http_api() {
     assert_eq!(updated.status(), StatusCode::OK);
     let updated = response_json(updated).await;
     assert_eq!(updated["related"][1], "rel-note");
-    assert_eq!(updated["blocks"].as_array().unwrap().len(), 0);
+    assert!(updated.get("blocks").is_none());
 
     let detail = app
         .oneshot(
@@ -1760,7 +1760,7 @@ async fn admin_key_claim_without_explicit_agent_is_rejected_not_silently_self_as
         .unwrap();
     let detail = response_json(detail).await;
     assert_eq!(detail["card"]["status"], "ready");
-    assert!(detail["card"]["claim"].is_null());
+    assert!(detail["card"].get("claim").is_none());
 }
 
 #[tokio::test]
