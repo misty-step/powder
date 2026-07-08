@@ -357,7 +357,8 @@ async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_
     let patched_many = response_json(patched_many).await;
     assert_eq!(patched_many["title"], "Patched card");
     assert_eq!(patched_many["body"], "Updated body");
-    assert_eq!(patched_many["acceptance"], json!(["new proof"]));
+    assert!(patched_many.get("acceptance").is_none());
+    assert_eq!(patched_many["criteria"][0]["text"], "new proof");
     assert_eq!(patched_many["priority"], "p0");
     assert_eq!(patched_many["status"], "blocked");
     assert_eq!(patched_many["labels"], json!(["api", "safe-update"]));

@@ -92,7 +92,10 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
         .with_criteria(criteria)
         .with_created_at(10);
     let card_json = serde_json::to_string(&card)?;
+    assert!(!card_json.contains("\"acceptance\""));
+    assert!(card_json.contains("\"criteria\""));
     for key in [
+        "acceptance",
         "proof_plan",
         "labels",
         "assignee",
@@ -107,7 +110,10 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
     ] {
         assert!(!card_json.contains(&format!("\"{key}\"")));
     }
-    assert_eq!(serde_json::from_str::<Card>(&card_json)?, card);
+    let restored = serde_json::from_str::<Card>(&card_json)?;
+    assert_eq!(restored, card);
+    assert_eq!(restored.acceptance, vec!["proof exists".to_string()]);
+    assert_eq!(restored.criteria[0].text, "proof exists");
 
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

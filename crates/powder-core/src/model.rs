@@ -413,12 +413,12 @@ impl Claim {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Card {
     pub id: CardId,
     pub title: String,
     pub body: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub acceptance: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub criteria: Vec<AcceptanceCriterion>,
@@ -450,7 +450,93 @@ pub struct Card {
     pub updated_at: i64,
 }
 
+#[derive(Deserialize)]
+struct CardFields {
+    id: CardId,
+    title: String,
+    body: String,
+    #[serde(default)]
+    acceptance: Vec<String>,
+    #[serde(default)]
+    criteria: Vec<AcceptanceCriterion>,
+    #[serde(default)]
+    proof_plan: Vec<String>,
+    status: CardStatus,
+    priority: Priority,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    related: Vec<CardId>,
+    #[serde(default)]
+    blocks: Vec<CardId>,
+    #[serde(default)]
+    blocked_by: Vec<CardId>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    #[serde(default)]
+    branch_name: Option<String>,
+    #[serde(default)]
+    source: Option<CardSource>,
+    #[serde(default)]
+    claim: Option<Claim>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl<'de> Deserialize<'de> for Card {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = CardFields::deserialize(deserializer)?;
+        let mut card = Self {
+            id: fields.id,
+            title: fields.title,
+            body: fields.body,
+            acceptance: fields.acceptance,
+            criteria: fields.criteria,
+            proof_plan: fields.proof_plan,
+            status: fields.status,
+            priority: fields.priority,
+            labels: fields.labels,
+            assignee: fields.assignee,
+            related: fields.related,
+            blocks: fields.blocks,
+            blocked_by: fields.blocked_by,
+            repo: fields.repo,
+            workspace_path: fields.workspace_path,
+            branch_name: fields.branch_name,
+            source: fields.source,
+            claim: fields.claim,
+            created_at: fields.created_at,
+            updated_at: fields.updated_at,
+        };
+        card.sync_acceptance_and_criteria();
+        Ok(card)
+    }
+}
+
 impl Card {
+    fn sync_acceptance_and_criteria(&mut self) {
+        if !self.criteria.is_empty() {
+            self.acceptance = self
+                .criteria
+                .iter()
+                .map(|criterion| criterion.text.clone())
+                .collect();
+        } else if !self.acceptance.is_empty() {
+            self.criteria = self
+                .acceptance
+                .iter()
+                .filter_map(|item| AcceptanceCriterion::new(item.clone()).ok())
+                .collect();
+        }
+    }
+
     pub fn new(
         id: CardId,
         title: impl Into<String>,

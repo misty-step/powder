@@ -1846,8 +1846,13 @@ mod tests {
         ]))
         .unwrap();
         let with_acceptance = run(&args(["get-card", "with-acceptance", "--db", &db])).unwrap();
-        assert!(with_acceptance.contains("\"acceptance\": [\n      \"the tests pass\"\n    ]"));
-        assert!(with_acceptance.contains("\"status\": \"ready\""));
+        let with_acceptance: Value = serde_json::from_str(&with_acceptance).unwrap();
+        assert!(with_acceptance["card"].get("acceptance").is_none());
+        assert_eq!(
+            with_acceptance["card"]["criteria"][0]["text"],
+            "the tests pass"
+        );
+        assert_eq!(with_acceptance["card"]["status"], "ready");
     }
 
     #[test]
