@@ -299,7 +299,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         other => return Err(format!("unknown tool: {other}")),
     };
 
-    let text = serde_json::to_string_pretty(&payload).map_err(to_string)?;
+    let text = serde_json::to_string(&payload).map_err(to_string)?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
 }
 
