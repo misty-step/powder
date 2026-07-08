@@ -573,7 +573,7 @@ pub fn call_tool_store(
         other => return Err(format!("unknown tool: {other}")),
     };
 
-    let text = serde_json::to_string_pretty(&payload).map_err(to_string)?;
+    let text = serde_json::to_string(&payload).map_err(to_string)?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
 }
 
@@ -957,6 +957,67 @@ Expose tools against the DB.
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
         assert!(invalid.contains("invalid status"));
+    }
+
+    #[test]
+    fn mcp_omits_empty_card_and_detail_fields_on_the_wire() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_card(
+                Card::new(
+                    CardId::new("empty-wire").unwrap(),
+                    "Empty wire",
+                    "compact response",
+                )
+                .unwrap()
+                .with_created_at(10),
+            )
+            .unwrap();
+
+        let response = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "empty-wire"}),
+            11,
+        )
+        .unwrap();
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains('\n'),
+            "MCP tool payload should be compact JSON"
+        );
+
+        let detail = tool_payload(&response);
+        let card = detail["card"].as_object().unwrap();
+        for key in [
+            "acceptance",
+            "criteria",
+            "proof_plan",
+            "labels",
+            "assignee",
+            "related",
+            "blocks",
+            "blocked_by",
+            "repo",
+            "workspace_path",
+            "branch_name",
+            "source",
+            "claim",
+        ] {
+            assert!(!card.contains_key(key), "{key} should be omitted");
+        }
+        let detail = detail.as_object().unwrap();
+        for key in [
+            "runs",
+            "activities",
+            "events",
+            "links",
+            "comments",
+            "work_log",
+        ] {
+            assert!(!detail.contains_key(key), "{key} should be omitted");
+        }
     }
 
     #[test]

@@ -380,9 +380,11 @@ pub struct CriterionProof {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptanceCriterion {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proof_links: Vec<CriterionProof>,
 }
 
@@ -416,22 +418,33 @@ pub struct Card {
     pub id: CardId,
     pub title: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub criteria: Vec<AcceptanceCriterion>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proof_plan: Vec<String>,
     pub status: CardStatus,
     pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<CardId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<CardId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<CardId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<CardSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<Claim>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -779,6 +792,7 @@ pub struct Run {
     pub state: RunState,
     pub agent: String,
     pub claim_expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -829,9 +843,13 @@ pub struct Comment {
 pub struct WorkLogEntry {
     pub card_id: CardId,
     pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
     pub body: String,
     pub created_at: i64,
@@ -840,11 +858,17 @@ pub struct WorkLogEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardDetail {
     pub card: Card,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<Run>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activities: Vec<Activity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<CardEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_log: Vec<WorkLogEntry>,
 }
 
@@ -852,8 +876,11 @@ pub struct CardDetail {
 pub struct RunDetail {
     pub run: Run,
     pub card: Card,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activities: Vec<Activity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
 }
 
@@ -861,6 +888,7 @@ pub struct RunDetail {
 pub struct AwaitingInput {
     pub card: Card,
     pub run: Run,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<Activity>,
 }
 

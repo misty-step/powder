@@ -1800,13 +1800,14 @@ mod tests {
         .unwrap();
 
         let card = run(&args(["get-card", "no-acceptance", "--db", &db])).unwrap();
+        let detail: Value = serde_json::from_str(&card).unwrap();
         assert!(
-            card.contains("\"acceptance\": []"),
-            "an omitted --acceptance must never fabricate a placeholder oracle: {card}"
+            detail["card"].get("acceptance").is_none(),
+            "an omitted --acceptance must never fabricate a placeholder oracle: {detail}"
         );
         assert!(
-            card.contains("\"status\": \"backlog\""),
-            "empty acceptance must not default to a claimable status: {card}"
+            detail["card"]["status"] == "backlog",
+            "empty acceptance must not default to a claimable status: {detail}"
         );
         let ready = run(&args(["list-ready", "--db", &db])).unwrap();
         assert!(!ready.contains("no-acceptance"));
@@ -1826,8 +1827,9 @@ mod tests {
         ]))
         .unwrap();
         let forced = run(&args(["get-card", "forced-ready", "--db", &db])).unwrap();
-        assert!(forced.contains("\"status\": \"ready\""));
-        assert!(forced.contains("\"acceptance\": []"));
+        let forced: Value = serde_json::from_str(&forced).unwrap();
+        assert_eq!(forced["card"]["status"], "ready");
+        assert!(forced["card"].get("acceptance").is_none());
 
         // real acceptance still makes the default status ready, matching
         // prior behavior for callers who do provide a criterion.
@@ -2227,9 +2229,10 @@ mod tests {
         assert!(imported.contains("imported\ttotal=2\tcreated=2"));
 
         let open_card = run(&args(["get-card", "example-1", "--db", &db])).unwrap();
-        assert!(open_card.contains("\"status\": \"backlog\""));
+        let open_card: Value = serde_json::from_str(&open_card).unwrap();
+        assert_eq!(open_card["card"]["status"], "backlog");
         assert!(
-            open_card.contains("\"acceptance\": []"),
+            open_card["card"].get("acceptance").is_none(),
             "no fabricated acceptance"
         );
         run(&args([
