@@ -129,6 +129,74 @@ pub struct CardListPage {
     pub total_count: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BoardStatsQuery {
+    pub repo: Option<String>,
+    pub include_hidden: bool,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BoardStats {
+    pub totals: BoardStatsCounts,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<BoardStatsRepo>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BoardStatsRepo {
+    pub repo: Option<String>,
+    #[serde(flatten)]
+    pub counts: BoardStatsCounts,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BoardStatsCounts {
+    pub cards: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub backlog: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ready: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub claimed: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub running: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub awaiting_input: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub blocked: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub done: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub shipped: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub abandoned: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub active_claims: usize,
+}
+
+impl BoardStatsCounts {
+    fn add(&mut self, status: CardStatus, cards: usize, active_claims: usize) {
+        self.cards += cards;
+        self.active_claims += active_claims;
+        match status {
+            CardStatus::Backlog => self.backlog += cards,
+            CardStatus::Ready => self.ready += cards,
+            CardStatus::Claimed => self.claimed += cards,
+            CardStatus::Running => self.running += cards,
+            CardStatus::AwaitingInput => self.awaiting_input += cards,
+            CardStatus::Blocked => self.blocked += cards,
+            CardStatus::Done => self.done += cards,
+            CardStatus::Shipped => self.shipped += cards,
+            CardStatus::Abandoned => self.abandoned += cards,
+        }
+    }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// Explicit partial update for mutable card fields. Fields left as `None`
 /// are preserved from the stored row; lifecycle/source/workspace fields are
 /// intentionally absent from this shape.
@@ -716,6 +784,79 @@ impl Store {
         });
         cards.truncate(limit.max(1));
         Ok(CardListPage { cards, total_count })
+    }
+
+    pub fn board_stats(&self, query: BoardStatsQuery) -> Result<BoardStats> {
+        let requested_repo_label = query.repo.as_deref().and_then(canonical_repo_label);
+        let repo_filter = query
+            .repo
+            .as_deref()
+            .map(|repo| resolve_repository_name(&self.connection, repo))
+            .transpose()?
+            .flatten()
+            .or(requested_repo_label);
+
+        let mut statement = self.connection.prepare(
+            "SELECT c.repo,
+                    c.status,
+                    COUNT(*) AS card_count,
+                    SUM(CASE
+                          WHEN c.claim_agent IS NOT NULL
+                           AND c.claim_expires_at > ?1
+                          THEN 1 ELSE 0
+                        END) AS active_claim_count
+             FROM cards c
+             LEFT JOIN repositories r ON r.name = c.repo
+             WHERE (?2 OR COALESCE(r.visibility, 'visible') = 'visible')
+               AND (?3 IS NULL OR c.repo = ?3)
+             GROUP BY c.repo, c.status
+             ORDER BY
+               CASE COALESCE(r.tier, 'backburner')
+                 WHEN 'active' THEN 0
+                 WHEN 'backburner' THEN 1
+                 ELSE 2
+               END,
+               c.repo ASC,
+               c.status ASC",
+        )?;
+        let grouped = statement
+            .query_map(
+                params![query.now, query.include_hidden, repo_filter.as_deref()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut stats = BoardStats::default();
+        for (repo, raw_status, card_count, active_claim_count) in grouped {
+            let status =
+                CardStatus::parse(&raw_status).ok_or_else(|| StoreError::InvalidStoredValue {
+                    field: "cards.status",
+                    value: raw_status,
+                })?;
+            let card_count = card_count.max(0) as usize;
+            let active_claim_count = active_claim_count.max(0) as usize;
+            stats.totals.add(status, card_count, active_claim_count);
+            if stats.repos.last().is_none_or(|row| row.repo != repo) {
+                stats.repos.push(BoardStatsRepo {
+                    repo: repo.clone(),
+                    counts: BoardStatsCounts::default(),
+                });
+            }
+            stats
+                .repos
+                .last_mut()
+                .expect("board stats row was inserted")
+                .counts
+                .add(status, card_count, active_claim_count);
+        }
+        Ok(stats)
     }
 
     pub fn claim_card(

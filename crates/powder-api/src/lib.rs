@@ -46,6 +46,12 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/api/v1/stats",
+        intent: "return compact board status counts by repository plus totals; optional repo and include_hidden query params",
+        body_shape: None,
+    },
+    ApiRoute {
+        method: "GET",
         path: "/api/v1/repositories",
         intent: "list repository entities with aliases, visibility, tier, import provenance, and status counts",
         body_shape: None,

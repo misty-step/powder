@@ -723,6 +723,89 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
 }
 
 #[tokio::test]
+async fn board_stats_route_returns_compact_counts_without_listing_cards() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let hidden = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/repositories",
+            Some(&admin_key),
+            r#"{"name":"secret-stats","visibility":"hidden","tier":"active"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::OK);
+
+    for body in [
+        r#"{"id":"stats-ready","title":"Ready","acceptance":["proof"],"status":"ready","repo":"stats-repo"}"#,
+        r#"{"id":"stats-blocked","title":"Blocked","acceptance":["proof"],"status":"blocked","repo":"stats-repo"}"#,
+        r#"{"id":"secret-stats-ready","title":"Hidden","acceptance":["proof"],"status":"ready","repo":"secret-stats"}"#,
+    ] {
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&admin_key),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+    }
+
+    let stats = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/stats?repo=stats-repo",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stats.status(), StatusCode::OK);
+    let stats = response_json(stats).await;
+    assert_eq!(stats["totals"]["cards"], 2);
+    assert_eq!(stats["totals"]["ready"], 1);
+    assert_eq!(stats["totals"]["blocked"], 1);
+    assert_eq!(stats["repos"][0]["repo"], "stats-repo");
+
+    let default_stats = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/stats",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let default_stats = response_json(default_stats).await;
+    assert_eq!(default_stats["totals"]["cards"], 2);
+
+    let with_hidden = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/stats?include_hidden=true",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let with_hidden = response_json(with_hidden).await;
+    assert_eq!(with_hidden["totals"]["cards"], 3);
+    assert!(with_hidden["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["repo"] == "secret-stats"));
+}
+
+#[tokio::test]
 async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

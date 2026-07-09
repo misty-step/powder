@@ -35,6 +35,14 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let response = client.get(&format!("/api/v1/cards?{query}"))?;
             remote_card_summary_page_payload(response, limit)?
         }
+        "board_stats" => {
+            let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
+            let mut query = format!("include_hidden={include_hidden}");
+            if let Some(repo) = optional_str(args, "repo") {
+                query.push_str(&format!("&repo={}", urlencode(repo)));
+            }
+            client.get(&format!("/api/v1/stats?{query}"))?
+        }
         "create_card" => {
             let id = required_str(args, "id")?;
             let title = required_str(args, "title")?;
@@ -870,6 +878,37 @@ mod tests {
         assert_eq!(
             requests[0].path,
             "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
+        );
+    }
+
+    #[test]
+    fn board_stats_sends_get_to_stats_endpoint_with_filters() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "totals": {"cards": 2, "ready": 1, "blocked": 1},
+                "repos": [{"repo": "example", "cards": 2, "ready": 1, "blocked": 1}]
+            }),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "board_stats",
+            &json!({"repo": "misty-step/example", "include_hidden": true}),
+        )
+        .unwrap();
+
+        assert_eq!(tool_payload(&result)["totals"]["cards"], 2);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/stats?include_hidden=true&repo=misty-step%2Fexample"
+        );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
         );
     }
 
