@@ -35,12 +35,12 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "create_card",
-        description: "Create one card with optional acceptance criteria, proof plan, relations, repository, and initial status.",
+        description: "Create one card with optional acceptance criteria, proof plan, relations, repository, and initial status; returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
-        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; read the criteria field back for acceptance state. In remote mode the deployed instance requires an admin-scope key.",
+        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. In remote mode the deployed instance requires an admin-scope key.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
@@ -110,17 +110,17 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "update_status",
-        description: "Set a card to any status in one call and record an audit event.",
+        description: "Set a card to any status in one call and record an audit event; returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "check_criterion",
-        description: "Mark one acceptance criterion checked or unchecked and audit actor/time.",
+        description: "Mark one acceptance criterion checked or unchecked and audit actor/time; returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["card_id","criterion","actor"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "update_relations",
-        description: "Replace a card's related, blocks, and blocked_by relation lists.",
+        description: "Replace a card's related, blocks, and blocked_by relation lists; returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
@@ -145,7 +145,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "complete_card",
-        description: "Set a card done, optionally recording a proof artifact or URL and proof links attached to criteria.",
+        description: "Set a card done, optionally recording a proof artifact or URL and proof links attached to criteria; returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
@@ -328,9 +328,10 @@ pub fn call_tool_store(
             card.blocks = card_ids_array(args, "blocks")?;
             card.blocked_by = card_ids_array(args, "blocked_by")?;
             card.repo = optional_str(args, "repo").map(str::to_string);
-            json!(store
+            let card = store
                 .create_card_with_events(card, &authority_arg(args).actor_label(), now)
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            card_ack_payload(&card)
         }
         "update_card" => {
             let card_id = card_id(args, "card_id")?;
@@ -351,9 +352,10 @@ pub fn call_tool_store(
                     .transpose()?,
                 labels: optional_string_array(args, "labels")?,
             };
-            json!(store
+            let card = store
                 .patch_card(&card_id, patch, &authority_arg(args).actor_label(), now)
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            card_ack_payload(&card)
         }
         "list_repositories" => {
             if args["include_hidden"].as_bool().unwrap_or(false) {
@@ -469,22 +471,24 @@ pub fn call_tool_store(
             let card_id = card_id(args, "card_id")?;
             let status = CardStatus::parse(required_str(args, "status")?)
                 .ok_or_else(|| "invalid status".to_string())?;
-            json!(store
+            let card = store
                 .update_status(&card_id, status, now, &authority_arg(args))
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            card_ack_payload(&card)
         }
         "check_criterion" => {
             let card_id = card_id(args, "card_id")?;
             let criterion = criterion_arg(args)?;
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
-            json!(store
+            let card = store
                 .check_criterion(&card_id, criterion, actor, checked, now)
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            criterion_ack_payload(&card, criterion, checked)
         }
         "update_relations" => {
             let card_id = card_id(args, "card_id")?;
-            json!(store
+            let card = store
                 .update_relations(
                     &card_id,
                     card_ids_array(args, "related")?,
@@ -493,7 +497,8 @@ pub fn call_tool_store(
                     now,
                     &authority_arg(args),
                 )
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            relation_ack_payload(&card)
         }
         "add_link" => {
             let card_id = card_id(args, "card_id")?;
@@ -534,15 +539,16 @@ pub fn call_tool_store(
         }
         "complete_card" => {
             let card_id = card_id(args, "card_id")?;
-            json!(store
+            let card = store
                 .complete_card(
                     &card_id,
                     optional_str(args, "proof"),
                     criterion_proofs_arg(args)?,
                     now,
-                    &authority_arg(args)
+                    &authority_arg(args),
                 )
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            card_ack_payload(&card)
         }
         "create_event_subscription" => {
             let url = required_str(args, "url")?;
@@ -612,6 +618,42 @@ fn card_detail_payload(detail: &CardDetail) -> Result<Value, String> {
         card.insert("criteria_total".to_string(), json!(summary.criteria_total));
     }
     Ok(payload)
+}
+
+fn card_ack_payload(card: &Card) -> Value {
+    json!({
+        "id": card.id.as_str(),
+        "status": card.status,
+        "updated_at": card.updated_at,
+    })
+}
+
+fn criterion_ack_payload(card: &Card, criterion: usize, checked: bool) -> Value {
+    let mut payload = card_ack_payload(card);
+    let checked_by = card
+        .criteria
+        .get(criterion)
+        .and_then(|criterion| criterion.checked_by.as_deref());
+    payload["criterion"] = json!(criterion);
+    payload["checked"] = json!(checked);
+    payload["checked_by"] = checked_by.map_or(Value::Null, |actor| json!(actor));
+    payload
+}
+
+fn relation_ack_payload(card: &Card) -> Value {
+    let mut payload = card_ack_payload(card);
+    payload["related"] = json!(card
+        .related
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>());
+    payload["blocks"] = json!(card.blocks.iter().map(|id| id.as_str()).collect::<Vec<_>>());
+    payload["blocked_by"] = json!(card
+        .blocked_by
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>());
+    payload
 }
 
 /// Wire shape for one key row, shared by store and remote dispatch so both
@@ -1208,10 +1250,26 @@ Expose tools against the DB.
         )
         .unwrap();
         let created = tool_payload(&created);
-        assert!(created.get("acceptance").is_none());
-        assert_eq!(created["proof_plan"][0], "PR link plus smoke transcript");
         assert_eq!(
-            created["criteria"][0]["text"],
+            created,
+            json!({"id": "proof-plan", "status": "ready", "updated_at": 10})
+        );
+
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "proof-plan"}),
+            10,
+        )
+        .unwrap();
+        let detail = tool_payload(&detail);
+        assert!(detail["card"].get("acceptance").is_none());
+        assert_eq!(
+            detail["card"]["proof_plan"][0],
+            "PR link plus smoke transcript"
+        );
+        assert_eq!(
+            detail["card"]["criteria"][0]["text"],
             "HTTP smoke proves detail rendering"
         );
 
@@ -1227,8 +1285,15 @@ Expose tools against the DB.
         )
         .unwrap();
         assert_eq!(
-            tool_payload(&checked)["criteria"][0]["checked_by"],
-            "operator"
+            tool_payload(&checked),
+            json!({
+                "id": "proof-plan",
+                "status": "ready",
+                "updated_at": 11,
+                "criterion": 0,
+                "checked": true,
+                "checked_by": "operator"
+            })
         );
 
         call_tool_store(
@@ -1343,10 +1408,10 @@ Expose tools against the DB.
         )
         .unwrap();
         let patched = tool_payload(&patched);
-        assert_eq!(patched["title"], "Edited via MCP");
-        assert_eq!(patched["body"], "Edited body");
-        assert!(patched.get("acceptance").is_none());
-        assert_eq!(patched["criteria"][0]["text"], "new oracle");
+        assert_eq!(
+            patched,
+            json!({"id": "007", "status": "ready", "updated_at": 10})
+        );
 
         let detail =
             call_tool_store(&mut store, "get_card", &json!({"card_id": "007"}), 11).unwrap();
@@ -1653,25 +1718,41 @@ Expose tools against the DB.
         )
         .unwrap();
         let relation_payload = tool_payload(&relations);
-        assert_eq!(relation_payload["related"][0], "peer");
-        assert_eq!(relation_payload["blocks"][0], "child");
-        assert_eq!(relation_payload["blocked_by"][0], "parent");
+        assert_eq!(
+            relation_payload,
+            json!({
+                "id": "006",
+                "status": "claimed",
+                "updated_at": 10,
+                "related": ["peer"],
+                "blocks": ["child"],
+                "blocked_by": ["parent"]
+            })
+        );
 
-        call_tool_store(
+        let status = call_tool_store(
             &mut store,
             "update_status",
             &json!({"card_id": "006", "status": "running", "actor": "intruder"}),
             11,
         )
         .unwrap();
+        assert_eq!(
+            tool_payload(&status),
+            json!({"id": "006", "status": "running", "updated_at": 11})
+        );
 
-        call_tool_store(
+        let completed = call_tool_store(
             &mut store,
             "complete_card",
             &json!({"card_id": "006", "actor": "intruder"}),
             13,
         )
         .unwrap();
+        assert_eq!(
+            tool_payload(&completed),
+            json!({"id": "006", "status": "done", "updated_at": 13})
+        );
 
         let card = call_tool_store(&mut store, "get_card", &json!({"card_id": "006"}), 14).unwrap();
         assert!(card["content"][0]["text"]
