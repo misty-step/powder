@@ -59,7 +59,8 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = args["repo"].as_str() {
                 body["repo"] = json!(value);
             }
-            client.post("/api/v1/cards", body)?
+            let response = client.post("/api/v1/cards", body)?;
+            remote_card_ack_payload(&response)?
         }
         "update_card" => {
             let id = card_id(args, "card_id")?;
@@ -85,7 +86,8 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = args["labels"].as_array() {
                 body["labels"] = json!(value);
             }
-            client.patch(&format!("/api/v1/cards/{id}"), body)?
+            let response = client.patch(&format!("/api/v1/cards/{id}"), body)?;
+            remote_card_ack_payload(&response)?
         }
         "list_repositories" => {
             let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
@@ -190,10 +192,11 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "update_status" => {
             let id = card_id(args, "card_id")?;
             let status = required_str(args, "status")?;
-            client.post(
+            let response = client.post(
                 &format!("/api/v1/cards/{id}/status"),
                 json!({"status": status}),
-            )?
+            )?;
+            remote_card_ack_payload(&response)?
         }
         "check_criterion" => {
             let id = card_id(args, "card_id")?;
@@ -202,21 +205,23 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 .ok_or_else(|| "criterion is required".to_string())?;
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
-            client.post(
+            let response = client.post(
                 &format!("/api/v1/cards/{id}/criteria/check"),
                 json!({"criterion": criterion, "actor": actor, "checked": checked}),
-            )?
+            )?;
+            remote_criterion_ack_payload(&response, criterion, checked, actor)?
         }
         "update_relations" => {
             let id = card_id(args, "card_id")?;
-            client.post(
+            let response = client.post(
                 &format!("/api/v1/cards/{id}/relations"),
                 json!({
                     "related": args["related"].as_array().cloned().unwrap_or_default(),
                     "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
                     "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
                 }),
-            )?
+            )?;
+            remote_relation_ack_payload(&response)?
         }
         "add_link" => {
             let id = card_id(args, "card_id")?;
@@ -269,7 +274,8 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(criterion_proofs) = args["criterion_proofs"].as_array() {
                 body["criterion_proofs"] = json!(criterion_proofs);
             }
-            client.post(&format!("/api/v1/cards/{id}/complete"), body)?
+            let response = client.post(&format!("/api/v1/cards/{id}/complete"), body)?;
+            remote_card_ack_payload(&response)?
         }
         "create_event_subscription" => {
             let url = required_str(args, "url")?;
@@ -324,6 +330,57 @@ fn remote_card_summary_page_payload(response: Value, limit: usize) -> Result<Val
             json!("remote total_count is unknown; raise limit or filter by status/repo");
     }
     Ok(payload)
+}
+
+fn remote_card_ack_payload(response: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "id": required_response_field(response, "id")?,
+        "status": required_response_field(response, "status")?,
+        "updated_at": required_response_field(response, "updated_at")?,
+    }))
+}
+
+fn remote_criterion_ack_payload(
+    response: &Value,
+    criterion: u64,
+    checked: bool,
+    actor: &str,
+) -> Result<Value, String> {
+    let mut payload = remote_card_ack_payload(response)?;
+    payload["criterion"] = json!(criterion);
+    payload["checked"] = json!(checked);
+    payload["checked_by"] = response
+        .get("criteria")
+        .and_then(Value::as_array)
+        .and_then(|criteria| criteria.get(criterion as usize))
+        .and_then(|criterion| criterion.get("checked_by"))
+        .cloned()
+        .unwrap_or_else(|| if checked { json!(actor) } else { Value::Null });
+    Ok(payload)
+}
+
+fn remote_relation_ack_payload(response: &Value) -> Result<Value, String> {
+    let mut payload = remote_card_ack_payload(response)?;
+    payload["related"] = response_array_or_empty(response, "related")?;
+    payload["blocks"] = response_array_or_empty(response, "blocks")?;
+    payload["blocked_by"] = response_array_or_empty(response, "blocked_by")?;
+    Ok(payload)
+}
+
+fn required_response_field(response: &Value, key: &'static str) -> Result<Value, String> {
+    response
+        .get(key)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .ok_or_else(|| format!("remote card response missing {key}"))
+}
+
+fn response_array_or_empty(response: &Value, key: &'static str) -> Result<Value, String> {
+    match response.get(key) {
+        Some(Value::Array(values)) => Ok(Value::Array(values.clone())),
+        Some(Value::Null) | None => Ok(json!([])),
+        Some(_) => Err(format!("remote card response {key} must be an array")),
+    }
 }
 
 fn detail_query(args: &Value) -> Result<String, String> {
@@ -735,7 +792,14 @@ mod tests {
     fn update_card_sends_patch_with_only_the_supplied_fields() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
-            json!({"id": "proof-plan", "title": "Edited title", "status": "blocked"}),
+            json!({
+                "id": "proof-plan",
+                "title": "Edited title",
+                "body": "edited body stays out of the ack",
+                "status": "blocked",
+                "updated_at": 42,
+                "criteria": [{"text": "criteria stay out too"}]
+            }),
         )]);
         let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
 
@@ -746,10 +810,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Edited title"));
+        assert_eq!(
+            tool_payload(&result),
+            json!({"id": "proof-plan", "status": "blocked", "updated_at": 42})
+        );
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "PATCH");
         assert_eq!(requests[0].path, "/api/v1/cards/proof-plan");
@@ -764,20 +828,38 @@ mod tests {
         let (base_url, recorded) = spawn_test_server(vec![
             (
                 200,
-                json!({"id": "proof-plan", "priority": "p0", "status": "ready", "proof_plan": ["PR plus smoke"]}),
+                json!({
+                    "id": "proof-plan",
+                    "body": "body stays remote-only",
+                    "priority": "p0",
+                    "status": "ready",
+                    "updated_at": 10,
+                    "proof_plan": ["PR plus smoke"],
+                    "criteria": [{"text": "proof exists"}]
+                }),
             ),
             (
                 200,
-                json!({"id": "proof-plan", "criteria": [{"text": "proof exists", "checked_by": "operator"}]}),
+                json!({
+                    "id": "proof-plan",
+                    "status": "ready",
+                    "updated_at": 11,
+                    "criteria": [{"text": "proof exists", "checked_by": "operator"}]
+                }),
             ),
             (
                 200,
-                json!({"id": "proof-plan", "status": "done", "criteria": [{"proof_links": [{"url": "https://example.test/pr"}]}]}),
+                json!({
+                    "id": "proof-plan",
+                    "status": "done",
+                    "updated_at": 12,
+                    "criteria": [{"proof_links": [{"url": "https://example.test/pr"}]}]
+                }),
             ),
         ]);
         let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
 
-        call_tool_remote(
+        let created = call_tool_remote(
             &client,
             "create_card",
             &json!({
@@ -792,13 +874,30 @@ mod tests {
             }),
         )
         .unwrap();
-        call_tool_remote(
+        assert_eq!(
+            tool_payload(&created),
+            json!({"id": "proof-plan", "status": "ready", "updated_at": 10})
+        );
+
+        let checked = call_tool_remote(
             &client,
             "check_criterion",
             &json!({"card_id": "proof-plan", "criterion": 0, "actor": "operator"}),
         )
         .unwrap();
-        call_tool_remote(
+        assert_eq!(
+            tool_payload(&checked),
+            json!({
+                "id": "proof-plan",
+                "status": "ready",
+                "updated_at": 11,
+                "criterion": 0,
+                "checked": true,
+                "checked_by": "operator"
+            })
+        );
+
+        let completed = call_tool_remote(
             &client,
             "complete_card",
             &json!({
@@ -807,6 +906,10 @@ mod tests {
             }),
         )
         .unwrap();
+        assert_eq!(
+            tool_payload(&completed),
+            json!({"id": "proof-plan", "status": "done", "updated_at": 12})
+        );
 
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "POST");
@@ -844,6 +947,74 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.authorization.as_deref() == Some("Bearer sk_powder_test")));
+    }
+
+    #[test]
+    fn status_and_relations_project_remote_card_payloads_to_acks() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({
+                    "id": "006",
+                    "title": "Remote holder",
+                    "body": "full body is not echoed",
+                    "status": "running",
+                    "updated_at": 11,
+                    "criteria": [{"text": "full criterion is not echoed"}]
+                }),
+            ),
+            (
+                200,
+                json!({
+                    "id": "006",
+                    "status": "running",
+                    "updated_at": 12,
+                    "related": ["peer"],
+                    "blocks": ["child"]
+                }),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let status = call_tool_remote(
+            &client,
+            "update_status",
+            &json!({"card_id": "006", "status": "running"}),
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&status),
+            json!({"id": "006", "status": "running", "updated_at": 11})
+        );
+
+        let relations = call_tool_remote(
+            &client,
+            "update_relations",
+            &json!({"card_id": "006", "related": ["peer"], "blocks": ["child"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&relations),
+            json!({
+                "id": "006",
+                "status": "running",
+                "updated_at": 12,
+                "related": ["peer"],
+                "blocks": ["child"],
+                "blocked_by": []
+            })
+        );
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/006/status");
+        assert_eq!(requests[0].body, Some(json!({"status": "running"})));
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/api/v1/cards/006/relations");
+        assert_eq!(
+            requests[1].body,
+            Some(json!({"related": ["peer"], "blocks": ["child"], "blocked_by": []}))
+        );
     }
 
     #[test]
