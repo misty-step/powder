@@ -23,6 +23,13 @@ reach a deployed instance instead, set `POWDER_API_BASE_URL` (and
 otherwise; there is no ephemeral in-memory mode, since claims and completions
 must never silently evaporate on process exit.
 
+By default, `powder-mcp` exposes the agent persona only. Set
+`POWDER_MCP_TOOLSETS=admin` or `POWDER_MCP_TOOLSETS=all` before starting the
+MCP subprocess to add operator/admin tools to the same server registration.
+The value is read once at startup for MCP client cache stability; changing it
+requires restarting `powder-mcp`. Calls to hidden admin tools fail with an
+error naming `POWDER_MCP_TOOLSETS`.
+
 ## Operating Contract
 
 The MCP server `instructions` field is the source of truth for Powder's agent
@@ -32,16 +39,14 @@ When the workflow contract changes, update the server instructions first.
 
 ## Expected MCP Tools
 
+Default agent persona:
+
 - `list_ready`: return claimable cards from active repositories sorted by
   priority, age, and identifier.
 - `list_cards`: enumerate cards by optional status/repo filter, including
   `blocked`, `review`, and `done` cards `list_ready` never surfaces.
 - `list_repositories`: list repository entities with aliases, visibility,
   tier, import provenance, and status counts.
-- `upsert_repository`: create or update repository settings.
-- `merge_repository_alias`: merge duplicate repo strings into one canonical
-  repository and audit re-homed cards.
-- `delete_repository`: delete an unused repository entity.
 - `manage_claim`: acquire, renew, heartbeat, release, or transfer a claim with
   `action` set to `claim`, `renew`, `heartbeat`, `release`, or `transfer`.
   This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
@@ -66,6 +71,20 @@ When the workflow contract changes, update the server instructions first.
   or labels on an existing card. Requires an admin-scope key in remote mode
   (`PATCH /api/v1/cards/{id}`); grooming and editing card content from an
   agent harness no longer requires falling back to raw HTTP.
+
+Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all`:
+
+- `upsert_repository`: create or update repository settings.
+- `merge_repository_alias`: merge duplicate repo strings into one canonical
+  repository and audit re-homed cards.
+- `delete_repository`: delete an unused repository entity.
+- `create_event_subscription`: create a signed webhook subscription.
+- `list_event_subscriptions`: list webhook subscriptions without secrets.
+- `disable_event_subscription`: disable a webhook subscription while preserving
+  delivery history.
+- `list_dead_letters`: list webhook deliveries that exhausted retry attempts.
+- `tail_events`: read durable card events after an optional sequence cursor.
+- `list_keys`: list API-key metadata without raw secrets or hashes.
 
 ## Instance CLI
 
