@@ -33,17 +33,17 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_cards",
         description: "Scan card summaries by optional status/repo filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string"},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, repository, and initial status; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
         description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. In remote mode the deployed instance requires an admin-scope key.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -72,12 +72,12 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_card",
-        description: "Read one card with runs, activities, links, comments, and claim state. detail defaults to concise: most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
+        description: "Read one card with runs, activities, links, comments, and claim state. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
     },
     ToolDef {
         name: "get_run",
-        description: "Read one run with its card, activities, links, comments, and run state. detail defaults to concise: most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
+        description: "Read one run with its card, activities, links, comments, and run state. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
         input_schema: r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
     },
     ToolDef {
@@ -93,7 +93,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "update_status",
         description: "Set a card to any status in one call and record an audit event; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "check_criterion",
@@ -368,10 +368,8 @@ pub fn call_tool_store(
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            let status = match args["status"].as_str() {
-                Some(raw) => {
-                    Some(CardStatus::parse(raw).ok_or_else(|| format!("invalid status: {raw}"))?)
-                }
+            let status = match optional_str(args, "status") {
+                Some(raw) => Some(parse_status(raw)?),
                 None => None,
             };
             let repo = args["repo"].as_str().map(str::to_string);
@@ -385,14 +383,12 @@ pub fn call_tool_store(
             let title = required_str(args, "title")?;
             let acceptance = string_array(args, "acceptance")?;
             let status = match optional_str(args, "status") {
-                Some(raw) => {
-                    CardStatus::parse(raw).ok_or_else(|| format!("invalid status: {raw}"))?
-                }
+                Some(raw) => parse_status(raw)?,
                 None if acceptance.is_empty() => CardStatus::Backlog,
                 None => CardStatus::Ready,
             };
             let priority = optional_str(args, "priority")
-                .map(|raw| Priority::parse(raw).ok_or_else(|| format!("invalid priority: {raw}")))
+                .map(parse_priority)
                 .transpose()?
                 .unwrap_or_default();
             let mut card = Card::new(id, title, optional_str(args, "body").unwrap_or_default())
@@ -419,15 +415,9 @@ pub fn call_tool_store(
                 body: optional_str(args, "body").map(str::to_string),
                 acceptance: optional_string_array(args, "acceptance")?,
                 proof_plan: optional_string_array(args, "proof_plan")?,
-                status: optional_str(args, "status")
-                    .map(|raw| {
-                        CardStatus::parse(raw).ok_or_else(|| format!("invalid status: {raw}"))
-                    })
-                    .transpose()?,
+                status: optional_str(args, "status").map(parse_status).transpose()?,
                 priority: optional_str(args, "priority")
-                    .map(|raw| {
-                        Priority::parse(raw).ok_or_else(|| format!("invalid priority: {raw}"))
-                    })
+                    .map(parse_priority)
                     .transpose()?,
                 labels: optional_string_array(args, "labels")?,
             };
@@ -479,7 +469,9 @@ pub fn call_tool_store(
             let detail = store
                 .get_card_detail(&card_id, detail_level)
                 .map_err(to_string)?
-                .ok_or_else(|| format!("card not found: {card_id}"))?;
+                .ok_or_else(|| {
+                    format!("card not found: {card_id}; use list_cards to enumerate ids")
+                })?;
             card_detail_payload(&detail)?
         }
         "get_run" => {
@@ -487,7 +479,9 @@ pub fn call_tool_store(
             json!(store
                 .get_run_detail(&run_id, detail_arg(args)?)
                 .map_err(to_string)?
-                .ok_or_else(|| format!("run not found: {run_id}"))?)
+                .ok_or_else(|| format!(
+                    "run not found: {run_id}; use list_cards then get_card to enumerate run ids"
+                ))?)
         }
         "list_awaiting_input" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -503,8 +497,7 @@ pub fn call_tool_store(
         }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
-            let status = CardStatus::parse(required_str(args, "status")?)
-                .ok_or_else(|| "invalid status".to_string())?;
+            let status = parse_status(required_str(args, "status")?)?;
             let card = store
                 .update_status(&card_id, status, now, &authority_arg(args))
                 .map_err(to_string)?;
@@ -813,7 +806,8 @@ fn required_claim_arg<'a>(
     action: ClaimAction,
     key: &'static str,
 ) -> Result<&'a str, String> {
-    required_str(args, key).map_err(|_| format!("{} requires {key}", action.as_str()))
+    required_str(args, key)
+        .map_err(|_| format!("{} requires {key} ({})", action.as_str(), field_role(key)))
 }
 
 fn run_id_for_claim(args: &Value, action: ClaimAction) -> Result<RunId, String> {
@@ -874,13 +868,16 @@ fn criterion_proofs_arg(args: &Value) -> Result<Vec<CriterionProofInput>, String
     values
         .iter()
         .map(|value| {
-            let criterion = value["criterion"]
-                .as_u64()
-                .ok_or_else(|| "criterion_proofs[].criterion is required".to_string())?
-                as usize;
+            let criterion = value["criterion"].as_u64().ok_or_else(|| {
+                "missing required argument: criterion_proofs[].criterion (criterion proof index)"
+                    .to_string()
+            })? as usize;
             let url = value["url"]
                 .as_str()
-                .ok_or_else(|| "criterion_proofs[].url is required".to_string())?
+                .ok_or_else(|| {
+                    "missing required argument: criterion_proofs[].url (criterion proof URL)"
+                        .to_string()
+                })?
                 .to_string();
             Ok(CriterionProofInput { criterion, url })
         })
@@ -891,7 +888,15 @@ fn criterion_arg(args: &Value) -> Result<usize, String> {
     args["criterion"]
         .as_u64()
         .map(|value| value as usize)
-        .ok_or_else(|| "criterion is required".to_string())
+        .ok_or_else(|| missing_required("criterion"))
+}
+
+fn parse_status(raw: &str) -> Result<CardStatus, String> {
+    CardStatus::parse(raw).ok_or_else(|| invalid_enum_value("status", raw, status_valid_values()))
+}
+
+fn parse_priority(raw: &str) -> Result<Priority, String> {
+    Priority::parse(raw).ok_or_else(|| invalid_enum_value("priority", raw, priority_valid_values()))
 }
 
 fn detail_arg(args: &Value) -> Result<DetailLevel, String> {
@@ -904,14 +909,19 @@ fn detail_arg(args: &Value) -> Result<DetailLevel, String> {
 fn optional_repository_visibility(args: &Value) -> Result<Option<RepositoryVisibility>, String> {
     optional_str(args, "visibility")
         .map(|raw| {
-            RepositoryVisibility::parse(raw).ok_or_else(|| format!("invalid visibility: {raw}"))
+            RepositoryVisibility::parse(raw).ok_or_else(|| {
+                invalid_enum_value("visibility", raw, repository_visibility_valid_values())
+            })
         })
         .transpose()
 }
 
 fn optional_repository_tier(args: &Value) -> Result<Option<RepositoryTier>, String> {
     optional_str(args, "tier")
-        .map(|raw| RepositoryTier::parse(raw).ok_or_else(|| format!("invalid tier: {raw}")))
+        .map(|raw| {
+            RepositoryTier::parse(raw)
+                .ok_or_else(|| invalid_enum_value("tier", raw, repository_tier_valid_values()))
+        })
         .transpose()
 }
 
@@ -920,7 +930,7 @@ fn required_str<'a>(args: &'a Value, key: &'static str) -> Result<&'a str, Strin
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("missing required argument: {key}"))
+        .ok_or_else(|| missing_required(key))
 }
 
 fn optional_str<'a>(args: &'a Value, key: &'static str) -> Option<&'a str> {
@@ -928,6 +938,76 @@ fn optional_str<'a>(args: &'a Value, key: &'static str) -> Option<&'a str> {
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn invalid_enum_value(field: &str, raw: &str, valid: String) -> String {
+    format!("invalid {field} {raw:?}; valid: {valid}")
+}
+
+fn status_valid_values() -> String {
+    CardStatus::ALL
+        .iter()
+        .copied()
+        .map(CardStatus::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn priority_valid_values() -> String {
+    Priority::ALL
+        .iter()
+        .copied()
+        .map(Priority::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn repository_visibility_valid_values() -> String {
+    RepositoryVisibility::ALL
+        .iter()
+        .copied()
+        .map(RepositoryVisibility::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn repository_tier_valid_values() -> String {
+    RepositoryTier::ALL
+        .iter()
+        .copied()
+        .map(RepositoryTier::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn missing_required(key: &'static str) -> String {
+    format!("missing required argument: {key} ({})", field_role(key))
+}
+
+fn field_role(key: &'static str) -> &'static str {
+    match key {
+        "id" => "card id for the new card",
+        "card_id" => "card id to read or mutate",
+        "run_id" => "run id to read or mutate",
+        "title" => "card title",
+        "name" => "repository name",
+        "alias" => "repository alias to merge",
+        "into" => "canonical repository target",
+        "action" => "claim lease operation",
+        "agent" => "agent identity for the claim or work log",
+        "to_agent" => "agent identity receiving the transferred claim",
+        "actor" => "actor recorded for the audit event",
+        "answer" => "answer text for the awaiting-input run",
+        "status" => "target card status",
+        "criterion" => "acceptance criterion index",
+        "label" => "link label",
+        "url" => "link or webhook URL",
+        "author" => "comment author",
+        "body" => "comment or work-log body",
+        "question" => "operator question for the awaiting-input run",
+        "subscription_id" => "webhook subscription id",
+        _ => "required input",
+    }
 }
 
 /// Build the `Authority` a mutation is checked against from the optional
@@ -953,7 +1033,7 @@ fn to_string(err: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use powder_core::parse_backlog_card;
-    use powder_store::{Store, WorkLogAttribution};
+    use powder_store::{RepositoryTier, RepositoryVisibility, Store, WorkLogAttribution};
 
     /// `complete_card`'s hand-written `input_schema` string had a missing
     /// closing brace that made every `tool_defs_json()` call -- and
@@ -1024,6 +1104,47 @@ mod tests {
                 .contains_key("oneOf"),
             "manage_claim schema must stay flat for clients that reject combinators"
         );
+    }
+
+    #[test]
+    fn schema_enums_match_domain_parse_sets() {
+        let listed = tool_defs_json_for(Toolset::WithAdmin);
+        let tools = listed.as_array().unwrap();
+        let statuses = card_status_values();
+        let priorities = priority_values();
+        let visibilities = repository_visibility_values();
+        let tiers = repository_tier_values();
+
+        for value in &statuses {
+            assert_eq!(
+                CardStatus::parse(value).map(CardStatus::as_str),
+                Some(*value)
+            );
+        }
+        for value in &priorities {
+            assert_eq!(Priority::parse(value).map(Priority::as_str), Some(*value));
+        }
+        for value in &visibilities {
+            assert_eq!(
+                RepositoryVisibility::parse(value).map(RepositoryVisibility::as_str),
+                Some(*value)
+            );
+        }
+        for value in &tiers {
+            assert_eq!(
+                RepositoryTier::parse(value).map(RepositoryTier::as_str),
+                Some(*value)
+            );
+        }
+
+        for tool in ["list_cards", "create_card", "update_card", "update_status"] {
+            assert_schema_enum(tools, tool, "status", &statuses);
+        }
+        for tool in ["create_card", "update_card"] {
+            assert_schema_enum(tools, tool, "priority", &priorities);
+        }
+        assert_schema_enum(tools, "upsert_repository", "visibility", &visibilities);
+        assert_schema_enum(tools, "upsert_repository", "tier", &tiers);
     }
 
     #[test]
@@ -1363,7 +1484,10 @@ Expose tools against the DB.
             10,
         )
         .unwrap_err();
-        assert_eq!(missing_agent, "claim requires agent");
+        assert_eq!(
+            missing_agent,
+            "claim requires agent (agent identity for the claim or work log)"
+        );
 
         let missing_run_id = call_tool_store(
             &mut store,
@@ -1372,7 +1496,10 @@ Expose tools against the DB.
             10,
         )
         .unwrap_err();
-        assert_eq!(missing_run_id, "renew requires run_id");
+        assert_eq!(
+            missing_run_id,
+            "renew requires run_id (run id to read or mutate)"
+        );
 
         let missing_to_agent = call_tool_store(
             &mut store,
@@ -1381,7 +1508,10 @@ Expose tools against the DB.
             10,
         )
         .unwrap_err();
-        assert_eq!(missing_to_agent, "transfer requires to_agent");
+        assert_eq!(
+            missing_to_agent,
+            "transfer requires to_agent (agent identity receiving the transferred claim)"
+        );
     }
 
     #[test]
@@ -1413,7 +1543,66 @@ Expose tools against the DB.
 
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
-        assert!(invalid.contains("invalid status"));
+        assert_eq!(
+            invalid,
+            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+        );
+    }
+
+    #[test]
+    fn mcp_invalid_status_and_priority_errors_enumerate_valid_values() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let invalid_status = call_tool_store(
+            &mut store,
+            "update_status",
+            &json!({"card_id": "005", "status": "not-real"}),
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_status,
+            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+        );
+
+        let invalid_priority = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "bad-priority",
+                "title": "Bad priority",
+                "priority": "urgent"
+            }),
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_priority,
+            "invalid priority \"urgent\"; valid: P0|P1|P2|P3"
+        );
+    }
+
+    #[test]
+    fn mcp_missing_card_and_run_errors_suggest_enumeration_tools() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let missing_card =
+            call_tool_store(&mut store, "get_card", &json!({"card_id": "missing"}), 10)
+                .unwrap_err();
+        assert_eq!(
+            missing_card,
+            "card not found: missing; use list_cards to enumerate ids"
+        );
+
+        let missing_run =
+            call_tool_store(&mut store, "get_run", &json!({"run_id": "run-missing"}), 10)
+                .unwrap_err();
+        assert_eq!(
+            missing_run,
+            "run not found: run-missing; use list_cards then get_card to enumerate run ids"
+        );
     }
 
     #[test]
@@ -2179,6 +2368,50 @@ Expose tools against the DB.
         )
         .unwrap();
         assert!(tool_payload(&disabled)["disabled_at"].is_number());
+    }
+
+    fn card_status_values() -> Vec<&'static str> {
+        CardStatus::ALL
+            .iter()
+            .copied()
+            .map(CardStatus::as_str)
+            .collect()
+    }
+
+    fn priority_values() -> Vec<&'static str> {
+        Priority::ALL
+            .iter()
+            .copied()
+            .map(Priority::as_str)
+            .collect()
+    }
+
+    fn repository_visibility_values() -> Vec<&'static str> {
+        RepositoryVisibility::ALL
+            .iter()
+            .copied()
+            .map(RepositoryVisibility::as_str)
+            .collect()
+    }
+
+    fn repository_tier_values() -> Vec<&'static str> {
+        RepositoryTier::ALL
+            .iter()
+            .copied()
+            .map(RepositoryTier::as_str)
+            .collect()
+    }
+
+    fn assert_schema_enum(tools: &[Value], tool_name: &str, property: &str, expected: &[&str]) {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} tool must be listed"));
+        assert_eq!(
+            tool["inputSchema"]["properties"][property]["enum"],
+            json!(expected),
+            "{tool_name}.{property} schema enum must match the domain type"
+        );
     }
 
     fn tool_payload(response: &Value) -> Value {
