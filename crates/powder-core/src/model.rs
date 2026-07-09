@@ -414,6 +414,21 @@ impl Claim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimSummary {
+    pub agent: String,
+    pub expires_at: i64,
+}
+
+impl From<&Claim> for ClaimSummary {
+    fn from(claim: &Claim) -> Self {
+        Self {
+            agent: claim.agent.clone(),
+            expires_at: claim.expires_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Card {
     pub id: CardId,
     pub title: String,
@@ -448,6 +463,46 @@ pub struct Card {
     pub claim: Option<Claim>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CardSummary {
+    pub id: CardId,
+    pub title: String,
+    pub status: CardStatus,
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimSummary>,
+    pub updated_at: i64,
+    pub criteria_checked: usize,
+    pub criteria_total: usize,
+}
+
+impl From<&Card> for CardSummary {
+    fn from(card: &Card) -> Self {
+        let criteria_total = card.criteria.len();
+        let criteria_checked = card
+            .criteria
+            .iter()
+            .filter(|criterion| criterion.checked_at.is_some() || criterion.checked_by.is_some())
+            .count();
+        Self {
+            id: card.id.clone(),
+            title: card.title.clone(),
+            status: card.status,
+            priority: card.priority,
+            repo: card.repo.clone(),
+            labels: card.labels.clone(),
+            claim: card.claim.as_ref().map(ClaimSummary::from),
+            updated_at: card.updated_at,
+            criteria_checked,
+            criteria_total,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -521,6 +576,10 @@ impl<'de> Deserialize<'de> for Card {
 }
 
 impl Card {
+    pub fn summary(&self) -> CardSummary {
+        CardSummary::from(self)
+    }
+
     fn sync_acceptance_and_criteria(&mut self) {
         if !self.criteria.is_empty() {
             self.acceptance = self

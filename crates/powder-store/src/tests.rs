@@ -205,6 +205,10 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
 
     let limited = store.list_cards(&CardFilter::default(), 1)?;
     assert_eq!(limited.len(), 1);
+
+    let page = store.list_cards_page(&CardFilter::default(), 1)?;
+    assert_eq!(page.cards.len(), 1);
+    assert_eq!(page.total_count, 3);
     Ok(())
 }
 
