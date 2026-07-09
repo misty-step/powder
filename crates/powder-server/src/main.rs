@@ -270,6 +270,12 @@ struct ListCardsParams {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BoardStatsParams {
+    repo: Option<String>,
+    include_hidden: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct DetailParams {
     detail: Option<DetailLevel>,
@@ -565,6 +571,7 @@ fn app(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/api/v1/onboarding", get(onboarding))
         .route("/api/v1/routes", get(routes))
+        .route("/api/v1/stats", get(board_stats))
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
@@ -734,6 +741,20 @@ async fn list_cards(
     };
     let cards = lock_store(&state)?.list_cards(&filter, limit)?;
     Ok(Json(json!({ "cards": cards })))
+}
+
+async fn board_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<BoardStatsParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_read(&state, &headers)?;
+    let stats = lock_store(&state)?.board_stats(powder_store::BoardStatsQuery {
+        repo: params.repo,
+        include_hidden: params.include_hidden.unwrap_or(false),
+        now: unix_now(),
+    })?;
+    Ok(Json(json!(stats)))
 }
 
 async fn list_repositories(
