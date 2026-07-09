@@ -122,7 +122,7 @@ yet trustworthy enough for a fleet to depend on:
   runs transactional card lifecycle operations.
 - `powder-cli` can initialize an instance database, import backlog markdown
   into it, create cards, list ready work, claim, transition, and complete cards.
-- `powder-mcp` exposes `list_ready`, `claim_card`, `update_status`,
+- `powder-mcp` exposes `list_ready`, `manage_claim`, `update_status`,
   `update_relations`, `add_link`, `request_input`, and `complete_card` over
   stdio using the same domain model; it uses SQLite when `POWDER_DB_PATH` is
   set.

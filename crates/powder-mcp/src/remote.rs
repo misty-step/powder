@@ -9,7 +9,10 @@ use powder_api::{urlencode, RemoteClient};
 use powder_core::{Card, CardSummary, DetailLevel};
 use serde_json::{json, Value};
 
-use super::{card_id, optional_str, required_str, run_id, to_string};
+use super::{
+    card_id, claim_action, optional_str, required_claim_arg, required_str, run_id,
+    run_id_for_claim, to_string, ClaimAction,
+};
 
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
     let payload = match name {
@@ -124,50 +127,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let name = required_str(args, "name")?;
             client.delete(&format!("/api/v1/repositories/{}", urlencode(name)))?
         }
-        "claim_card" => {
-            let id = card_id(args, "card_id")?;
-            let agent = required_str(args, "agent")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            client.post(
-                &format!("/api/v1/cards/{id}/claim"),
-                json!({"agent": agent, "ttl_seconds": ttl_seconds}),
-            )?
-        }
-        "release_claim" => {
-            let id = card_id(args, "card_id")?;
-            let run = run_id(args, "run_id")?;
-            client.post(
-                &format!("/api/v1/cards/{id}/release"),
-                json!({"run_id": run.as_str()}),
-            )?
-        }
-        "renew_claim" => {
-            let id = card_id(args, "card_id")?;
-            let run = run_id(args, "run_id")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            client.post(
-                &format!("/api/v1/cards/{id}/renew"),
-                json!({"run_id": run.as_str(), "ttl_seconds": ttl_seconds}),
-            )?
-        }
-        "transfer_claim" => {
-            let id = card_id(args, "card_id")?;
-            let run = run_id(args, "run_id")?;
-            let to_agent = required_str(args, "to_agent")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            client.post(
-                &format!("/api/v1/cards/{id}/transfer"),
-                json!({"run_id": run.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
-            )?
-        }
-        "heartbeat" => {
-            let id = card_id(args, "card_id")?;
-            let run = run_id(args, "run_id")?;
-            client.post(
-                &format!("/api/v1/cards/{id}/heartbeat"),
-                json!({"run_id": run.as_str()}),
-            )?
-        }
+        "manage_claim" => manage_claim_remote(client, args)?,
         "get_card" => {
             let id = card_id(args, "card_id")?;
             client.get(&format!("/api/v1/cards/{id}{}", detail_query(args)?))?
@@ -310,6 +270,51 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
 
     let text = serde_json::to_string(&payload).map_err(to_string)?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
+}
+
+fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, String> {
+    let action = claim_action(args)?;
+    let id = card_id(args, "card_id")?;
+    let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
+
+    match action {
+        ClaimAction::Claim => {
+            let agent = required_claim_arg(args, action, "agent")?;
+            client.post(
+                &format!("/api/v1/cards/{id}/claim"),
+                json!({"agent": agent, "ttl_seconds": ttl_seconds}),
+            )
+        }
+        ClaimAction::Renew => {
+            let run = run_id_for_claim(args, action)?;
+            client.post(
+                &format!("/api/v1/cards/{id}/renew"),
+                json!({"run_id": run.as_str(), "ttl_seconds": ttl_seconds}),
+            )
+        }
+        ClaimAction::Heartbeat => {
+            let run = run_id_for_claim(args, action)?;
+            client.post(
+                &format!("/api/v1/cards/{id}/heartbeat"),
+                json!({"run_id": run.as_str()}),
+            )
+        }
+        ClaimAction::Release => {
+            let run = run_id_for_claim(args, action)?;
+            client.post(
+                &format!("/api/v1/cards/{id}/release"),
+                json!({"run_id": run.as_str()}),
+            )
+        }
+        ClaimAction::Transfer => {
+            let run = run_id_for_claim(args, action)?;
+            let to_agent = required_claim_arg(args, action, "to_agent")?;
+            client.post(
+                &format!("/api/v1/cards/{id}/transfer"),
+                json!({"run_id": run.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
+            )
+        }
+    }
 }
 
 fn remote_card_summary_page_payload(response: Value, limit: usize) -> Result<Value, String> {
@@ -532,27 +537,70 @@ mod tests {
     }
 
     #[test]
-    fn claim_card_sends_agent_and_ttl_with_bearer_auth() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({"card_id": "001", "run_id": "run-1", "agent": "codex", "expires_at": 100}),
-        )]);
+    fn manage_claim_remote_dispatches_the_full_claim_lifecycle() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"card_id": "001", "run_id": "run-1", "agent": "codex", "expires_at": 100}),
+            ),
+            (
+                200,
+                json!({"card_id": "001", "run_id": "run-1", "agent": "codex", "expires_at": 100}),
+            ),
+            (
+                200,
+                json!({"card_id": "001", "run_id": "run-1", "agent": "codex", "expires_at": 160}),
+            ),
+            (
+                200,
+                json!({"card_id": "001", "run_id": "run-1", "agent": "codex-b", "expires_at": 220}),
+            ),
+            (
+                200,
+                json!({"card_id": "001", "run_id": "run-1", "agent": "codex-b", "expires_at": 220}),
+            ),
+        ]);
         let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
 
-        let result = call_tool_remote(
+        let claimed = call_tool_remote(
             &client,
-            "claim_card",
-            &json!({"card_id": "001", "agent": "codex", "ttl_seconds": 60}),
+            "manage_claim",
+            &json!({"card_id": "001", "action": "claim", "agent": "codex", "ttl_seconds": 60}),
+        )
+        .unwrap();
+        let run_id = tool_payload(&claimed)["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        call_tool_remote(
+            &client,
+            "manage_claim",
+            &json!({"card_id": "001", "action": "heartbeat", "run_id": run_id.as_str()}),
+        )
+        .unwrap();
+        call_tool_remote(
+            &client,
+            "manage_claim",
+            &json!({"card_id": "001", "action": "renew", "run_id": run_id.as_str(), "ttl_seconds": 60}),
+        )
+        .unwrap();
+        let transferred = call_tool_remote(
+            &client,
+            "manage_claim",
+            &json!({"card_id": "001", "action": "transfer", "run_id": run_id.as_str(), "to_agent": "codex-b", "ttl_seconds": 60}),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&transferred)["agent"], "codex-b");
+        call_tool_remote(
+            &client,
+            "manage_claim",
+            &json!({"card_id": "001", "action": "release", "run_id": run_id.as_str()}),
         )
         .unwrap();
 
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("run-1"));
-
         let requests = recorded.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 5);
         assert_eq!(requests[0].method, "POST");
         assert_eq!(requests[0].path, "/api/v1/cards/001/claim");
         assert_eq!(
@@ -563,35 +611,52 @@ mod tests {
             requests[0].body,
             Some(json!({"agent": "codex", "ttl_seconds": 60}))
         );
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/api/v1/cards/001/heartbeat");
+        assert_eq!(requests[1].body, Some(json!({"run_id": "run-1"})));
+        assert_eq!(requests[2].method, "POST");
+        assert_eq!(requests[2].path, "/api/v1/cards/001/renew");
+        assert_eq!(
+            requests[2].body,
+            Some(json!({"run_id": "run-1", "ttl_seconds": 60}))
+        );
+        assert_eq!(requests[3].method, "POST");
+        assert_eq!(requests[3].path, "/api/v1/cards/001/transfer");
+        assert_eq!(
+            requests[3].body,
+            Some(json!({"run_id": "run-1", "to_agent": "codex-b", "ttl_seconds": 60}))
+        );
+        assert_eq!(requests[4].method, "POST");
+        assert_eq!(requests[4].path, "/api/v1/cards/001/release");
+        assert_eq!(requests[4].body, Some(json!({"run_id": "run-1"})));
+        assert!(requests
+            .iter()
+            .all(|request| { request.authorization.as_deref() == Some("Bearer sk_powder_test") }));
     }
 
     #[test]
-    fn transfer_claim_posts_run_id_to_agent_and_ttl() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({"card_id": "001", "run_id": "run-1", "agent": "codex-b", "expires_at": 160}),
-        )]);
+    fn manage_claim_remote_errors_steer_before_http_dispatch() {
+        let (base_url, recorded) = spawn_test_server(Vec::new());
         let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
 
-        let result = call_tool_remote(
+        let invalid = call_tool_remote(
             &client,
-            "transfer_claim",
-            &json!({"card_id": "001", "run_id": "run-1", "to_agent": "codex-b", "ttl_seconds": 60}),
+            "manage_claim",
+            &json!({"card_id": "001", "action": "extend"}),
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(invalid.contains("valid actions: claim, renew, heartbeat, release, transfer"));
 
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("codex-b"));
-
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "POST");
-        assert_eq!(requests[0].path, "/api/v1/cards/001/transfer");
-        assert_eq!(
-            requests[0].body,
-            Some(json!({"run_id": "run-1", "to_agent": "codex-b", "ttl_seconds": 60}))
+        let missing = call_tool_remote(
+            &client,
+            "manage_claim",
+            &json!({"card_id": "001", "action": "transfer", "run_id": "run-1"}),
+        )
+        .unwrap_err();
+        assert_eq!(missing, "transfer requires to_agent");
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "local validation errors should not call the remote server"
         );
     }
 
@@ -1166,8 +1231,8 @@ mod tests {
 
         let err = call_tool_remote(
             &client,
-            "release_claim",
-            &json!({"card_id": "001", "run_id": "run-001"}),
+            "manage_claim",
+            &json!({"card_id": "001", "action": "release", "run_id": "run-001"}),
         )
         .unwrap_err();
 
