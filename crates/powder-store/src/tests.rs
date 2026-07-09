@@ -4,9 +4,9 @@ use powder_core::{
 };
 
 use crate::{
-    ApiKeyScope, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError, WorkLogAttribution,
-    API_KEY_ALPHABET,
+    ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
+    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError,
+    WorkLogAttribution, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -209,6 +209,158 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     let page = store.list_cards_page(&CardFilter::default(), 1)?;
     assert_eq!(page.cards.len(), 1);
     assert_eq!(page.total_count, 3);
+    Ok(())
+}
+
+#[test]
+fn board_stats_counts_statuses_claims_and_visibility_by_repo() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    for (name, visibility) in [
+        ("alpha", RepositoryVisibility::Visible),
+        ("beta", RepositoryVisibility::Visible),
+        ("secret", RepositoryVisibility::Hidden),
+    ] {
+        store.upsert_repository(
+            RepositoryUpsert {
+                name: name.to_string(),
+                aliases: (name == "beta").then(|| vec!["misty-step/beta".to_string()]),
+                visibility: Some(visibility),
+                tier: Some(RepositoryTier::Active),
+                import_provenance: Some("board stats fixture".to_string()),
+            },
+            1,
+        )?;
+    }
+
+    let mut alpha_ready = ready_card("alpha-ready", 10);
+    alpha_ready.repo = Some("alpha".to_string());
+    let mut alpha_blocked = ready_card("alpha-blocked", 11);
+    alpha_blocked.status = CardStatus::Blocked;
+    alpha_blocked.repo = Some("alpha".to_string());
+    let mut alpha_expired = ready_card("alpha-expired", 12);
+    alpha_expired.repo = Some("alpha".to_string());
+    let mut beta_running = ready_card("beta-running", 13);
+    beta_running.repo = Some("beta".to_string());
+    let mut beta_input = ready_card("beta-input", 14);
+    beta_input.repo = Some("beta".to_string());
+    let mut beta_done = ready_card("beta-done", 15);
+    beta_done.status = CardStatus::Done;
+    beta_done.repo = Some("beta".to_string());
+    let mut secret_ready = ready_card("secret-ready", 16);
+    secret_ready.repo = Some("secret".to_string());
+
+    store.import_cards(vec![
+        alpha_ready,
+        alpha_blocked,
+        alpha_expired,
+        beta_running,
+        beta_input,
+        beta_done,
+        secret_ready,
+    ])?;
+
+    let alpha_expired_claim = store.claim_card(
+        &CardId::new("alpha-expired")?,
+        "agent-a",
+        20,
+        5,
+        &Authority::unchecked(),
+    )?;
+    assert_eq!(alpha_expired_claim.expires_at, 25);
+    let beta_running_claim = store.claim_card(
+        &CardId::new("beta-running")?,
+        "agent-b",
+        80,
+        100,
+        &Authority::unchecked(),
+    )?;
+    store.update_status(
+        &CardId::new("beta-running")?,
+        CardStatus::Running,
+        81,
+        &Authority::unchecked(),
+    )?;
+    let beta_input_claim = store.claim_card(
+        &CardId::new("beta-input")?,
+        "agent-b",
+        82,
+        100,
+        &Authority::unchecked(),
+    )?;
+    store.request_input(
+        &beta_input_claim.run_id,
+        "Need operator decision?",
+        83,
+        &Authority::unchecked(),
+    )?;
+    assert_eq!(beta_running_claim.expires_at, 180);
+
+    let stats = store.board_stats(BoardStatsQuery {
+        now: 100,
+        ..BoardStatsQuery::default()
+    })?;
+    assert_eq!(stats.repos.len(), 2);
+    assert_eq!(stats.totals.cards, 6);
+    assert_eq!(stats.totals.ready, 1);
+    assert_eq!(stats.totals.claimed, 1);
+    assert_eq!(stats.totals.running, 1);
+    assert_eq!(stats.totals.awaiting_input, 1);
+    assert_eq!(stats.totals.blocked, 1);
+    assert_eq!(stats.totals.done, 1);
+    assert_eq!(stats.totals.active_claims, 2);
+
+    let alpha = stats
+        .repos
+        .iter()
+        .find(|row| row.repo.as_deref() == Some("alpha"))
+        .expect("alpha stats");
+    assert_eq!(alpha.counts.cards, 3);
+    assert_eq!(alpha.counts.ready, 1);
+    assert_eq!(alpha.counts.claimed, 1);
+    assert_eq!(alpha.counts.blocked, 1);
+    assert_eq!(alpha.counts.active_claims, 0);
+
+    let beta = stats
+        .repos
+        .iter()
+        .find(|row| row.repo.as_deref() == Some("beta"))
+        .expect("beta stats");
+    assert_eq!(beta.counts.cards, 3);
+    assert_eq!(beta.counts.running, 1);
+    assert_eq!(beta.counts.awaiting_input, 1);
+    assert_eq!(beta.counts.done, 1);
+    assert_eq!(beta.counts.active_claims, 2);
+
+    let beta_alias_stats = store.board_stats(BoardStatsQuery {
+        repo: Some("misty-step/beta".to_string()),
+        now: 100,
+        ..BoardStatsQuery::default()
+    })?;
+    assert_eq!(beta_alias_stats.repos.len(), 1);
+    assert_eq!(beta_alias_stats.totals.cards, 3);
+    assert_eq!(beta_alias_stats.repos[0].repo.as_deref(), Some("beta"));
+
+    let hidden_default = store.board_stats(BoardStatsQuery {
+        repo: Some("secret".to_string()),
+        now: 100,
+        ..BoardStatsQuery::default()
+    })?;
+    assert_eq!(hidden_default.totals.cards, 0);
+    assert!(hidden_default.repos.is_empty());
+
+    let with_hidden = store.board_stats(BoardStatsQuery {
+        include_hidden: true,
+        now: 100,
+        ..BoardStatsQuery::default()
+    })?;
+    assert_eq!(with_hidden.totals.cards, 7);
+    assert_eq!(with_hidden.totals.ready, 2);
+    assert!(with_hidden
+        .repos
+        .iter()
+        .any(|row| row.repo.as_deref() == Some("secret") && row.counts.ready == 1));
     Ok(())
 }
 

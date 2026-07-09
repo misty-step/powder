@@ -6,7 +6,7 @@ use powder_core::{
     ReadyQuery, RunId,
 };
 use powder_store::{
-    CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
+    BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
     RepositoryVisibility, Store,
 };
 use serde_json::{json, Value};
@@ -34,6 +34,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "list_cards",
         description: "Scan card summaries by optional status/repo filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
         input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "board_stats",
+        description: "call before list_cards when you need board shape, not card contents.",
+        input_schema: r#"{"type":"object","properties":{"repo":{"type":"string"},"include_hidden":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "create_card",
@@ -378,6 +383,13 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             card_summary_page_payload(&page.cards, page.total_count)
         }
+        "board_stats" => json!(store
+            .board_stats(BoardStatsQuery {
+                repo: optional_str(args, "repo").map(str::to_string),
+                include_hidden: args["include_hidden"].as_bool().unwrap_or(false),
+                now,
+            })
+            .map_err(to_string)?),
         "create_card" => {
             let id = CardId::new(required_str(args, "id")?).map_err(to_string)?;
             let title = required_str(args, "title")?;
@@ -1033,7 +1045,9 @@ fn to_string(err: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use powder_core::parse_backlog_card;
-    use powder_store::{RepositoryTier, RepositoryVisibility, Store, WorkLogAttribution};
+    use powder_store::{
+        RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store, WorkLogAttribution,
+    };
 
     /// `complete_card`'s hand-written `input_schema` string had a missing
     /// closing brace that made every `tool_defs_json()` call -- and
@@ -1054,7 +1068,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 18);
+        assert_eq!(default_tools.len(), 19);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1157,6 +1171,7 @@ mod tests {
             vec![
                 "list_ready",
                 "list_cards",
+                "board_stats",
                 "create_card",
                 "update_card",
                 "list_repositories",
@@ -1175,7 +1190,7 @@ mod tests {
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 18);
+        assert_eq!(default_names.len(), 19);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1187,7 +1202,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 27);
+        assert_eq!(admin_names.len(), 28);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -1546,6 +1561,53 @@ Expose tools against the DB.
         assert_eq!(
             invalid,
             "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+        );
+    }
+
+    #[test]
+    fn mcp_board_stats_returns_compact_status_counts() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        for index in 0..10 {
+            let repo = format!("r{index:02}");
+            store
+                .upsert_repository(
+                    RepositoryUpsert {
+                        name: repo.clone(),
+                        aliases: None,
+                        visibility: Some(RepositoryVisibility::Visible),
+                        tier: Some(RepositoryTier::Active),
+                        import_provenance: Some("board stats compact fixture".to_string()),
+                    },
+                    1,
+                )
+                .unwrap();
+            call_tool_store(
+                &mut store,
+                "create_card",
+                &json!({
+                    "id": format!("{repo}-001"),
+                    "title": format!("{repo} ready"),
+                    "acceptance": ["proof"],
+                    "status": "ready",
+                    "repo": repo
+                }),
+                10 + index,
+            )
+            .unwrap();
+        }
+
+        let stats = call_tool_store(&mut store, "board_stats", &json!({}), 30).unwrap();
+        let text = stats["content"][0]["text"].as_str().unwrap();
+        let payload = tool_payload(&stats);
+
+        assert_eq!(payload["totals"]["cards"], 10);
+        assert_eq!(payload["totals"]["ready"], 10);
+        assert_eq!(payload["repos"].as_array().unwrap().len(), 10);
+        assert!(
+            text.len() < 600,
+            "10-repo board_stats response was {} chars: {text}",
+            text.len()
         );
     }
 
