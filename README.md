@@ -158,6 +158,29 @@ silently diverge from an operator's interactive shell. `initialize` reports
 `result.serverInfo.baseUrl`, so a caller can confirm the two faces agree
 instead of guessing at deployment drift from intermittent connection errors.
 
+The repo also includes a deterministic MCP tool-use eval harness. It creates
+throwaway fixture SQLite DBs, starts the real `powder-mcp` binary over stdio,
+runs four scripted scenarios, and prints one compact baseline table. `response
+chars` is the total visible tool-result JSON text, plus JSON-RPC error message
+text for recovery scenarios:
+
+```sh
+cargo build -q -p powder-mcp --bin powder-mcp
+cargo run -q -p powder-mcp --example eval
+```
+
+Set `POWDER_MCP_BIN=/path/to/powder-mcp` to force a specific binary. The
+integration test runs the same harness without any LLM calls:
+
+```sh
+cargo test -p powder-mcp --test tool_use_eval
+```
+
+To add a scenario, extend `crates/powder-mcp/src/eval_harness.rs` with a seed
+function, a stdio tool-call script, and persisted end-state assertions, then
+add the scenario to `run_eval`. Keep setup synthetic and repo-local: fixture
+data is written only to temp SQLite DBs, never to checked-in backlog data.
+
 Agents that talk to the HTTP API directly, without the CLI or MCP, can read
 `GET /api/v1/routes` for the full route contract with example request bodies
 naming required fields -- `POST /api/v1/cards` and
