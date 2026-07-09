@@ -37,7 +37,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "update_card",
-        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, labels) on one existing card without replacing protected lifecycle or source metadata. In remote mode the deployed instance requires an admin-scope key.",
+        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; read the criteria field back for acceptance state. In remote mode the deployed instance requires an admin-scope key.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string"},"priority":{"type":"string"},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
@@ -1041,6 +1041,7 @@ Expose tools against the DB.
         )
         .unwrap();
         let created = tool_payload(&created);
+        assert!(created.get("acceptance").is_none());
         assert_eq!(created["proof_plan"][0], "PR link plus smoke transcript");
         assert_eq!(
             created["criteria"][0]["text"],
@@ -1084,6 +1085,7 @@ Expose tools against the DB.
         )
         .unwrap();
         let detail = tool_payload(&detail);
+        assert!(detail["card"].get("acceptance").is_none());
         assert_eq!(
             detail["card"]["proof_plan"][0],
             "PR link plus smoke transcript"
@@ -1097,6 +1099,48 @@ Expose tools against the DB.
             .unwrap()
             .iter()
             .any(|event| { event["event_type"] == "criterion" && event["actor"] == "operator" }));
+    }
+
+    #[test]
+    fn mcp_card_responses_emit_criteria_but_not_acceptance() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "criteria-wire",
+                "title": "Criteria wire",
+                "acceptance": ["prove the wire shape"],
+                "status": "ready",
+                "actor": "operator"
+            }),
+            10,
+        )
+        .unwrap();
+
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "criteria-wire"}),
+            11,
+        )
+        .unwrap();
+        let detail = tool_payload(&detail);
+        let card = &detail["card"];
+        assert!(card.get("acceptance").is_none());
+        assert_eq!(card["criteria"][0]["text"], "prove the wire shape");
+
+        let listed = call_tool_store(&mut store, "list_cards", &json!({"limit": 50}), 12).unwrap();
+        let cards = tool_payload(&listed);
+        let listed_card = cards
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == "criteria-wire")
+            .unwrap();
+        assert!(listed_card.get("acceptance").is_none());
+        assert_eq!(listed_card["criteria"][0]["text"], "prove the wire shape");
     }
 
     #[test]
@@ -1128,12 +1172,15 @@ Expose tools against the DB.
         let patched = tool_payload(&patched);
         assert_eq!(patched["title"], "Edited via MCP");
         assert_eq!(patched["body"], "Edited body");
+        assert!(patched.get("acceptance").is_none());
         assert_eq!(patched["criteria"][0]["text"], "new oracle");
 
         let detail =
             call_tool_store(&mut store, "get_card", &json!({"card_id": "007"}), 11).unwrap();
         let detail = tool_payload(&detail);
         assert_eq!(detail["card"]["title"], "Edited via MCP");
+        assert!(detail["card"].get("acceptance").is_none());
+        assert_eq!(detail["card"]["criteria"][0]["text"], "new oracle");
         assert!(detail["events"]
             .as_array()
             .unwrap()

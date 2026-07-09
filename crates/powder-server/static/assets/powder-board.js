@@ -1085,9 +1085,7 @@ function section(title, body) {
 }
 
 function acceptanceHTML(card) {
-  const criteria = Array.isArray(card.criteria) && card.criteria.length
-    ? card.criteria
-    : (card.acceptance || []).map((item) => ({ text: item, checked_at: null, checked_by: null, proof_links: [] }));
+  const criteria = Array.isArray(card.criteria) ? card.criteria : [];
   if (!criteria.length) return empty("No acceptance oracle.");
   return `<ul class="pw-acc-list">${criteria.map((criterion) => {
     const checked = Boolean(criterion.checked_at);
