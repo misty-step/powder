@@ -162,14 +162,71 @@ pub const TOOLS: &[ToolDef] = &[
     },
 ];
 
+pub const ADMIN_TOOL_NAMES: &[&str] = &[
+    "create_event_subscription",
+    "list_event_subscriptions",
+    "disable_event_subscription",
+    "list_dead_letters",
+    "tail_events",
+    "list_keys",
+    "upsert_repository",
+    "delete_repository",
+    "merge_repository_alias",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toolset {
+    Default,
+    WithAdmin,
+}
+
+impl Toolset {
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var("POWDER_MCP_TOOLSETS") {
+            Ok(raw) => Self::parse(&raw),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Default),
+            Err(std::env::VarError::NotUnicode(_)) => Err(
+                "POWDER_MCP_TOOLSETS must be valid UTF-8; unset it or set it to admin or all"
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "" => Ok(Self::Default),
+            "admin" | "all" => Ok(Self::WithAdmin),
+            value => Err(format!(
+                "POWDER_MCP_TOOLSETS must be unset, admin, or all; got {value:?}"
+            )),
+        }
+    }
+
+    fn includes(self, tool_name: &str) -> bool {
+        self == Self::WithAdmin || !is_admin_tool(tool_name)
+    }
+}
+
 pub fn tools() -> &'static [ToolDef] {
     TOOLS
 }
 
+pub fn tools_for(toolset: Toolset) -> Vec<&'static ToolDef> {
+    TOOLS
+        .iter()
+        .filter(|tool| toolset.includes(tool.name))
+        .collect()
+}
+
 pub fn tool_defs_json() -> Value {
+    tool_defs_json_for(Toolset::Default)
+}
+
+pub fn tool_defs_json_for(toolset: Toolset) -> Value {
     Value::Array(
         TOOLS
             .iter()
+            .filter(|tool| toolset.includes(tool.name))
             .map(|tool| {
                 json!({
                     "name": tool.name,
@@ -183,6 +240,15 @@ pub fn tool_defs_json() -> Value {
 }
 
 pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Option<Value> {
+    handle_json_rpc_store_with_toolset(store, request, now, Toolset::Default)
+}
+
+pub fn handle_json_rpc_store_with_toolset(
+    store: &mut Store,
+    request: &Value,
+    now: i64,
+    toolset: Toolset,
+) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
 
@@ -195,12 +261,12 @@ pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Op
             "capabilities": {"tools": {"listChanged": false}},
             "instructions": INSTRUCTIONS,
         })),
-        "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
+        "tools/list" => Ok(json!({ "tools": tool_defs_json_for(toolset) })),
         "tools/call" => {
             let params = &request["params"];
             let name = params["name"].as_str().unwrap_or("");
             let args = &params["arguments"];
-            call_tool_store(store, name, args, now)
+            call_tool_store_with_toolset(store, name, args, now, toolset)
         }
         "ping" => Ok(json!({})),
         other => Err(format!("method not found: {other}")),
@@ -220,6 +286,14 @@ pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Op
 /// deployed instance's HTTP API via `client` instead of a local `Store`. The
 /// deployed instance supplies its own clock, so there is no `now` parameter.
 pub fn handle_json_rpc_remote(client: &RemoteClient, request: &Value) -> Option<Value> {
+    handle_json_rpc_remote_with_toolset(client, request, Toolset::Default)
+}
+
+pub fn handle_json_rpc_remote_with_toolset(
+    client: &RemoteClient,
+    request: &Value,
+    toolset: Toolset,
+) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
 
@@ -236,12 +310,12 @@ pub fn handle_json_rpc_remote(client: &RemoteClient, request: &Value) -> Option<
             "capabilities": {"tools": {"listChanged": false}},
             "instructions": INSTRUCTIONS,
         })),
-        "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
+        "tools/list" => Ok(json!({ "tools": tool_defs_json_for(toolset) })),
         "tools/call" => {
             let params = &request["params"];
             let name = params["name"].as_str().unwrap_or("");
             let args = &params["arguments"];
-            call_tool_remote(client, name, args)
+            call_tool_remote_with_toolset(client, name, args, toolset)
         }
         "ping" => Ok(json!({})),
         other => Err(format!("method not found: {other}")),
@@ -255,6 +329,27 @@ pub fn handle_json_rpc_remote(client: &RemoteClient, request: &Value) -> Option<
             "error": {"code": -32603, "message": message},
         }),
     })
+}
+
+pub fn call_tool_store_with_toolset(
+    store: &mut Store,
+    name: &str,
+    args: &Value,
+    now: i64,
+    toolset: Toolset,
+) -> Result<Value, String> {
+    ensure_tool_enabled(name, toolset)?;
+    call_tool_store(store, name, args, now)
+}
+
+pub fn call_tool_remote_with_toolset(
+    client: &RemoteClient,
+    name: &str,
+    args: &Value,
+    toolset: Toolset,
+) -> Result<Value, String> {
+    ensure_tool_enabled(name, toolset)?;
+    call_tool_remote(client, name, args)
 }
 
 pub fn call_tool_store(
@@ -527,6 +622,21 @@ pub fn call_tool_store(
 
     let text = serde_json::to_string(&payload).map_err(to_string)?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
+}
+
+fn ensure_tool_enabled(name: &str, toolset: Toolset) -> Result<(), String> {
+    if TOOLS.iter().any(|tool| tool.name == name) && !toolset.includes(name) {
+        return Err(format!(
+            "tool {name} is hidden from the default Powder MCP persona; set \
+             POWDER_MCP_TOOLSETS=admin or POWDER_MCP_TOOLSETS=all before starting \
+             powder-mcp to enable admin tools"
+        ));
+    }
+    Ok(())
+}
+
+fn is_admin_tool(name: &str) -> bool {
+    ADMIN_TOOL_NAMES.contains(&name)
 }
 
 fn card_summary_page_payload(cards: &[Card], total_count: usize) -> Value {
@@ -862,7 +972,11 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{}: invalid input_schema JSON: {err}", tool.name));
         }
 
-        let listed = tool_defs_json();
+        let default_listed = tool_defs_json_for(Toolset::Default);
+        let default_tools = default_listed.as_array().unwrap();
+        assert_eq!(default_tools.len(), 18);
+
+        let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
         assert_eq!(tools.len(), TOOLS.len());
 
@@ -914,21 +1028,48 @@ mod tests {
 
     #[test]
     fn mcp_tools_are_agent_intents_not_rest_routes() {
-        let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
+        let default_names = tool_names(Toolset::Default);
+        let admin_names = tool_names(Toolset::WithAdmin);
 
-        assert_eq!(TOOLS.len(), 27);
-        assert!(names.contains(&"list_ready"));
-        assert!(names.contains(&"list_cards"));
-        assert!(names.contains(&"create_card"));
-        assert!(names.contains(&"update_card"));
-        assert!(names.contains(&"list_repositories"));
-        assert!(names.contains(&"upsert_repository"));
-        assert!(names.contains(&"merge_repository_alias"));
-        assert!(names.contains(&"delete_repository"));
-        assert!(names.contains(&"update_relations"));
-        assert!(names.contains(&"add_comment"));
-        assert!(names.contains(&"append_work_log"));
-        assert!(names.contains(&"manage_claim"));
+        assert_eq!(
+            default_names,
+            vec![
+                "list_ready",
+                "list_cards",
+                "create_card",
+                "update_card",
+                "list_repositories",
+                "manage_claim",
+                "get_card",
+                "get_run",
+                "list_awaiting_input",
+                "answer_input",
+                "update_status",
+                "check_criterion",
+                "update_relations",
+                "add_link",
+                "add_comment",
+                "append_work_log",
+                "request_input",
+                "complete_card",
+            ]
+        );
+        assert_eq!(default_names.len(), 18);
+        for admin_tool in ADMIN_TOOL_NAMES {
+            assert!(
+                !default_names.contains(admin_tool),
+                "{admin_tool} must be hidden from the default MCP persona"
+            );
+        }
+
+        assert_eq!(
+            admin_names,
+            TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
+        );
+        assert_eq!(admin_names.len(), 27);
+        assert!(admin_names.contains(&"upsert_repository"));
+        assert!(admin_names.contains(&"merge_repository_alias"));
+        assert!(admin_names.contains(&"delete_repository"));
         for removed in [
             "claim_card",
             "release_claim",
@@ -937,23 +1078,101 @@ mod tests {
             "heartbeat",
         ] {
             assert!(
-                !names.contains(&removed),
+                !admin_names.contains(&removed),
                 "{removed} must stay consolidated"
             );
         }
-        assert!(names.contains(&"get_card"));
-        assert!(names.contains(&"get_run"));
-        assert!(names.contains(&"list_awaiting_input"));
-        assert!(names.contains(&"answer_input"));
-        assert!(names.contains(&"add_link"));
-        assert!(names.contains(&"check_criterion"));
-        assert!(names.contains(&"request_input"));
-        assert!(names.contains(&"create_event_subscription"));
-        assert!(names.contains(&"list_event_subscriptions"));
-        assert!(names.contains(&"disable_event_subscription"));
-        assert!(names.contains(&"list_dead_letters"));
-        assert!(names.contains(&"tail_events"));
-        assert!(names.contains(&"list_keys"));
+        assert!(admin_names.contains(&"create_event_subscription"));
+        assert!(admin_names.contains(&"list_event_subscriptions"));
+        assert!(admin_names.contains(&"disable_event_subscription"));
+        assert!(admin_names.contains(&"list_dead_letters"));
+        assert!(admin_names.contains(&"tail_events"));
+        assert!(admin_names.contains(&"list_keys"));
+    }
+
+    #[test]
+    fn toolset_env_is_startup_static_configuration() {
+        assert_eq!(Toolset::parse(""), Ok(Toolset::Default));
+        assert_eq!(Toolset::parse("admin"), Ok(Toolset::WithAdmin));
+        assert_eq!(Toolset::parse(" all "), Ok(Toolset::WithAdmin));
+        let err = Toolset::parse("runtime").unwrap_err();
+        assert!(err.contains("POWDER_MCP_TOOLSETS"));
+    }
+
+    #[test]
+    fn json_rpc_tools_list_uses_the_same_toolset_in_store_and_remote_modes() {
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let store_default =
+            handle_json_rpc_store_with_toolset(&mut store, &request, 10, Toolset::Default).unwrap();
+        assert_eq!(
+            json_rpc_tool_names(&store_default),
+            tool_names(Toolset::Default)
+        );
+
+        let store_admin =
+            handle_json_rpc_store_with_toolset(&mut store, &request, 10, Toolset::WithAdmin)
+                .unwrap();
+        assert_eq!(
+            json_rpc_tool_names(&store_admin),
+            tool_names(Toolset::WithAdmin)
+        );
+
+        let client = RemoteClient::new("http://127.0.0.1:4017".to_string(), None);
+        let remote_default =
+            handle_json_rpc_remote_with_toolset(&client, &request, Toolset::Default).unwrap();
+        assert_eq!(
+            json_rpc_tool_names(&remote_default),
+            tool_names(Toolset::Default)
+        );
+
+        let remote_admin =
+            handle_json_rpc_remote_with_toolset(&client, &request, Toolset::WithAdmin).unwrap();
+        assert_eq!(
+            json_rpc_tool_names(&remote_admin),
+            tool_names(Toolset::WithAdmin)
+        );
+    }
+
+    #[test]
+    fn hidden_admin_tool_calls_name_toolsets_env_in_store_and_remote_modes() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "create_event_subscription", "arguments": {}}
+        });
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let store_response =
+            handle_json_rpc_store_with_toolset(&mut store, &request, 10, Toolset::Default).unwrap();
+        let store_message = store_response["error"]["message"].as_str().unwrap();
+        assert!(store_message.contains("create_event_subscription"));
+        assert!(store_message.contains("POWDER_MCP_TOOLSETS"));
+
+        let client = RemoteClient::new("http://127.0.0.1:1".to_string(), None);
+        let remote_response =
+            handle_json_rpc_remote_with_toolset(&client, &request, Toolset::Default).unwrap();
+        let remote_message = remote_response["error"]["message"].as_str().unwrap();
+        assert!(remote_message.contains("create_event_subscription"));
+        assert!(remote_message.contains("POWDER_MCP_TOOLSETS"));
+    }
+
+    #[test]
+    fn admin_toolset_allows_store_dispatch_of_hidden_tools() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let listed = call_tool_store_with_toolset(
+            &mut store,
+            "list_keys",
+            &json!({}),
+            10,
+            Toolset::WithAdmin,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&listed)["keys"], json!([]));
     }
 
     #[test]
@@ -1983,5 +2202,21 @@ Expose tools against the DB.
             response["result"]["serverInfo"]["baseUrl"],
             "http://127.0.0.1:4017"
         );
+    }
+
+    fn tool_names(toolset: Toolset) -> Vec<&'static str> {
+        tools_for(toolset)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
+    fn json_rpc_tool_names(response: &Value) -> Vec<&str> {
+        response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect()
     }
 }

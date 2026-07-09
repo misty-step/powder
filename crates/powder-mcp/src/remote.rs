@@ -1222,6 +1222,37 @@ mod tests {
     }
 
     #[test]
+    fn admin_toolset_allows_remote_json_rpc_dispatch_of_hidden_tools() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"keys": [{"id": "key-1", "name": "codex", "scope": "agent", "actor": "codex", "key_prefix": "sk_powder_abc", "created_at": 1, "revoked_at": null, "last_used_at": 5}]}),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let response = crate::handle_json_rpc_remote_with_toolset(
+            &client,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "list_keys", "arguments": {}}
+            }),
+            crate::Toolset::WithAdmin,
+        )
+        .unwrap();
+
+        assert!(response.get("error").is_none());
+        assert!(tool_payload(&response["result"])["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|key| key["last_used_at"] == 5));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v1/keys");
+    }
+
+    #[test]
     fn lease_owner_forbidden_response_surfaces_the_deployed_error_message() {
         let (base_url, _recorded) = spawn_test_server(vec![(
             403,
