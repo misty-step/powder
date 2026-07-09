@@ -22,6 +22,8 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, heartbeat and renew_claim before the lease gets stale. If you stop voluntarily, release_claim. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback.";
+
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
@@ -211,6 +213,7 @@ pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Op
                 .unwrap_or("2024-11-05"),
             "serverInfo": {"name": "powder", "version": env!("CARGO_PKG_VERSION")},
             "capabilities": {"tools": {"listChanged": false}},
+            "instructions": INSTRUCTIONS,
         })),
         "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
         "tools/call" => {
@@ -251,6 +254,7 @@ pub fn handle_json_rpc_remote(client: &RemoteClient, request: &Value) -> Option<
                 "baseUrl": client.base_url(),
             },
             "capabilities": {"tools": {"listChanged": false}},
+            "instructions": INSTRUCTIONS,
         })),
         "tools/list" => Ok(json!({ "tools": tool_defs_json() })),
         "tools/call" => {
@@ -891,6 +895,36 @@ mod tests {
         assert!(names.contains(&"list_dead_letters"));
         assert!(names.contains(&"tail_events"));
         assert!(names.contains(&"list_keys"));
+    }
+
+    #[test]
+    fn mcp_server_instructions_fit_initialize_budget() {
+        assert!(
+            INSTRUCTIONS.len() <= 1400,
+            "MCP server instructions must stay within the card budget"
+        );
+    }
+
+    #[test]
+    fn initialize_responses_include_operating_instructions_in_store_and_remote_modes() {
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let store_response = handle_json_rpc_store(&mut store, &request, 10).unwrap();
+        assert_eq!(store_response["result"]["instructions"], INSTRUCTIONS);
+
+        let client = RemoteClient::new("http://127.0.0.1:4017".to_string(), None);
+        let remote_response = handle_json_rpc_remote(&client, &request).unwrap();
+        assert_eq!(remote_response["result"]["instructions"], INSTRUCTIONS);
+
+        for response in [store_response, remote_response] {
+            let instructions = response["result"]["instructions"].as_str().unwrap();
+            assert!(instructions.contains("list_ready"));
+            assert!(instructions.contains("claim exactly one card"));
+            assert!(instructions.contains("get_card"));
+            assert!(instructions.contains("complete_card"));
+        }
     }
 
     /// powder-940: `last_used_at` already recorded on auth and surfaced via
