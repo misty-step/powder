@@ -6,6 +6,7 @@
 //! `actor`/`admin` tool arguments needed.
 
 use powder_api::{urlencode, RemoteClient};
+use powder_core::{Card, CardSummary};
 use serde_json::{json, Value};
 
 use super::{card_id, optional_str, required_str, run_id, to_string};
@@ -13,11 +14,12 @@ use super::{card_id, optional_str, required_str, run_id, to_string};
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
     let payload = match name {
         "list_ready" => {
-            let limit = args["limit"].as_u64().unwrap_or(20);
-            client.get(&format!("/api/v1/cards/ready?limit={limit}"))?["cards"].clone()
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let response = client.get(&format!("/api/v1/cards/ready?limit={limit}"))?;
+            remote_card_summary_page_payload(response, limit)?
         }
         "list_cards" => {
-            let limit = args["limit"].as_u64().unwrap_or(20);
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mut query = format!("limit={limit}");
             if let Some(status) = args["status"].as_str() {
                 query.push_str(&format!("&status={}", urlencode(status)));
@@ -25,7 +27,8 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(repo) = args["repo"].as_str() {
                 query.push_str(&format!("&repo={}", urlencode(repo)));
             }
-            client.get(&format!("/api/v1/cards?{query}"))?["cards"].clone()
+            let response = client.get(&format!("/api/v1/cards?{query}"))?;
+            remote_card_summary_page_payload(response, limit)?
         }
         "create_card" => {
             let id = required_str(args, "id")?;
@@ -303,6 +306,26 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
     Ok(json!({"content": [{"type": "text", "text": text}]}))
 }
 
+fn remote_card_summary_page_payload(response: Value, limit: usize) -> Result<Value, String> {
+    let cards =
+        serde_json::from_value::<Vec<Card>>(response["cards"].clone()).map_err(to_string)?;
+    let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
+    let returned = summaries.len();
+    let limit = limit.max(1);
+
+    let mut payload = json!({
+        "cards": summaries,
+        "has_more": returned >= limit,
+    });
+    if returned < limit {
+        payload["total_count"] = json!(returned);
+    } else {
+        payload["hint"] =
+            json!("remote total_count is unknown; raise limit or filter by status/repo");
+    }
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +416,22 @@ mod tests {
         });
 
         (format!("http://{addr}"), recorded)
+    }
+
+    fn api_card(id: &str, title: &str, status: &str, priority: &str, updated_at: i64) -> Value {
+        json!({
+            "id": id,
+            "title": title,
+            "body": format!("{title} full body"),
+            "status": status,
+            "priority": priority,
+            "created_at": 1,
+            "updated_at": updated_at,
+        })
+    }
+
+    fn tool_payload(result: &Value) -> Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
     }
 
     #[test]
@@ -535,8 +574,10 @@ mod tests {
 
     #[test]
     fn list_ready_sends_get_with_limit_query() {
-        let (base_url, recorded) =
-            spawn_test_server(vec![(200, json!({"cards": [{"id": "001"}]}))]);
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"cards": [api_card("001", "Remote ready", "ready", "p0", 10)]}),
+        )]);
         let client = RemoteClient::new(base_url, None);
 
         let result = call_tool_remote(&client, "list_ready", &json!({"limit": 5})).unwrap();
@@ -553,8 +594,10 @@ mod tests {
 
     #[test]
     fn list_cards_sends_get_with_status_and_url_encoded_repo_query() {
-        let (base_url, recorded) =
-            spawn_test_server(vec![(200, json!({"cards": [{"id": "blocked-1"}]}))]);
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"cards": [api_card("blocked-1", "Blocked remote", "blocked", "p1", 10)]}),
+        )]);
         let client = RemoteClient::new(base_url, None);
 
         let result = call_tool_remote(
@@ -574,6 +617,78 @@ mod tests {
             requests[0].path,
             "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
         );
+    }
+
+    #[test]
+    fn list_cards_remote_dispatch_projects_summary_envelope_with_limit_heuristic() {
+        let mut first_card = api_card("remote-1", "Remote one", "ready", "p0", 10);
+        first_card["repo"] = json!("misty-step/powder");
+        first_card["labels"] = json!(["mcp"]);
+        first_card["criteria"] = json!([
+            {"text": "first", "checked_by": "codex"},
+            {"text": "second"}
+        ]);
+
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (200, json!({"cards": [first_card]})),
+            (
+                200,
+                json!({"cards": [
+                    api_card("remote-2", "Remote two", "running", "p1", 20),
+                    api_card("remote-3", "Remote three", "blocked", "p2", 30)
+                ]}),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, None);
+
+        let first_response = crate::handle_json_rpc_remote(
+            &client,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_cards",
+                    "arguments": {"limit": 3}
+                }
+            }),
+        )
+        .unwrap();
+        let first_payload = tool_payload(&first_response["result"]);
+
+        assert_eq!(first_payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(first_payload["cards"][0]["id"], "remote-1");
+        assert_eq!(first_payload["cards"][0]["title"], "Remote one");
+        assert_eq!(first_payload["cards"][0]["repo"], "misty-step/powder");
+        assert_eq!(first_payload["cards"][0]["labels"], json!(["mcp"]));
+        assert_eq!(first_payload["cards"][0]["criteria_checked"], 1);
+        assert_eq!(first_payload["cards"][0]["criteria_total"], 2);
+        assert!(first_payload["cards"][0].get("body").is_none());
+        assert_eq!(first_payload["total_count"], 1);
+        assert_eq!(first_payload["has_more"], false);
+        assert!(first_payload.get("hint").is_none());
+
+        let second_response = crate::handle_json_rpc_remote(
+            &client,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_cards",
+                    "arguments": {"limit": 2}
+                }
+            }),
+        )
+        .unwrap();
+        let second_payload = tool_payload(&second_response["result"]);
+
+        assert_eq!(second_payload["cards"].as_array().unwrap().len(), 2);
+        assert_eq!(second_payload["has_more"], true);
+        assert!(second_payload.get("total_count").is_none());
+        let hint = second_payload["hint"].as_str().unwrap();
+        assert!(hint.contains("raise limit"));
+        assert!(hint.contains("filter"));
     }
 
     #[test]
