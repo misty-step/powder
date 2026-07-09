@@ -123,6 +123,12 @@ pub struct CardFilter {
     pub repo: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardListPage {
+    pub cards: Vec<Card>,
+    pub total_count: usize,
+}
+
 /// Explicit partial update for mutable card fields. Fields left as `None`
 /// are preserved from the stored row; lifecycle/source/workspace fields are
 /// intentionally absent from this shape.
@@ -621,6 +627,10 @@ impl Store {
     }
 
     pub fn list_ready(&self, query: ReadyQuery) -> Result<Vec<Card>> {
+        Ok(self.list_ready_page(query)?.cards)
+    }
+
+    pub fn list_ready_page(&self, query: ReadyQuery) -> Result<CardListPage> {
         let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
         let records = statement
             .query_map([], CardRecord::from_row)?
@@ -645,6 +655,7 @@ impl Store {
             }
             cards.push(card);
         }
+        let total_count = cards.len();
 
         cards.sort_by(|left, right| {
             left.priority
@@ -653,7 +664,7 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
         });
         cards.truncate(query.limit);
-        Ok(cards)
+        Ok(CardListPage { cards, total_count })
     }
 
     /// List cards by optional `status`/`repo` filter, not just ready-eligible
@@ -662,6 +673,10 @@ impl Store {
     /// cards no other surface can enumerate without opening the database
     /// file directly. Same sort as `list_ready` (priority, age, id).
     pub fn list_cards(&self, filter: &CardFilter, limit: usize) -> Result<Vec<Card>> {
+        Ok(self.list_cards_page(filter, limit)?.cards)
+    }
+
+    pub fn list_cards_page(&self, filter: &CardFilter, limit: usize) -> Result<CardListPage> {
         let repo_filter_requested = filter.repo.is_some();
         let requested_repo_label = filter.repo.as_deref().and_then(canonical_repo_label);
         let repo_filter = filter
@@ -691,6 +706,7 @@ impl Store {
                 None => !repo_filter_requested,
             })
             .collect::<Vec<_>>();
+        let total_count = cards.len();
 
         cards.sort_by(|left, right| {
             left.priority
@@ -699,7 +715,7 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
         });
         cards.truncate(limit.max(1));
-        Ok(cards)
+        Ok(CardListPage { cards, total_count })
     }
 
     pub fn claim_card(

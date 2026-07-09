@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 pub use powder_api::RemoteClient;
-use powder_core::{Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
+use powder_core::{
+    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, Priority, ReadyQuery, RunId,
+};
 use powder_store::{
     CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
     RepositoryVisibility, Store,
@@ -22,12 +24,12 @@ pub struct ToolDef {
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
-        description: "List claimable cards sorted by priority, age, and identifier. Use before claiming work.",
+        description: "Scan claimable card summaries sorted by priority, age, and identifier. Use get_card for full card detail before implementation.",
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
         name: "list_cards",
-        description: "List cards by optional status/repo filter, not just ready-eligible ones -- enumerate blocked, in-review, or done cards.",
+        description: "Scan card summaries by optional status/repo filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
         input_schema: r#"{"type":"object","properties":{"status":{"type":"string"},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
@@ -279,9 +281,10 @@ pub fn call_tool_store(
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            json!(store
-                .list_ready(ReadyQuery::new(now, limit))
-                .map_err(to_string)?)
+            let page = store
+                .list_ready_page(ReadyQuery::new(now, limit))
+                .map_err(to_string)?;
+            card_summary_page_payload(&page.cards, page.total_count)
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -292,9 +295,10 @@ pub fn call_tool_store(
                 None => None,
             };
             let repo = args["repo"].as_str().map(str::to_string);
-            json!(store
-                .list_cards(&CardFilter { status, repo }, limit)
-                .map_err(to_string)?)
+            let page = store
+                .list_cards_page(&CardFilter { status, repo }, limit)
+                .map_err(to_string)?;
+            card_summary_page_payload(&page.cards, page.total_count)
         }
         "create_card" => {
             let id = CardId::new(required_str(args, "id")?).map_err(to_string)?;
@@ -434,10 +438,11 @@ pub fn call_tool_store(
         }
         "get_card" => {
             let card_id = card_id(args, "card_id")?;
-            json!(store
+            let detail = store
                 .get_card_detail(&card_id)
                 .map_err(to_string)?
-                .ok_or_else(|| format!("card not found: {card_id}"))?)
+                .ok_or_else(|| format!("card not found: {card_id}"))?;
+            card_detail_payload(&detail)?
         }
         "get_run" => {
             let run_id = run_id(args, "run_id")?;
@@ -575,6 +580,36 @@ pub fn call_tool_store(
 
     let text = serde_json::to_string(&payload).map_err(to_string)?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
+}
+
+fn card_summary_page_payload(cards: &[Card], total_count: usize) -> Value {
+    let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
+    let has_more = total_count > summaries.len();
+    let mut payload = json!({
+        "cards": summaries,
+        "total_count": total_count,
+        "has_more": has_more,
+    });
+    if has_more {
+        payload["hint"] = json!(format!(
+            "{} more cards; filter by status/repo or raise limit",
+            total_count - summaries.len()
+        ));
+    }
+    payload
+}
+
+fn card_detail_payload(detail: &CardDetail) -> Result<Value, String> {
+    let mut payload = serde_json::to_value(detail).map_err(to_string)?;
+    if let Some(card) = payload.get_mut("card").and_then(Value::as_object_mut) {
+        let summary = detail.card.summary();
+        card.insert(
+            "criteria_checked".to_string(),
+            json!(summary.criteria_checked),
+        );
+        card.insert("criteria_total".to_string(), json!(summary.criteria_total));
+    }
+    Ok(payload)
 }
 
 /// Wire shape for one key row, shared by store and remote dispatch so both
@@ -943,7 +978,7 @@ Expose tools against the DB.
             .unwrap();
 
         let all = call_tool_store(&mut store, "list_cards", &json!({}), 10).unwrap();
-        assert!(tool_payload(&all)
+        assert!(tool_payload(&all)["cards"]
             .as_array()
             .unwrap()
             .iter()
@@ -951,12 +986,121 @@ Expose tools against the DB.
 
         let filtered =
             call_tool_store(&mut store, "list_cards", &json!({"status": "blocked"}), 10).unwrap();
-        let cards = tool_payload(&filtered);
-        assert_eq!(cards.as_array().unwrap().len(), 1);
+        let payload = tool_payload(&filtered);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["total_count"], 1);
+        assert_eq!(payload["has_more"], false);
 
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
         assert!(invalid.contains("invalid status"));
+    }
+
+    #[test]
+    fn mcp_list_envelope_reports_total_count_has_more_and_hint() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        for index in 1..=3 {
+            call_tool_store(
+                &mut store,
+                "create_card",
+                &json!({
+                    "id": format!("powder-{index:03}"),
+                    "title": format!("Page card {index}"),
+                    "acceptance": ["prove it"],
+                    "status": "ready",
+                    "repo": "powder"
+                }),
+                10 + index,
+            )
+            .unwrap();
+        }
+
+        let listed = call_tool_store(&mut store, "list_cards", &json!({"limit": 1}), 20).unwrap();
+        let payload = tool_payload(&listed);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["total_count"], 3);
+        assert_eq!(payload["has_more"], true);
+        assert_eq!(
+            payload["hint"],
+            "2 more cards; filter by status/repo or raise limit"
+        );
+
+        let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 1}), 20).unwrap();
+        let payload = tool_payload(&ready);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["total_count"], 3);
+        assert_eq!(payload["has_more"], true);
+        assert_eq!(
+            payload["hint"],
+            "2 more cards; filter by status/repo or raise limit"
+        );
+    }
+
+    #[test]
+    fn mcp_card_summary_fields_are_subset_of_get_card_card_fields() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "powder-901",
+                "title": "Summary subset",
+                "body": "full body stays out of lists",
+                "acceptance": ["first criterion", "second criterion"],
+                "status": "ready",
+                "priority": "P1",
+                "labels": ["mcp", "summary"],
+                "repo": "powder"
+            }),
+            10,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "claim_card",
+            &json!({"card_id": "powder-901", "agent": "codex", "ttl_seconds": 60}),
+            11,
+        )
+        .unwrap();
+
+        let listed = call_tool_store(
+            &mut store,
+            "list_cards",
+            &json!({"status": "claimed", "limit": 1}),
+            12,
+        )
+        .unwrap();
+        let payload = tool_payload(&listed);
+        let summary = &payload["cards"].as_array().unwrap()[0];
+        assert!(summary.get("body").is_none());
+        assert!(summary.get("criteria").is_none());
+        assert!(summary.get("proof_plan").is_none());
+        assert!(summary["claim"].get("run_id").is_none());
+
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "powder-901"}),
+            13,
+        )
+        .unwrap();
+        let detail = tool_payload(&detail);
+        let full_card = &detail["card"];
+
+        for key in summary.as_object().unwrap().keys() {
+            assert!(
+                full_card.get(key).is_some(),
+                "summary key {key} missing from get_card card"
+            );
+        }
+        for key in summary["claim"].as_object().unwrap().keys() {
+            assert!(
+                full_card["claim"].get(key).is_some(),
+                "summary claim key {key} missing from get_card claim"
+            );
+        }
     }
 
     #[test]
@@ -1102,7 +1246,7 @@ Expose tools against the DB.
     }
 
     #[test]
-    fn mcp_card_responses_emit_criteria_but_not_acceptance() {
+    fn mcp_get_card_emits_criteria_but_lists_emit_only_summaries() {
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         call_tool_store(
@@ -1130,17 +1274,23 @@ Expose tools against the DB.
         let card = &detail["card"];
         assert!(card.get("acceptance").is_none());
         assert_eq!(card["criteria"][0]["text"], "prove the wire shape");
+        assert_eq!(card["criteria_checked"], 0);
+        assert_eq!(card["criteria_total"], 1);
 
         let listed = call_tool_store(&mut store, "list_cards", &json!({"limit": 50}), 12).unwrap();
-        let cards = tool_payload(&listed);
-        let listed_card = cards
+        let payload = tool_payload(&listed);
+        let listed_card = payload["cards"]
             .as_array()
             .unwrap()
             .iter()
             .find(|card| card["id"] == "criteria-wire")
             .unwrap();
+        assert_eq!(payload["total_count"], 1);
         assert!(listed_card.get("acceptance").is_none());
-        assert_eq!(listed_card["criteria"][0]["text"], "prove the wire shape");
+        assert!(listed_card.get("body").is_none());
+        assert!(listed_card.get("criteria").is_none());
+        assert_eq!(listed_card["criteria_checked"], 0);
+        assert_eq!(listed_card["criteria_total"], 1);
     }
 
     #[test]
