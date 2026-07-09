@@ -83,7 +83,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/{id}",
-        intent: "read one card with runs, activity, links, comments, and claim state; optional query detail=concise|detailed defaults to concise, returning the most recent 20 per history section plus totals/hint when truncated",
+        intent: "read one card with runs, activity, links, comments, and claim state; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
         body_shape: None,
     },
     ApiRoute {
@@ -183,7 +183,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/{id}",
-        intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the most recent 20 per history section plus totals/hint when truncated",
+        intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
         body_shape: None,
     },
     ApiRoute {

@@ -14,6 +14,8 @@ pub enum RepositoryVisibility {
 }
 
 impl RepositoryVisibility {
+    pub const ALL: [Self; 2] = [Self::Visible, Self::Hidden];
+
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "visible" => Some(Self::Visible),
@@ -39,6 +41,8 @@ pub enum RepositoryTier {
 }
 
 impl RepositoryTier {
+    pub const ALL: [Self; 3] = [Self::Active, Self::Backburner, Self::Archived];
+
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "active" => Some(Self::Active),

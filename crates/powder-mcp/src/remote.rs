@@ -10,8 +10,9 @@ use powder_core::{Card, CardSummary, DetailLevel};
 use serde_json::{json, Value};
 
 use super::{
-    card_id, claim_action, optional_str, required_claim_arg, required_str, run_id,
-    run_id_for_claim, to_string, ClaimAction,
+    card_id, claim_action, missing_required, optional_repository_tier,
+    optional_repository_visibility, optional_str, parse_priority, parse_status, required_claim_arg,
+    required_str, run_id, run_id_for_claim, to_string, ClaimAction,
 };
 
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
@@ -24,10 +25,11 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mut query = format!("limit={limit}");
-            if let Some(status) = args["status"].as_str() {
+            if let Some(status) = optional_str(args, "status") {
+                parse_status(status)?;
                 query.push_str(&format!("&status={}", urlencode(status)));
             }
-            if let Some(repo) = args["repo"].as_str() {
+            if let Some(repo) = optional_str(args, "repo") {
                 query.push_str(&format!("&repo={}", urlencode(repo)));
             }
             let response = client.get(&format!("/api/v1/cards?{query}"))?;
@@ -44,22 +46,24 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
                 "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
             });
-            if let Some(value) = args["body"].as_str() {
+            if let Some(value) = optional_str(args, "body") {
                 body["body"] = json!(value);
             }
             if let Some(value) = args["proof_plan"].as_array() {
                 body["proof_plan"] = json!(value);
             }
-            if let Some(value) = args["status"].as_str() {
+            if let Some(value) = optional_str(args, "status") {
+                parse_status(value)?;
                 body["status"] = json!(value);
             }
-            if let Some(value) = args["priority"].as_str() {
+            if let Some(value) = optional_str(args, "priority") {
+                parse_priority(value)?;
                 body["priority"] = json!(value);
             }
             if let Some(value) = args["labels"].as_array() {
                 body["labels"] = json!(value);
             }
-            if let Some(value) = args["repo"].as_str() {
+            if let Some(value) = optional_str(args, "repo") {
                 body["repo"] = json!(value);
             }
             let response = client.post("/api/v1/cards", body)?;
@@ -68,10 +72,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "update_card" => {
             let id = card_id(args, "card_id")?;
             let mut body = json!({});
-            if let Some(value) = args["title"].as_str() {
+            if let Some(value) = optional_str(args, "title") {
                 body["title"] = json!(value);
             }
-            if let Some(value) = args["body"].as_str() {
+            if let Some(value) = optional_str(args, "body") {
                 body["body"] = json!(value);
             }
             if let Some(value) = args["acceptance"].as_array() {
@@ -80,10 +84,12 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = args["proof_plan"].as_array() {
                 body["proof_plan"] = json!(value);
             }
-            if let Some(value) = args["status"].as_str() {
+            if let Some(value) = optional_str(args, "status") {
+                parse_status(value)?;
                 body["status"] = json!(value);
             }
-            if let Some(value) = args["priority"].as_str() {
+            if let Some(value) = optional_str(args, "priority") {
+                parse_priority(value)?;
                 body["priority"] = json!(value);
             }
             if let Some(value) = args["labels"].as_array() {
@@ -100,14 +106,16 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "upsert_repository" => {
             let name = required_str(args, "name")?;
+            optional_repository_visibility(args)?;
+            optional_repository_tier(args)?;
             client.post(
                 "/api/v1/repositories",
                 json!({
                     "name": name,
                     "aliases": args["aliases"].as_array().cloned(),
-                    "visibility": args["visibility"].as_str(),
-                    "tier": args["tier"].as_str(),
-                    "import_provenance": args["import_provenance"].as_str(),
+                    "visibility": optional_str(args, "visibility"),
+                    "tier": optional_str(args, "tier"),
+                    "import_provenance": optional_str(args, "import_provenance"),
                 }),
             )?
         }
@@ -130,11 +138,27 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "manage_claim" => manage_claim_remote(client, args)?,
         "get_card" => {
             let id = card_id(args, "card_id")?;
-            client.get(&format!("/api/v1/cards/{id}{}", detail_query(args)?))?
+            client
+                .get(&format!("/api/v1/cards/{id}{}", detail_query(args)?))
+                .map_err(|err| {
+                    steer_remote_not_found(
+                        err,
+                        format!("card not found: {id}; use list_cards to enumerate ids"),
+                    )
+                })?
         }
         "get_run" => {
             let run = run_id(args, "run_id")?;
-            client.get(&format!("/api/v1/runs/{run}{}", detail_query(args)?))?
+            client
+                .get(&format!("/api/v1/runs/{run}{}", detail_query(args)?))
+                .map_err(|err| {
+                    steer_remote_not_found(
+                        err,
+                        format!(
+                            "run not found: {run}; use list_cards then get_card to enumerate run ids"
+                        ),
+                    )
+                })?
         }
         "list_awaiting_input" => {
             let limit = args["limit"].as_u64().unwrap_or(20);
@@ -152,6 +176,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "update_status" => {
             let id = card_id(args, "card_id")?;
             let status = required_str(args, "status")?;
+            parse_status(status)?;
             let response = client.post(
                 &format!("/api/v1/cards/{id}/status"),
                 json!({"status": status}),
@@ -162,7 +187,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let id = card_id(args, "card_id")?;
             let criterion = args["criterion"]
                 .as_u64()
-                .ok_or_else(|| "criterion is required".to_string())?;
+                .ok_or_else(|| missing_required("criterion"))?;
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
             let response = client.post(
@@ -385,6 +410,14 @@ fn response_array_or_empty(response: &Value, key: &'static str) -> Result<Value,
         Some(Value::Array(values)) => Ok(Value::Array(values.clone())),
         Some(Value::Null) | None => Ok(json!([])),
         Some(_) => Err(format!("remote card response {key} must be an array")),
+    }
+}
+
+fn steer_remote_not_found(err: String, steered: String) -> String {
+    if err.starts_with("http 404:") {
+        steered
+    } else {
+        err
     }
 }
 
@@ -653,10 +686,69 @@ mod tests {
             &json!({"card_id": "001", "action": "transfer", "run_id": "run-1"}),
         )
         .unwrap_err();
-        assert_eq!(missing, "transfer requires to_agent");
+        assert_eq!(
+            missing,
+            "transfer requires to_agent (agent identity receiving the transferred claim)"
+        );
         assert!(
             recorded.lock().unwrap().is_empty(),
             "local validation errors should not call the remote server"
+        );
+    }
+
+    #[test]
+    fn remote_invalid_status_and_priority_errors_enumerate_valid_values_before_http() {
+        let (base_url, recorded) = spawn_test_server(Vec::new());
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let invalid_status = call_tool_remote(
+            &client,
+            "update_status",
+            &json!({"card_id": "001", "status": "not-real"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_status,
+            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+        );
+
+        let invalid_priority = call_tool_remote(
+            &client,
+            "create_card",
+            &json!({"id": "001", "title": "Remote", "priority": "urgent"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_priority,
+            "invalid priority \"urgent\"; valid: P0|P1|P2|P3"
+        );
+
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "schema-steered local validation should not call the remote server"
+        );
+    }
+
+    #[test]
+    fn remote_get_card_and_get_run_not_found_errors_steer() {
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (404, json!({"error": "card not found: missing"})),
+            (404, json!({"error": "run not found: run-missing"})),
+        ]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let missing_card =
+            call_tool_remote(&client, "get_card", &json!({"card_id": "missing"})).unwrap_err();
+        assert_eq!(
+            missing_card,
+            "card not found: missing; use list_cards to enumerate ids"
+        );
+
+        let missing_run =
+            call_tool_remote(&client, "get_run", &json!({"run_id": "run-missing"})).unwrap_err();
+        assert_eq!(
+            missing_run,
+            "run not found: run-missing; use list_cards then get_card to enumerate run ids"
         );
     }
 

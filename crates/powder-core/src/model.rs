@@ -190,6 +190,8 @@ pub enum Priority {
 }
 
 impl Priority {
+    pub const ALL: [Self; 4] = [Self::P0, Self::P1, Self::P2, Self::P3];
+
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_uppercase().as_str() {
             "P0" => Some(Self::P0),
@@ -225,6 +227,18 @@ pub enum CardStatus {
 }
 
 impl CardStatus {
+    pub const ALL: [Self; 9] = [
+        Self::Backlog,
+        Self::Ready,
+        Self::Claimed,
+        Self::Running,
+        Self::AwaitingInput,
+        Self::Blocked,
+        Self::Done,
+        Self::Shipped,
+        Self::Abandoned,
+    ];
+
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "backlog" | "pending" => Some(Self::Backlog),
