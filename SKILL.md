@@ -25,28 +25,10 @@ must never silently evaporate on process exit.
 
 ## Operating Contract
 
-- Use `list_ready` before claiming work.
-- Claim exactly one card at a time unless the operator authorizes a batch.
-- Keep the card updated through lease heartbeats, renewals, audit events,
-  relations, and status changes.
-- Call `append_work_log` while you work, not only at completion: context,
-  what you are currently doing, issues you hit, chain of thought. This is a
-  first-class, high-frequency field distinct from `add_comment` -- it is the
-  raw material downstream synthesis (e.g. glass, fleet-retro reports) reads.
-  Only `agent` is required; supply `model`/`reasoning`/`harness`/`run_id`
-  whenever your surface knows them so the entry carries full attribution.
-- Release the claim when stopping voluntarily so another worker can pick the
-  card up immediately.
-- In API-key mode, claim as the authenticated key actor; do not supply another
-  agent name to impersonate a different worker.
-- Use `get_card`, `get_run`, and `list_awaiting_input` to read timelines before
-  answering or completing work.
-- Use `request_input` when a human decision is needed; do not invent approvals.
-- Use `answer_input` only with an actor and the actual answer text.
-- Use `update_status` or `complete_card` to record the current truth; proof is
-  optional, and Powder audits the actor/time/change instead of enforcing a
-  lifecycle matrix.
-- Do not spawn agents from Powder core. Dispatch belongs to a separate runner.
+The MCP server `instructions` field is the source of truth for Powder's agent
+operating contract. Clients receive it in the initialize response; keep this
+skill focused on harness setup, environment variables, and reference details.
+When the workflow contract changes, update the server instructions first.
 
 ## Expected MCP Tools
 
