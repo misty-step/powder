@@ -1502,6 +1502,73 @@ async fn append_work_log_appears_in_get_card_immediately() {
 }
 
 #[tokio::test]
+async fn api_get_card_defaults_to_concise_and_accepts_detailed_detail() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    {
+        let mut store = lock_store(&state).unwrap();
+        let card_id = CardId::new("api-worklog-heavy").unwrap();
+        store
+            .import_cards(vec![Card::new(
+                card_id.clone(),
+                "API worklog heavy",
+                "body",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["proof exists".to_string()])
+            .with_created_at(1)])
+            .unwrap();
+        for index in 0..55 {
+            store
+                .append_work_log(
+                    &card_id,
+                    "codex",
+                    powder_store::WorkLogAttribution::default(),
+                    &format!("entry-{index:02}"),
+                    100 + index,
+                )
+                .unwrap();
+        }
+    }
+    let app = app(state);
+
+    let concise = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/api-worklog-heavy")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(concise.status(), StatusCode::OK);
+    let concise = response_json(concise).await;
+    assert_eq!(concise["work_log"].as_array().unwrap().len(), 20);
+    assert_eq!(concise["work_log_total"], 55);
+    assert_eq!(concise["work_log"][0]["body"], "entry-54");
+
+    let detailed = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/api-worklog-heavy?detail=detailed")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detailed.status(), StatusCode::OK);
+    let detailed = response_json(detailed).await;
+    assert_eq!(detailed["work_log"].as_array().unwrap().len(), 55);
+    assert!(detailed.get("work_log_total").is_none());
+    assert_eq!(detailed["work_log"][0]["body"], "entry-00");
+}
+
+#[tokio::test]
 async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -2142,7 +2209,7 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/api/v1/runs/{run_id}"))
+                .uri(format!("/api/v1/runs/{run_id}?detail=detailed"))
                 .header(AUTHORIZATION, format!("Bearer {raw_key}"))
                 .body(Body::empty())
                 .unwrap(),

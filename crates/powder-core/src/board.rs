@@ -71,11 +71,18 @@ impl Board {
         Some(CardDetail {
             card,
             runs: self.runs_for_card(card_id),
+            runs_total: None,
             activities: self.activities_for_card(card_id),
+            activities_total: None,
             events: self.events_for_card(card_id),
+            events_total: None,
             links: self.links_for_card(card_id),
+            links_total: None,
             comments: self.comments_for_card(card_id),
+            comments_total: None,
             work_log: self.work_log_for_card(card_id),
+            work_log_total: None,
+            hint: None,
         })
     }
 
@@ -84,10 +91,14 @@ impl Board {
         let card = self.cards.get(&run.card_id)?.clone();
         Some(RunDetail {
             links: self.links_for_card(&run.card_id),
+            links_total: None,
             comments: self.comments_for_card(&run.card_id),
+            comments_total: None,
             activities: self.activities_for_run(run_id),
+            activities_total: None,
             run,
             card,
+            hint: None,
         })
     }
 
