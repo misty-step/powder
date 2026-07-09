@@ -117,6 +117,11 @@ reimport it, rather than patching reconstructed JSON back into the database.
 MCP can also run against a local or deployed `powder-server` over HTTP instead
 of opening SQLite directly:
 
+MCP claim lifecycle operations are consolidated under `manage_claim` with an
+`action` enum (`claim`, `renew`, `heartbeat`, `release`, `transfer`). This is a
+pre-1.0 MCP break: the former `claim_card`, `renew_claim`, `heartbeat`,
+`release_claim`, and `transfer_claim` tools are removed from `tools/list`.
+
 ```sh
 DB=/tmp/powder-http-smoke/powder.db
 mkdir -p "$(dirname "$DB")"
@@ -129,7 +134,7 @@ export POWDER_API_BASE_URL=http://127.0.0.1:4017
 export POWDER_API_KEY="$KEY"
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_ready","arguments":{"limit":1}}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"claim_card","arguments":{"card_id":"001","agent":"codex","ttl_seconds":60}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manage_claim","arguments":{"card_id":"001","action":"claim","agent":"codex","ttl_seconds":60}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"complete_card","arguments":{"card_id":"001","proof":"http://example.test/proof"}}}' \
   | cargo run -q -p powder-mcp
 ```

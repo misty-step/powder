@@ -22,7 +22,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, heartbeat and renew_claim before the lease gets stale. If you stop voluntarily, release_claim. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -66,29 +66,9 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#,
     },
     ToolDef {
-        name: "claim_card",
-        description: "Claim one ready card for an agent and open a run with an expiring lock. Optional actor/admin authorize the caller; omit both to keep unchecked local trust.",
-        input_schema: r#"{"type":"object","required":["card_id","agent"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":60},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
-    },
-    ToolDef {
-        name: "release_claim",
-        description: "Release an active claim by run id and make the card ready immediately. Optional actor/admin are checked against the claim holder.",
-        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
-    },
-    ToolDef {
-        name: "renew_claim",
-        description: "Extend an active claim lease by run id. Optional actor/admin are checked against the claim holder.",
-        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
-    },
-    ToolDef {
-        name: "transfer_claim",
-        description: "Atomically hand an active claim to a named agent on the same run -- no release-then-race window for a handoff. Optional actor/admin are checked against the claim holder.",
-        input_schema: r#"{"type":"object","required":["card_id","run_id","to_agent"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"to_agent":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
-    },
-    ToolDef {
-        name: "heartbeat",
-        description: "Record liveness for an active claim without changing ownership. Optional actor/admin are checked against the claim holder.",
-        input_schema: r#"{"type":"object","required":["card_id","run_id"],"properties":{"card_id":{"type":"string"},"run_id":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        name: "manage_claim",
+        description: "Manage the claim lease for one card. action=claim requires agent and returns run_id; action=renew, heartbeat, release, or transfer requires run_id; action=transfer also requires to_agent. ttl_seconds applies to claim, renew, and transfer. actor/admin are optional local-store authority args. Heartbeat or renew before lease expiry.",
+        input_schema: r#"{"type":"object","required":["card_id","action"],"properties":{"card_id":{"type":"string"},"action":{"type":"string","enum":["claim","renew","heartbeat","release","transfer"]},"agent":{"type":"string"},"to_agent":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "get_card",
@@ -397,52 +377,7 @@ pub fn call_tool_store(
             store.delete_repository(name).map_err(to_string)?;
             json!({"deleted": true, "repository": name})
         }
-        "claim_card" => {
-            let card_id = card_id(args, "card_id")?;
-            let agent = required_str(args, "agent")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            json!(store
-                .claim_card(&card_id, agent, now, ttl_seconds, &authority_arg(args))
-                .map_err(to_string)?)
-        }
-        "release_claim" => {
-            let card_id = card_id(args, "card_id")?;
-            let run_id = run_id(args, "run_id")?;
-            json!(store
-                .release_claim(&card_id, &run_id, now, &authority_arg(args))
-                .map_err(to_string)?)
-        }
-        "renew_claim" => {
-            let card_id = card_id(args, "card_id")?;
-            let run_id = run_id(args, "run_id")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            json!(store
-                .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority_arg(args))
-                .map_err(to_string)?)
-        }
-        "transfer_claim" => {
-            let card_id = card_id(args, "card_id")?;
-            let run_id = run_id(args, "run_id")?;
-            let to_agent = required_str(args, "to_agent")?;
-            let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-            json!(store
-                .transfer_claim(
-                    &card_id,
-                    &run_id,
-                    to_agent,
-                    now,
-                    ttl_seconds,
-                    &authority_arg(args)
-                )
-                .map_err(to_string)?)
-        }
-        "heartbeat" => {
-            let card_id = card_id(args, "card_id")?;
-            let run_id = run_id(args, "run_id")?;
-            json!(store
-                .heartbeat_claim(&card_id, &run_id, now, &authority_arg(args))
-                .map_err(to_string)?)
-        }
+        "manage_claim" => manage_claim_store(store, args, now)?,
         "get_card" => {
             let card_id = card_id(args, "card_id")?;
             let detail_level = detail_arg(args)?;
@@ -678,6 +613,103 @@ fn key_summary_json(key: powder_store::ApiKeySummary) -> Value {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimAction {
+    Claim,
+    Renew,
+    Heartbeat,
+    Release,
+    Transfer,
+}
+
+impl ClaimAction {
+    const VALID: &'static str = "claim, renew, heartbeat, release, transfer";
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "claim" => Some(Self::Claim),
+            "renew" => Some(Self::Renew),
+            "heartbeat" => Some(Self::Heartbeat),
+            "release" => Some(Self::Release),
+            "transfer" => Some(Self::Transfer),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claim => "claim",
+            Self::Renew => "renew",
+            Self::Heartbeat => "heartbeat",
+            Self::Release => "release",
+            Self::Transfer => "transfer",
+        }
+    }
+}
+
+fn manage_claim_store(store: &mut Store, args: &Value, now: i64) -> Result<Value, String> {
+    let action = claim_action(args)?;
+    let card_id = card_id(args, "card_id")?;
+    let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
+    let authority = authority_arg(args);
+
+    Ok(match action {
+        ClaimAction::Claim => {
+            let agent = required_claim_arg(args, action, "agent")?;
+            json!(store
+                .claim_card(&card_id, agent, now, ttl_seconds, &authority)
+                .map_err(to_string)?)
+        }
+        ClaimAction::Renew => {
+            let run_id = run_id_for_claim(args, action)?;
+            json!(store
+                .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority)
+                .map_err(to_string)?)
+        }
+        ClaimAction::Heartbeat => {
+            let run_id = run_id_for_claim(args, action)?;
+            json!(store
+                .heartbeat_claim(&card_id, &run_id, now, &authority)
+                .map_err(to_string)?)
+        }
+        ClaimAction::Release => {
+            let run_id = run_id_for_claim(args, action)?;
+            json!(store
+                .release_claim(&card_id, &run_id, now, &authority)
+                .map_err(to_string)?)
+        }
+        ClaimAction::Transfer => {
+            let run_id = run_id_for_claim(args, action)?;
+            let to_agent = required_claim_arg(args, action, "to_agent")?;
+            json!(store
+                .transfer_claim(&card_id, &run_id, to_agent, now, ttl_seconds, &authority)
+                .map_err(to_string)?)
+        }
+    })
+}
+
+fn claim_action(args: &Value) -> Result<ClaimAction, String> {
+    let raw = required_str(args, "action")?;
+    ClaimAction::parse(raw).ok_or_else(|| {
+        format!(
+            "invalid action: {raw}; valid actions: {}",
+            ClaimAction::VALID
+        )
+    })
+}
+
+fn required_claim_arg<'a>(
+    args: &'a Value,
+    action: ClaimAction,
+    key: &'static str,
+) -> Result<&'a str, String> {
+    required_str(args, key).map_err(|_| format!("{} requires {key}", action.as_str()))
+}
+
+fn run_id_for_claim(args: &Value, action: ClaimAction) -> Result<RunId, String> {
+    RunId::new(required_claim_arg(args, action, "run_id")?).map_err(to_string)
+}
+
 fn card_id(args: &Value, key: &'static str) -> Result<CardId, String> {
     CardId::new(required_str(args, key)?).map_err(to_string)
 }
@@ -859,13 +891,32 @@ mod tests {
             get_run["inputSchema"]["properties"]["detail"]["enum"],
             json!(["concise", "detailed"])
         );
+        let manage_claim = tools
+            .iter()
+            .find(|tool| tool["name"] == "manage_claim")
+            .unwrap();
+        assert_eq!(
+            manage_claim["inputSchema"]["required"],
+            json!(["card_id", "action"])
+        );
+        assert_eq!(
+            manage_claim["inputSchema"]["properties"]["action"]["enum"],
+            json!(["claim", "renew", "heartbeat", "release", "transfer"])
+        );
+        assert!(
+            !manage_claim["inputSchema"]
+                .as_object()
+                .unwrap()
+                .contains_key("oneOf"),
+            "manage_claim schema must stay flat for clients that reject combinators"
+        );
     }
 
     #[test]
     fn mcp_tools_are_agent_intents_not_rest_routes() {
         let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
-        assert_eq!(TOOLS.len(), 31);
+        assert_eq!(TOOLS.len(), 27);
         assert!(names.contains(&"list_ready"));
         assert!(names.contains(&"list_cards"));
         assert!(names.contains(&"create_card"));
@@ -877,11 +928,19 @@ mod tests {
         assert!(names.contains(&"update_relations"));
         assert!(names.contains(&"add_comment"));
         assert!(names.contains(&"append_work_log"));
-        assert!(names.contains(&"claim_card"));
-        assert!(names.contains(&"release_claim"));
-        assert!(names.contains(&"renew_claim"));
-        assert!(names.contains(&"transfer_claim"));
-        assert!(names.contains(&"heartbeat"));
+        assert!(names.contains(&"manage_claim"));
+        for removed in [
+            "claim_card",
+            "release_claim",
+            "renew_claim",
+            "transfer_claim",
+            "heartbeat",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "{removed} must stay consolidated"
+            );
+        }
         assert!(names.contains(&"get_card"));
         assert!(names.contains(&"get_run"));
         assert!(names.contains(&"list_awaiting_input"));
@@ -986,8 +1045,8 @@ Expose tools against the DB.
 
         let claimed = call_tool_store(
             &mut store,
-            "claim_card",
-            &json!({"card_id": "005", "agent": "codex", "ttl_seconds": 60}),
+            "manage_claim",
+            &json!({"card_id": "005", "action": "claim", "agent": "codex", "ttl_seconds": 60}),
             11,
         )
         .unwrap();
@@ -998,22 +1057,22 @@ Expose tools against the DB.
 
         call_tool_store(
             &mut store,
-            "heartbeat",
-            &json!({"card_id": "005", "run_id": run_id}),
+            "manage_claim",
+            &json!({"card_id": "005", "action": "heartbeat", "run_id": run_id}),
             12,
         )
         .unwrap();
         call_tool_store(
             &mut store,
-            "renew_claim",
-            &json!({"card_id": "005", "run_id": run_id, "ttl_seconds": 60}),
+            "manage_claim",
+            &json!({"card_id": "005", "action": "renew", "run_id": run_id, "ttl_seconds": 60}),
             13,
         )
         .unwrap();
         let transferred = call_tool_store(
             &mut store,
-            "transfer_claim",
-            &json!({"card_id": "005", "run_id": run_id, "to_agent": "codex-b", "ttl_seconds": 60}),
+            "manage_claim",
+            &json!({"card_id": "005", "action": "transfer", "run_id": run_id, "to_agent": "codex-b", "ttl_seconds": 60}),
             13,
         )
         .unwrap();
@@ -1051,8 +1110,8 @@ Expose tools against the DB.
             .contains("Approved"));
         call_tool_store(
             &mut store,
-            "release_claim",
-            &json!({"card_id": "005", "run_id": run_id}),
+            "manage_claim",
+            &json!({"card_id": "005", "action": "release", "run_id": run_id}),
             18,
         )
         .unwrap();
@@ -1061,6 +1120,49 @@ Expose tools against the DB.
             .as_str()
             .unwrap()
             .contains("005"));
+    }
+
+    #[test]
+    fn manage_claim_errors_steer_invalid_action_and_missing_conditional_args() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let invalid = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"card_id": "005", "action": "extend"}),
+            10,
+        )
+        .unwrap_err();
+        assert!(invalid.contains("invalid action: extend"));
+        assert!(invalid.contains("valid actions: claim, renew, heartbeat, release, transfer"));
+
+        let missing_agent = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"card_id": "005", "action": "claim"}),
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(missing_agent, "claim requires agent");
+
+        let missing_run_id = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"card_id": "005", "action": "renew"}),
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(missing_run_id, "renew requires run_id");
+
+        let missing_to_agent = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"card_id": "005", "action": "transfer", "run_id": "run-005"}),
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(missing_to_agent, "transfer requires to_agent");
     }
 
     #[test]
@@ -1158,8 +1260,8 @@ Expose tools against the DB.
         .unwrap();
         call_tool_store(
             &mut store,
-            "claim_card",
-            &json!({"card_id": "powder-901", "agent": "codex", "ttl_seconds": 60}),
+            "manage_claim",
+            &json!({"card_id": "powder-901", "action": "claim", "agent": "codex", "ttl_seconds": 60}),
             11,
         )
         .unwrap();
@@ -1732,8 +1834,8 @@ Expose tools against the DB.
 
         call_tool_store(
             &mut store,
-            "claim_card",
-            &json!({"card_id": "006", "agent": "codex", "actor": "codex"}),
+            "manage_claim",
+            &json!({"card_id": "006", "action": "claim", "agent": "codex", "actor": "codex"}),
             10,
         )
         .unwrap();

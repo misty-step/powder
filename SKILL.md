@@ -42,13 +42,10 @@ When the workflow contract changes, update the server instructions first.
 - `merge_repository_alias`: merge duplicate repo strings into one canonical
   repository and audit re-homed cards.
 - `delete_repository`: delete an unused repository entity.
-- `claim_card`: acquire an expiring lock for one card and open a run.
-- `release_claim`: clear an active claim by run id and make the card ready.
-- `renew_claim`: extend an active claim lease by run id.
-- `transfer_claim`: atomically hand an active claim to a named agent on the
-  same run -- no release-then-race window for a handoff; invocable by the
-  claim holder or admin.
-- `heartbeat`: record liveness for an active claim without changing ownership.
+- `manage_claim`: acquire, renew, heartbeat, release, or transfer a claim with
+  `action` set to `claim`, `renew`, `heartbeat`, `release`, or `transfer`.
+  This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
+  `heartbeat`, `release_claim`, and `transfer_claim` tools.
 - `get_card`: read one card with runs, activities, links, comments, and claim state.
 - `get_run`: read one run with its card, activities, links, comments, and run state.
 - `list_awaiting_input`: list runs paused for human or agent input.
