@@ -2,7 +2,8 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, Priority, ReadyQuery, RunId,
+    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel, Priority,
+    ReadyQuery, RunId,
 };
 use powder_store::{
     CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -89,13 +90,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_card",
-        description: "Read one card with runs, activities, links, comments, and claim state.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"}}}"#,
+        description: "Read one card with runs, activities, links, comments, and claim state. detail defaults to concise: most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
     },
     ToolDef {
         name: "get_run",
-        description: "Read one run with its card, activities, links, comments, and run state.",
-        input_schema: r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string"}}}"#,
+        description: "Read one run with its card, activities, links, comments, and run state. detail defaults to concise: most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
+        input_schema: r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
     },
     ToolDef {
         name: "list_awaiting_input",
@@ -438,8 +439,9 @@ pub fn call_tool_store(
         }
         "get_card" => {
             let card_id = card_id(args, "card_id")?;
+            let detail_level = detail_arg(args)?;
             let detail = store
-                .get_card_detail(&card_id)
+                .get_card_detail(&card_id, detail_level)
                 .map_err(to_string)?
                 .ok_or_else(|| format!("card not found: {card_id}"))?;
             card_detail_payload(&detail)?
@@ -447,7 +449,7 @@ pub fn call_tool_store(
         "get_run" => {
             let run_id = run_id(args, "run_id")?;
             json!(store
-                .get_run_detail(&run_id)
+                .get_run_detail(&run_id, detail_arg(args)?)
                 .map_err(to_string)?
                 .ok_or_else(|| format!("run not found: {run_id}"))?)
         }
@@ -704,6 +706,13 @@ fn criterion_arg(args: &Value) -> Result<usize, String> {
         .ok_or_else(|| "criterion is required".to_string())
 }
 
+fn detail_arg(args: &Value) -> Result<DetailLevel, String> {
+    optional_str(args, "detail")
+        .map(|raw| DetailLevel::parse(raw).ok_or_else(|| format!("invalid detail: {raw}")))
+        .transpose()
+        .map(|detail| detail.unwrap_or_default())
+}
+
 fn optional_repository_visibility(args: &Value) -> Result<Option<RepositoryVisibility>, String> {
     optional_str(args, "visibility")
         .map(|raw| {
@@ -756,7 +765,7 @@ fn to_string(err: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use powder_core::parse_backlog_card;
-    use powder_store::Store;
+    use powder_store::{Store, WorkLogAttribution};
 
     /// `complete_card`'s hand-written `input_schema` string had a missing
     /// closing brace that made every `tool_defs_json()` call -- and
@@ -790,6 +799,20 @@ mod tests {
         );
         assert!(properties["admin"].is_object());
         assert!(properties["criterion_proofs"]["items"]["properties"]["url"].is_object());
+
+        let get_card = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_card")
+            .unwrap();
+        assert_eq!(
+            get_card["inputSchema"]["properties"]["detail"]["enum"],
+            json!(["concise", "detailed"])
+        );
+        let get_run = tools.iter().find(|tool| tool["name"] == "get_run").unwrap();
+        assert_eq!(
+            get_run["inputSchema"]["properties"]["detail"]["enum"],
+            json!(["concise", "detailed"])
+        );
     }
 
     #[test]
@@ -1522,6 +1545,68 @@ Expose tools against the DB.
         )
         .unwrap();
         assert!(tool_payload(&card)["work_log"][0]["agent"] == "codex");
+    }
+
+    #[test]
+    fn mcp_get_card_defaults_to_concise_work_log_and_detail_returns_full_history() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![Card::new(
+                CardId::new("worklog-heavy").unwrap(),
+                "Worklog heavy",
+                "G.",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["g".to_string()])
+            .with_created_at(1)])
+            .unwrap();
+        let card_id = CardId::new("worklog-heavy").unwrap();
+        for index in 0..55 {
+            store
+                .append_work_log(
+                    &card_id,
+                    "codex",
+                    WorkLogAttribution::default(),
+                    &format!("entry-{index:02}"),
+                    100 + index,
+                )
+                .unwrap();
+        }
+
+        let concise = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "worklog-heavy"}),
+            200,
+        )
+        .unwrap();
+        let concise = tool_payload(&concise);
+        let work_log = concise["work_log"].as_array().unwrap();
+        assert_eq!(work_log.len(), 20);
+        assert_eq!(concise["work_log_total"], 55);
+        assert!(concise["hint"]
+            .as_str()
+            .unwrap()
+            .contains("detail:\"detailed\""));
+        assert_eq!(work_log[0]["body"], "entry-54");
+        assert_eq!(work_log[19]["body"], "entry-35");
+
+        let detailed = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "worklog-heavy", "detail": "detailed"}),
+            201,
+        )
+        .unwrap();
+        let detailed = tool_payload(&detailed);
+        let work_log = detailed["work_log"].as_array().unwrap();
+        assert_eq!(work_log.len(), 55);
+        assert!(detailed.get("work_log_total").is_none());
+        assert!(detailed.get("hint").is_none());
+        assert_eq!(work_log[0]["body"], "entry-00");
+        assert_eq!(work_log[54]["body"], "entry-54");
     }
 
     #[test]

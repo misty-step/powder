@@ -6,7 +6,7 @@
 //! `actor`/`admin` tool arguments needed.
 
 use powder_api::{urlencode, RemoteClient};
-use powder_core::{Card, CardSummary};
+use powder_core::{Card, CardSummary, DetailLevel};
 use serde_json::{json, Value};
 
 use super::{card_id, optional_str, required_str, run_id, to_string};
@@ -168,11 +168,11 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "get_card" => {
             let id = card_id(args, "card_id")?;
-            client.get(&format!("/api/v1/cards/{id}"))?
+            client.get(&format!("/api/v1/cards/{id}{}", detail_query(args)?))?
         }
         "get_run" => {
             let run = run_id(args, "run_id")?;
-            client.get(&format!("/api/v1/runs/{run}"))?
+            client.get(&format!("/api/v1/runs/{run}{}", detail_query(args)?))?
         }
         "list_awaiting_input" => {
             let limit = args["limit"].as_u64().unwrap_or(20);
@@ -326,6 +326,14 @@ fn remote_card_summary_page_payload(response: Value, limit: usize) -> Result<Val
     Ok(payload)
 }
 
+fn detail_query(args: &Value) -> Result<String, String> {
+    let detail = optional_str(args, "detail")
+        .map(|raw| DetailLevel::parse(raw).ok_or_else(|| format!("invalid detail: {raw}")))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(format!("?detail={}", detail.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +440,38 @@ mod tests {
 
     fn tool_payload(result: &Value) -> Value {
         serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn get_card_and_get_run_send_detail_query() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"card": api_card("001", "Remote card", "ready", "p0", 10)}),
+            ),
+            (
+                200,
+                json!({
+                    "run": {"id": "run-1", "card_id": "001", "state": "active", "agent": "codex", "claim_expires_at": 100, "created_at": 1, "updated_at": 2},
+                    "card": api_card("001", "Remote card", "ready", "p0", 10),
+                }),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        call_tool_remote(
+            &client,
+            "get_card",
+            &json!({"card_id": "001", "detail": "detailed"}),
+        )
+        .unwrap();
+        call_tool_remote(&client, "get_run", &json!({"run_id": "run-1"})).unwrap();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v1/cards/001?detail=detailed");
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/v1/runs/run-1?detail=concise");
     }
 
     #[test]

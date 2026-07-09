@@ -25,7 +25,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    parse_backlog_card, Authority, Card, CardId, CardStatus, Priority, ReadyQuery, RunId,
+    parse_backlog_card, Authority, Card, CardId, CardStatus, DetailLevel, Priority, ReadyQuery,
+    RunId,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
@@ -267,6 +268,11 @@ struct ListCardsParams {
     status: Option<String>,
     repo: Option<String>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DetailParams {
+    detail: Option<DetailLevel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -916,11 +922,12 @@ async fn get_card(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(params): Query<DetailParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let detail = lock_store(&state)?
-        .get_card_detail(&card_id)?
+        .get_card_detail(&card_id, params.detail.unwrap_or_default())?
         .ok_or_else(|| powder_core::DomainError::not_found("card", card_id.to_string()))?;
     Ok(Json(json!(detail)))
 }
@@ -1224,11 +1231,12 @@ async fn get_run(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(params): Query<DetailParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let run_id = RunId::new(id)?;
     let detail = lock_store(&state)?
-        .get_run_detail(&run_id)?
+        .get_run_detail(&run_id, params.detail.unwrap_or_default())?
         .ok_or_else(|| powder_core::DomainError::not_found("run", run_id.to_string()))?;
     Ok(Json(json!(detail)))
 }

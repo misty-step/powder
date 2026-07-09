@@ -1,6 +1,6 @@
 use powder_core::{
-    AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, DomainError, Priority,
-    ReadyQuery, RunId, RunState,
+    AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, DetailLevel, DomainError,
+    Priority, ReadyQuery, RunId, RunState,
 };
 
 use crate::{
@@ -302,7 +302,9 @@ fn criteria_check_and_completion_proofs_are_persisted_and_audited() -> Result<()
         completed.criteria[0].proof_links[0].url,
         "https://example.test/pr"
     );
-    let detail = store.get_card_detail(&card_id)?.expect("detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "criterion"
             && event.actor == "operator"
@@ -351,7 +353,7 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
         .all(|card| card.repo.as_deref() == Some("canary")));
 
     let detail = store
-        .get_card_detail(&CardId::new("slug-canary")?)?
+        .get_card_detail(&CardId::new("slug-canary")?, DetailLevel::Detailed)?
         .expect("rehomed card detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "repository"
@@ -575,7 +577,9 @@ fn card_relations_round_trip_through_store_and_detail() -> Result<()> {
     assert_eq!(card.blocks[0].as_str(), "blocked-child");
     assert_eq!(card.blocked_by[0].as_str(), "blocker-parent");
 
-    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert_eq!(detail.card.related[0].as_str(), "neighbor");
     assert_eq!(detail.card.blocks[0].as_str(), "blocked-child");
     assert!(detail.events.iter().any(|event| {
@@ -645,7 +649,9 @@ fn add_comment_appears_in_get_card_detail_in_creation_order() -> Result<()> {
     assert_eq!(first.body, "first note");
     let second = store.add_comment(&card_id, "codex", "second note", 20)?;
 
-    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert_eq!(detail.comments.len(), 2);
     assert_eq!(detail.comments[0].body, "first note");
     assert_eq!(detail.comments[1].body, "second note");
@@ -705,7 +711,9 @@ fn append_work_log_appears_in_get_card_detail_in_creation_order() -> Result<()> 
     )?;
     assert!(second.model.is_none());
 
-    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert_eq!(detail.work_log.len(), 2);
     assert_eq!(
         detail.work_log[0].body,
@@ -737,6 +745,103 @@ fn append_work_log_appears_in_get_card_detail_in_creation_order() -> Result<()> 
 }
 
 #[test]
+fn concise_card_detail_bounds_work_log_with_totals_and_recent_order() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("worklog-heavy")?;
+    store.import_cards(vec![ready_card("worklog-heavy", 2)])?;
+
+    for index in 0..55 {
+        store.append_work_log(
+            &card_id,
+            "codex",
+            WorkLogAttribution::default(),
+            &format!("entry-{index:02}"),
+            100 + index,
+        )?;
+    }
+
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Concise)?
+        .expect("card detail");
+    assert_eq!(detail.work_log.len(), 20);
+    assert_eq!(detail.work_log_total, Some(55));
+    assert!(detail
+        .hint
+        .as_deref()
+        .expect("truncation hint")
+        .contains("detail:\"detailed\""));
+    assert_eq!(detail.work_log[0].body, "entry-54");
+    assert_eq!(detail.work_log[19].body, "entry-35");
+    assert!(detail.comments_total.is_none());
+    Ok(())
+}
+
+#[test]
+fn detailed_card_detail_returns_full_work_log_in_existing_order() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("worklog-full")?;
+    store.import_cards(vec![ready_card("worklog-full", 2)])?;
+
+    for index in 0..55 {
+        store.append_work_log(
+            &card_id,
+            "codex",
+            WorkLogAttribution::default(),
+            &format!("entry-{index:02}"),
+            100 + index,
+        )?;
+    }
+
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert_eq!(detail.work_log.len(), 55);
+    assert_eq!(detail.work_log_total, None);
+    assert_eq!(detail.hint, None);
+    assert_eq!(detail.work_log[0].body, "entry-00");
+    assert_eq!(detail.work_log[54].body, "entry-54");
+    Ok(())
+}
+
+#[test]
+fn concise_run_detail_bounds_activity_history_with_totals() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("activity-heavy")?;
+    store.import_cards(vec![ready_card("activity-heavy", 2)])?;
+    let claim = store.claim_card(&card_id, "codex", 10, 600, &Authority::unchecked())?;
+
+    for index in 0..55 {
+        store.heartbeat_claim(&card_id, &claim.run_id, 20 + index, &Authority::unchecked())?;
+    }
+
+    let concise = store
+        .get_run_detail(&claim.run_id, DetailLevel::Concise)?
+        .expect("run detail");
+    assert_eq!(concise.activities.len(), 20);
+    assert_eq!(concise.activities_total, Some(56));
+    assert!(concise
+        .hint
+        .as_deref()
+        .expect("truncation hint")
+        .contains("detail:\"detailed\""));
+    assert_eq!(concise.activities[0].created_at, 74);
+    assert_eq!(concise.activities[19].created_at, 55);
+
+    let detailed = store
+        .get_run_detail(&claim.run_id, DetailLevel::Detailed)?
+        .expect("run detail");
+    assert_eq!(detailed.activities.len(), 56);
+    assert_eq!(detailed.activities_total, None);
+    assert_eq!(detailed.hint, None);
+    assert_eq!(detailed.activities[0].created_at, 10);
+    assert_eq!(detailed.activities[55].created_at, 74);
+    Ok(())
+}
+
+#[test]
 fn append_work_log_scrubs_secrets_from_the_body_before_storage() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -754,7 +859,9 @@ fn append_work_log_scrubs_secrets_from_the_body_before_storage() -> Result<()> {
     assert!(!entry.body.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
     assert!(entry.body.contains("[REDACTED:openai-key]"));
 
-    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert!(!detail.work_log[0]
         .body
         .contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
@@ -790,7 +897,9 @@ fn any_status_transition_is_audited_without_matrix_enforcement() -> Result<()> {
     )?;
 
     assert_eq!(card.status, CardStatus::Shipped);
-    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "status"
             && event.actor == "operator"
@@ -958,7 +1067,9 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
         store.get_run(&claim.run_id)?.expect("run").state,
         RunState::Active
     );
-    let detail = store.get_card_detail(&card_id)?.expect("detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "patch"
             && event.actor == "operator"
@@ -1014,7 +1125,9 @@ fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call
         store.get_run(&claim.run_id)?.expect("run").state,
         RunState::Complete
     );
-    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "status"
             && event.actor == "external-closer"
@@ -1327,7 +1440,9 @@ fn transfer_claim_moves_the_lease_to_a_new_agent_with_a_fresh_ttl() -> Result<()
     assert_eq!(run.claim_expires_at, 80);
 
     // Single handoff event naming both agents, not a release+claim pair.
-    let detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert!(detail.activities.iter().any(|activity| {
         activity.payload.contains("agent-a") && activity.payload.contains("agent-b")
     }));
@@ -1411,7 +1526,9 @@ fn answer_input_preserves_question_and_resumes_run() -> Result<()> {
         Some("Approve completion?")
     );
 
-    let card_detail = store.get_card_detail(&card_id)?.expect("card detail");
+    let card_detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
     assert_eq!(card_detail.card.status, CardStatus::AwaitingInput);
     assert_eq!(card_detail.runs.len(), 1);
     assert_eq!(card_detail.links.len(), 1);
@@ -1432,7 +1549,9 @@ fn answer_input_preserves_question_and_resumes_run() -> Result<()> {
     let card = store.get_card(&card_id)?.expect("card");
     assert_eq!(card.status, CardStatus::Running);
 
-    let run_detail = store.get_run_detail(&claim.run_id)?.expect("run detail");
+    let run_detail = store
+        .get_run_detail(&claim.run_id, DetailLevel::Detailed)?
+        .expect("run detail");
     assert_eq!(run_detail.run.state, RunState::Active);
     assert_eq!(
         run_detail
@@ -2487,7 +2606,7 @@ fn field_note_generator_embeds_evidence_links_in_the_draft() -> Result<()> {
 
     let draft_id = CardId::new("field-note-source-beta")?;
     let draft_detail = store
-        .get_card_detail(&draft_id)?
+        .get_card_detail(&draft_id, DetailLevel::Detailed)?
         .expect("draft card detail");
     assert!(draft_detail
         .card

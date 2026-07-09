@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use powder_api::{urlencode, RemoteClient};
-use powder_core::{Authority, Board, Card, CardId, CardStatus, Priority, ReadyQuery, RunId};
+use powder_core::{
+    Authority, Board, Card, CardId, CardStatus, DetailLevel, Priority, ReadyQuery, RunId,
+};
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
 };
@@ -899,13 +901,13 @@ fn get_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         let detail = store
-            .get_card_detail(&card_id)
+            .get_card_detail(&card_id, DetailLevel::Detailed)
             .map_err(store_err)?
             .ok_or_else(|| ShellError::NotFound(format!("card not found: {card_id}")))?;
         to_pretty_json(&detail)
     } else if let Some(client) = remote_env.client() {
         let detail = client
-            .get(&format!("/api/v1/cards/{card_id}"))
+            .get(&format!("/api/v1/cards/{card_id}?detail=detailed"))
             .map_err(remote_err)?;
         to_pretty_json(&detail)
     } else {
@@ -921,7 +923,7 @@ fn get_run(args: &[String]) -> Result<String, ShellError> {
         .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
     let store = open_store(required_flag(args, "--db")?)?;
     let detail = store
-        .get_run_detail(&run_id)
+        .get_run_detail(&run_id, DetailLevel::Detailed)
         .map_err(store_err)?
         .ok_or_else(|| ShellError::NotFound(format!("run not found: {run_id}")))?;
     to_pretty_json(&detail)
@@ -2865,7 +2867,7 @@ mod tests {
             vec![
                 "GET /api/v1/cards/ready?limit=1",
                 "GET /api/v1/cards?limit=2&status=blocked&repo=misty-step%2Fpowder",
-                "GET /api/v1/cards/remote-1",
+                "GET /api/v1/cards/remote-1?detail=detailed",
                 "POST /api/v1/cards",
                 "POST /api/v1/cards/remote-created/claim",
                 "POST /api/v1/cards/remote-created/status",

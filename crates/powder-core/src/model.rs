@@ -1000,21 +1000,60 @@ pub struct WorkLogEntry {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailLevel {
+    #[default]
+    Concise,
+    Detailed,
+}
+
+impl DetailLevel {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "concise" => Some(Self::Concise),
+            "detailed" => Some(Self::Detailed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardDetail {
     pub card: Card,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<Run>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activities: Vec<Activity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activities_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<CardEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_log: Vec<WorkLogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_log_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1023,10 +1062,18 @@ pub struct RunDetail {
     pub card: Card,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activities: Vec<Activity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activities_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
