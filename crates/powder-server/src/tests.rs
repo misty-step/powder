@@ -191,6 +191,28 @@ async fn create_card_derives_repo_from_numeric_id_prefix_for_repo_filtered_lists
 }
 
 #[tokio::test]
+async fn create_card_rejects_unknown_fields_by_name() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"wrong-body-field","title":"Filed from API","acceptance":["proof"],"description":"x"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_text(response).await;
+    assert!(
+        body.contains("description"),
+        "unknown-field rejection should name the field: {body}"
+    );
+}
+
+#[tokio::test]
 async fn create_card_rejects_repo_conflicting_with_numeric_id_prefix() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -365,6 +387,23 @@ async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_
     assert_eq!(patched_many["created_at"], before["card"]["created_at"]);
     assert_eq!(patched_many["source"], before["card"]["source"]);
     assert_eq!(patched_many["claim"], claim);
+
+    let unknown = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/patchable",
+            Some(&raw_key),
+            r#"{"description":"wrong field"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_text(unknown).await;
+    assert!(
+        body.contains("description"),
+        "unknown-field rejection should name the field: {body}"
+    );
 
     let detail = app
         .oneshot(json_request(
@@ -641,9 +680,28 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(all.status(), StatusCode::OK);
-    let all_ids = ids_from(&response_json(all).await);
+    let all = response_json(all).await;
+    let all_ids = ids_from(&all);
     assert!(all_ids.contains(&"blocked-1".to_string()));
     assert!(all_ids.contains(&"other-001".to_string()));
+    assert_eq!(all["total_count"], 2);
+    assert_eq!(all["has_more"], false);
+
+    let limited = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?limit=1",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::OK);
+    let limited = response_json(limited).await;
+    assert_eq!(limited["cards"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["total_count"], 2);
+    assert_eq!(limited["has_more"], true);
 
     let blocked_only = app
         .clone()
@@ -711,6 +769,7 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     assert_eq!(other["card_count"], 1);
 
     let invalid_status = app
+        .clone()
         .oneshot(json_request(
             Method::GET,
             "/api/v1/cards?status=not-a-real-status",
@@ -720,6 +779,22 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
+
+    let unknown_query = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?repository=x",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_query.status(), StatusCode::BAD_REQUEST);
+    let body = response_text(unknown_query).await;
+    assert!(
+        body.contains("repository"),
+        "unknown-query rejection should name the parameter: {body}"
+    );
 }
 
 #[tokio::test]

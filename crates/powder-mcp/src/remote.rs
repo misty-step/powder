@@ -5,7 +5,7 @@
 //! instance exactly as they are for any other HTTP caller -- no
 //! `actor`/`admin` tool arguments needed.
 
-use powder_api::{urlencode, RemoteClient};
+use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{Card, CardSummary, DetailLevel};
 use serde_json::{json, Value};
 
@@ -20,7 +20,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let response = client.get(&format!("/api/v1/cards/ready?limit={limit}"))?;
-            remote_card_summary_page_payload(response, limit)?
+            remote_card_summary_page_payload(response)?
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -33,7 +33,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 query.push_str(&format!("&repo={}", urlencode(repo)));
             }
             let response = client.get(&format!("/api/v1/cards?{query}"))?;
-            remote_card_summary_page_payload(response, limit)?
+            remote_card_summary_page_payload(response)?
         }
         "board_stats" => {
             let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
@@ -350,22 +350,23 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
     }
 }
 
-fn remote_card_summary_page_payload(response: Value, limit: usize) -> Result<Value, String> {
-    let cards =
-        serde_json::from_value::<Vec<Card>>(response["cards"].clone()).map_err(to_string)?;
+fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
+    let page = parse_list_page(response)?;
+    let total_count = page.total_count;
+    let has_more = page.has_more;
+    let cards = serde_json::from_value::<Vec<Card>>(Value::Array(page.cards)).map_err(to_string)?;
     let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
-    let returned = summaries.len();
-    let limit = limit.max(1);
 
     let mut payload = json!({
         "cards": summaries,
-        "has_more": returned >= limit,
+        "total_count": total_count,
+        "has_more": has_more,
     });
-    if returned < limit {
-        payload["total_count"] = json!(returned);
-    } else {
-        payload["hint"] =
-            json!("remote total_count is unknown; raise limit or filter by status/repo");
+    if has_more {
+        payload["hint"] = json!(format!(
+            "{} more cards; filter by status/repo or raise limit",
+            total_count.saturating_sub(cards.len())
+        ));
     }
     Ok(payload)
 }
@@ -838,7 +839,11 @@ mod tests {
     fn list_ready_sends_get_with_limit_query() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
-            json!({"cards": [api_card("001", "Remote ready", "ready", "p0", 10)]}),
+            json!({
+                "cards": [api_card("001", "Remote ready", "ready", "p0", 10)],
+                "total_count": 1,
+                "has_more": false
+            }),
         )]);
         let client = RemoteClient::new(base_url, None);
 
@@ -858,7 +863,11 @@ mod tests {
     fn list_cards_sends_get_with_status_and_url_encoded_repo_query() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
-            json!({"cards": [api_card("blocked-1", "Blocked remote", "blocked", "p1", 10)]}),
+            json!({
+                "cards": [api_card("blocked-1", "Blocked remote", "blocked", "p1", 10)],
+                "total_count": 1,
+                "has_more": false
+            }),
         )]);
         let client = RemoteClient::new(base_url, None);
 
@@ -913,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn list_cards_remote_dispatch_projects_summary_envelope_with_limit_heuristic() {
+    fn list_cards_remote_dispatch_projects_summary_envelope_with_exact_total_count() {
         let mut first_card = api_card("remote-1", "Remote one", "ready", "p0", 10);
         first_card["repo"] = json!("misty-step/powder");
         first_card["labels"] = json!(["mcp"]);
@@ -923,13 +932,24 @@ mod tests {
         ]);
 
         let (base_url, _recorded) = spawn_test_server(vec![
-            (200, json!({"cards": [first_card]})),
             (
                 200,
-                json!({"cards": [
-                    api_card("remote-2", "Remote two", "running", "p1", 20),
-                    api_card("remote-3", "Remote three", "blocked", "p2", 30)
-                ]}),
+                json!({
+                    "cards": [first_card],
+                    "total_count": 1,
+                    "has_more": false
+                }),
+            ),
+            (
+                200,
+                json!({
+                    "cards": [
+                        api_card("remote-2", "Remote two", "running", "p1", 20),
+                        api_card("remote-3", "Remote three", "blocked", "p2", 30)
+                    ],
+                    "total_count": 7,
+                    "has_more": true
+                }),
             ),
         ]);
         let client = RemoteClient::new(base_url, None);
@@ -977,11 +997,10 @@ mod tests {
         let second_payload = tool_payload(&second_response["result"]);
 
         assert_eq!(second_payload["cards"].as_array().unwrap().len(), 2);
+        assert_eq!(second_payload["total_count"], 7);
         assert_eq!(second_payload["has_more"], true);
-        assert!(second_payload.get("total_count").is_none());
         let hint = second_payload["hint"].as_str().unwrap();
-        assert!(hint.contains("raise limit"));
-        assert!(hint.contains("filter"));
+        assert!(hint.contains("5 more cards"));
     }
 
     #[test]
