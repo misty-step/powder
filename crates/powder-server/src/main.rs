@@ -34,7 +34,7 @@ use powder_store::{
     RepositoryUpsert, RepositoryVisibility, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::Sha256;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -988,7 +988,7 @@ async fn create_card(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateCardRequest>,
-) -> Result<Json<Card>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     // powder-925: single-card authoring is agent-accessible, same as
     // claim/status/comment/complete -- a scoped (non-admin) key can carry
     // the operator's mobile quick-add flow without holding admin. Bulk
@@ -1041,7 +1041,12 @@ async fn create_card(
         let mut store = lock_store(&state)?;
         store.create_card_with_events(card, &actor.display_name, now)?
     };
-    Ok(Json(card))
+    let mut payload = json!(card);
+    if card.acceptance.is_empty() {
+        payload["hint"] =
+            json!("no acceptance criteria; the card cannot be claimed until it carries an oracle");
+    }
+    Ok(Json(payload))
 }
 
 async fn patch_card(

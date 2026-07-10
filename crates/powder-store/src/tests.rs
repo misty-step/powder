@@ -25,6 +25,14 @@ fn ready_card(id: &str, created_at: i64) -> Card {
         .with_created_at(created_at)
 }
 
+fn ready_card_without_acceptance(id: &str, created_at: i64) -> Card {
+    Card::new(CardId::new(id).unwrap(), format!("Card {id}"), "do it")
+        .unwrap()
+        .with_status(CardStatus::Ready)
+        .with_priority(Priority::P0)
+        .with_created_at(created_at)
+}
+
 #[test]
 fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
     let path = temp_db("lifecycle");
@@ -73,6 +81,31 @@ fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
     let run = store.get_run(&claim.run_id)?.expect("persisted run");
     assert_eq!(run.state, RunState::Complete);
     assert_eq!(run.proof.as_deref(), Some("https://example.test/proof"));
+    Ok(())
+}
+
+#[test]
+fn claim_card_on_criteria_less_card_steers_toward_acceptance_update() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("no-oracle")?;
+    store.create_card_with_events(
+        ready_card_without_acceptance("no-oracle", 10),
+        "operator",
+        10,
+    )?;
+
+    let err = store
+        .claim_card(&card_id, "agent-a", 20, 60, &Authority::unchecked())
+        .unwrap_err();
+
+    match err {
+        StoreError::Domain(DomainError::Conflict(message)) => assert_eq!(
+            message,
+            "card no-oracle has no acceptance criteria; add them via update (acceptance: [...]) before claiming"
+        ),
+        other => panic!("expected a criteria-steering conflict, got {other:?}"),
+    }
     Ok(())
 }
 

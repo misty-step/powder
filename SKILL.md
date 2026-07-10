@@ -35,7 +35,9 @@ error naming `POWDER_MCP_TOOLSETS`.
 The MCP server `instructions` field is the source of truth for Powder's agent
 operating contract. Clients receive it in the initialize response; keep this
 skill focused on harness setup, environment variables, and reference details.
-When the workflow contract changes, update the server instructions first.
+When the workflow contract changes, update the server instructions first
+(including the claim gate: cards without acceptance criteria cannot be
+claimed).
 
 ## Expected MCP Tools
 

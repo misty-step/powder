@@ -25,7 +25,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -441,7 +441,13 @@ pub fn call_tool_store(
             let card = store
                 .create_card_with_events(card, &authority_arg(args).actor_label(), now)
                 .map_err(to_string)?;
-            card_ack_payload(&card)
+            let mut payload = card_ack_payload(&card);
+            if card.acceptance.is_empty() {
+                payload["hint"] = json!(
+                    "no acceptance criteria; the card cannot be claimed until it carries an oracle"
+                );
+            }
+            payload
         }
         "update_card" => {
             let card_id = card_id(args, "card_id")?;
@@ -1582,6 +1588,59 @@ Expose tools against the DB.
             missing_to_agent,
             "transfer requires to_agent (agent identity receiving the transferred claim)"
         );
+    }
+
+    #[test]
+    fn manage_claim_on_criteria_less_card_steers_toward_acceptance_update() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "no-oracle", "title": "No oracle yet", "status": "ready"}),
+            10,
+        )
+        .unwrap();
+
+        let claimed = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"card_id": "no-oracle", "action": "claim", "agent": "codex"}),
+            11,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            claimed,
+            "card no-oracle has no acceptance criteria; add them via update (acceptance: [...]) before claiming"
+        );
+    }
+
+    #[test]
+    fn create_card_ack_carries_a_hint_iff_criteria_are_empty() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let no_criteria = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "no-oracle-ack", "title": "No oracle yet"}),
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&no_criteria)["hint"],
+            "no acceptance criteria; the card cannot be claimed until it carries an oracle"
+        );
+
+        let with_criteria = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "has-oracle-ack", "title": "Has oracle", "acceptance": ["prove it"]}),
+            11,
+        )
+        .unwrap();
+        assert!(tool_payload(&with_criteria).get("hint").is_none());
     }
 
     #[test]
