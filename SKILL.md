@@ -179,6 +179,33 @@ bodies -- it names the fields `POST /api/v1/cards` and
 `POST /api/v1/cards/{id}/links` actually require instead of leaving that to
 deserialize-error trial-and-error.
 
+### Key rotation and stale-key/stale-host runbook (powder-944)
+
+A registered `powder-mcp` subprocess captures `POWDER_API_KEY` (and
+`POWDER_API_BASE_URL`) once, at process boot. Rotating the key, or
+re-pointing the deployment at a new hostname, does not change an
+already-running subprocess's environment -- it keeps sending the old
+value until something restarts it. Two ways to handle this:
+
+- **Restart the MCP client** after any key rotation or host cutover. This
+  always works and needs no configuration.
+- Set `POWDER_API_KEY_CMD` to a shell command that prints a fresh key on
+  stdout (e.g. `security find-generic-password -a "$USER" -s
+  powder-api-key -w`, or `op read op://Agents/POWDER_API_KEY__bridge/credential`).
+  `powder-mcp` runs it once at boot, and again, once, the first time a
+  request comes back `401` -- if the command resolves a different key than
+  the one that just failed, it transparently retries with the new key and
+  the caller never sees the rotation. `POWDER_API_KEY` remains the plain
+  fallback; leaving `POWDER_API_KEY_CMD` unset is unchanged behavior.
+
+When both a rotation and a retry are exhausted, or `POWDER_API_KEY_CMD` isn't
+set, a `401` error names the key prefix `powder-mcp` used (matching the
+`list_keys`/`ApiKeySummary` prefix convention) and says to restart the MCP
+client or configure `POWDER_API_KEY_CMD`. A run of three or more consecutive
+`404`s on tool calls gets a distinct steer instead: `POWDER_API_BASE_URL` may
+be pointed at a stale host (a deployment cutover, powder-965's class of
+incident) -- restart the MCP client after fixing the URL.
+
 ## Local Gate
 
 ```sh
