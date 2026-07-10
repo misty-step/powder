@@ -166,6 +166,16 @@ async function apiJson(path, options = {}) {
   return response.json();
 }
 
+function listPageCards(data, label) {
+  const cards = Array.isArray(data.cards) ? data.cards : [];
+  if (data.has_more) {
+    const total =
+      typeof data.total_count === "number" ? data.total_count : "more than one page";
+    throw new Error(`${label} list truncated at ${cards.length} of ${total}`);
+  }
+  return cards;
+}
+
 async function loadOnboarding() {
   try {
     const response = await fetch("/api/v1/onboarding", {
@@ -219,7 +229,7 @@ async function loadBoard() {
             const data = await apiJson(
               `/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`,
             );
-            return data.cards || [];
+            return listPageCards(data, status);
           } catch (err) {
             throw err;
           }

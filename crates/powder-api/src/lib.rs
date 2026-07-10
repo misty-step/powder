@@ -2,7 +2,7 @@
 
 mod remote;
 
-pub use remote::{urlencode, RemoteClient};
+pub use remote::{parse_list_page, urlencode, ListPage, RemoteClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiRoute {
@@ -35,13 +35,13 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
-        intent: "list ready cards for an agent to claim",
+        intent: "list ready cards for an agent to claim; response is {cards,total_count,has_more}",
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards",
-        intent: "list cards by optional status/autonomy/repo filter, including blocked and done cards list_ready never surfaces",
+        intent: "list cards by optional status/autonomy/repo filter; response is {cards,total_count,has_more}",
         body_shape: None,
     },
     ApiRoute {
@@ -350,5 +350,26 @@ mod tests {
             .find(|route| route["path"] == "/api/v1/cards/ready")
             .unwrap();
         assert!(healthz_shaped["body_shape"].is_null());
+    }
+
+    #[test]
+    fn remote_list_page_parser_requires_pagination_metadata() {
+        let page = parse_list_page(serde_json::json!({
+            "cards": [{"id": "001"}],
+            "total_count": 3,
+            "has_more": true,
+        }))
+        .unwrap();
+
+        assert_eq!(page.cards.len(), 1);
+        assert_eq!(page.total_count, 3);
+        assert!(page.has_more);
+
+        let missing_total = parse_list_page(serde_json::json!({
+            "cards": [],
+            "has_more": false,
+        }))
+        .unwrap_err();
+        assert!(missing_total.contains("total_count"));
     }
 }

@@ -264,6 +264,7 @@ struct ReadyParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListCardsParams {
     status: Option<String>,
     autonomy: Option<String>,
@@ -312,6 +313,7 @@ struct ImportRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateCardRequest {
     id: String,
     title: String,
@@ -329,6 +331,7 @@ struct CreateCardRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PatchCardRequest {
     title: Option<String>,
     body: Option<String>,
@@ -719,8 +722,8 @@ async fn list_ready(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
-    let cards = lock_store(&state)?.list_ready(ReadyQuery::new(unix_now(), limit))?;
-    Ok(Json(json!({ "cards": cards })))
+    let page = lock_store(&state)?.list_ready_page(ReadyQuery::new(unix_now(), limit))?;
+    Ok(Json(card_list_page_json(page.cards, page.total_count)))
 }
 
 /// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
@@ -747,8 +750,17 @@ async fn list_cards(
         autonomy,
         repo: params.repo,
     };
-    let cards = lock_store(&state)?.list_cards(&filter, limit)?;
-    Ok(Json(json!({ "cards": cards })))
+    let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
+    Ok(Json(card_list_page_json(page.cards, page.total_count)))
+}
+
+fn card_list_page_json(cards: Vec<Card>, total_count: usize) -> serde_json::Value {
+    let has_more = total_count > cards.len();
+    json!({
+        "cards": cards,
+        "total_count": total_count,
+        "has_more": has_more,
+    })
 }
 
 async fn list_approvals(
