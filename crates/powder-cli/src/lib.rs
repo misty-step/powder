@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use powder_api::{urlencode, RemoteClient};
+use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
     Authority, Board, Card, CardId, CardStatus, DetailLevel, Priority, ReadyQuery, RunId,
 };
@@ -573,10 +573,10 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         board.import_cards(cards);
         json!(board.list_ready(ReadyQuery::new(now, limit)))
     } else if let Some(client) = remote_env.client() {
-        client
+        let page = client
             .get(&format!("/api/v1/cards/ready?limit={limit}"))
-            .map_err(remote_err)?["cards"]
-            .clone()
+            .map_err(remote_err)?;
+        list_page_cards(page)?
     } else {
         return Err(ShellError::Invalid(
             "list-ready requires --db, POWDER_API_BASE_URL, or a backlog.d path".to_string(),
@@ -625,10 +625,10 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         if let Some(repo) = &repo {
             query.push_str(&format!("&repo={}", urlencode(repo)));
         }
-        client
+        let page = client
             .get(&format!("/api/v1/cards?{query}"))
-            .map_err(remote_err)?["cards"]
-            .clone()
+            .map_err(remote_err)?;
+        list_page_cards(page)?
     } else {
         return Err(missing_transport("list-cards"));
     };
@@ -1358,6 +1358,11 @@ fn json_array(value: &Value) -> Result<&[Value], ShellError> {
         .as_array()
         .map(Vec::as_slice)
         .ok_or_else(|| ShellError::Store("remote response expected an array".to_string()))
+}
+
+fn list_page_cards(value: Value) -> Result<Value, ShellError> {
+    let page = parse_list_page(value).map_err(ShellError::Store)?;
+    Ok(Value::Array(page.cards))
 }
 
 fn json_string(value: &Value, field: &'static str) -> Result<String, ShellError> {
@@ -2734,11 +2739,19 @@ mod tests {
         let (base_url, recorded) = spawn_test_server(vec![
             (
                 200,
-                json!({"cards": [{"id": "remote-1", "priority": "p0", "title": "Remote ready"}]}),
+                json!({
+                    "cards": [{"id": "remote-1", "priority": "p0", "title": "Remote ready"}],
+                    "total_count": 1,
+                    "has_more": false
+                }),
             ),
             (
                 200,
-                json!({"cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "title": "Blocked"}]}),
+                json!({
+                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "title": "Blocked"}],
+                    "total_count": 1,
+                    "has_more": false
+                }),
             ),
             (
                 200,
@@ -3139,7 +3152,11 @@ mod tests {
     fn cli_list_ready_path_preview_wins_over_remote_environment() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
-            json!({"cards": [{"id": "wrong-remote", "priority": "p0", "title": "Wrong remote"}]}),
+            json!({
+                "cards": [{"id": "wrong-remote", "priority": "p0", "title": "Wrong remote"}],
+                "total_count": 1,
+                "has_more": false
+            }),
         )]);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

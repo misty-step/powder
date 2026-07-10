@@ -1,5 +1,12 @@
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListPage {
+    pub cards: Vec<Value>,
+    pub total_count: usize,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
     base_url: String,
@@ -94,6 +101,28 @@ pub fn urlencode(raw: &str) -> String {
         }
     }
     out
+}
+
+pub fn parse_list_page(response: Value) -> Result<ListPage, String> {
+    let cards = match response.get("cards") {
+        Some(Value::Array(cards)) => cards.clone(),
+        _ => return Err("remote list response missing cards array".to_string()),
+    };
+    let total_count = response
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "remote list response missing total_count".to_string())?;
+    let total_count = usize::try_from(total_count)
+        .map_err(|_| "remote list response total_count is too large".to_string())?;
+    let has_more = response
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "remote list response missing has_more".to_string())?;
+    Ok(ListPage {
+        cards,
+        total_count,
+        has_more,
+    })
 }
 
 fn to_string(error: impl std::fmt::Display) -> String {
