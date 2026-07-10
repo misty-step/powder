@@ -11,15 +11,21 @@ use serde_json::{json, Value};
 
 use super::{
     card_id, claim_action, missing_required, optional_repository_tier,
-    optional_repository_visibility, optional_str, parse_autonomy, parse_priority, parse_status,
-    required_claim_arg, required_str, run_id, run_id_for_claim, to_string, ClaimAction,
+    optional_repository_visibility, optional_str, parse_autonomy, parse_estimate, parse_priority,
+    parse_status, required_claim_arg, required_str, run_id, run_id_for_claim, to_string,
+    ClaimAction,
 };
 
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            let response = client.get(&format!("/api/v1/cards/ready?limit={limit}"))?;
+            let mut query = format!("limit={limit}");
+            if let Some(estimate) = optional_str(args, "estimate") {
+                parse_estimate(estimate)?;
+                query.push_str(&format!("&estimate={}", urlencode(estimate)));
+            }
+            let response = client.get(&format!("/api/v1/cards/ready?{query}"))?;
             remote_card_summary_page_payload(response)?
         }
         "list_cards" => {
@@ -32,6 +38,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(autonomy) = optional_str(args, "autonomy") {
                 parse_autonomy(autonomy)?;
                 query.push_str(&format!("&autonomy={}", urlencode(autonomy)));
+            }
+            if let Some(estimate) = optional_str(args, "estimate") {
+                parse_estimate(estimate)?;
+                query.push_str(&format!("&estimate={}", urlencode(estimate)));
             }
             if let Some(repo) = optional_str(args, "repo") {
                 query.push_str(&format!("&repo={}", urlencode(repo)));
@@ -76,6 +86,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 parse_priority(value)?;
                 body["priority"] = json!(value);
             }
+            if let Some(value) = optional_str(args, "estimate") {
+                parse_estimate(value)?;
+                body["estimate"] = json!(value);
+            }
             if let Some(value) = args["labels"].as_array() {
                 body["labels"] = json!(value);
             }
@@ -111,6 +125,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = optional_str(args, "priority") {
                 parse_priority(value)?;
                 body["priority"] = json!(value);
+            }
+            if let Some(value) = optional_str(args, "estimate") {
+                parse_estimate(value)?;
+                body["estimate"] = json!(value);
             }
             if let Some(value) = args["labels"].as_array() {
                 body["labels"] = json!(value);
@@ -917,6 +935,87 @@ mod tests {
         );
     }
 
+    /// powder-964 follow-up: remote dispatch dropped `estimate` on all four
+    /// tools that carry it -- local (in-process store) mode filtered/wrote
+    /// it correctly, but a remote MCP client got unfiltered lists and
+    /// estimate-less writes with no error. Asserts the query param / body
+    /// field actually reaches the recorded HTTP request for every one of
+    /// list_ready, list_cards, create_card, and update_card.
+    #[test]
+    fn estimate_is_forwarded_and_validated_on_every_tool_that_carries_it() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"cards": [], "total_count": 0, "has_more": false}),
+            ),
+            (
+                200,
+                json!({"cards": [], "total_count": 0, "has_more": false}),
+            ),
+            (
+                200,
+                json!({"id": "sized", "status": "ready", "updated_at": 10}),
+            ),
+            (
+                200,
+                json!({"id": "sized", "status": "ready", "updated_at": 11}),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        call_tool_remote(&client, "list_ready", &json!({"estimate": "S", "limit": 5})).unwrap();
+        call_tool_remote(&client, "list_cards", &json!({"estimate": "M", "limit": 5})).unwrap();
+        call_tool_remote(
+            &client,
+            "create_card",
+            &json!({"id": "sized", "title": "Sized", "acceptance": ["proof"], "estimate": "L"}),
+        )
+        .unwrap();
+        call_tool_remote(
+            &client,
+            "update_card",
+            &json!({"card_id": "sized", "estimate": "XL"}),
+        )
+        .unwrap();
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].path, "/api/v1/cards/ready?limit=5&estimate=S");
+        assert_eq!(requests[1].path, "/api/v1/cards?limit=5&estimate=M");
+        assert_eq!(requests[2].body.as_ref().unwrap()["estimate"], "L");
+        assert_eq!(
+            requests[3].body,
+            Some(json!({"estimate": "XL"})),
+            "update_card must forward estimate as the only patched field when it's the \
+             only field supplied"
+        );
+    }
+
+    #[test]
+    fn invalid_estimate_is_rejected_locally_before_any_remote_dispatch() {
+        let (base_url, recorded) = spawn_test_server(Vec::new());
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        for (tool, args) in [
+            ("list_ready", json!({"estimate": "huge"})),
+            ("list_cards", json!({"estimate": "huge"})),
+            (
+                "create_card",
+                json!({"id": "x", "title": "x", "estimate": "huge"}),
+            ),
+            ("update_card", json!({"card_id": "x", "estimate": "huge"})),
+        ] {
+            let err = call_tool_remote(&client, tool, &args).unwrap_err();
+            assert!(
+                err.contains("invalid estimate"),
+                "{tool} did not steer an invalid estimate before dispatch: {err}"
+            );
+        }
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "schema-steered local validation should not call the remote server"
+        );
+    }
+
     #[test]
     fn board_stats_sends_get_to_stats_endpoint_with_filters() {
         let (base_url, recorded) = spawn_test_server(vec![(
@@ -1446,5 +1545,91 @@ mod tests {
 
         assert!(err.contains("403"));
         assert!(err.contains("does not hold the active claim"));
+    }
+
+    /// Params meaningful only to in-process (local store) dispatch, never
+    /// sent to a deployed instance over the wire -- remote identity comes
+    /// from the bearer key alone (see the module doc comment), so `actor`/
+    /// `admin` args that a local caller supplies for audit attribution have
+    /// no remote equivalent -- verified per tool against the deployed REST
+    /// handlers in `powder-server/src/main.rs`, which derive `actor` from
+    /// the authenticated request for every one of these routes and accept
+    /// no client-supplied admin-bypass flag at all. Every other schema
+    /// param must be forwarded.
+    const LOCAL_ONLY_PARAMS: &[(&str, &[&str])] = &[
+        ("create_card", &["actor"]),
+        ("update_card", &["actor"]),
+        ("manage_claim", &["actor", "admin"]),
+        ("update_status", &["actor", "admin"]),
+        ("update_relations", &["actor", "admin"]),
+        ("request_input", &["actor", "admin"]),
+        ("complete_card", &["actor", "admin"]),
+    ];
+
+    /// Params that genuinely reach the remote server but not as a literal
+    /// `args["name"]`-shaped token in this file -- `manage_claim`'s
+    /// `action` is read once by the shared `claim_action` parser in
+    /// `lib.rs` into a `ClaimAction` enum, and `manage_claim_remote`'s
+    /// `match action { ... }` is exhaustive, so the compiler itself
+    /// guarantees every variant dispatches to its REST route; there is no
+    /// silent-drop failure mode for it to catch. Every other exemption
+    /// belongs in `LOCAL_ONLY_PARAMS`, not here.
+    const HANDLED_INDIRECTLY: &[(&str, &[&str])] = &[("manage_claim", &["action"])];
+
+    /// Third remote-parity gap this month (list summaries, then
+    /// answer-input, then `estimate` in powder-964): a schema param added to
+    /// a tool with no corresponding remote-dispatch handling silently
+    /// vanishes for every remote MCP client while local mode works fine, and
+    /// nothing fails to say so. This walks every `TOOLS` schema and requires
+    /// each property to either appear as a literal `"name"` args-access
+    /// token somewhere in this file's non-test production code (the shape
+    /// every `args["x"]` / `optional_str(args, "x")` / `required_str(args,
+    /// "x")` access takes), or be named in `LOCAL_ONLY_PARAMS` /
+    /// `HANDLED_INDIRECTLY`. Deliberately scoped to `remote.rs` alone, not
+    /// `lib.rs`: `lib.rs` declares `TOOLS` itself, so every schema's own
+    /// property names trivially "appear" there regardless of whether
+    /// dispatch code actually forwards them -- searching it would make this
+    /// check tautological. A newly added param that lands in none of these
+    /// buckets fails this test by name instead of dropping silently.
+    #[test]
+    fn every_remote_tool_param_is_forwarded_or_explicitly_local_only() {
+        // Search only the dispatch code above `#[cfg(test)]`, not this test
+        // module itself -- otherwise a param name that only ever appears in
+        // a test fixture (e.g. a canned JSON response body) would falsely
+        // "cover" a tool whose real dispatch arm never forwards it.
+        let source = include_str!("remote.rs")
+            .split_once("#[cfg(test)]")
+            .expect("remote.rs must contain a #[cfg(test)] module boundary")
+            .0;
+        let mut gaps = Vec::new();
+
+        for tool in crate::TOOLS {
+            let schema: Value = serde_json::from_str(tool.input_schema)
+                .unwrap_or_else(|err| panic!("{} has invalid input_schema JSON: {err}", tool.name));
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                continue;
+            };
+            let exempt = |list: &[(&str, &[&str])], param: &str| {
+                list.iter()
+                    .find(|(name, _)| *name == tool.name)
+                    .is_some_and(|(_, params)| params.contains(&param))
+            };
+
+            for param in properties.keys() {
+                if exempt(LOCAL_ONLY_PARAMS, param) || exempt(HANDLED_INDIRECTLY, param) {
+                    continue;
+                }
+                if !source.contains(&format!("\"{param}\"")) {
+                    gaps.push(format!("{}::{param}", tool.name));
+                }
+            }
+        }
+
+        assert!(
+            gaps.is_empty(),
+            "remote dispatch (crates/powder-mcp/src/remote.rs) does not reference these tool \
+             params anywhere -- add forwarding in call_tool_remote, or add them to \
+             LOCAL_ONLY_PARAMS above if the gap is intentional: {gaps:?}"
+        );
     }
 }

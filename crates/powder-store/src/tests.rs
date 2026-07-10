@@ -2940,6 +2940,34 @@ fn reimport_with_same_digest_but_repaired_acceptance_is_flagged_content_repaired
 }
 
 #[test]
+fn reimport_with_a_changed_digest_never_counts_as_content_repaired() -> Result<()> {
+    // An ordinary source edit changes the digest (source.path/contents
+    // differ) as well as the acceptance text. That's expected drift from a
+    // real edit, not the powder-963 parser-fix-repaired-existing-damage
+    // case content_repaired exists to surface -- counting it here would
+    // make the audit signal noisy on every normal reimport.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut original = backlog_card("001", 2, "sha256:v1");
+    original.acceptance = vec!["original wording".to_string()];
+    store.import_cards(vec![original])?;
+
+    let mut edited = backlog_card("001", 2, "sha256:v2");
+    edited.acceptance = vec!["a genuinely different criterion".to_string()];
+    let outcome = store.import_cards(vec![edited])?;
+
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            updated: 1,
+            content_repaired: 0,
+            ..Default::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn import_reports_create_update_preserve_and_unchanged_together() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

@@ -930,6 +930,15 @@ impl Card {
             if self.status == CardStatus::Ready {
                 merged.status = CardStatus::Ready;
             }
+        } else if !merged.criteria.is_empty() {
+            // powder-963 follow-up: the freshly parsed `incoming` criteria
+            // always start with no checked/proof state (`parse_backlog_card`
+            // builds them fresh from raw oracle text every time), so a plain
+            // reimport used to wipe completion evidence off every criterion
+            // on the card -- including ones whose text never changed --
+            // every single time a backlog.d file was reimported. Preserve
+            // state by criterion identity instead of overwriting wholesale.
+            merged.criteria = merge_criteria_state(&self.criteria, merged.criteria);
         }
         merged.created_at = self.created_at;
         merged
@@ -1258,6 +1267,41 @@ pub fn clean_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// Preserves checked/proof state across a reimport for a criterion whose
+/// identity survives it: same position and either unchanged text, or the
+/// stored text is a truncation-prefix of the freshly parsed text -- the
+/// same oracle item, grown back to its full length by a parser fix
+/// (powder-963's continuation-aware oracle parser repairing previously
+/// truncated criteria). Any other text change at that position is treated
+/// as a new oracle item with no prior state to inherit; positions beyond
+/// `stored`'s length are new items and pass through untouched.
+fn merge_criteria_state(
+    stored: &[AcceptanceCriterion],
+    incoming: Vec<AcceptanceCriterion>,
+) -> Vec<AcceptanceCriterion> {
+    incoming
+        .into_iter()
+        .enumerate()
+        .map(|(index, criterion)| {
+            let Some(previous) = stored.get(index) else {
+                return criterion;
+            };
+            let same_identity = previous.text == criterion.text
+                || criterion.text.starts_with(previous.text.as_str());
+            if same_identity {
+                AcceptanceCriterion {
+                    text: criterion.text,
+                    checked_by: previous.checked_by.clone(),
+                    checked_at: previous.checked_at,
+                    proof_links: previous.proof_links.clone(),
+                }
+            } else {
+                criterion
+            }
+        })
+        .collect()
+}
+
 fn validate_ttl(ttl_seconds: u64) -> Result<(), DomainError> {
     if ttl_seconds == 0 {
         Err(DomainError::validation(
@@ -1456,6 +1500,104 @@ mod tests {
              acceptance must not get silently promoted to Ready -- the Backlog->Ready \
              re-derivation only fires when this reimport had to restore acceptance from \
              the stored card, not whenever the final acceptance happens to be non-empty"
+        );
+    }
+
+    #[test]
+    fn reimport_preserves_checked_and_proof_state_by_criterion_identity() {
+        // A reimport used to wipe checked_by/checked_at/proof_links off
+        // every criterion, because parse_backlog_card always builds a fresh
+        // AcceptanceCriterion with no state, and merge_reimport used to take
+        // that fresh vector wholesale -- so a byte-identical reimport (e.g.
+        // running `import` again for an unrelated reason) silently erased
+        // completion evidence. This is doubly important after powder-963:
+        // the continuation-aware parser now legitimately changes a
+        // previously-truncated criterion's text on reimport (the "wrapped"
+        // criterion below), and that repair must not cost it its checked
+        // state either -- the prefix rule treats a text that only grew is
+        // the same oracle item, not a new one.
+        let mut current = Card::new(CardId::new("001").unwrap(), "Title", "body")
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance([
+                "first criterion".to_string(),
+                "The list/shuffle (`assets/route.ts`), and similar".to_string(),
+            ])
+            .with_created_at(10);
+        current.criteria[0].checked_by = Some("agent-a".to_string());
+        current.criteria[0].checked_at = Some(20);
+        current.criteria[0].proof_links.push(CriterionProof {
+            url: "https://example.test/pr-1".to_string(),
+            actor: "agent-a".to_string(),
+            created_at: 20,
+        });
+        current.criteria[1].checked_by = Some("agent-b".to_string());
+        current.criteria[1].checked_at = Some(21);
+        current.criteria[1].proof_links.push(CriterionProof {
+            url: "https://example.test/pr-2".to_string(),
+            actor: "agent-b".to_string(),
+            created_at: 21,
+        });
+
+        // The repaired reimport: criterion 0's text is unchanged; criterion
+        // 1's text grew from the previously-truncated prefix to its full
+        // wrapped sentence (the powder-963 fix repairing prior damage).
+        let repaired = Card::new(CardId::new("001").unwrap(), "Title", "body")
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance([
+                "first criterion".to_string(),
+                "The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) \
+                 read paths return `thumbnailUrl`."
+                    .to_string(),
+            ])
+            .with_created_at(999);
+
+        let merged = current.merge_reimport(repaired);
+
+        assert_eq!(merged.criteria[0].text, "first criterion");
+        assert_eq!(merged.criteria[0].checked_by.as_deref(), Some("agent-a"));
+        assert_eq!(merged.criteria[0].checked_at, Some(20));
+        assert_eq!(merged.criteria[0].proof_links.len(), 1);
+
+        assert_eq!(
+            merged.criteria[1].text,
+            "The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) \
+             read paths return `thumbnailUrl`."
+        );
+        assert_eq!(
+            merged.criteria[1].checked_by.as_deref(),
+            Some("agent-b"),
+            "a criterion repaired by the truncation fix keeps its checked state -- the \
+             stored text is a prefix of the repaired text, so it's the same oracle item"
+        );
+        assert_eq!(merged.criteria[1].checked_at, Some(21));
+        assert_eq!(merged.criteria[1].proof_links.len(), 1);
+    }
+
+    #[test]
+    fn reimport_resets_state_for_a_criterion_whose_text_changed_for_an_unrelated_reason() {
+        let mut current = Card::new(CardId::new("001").unwrap(), "Title", "body")
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["old wording entirely".to_string()])
+            .with_created_at(10);
+        current.criteria[0].checked_by = Some("agent-a".to_string());
+        current.criteria[0].checked_at = Some(20);
+
+        let edited = Card::new(CardId::new("001").unwrap(), "Title", "body")
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["a completely different criterion".to_string()])
+            .with_created_at(999);
+
+        let merged = current.merge_reimport(edited);
+
+        assert_eq!(merged.criteria[0].text, "a completely different criterion");
+        assert_eq!(
+            merged.criteria[0].checked_by, None,
+            "a genuine content edit (not a text-preserving-or-growing repair) is a new \
+             oracle item and must not inherit stale checked state"
         );
     }
 

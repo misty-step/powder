@@ -1953,12 +1953,15 @@ pub struct ImportOutcome {
     pub preserved: usize,
     pub unchanged: usize,
     /// Cards whose acceptance text actually changed on this reimport even
-    /// though the source file's digest did not (powder-963): a parser fix
+    /// though the source file's digest did NOT (powder-963): a parser fix
     /// repairing previously-truncated criteria on already-imported cards.
-    /// Audit an already-imported repo for backlog.d parser damage by running
-    /// `preview_import` (or `import-repo --dry-run` from the CLI) after a
-    /// parser fix ships and reading this count instead of hand-diffing
-    /// every card against its source file.
+    /// Scoped to `ReimportClass::Unchanged` specifically -- an ordinary
+    /// source edit changes the digest too (`ReimportClass::Updated`), and
+    /// that acceptance-text delta is expected, not damage, so it must not
+    /// inflate this counter. Audit an already-imported repo for backlog.d
+    /// parser damage by running `preview_import` (or `import-repo
+    /// --dry-run` from the CLI) after a parser fix ships and reading this
+    /// count instead of hand-diffing every card against its source file.
     pub content_repaired: usize,
 }
 
@@ -1973,7 +1976,7 @@ impl ImportOutcome {
             ReimportClass::Updated => self.updated += 1,
             ReimportClass::Unchanged => self.unchanged += 1,
         }
-        if current.acceptance != merged.acceptance {
+        if class == ReimportClass::Unchanged && current.acceptance != merged.acceptance {
             self.content_repaired += 1;
         }
     }
