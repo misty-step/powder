@@ -827,6 +827,192 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     );
 }
 
+/// powder-966: an agent judging chewability from a list response must see
+/// the same acceptance-criterion text `get_card` would show, not a clipped
+/// preview. `GET /api/v1/cards` and `GET /api/v1/cards/ready` both serialize
+/// the full `Card` (not a summary DTO), so this locks that in with a
+/// >200-char criterion driven through both list routes plus the single-card
+/// route, verifying byte-for-byte equality across all three.
+#[tokio::test]
+async fn list_and_ready_routes_carry_full_criteria_text_not_a_clipped_preview() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let long_criterion = "The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and \
+        similar (`similar/route.ts`) read paths return `thumbnailUrl`, so grid tiles source the \
+        256px thumbnail (with the existing thumbnail\u{2192}blob error fallback intact), and this \
+        sentence keeps going well past two hundred characters to prove nothing server-side clips it.";
+    assert!(long_criterion.len() > 200);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            &json!({
+                "id": "long-criterion-card",
+                "title": "Long criterion",
+                "acceptance": [long_criterion],
+                "status": "ready",
+                "autonomy": "auto",
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let get = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/long-criterion-card",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let get = response_json(get).await;
+    assert_eq!(get["card"]["criteria"][0]["text"], long_criterion);
+
+    let listed = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?limit=50",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let listed = response_json(listed).await;
+    let listed_card = listed["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["id"] == "long-criterion-card")
+        .unwrap();
+    assert_eq!(listed_card["criteria"][0]["text"], long_criterion);
+
+    let ready = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready?limit=50",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let ready = response_json(ready).await;
+    let ready_card = ready["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["id"] == "long-criterion-card")
+        .unwrap();
+    assert_eq!(ready_card["criteria"][0]["text"], long_criterion);
+}
+
+/// powder-964: backlog.d's `Estimate: S/M/L/XL` header round-trips through
+/// create, patch, get, and the estimate filter on both list surfaces.
+#[tokio::test]
+async fn estimate_round_trips_through_create_patch_and_filters_list_and_ready() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"sized-card","title":"Sized card","acceptance":["proof"],"status":"ready","estimate":"M"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(created["estimate"], "m");
+
+    let filtered_out = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?estimate=S",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let filtered_out = response_json(filtered_out).await;
+    assert!(!filtered_out["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|card| card["id"] == "sized-card"));
+
+    let filtered_in = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?estimate=M",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let filtered_in = response_json(filtered_in).await;
+    assert!(filtered_in["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|card| card["id"] == "sized-card"));
+
+    let ready_filtered = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready?estimate=M",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let ready_filtered = response_json(ready_filtered).await;
+    assert!(ready_filtered["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|card| card["id"] == "sized-card"));
+
+    let patched = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/sized-card",
+            Some(&raw_key),
+            r#"{"estimate":"XL"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched = response_json(patched).await;
+    assert_eq!(patched["estimate"], "xl");
+
+    let invalid = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"bad-estimate","title":"t","acceptance":["x"],"estimate":"huge"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn board_stats_route_returns_compact_counts_without_listing_cards() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);

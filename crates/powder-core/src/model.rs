@@ -212,6 +212,43 @@ impl Priority {
     }
 }
 
+/// A coarse size signal, matching backlog.d's `Estimate: S/M/L/XL` header
+/// convention (powder-964): a cheap, structured way for an autonomous
+/// chewer to filter for low-complexity work before spending tokens reading
+/// a full card body. Optional everywhere -- cards imported before this
+/// field existed are not required to backfill it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Estimate {
+    S,
+    M,
+    L,
+    Xl,
+}
+
+impl Estimate {
+    pub const ALL: [Self; 4] = [Self::S, Self::M, Self::L, Self::Xl];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "S" => Some(Self::S),
+            "M" => Some(Self::M),
+            "L" => Some(Self::L),
+            "XL" => Some(Self::Xl),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::S => "S",
+            Self::M => "M",
+            Self::L => "L",
+            Self::Xl => "XL",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutonomyClass {
@@ -483,6 +520,8 @@ pub struct Card {
     pub status: CardStatus,
     pub autonomy: AutonomyClass,
     pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -515,6 +554,8 @@ pub struct CardSummary {
     pub autonomy: AutonomyClass,
     pub priority: Priority,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
@@ -539,6 +580,7 @@ impl From<&Card> for CardSummary {
             status: card.status,
             autonomy: card.autonomy,
             priority: card.priority,
+            estimate: card.estimate,
             repo: card.repo.clone(),
             labels: card.labels.clone(),
             claim: card.claim.as_ref().map(ClaimSummary::from),
@@ -564,6 +606,8 @@ struct CardFields {
     #[serde(default)]
     autonomy: AutonomyClass,
     priority: Priority,
+    #[serde(default)]
+    estimate: Option<Estimate>,
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default)]
@@ -604,6 +648,7 @@ impl<'de> Deserialize<'de> for Card {
             status: fields.status,
             autonomy: fields.autonomy,
             priority: fields.priority,
+            estimate: fields.estimate,
             labels: fields.labels,
             assignee: fields.assignee,
             related: fields.related,
@@ -659,6 +704,7 @@ impl Card {
             status: CardStatus::Backlog,
             autonomy: AutonomyClass::default(),
             priority: Priority::default(),
+            estimate: None,
             labels: Vec::new(),
             assignee: None,
             related: Vec::new(),
@@ -719,6 +765,11 @@ impl Card {
 
     pub fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    pub fn with_estimate(mut self, estimate: Option<Estimate>) -> Self {
+        self.estimate = estimate;
         self
     }
 

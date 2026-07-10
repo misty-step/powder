@@ -1,6 +1,6 @@
 use powder_core::{
     AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource, CardStatus,
-    DetailLevel, DomainError, Priority, ReadyQuery, RunId, RunState,
+    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
 };
 
 use crate::{
@@ -221,6 +221,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             status: Some(CardStatus::Blocked),
             repo: None,
             autonomy: None,
+            estimate: None,
         },
         20,
     )?;
@@ -234,6 +235,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             status: None,
             repo: Some("other".to_string()),
             autonomy: None,
+            estimate: None,
         },
         20,
     )?;
@@ -246,6 +248,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             status: None,
             repo: Some("misty-step/other".to_string()),
             autonomy: None,
+            estimate: None,
         },
         20,
     )?;
@@ -259,6 +262,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             status: Some(CardStatus::Done),
             repo: Some("misty-step/other".to_string()),
             autonomy: None,
+            estimate: None,
         },
         20,
     )?;
@@ -269,6 +273,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             status: None,
             repo: None,
             autonomy: Some(AutonomyClass::Auto),
+            estimate: None,
         },
         20,
     )?;
@@ -570,6 +575,7 @@ fn list_cards_repo_filter_surfaces_legacy_repo_null_cards_with_numeric_id_prefix
             status: None,
             repo: Some("misty-step".to_string()),
             autonomy: None,
+            estimate: None,
         },
         20,
     )?;
@@ -596,6 +602,58 @@ fn create_card_with_events_rejects_repo_that_conflicts_with_numeric_id_prefix() 
         StoreError::Domain(DomainError::Validation { field: "repo", .. })
     ));
     assert!(store.get_card(&CardId::new("misty-step-906")?)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn estimate_round_trips_through_persist_and_load_and_filters_list_and_ready() -> Result<()> {
+    // powder-964: backlog.d's Estimate: S/M/L/XL header has a Powder
+    // equivalent now -- optional, round-trips, and both list-ready and
+    // list-cards can filter on it so an autonomous chewer can self-select
+    // for low-complexity work without reading full card bodies.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let small = ready_card("small-card", 10).with_estimate(Some(Estimate::S));
+    let large = ready_card("large-card", 11).with_estimate(Some(Estimate::L));
+    let unset = ready_card("unset-card", 12);
+    store.import_cards(vec![small, large, unset])?;
+
+    assert_eq!(
+        store
+            .get_card(&CardId::new("small-card")?)?
+            .expect("stored card")
+            .estimate,
+        Some(Estimate::S)
+    );
+    assert_eq!(
+        store
+            .get_card(&CardId::new("unset-card")?)?
+            .expect("stored card")
+            .estimate,
+        None
+    );
+
+    let small_only = store.list_cards(
+        &CardFilter {
+            estimate: Some(Estimate::S),
+            ..Default::default()
+        },
+        20,
+    )?;
+    assert_eq!(
+        small_only.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["small-card"]
+    );
+
+    let ready_small_only =
+        store.list_ready(ReadyQuery::new(20, 20).with_estimate(Some(Estimate::S)))?;
+    assert_eq!(
+        ready_small_only
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["small-card"]
+    );
     Ok(())
 }
 
@@ -692,6 +750,7 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
             status: None,
             repo: Some("misty-step/canary".to_string()),
             autonomy: None,
+            estimate: None,
         },
         20,
     )?;
@@ -2847,6 +2906,40 @@ fn reimport_with_no_content_change_is_reported_unchanged() -> Result<()> {
 }
 
 #[test]
+fn reimport_with_same_digest_but_repaired_acceptance_is_flagged_content_repaired() -> Result<()> {
+    // powder-963: a parser fix can change what a byte-identical backlog.d
+    // file parses into (e.g. absorbing a previously-truncated continuation
+    // line) without the file itself changing, so `source.digest` stays the
+    // same across the reimport. `content_repaired` is the audit signal an
+    // operator reads after shipping a parser fix to find already-imported
+    // cards whose acceptance text just got corrected, without hand-diffing
+    // every card against its source file.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut truncated = backlog_card("001", 2, "sha256:v1");
+    truncated.acceptance = vec!["The list/shuffle (`assets/route.ts`), and similar".to_string()];
+    store.import_cards(vec![truncated])?;
+
+    let mut repaired = backlog_card("001", 2, "sha256:v1");
+    repaired.acceptance = vec![
+        "The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) read paths \
+         return `thumbnailUrl`."
+            .to_string(),
+    ];
+    let outcome = store.import_cards(vec![repaired])?;
+
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            unchanged: 1,
+            content_repaired: 1,
+            ..Default::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn import_reports_create_update_preserve_and_unchanged_together() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -2879,6 +2972,7 @@ fn import_reports_create_update_preserve_and_unchanged_together() -> Result<()> 
             updated: 1,
             preserved: 1,
             unchanged: 1,
+            content_repaired: 0,
         }
     );
     assert_eq!(outcome.total(), 4);
@@ -2971,6 +3065,7 @@ fn field_note_generator_spawns_exactly_one_draft_for_a_qualifying_completion() -
             status: None,
             repo: Some("content".to_string()),
             autonomy: None,
+            estimate: None,
         },
         50,
     )?;

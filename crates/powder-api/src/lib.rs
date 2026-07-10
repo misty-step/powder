@@ -23,7 +23,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards",
         intent: "create one new card in the instance database, rejecting duplicate ids; response includes a hint field when the created card has no acceptance criteria",
         body_shape: Some(
-            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely"#,
+            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"estimate":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely; estimate is one of S|M|L|XL"#,
         ),
     },
     ApiRoute {
@@ -35,13 +35,13 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
-        intent: "list ready cards for an agent to claim; response is {cards,total_count,has_more}",
+        intent: "list ready cards for an agent to claim; optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more}",
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards",
-        intent: "list cards by optional status/autonomy/repo filter; response is {cards,total_count,has_more}",
+        intent: "list cards by optional status/autonomy/repo/estimate filter; response is {cards,total_count,has_more}",
         body_shape: None,
     },
     ApiRoute {
@@ -103,7 +103,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}",
         intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
         body_shape: Some(
-            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"labels":null} -- every field is optional; only the fields present in the body are changed, admin scope required"#,
+            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"estimate":null,"labels":null} -- every field is optional; only the fields present in the body are changed, admin scope required; estimate is one of S|M|L|XL"#,
         ),
     },
     ApiRoute {

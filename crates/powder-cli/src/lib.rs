@@ -2,8 +2,8 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Priority, ReadyQuery,
-    RunId,
+    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
+    ReadyQuery, RunId,
 };
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
@@ -378,12 +378,13 @@ fn import(args: &[String]) -> Result<String, ShellError> {
 
 fn outcome_line(outcome: &powder_store::ImportOutcome) -> String {
     format!(
-        "total={}\tcreated={}\tupdated={}\tpreserved={}\tunchanged={}",
+        "total={}\tcreated={}\tupdated={}\tpreserved={}\tunchanged={}\tcontent_repaired={}",
         outcome.total(),
         outcome.created,
         outcome.updated,
         outcome.preserved,
-        outcome.unchanged
+        outcome.unchanged,
+        outcome.content_repaired
     )
 }
 
@@ -494,6 +495,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .map(parse_autonomy_flag)
         .transpose()?
         .unwrap_or_default();
+    let estimate = flag_value(args, "--estimate")
+        .map(parse_estimate_flag)
+        .transpose()?;
 
     let related = card_ids_flag(args, "--related")?;
     let blocks = card_ids_flag(args, "--blocks")?;
@@ -511,6 +515,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .with_status(status)
         .with_autonomy(autonomy)
         .with_priority(priority)
+        .with_estimate(estimate)
         .with_acceptance(acceptance)
         .with_proof_plan(proof_plan.clone())
         .with_created_at(now);
@@ -541,6 +546,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         }
         if let Some(repo) = repo {
             payload["repo"] = json!(repo);
+        }
+        if let Some(estimate) = estimate {
+            payload["estimate"] = json!(estimate.as_str());
         }
         client.post("/api/v1/cards", payload).map_err(remote_err)?
     } else {
@@ -579,6 +587,9 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
                     .ok_or_else(|| ShellError::Invalid(format!("invalid --priority: {raw}")))
             })
             .transpose()?,
+        estimate: flag_value(args, "--estimate")
+            .map(parse_estimate_flag)
+            .transpose()?,
         labels: flag_value(args, "--labels").map(split_csv),
     };
     let card = if let Some(db) = flag_value(args, "--db") {
@@ -608,6 +619,9 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         }
         if let Some(priority) = patch.priority {
             payload["priority"] = json!(priority.as_str());
+        }
+        if let Some(estimate) = patch.estimate {
+            payload["estimate"] = json!(estimate.as_str());
         }
         if let Some(labels) = patch.labels {
             payload["labels"] = json!(labels);
@@ -648,20 +662,24 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
 fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
     let now = unix_now();
+    let estimate = flag_value(args, "--estimate")
+        .map(parse_estimate_flag)
+        .transpose()?;
+    let query = ReadyQuery::new(now, limit).with_estimate(estimate);
     let ready = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
-        json!(store
-            .list_ready(ReadyQuery::new(now, limit))
-            .map_err(store_err)?)
+        json!(store.list_ready(query).map_err(store_err)?)
     } else if let Some(path) = positional(args).first().copied() {
         let cards = load_backlog_dir(path, now)?;
         let mut board = Board::default();
         board.import_cards(cards);
-        json!(board.list_ready(ReadyQuery::new(now, limit)))
+        json!(board.list_ready(query))
     } else if let Some(client) = remote_env.client() {
-        let page = client
-            .get(&format!("/api/v1/cards/ready?limit={limit}"))
-            .map_err(remote_err)?;
+        let mut url = format!("/api/v1/cards/ready?limit={limit}");
+        if let Some(estimate) = estimate {
+            url.push_str(&format!("&estimate={}", estimate.as_str()));
+        }
+        let page = client.get(&url).map_err(remote_err)?;
         list_page_cards(page)?
     } else {
         return Err(ShellError::Invalid(
@@ -698,12 +716,16 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let autonomy = flag_value(args, "--autonomy")
         .map(parse_autonomy_flag)
         .transpose()?;
+    let estimate = flag_value(args, "--estimate")
+        .map(parse_estimate_flag)
+        .transpose()?;
     let repo = flag_value(args, "--repo").map(str::to_string);
     let cards = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         let filter = CardFilter {
             status,
             autonomy,
+            estimate,
             repo: repo.clone(),
         };
         json!(store.list_cards(&filter, limit).map_err(store_err)?)
@@ -714,6 +736,9 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         }
         if let Some(autonomy) = autonomy {
             query.push_str(&format!("&autonomy={}", autonomy.as_str()));
+        }
+        if let Some(estimate) = estimate {
+            query.push_str(&format!("&estimate={}", estimate.as_str()));
         }
         if let Some(repo) = &repo {
             query.push_str(&format!("&repo={}", urlencode(repo)));
@@ -1413,6 +1438,20 @@ fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, She
         .collect()
 }
 
+fn parse_estimate_flag(raw: &str) -> Result<Estimate, ShellError> {
+    Estimate::parse(raw).ok_or_else(|| {
+        ShellError::Invalid(format!(
+            "invalid --estimate {raw:?}; valid: {}",
+            Estimate::ALL
+                .iter()
+                .copied()
+                .map(Estimate::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })
+}
+
 fn parse_autonomy_flag(raw: &str) -> Result<AutonomyClass, ShellError> {
     AutonomyClass::parse(raw).ok_or_else(|| {
         ShellError::Invalid(format!(
@@ -1813,6 +1852,75 @@ mod tests {
         .unwrap();
 
         assert!(completed.contains("completed\tcli-test\tdone"));
+    }
+
+    #[test]
+    fn cli_estimate_round_trips_through_create_update_and_list_filters() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-estimate-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        let created = run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "sized-cli",
+            "--title",
+            "Sized CLI card",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+            "--estimate",
+            "S",
+        ]))
+        .unwrap();
+        assert!(created.contains("created\tsized-cli"));
+
+        let card = run(&args(["get-card", "sized-cli", "--db", &db])).unwrap();
+        assert!(card.contains("\"estimate\": \"s\""));
+
+        let filtered_out = run(&args(["list-cards", "--db", &db, "--estimate", "L"])).unwrap();
+        assert!(!filtered_out.contains("sized-cli"));
+
+        let filtered_in = run(&args(["list-cards", "--db", &db, "--estimate", "S"])).unwrap();
+        assert!(filtered_in.contains("sized-cli"));
+
+        let ready_filtered = run(&args(["list-ready", "--db", &db, "--estimate", "S"])).unwrap();
+        assert!(ready_filtered.contains("sized-cli"));
+
+        run(&args([
+            "update-card",
+            "sized-cli",
+            "--db",
+            &db,
+            "--estimate",
+            "XL",
+        ]))
+        .unwrap();
+        let card = run(&args(["get-card", "sized-cli", "--db", &db])).unwrap();
+        assert!(card.contains("\"estimate\": \"xl\""));
+
+        let err = run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "bad-estimate",
+            "--title",
+            "t",
+            "--estimate",
+            "huge",
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid --estimate"));
     }
 
     #[test]

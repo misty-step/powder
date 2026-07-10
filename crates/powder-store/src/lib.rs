@@ -6,8 +6,8 @@ use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
-    WorkLogEntry,
+    CriterionProof, DomainError, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId,
+    RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -36,8 +36,9 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7,
-    MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_12_TO_13, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5,
+    MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10,
+    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -123,6 +124,7 @@ pub struct CardFilter {
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
     pub autonomy: Option<AutonomyClass>,
+    pub estimate: Option<Estimate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +213,7 @@ pub struct CardPatch {
     pub status: Option<CardStatus>,
     pub autonomy: Option<AutonomyClass>,
     pub priority: Option<Priority>,
+    pub estimate: Option<Estimate>,
     pub labels: Option<Vec<String>>,
 }
 
@@ -329,6 +332,10 @@ impl Store {
                     self.migrate_11_to_12()?;
                     12
                 }
+                12 => {
+                    self.migrate_12_to_13()?;
+                    13
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -342,6 +349,13 @@ impl Store {
         // migration contract retroactively.
         if !self.cards_has_column("autonomy")? {
             self.connection.execute_batch(MIGRATE_11_TO_12)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_12_to_13(&mut self) -> Result<()> {
+        if !self.cards_has_column("estimate")? {
+            self.connection.execute_batch(MIGRATE_12_TO_13)?;
         }
         Ok(())
     }
@@ -398,8 +412,9 @@ impl Store {
                 }
                 Some(current) => {
                     let class = classify_reimport(&current, &incoming);
-                    persist_card(&transaction, &current.merge_reimport(incoming))?;
-                    outcome.record(class);
+                    let merged = current.merge_reimport(incoming);
+                    outcome.record(class, &current, &merged);
+                    persist_card(&transaction, &merged)?;
                 }
             }
         }
@@ -444,8 +459,8 @@ impl Store {
                     let class = classify_reimport(&current, &incoming);
                     let merged = current.merge_reimport(incoming);
                     let previous = current.status;
+                    outcome.record(class, &current, &merged);
                     persist_card(&transaction, &merged)?;
-                    outcome.record(class);
                     if let Some(event_type) =
                         events::outbound_event_for_status_change(previous, merged.status)
                     {
@@ -479,13 +494,22 @@ impl Store {
 
     /// Compute what [`Store::import_cards`] would do to `cards` without
     /// writing anything, so a caller can show a create/update/preserve/
-    /// unchanged report before committing to the import.
+    /// unchanged report before committing to the import. `content_repaired`
+    /// (powder-963) surfaces cards whose source file digest is unchanged but
+    /// whose re-parsed acceptance text now differs from what's stored -- the
+    /// audit signal for a parser fix landing on already-imported cards
+    /// (e.g. the hard-wrapped-continuation truncation bug) without a manual
+    /// per-card diff against the backlog.d source.
     pub fn preview_import(&self, cards: &[Card]) -> Result<ImportOutcome> {
         let mut outcome = ImportOutcome::default();
         for incoming in cards {
             match load_card_optional(&self.connection, &incoming.id)? {
                 None => outcome.created += 1,
-                Some(current) => outcome.record(classify_reimport(&current, incoming)),
+                Some(current) => {
+                    let class = classify_reimport(&current, incoming);
+                    let merged = current.merge_reimport(incoming.clone());
+                    outcome.record(class, &current, &merged);
+                }
             }
         }
         Ok(outcome)
@@ -614,6 +638,10 @@ impl Store {
         if let Some(priority) = patch.priority {
             card.priority = priority;
             patched_fields.push("priority");
+        }
+        if let Some(estimate) = patch.estimate {
+            card.estimate = Some(estimate);
+            patched_fields.push("estimate");
         }
         if let Some(labels) = patch.labels {
             card.labels = clean_string_list(labels);
@@ -747,6 +775,12 @@ impl Store {
             }) {
                 continue;
             }
+            if query
+                .estimate
+                .is_some_and(|estimate| card.estimate != Some(estimate))
+            {
+                continue;
+            }
             if !card_repository_allows_ready(&self.connection, &card)? {
                 continue;
             }
@@ -797,6 +831,12 @@ impl Store {
                 filter
                     .autonomy
                     .map(|autonomy| card.autonomy == autonomy)
+                    .unwrap_or(true)
+            })
+            .filter(|card| {
+                filter
+                    .estimate
+                    .map(|estimate| card.estimate == Some(estimate))
                     .unwrap_or(true)
             })
             .filter(|card| match repo_filter.as_deref() {
@@ -1633,7 +1673,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -1643,6 +1683,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                status = excluded.status,
                autonomy = excluded.autonomy,
                priority = excluded.priority,
+               estimate = excluded.estimate,
                labels_json = excluded.labels_json,
                assignee = excluded.assignee,
                related_json = excluded.related_json,
@@ -1670,6 +1711,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             card.status.as_str(),
             card.autonomy.as_str(),
             card.priority.as_str(),
+            card.estimate.map(Estimate::as_str),
             to_json(&card.labels)?,
             card.assignee,
             to_json(&card.related)?,
@@ -1910,6 +1952,14 @@ pub struct ImportOutcome {
     pub updated: usize,
     pub preserved: usize,
     pub unchanged: usize,
+    /// Cards whose acceptance text actually changed on this reimport even
+    /// though the source file's digest did not (powder-963): a parser fix
+    /// repairing previously-truncated criteria on already-imported cards.
+    /// Audit an already-imported repo for backlog.d parser damage by running
+    /// `preview_import` (or `import-repo --dry-run` from the CLI) after a
+    /// parser fix ships and reading this count instead of hand-diffing
+    /// every card against its source file.
+    pub content_repaired: usize,
 }
 
 impl ImportOutcome {
@@ -1917,11 +1967,14 @@ impl ImportOutcome {
         self.created + self.updated + self.preserved + self.unchanged
     }
 
-    fn record(&mut self, class: ReimportClass) {
+    fn record(&mut self, class: ReimportClass, current: &Card, merged: &Card) {
         match class {
             ReimportClass::Preserved => self.preserved += 1,
             ReimportClass::Updated => self.updated += 1,
             ReimportClass::Unchanged => self.unchanged += 1,
+        }
+        if current.acceptance != merged.acceptance {
+            self.content_repaired += 1;
         }
     }
 }
@@ -1994,6 +2047,7 @@ struct CardRecord {
     status: String,
     autonomy: String,
     priority: String,
+    estimate: Option<String>,
     labels_json: String,
     assignee: Option<String>,
     related_json: String,
@@ -2024,22 +2078,23 @@ impl CardRecord {
             status: row.get(6)?,
             autonomy: row.get(7)?,
             priority: row.get(8)?,
-            labels_json: row.get(9)?,
-            assignee: row.get(10)?,
-            related_json: row.get(11)?,
-            blocks_json: row.get(12)?,
-            blocked_by_json: row.get(13)?,
-            repo: row.get(14)?,
-            workspace_path: row.get(15)?,
-            branch_name: row.get(16)?,
-            source_path: row.get(17)?,
-            source_digest: row.get(18)?,
-            claim_agent: row.get(19)?,
-            claim_run_id: row.get(20)?,
-            claim_acquired_at: row.get(21)?,
-            claim_expires_at: row.get(22)?,
-            created_at: row.get(23)?,
-            updated_at: row.get(24)?,
+            estimate: row.get(9)?,
+            labels_json: row.get(10)?,
+            assignee: row.get(11)?,
+            related_json: row.get(12)?,
+            blocks_json: row.get(13)?,
+            blocked_by_json: row.get(14)?,
+            repo: row.get(15)?,
+            workspace_path: row.get(16)?,
+            branch_name: row.get(17)?,
+            source_path: row.get(18)?,
+            source_digest: row.get(19)?,
+            claim_agent: row.get(20)?,
+            claim_run_id: row.get(21)?,
+            claim_acquired_at: row.get(22)?,
+            claim_expires_at: row.get(23)?,
+            created_at: row.get(24)?,
+            updated_at: row.get(25)?,
         })
     }
 
@@ -2067,6 +2122,16 @@ impl CardRecord {
                     value: self.priority,
                 },
             )?)
+            .with_estimate(
+                self.estimate
+                    .map(|raw| {
+                        Estimate::parse(&raw).ok_or(StoreError::InvalidStoredValue {
+                            field: "cards.estimate",
+                            value: raw,
+                        })
+                    })
+                    .transpose()?,
+            )
             .with_created_at(self.created_at);
         let criteria =
             from_json::<Vec<AcceptanceCriterion>>("cards.criteria_json", self.criteria_json)?;

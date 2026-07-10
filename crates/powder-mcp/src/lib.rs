@@ -3,7 +3,7 @@
 pub use powder_api::RemoteClient;
 use powder_core::{
     Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel,
-    Priority, ReadyQuery, RunId,
+    Estimate, Priority, ReadyQuery, RunId,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -31,12 +31,12 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
         description: "Scan claimable card summaries sorted by priority, age, and identifier. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"estimate":{"type":"string","enum":["S","M","L","XL"]}}}"#,
     },
     ToolDef {
         name: "list_cards",
-        description: "Scan card summaries by optional status/autonomy/repo filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
+        description: "Scan card summaries by optional status/autonomy/repo/estimate filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -45,13 +45,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "create_card",
-        description: "Create one card with optional acceptance criteria, proof plan, relations, repository, and initial status; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        description: "Create one card with optional acceptance criteria, proof plan, relations, repository, estimate, and initial status; returns a minimal ack; get_card for full state.",
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
-        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, autonomy, priority, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. In remote mode the deployed instance requires an admin-scope key.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, autonomy, priority, estimate, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. In remote mode the deployed instance requires an admin-scope key.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -374,8 +374,11 @@ pub fn call_tool_store(
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let estimate = optional_str(args, "estimate")
+                .map(parse_estimate)
+                .transpose()?;
             let page = store
-                .list_ready_page(ReadyQuery::new(now, limit))
+                .list_ready_page(ReadyQuery::new(now, limit).with_estimate(estimate))
                 .map_err(to_string)?;
             card_summary_page_payload(&page.cards, page.total_count)
         }
@@ -388,6 +391,9 @@ pub fn call_tool_store(
             let autonomy = optional_str(args, "autonomy")
                 .map(parse_autonomy)
                 .transpose()?;
+            let estimate = optional_str(args, "estimate")
+                .map(parse_estimate)
+                .transpose()?;
             let repo = args["repo"].as_str().map(str::to_string);
             let page = store
                 .list_cards_page(
@@ -395,6 +401,7 @@ pub fn call_tool_store(
                         status,
                         repo,
                         autonomy,
+                        estimate,
                     },
                     limit,
                 )
@@ -425,6 +432,9 @@ pub fn call_tool_store(
                 .map(parse_autonomy)
                 .transpose()?
                 .unwrap_or_default();
+            let estimate = optional_str(args, "estimate")
+                .map(parse_estimate)
+                .transpose()?;
             let mut card = Card::new(id, title, optional_str(args, "body").unwrap_or_default())
                 .map_err(to_string)?
                 .with_acceptance(acceptance)
@@ -432,6 +442,7 @@ pub fn call_tool_store(
                 .with_status(status)
                 .with_autonomy(autonomy)
                 .with_priority(priority)
+                .with_estimate(estimate)
                 .with_created_at(now);
             card.labels = string_array(args, "labels")?;
             card.related = card_ids_array(args, "related")?;
@@ -462,6 +473,9 @@ pub fn call_tool_store(
                     .transpose()?,
                 priority: optional_str(args, "priority")
                     .map(parse_priority)
+                    .transpose()?,
+                estimate: optional_str(args, "estimate")
+                    .map(parse_estimate)
                     .transpose()?,
                 labels: optional_string_array(args, "labels")?,
             };
@@ -952,6 +966,10 @@ fn parse_autonomy(raw: &str) -> Result<AutonomyClass, String> {
         .ok_or_else(|| invalid_enum_value("autonomy", raw, autonomy_valid_values()))
 }
 
+fn parse_estimate(raw: &str) -> Result<Estimate, String> {
+    Estimate::parse(raw).ok_or_else(|| invalid_enum_value("estimate", raw, estimate_valid_values()))
+}
+
 fn detail_arg(args: &Value) -> Result<DetailLevel, String> {
     optional_str(args, "detail")
         .map(|raw| DetailLevel::parse(raw).ok_or_else(|| format!("invalid detail: {raw}")))
@@ -1020,6 +1038,15 @@ fn autonomy_valid_values() -> String {
         .iter()
         .copied()
         .map(AutonomyClass::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn estimate_valid_values() -> String {
+    Estimate::ALL
+        .iter()
+        .copied()
+        .map(Estimate::as_str)
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -2169,6 +2196,18 @@ Expose tools against the DB.
 
     #[test]
     fn mcp_get_card_emits_criteria_but_lists_emit_only_summaries() {
+        // powder-966: a >200-char criterion is the falsifier for server-side
+        // truncation. get_card must return it byte-for-byte; list_cards and
+        // list_ready must return a summary that omits criteria text
+        // entirely (counts only) -- that omission is a deliberate summary
+        // shape, not truncation, and this test locks both halves of that
+        // contract so neither regresses into a clipped preview.
+        let long_criterion = "The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and \
+            similar (`similar/route.ts`) read paths return `thumbnailUrl`, so grid tiles source \
+            the 256px thumbnail, and this sentence keeps going well past two hundred characters \
+            to prove nothing server-side clips it.";
+        assert!(long_criterion.len() > 200);
+
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         call_tool_store(
@@ -2177,7 +2216,7 @@ Expose tools against the DB.
             &json!({
                 "id": "criteria-wire",
                 "title": "Criteria wire",
-                "acceptance": ["prove the wire shape"],
+                "acceptance": [long_criterion],
                 "status": "ready",
                 "actor": "operator"
             }),
@@ -2195,7 +2234,7 @@ Expose tools against the DB.
         let detail = tool_payload(&detail);
         let card = &detail["card"];
         assert!(card.get("acceptance").is_none());
-        assert_eq!(card["criteria"][0]["text"], "prove the wire shape");
+        assert_eq!(card["criteria"][0]["text"], long_criterion);
         assert_eq!(card["criteria_checked"], 0);
         assert_eq!(card["criteria_total"], 1);
 
@@ -2213,6 +2252,19 @@ Expose tools against the DB.
         assert!(listed_card.get("criteria").is_none());
         assert_eq!(listed_card["criteria_checked"], 0);
         assert_eq!(listed_card["criteria_total"], 1);
+
+        let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 50}), 13).unwrap();
+        let ready_payload = tool_payload(&ready);
+        let ready_card = ready_payload["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == "criteria-wire")
+            .unwrap();
+        assert!(ready_card.get("acceptance").is_none());
+        assert!(ready_card.get("criteria").is_none());
+        assert_eq!(ready_card["criteria_checked"], 0);
+        assert_eq!(ready_card["criteria_total"], 1);
     }
 
     #[test]
@@ -2258,6 +2310,80 @@ Expose tools against the DB.
             .unwrap()
             .iter()
             .any(|event| event["event_type"] == "patch" && event["actor"] == "operator"));
+    }
+
+    #[test]
+    fn mcp_create_card_sets_estimate_and_update_card_patches_it_and_lists_filter_on_it() {
+        // powder-964: the chewer-facing size signal round-trips through
+        // create_card, update_card, get_card, and both list_cards/list_ready
+        // estimate filters.
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "sized-card",
+                "title": "Sized card",
+                "acceptance": ["proof"],
+                "status": "ready",
+                "estimate": "S",
+                "actor": "operator"
+            }),
+            10,
+        )
+        .unwrap();
+
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "sized-card"}),
+            11,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&detail)["card"]["estimate"], "s");
+
+        let small_only =
+            call_tool_store(&mut store, "list_cards", &json!({"estimate": "S"}), 12).unwrap();
+        let small_only = tool_payload(&small_only);
+        assert!(small_only["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|card| card["id"] == "sized-card"));
+
+        let ready_small_only =
+            call_tool_store(&mut store, "list_ready", &json!({"estimate": "S"}), 13).unwrap();
+        let ready_small_only = tool_payload(&ready_small_only);
+        assert!(ready_small_only["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|card| card["id"] == "sized-card"));
+
+        call_tool_store(
+            &mut store,
+            "update_card",
+            &json!({"card_id": "sized-card", "estimate": "L", "actor": "operator"}),
+            14,
+        )
+        .unwrap();
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "sized-card"}),
+            15,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&detail)["card"]["estimate"], "l");
+
+        let invalid = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "bad-estimate", "title": "t", "estimate": "huge"}),
+            16,
+        );
+        assert!(invalid.is_err());
     }
 
     #[test]
