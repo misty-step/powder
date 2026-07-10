@@ -806,6 +806,7 @@ impl Card {
         let mut merged = incoming;
         if self.protects_lifecycle_on_reimport() {
             merged.status = self.status;
+            merged.autonomy = self.autonomy;
             merged.claim = self.claim.clone();
         }
         if merged.body.trim().is_empty() && !self.body.trim().is_empty() {

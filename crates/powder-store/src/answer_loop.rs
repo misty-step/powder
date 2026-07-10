@@ -116,6 +116,8 @@ impl Store {
             "SELECT DISTINCT runs.id, runs.card_id, runs.state, runs.agent,
              runs.claim_expires_at, runs.proof, runs.created_at, runs.updated_at
              FROM runs
+             JOIN cards ON cards.id = runs.card_id
+                       AND cards.claim_run_id = runs.id
              JOIN links ON links.card_id = runs.card_id
              WHERE runs.state = 'awaiting_input'
                AND lower(ltrim(links.label)) LIKE 'approval%'
@@ -175,6 +177,13 @@ impl Store {
             );
         }
         let mut card = load_card(&transaction, &run.card_id)?;
+        if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
+            return Err(DomainError::conflict(format!(
+                "run {run_id} is not the current claim for card {}",
+                card.id
+            ))
+            .into());
+        }
         card.status.validate_transition(CardStatus::Running)?;
         card.status = CardStatus::Running;
         card.updated_at = now;

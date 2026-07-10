@@ -131,7 +131,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "get-run" => get_run(rest),
         [command, rest @ ..] if command == "list-approvals" => list_approvals(rest, remote_env),
         [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
-        [command, rest @ ..] if command == "answer-input" => answer_input(rest),
+        [command, rest @ ..] if command == "answer-input" => answer_input(rest, remote_env),
         [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
         [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
         [command, rest @ ..] if command == "add-link" => add_link(rest, remote_env),
@@ -1047,7 +1047,7 @@ fn list_awaiting_input(args: &[String]) -> Result<String, ShellError> {
     to_pretty_json(&serde_json::json!({ "awaiting": awaiting }))
 }
 
-fn answer_input(args: &[String]) -> Result<String, ShellError> {
+fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let run_id = positional(args)
         .first()
@@ -1056,11 +1056,26 @@ fn answer_input(args: &[String]) -> Result<String, ShellError> {
         .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
     let actor = required_flag(args, "--actor")?;
     let answer = required_flag(args, "--answer")?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let run = store
-        .answer_input(&run_id, actor, answer, now, &authority(args))
-        .map_err(store_err)?;
-    Ok(format!("answered-input\t{}\t{}\n", run.id, run.card_id))
+    let run = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .answer_input(&run_id, actor, answer, now, &authority(args))
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/runs/{run_id}/answer"),
+                json!({"actor": actor, "answer": answer}),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("answer-input"));
+    };
+    Ok(format!(
+        "answered-input\t{}\t{}\n",
+        json_string(&run, "id")?,
+        json_string(&run, "card_id")?
+    ))
 }
 
 fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -3259,6 +3274,44 @@ mod tests {
         assert_eq!(
             requests[2].body,
             Some(json!({"proof": "https://example.test/pr"}))
+        );
+    }
+
+    #[test]
+    fn cli_remote_mode_answers_input_without_db() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"id": "run-approval", "card_id": "approval-1", "state": "active"}),
+        )]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let answered = run_with_env(
+            &args([
+                "answer-input",
+                "run-approval",
+                "--actor",
+                "operator",
+                "--answer",
+                "Approved",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(answered, "answered-input\trun-approval\tapproval-1\n");
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            format!("{} {}", requests[0].method, requests[0].path),
+            "POST /api/v1/runs/run-approval/answer"
+        );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
+        );
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"actor": "operator", "answer": "Approved"}))
         );
     }
 

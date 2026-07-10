@@ -326,7 +326,7 @@ impl Store {
                     11
                 }
                 11 => {
-                    self.connection.execute_batch(MIGRATE_11_TO_12)?;
+                    self.migrate_11_to_12()?;
                     12
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
@@ -334,6 +334,24 @@ impl Store {
             self.connection
                 .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
+    }
+
+    fn migrate_11_to_12(&mut self) -> Result<()> {
+        // This migration may have half-applied in the old ALTER-then-version
+        // pattern; keep only this step idempotent instead of broadening the
+        // migration contract retroactively.
+        if !self.cards_has_column("autonomy")? {
+            self.connection.execute_batch(MIGRATE_11_TO_12)?;
+        }
+        Ok(())
+    }
+
+    fn cards_has_column(&self, column: &str) -> Result<bool> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(cards)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(columns.iter().any(|name| name.eq_ignore_ascii_case(column)))
     }
 
     /// Opts this `Store` into the field-note seed generator (see

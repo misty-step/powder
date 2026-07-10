@@ -14,9 +14,11 @@ Valid values:
 - `review`: the conservative default. The work still must be fully verified by
   agents; the operator only supplies the explicit approval answer.
 
-The class can be set when a card is created and revised later through the safe
-card patch/update surfaces. Importers, grooming tools, routers, and humans may
-set it. Powder does not infer it and never calls a model to classify it.
+The class can be set when a card is created, revised later through the safe
+card patch/update surfaces, or supplied in backlog.d as `Autonomy: auto` or
+`Autonomy: review`. GitHub issue imports do not map autonomy yet; they rely on
+the conservative `review` default. Powder does not infer class and never calls
+a model to classify it.
 
 The Bitterblossom router reads `autonomy` to choose between autonomous merge
 and approval-request routing. Other machine consumers should treat omitted

@@ -137,6 +137,25 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
 }
 
 #[test]
+fn migration_11_to_12_tolerates_half_applied_autonomy_column() -> Result<()> {
+    let path = temp_db("v11-half-autonomy");
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE cards (id TEXT PRIMARY KEY);
+             ALTER TABLE cards ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'review';
+             PRAGMA user_version = 11;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    Ok(())
+}
+
+#[test]
 fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -293,6 +312,64 @@ fn list_approvals_surfaces_packet_links_and_drains_after_answer() -> Result<()> 
         &Authority::unchecked(),
     )?;
     assert!(store.list_approvals(10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn approval_queue_and_answer_input_reject_stale_awaiting_run_after_reclaim() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+
+    let first = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.add_link(
+        &card_id,
+        "approval/packet",
+        "https://example.test/approval",
+        12,
+    )?;
+    store.request_input(
+        &first.run_id,
+        "Approve old run?",
+        12,
+        &Authority::unchecked(),
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET status = 'running' WHERE id = ?1",
+        [card_id.as_str()],
+    )?;
+
+    let second = store.claim_card(&card_id, "agent-b", 16, 3600, &Authority::unchecked())?;
+    assert_ne!(first.run_id, second.run_id);
+
+    assert!(
+        store.list_approvals(10)?.is_empty(),
+        "the old awaiting run is not the card's current claim"
+    );
+    let err = store
+        .answer_input(
+            &first.run_id,
+            "operator",
+            "Approved",
+            17,
+            &Authority::unchecked(),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not the current claim"),
+        "error was: {err}"
+    );
+    assert_eq!(
+        store.get_run(&first.run_id)?.expect("first run").state,
+        RunState::AwaitingInput
+    );
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(
+        card.claim.as_ref().map(|claim| &claim.run_id),
+        Some(&second.run_id)
+    );
     Ok(())
 }
 
@@ -2605,6 +2682,60 @@ fn reimport_over_a_quiescent_card_refreshes_content_and_status() -> Result<()> {
         outcome,
         ImportOutcome {
             updated: 1,
+            ..Default::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn backlog_autonomy_import_round_trips_and_reimport_tracks_status_semantics() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+
+    let auto = powder_core::parse_backlog_card(
+        "backlog.d/001-autonomy.md",
+        "# Autonomy fixture\n\nPriority: P1 | Status: ready | Autonomy: auto\n\n## Goal\nShip it.\n\n## Oracle\n- [ ] proof\n",
+        1,
+    )
+    .unwrap();
+    store.import_cards(vec![auto])?;
+    assert_eq!(
+        store.get_card(&card_id)?.expect("card").autonomy,
+        AutonomyClass::Auto
+    );
+
+    let review = powder_core::parse_backlog_card(
+        "backlog.d/001-autonomy.md",
+        "# Autonomy fixture edited\n\nPriority: P1 | Status: blocked | Autonomy: review\n\n## Goal\nShip it after review.\n\n## Oracle\n- [ ] proof\n",
+        2,
+    )
+    .unwrap();
+    store.import_cards(vec![review])?;
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::Blocked);
+    assert_eq!(card.autonomy, AutonomyClass::Review);
+
+    store.update_status(&card_id, CardStatus::Ready, 3, &Authority::unchecked())?;
+    let claim = store.claim_card(&card_id, "agent-a", 4, 3600, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 5, &Authority::unchecked())?;
+    let stale = powder_core::parse_backlog_card(
+        "backlog.d/001-autonomy.md",
+        "# Autonomy fixture stale\n\nPriority: P1 | Status: ready | Autonomy: auto\n\n## Goal\nStale copy.\n\n## Oracle\n- [ ] proof\n",
+        6,
+    )
+    .unwrap();
+    let outcome = store.import_cards(vec![stale])?;
+
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::Running);
+    assert_eq!(card.autonomy, AutonomyClass::Review);
+    assert_eq!(card.claim.as_ref().map(|c| &c.run_id), Some(&claim.run_id));
+    assert_eq!(
+        outcome,
+        ImportOutcome {
+            preserved: 1,
             ..Default::default()
         }
     );
