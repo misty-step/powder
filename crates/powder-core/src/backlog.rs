@@ -1,6 +1,8 @@
 use sha2::{Digest, Sha256};
 
-use crate::model::{AutonomyClass, Card, CardId, CardSource, CardStatus, DomainError, Priority};
+use crate::model::{
+    AutonomyClass, Card, CardId, CardSource, CardStatus, DomainError, Estimate, Priority,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacklogParseError {
@@ -55,6 +57,24 @@ pub fn parse_backlog_card(
         })
         .transpose()?
         .unwrap_or_default();
+    let estimate = parse_field(contents, "Estimate")
+        .map(|raw| {
+            Estimate::parse(&raw).ok_or_else(|| {
+                BacklogParseError::new(
+                    path,
+                    format!(
+                        "invalid Estimate {raw:?}; valid: {}",
+                        Estimate::ALL
+                            .iter()
+                            .copied()
+                            .map(Estimate::as_str)
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    ),
+                )
+            })
+        })
+        .transpose()?;
     let goal = section(contents, "Goal").unwrap_or_default();
     let oracle = oracle_items(contents);
     // No fabricated acceptance: an omitted/unparseable Status must default
@@ -84,6 +104,7 @@ pub fn parse_backlog_card(
     .map_err(|err| BacklogParseError::new(path, err.to_string()))?
     .with_priority(priority)
     .with_autonomy(autonomy)
+    .with_estimate(estimate)
     .with_status(status)
     .with_created_at(created_at)
     .with_acceptance(oracle);
@@ -162,18 +183,48 @@ fn oracle_items(contents: &str) -> Vec<String> {
         return Vec::new();
     };
 
-    oracle
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            line.strip_prefix("- [ ]")
-                .or_else(|| line.strip_prefix("- [x]"))
-                .or_else(|| line.strip_prefix("- [X]"))
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .collect()
+    checklist_items(&oracle)
+}
+
+/// backlog.d authors hard-wrap prose under a checklist item with a hanging
+/// indent (powder-963: sploot's `- [ ] ...` items commonly span 2-3 physical
+/// lines). A naive one-line-per-item parse truncates every wrapped item to
+/// its first source line, silently dropping the rest of the sentence --
+/// including the concrete detail (file paths, route names, clauses) that
+/// made the criterion checkable. This absorbs indented continuation lines
+/// into the preceding item until a blank line, a new `- [ ]`, or a
+/// non-indented line (e.g. the next heading) ends it.
+fn checklist_items(section_text: &str) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    let mut absorbing = false;
+    for raw_line in section_text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            absorbing = false;
+            continue;
+        }
+        if let Some(rest) = strip_checklist_marker(trimmed) {
+            items.push(rest.trim().to_owned());
+            absorbing = true;
+        } else if absorbing && raw_line.starts_with(char::is_whitespace) {
+            if let Some(last) = items.last_mut() {
+                if !last.is_empty() {
+                    last.push(' ');
+                }
+                last.push_str(trimmed);
+            }
+        } else {
+            absorbing = false;
+        }
+    }
+    items.into_iter().filter(|item| !item.is_empty()).collect()
+}
+
+fn strip_checklist_marker(trimmed: &str) -> Option<&str> {
+    trimmed
+        .strip_prefix("- [ ]")
+        .or_else(|| trimmed.strip_prefix("- [x]"))
+        .or_else(|| trimmed.strip_prefix("- [X]"))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -219,9 +270,34 @@ Turn tickets into cards.
         assert_eq!(card.priority, Priority::P0);
         assert_eq!(card.status, CardStatus::Ready);
         assert_eq!(card.autonomy, AutonomyClass::Auto);
+        assert_eq!(card.estimate, Some(Estimate::M));
         assert_eq!(card.acceptance.len(), 2);
         assert_eq!(card.created_at, 42);
         assert!(card.source.unwrap().digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn estimate_is_none_when_the_header_omits_it() {
+        // powder-964: existing cards imported before this field existed
+        // must not be forced to backfill it.
+        let text =
+            "# No estimate here\n\nPriority: P1\n\n## Goal\nShip it.\n\n## Oracle\n- [ ] proof\n";
+
+        let card = parse_backlog_card("backlog.d/006-no-estimate.md", text, 10).unwrap();
+
+        assert_eq!(card.estimate, None);
+    }
+
+    #[test]
+    fn rejects_invalid_estimate_with_valid_values() {
+        let err = parse_backlog_card(
+            "backlog.d/007-estimate.md",
+            "# Invalid estimate\n\nEstimate: huge\n\n## Goal\nShip.\n\n## Oracle\n- [ ] proof\n",
+            10,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.message, "invalid Estimate \"huge\"; valid: S|M|L|XL");
     }
 
     #[test]
@@ -282,6 +358,54 @@ Figure out what done looks like.
                 "Status: {label} must fall through to the oracle-based default, not be honored"
             );
         }
+    }
+
+    #[test]
+    fn oracle_items_absorb_hard_wrapped_continuation_lines() {
+        // powder-963: backlog.d authors hard-wrap a checklist item's prose
+        // with a four-space hanging indent (the sploot-048 shape below).
+        // The naive one-line-per-item parse truncated this to just the
+        // first physical line -- "The list/shuffle (`assets/route.ts`),
+        // search (`vectorSearch`), and similar" -- silently dropping the
+        // route name, the fallback clause, and the closing sentence.
+        let text = "# Serve grid thumbnails, not full originals\n\n\
+Priority: P1\n\n\
+## Goal\n\
+Grid tiles source thumbnails.\n\n\
+## Oracle\n\
+- [ ] The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar (`similar/route.ts`) read paths return\n    `thumbnailUrl`, so grid tiles source the 256px thumbnail (with the existing\n    thumbnail\u{2192}blob error fallback intact).\n";
+
+        let card = parse_backlog_card("backlog.d/048-serve-grid-thumbnails.md", text, 10).unwrap();
+
+        assert_eq!(
+            card.acceptance,
+            vec![
+                "The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar \
+                 (`similar/route.ts`) read paths return `thumbnailUrl`, so grid tiles source \
+                 the 256px thumbnail (with the existing thumbnail\u{2192}blob error fallback \
+                 intact)."
+            ]
+        );
+    }
+
+    #[test]
+    fn oracle_items_stop_continuation_at_the_next_checklist_item_or_blank_line() {
+        let text = "# Two wrapped items\n\n\
+## Goal\n\
+Ship it.\n\n\
+## Oracle\n\
+- [ ] first item wraps\n    onto a second line\n- [ ] second item starts here\n\n    this indented text follows a blank line and must not attach to anything\n- [ ] third item\n";
+
+        let card = parse_backlog_card("backlog.d/005-two-wrapped.md", text, 10).unwrap();
+
+        assert_eq!(
+            card.acceptance,
+            vec![
+                "first item wraps onto a second line",
+                "second item starts here",
+                "third item",
+            ]
+        );
     }
 
     #[test]

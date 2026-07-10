@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS cards (
   status TEXT NOT NULL,
   autonomy TEXT NOT NULL DEFAULT 'review',
   priority TEXT NOT NULL,
+  estimate TEXT,
   labels_json TEXT NOT NULL,
   assignee TEXT,
   related_json TEXT NOT NULL,
@@ -355,17 +356,25 @@ pub const MIGRATE_11_TO_12: &str = r#"
 ALTER TABLE cards ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'review';
 "#;
 
-pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, labels_json,
+/// powder-964: backlog.d's `Estimate: S/M/L/XL` header has no Powder
+/// equivalent, so an autonomous chewer has to read a full card body to
+/// gauge complexity. Nullable/optional: existing cards are not required to
+/// backfill it.
+pub const MIGRATE_12_TO_13: &str = r#"
+ALTER TABLE cards ADD COLUMN estimate TEXT;
+"#;
+
+pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
 created_at, updated_at";
 
-pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority,
+pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards WHERE id = ?1";
 
-pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority,
+pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards";

@@ -4,14 +4,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     non_empty, Activity, ActivityId, ActivityType, AwaitingInput, Card, CardDetail, CardEvent,
-    CardEventId, CardId, CardStatus, Comment, DomainError, Link, LinkId, Run, RunDetail, RunId,
-    RunState, WorkLogEntry,
+    CardEventId, CardId, CardStatus, Comment, DomainError, Estimate, Link, LinkId, Run, RunDetail,
+    RunId, RunState, WorkLogEntry,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyQuery {
     pub now: i64,
     pub limit: usize,
+    /// `None` means unfiltered; set to self-select for low-complexity work
+    /// without reading full card bodies (powder-964).
+    pub estimate: Option<Estimate>,
 }
 
 impl ReadyQuery {
@@ -19,7 +22,13 @@ impl ReadyQuery {
         Self {
             now,
             limit: limit.max(1),
+            estimate: None,
         }
+    }
+
+    pub fn with_estimate(mut self, estimate: Option<Estimate>) -> Self {
+        self.estimate = estimate;
+        self
     }
 }
 
@@ -139,6 +148,12 @@ impl Board {
             .cards
             .values()
             .filter(|card| card.is_ready_at(query.now, |id| self.blocker_is_terminal(id)))
+            .filter(|card| {
+                query
+                    .estimate
+                    .map(|estimate| card.estimate == Some(estimate))
+                    .unwrap_or(true)
+            })
             .cloned()
             .collect::<Vec<_>>();
 

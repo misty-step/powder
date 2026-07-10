@@ -25,8 +25,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Priority,
-    ReadyQuery, RunId,
+    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate,
+    Priority, ReadyQuery, RunId,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
@@ -261,6 +261,7 @@ struct Onboarding {
 #[derive(Debug, Deserialize)]
 struct ReadyParams {
     limit: Option<usize>,
+    estimate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +270,7 @@ struct ListCardsParams {
     status: Option<String>,
     autonomy: Option<String>,
     repo: Option<String>,
+    estimate: Option<String>,
     limit: Option<usize>,
 }
 
@@ -323,6 +325,7 @@ struct CreateCardRequest {
     status: Option<String>,
     autonomy: Option<String>,
     priority: Option<String>,
+    estimate: Option<String>,
     labels: Option<Vec<String>>,
     repo: Option<String>,
     related: Option<Vec<String>>,
@@ -340,6 +343,7 @@ struct PatchCardRequest {
     status: Option<String>,
     autonomy: Option<String>,
     priority: Option<String>,
+    estimate: Option<String>,
     labels: Option<Vec<String>>,
 }
 
@@ -360,6 +364,7 @@ impl PatchCardRequest {
             })
             .transpose()?;
         let autonomy = self.autonomy.as_deref().map(parse_autonomy).transpose()?;
+        let estimate = self.estimate.as_deref().map(parse_estimate).transpose()?;
 
         Ok(CardPatch {
             title: self.title,
@@ -369,6 +374,7 @@ impl PatchCardRequest {
             status,
             autonomy,
             priority,
+            estimate,
             labels: self.labels,
         })
     }
@@ -722,7 +728,9 @@ async fn list_ready(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
-    let page = lock_store(&state)?.list_ready_page(ReadyQuery::new(unix_now(), limit))?;
+    let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
+    let query = ReadyQuery::new(unix_now(), limit).with_estimate(estimate);
+    let page = lock_store(&state)?.list_ready_page(query)?;
     Ok(Json(card_list_page_json(page.cards, page.total_count)))
 }
 
@@ -744,10 +752,12 @@ async fn list_cards(
         })
         .transpose()?;
     let autonomy = params.autonomy.as_deref().map(parse_autonomy).transpose()?;
+    let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
     let limit = params.limit.unwrap_or(20).max(1);
     let filter = CardFilter {
         status,
         autonomy,
+        estimate,
         repo: params.repo,
     };
     let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
@@ -1020,6 +1030,11 @@ async fn create_card(
         .map(parse_autonomy)
         .transpose()?
         .unwrap_or_default();
+    let estimate = request
+        .estimate
+        .as_deref()
+        .map(parse_estimate)
+        .transpose()?;
     let card_id = CardId::new(request.id)?;
     let mut card = Card::new(
         card_id.clone(),
@@ -1029,6 +1044,7 @@ async fn create_card(
     .with_status(status)
     .with_autonomy(autonomy)
     .with_priority(priority)
+    .with_estimate(estimate)
     .with_acceptance(request.acceptance)
     .with_proof_plan(request.proof_plan.unwrap_or_default())
     .with_created_at(now);
@@ -1612,6 +1628,20 @@ fn parse_autonomy(raw: &str) -> Result<AutonomyClass, ApiError> {
                 .iter()
                 .copied()
                 .map(AutonomyClass::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })
+}
+
+fn parse_estimate(raw: &str) -> Result<Estimate, ApiError> {
+    Estimate::parse(raw).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "invalid estimate {raw:?}; valid: {}",
+            Estimate::ALL
+                .iter()
+                .copied()
+                .map(Estimate::as_str)
                 .collect::<Vec<_>>()
                 .join("|")
         ))
