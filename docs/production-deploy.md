@@ -2,28 +2,37 @@
 
 Two independent lanes (powder-921, misty-step-906) found the checked-in
 `fly.toml` in this repo names a Fly app (`powder`) that is **not** production:
-`fly status --app powder` shows zero running machines, and the fleet-wide
-board every agent actually reads and writes lives behind a companion box.
-Nobody working from this repo alone could find the real deploy path. This
-document is that path.
+the fleet-wide board every agent actually reads and writes lives behind a
+companion box. Nobody working from this repo alone could find the real deploy
+path. This document is that path.
+
+> **Hosting ruling (operator, 2026-07-09): the fleet is off Fly and on
+> DigitalOcean.** The supervising box is a DigitalOcean droplet. Fly remains
+> only for explicitly retained exceptions (Fly Sprites); nothing in this
+> repo's deploy path touches Fly anymore. Any Fly-shaped instruction you find
+> in older docs, cards, or the checked-in `fly.toml` is historical reference
+> for standalone self-hosters, not the operator's production path.
 
 ## The real production instance
 
 Powder is supervised as a private app on a
 [Bastion](https://github.com/misty-step/bastion) box -- a separate,
-operator-owned Fly machine that supervises several small apps privately over
-Tailscale, canonical as of the 2026-07-04 cutover. It is reached only over
-Tailscale, never a public Fly URL:
+operator-owned **DigitalOcean droplet** that supervises several small apps
+privately over Tailscale (Fly-hosted 2026-07-04 to 2026-07-09, DigitalOcean
+canonical since the 2026-07-09 migration). It is reached only over Tailscale,
+never a public URL:
 
 - **Origin:** the box's own private tailnet hostname on port `10001` -- the
   operator's `POWDER_API_BASE_URL` env var is the live source of truth for
   the exact value; this repo does not carry it (powder-951: no operator
   topology literals in tracked source).
 - **Process:** `powder-server`, bound to a loopback port inside the Bastion
-  machine, launched by Bastion's own supervisor config (an `[[app]]` block
-  named `"powder"` in Bastion's own repo)
-- **Data:** a SQLite path under Bastion's own `/data` volume (WAL mode) --
-  **not** the volume this repo's `fly.toml` provisions
+  box, launched by the Bastion supervisor (systemd `bastion.service` running
+  `bastion --config /etc/bastion/bastion.toml run`; an `[[app]]` block named
+  `"powder"` in that config). Binaries live at `/usr/local/bin/` on the box;
+  `powder-serve` is the launch wrapper that sets the env below.
+- **Data:** a SQLite path under the box's `/data` volume (WAL mode), streamed
+  to DigitalOcean Spaces via Litestream
 - **Runtime env** (set in Bastion's own supervisor config, in that `[[app]]`
   block's env section):
 
@@ -41,59 +50,65 @@ the canonical, detailed, and current source; this is a pointer for agents who
 never clone Bastion, not a mirror of its content:
 
 ```sh
-fly machine list --app powder      # confirm 0 running -- the checked-in app is inert
 curl -s "$POWDER_API_BASE_URL/healthz"
+tailscale ssh root@<box-hostname>   # the droplet is on the tailnet; ssh works from operator machines
 ```
 
 ## Deploying a code change to production
 
-The Bastion image bakes in a **pinned, git-archived snapshot** of this repo
-under `vendor/powder` -- Fly builds never need GitHub credentials, and the
-pin is an explicit, reviewable commit in Bastion's own git history. Shipping
-a merged powder PR to the live instance is a two-step, cross-repo process,
-not a single command:
+The box runs plain host binaries -- there is no image build and no Fly step.
+Shipping a merged powder PR to the live instance (verified 2026-07-09):
 
-1. **From the Bastion checkout**, bump the vendored snapshot to the new
-   `main` commit (this repo's own `main` is never deployed directly):
+1. **Cross-compile from a checkout at the merged `main` SHA** (the box
+   carries no toolchain, deliberately):
 
    ```sh
-   rm -rf vendor/powder
-   mkdir -p vendor/powder
-   git -C ../powder archive --format=tar <new-commit-sha> | tar -x -C vendor/powder
-   $EDITOR vendor/powder/SOURCE   # record the new pin
-   cargo test --release --locked -p powder-server -p powder-cli   # the exact Docker build step
+   cargo zigbuild --release --target x86_64-unknown-linux-gnu -p powder-server -p powder-cli
    ```
 
-   Commit this as a `chore: bump sanctum powder pin for <reason>` -- see
-   Bastion's own git history for the established shape and message
-   convention (several such commits already exist there).
+2. **Swap binaries atomically and let the supervisor respawn** (do NOT
+   restart `bastion.service` -- that bounces every app on the box):
 
-2. **Deploy Bastion itself.** This restarts every app Bastion supervises,
-   not just Powder -- treat it as a Bastion-repo production deploy, with
-   Bastion's own review and rollback discipline, not a Powder-repo action.
+   ```sh
+   scp target/x86_64-unknown-linux-gnu/release/powder-server root@<box>:/usr/local/bin/powder-server.new
+   scp target/x86_64-unknown-linux-gnu/release/powder root@<box>:/usr/local/bin/powder.new
+   ssh root@<box> 'mv /usr/local/bin/powder-server.new /usr/local/bin/powder-server \
+     && mv /usr/local/bin/powder.new /usr/local/bin/powder \
+     && chmod +x /usr/local/bin/powder-server /usr/local/bin/powder \
+     && pkill -x powder-server'   # supervisor respawns it on the new binary
+   curl -s "$POWDER_API_BASE_URL/healthz"   # verify it came back
+   ```
+
+3. **Record the deploy**: bump the Bastion repo's `vendor/powder` pin to the
+   deployed SHA (`git -C ../powder archive --format=tar <sha> | tar -x -C
+   vendor/powder`, update `vendor/powder/SOURCE`, commit as `chore: bump
+   sanctum powder pin for <reason>`). The pin is the durable record of what
+   production runs; the binaries are what actually run it.
 
 A merged PR on `misty-step/powder` alone changes nothing in production until
-both steps above happen. `powder version` on the CLI installed locally
-reports the commit *your local build* came from; it says nothing about what
-commit the deployed instance is running.
+the steps above happen. `powder version` on a locally installed CLI reports
+the commit *your local build* came from; it says nothing about what commit
+the deployed instance is running.
 
-## The checked-in Fly app: disposition
+## The checked-in Fly config: disposition
 
-The `powder` Fly app this repo's `fly.toml`/README describe (`fly apps
-create powder`, `fly deploy --app powder`) was **destroyed 2026-07-07**,
-after its data was verified fully migrated to the Bastion-hosted instance.
-`fly.toml`'s header comment records this and explains why the file is kept
-only as a config reference -- `fly deploy` against it would recreate a decoy,
-not restore production.
+The `powder` Fly app that `fly.toml`/README once described was **destroyed
+2026-07-07** after its data migrated to the Bastion-hosted instance, and the
+fleet left Fly entirely on 2026-07-09. `fly.toml` is kept only as a reference
+implementation for anyone self-hosting Powder standalone on Fly under their
+own org -- the operator's production never touches it.
 
-- It remains useful only as the reference implementation for anyone
-  self-hosting Powder standalone under their own Fly org (the product's own
-  README instructions are written against that use case and are correct for
-  it).
 - It must **never** be assumed live. Every agent and every doc in this repo
-  that references "the deployed instance" means the Bastion-fronted one
-  above, not a `powder` Fly app, unless `POWDER_API_BASE_URL` is explicitly
-  pointed at one.
+  that references "the deployed instance" means the Bastion-fronted
+  DigitalOcean box above, unless `POWDER_API_BASE_URL` is explicitly pointed
+  elsewhere.
+- **Stale-client warning** (observed 2026-07-09): long-lived MCP
+  subprocesses resolve `POWDER_API_BASE_URL` once at startup. When the box's
+  tailnet hostname changes (as it did in the Fly→DO cutover), running
+  sessions keep calling the dead origin and fail with opaque 404s until
+  restarted. If the MCP face 404s while direct `curl` against the current
+  env var succeeds, restart the MCP client. powder-944 tracks the durable
+  fix.
 
 ## Field-note generator env target (powder-921 residual)
 
