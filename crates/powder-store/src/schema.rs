@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS cards (
   criteria_json TEXT NOT NULL DEFAULT '[]',
   proof_plan_json TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL,
+  autonomy TEXT NOT NULL DEFAULT 'review',
   priority TEXT NOT NULL,
   labels_json TEXT NOT NULL,
   assignee TEXT,
@@ -348,17 +349,23 @@ CREATE TABLE IF NOT EXISTS work_log_entries (
 CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
 "#;
 
-pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, labels_json,
+/// powder-945: autonomy is a card class (`auto`/`review`), not a lifecycle
+/// state. Existing instances default to conservative operator review.
+pub const MIGRATE_11_TO_12: &str = r#"
+ALTER TABLE cards ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'review';
+"#;
+
+pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
 created_at, updated_at";
 
-pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority,
+pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards WHERE id = ?1";
 
-pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority,
+pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards";

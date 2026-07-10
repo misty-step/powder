@@ -2,8 +2,8 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel, Priority,
-    ReadyQuery, RunId,
+    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel,
+    Priority, ReadyQuery, RunId,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -35,8 +35,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_cards",
-        description: "Scan card summaries by optional status/repo filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
+        description: "Scan card summaries by optional status/autonomy/repo filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -46,12 +46,12 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, repository, and initial status; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
-        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. In remote mode the deployed instance requires an admin-scope key.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, autonomy, priority, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. In remote mode the deployed instance requires an admin-scope key.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -91,6 +91,11 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_awaiting_input",
         description: "List runs currently paused for human or agent input.",
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
+        name: "list_approvals",
+        description: "List awaiting-input runs with card autonomy, latest question text, run id, and approval-prefixed packet links.",
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
@@ -380,9 +385,19 @@ pub fn call_tool_store(
                 Some(raw) => Some(parse_status(raw)?),
                 None => None,
             };
+            let autonomy = optional_str(args, "autonomy")
+                .map(parse_autonomy)
+                .transpose()?;
             let repo = args["repo"].as_str().map(str::to_string);
             let page = store
-                .list_cards_page(&CardFilter { status, repo }, limit)
+                .list_cards_page(
+                    &CardFilter {
+                        status,
+                        repo,
+                        autonomy,
+                    },
+                    limit,
+                )
                 .map_err(to_string)?;
             card_summary_page_payload(&page.cards, page.total_count)
         }
@@ -406,11 +421,16 @@ pub fn call_tool_store(
                 .map(parse_priority)
                 .transpose()?
                 .unwrap_or_default();
+            let autonomy = optional_str(args, "autonomy")
+                .map(parse_autonomy)
+                .transpose()?
+                .unwrap_or_default();
             let mut card = Card::new(id, title, optional_str(args, "body").unwrap_or_default())
                 .map_err(to_string)?
                 .with_acceptance(acceptance)
                 .with_proof_plan(string_array(args, "proof_plan")?)
                 .with_status(status)
+                .with_autonomy(autonomy)
                 .with_priority(priority)
                 .with_created_at(now);
             card.labels = string_array(args, "labels")?;
@@ -431,6 +451,9 @@ pub fn call_tool_store(
                 acceptance: optional_string_array(args, "acceptance")?,
                 proof_plan: optional_string_array(args, "proof_plan")?,
                 status: optional_str(args, "status").map(parse_status).transpose()?,
+                autonomy: optional_str(args, "autonomy")
+                    .map(parse_autonomy)
+                    .transpose()?,
                 priority: optional_str(args, "priority")
                     .map(parse_priority)
                     .transpose()?,
@@ -501,6 +524,10 @@ pub fn call_tool_store(
         "list_awaiting_input" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             json!(store.list_awaiting_input(limit).map_err(to_string)?)
+        }
+        "list_approvals" => {
+            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            json!({"approvals": store.list_approvals(limit).map_err(to_string)?})
         }
         "answer_input" => {
             let run_id = run_id(args, "run_id")?;
@@ -914,6 +941,11 @@ fn parse_priority(raw: &str) -> Result<Priority, String> {
     Priority::parse(raw).ok_or_else(|| invalid_enum_value("priority", raw, priority_valid_values()))
 }
 
+fn parse_autonomy(raw: &str) -> Result<AutonomyClass, String> {
+    AutonomyClass::parse(raw)
+        .ok_or_else(|| invalid_enum_value("autonomy", raw, autonomy_valid_values()))
+}
+
 fn detail_arg(args: &Value) -> Result<DetailLevel, String> {
     optional_str(args, "detail")
         .map(|raw| DetailLevel::parse(raw).ok_or_else(|| format!("invalid detail: {raw}")))
@@ -973,6 +1005,15 @@ fn priority_valid_values() -> String {
         .iter()
         .copied()
         .map(Priority::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn autonomy_valid_values() -> String {
+    AutonomyClass::ALL
+        .iter()
+        .copied()
+        .map(AutonomyClass::as_str)
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -1071,7 +1112,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 19);
+        assert_eq!(default_tools.len(), 20);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1129,6 +1170,7 @@ mod tests {
         let tools = listed.as_array().unwrap();
         let statuses = card_status_values();
         let priorities = priority_values();
+        let autonomies = autonomy_values();
         let visibilities = repository_visibility_values();
         let tiers = repository_tier_values();
 
@@ -1140,6 +1182,12 @@ mod tests {
         }
         for value in &priorities {
             assert_eq!(Priority::parse(value).map(Priority::as_str), Some(*value));
+        }
+        for value in &autonomies {
+            assert_eq!(
+                AutonomyClass::parse(value).map(AutonomyClass::as_str),
+                Some(*value)
+            );
         }
         for value in &visibilities {
             assert_eq!(
@@ -1159,6 +1207,9 @@ mod tests {
         }
         for tool in ["create_card", "update_card"] {
             assert_schema_enum(tools, tool, "priority", &priorities);
+        }
+        for tool in ["list_cards", "create_card", "update_card"] {
+            assert_schema_enum(tools, tool, "autonomy", &autonomies);
         }
         assert_schema_enum(tools, "upsert_repository", "visibility", &visibilities);
         assert_schema_enum(tools, "upsert_repository", "tier", &tiers);
@@ -1182,6 +1233,7 @@ mod tests {
                 "get_card",
                 "get_run",
                 "list_awaiting_input",
+                "list_approvals",
                 "answer_input",
                 "update_status",
                 "check_criterion",
@@ -1193,7 +1245,7 @@ mod tests {
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 19);
+        assert_eq!(default_names.len(), 20);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1205,7 +1257,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 28);
+        assert_eq!(admin_names.len(), 29);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -1559,6 +1611,19 @@ Expose tools against the DB.
         assert_eq!(payload["total_count"], 1);
         assert_eq!(payload["has_more"], false);
 
+        call_tool_store(
+            &mut store,
+            "update_card",
+            &json!({"card_id": "blocked", "autonomy": "auto"}),
+            11,
+        )
+        .unwrap();
+        let auto =
+            call_tool_store(&mut store, "list_cards", &json!({"autonomy": "auto"}), 12).unwrap();
+        let payload = tool_payload(&auto);
+        assert_eq!(payload["cards"][0]["id"], "blocked");
+        assert_eq!(payload["cards"][0]["autonomy"], "auto");
+
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
         assert_eq!(
@@ -1646,6 +1711,107 @@ Expose tools against the DB.
             invalid_priority,
             "invalid priority \"urgent\"; valid: P0|P1|P2|P3"
         );
+
+        let invalid_autonomy = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "bad-autonomy",
+                "title": "Bad autonomy",
+                "autonomy": "robot"
+            }),
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid_autonomy,
+            "invalid autonomy \"robot\"; valid: auto|review"
+        );
+    }
+
+    #[test]
+    fn mcp_list_approvals_surfaces_packet_links_and_drains_after_answer() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "approval-card",
+                "title": "Approval card",
+                "acceptance": ["proof"],
+                "status": "ready",
+                "autonomy": "review"
+            }),
+            1,
+        )
+        .unwrap();
+        let claimed = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"card_id": "approval-card", "action": "claim", "agent": "agent-a"}),
+            2,
+        )
+        .unwrap();
+        let run_id = tool_payload(&claimed)["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        call_tool_store(
+            &mut store,
+            "update_status",
+            &json!({"card_id": "approval-card", "status": "running"}),
+            3,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "add_link",
+            &json!({
+                "card_id": "approval-card",
+                "label": "approval/packet",
+                "url": "https://example.test/packet"
+            }),
+            4,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "request_input",
+            &json!({"run_id": run_id, "question": "Approve?"}),
+            5,
+        )
+        .unwrap();
+
+        let approvals = call_tool_store(&mut store, "list_approvals", &json!({}), 6).unwrap();
+        let payload = tool_payload(&approvals);
+        assert_eq!(payload["approvals"][0]["card_id"], "approval-card");
+        assert_eq!(payload["approvals"][0]["question"], "Approve?");
+        assert_eq!(
+            payload["approvals"][0]["packet_links"][0]["url"],
+            "https://example.test/packet"
+        );
+
+        call_tool_store(
+            &mut store,
+            "answer_input",
+            &json!({"run_id": run_id, "actor": "operator", "answer": "Approved"}),
+            7,
+        )
+        .unwrap();
+        let approvals = call_tool_store(&mut store, "list_approvals", &json!({}), 8).unwrap();
+        assert!(tool_payload(&approvals)["approvals"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    fn autonomy_values() -> Vec<&'static str> {
+        AutonomyClass::ALL
+            .iter()
+            .copied()
+            .map(AutonomyClass::as_str)
+            .collect()
     }
 
     #[test]

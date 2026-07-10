@@ -4,9 +4,10 @@ use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
-    CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, CriterionProof,
-    DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState, WorkLogEntry,
+    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
+    CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
+    CriterionProof, DomainError, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
+    WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -34,9 +35,9 @@ pub use repositories::{
 };
 
 use schema::{
-    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_1_TO_2,
-    MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8,
-    MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
+    MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7,
+    MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -121,6 +122,7 @@ const FIELD_NOTE_DRAFT_LABEL: &str = "field-note-draft";
 pub struct CardFilter {
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
+    pub autonomy: Option<AutonomyClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +209,7 @@ pub struct CardPatch {
     pub acceptance: Option<Vec<String>>,
     pub proof_plan: Option<Vec<String>>,
     pub status: Option<CardStatus>,
+    pub autonomy: Option<AutonomyClass>,
     pub priority: Option<Priority>,
     pub labels: Option<Vec<String>>,
 }
@@ -322,11 +325,33 @@ impl Store {
                     self.connection.execute_batch(MIGRATE_10_TO_11)?;
                     11
                 }
+                11 => {
+                    self.migrate_11_to_12()?;
+                    12
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
                 .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
+    }
+
+    fn migrate_11_to_12(&mut self) -> Result<()> {
+        // This migration may have half-applied in the old ALTER-then-version
+        // pattern; keep only this step idempotent instead of broadening the
+        // migration contract retroactively.
+        if !self.cards_has_column("autonomy")? {
+            self.connection.execute_batch(MIGRATE_11_TO_12)?;
+        }
+        Ok(())
+    }
+
+    fn cards_has_column(&self, column: &str) -> Result<bool> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(cards)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(columns.iter().any(|name| name.eq_ignore_ascii_case(column)))
     }
 
     /// Opts this `Store` into the field-note seed generator (see
@@ -602,6 +627,10 @@ impl Store {
             card.status = status;
             patched_fields.push("status");
         }
+        if let Some(autonomy) = patch.autonomy {
+            card.autonomy = autonomy;
+            patched_fields.push("autonomy");
+        }
 
         if patched_fields.is_empty() {
             transaction.commit()?;
@@ -735,9 +764,9 @@ impl Store {
         Ok(CardListPage { cards, total_count })
     }
 
-    /// List cards by optional `status`/`repo` filter, not just ready-eligible
+    /// List cards by optional `status`/`autonomy`/`repo` filter, not just ready-eligible
     /// ones -- `list_ready` answers "what can an agent claim now"; this
-    /// answers "what exists," including `blocked`, `review`, and `done`
+    /// answers "what exists," including `blocked` and `done`
     /// cards no other surface can enumerate without opening the database
     /// file directly. Same sort as `list_ready` (priority, age, id).
     pub fn list_cards(&self, filter: &CardFilter, limit: usize) -> Result<Vec<Card>> {
@@ -764,6 +793,12 @@ impl Store {
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter(|card| filter.status.map(|s| card.status == s).unwrap_or(true))
+            .filter(|card| {
+                filter
+                    .autonomy
+                    .map(|autonomy| card.autonomy == autonomy)
+                    .unwrap_or(true)
+            })
             .filter(|card| match repo_filter.as_deref() {
                 Some(repo) => {
                     card.repo.as_deref() == Some(repo)
@@ -1598,7 +1633,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -1606,6 +1641,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                criteria_json = excluded.criteria_json,
                proof_plan_json = excluded.proof_plan_json,
                status = excluded.status,
+               autonomy = excluded.autonomy,
                priority = excluded.priority,
                labels_json = excluded.labels_json,
                assignee = excluded.assignee,
@@ -1632,6 +1668,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             to_json(&card.criteria)?,
             to_json(&card.proof_plan)?,
             card.status.as_str(),
+            card.autonomy.as_str(),
             card.priority.as_str(),
             to_json(&card.labels)?,
             card.assignee,
@@ -1955,6 +1992,7 @@ struct CardRecord {
     criteria_json: String,
     proof_plan_json: String,
     status: String,
+    autonomy: String,
     priority: String,
     labels_json: String,
     assignee: Option<String>,
@@ -1984,23 +2022,24 @@ impl CardRecord {
             criteria_json: row.get(4)?,
             proof_plan_json: row.get(5)?,
             status: row.get(6)?,
-            priority: row.get(7)?,
-            labels_json: row.get(8)?,
-            assignee: row.get(9)?,
-            related_json: row.get(10)?,
-            blocks_json: row.get(11)?,
-            blocked_by_json: row.get(12)?,
-            repo: row.get(13)?,
-            workspace_path: row.get(14)?,
-            branch_name: row.get(15)?,
-            source_path: row.get(16)?,
-            source_digest: row.get(17)?,
-            claim_agent: row.get(18)?,
-            claim_run_id: row.get(19)?,
-            claim_acquired_at: row.get(20)?,
-            claim_expires_at: row.get(21)?,
-            created_at: row.get(22)?,
-            updated_at: row.get(23)?,
+            autonomy: row.get(7)?,
+            priority: row.get(8)?,
+            labels_json: row.get(9)?,
+            assignee: row.get(10)?,
+            related_json: row.get(11)?,
+            blocks_json: row.get(12)?,
+            blocked_by_json: row.get(13)?,
+            repo: row.get(14)?,
+            workspace_path: row.get(15)?,
+            branch_name: row.get(16)?,
+            source_path: row.get(17)?,
+            source_digest: row.get(18)?,
+            claim_agent: row.get(19)?,
+            claim_run_id: row.get(20)?,
+            claim_acquired_at: row.get(21)?,
+            claim_expires_at: row.get(22)?,
+            created_at: row.get(23)?,
+            updated_at: row.get(24)?,
         })
     }
 
@@ -2016,6 +2055,12 @@ impl CardRecord {
                     value: self.status,
                 })?,
             )
+            .with_autonomy(AutonomyClass::parse(&self.autonomy).ok_or(
+                StoreError::InvalidStoredValue {
+                    field: "cards.autonomy",
+                    value: self.autonomy,
+                },
+            )?)
             .with_priority(Priority::parse(&self.priority).ok_or(
                 StoreError::InvalidStoredValue {
                     field: "cards.priority",

@@ -25,8 +25,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    parse_backlog_card, Authority, Card, CardId, CardStatus, DetailLevel, Priority, ReadyQuery,
-    RunId,
+    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Priority,
+    ReadyQuery, RunId,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
@@ -267,6 +267,7 @@ struct ReadyParams {
 #[serde(deny_unknown_fields)]
 struct ListCardsParams {
     status: Option<String>,
+    autonomy: Option<String>,
     repo: Option<String>,
     limit: Option<usize>,
 }
@@ -320,6 +321,7 @@ struct CreateCardRequest {
     acceptance: Vec<String>,
     proof_plan: Option<Vec<String>>,
     status: Option<String>,
+    autonomy: Option<String>,
     priority: Option<String>,
     labels: Option<Vec<String>>,
     repo: Option<String>,
@@ -336,6 +338,7 @@ struct PatchCardRequest {
     acceptance: Option<Vec<String>>,
     proof_plan: Option<Vec<String>>,
     status: Option<String>,
+    autonomy: Option<String>,
     priority: Option<String>,
     labels: Option<Vec<String>>,
 }
@@ -356,6 +359,7 @@ impl PatchCardRequest {
                 Priority::parse(raw).ok_or_else(|| ApiError::bad_request("invalid priority"))
             })
             .transpose()?;
+        let autonomy = self.autonomy.as_deref().map(parse_autonomy).transpose()?;
 
         Ok(CardPatch {
             title: self.title,
@@ -363,6 +367,7 @@ impl PatchCardRequest {
             acceptance: self.acceptance,
             proof_plan: self.proof_plan,
             status,
+            autonomy,
             priority,
             labels: self.labels,
         })
@@ -575,6 +580,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/onboarding", get(onboarding))
         .route("/api/v1/routes", get(routes))
         .route("/api/v1/stats", get(board_stats))
+        .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
@@ -737,9 +743,11 @@ async fn list_cards(
                 .ok_or_else(|| ApiError::bad_request(format!("invalid status: {raw}")))
         })
         .transpose()?;
+    let autonomy = params.autonomy.as_deref().map(parse_autonomy).transpose()?;
     let limit = params.limit.unwrap_or(20).max(1);
     let filter = CardFilter {
         status,
+        autonomy,
         repo: params.repo,
     };
     let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
@@ -753,6 +761,17 @@ fn card_list_page_json(cards: Vec<Card>, total_count: usize) -> serde_json::Valu
         "total_count": total_count,
         "has_more": has_more,
     })
+}
+
+async fn list_approvals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReadyParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_read(&state, &headers)?;
+    let limit = params.limit.unwrap_or(20).max(1);
+    let approvals = lock_store(&state)?.list_approvals(limit)?;
+    Ok(Json(json!({ "approvals": approvals })))
 }
 
 async fn board_stats(
@@ -995,6 +1014,12 @@ async fn create_card(
         .as_deref()
         .and_then(Priority::parse)
         .unwrap_or_default();
+    let autonomy = request
+        .autonomy
+        .as_deref()
+        .map(parse_autonomy)
+        .transpose()?
+        .unwrap_or_default();
     let card_id = CardId::new(request.id)?;
     let mut card = Card::new(
         card_id.clone(),
@@ -1002,6 +1027,7 @@ async fn create_card(
         request.body.unwrap_or_default(),
     )?
     .with_status(status)
+    .with_autonomy(autonomy)
     .with_priority(priority)
     .with_acceptance(request.acceptance)
     .with_proof_plan(request.proof_plan.unwrap_or_default())
@@ -1571,6 +1597,20 @@ fn card_ids(raw: Option<Vec<String>>) -> Result<Vec<CardId>, ApiError> {
         .map(CardId::new)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(ApiError::from)
+}
+
+fn parse_autonomy(raw: &str) -> Result<AutonomyClass, ApiError> {
+    AutonomyClass::parse(raw).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "invalid autonomy {raw:?}; valid: {}",
+            AutonomyClass::ALL
+                .iter()
+                .copied()
+                .map(AutonomyClass::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })
 }
 
 fn repository_upsert(

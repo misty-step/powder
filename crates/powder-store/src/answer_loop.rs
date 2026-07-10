@@ -1,7 +1,7 @@
 use powder_core::{
-    Activity, ActivityId, ActivityType, Authority, AwaitingInput, CardDetail, CardEvent,
-    CardEventId, CardId, CardStatus, Comment, DetailLevel, DomainError, Link, LinkId, Run,
-    RunDetail, RunId, RunState, WorkLogEntry,
+    Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
+    CardEvent, CardEventId, CardId, CardStatus, Comment, DetailLevel, DomainError, Link, LinkId,
+    Run, RunDetail, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -111,6 +111,51 @@ impl Store {
             .collect()
     }
 
+    pub fn list_approvals(&self, limit: usize) -> Result<Vec<ApprovalQueueRow>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT runs.id, runs.card_id, runs.state, runs.agent,
+             runs.claim_expires_at, runs.proof, runs.created_at, runs.updated_at
+             FROM runs
+             JOIN cards ON cards.id = runs.card_id
+                       AND cards.claim_run_id = runs.id
+             JOIN links ON links.card_id = runs.card_id
+             WHERE runs.state = 'awaiting_input'
+               AND lower(ltrim(links.label)) LIKE 'approval%'
+             ORDER BY runs.updated_at ASC, runs.id ASC
+             LIMIT ?1",
+        )?;
+        let runs = statement
+            .query_map([limit.max(1) as i64], RunRecord::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(RunRecord::into_run)
+            .collect::<Result<Vec<_>>>()?;
+
+        runs.into_iter()
+            .map(|run| {
+                let card = load_card(&self.connection, &run.card_id)?;
+                let question = latest_elicitation(&self.connection, &run.id)?;
+                let packet_links = load_links_for_card(&self.connection, &card.id)?
+                    .into_iter()
+                    .filter(|link| {
+                        link.label
+                            .trim_start()
+                            .to_ascii_lowercase()
+                            .starts_with("approval")
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ApprovalQueueRow {
+                    card_id: card.id,
+                    title: card.title,
+                    autonomy: card.autonomy,
+                    run_id: run.id,
+                    question: question.map(|question| question.payload),
+                    packet_links,
+                })
+            })
+            .collect()
+    }
+
     pub fn answer_input(
         &mut self,
         run_id: &RunId,
@@ -132,6 +177,13 @@ impl Store {
             );
         }
         let mut card = load_card(&transaction, &run.card_id)?;
+        if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
+            return Err(DomainError::conflict(format!(
+                "run {run_id} is not the current claim for card {}",
+                card.id
+            ))
+            .into());
+        }
         card.status.validate_transition(CardStatus::Running)?;
         card.status = CardStatus::Running;
         card.updated_at = now;

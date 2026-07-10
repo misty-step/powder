@@ -274,7 +274,7 @@ function normalizeCard(card) {
 }
 
 function displayStatus(status) {
-  if (["claimed", "running", "awaiting_input", "review"].includes(status)) {
+  if (["claimed", "running", "awaiting_input"].includes(status)) {
     return "in_progress";
   }
   if (status === "done" || status === "shipped" || status === "abandoned") {
@@ -989,7 +989,6 @@ function statusGlyph(status) {
   if (status === "awaiting_input") return glyph("i-ask", "ae-warn");
   if (status === "blocked" || status === "abandoned") return glyph("i-block", "ae-warn");
   if (status === "running") return glyph("i-play");
-  if (status === "review") return glyph("i-eye");
   if (status === "claimed") return glyph("i-hand");
   return "";
 }
@@ -1051,14 +1050,16 @@ function detailHTML(card, detail = {}) {
         <select class="pw-sort pw-status-change" id="detail-status-change" data-card-id="${escapeHtml(normalized.id)}" aria-label="change status">
           ${RAW_STATUSES.map((status) => `<option value="${status}"${status === normalized.status ? " selected" : ""}>${escapeHtml(statusText(status))}</option>`).join("")}
         </select>
-        <span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}
+        <span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>
+        <span class="ae-tag">${escapeHtml(normalized.autonomy || "review")}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}
       </p>
       <p id="detail-status-message" class="ae-chrome" aria-live="polite"></p>
     </section>
   `);
   const awaiting = (detail.activities || []).filter((activity) => activity.activity_type === "elicitation");
   if (normalized.status === "awaiting_input" && awaiting[0]) {
-    parts.push(`<div class="pw-ask"><p class="pw-ask-cap"><svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg>INPUT REQUESTED</p><p>${escapeHtml(awaiting[0].payload)}</p></div>`);
+    const approvalLinks = approvalPacketLinksHTML(detail.links || []);
+    parts.push(`<div class="pw-ask"><p class="pw-ask-cap"><svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg>INPUT REQUESTED</p><p>${escapeHtml(awaiting[0].payload)}</p>${approvalLinks}</div>`);
   }
   parts.push(`
     <div class="pw-detail-grid">
@@ -1160,6 +1161,14 @@ function linksHTML(links, runs) {
       : `<span>${escapeHtml(link.url)}</span>`;
     return `<p class="pw-link-row"><svg class="ae-icon" aria-hidden="true"><use href="#i-link"></use></svg><span><span class="ae-item">${escapeHtml(link.label)}</span><br>${target}</span></p>`;
   }).join("");
+}
+
+function approvalPacketLinksHTML(links) {
+  const approvalLinks = links.filter((link) =>
+    String(link.label || "").trimStart().toLowerCase().startsWith("approval"),
+  );
+  if (!approvalLinks.length) return "";
+  return `<div class="pw-approval-links">${linksHTML(approvalLinks, [])}</div>`;
 }
 
 function runHistoryHTML(card, runs, latestRun) {

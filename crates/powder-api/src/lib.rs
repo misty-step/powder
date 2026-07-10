@@ -23,7 +23,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards",
         intent: "create one new card in the instance database, rejecting duplicate ids",
         body_shape: Some(
-            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely"#,
+            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely"#,
         ),
     },
     ApiRoute {
@@ -41,7 +41,13 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards",
-        intent: "list cards by optional status/repo/limit filter; response is {cards,total_count,has_more}",
+        intent: "list cards by optional status/autonomy/repo filter; response is {cards,total_count,has_more}",
+        body_shape: None,
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/approvals",
+        intent: "list awaiting-input runs with card autonomy, latest question, run id, and any approval-prefixed packet links",
         body_shape: None,
     },
     ApiRoute {
@@ -97,7 +103,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}",
         intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
         body_shape: Some(
-            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"labels":null} -- every field is optional; only the fields present in the body are changed, admin scope required"#,
+            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"labels":null} -- every field is optional; only the fields present in the body are changed, admin scope required"#,
         ),
     },
     ApiRoute {
@@ -294,6 +300,7 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards"));
         assert!(paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
+        assert!(paths.contains(&"/api/v1/approvals"));
         assert!(paths.contains(&"/api/v1/repositories"));
         assert!(paths.contains(&"/api/v1/repositories/{name}"));
         assert!(paths.contains(&"/api/v1/repositories/{name}/merge-alias"));

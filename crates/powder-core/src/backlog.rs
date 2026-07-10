@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use crate::model::{Card, CardId, CardSource, CardStatus, DomainError, Priority};
+use crate::model::{AutonomyClass, Card, CardId, CardSource, CardStatus, DomainError, Priority};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacklogParseError {
@@ -36,6 +36,25 @@ pub fn parse_backlog_card(
         .as_deref()
         .and_then(Priority::parse)
         .unwrap_or_default();
+    let autonomy = parse_field(contents, "Autonomy")
+        .map(|raw| {
+            AutonomyClass::parse(&raw).ok_or_else(|| {
+                BacklogParseError::new(
+                    path,
+                    format!(
+                        "invalid Autonomy {raw:?}; valid: {}",
+                        AutonomyClass::ALL
+                            .iter()
+                            .copied()
+                            .map(AutonomyClass::as_str)
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    ),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let goal = section(contents, "Goal").unwrap_or_default();
     let oracle = oracle_items(contents);
     // No fabricated acceptance: an omitted/unparseable Status must default
@@ -64,6 +83,7 @@ pub fn parse_backlog_card(
     )
     .map_err(|err| BacklogParseError::new(path, err.to_string()))?
     .with_priority(priority)
+    .with_autonomy(autonomy)
     .with_status(status)
     .with_created_at(created_at)
     .with_acceptance(oracle);
@@ -182,7 +202,7 @@ mod tests {
     fn parses_backlog_ticket_into_card_with_source_digest() {
         let text = r#"# Import backlog.d markdown into cards
 
-Priority: P0 | Status: ready | Estimate: M
+Priority: P0 | Status: ready | Autonomy: auto | Estimate: M
 
 ## Goal
 Turn tickets into cards.
@@ -198,6 +218,7 @@ Turn tickets into cards.
         assert_eq!(card.title, "Import backlog.d markdown into cards");
         assert_eq!(card.priority, Priority::P0);
         assert_eq!(card.status, CardStatus::Ready);
+        assert_eq!(card.autonomy, AutonomyClass::Auto);
         assert_eq!(card.acceptance.len(), 2);
         assert_eq!(card.created_at, 42);
         assert!(card.source.unwrap().digest.starts_with("sha256:"));
@@ -268,5 +289,20 @@ Figure out what done looks like.
         let err = parse_backlog_card("backlog.d/001-import.md", "Priority: P0", 0).unwrap_err();
 
         assert!(err.message.contains("missing h1"));
+    }
+
+    #[test]
+    fn rejects_invalid_autonomy_with_valid_values() {
+        let err = parse_backlog_card(
+            "backlog.d/004-autonomy.md",
+            "# Invalid autonomy\n\nAutonomy: robot\n\n## Goal\nShip.\n\n## Oracle\n- [ ] proof\n",
+            10,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.message,
+            "invalid Autonomy \"robot\"; valid: auto|review"
+        );
     }
 }

@@ -2,14 +2,15 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, Board, Card, CardId, CardStatus, DetailLevel, Priority, ReadyQuery, RunId,
+    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Priority, ReadyQuery,
+    RunId,
 };
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
 };
 use powder_store::{
-    ApiKeyScope, CardFilter, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store,
-    StoreError,
+    ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
+    Store, StoreError,
 };
 use serde_json::{json, Value};
 
@@ -23,6 +24,7 @@ pub const COMMANDS: &[&str] = &[
     "import-repo",
     "import-github-issues",
     "create-card",
+    "update-card",
     "update-relations",
     "list-ready",
     "list-cards",
@@ -38,6 +40,7 @@ pub const COMMANDS: &[&str] = &[
     "heartbeat",
     "get-card",
     "get-run",
+    "list-approvals",
     "list-awaiting-input",
     "answer-input",
     "update-status",
@@ -110,6 +113,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "import-repo" => import_repo(rest),
         [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
+        [command, rest @ ..] if command == "update-card" => update_card(rest, remote_env),
         [command, rest @ ..] if command == "update-relations" => update_relations(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
@@ -125,8 +129,9 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest, remote_env),
         [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
         [command, rest @ ..] if command == "get-run" => get_run(rest),
+        [command, rest @ ..] if command == "list-approvals" => list_approvals(rest, remote_env),
         [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
-        [command, rest @ ..] if command == "answer-input" => answer_input(rest),
+        [command, rest @ ..] if command == "answer-input" => answer_input(rest, remote_env),
         [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
         [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
         [command, rest @ ..] if command == "add-link" => add_link(rest, remote_env),
@@ -188,6 +193,7 @@ pub fn help() -> String {
     help.push_str(
         "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary [--proof-plan \"CI + PR\"]\n",
     );
+    help.push_str("  powder update-card canary-001 --db ./data/powder.db --autonomy auto\n");
     help.push_str(
         "  powder list-cards --db ./data/powder.db --status blocked --repo misty-step/example\n",
     );
@@ -209,6 +215,7 @@ pub fn help() -> String {
     );
     help.push_str("  powder release-claim 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder get-card 001 --db ./data/powder.db\n");
+    help.push_str("  powder list-approvals --db ./data/powder.db\n");
     help.push_str("  powder list-awaiting-input --db ./data/powder.db\n");
     help.push_str(
         "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
@@ -483,6 +490,10 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let priority = flag_value(args, "--priority")
         .and_then(Priority::parse)
         .unwrap_or_default();
+    let autonomy = flag_value(args, "--autonomy")
+        .map(parse_autonomy_flag)
+        .transpose()?
+        .unwrap_or_default();
 
     let related = card_ids_flag(args, "--related")?;
     let blocks = card_ids_flag(args, "--blocks")?;
@@ -498,6 +509,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         )
         .map_err(ShellError::from)?
         .with_status(status)
+        .with_autonomy(autonomy)
         .with_priority(priority)
         .with_acceptance(acceptance)
         .with_proof_plan(proof_plan.clone())
@@ -515,6 +527,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             "title": title,
             "acceptance": acceptance,
             "status": status.as_str(),
+            "autonomy": autonomy.as_str(),
             "priority": priority.as_str(),
             "related": card_id_values(&related),
             "blocks": card_id_values(&blocks),
@@ -535,10 +548,83 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
 
     Ok(format!(
-        "created\t{}\t{}\t{}\n",
+        "created\t{}\t{}\t{}\t{}\n",
         json_string(&card, "id")?,
         json_priority(&card)?,
-        json_string(&card, "status")?
+        json_string(&card, "status")?,
+        json_string(&card, "autonomy")?
+    ))
+}
+
+fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "update-card")?;
+    let patch = CardPatch {
+        title: flag_value(args, "--title").map(str::to_string),
+        body: flag_value(args, "--body").map(str::to_string),
+        acceptance: flag_value(args, "--acceptance").map(|value| vec![value.to_string()]),
+        proof_plan: flag_value(args, "--proof-plan").map(|value| vec![value.to_string()]),
+        status: flag_value(args, "--status")
+            .map(|raw| {
+                CardStatus::parse(raw)
+                    .ok_or_else(|| ShellError::Invalid(format!("invalid --status: {raw}")))
+            })
+            .transpose()?,
+        autonomy: flag_value(args, "--autonomy")
+            .map(parse_autonomy_flag)
+            .transpose()?,
+        priority: flag_value(args, "--priority")
+            .map(|raw| {
+                Priority::parse(raw)
+                    .ok_or_else(|| ShellError::Invalid(format!("invalid --priority: {raw}")))
+            })
+            .transpose()?,
+        labels: flag_value(args, "--labels").map(split_csv),
+    };
+    let card = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .patch_card(&card_id, patch, &authority(args).actor_label(), now)
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        let mut payload = json!({});
+        if let Some(title) = patch.title {
+            payload["title"] = json!(title);
+        }
+        if let Some(body) = patch.body {
+            payload["body"] = json!(body);
+        }
+        if let Some(acceptance) = patch.acceptance {
+            payload["acceptance"] = json!(acceptance);
+        }
+        if let Some(proof_plan) = patch.proof_plan {
+            payload["proof_plan"] = json!(proof_plan);
+        }
+        if let Some(status) = patch.status {
+            payload["status"] = json!(status.as_str());
+        }
+        if let Some(autonomy) = patch.autonomy {
+            payload["autonomy"] = json!(autonomy.as_str());
+        }
+        if let Some(priority) = patch.priority {
+            payload["priority"] = json!(priority.as_str());
+        }
+        if let Some(labels) = patch.labels {
+            payload["labels"] = json!(labels);
+        }
+        client
+            .patch(&format!("/api/v1/cards/{card_id}"), payload)
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("update-card"));
+    };
+
+    Ok(format!(
+        "updated\t{}\t{}\t{}\t{}\n",
+        json_string(&card, "id")?,
+        json_priority(&card)?,
+        json_string(&card, "status")?,
+        json_string(&card, "autonomy")?
     ))
 }
 
@@ -598,8 +684,8 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     Ok(out)
 }
 
-/// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
-/// `review`, and `done` cards are otherwise invisible without opening the
+/// Enumerate cards by status/autonomy/repo, not just ready-eligible ones -- `blocked`
+/// and `done` cards are otherwise invisible without opening the
 /// database file directly.
 fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
@@ -609,11 +695,15 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
                 .ok_or_else(|| ShellError::Invalid(format!("invalid status: {raw}")))
         })
         .transpose()?;
+    let autonomy = flag_value(args, "--autonomy")
+        .map(parse_autonomy_flag)
+        .transpose()?;
     let repo = flag_value(args, "--repo").map(str::to_string);
     let cards = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         let filter = CardFilter {
             status,
+            autonomy,
             repo: repo.clone(),
         };
         json!(store.list_cards(&filter, limit).map_err(store_err)?)
@@ -621,6 +711,9 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         let mut query = format!("limit={limit}");
         if let Some(status) = status {
             query.push_str(&format!("&status={}", status.as_str()));
+        }
+        if let Some(autonomy) = autonomy {
+            query.push_str(&format!("&autonomy={}", autonomy.as_str()));
         }
         if let Some(repo) = &repo {
             query.push_str(&format!("&repo={}", urlencode(repo)));
@@ -636,10 +729,11 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let mut out = String::new();
     for card in json_array(&cards)? {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             json_string(card, "id")?,
             json_priority(card)?,
             json_string(card, "status")?,
+            json_string(card, "autonomy")?,
             json_string(card, "title")?
         ));
     }
@@ -929,6 +1023,22 @@ fn get_run(args: &[String]) -> Result<String, ShellError> {
     to_pretty_json(&detail)
 }
 
+fn list_approvals(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let limit = parse_limit(args).unwrap_or(20);
+    let approvals = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        json!(store.list_approvals(limit).map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .get(&format!("/api/v1/approvals?limit={limit}"))
+            .map_err(remote_err)?["approvals"]
+            .clone()
+    } else {
+        return Err(missing_transport("list-approvals"));
+    };
+    to_pretty_json(&serde_json::json!({ "approvals": approvals }))
+}
+
 fn list_awaiting_input(args: &[String]) -> Result<String, ShellError> {
     let store = open_store(required_flag(args, "--db")?)?;
     let awaiting = store
@@ -937,7 +1047,7 @@ fn list_awaiting_input(args: &[String]) -> Result<String, ShellError> {
     to_pretty_json(&serde_json::json!({ "awaiting": awaiting }))
 }
 
-fn answer_input(args: &[String]) -> Result<String, ShellError> {
+fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let run_id = positional(args)
         .first()
@@ -946,11 +1056,26 @@ fn answer_input(args: &[String]) -> Result<String, ShellError> {
         .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
     let actor = required_flag(args, "--actor")?;
     let answer = required_flag(args, "--answer")?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let run = store
-        .answer_input(&run_id, actor, answer, now, &authority(args))
-        .map_err(store_err)?;
-    Ok(format!("answered-input\t{}\t{}\n", run.id, run.card_id))
+    let run = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .answer_input(&run_id, actor, answer, now, &authority(args))
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/runs/{run_id}/answer"),
+                json!({"actor": actor, "answer": answer}),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("answer-input"));
+    };
+    Ok(format!(
+        "answered-input\t{}\t{}\n",
+        json_string(&run, "id")?,
+        json_string(&run, "card_id")?
+    ))
 }
 
 fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1288,15 +1413,30 @@ fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, She
         .collect()
 }
 
-fn aliases_flag(args: &[String]) -> Option<Vec<String>> {
-    flag_value(args, "--aliases").map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect()
+fn parse_autonomy_flag(raw: &str) -> Result<AutonomyClass, ShellError> {
+    AutonomyClass::parse(raw).ok_or_else(|| {
+        ShellError::Invalid(format!(
+            "invalid --autonomy {raw:?}; valid: {}",
+            AutonomyClass::ALL
+                .iter()
+                .copied()
+                .map(AutonomyClass::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
     })
+}
+
+fn split_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn aliases_flag(args: &[String]) -> Option<Vec<String>> {
+    flag_value(args, "--aliases").map(split_csv)
 }
 
 fn event_filter_flag(args: &[String]) -> Result<Vec<String>, ShellError> {
@@ -1476,6 +1616,7 @@ mod tests {
         assert!(COMMANDS.contains(&"import"));
         assert!(COMMANDS.contains(&"import-repo"));
         assert!(COMMANDS.contains(&"import-github-issues"));
+        assert!(COMMANDS.contains(&"update-card"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"list-cards"));
         assert!(COMMANDS.contains(&"repository-list"));
@@ -1491,6 +1632,7 @@ mod tests {
         assert!(COMMANDS.contains(&"heartbeat"));
         assert!(COMMANDS.contains(&"get-card"));
         assert!(COMMANDS.contains(&"get-run"));
+        assert!(COMMANDS.contains(&"list-approvals"));
         assert!(COMMANDS.contains(&"list-awaiting-input"));
         assert!(COMMANDS.contains(&"answer-input"));
         assert!(COMMANDS.contains(&"add-comment"));
@@ -1955,6 +2097,8 @@ mod tests {
             "Blocked ticket",
             "--status",
             "blocked",
+            "--autonomy",
+            "auto",
         ]))
         .unwrap();
         run(&args([
@@ -1979,6 +2123,23 @@ mod tests {
         let blocked_only = run(&args(["list-cards", "--db", &db, "--status", "blocked"])).unwrap();
         assert!(blocked_only.contains("blocked-1"));
         assert!(!blocked_only.contains("ready-1"));
+
+        let auto_only = run(&args(["list-cards", "--db", &db, "--autonomy", "auto"])).unwrap();
+        assert!(auto_only.contains("blocked-1"));
+        assert!(auto_only.contains("\tauto\t"));
+        assert!(!auto_only.contains("ready-1"));
+
+        run(&args([
+            "update-card",
+            "blocked-1",
+            "--db",
+            &db,
+            "--autonomy",
+            "review",
+        ]))
+        .unwrap();
+        let auto_empty = run(&args(["list-cards", "--db", &db, "--autonomy", "auto"])).unwrap();
+        assert_eq!(auto_empty, "no-cards\n");
 
         let err = run(&args([
             "list-cards",
@@ -2697,6 +2858,17 @@ mod tests {
         ]))
         .unwrap();
         run(&args([
+            "add-link",
+            "answer-test",
+            "--db",
+            &db,
+            "--label",
+            "approval/packet",
+            "--url",
+            "https://example.test/packet",
+        ]))
+        .unwrap();
+        run(&args([
             "request-input",
             &run_id,
             "--db",
@@ -2710,6 +2882,12 @@ mod tests {
         assert!(awaiting.contains("\"awaiting\""));
         assert!(awaiting.contains("answer-test"));
         assert!(awaiting.contains("Approve?\\nwith\\ttab"));
+
+        let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
+        assert!(approvals.contains("\"approvals\""));
+        assert!(approvals.contains("\"card_id\": \"answer-test\""));
+        assert!(approvals.contains("\"autonomy\": \"review\""));
+        assert!(approvals.contains("https://example.test/packet"));
 
         let card = run(&args(["get-card", "answer-test", "--db", &db])).unwrap();
         assert!(card.contains("\"activities\""));
@@ -2727,6 +2905,9 @@ mod tests {
         ]))
         .unwrap();
         assert!(answered.contains("answered-input"));
+
+        let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
+        assert!(approvals.contains("\"approvals\": []"));
 
         let run_detail = run(&args(["get-run", &run_id, "--db", &db])).unwrap();
         assert!(run_detail.contains("\"state\": \"active\""));
@@ -2748,7 +2929,7 @@ mod tests {
             (
                 200,
                 json!({
-                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "title": "Blocked"}],
+                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "autonomy": "review", "title": "Blocked"}],
                     "total_count": 1,
                     "has_more": false
                 }),
@@ -2759,7 +2940,7 @@ mod tests {
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "ready", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "ready", "autonomy": "review", "title": "Remote created"}),
             ),
             (
                 200,
@@ -2767,11 +2948,11 @@ mod tests {
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
             ),
             (
                 200,
@@ -2796,7 +2977,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(cards, "blocked-1\tP2\tblocked\tBlocked\n");
+        assert_eq!(cards, "blocked-1\tP2\tblocked\treview\tBlocked\n");
 
         let detail = run_with_env(&args(["get-card", "remote-1"]), &env).unwrap();
         assert!(detail.contains("\"id\": \"remote-1\""));
@@ -2826,7 +3007,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(created, "created\tremote-created\tP1\tready\n");
+        assert_eq!(created, "created\tremote-created\tP1\tready\treview\n");
 
         let claimed = run_with_env(
             &args(["claim", "remote-created", "--agent", "codex", "--ttl", "60"]),
@@ -2900,6 +3081,7 @@ mod tests {
                 "acceptance": ["proof exists"],
                 "proof_plan": ["PR plus smoke"],
                 "status": "ready",
+                "autonomy": "review",
                 "priority": "P1",
                 "related": ["remote-1"],
                 "blocks": [],
@@ -3109,6 +3291,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_remote_mode_answers_input_without_db() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({"id": "run-approval", "card_id": "approval-1", "state": "active"}),
+        )]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let answered = run_with_env(
+            &args([
+                "answer-input",
+                "run-approval",
+                "--actor",
+                "operator",
+                "--answer",
+                "Approved",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(answered, "answered-input\trun-approval\tapproval-1\n");
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            format!("{} {}", requests[0].method, requests[0].path),
+            "POST /api/v1/runs/run-approval/answer"
+        );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
+        );
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"actor": "operator", "answer": "Approved"}))
+        );
+    }
+
+    #[test]
     fn cli_db_flag_wins_over_remote_environment() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
@@ -3140,7 +3360,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(output, "created\tlocal-card\tP2\tready\n");
+        assert_eq!(output, "created\tlocal-card\tP2\tready\treview\n");
 
         assert!(
             recorded.lock().unwrap().is_empty(),
