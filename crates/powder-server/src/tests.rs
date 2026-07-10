@@ -349,7 +349,7 @@ async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_
             Method::PATCH,
             "/api/v1/cards/patchable",
             Some(&raw_key),
-            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","labels":["api","safe-update"]}"#,
+            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","autonomy":"auto","labels":["api","safe-update"]}"#,
         ))
         .await
         .unwrap();
@@ -361,6 +361,7 @@ async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_
     assert_eq!(patched_many["criteria"][0]["text"], "new proof");
     assert_eq!(patched_many["priority"], "p0");
     assert_eq!(patched_many["status"], "blocked");
+    assert_eq!(patched_many["autonomy"], "auto");
     assert_eq!(patched_many["labels"], json!(["api", "safe-update"]));
     assert_eq!(patched_many["created_at"], before["card"]["created_at"]);
     assert_eq!(patched_many["source"], before["card"]["source"]);
@@ -598,11 +599,13 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
             Method::POST,
             "/api/v1/cards",
             Some(&raw_key),
-            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked"}"#,
+            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked","autonomy":"auto"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(blocked.status(), StatusCode::OK);
+    let blocked = response_json(blocked).await;
+    assert_eq!(blocked["autonomy"], "auto");
 
     let ticket = "# Done in another repo\n\nPriority: P0 | Status: done\n\n## Goal\nG.\n\n## Oracle\n- [x] g\n";
     let imported = app
@@ -660,6 +663,21 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         vec!["blocked-1".to_string()]
     );
 
+    let auto_only = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?autonomy=auto",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_from(&response_json(auto_only).await),
+        vec!["blocked-1".to_string()]
+    );
+
     let other_repo = app
         .clone()
         .oneshot(json_request(
@@ -711,6 +729,7 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     assert_eq!(other["card_count"], 1);
 
     let invalid_status = app
+        .clone()
         .oneshot(json_request(
             Method::GET,
             "/api/v1/cards?status=not-a-real-status",
@@ -720,6 +739,17 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_autonomy = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?autonomy=robot",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_autonomy.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1253,6 +1283,7 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
         "/api/v1/cards/ready",
         "/api/v1/cards",
         "/api/v1/cards?status=ready",
+        "/api/v1/approvals",
         "/api/v1/cards/board-readable",
     ] {
         let response = app
@@ -1271,10 +1302,15 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
             StatusCode::OK,
             "private-ingress board read route {route} should not need a bearer token"
         );
-        assert!(
-            response_text(response).await.contains("board-readable"),
-            "read route {route} should expose the seeded card"
-        );
+        let body = response_text(response).await;
+        if route == "/api/v1/approvals" {
+            assert!(body.contains("\"approvals\":[]") || body.contains("\"approvals\": []"));
+        } else {
+            assert!(
+                body.contains("board-readable"),
+                "read route {route} should expose the seeded card"
+            );
+        }
     }
 }
 
@@ -2234,6 +2270,38 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
         .unwrap();
     assert_eq!(input.status(), StatusCode::OK);
 
+    let linked = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/api-answer/links",
+            Some(&raw_key),
+            r#"{"label":"approval/packet","url":"https://example.test/packet"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(linked.status(), StatusCode::OK);
+
+    let approvals = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/approvals",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(approvals.status(), StatusCode::OK);
+    let approvals = response_json(approvals).await;
+    assert_eq!(approvals["approvals"][0]["card_id"], "api-answer");
+    assert_eq!(approvals["approvals"][0]["run_id"], run_id);
+    assert_eq!(approvals["approvals"][0]["question"], "Approve completion?");
+    assert_eq!(
+        approvals["approvals"][0]["packet_links"][0]["url"],
+        "https://example.test/packet"
+    );
+
     let awaiting = app
         .clone()
         .oneshot(
@@ -2287,6 +2355,22 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
         .await
         .unwrap();
     assert_eq!(answer.status(), StatusCode::OK);
+
+    let approvals = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/approvals",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(approvals.status(), StatusCode::OK);
+    assert!(response_json(approvals).await["approvals"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     let run = app
         .oneshot(

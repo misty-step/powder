@@ -1,6 +1,6 @@
 use powder_core::{
-    AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, DetailLevel, DomainError,
-    Priority, ReadyQuery, RunId, RunState,
+    AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource, CardStatus,
+    DetailLevel, DomainError, Priority, ReadyQuery, RunId, RunState,
 };
 
 use crate::{
@@ -92,6 +92,7 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
         .with_criteria(criteria)
         .with_created_at(10);
     let card_json = serde_json::to_string(&card)?;
+    assert!(card_json.contains("\"autonomy\":\"review\""));
     assert!(!card_json.contains("\"acceptance\""));
     assert!(card_json.contains("\"criteria\""));
     for key in [
@@ -114,12 +115,24 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
     assert_eq!(restored, card);
     assert_eq!(restored.acceptance, vec!["proof exists".to_string()]);
     assert_eq!(restored.criteria[0].text, "proof exists");
+    assert_eq!(restored.autonomy, AutonomyClass::Review);
 
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let saved = store.upsert_card(card.clone())?;
     assert_eq!(saved, card);
     assert_eq!(store.get_card(&card.id)?.expect("stored card"), card);
+
+    let auto = card.clone().with_autonomy(AutonomyClass::Auto);
+    let saved = store.upsert_card(auto.clone())?;
+    assert_eq!(saved.autonomy, AutonomyClass::Auto);
+    assert_eq!(
+        store
+            .get_card(&auto.id)?
+            .expect("stored auto card")
+            .autonomy,
+        AutonomyClass::Auto
+    );
     Ok(())
 }
 
@@ -135,6 +148,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
 
     let mut done = ready_card("done-1", 20);
     done.status = CardStatus::Done;
+    done.autonomy = AutonomyClass::Auto;
     done.repo = Some("misty-step/other".to_string());
     store.import_cards(vec![done])?;
     store.connection.execute(
@@ -154,6 +168,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: Some(CardStatus::Blocked),
             repo: None,
+            autonomy: None,
         },
         20,
     )?;
@@ -166,6 +181,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: None,
             repo: Some("other".to_string()),
+            autonomy: None,
         },
         20,
     )?;
@@ -177,6 +193,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: None,
             repo: Some("misty-step/other".to_string()),
+            autonomy: None,
         },
         20,
     )?;
@@ -189,10 +206,22 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: Some(CardStatus::Done),
             repo: Some("misty-step/other".to_string()),
+            autonomy: None,
         },
         20,
     )?;
     assert_eq!(done_in_other.len(), 1);
+
+    let auto_only = store.list_cards(
+        &CardFilter {
+            status: None,
+            repo: None,
+            autonomy: Some(AutonomyClass::Auto),
+        },
+        20,
+    )?;
+    assert_eq!(auto_only.len(), 1);
+    assert_eq!(auto_only[0].id.as_str(), "done-1");
 
     let repositories = store.list_repositories()?;
     let other_summary = repositories
@@ -209,6 +238,61 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     let page = store.list_cards_page(&CardFilter::default(), 1)?;
     assert_eq!(page.cards.len(), 1);
     assert_eq!(page.total_count, 3);
+    Ok(())
+}
+
+#[test]
+fn list_approvals_surfaces_packet_links_and_drains_after_answer() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    let unlinked_card_id = CardId::new("002")?;
+    store.import_cards(vec![
+        ready_card("001", 2).with_autonomy(AutonomyClass::Auto),
+        ready_card("002", 2),
+    ])?;
+
+    let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
+    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    let unlinked_claim = store.claim_card(
+        &unlinked_card_id,
+        "agent-b",
+        10,
+        3600,
+        &Authority::unchecked(),
+    )?;
+    store.request_input(
+        &unlinked_claim.run_id,
+        "This row has no approval packet",
+        12,
+        &Authority::unchecked(),
+    )?;
+    store.add_link(
+        &card_id,
+        "approval/packet",
+        "https://example.test/approval",
+        12,
+    )?;
+    store.add_link(&card_id, "context", "https://example.test/context", 12)?;
+    store.request_input(&claim.run_id, "Approve merge?", 13, &Authority::unchecked())?;
+
+    let approvals = store.list_approvals(10)?;
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].card_id, card_id);
+    assert_eq!(approvals[0].run_id, claim.run_id);
+    assert_eq!(approvals[0].autonomy, AutonomyClass::Auto);
+    assert_eq!(approvals[0].question.as_deref(), Some("Approve merge?"));
+    assert_eq!(approvals[0].packet_links.len(), 1);
+    assert_eq!(approvals[0].packet_links[0].label, "approval/packet");
+
+    store.answer_input(
+        &claim.run_id,
+        "operator",
+        "Approved",
+        14,
+        &Authority::unchecked(),
+    )?;
+    assert!(store.list_approvals(10)?.is_empty());
     Ok(())
 }
 
@@ -375,6 +459,7 @@ fn list_cards_repo_filter_surfaces_legacy_repo_null_cards_with_numeric_id_prefix
         &CardFilter {
             status: None,
             repo: Some("misty-step".to_string()),
+            autonomy: None,
         },
         20,
     )?;
@@ -496,6 +581,7 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
         &CardFilter {
             status: None,
             repo: Some("misty-step/canary".to_string()),
+            autonomy: None,
         },
         20,
     )?;
@@ -2720,6 +2806,7 @@ fn field_note_generator_spawns_exactly_one_draft_for_a_qualifying_completion() -
         &CardFilter {
             status: None,
             repo: Some("content".to_string()),
+            autonomy: None,
         },
         50,
     )?;

@@ -212,6 +212,33 @@ impl Priority {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyClass {
+    Auto,
+    #[default]
+    Review,
+}
+
+impl AutonomyClass {
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Review];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "review" => Some(Self::Review),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Review => "review",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardStatus {
@@ -454,6 +481,7 @@ pub struct Card {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proof_plan: Vec<String>,
     pub status: CardStatus,
+    pub autonomy: AutonomyClass,
     pub priority: Priority,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
@@ -484,6 +512,7 @@ pub struct CardSummary {
     pub id: CardId,
     pub title: String,
     pub status: CardStatus,
+    pub autonomy: AutonomyClass,
     pub priority: Priority,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
@@ -508,6 +537,7 @@ impl From<&Card> for CardSummary {
             id: card.id.clone(),
             title: card.title.clone(),
             status: card.status,
+            autonomy: card.autonomy,
             priority: card.priority,
             repo: card.repo.clone(),
             labels: card.labels.clone(),
@@ -531,6 +561,8 @@ struct CardFields {
     #[serde(default)]
     proof_plan: Vec<String>,
     status: CardStatus,
+    #[serde(default)]
+    autonomy: AutonomyClass,
     priority: Priority,
     #[serde(default)]
     labels: Vec<String>,
@@ -570,6 +602,7 @@ impl<'de> Deserialize<'de> for Card {
             criteria: fields.criteria,
             proof_plan: fields.proof_plan,
             status: fields.status,
+            autonomy: fields.autonomy,
             priority: fields.priority,
             labels: fields.labels,
             assignee: fields.assignee,
@@ -624,6 +657,7 @@ impl Card {
             criteria: Vec::new(),
             proof_plan: Vec::new(),
             status: CardStatus::Backlog,
+            autonomy: AutonomyClass::default(),
             priority: Priority::default(),
             labels: Vec::new(),
             assignee: None,
@@ -675,6 +709,11 @@ impl Card {
 
     pub fn with_status(mut self, status: CardStatus) -> Self {
         self.status = status;
+        self
+    }
+
+    pub fn with_autonomy(mut self, autonomy: AutonomyClass) -> Self {
+        self.autonomy = autonomy;
         self
     }
 
@@ -1096,6 +1135,18 @@ pub struct AwaitingInput {
     pub run: Run,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<Activity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalQueueRow {
+    pub card_id: CardId,
+    pub title: String,
+    pub autonomy: AutonomyClass,
+    pub run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packet_links: Vec<Link>,
 }
 
 pub fn non_empty(field: &'static str, value: String) -> Result<String, DomainError> {

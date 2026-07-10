@@ -8,10 +8,10 @@ mod repository;
 pub use backlog::{parse_backlog_card, BacklogParseError};
 pub use board::{Board, ClaimReceipt, ReadyQuery};
 pub use model::{
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AwaitingInput, Card,
-    CardDetail, CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim,
-    ClaimSummary, Comment, CriterionProof, DetailLevel, DomainError, Link, LinkId, Priority, Run,
-    RunDetail, RunId, RunState, WorkLogEntry,
+    AcceptanceCriterion, Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority,
+    AutonomyClass, AwaitingInput, Card, CardDetail, CardEvent, CardEventId, CardId, CardSource,
+    CardStatus, CardSummary, Claim, ClaimSummary, Comment, CriterionProof, DetailLevel,
+    DomainError, Link, LinkId, Priority, Run, RunDetail, RunId, RunState, WorkLogEntry,
 };
 pub use repository::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
