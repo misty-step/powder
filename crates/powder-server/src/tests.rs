@@ -1763,6 +1763,45 @@ async fn api_get_card_defaults_to_concise_and_accepts_detailed_detail() {
 }
 
 #[tokio::test]
+async fn claim_route_on_criteria_less_card_names_the_missing_oracle() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"no-oracle","title":"No oracle yet","acceptance":[],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(
+        created["hint"],
+        "no acceptance criteria; the card cannot be claimed until it carries an oracle"
+    );
+
+    let claimed = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/no-oracle/claim",
+            Some(&raw_key),
+            r#"{"agent":"bootstrap","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::CONFLICT);
+    let claimed = response_json(claimed).await;
+    assert_eq!(
+        claimed["error"],
+        "card no-oracle has no acceptance criteria; add them via update (acceptance: [...]) before claiming"
+    );
+}
+
+#[tokio::test]
 async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

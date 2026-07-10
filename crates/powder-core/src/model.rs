@@ -734,15 +734,42 @@ impl Card {
     /// cards. A card is blocked only while at least one entry in
     /// `blocked_by` is *not yet* terminal; once every blocker resolves, the
     /// card is eligible again with no edit to `blocked_by` required.
-    pub fn is_ready_at(&self, now: i64, blocker_is_terminal: impl Fn(&CardId) -> bool) -> bool {
+    ///
+    /// This is the single seam that decides claim eligibility -- boolean
+    /// callers ([`is_ready_at`](Self::is_ready_at),
+    /// [`can_be_claimed_at`](Self::can_be_claimed_at)) collapse the result
+    /// with `.is_ok()`, and [`apply_claim`](Self::apply_claim) propagates
+    /// the `Err` verbatim so a rejected claim names its actual cause
+    /// (powder-oracle-discipline: a bare "not ready to claim" left a caller
+    /// unable to tell a criteria-less card from a blocked or wrong-status
+    /// one).
+    pub fn claim_readiness(
+        &self,
+        now: i64,
+        blocker_is_terminal: impl Fn(&CardId) -> bool,
+    ) -> Result<(), DomainError> {
         if self.acceptance.is_empty() {
-            return false;
-        }
-        if self.blocked_by.iter().any(|id| !blocker_is_terminal(id)) {
-            return false;
+            return Err(DomainError::conflict(format!(
+                "card {} has no acceptance criteria; add them via update (acceptance: [...]) before claiming",
+                self.id
+            )));
         }
 
-        match self.status {
+        let unresolved = self
+            .blocked_by
+            .iter()
+            .filter(|id| !blocker_is_terminal(id))
+            .map(CardId::as_str)
+            .collect::<Vec<_>>();
+        if !unresolved.is_empty() {
+            return Err(DomainError::conflict(format!(
+                "card {} is blocked by unresolved cards: {}",
+                self.id,
+                unresolved.join(", ")
+            )));
+        }
+
+        let status_ready = match self.status {
             CardStatus::Ready => self
                 .claim
                 .as_ref()
@@ -752,7 +779,25 @@ impl Card {
                 .as_ref()
                 .is_some_and(|claim| claim.is_expired(now)),
             _ => false,
+        };
+        if !status_ready {
+            return Err(DomainError::conflict(format!(
+                "card {} is not ready to claim",
+                self.id
+            )));
         }
+
+        Ok(())
+    }
+
+    /// `blocker_is_terminal` answers, for one blocker id, whether that
+    /// blocker has reached a terminal status (done/shipped/abandoned) --
+    /// the caller supplies this because a `Card` has no access to other
+    /// cards. A card is blocked only while at least one entry in
+    /// `blocked_by` is *not yet* terminal; once every blocker resolves, the
+    /// card is eligible again with no edit to `blocked_by` required.
+    pub fn is_ready_at(&self, now: i64, blocker_is_terminal: impl Fn(&CardId) -> bool) -> bool {
+        self.claim_readiness(now, blocker_is_terminal).is_ok()
     }
 
     pub fn can_be_claimed_at(
@@ -859,12 +904,7 @@ impl Card {
             }
         }
 
-        if !self.can_be_claimed_at(now, blocker_is_terminal) {
-            return Err(DomainError::conflict(format!(
-                "card {} is not ready to claim",
-                self.id
-            )));
-        }
+        self.claim_readiness(now, blocker_is_terminal)?;
 
         let claim = Claim {
             agent,
@@ -1379,5 +1419,44 @@ mod tests {
         assert!(card("001", CardStatus::Done).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Shipped).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Abandoned).protects_lifecycle_on_reimport());
+    }
+
+    #[test]
+    fn claim_readiness_names_missing_acceptance_criteria() {
+        let card = card("001", CardStatus::Ready);
+        let err = card.claim_readiness(10, |_| true).unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::conflict(
+                "card 001 has no acceptance criteria; add them via update (acceptance: [...]) before claiming"
+            )
+        );
+    }
+
+    #[test]
+    fn claim_readiness_names_unresolved_blocker_ids() {
+        let mut card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
+        card.blocked_by = vec![CardId::new("002").unwrap(), CardId::new("003").unwrap()];
+
+        let err = card
+            .claim_readiness(10, |id| id.as_str() == "003")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DomainError::conflict("card 001 is blocked by unresolved cards: 002")
+        );
+    }
+
+    #[test]
+    fn claim_readiness_falls_back_to_generic_message_for_wrong_status() {
+        let card = card("001", CardStatus::Backlog).with_acceptance(["prove it".to_string()]);
+        let err = card.claim_readiness(10, |_| true).unwrap_err();
+        assert_eq!(err, DomainError::conflict("card 001 is not ready to claim"));
+    }
+
+    #[test]
+    fn claim_readiness_ok_when_criteria_present_and_unblocked() {
+        let card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
+        assert!(card.claim_readiness(10, |_| true).is_ok());
     }
 }

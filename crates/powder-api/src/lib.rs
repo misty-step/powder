@@ -21,7 +21,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards",
-        intent: "create one new card in the instance database, rejecting duplicate ids",
+        intent: "create one new card in the instance database, rejecting duplicate ids; response includes a hint field when the created card has no acceptance criteria",
         body_shape: Some(
             r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely"#,
         ),
