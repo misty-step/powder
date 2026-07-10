@@ -15,7 +15,12 @@ fn main() {
     };
 
     if let Ok(base_url) = std::env::var("POWDER_API_BASE_URL") {
-        run_remote(base_url, std::env::var("POWDER_API_KEY").ok(), toolset);
+        run_remote(
+            base_url,
+            std::env::var("POWDER_API_KEY").ok(),
+            std::env::var("POWDER_API_KEY_CMD").ok(),
+            toolset,
+        );
         return;
     }
 
@@ -83,8 +88,16 @@ fn run_persistent(db_path: &str, toolset: Toolset) -> Result<(), Box<dyn std::er
 /// Work against a deployed Powder instance's HTTP API instead of a local
 /// SQLite file, so MCP tool calls carry the identity, lease ownership, and
 /// admin authority of `POWDER_API_KEY` all the way to the deployed instance.
-fn run_remote(base_url: String, api_key: Option<String>, toolset: Toolset) {
-    let client = RemoteClient::new(base_url, api_key);
+/// `key_cmd` (`POWDER_API_KEY_CMD`) lets a long-lived subprocess resolve a
+/// fresh key on a rotation instead of dying on the one it booted with
+/// (powder-944).
+fn run_remote(
+    base_url: String,
+    api_key: Option<String>,
+    key_cmd: Option<String>,
+    toolset: Toolset,
+) {
+    let client = RemoteClient::new_with_key_cmd(base_url, api_key, key_cmd);
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {

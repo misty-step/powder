@@ -16,6 +16,9 @@ mod remote;
 #[doc(hidden)]
 pub mod eval_harness;
 
+#[doc(hidden)]
+pub mod live_eval;
+
 pub use remote::call_tool_remote;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

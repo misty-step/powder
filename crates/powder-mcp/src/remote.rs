@@ -1528,6 +1528,147 @@ mod tests {
         assert_eq!(requests[0].path, "/api/v1/keys");
     }
 
+    /// A `POWDER_API_KEY_CMD` stand-in: on each invocation it bumps a
+    /// counter persisted at `counter_path` and echoes `keys[counter - 1]`
+    /// (clamped to the last entry), so a test can both prove how many times
+    /// the command ran and hand back a different key on a later call.
+    fn sequential_key_cmd(counter_path: &std::path::Path, keys: &[&str]) -> String {
+        let mut script = format!(
+            "n=$(( $(cat '{path}' 2>/dev/null || echo 0) + 1 )); printf '%s' \"$n\" > '{path}';",
+            path = counter_path.display()
+        );
+        script.push_str("case $n in ");
+        for (index, key) in keys.iter().enumerate() {
+            script.push_str(&format!("{}) printf '%s' {key};;", index + 1));
+        }
+        script.push_str(&format!(
+            "*) printf '%s' {};;",
+            keys.last().expect("at least one key")
+        ));
+        script.push_str(" esac");
+        script
+    }
+
+    fn unique_counter_path(name: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let ordinal = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "powder-mcp-key-cmd-{name}-{}-{nonce}-{ordinal}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn key_cmd_is_resolved_exactly_once_at_boot() {
+        let counter_path = unique_counter_path("boot");
+        let key_cmd = sequential_key_cmd(&counter_path, &["sk_powder_boot"]);
+
+        let _client =
+            RemoteClient::new_with_key_cmd("http://127.0.0.1:1".to_string(), None, Some(key_cmd));
+
+        let calls = std::fs::read_to_string(&counter_path).unwrap();
+        assert_eq!(
+            calls, "1",
+            "key_cmd must resolve exactly once at construction"
+        );
+        let _ = std::fs::remove_file(&counter_path);
+    }
+
+    #[test]
+    fn a_401_re_resolves_key_cmd_and_retries_once_successfully() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (401, json!({"error": "invalid bearer token"})),
+            (
+                200,
+                json!({"cards": [], "total_count": 0, "has_more": false}),
+            ),
+        ]);
+        let counter_path = unique_counter_path("retry-success");
+        let key_cmd = sequential_key_cmd(&counter_path, &["sk_powder_old", "sk_powder_new"]);
+        let client = RemoteClient::new_with_key_cmd(base_url, None, Some(key_cmd));
+
+        let result = call_tool_remote(&client, "list_ready", &json!({})).unwrap();
+        assert_eq!(tool_payload(&result)["total_count"], 0);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_old")
+        );
+        assert_eq!(
+            requests[1].authorization.as_deref(),
+            Some("Bearer sk_powder_new")
+        );
+        let _ = std::fs::remove_file(&counter_path);
+    }
+
+    #[test]
+    fn a_second_401_after_retry_fails_with_a_diagnosable_error() {
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (401, json!({"error": "invalid bearer token"})),
+            (401, json!({"error": "invalid bearer token"})),
+        ]);
+        let counter_path = unique_counter_path("retry-still-401");
+        let key_cmd = sequential_key_cmd(&counter_path, &["sk_powder_old", "sk_powder_new"]);
+        let client = RemoteClient::new_with_key_cmd(base_url, None, Some(key_cmd));
+
+        let err = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+
+        assert!(err.contains("http 401"));
+        assert!(
+            err.contains("sk_powder_ne"),
+            "error should name the prefix of the key actually used on the failing retry: {err}"
+        );
+        assert!(err.contains("key may have been rotated"));
+        assert!(err.contains("restart this MCP client or configure POWDER_API_KEY_CMD"));
+        let _ = std::fs::remove_file(&counter_path);
+    }
+
+    #[test]
+    fn a_401_with_no_key_cmd_configured_fails_immediately_with_a_diagnosable_error() {
+        let (base_url, recorded) =
+            spawn_test_server(vec![(401, json!({"error": "invalid bearer token"}))]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_static".to_string()));
+
+        let err = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+
+        assert!(err.contains("sk_powder_st"));
+        assert!(err.contains("key may have been rotated"));
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "no key_cmd means no retry attempt"
+        );
+    }
+
+    #[test]
+    fn a_fourth_consecutive_404_gets_a_stale_base_url_steer() {
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (404, json!({"error": "not found"})),
+            (404, json!({"error": "not found"})),
+            (404, json!({"error": "not found"})),
+            (404, json!({"error": "not found"})),
+        ]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let first = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+        let second = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+        let third = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+        let fourth = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+
+        for early in [&first, &second, &third] {
+            assert!(!early.contains("POWDER_API_BASE_URL may be stale"));
+        }
+        assert!(fourth.contains("POWDER_API_BASE_URL may be stale"));
+        assert!(fourth.contains("restart this MCP client"));
+    }
+
     #[test]
     fn lease_owner_forbidden_response_surfaces_the_deployed_error_message() {
         let (base_url, _recorded) = spawn_test_server(vec![(

@@ -160,6 +160,22 @@ silently diverge from an operator's interactive shell. `initialize` reports
 `result.serverInfo.baseUrl`, so a caller can confirm the two faces agree
 instead of guessing at deployment drift from intermittent connection errors.
 
+A long-lived `powder-mcp` subprocess also captures `POWDER_API_KEY` once, at
+boot; rotating the key does not change the running process's environment, so
+it keeps sending the old value until something restarts it (powder-944).
+Restarting the MCP client always fixes this. To avoid the restart, set
+`POWDER_API_KEY_CMD` to a shell command that prints a fresh key on stdout
+(e.g. `security find-generic-password -a "$USER" -s powder-api-key -w`);
+`powder-mcp` runs it once at boot and again, once, on the first `401` a
+request hits, transparently retrying with whatever key that produces if it
+differs from the one that just failed. `POWDER_API_KEY` remains the plain
+fallback and is unchanged when `POWDER_API_KEY_CMD` is unset. A `401` that
+survives the retry (or has no `POWDER_API_KEY_CMD` to retry with) names the
+key prefix `powder-mcp` used and says to restart the client or configure
+`POWDER_API_KEY_CMD`; three or more consecutive `404`s on tool calls get a
+distinct steer toward a stale `POWDER_API_BASE_URL` (a deployment host
+cutover, powder-965's class of incident) instead.
+
 The repo also includes a deterministic MCP tool-use eval harness. It creates
 throwaway fixture SQLite DBs, starts the real `powder-mcp` binary over stdio,
 runs four scripted scenarios, and prints one compact baseline table. `response
