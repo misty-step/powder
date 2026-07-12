@@ -30,7 +30,7 @@ const KNOWN_REPO_META = {
   landmark: { icon: "i-landmark", cat: 0 },
   session: { icon: "i-factory", cat: 1 },
   "factory/session": { icon: "i-factory", cat: 1 },
-  bastion: { icon: "i-db", cat: 2 },
+  sanctum: { icon: "i-shield", cat: 2 },
 };
 
 const els = {

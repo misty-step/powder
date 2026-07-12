@@ -16,7 +16,7 @@ path. This document is that path.
 ## The real production instance
 
 Powder is supervised as a private app on a
-[Bastion](https://github.com/misty-step/bastion) box -- a separate,
+[Sanctum](https://github.com/misty-step/sanctum) box -- a separate,
 operator-owned **DigitalOcean droplet** that supervises several small apps
 privately over Tailscale (Fly-hosted 2026-07-04 to 2026-07-09, DigitalOcean
 canonical since the 2026-07-09 migration). It is reached only over Tailscale,
@@ -26,28 +26,28 @@ never a public URL:
   operator's `POWDER_API_BASE_URL` env var is the live source of truth for
   the exact value; this repo does not carry it (powder-951: no operator
   topology literals in tracked source).
-- **Process:** `powder-server`, bound to a loopback port inside the Bastion
-  box, launched by the Bastion supervisor (systemd `bastion.service` running
-  `bastion --config /etc/bastion/bastion.toml run`; an `[[app]]` block named
+- **Process:** `powder-server`, bound to a loopback port inside the Sanctum
+  box, launched by the Sanctum supervisor (systemd `sanctum.service` running
+  `sanctum --config /etc/sanctum/sanctum.toml run`; an `[[app]]` block named
   `"powder"` in that config). Binaries live at `/usr/local/bin/` on the box;
   `powder-serve` is the launch wrapper that sets the env below.
 - **Data:** a SQLite path under the box's `/data` volume (WAL mode), streamed
   to DigitalOcean Spaces via Litestream
-- **Runtime env** (set in Bastion's own supervisor config, in that `[[app]]`
+- **Runtime env** (set in Sanctum's own supervisor config, in that `[[app]]`
   block's env section):
 
   ```
-  POWDER_DB_PATH=<path under Bastion's /data volume>
+  POWDER_DB_PATH=<path under Sanctum's /data volume>
   POWDER_BIND_ADDR=127.0.0.1:<port>
   POWDER_AUTH_MODE=api-key
   POWDER_PUBLIC_BASE_URL=<the box's tailnet origin, see above>
   POWDER_DISCLOSE_BOOTSTRAP_KEY=false
   ```
 
-**Verify before trusting this document over live state** -- Bastion's own
-`README.md` "powder — the agent work board" section, in the Bastion repo, is
+**Verify before trusting this document over live state** -- Sanctum's own
+`README.md` "powder — the agent work board" section, in the Sanctum repo, is
 the canonical, detailed, and current source; this is a pointer for agents who
-never clone Bastion, not a mirror of its content:
+never clone Sanctum, not a mirror of its content:
 
 ```sh
 curl -s "$POWDER_API_BASE_URL/healthz"
@@ -67,7 +67,7 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    ```
 
 2. **Swap binaries atomically and let the supervisor respawn** (do NOT
-   restart `bastion.service` -- that bounces every app on the box):
+   restart `sanctum.service` -- that bounces every app on the box):
 
    ```sh
    scp target/x86_64-unknown-linux-gnu/release/powder-server root@<box>:/usr/local/bin/powder-server.new
@@ -79,7 +79,7 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    curl -s "$POWDER_API_BASE_URL/healthz"   # verify it came back
    ```
 
-3. **Record the deploy**: bump the Bastion repo's `vendor/powder` pin to the
+3. **Record the deploy**: bump the Sanctum repo's `vendor/powder` pin to the
    deployed SHA (`git -C ../powder archive --format=tar <sha> | tar -x -C
    vendor/powder`, update `vendor/powder/SOURCE`, commit as `chore: bump
    sanctum powder pin for <reason>`). The pin is the durable record of what
@@ -93,13 +93,13 @@ the deployed instance is running.
 ## The checked-in Fly config: disposition
 
 The `powder` Fly app that `fly.toml`/README once described was **destroyed
-2026-07-07** after its data migrated to the Bastion-hosted instance, and the
+2026-07-07** after its data migrated to the Sanctum-hosted instance, and the
 fleet left Fly entirely on 2026-07-09. `fly.toml` is kept only as a reference
 implementation for anyone self-hosting Powder standalone on Fly under their
 own org -- the operator's production never touches it.
 
 - It must **never** be assumed live. Every agent and every doc in this repo
-  that references "the deployed instance" means the Bastion-fronted
+  that references "the deployed instance" means the Sanctum-hosted
   DigitalOcean box above, unless `POWDER_API_BASE_URL` is explicitly pointed
   elsewhere.
 - **Stale-client warning** (observed 2026-07-09): long-lived MCP
@@ -121,8 +121,8 @@ The field-note draft generator (`Store::with_field_note_config`,
 - `POWDER_FIELD_NOTE_WEEKLY_BUDGET` (optional override)
 
 Enabling it in production means adding these to the **same** `[[app]]` env
-block in Bastion's own supervisor config documented above, then redeploying
-Bastion per the steps above -- there is no separate config surface for this
+block in Sanctum's own supervisor config documented above, then redeploying
+Sanctum per the steps above -- there is no separate config surface for this
 repo's own `fly.toml` to carry, since that app is not what serves production
 traffic.
 
@@ -134,4 +134,4 @@ view, header on the card-detail view) -- built for exactly this deployment
 shape, where Powder is its own tailnet origin and a separate portal root
 lives at a different one. Setting it in production is the same env-target
 pattern as the field-note generator above: add `POWDER_HOME_URL=<the box's
-portal root>` to the same `[[app]]` env block, then redeploy Bastion.
+portal root>` to the same `[[app]]` env block, then redeploy Sanctum.

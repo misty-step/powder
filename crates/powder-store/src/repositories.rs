@@ -116,7 +116,15 @@ impl Store {
                 },
             )?;
         }
-        insert_repository_alias(&transaction, "bastion", "sanctum/bastion", seed_time, false)?;
+        insert_repository_alias(
+            &transaction,
+            "sanctum",
+            "misty-step/sanctum",
+            seed_time,
+            false,
+        )?;
+        insert_repository_alias(&transaction, "sanctum", "bastion", seed_time, false)?;
+        insert_repository_alias(&transaction, "sanctum", "sanctum/bastion", seed_time, false)?;
         transaction.commit()?;
         Ok(())
     }
@@ -781,7 +789,7 @@ const RATIFIED_REPOSITORY_TIERS: &[(&str, RepositoryTier)] = &[
     ("aesthetic", RepositoryTier::Active),
     ("landmark", RepositoryTier::Active),
     ("bridge", RepositoryTier::Active),
-    ("bastion", RepositoryTier::Active),
+    ("sanctum", RepositoryTier::Active),
     ("linejam", RepositoryTier::Active),
     ("misty-step", RepositoryTier::Active),
     ("daybook", RepositoryTier::Active),
