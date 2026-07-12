@@ -43,7 +43,7 @@ run_doctor() {
 success="$(run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key)"
 grep -q 'PASS powder_remote' <<<"$success"
 
-if run_doctor POWDER_API_BASE_URL=https://bastion.example:10001 POWDER_API_KEY=test-key >"$TMP/drift.out" 2>&1; then
+if run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key >"$TMP/drift.out" 2>&1; then
   echo "expected endpoint drift to fail" >&2
   exit 1
 fi

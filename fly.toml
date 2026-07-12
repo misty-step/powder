@@ -1,8 +1,8 @@
 # DECOMMISSIONED (2026-07-07): the standalone `powder` Fly app was a decoy —
-# it was destroyed after its data was verified migrated to the bastion box
-# (a separate, operator-owned Fly machine, litestream-replicated; see
+# it was destroyed after its data was verified migrated to Sanctum
+# (a separate, operator-owned DigitalOcean droplet, Litestream-replicated; see
 # docs/production-deploy.md for where that instance actually runs).
-# Deployment is owned by the bastion repo, not this one.
+# Deployment is owned by the Sanctum repo, not this one.
 # Do NOT `fly deploy` from this file; it is kept only as a config reference.
 app = "powder"
 primary_region = "iad"

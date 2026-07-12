@@ -330,9 +330,9 @@ fly deploy --app powder
 The default `fly.toml` keeps one machine warm, mounts `/data`, listens on
 `[::]:4000` for Fly private IPv6, checks `/healthz` and `/readyz`, and sets
 `POWDER_PUBLIC_BASE_URL` to `https://powder.internal` for a tailnet-fronted
-instance. The companion bastion lane can expose `http://powder.internal:4000`
+instance. A private host can expose `http://powder.internal:4000`
 through Tailscale Serve while Powder keeps its own database and secrets on its
-Fly volume. Misty Step's current operator instance is fronted by Bastion rather
+Fly volume. Misty Step's current operator instance is hosted by Sanctum rather
 than the checked-in `powder` Fly app; verify the active deployment with
 `POWDER_API_BASE_URL` before treating the template app name as live -- see
 [`docs/production-deploy.md`](docs/production-deploy.md) for exactly where

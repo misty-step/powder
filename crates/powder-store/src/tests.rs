@@ -825,11 +825,18 @@ fn ratified_repository_tier_seed_marks_active_backburner_and_archived_repos() ->
     assert_eq!(sploot.tier, RepositoryTier::Backburner);
     let atlas = store.get_repository("atlas")?.expect("atlas seed");
     assert_eq!(atlas.tier, RepositoryTier::Archived);
-    let bastion = store
+    let sanctum = store
         .get_repository("sanctum/bastion")?
-        .expect("bastion alias seed");
-    assert_eq!(bastion.name, "bastion");
-    assert_eq!(bastion.tier, RepositoryTier::Active);
+        .expect("legacy alias resolves to Sanctum seed");
+    assert_eq!(sanctum.name, "sanctum");
+    assert_eq!(sanctum.tier, RepositoryTier::Active);
+    assert_eq!(
+        store
+            .get_repository("misty-step/sanctum")?
+            .expect("canonical GitHub alias")
+            .name,
+        "sanctum"
+    );
     Ok(())
 }
 
