@@ -41,7 +41,7 @@ Current local smoke paths:
 DB=/tmp/powder-smoke/powder.db
 cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret
 cargo run -q -p powder-cli -- create-card --db "$DB" --id smoke-proof --title "Proof plan smoke" --acceptance "detail renders" --proof-plan "PR + HTTP smoke"
-cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
+cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/legacy-board-source --db "$DB"
 cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
 CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex)
 printf "%s" "$CLAIM"
@@ -141,7 +141,7 @@ A hidden-tool call returns an error naming `POWDER_MCP_TOOLSETS`.
 DB=/tmp/powder-http-smoke/powder.db
 mkdir -p "$(dirname "$DB")"
 KEY=$(cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret | awk -F '\t' '/bootstrap-key/ {print $4}')
-cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
+cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/legacy-board-source --db "$DB"
 POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 cargo run -q -p powder-server
 
 # in another shell
@@ -372,6 +372,7 @@ admin key can touch.
 ## Gate
 
 ```sh
+test -z "$(find . -type d -name backlog.d -not -path './.git/*' -print -quit)"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace

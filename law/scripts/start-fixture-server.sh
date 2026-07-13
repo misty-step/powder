@@ -18,6 +18,6 @@ export PORT="${PORT:-4100}"
 export POWDER_HOME_URL="https://sanctum.example.test"
 
 cargo run -q -p powder-cli -- init-db --db "$DB" >/dev/null
-cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB" >/dev/null
+cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/legacy-board-source --db "$DB" >/dev/null
 
 exec cargo run -q -p powder-server

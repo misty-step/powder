@@ -99,7 +99,7 @@ powder version</code></pre>
             <pre><code>DB=./data/powder.db
 mkdir -p "$(dirname "$DB")"
 powder init-db --db "$DB" --show-secret
-powder import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
+powder import crates/powder-core/tests/fixtures/legacy-board-source --db "$DB"
 powder list-ready --db "$DB" --limit 10
 POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 powder-server</code></pre>
           </section>

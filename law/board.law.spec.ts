@@ -15,7 +15,7 @@ import {
    @misty-step/aesthetic/law, proven on the real UI instead of eyeballed
    per PR (aesthetic 011/015). playwright.config.ts boots powder-server
    against a throwaway DB seeded with the repo's own import fixture
-   (crates/powder-core/tests/fixtures/backlog.d), so the board renders a
+   (crates/powder-core/tests/fixtures/legacy-board-source), so the board renders a
    real card rather than an empty shell. */
 
 const MODES = ["light", "dark"] as const;
