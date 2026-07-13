@@ -1,7 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-// vendored from @misty-step/aesthetic v2.17.1 — see vendor/aesthetic-law/README.md
+// vendored from @misty-step/aesthetic v0.25.0 — see vendor/aesthetic-law/README.md
 // for why this is a vendored copy rather than a package import.
 import {
   assertLaw,

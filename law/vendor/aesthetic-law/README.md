@@ -1,14 +1,8 @@
 # Vendored: @misty-step/aesthetic law gate
 
 `index.ts` and `invariants.ts` are byte-identical copies of
-`misty-step/aesthetic`'s `law/` directory at tag **v2.17.1**.
-
-**Note:** `crates/powder-server/static/assets/aesthetic.css` is still
-vendored at v2.16.0 as of this law refresh. The law-gate bump to v2.17.1 was
-a targeted bugfix pull (see below) done ahead of the next CSS refresh, so the
-two are temporarily unpinned from each other; `invariants.ts` did not change
-between the two tags, so the law the gate checks is unaffected. Bump the CSS
-asset to v2.17.1 in a follow-up change to re-pin them, per "Upgrading" below.
+`misty-step/aesthetic`'s `law/` directory at tag **v0.25.0**. Both files are
+byte-identical to that tag, and the served CSS is pinned to the same release.
 
 ### Why this refresh (v2.16.0 → v2.17.1)
 
