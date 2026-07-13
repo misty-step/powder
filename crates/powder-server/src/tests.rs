@@ -17,10 +17,6 @@ fn config_defaults_to_api_key_auth_and_data_path() {
 
     assert_eq!(config.db_path, PathBuf::from(DEFAULT_DB_PATH));
     assert_eq!(
-        config.import_files_dir,
-        PathBuf::from("/data/imported-backlog.d")
-    );
-    assert_eq!(
         config.bind_addr,
         SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT))
     );
@@ -66,13 +62,12 @@ fn config_rejects_a_non_numeric_field_note_proof_min_chars() {
 }
 
 #[test]
-fn config_accepts_explicit_import_files_dir() {
-    let config = Config::from_pairs([("POWDER_IMPORT_FILES_DIR", "/tmp/powder-imports")]).unwrap();
+fn config_rejects_the_retired_import_files_setting() {
+    let retired_import_dir = concat!("POWDER_", "IMPORT_FILES_DIR");
+    let err = Config::from_pairs([(retired_import_dir, "/tmp/retired")]).unwrap_err();
 
-    assert_eq!(
-        config.import_files_dir,
-        PathBuf::from("/tmp/powder-imports")
-    );
+    assert_eq!(err.variable, retired_import_dir);
+    assert!(err.message.contains("retired"));
 }
 
 #[test]
@@ -287,27 +282,21 @@ async fn create_card_rejects_an_existing_id_without_replacing_the_card() {
 }
 
 #[tokio::test]
-async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_and_claim() {
+async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_claim() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
-    let imported = app
+    let created = app
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/cards/import",
+            "/api/v1/cards",
             Some(&raw_key),
-            &json!({
-                "files": [{
-                    "path": "patchable-card.md",
-                    "contents": "# Patchable card\n\nPriority: P1 | Status: ready\n\n## Goal\nKeep this body.\n\n## Oracle\n- [ ] keep the source\n"
-                }]
-            })
-            .to_string(),
+            r#"{"id":"patchable","title":"Patchable card","body":"Keep this body.","acceptance":["keep the card"],"status":"ready","priority":"P1"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(imported.status(), StatusCode::OK);
+    assert_eq!(created.status(), StatusCode::OK);
 
     let before = app
         .clone()
@@ -362,7 +351,6 @@ async fn patch_card_updates_only_present_fields_and_preserves_source_created_at_
     assert_eq!(patched["title"], "Patched card");
     assert_eq!(patched["body"], "Keep this body.");
     assert_eq!(patched["created_at"], before["card"]["created_at"]);
-    assert_eq!(patched["source"], before["card"]["source"]);
     assert_eq!(patched["claim"], claim);
 
     let patched_many = app
@@ -646,22 +634,17 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     let blocked = response_json(blocked).await;
     assert_eq!(blocked["autonomy"], "auto");
 
-    let ticket = "# Done in another repo\n\nPriority: P0 | Status: done\n\n## Goal\nG.\n\n## Oracle\n- [x] g\n";
-    let imported = app
+    let created = app
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/cards/import",
+            "/api/v1/cards",
             Some(&raw_key),
-            &json!({
-                "files": [{"path": "001-done.md", "contents": ticket}],
-                "repo": "misty-step/other",
-            })
-            .to_string(),
+            r#"{"id":"other-001","title":"Done in another repo","body":"G.","acceptance":["g"],"status":"done","priority":"P0","repo":"misty-step/other"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(imported.status(), StatusCode::OK);
+    assert_eq!(created.status(), StatusCode::OK);
 
     let ids_from = |value: &serde_json::Value| -> Vec<String> {
         value["cards"]
@@ -915,8 +898,8 @@ async fn list_and_ready_routes_carry_full_criteria_text_not_a_clipped_preview() 
     assert_eq!(ready_card["criteria"][0]["text"], long_criterion);
 }
 
-/// powder-964: backlog.d's `Estimate: S/M/L/XL` header round-trips through
-/// create, patch, get, and the estimate filter on both list surfaces.
+/// Estimate round-trips through create, patch, get, and the estimate filter
+/// on both list surfaces.
 #[tokio::test]
 async fn estimate_round_trips_through_create_patch_and_filters_list_and_ready() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -1769,6 +1752,25 @@ async fn api_routes_are_not_shadowed_by_the_board_shell() {
         .starts_with("application/json"));
     let body = response_json(response).await;
     assert_eq!(body["auth_mode"], "none");
+}
+
+#[tokio::test]
+async fn retired_bulk_import_route_is_not_served() {
+    let (state, _) = test_state(AuthMode::None);
+    let response = app(state)
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            None,
+            "{}",
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        response.status(),
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+    ));
 }
 
 #[tokio::test]
@@ -2704,199 +2706,9 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
 }
 
 #[tokio::test]
-async fn import_accepts_raw_file_contents_body_for_a_remote_client() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let import_files_dir = state.config.import_files_dir.clone();
-    let app = app(state);
-
-    let ticket = r#"# Body-content import test
-
-Priority: P0 | Status: ready
-
-## Goal
-Prove a remote client can push parsed cards without server filesystem access.
-
-## Oracle
-- [ ] it works
-"#;
-    let body = json!({
-        "files": [{"path": "backlog.d/001-body-import.md", "contents": ticket}],
-    })
-    .to_string();
-
-    let imported = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/import",
-            Some(&admin_key),
-            &body,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(imported.status(), StatusCode::OK);
-    let outcome = response_json(imported).await;
-    assert_eq!(outcome["created"], 1);
-
-    let card = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/cards/001")
-                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(card.status(), StatusCode::OK);
-    let card = response_json(card).await;
-    assert_eq!(card["card"]["title"], "Body-content import test");
-    assert_eq!(
-        card["card"]["source"]["path"],
-        "backlog.d/001-body-import.md"
-    );
-    assert_eq!(
-        std::fs::read_to_string(import_files_dir.join("backlog.d/001-body-import.md")).unwrap(),
-        ticket
-    );
-}
-
-#[tokio::test]
-async fn import_files_dry_run_does_not_write_inline_markdown_to_disk() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let import_files_dir = state.config.import_files_dir.clone();
-    let app = app(state);
-
-    let ticket = "# Dry run\n\nPriority: P2 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n";
-    let body = json!({
-        "dry_run": true,
-        "files": [{"path": "backlog.d/001-dry-run.md", "contents": ticket}],
-    })
-    .to_string();
-
-    let imported = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/import",
-            Some(&admin_key),
-            &body,
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(imported.status(), StatusCode::OK);
-    assert!(!import_files_dir.join("backlog.d/001-dry-run.md").exists());
-}
-
-#[tokio::test]
-async fn import_rejects_inline_file_paths_outside_the_import_directory() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let ticket = "# Escape\n\nPriority: P2 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n";
-    let body = json!({
-        "files": [{"path": "../escape.md", "contents": ticket}],
-    })
-    .to_string();
-
-    let imported = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/import",
-            Some(&admin_key),
-            &body,
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(imported.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn import_with_repo_namespaces_card_ids_over_http() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let ticket = "# Remote repo ticket\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n";
-    let body = json!({
-        "files": [{"path": "001-first.md", "contents": ticket}],
-        "repo": "misty-step/bitterblossom",
-    })
-    .to_string();
-
-    let imported = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/import",
-            Some(&admin_key),
-            &body,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(imported.status(), StatusCode::OK);
-
-    let card = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/cards/bitterblossom-001")
-                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        card.status(),
-        StatusCode::OK,
-        "card id must be namespaced bitterblossom-001"
-    );
-    let card = response_json(card).await;
-    assert_eq!(card["card"]["repo"], "bitterblossom");
-}
-
-#[tokio::test]
-async fn import_rejects_both_path_and_files_together() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let response = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/import",
-            Some(&admin_key),
-            r#"{"path":"backlog.d","files":[]}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn import_rejects_neither_path_nor_files() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let response = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/import",
-            Some(&admin_key),
-            "{}",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn agent_scoped_key_can_author_a_card_but_not_bulk_import() {
+async fn agent_scoped_key_can_author_a_card() {
     // powder-925: single-card authoring moved to authorize() so a scoped
     // (non-admin) key can carry the operator's mobile quick-add flow.
-    // Bulk import stays admin-only -- many cards land with no per-card
-    // review, unlike one deliberate quick-add.
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state
         .store
@@ -2908,7 +2720,6 @@ async fn agent_scoped_key_can_author_a_card_but_not_bulk_import() {
     let app = app(state);
 
     let created = app
-        .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards",
@@ -2918,17 +2729,6 @@ async fn agent_scoped_key_can_author_a_card_but_not_bulk_import() {
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
-
-    let imported = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/import",
-            Some(&agent_key),
-            r#"{"path":"backlog.d"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(imported.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -3527,17 +3327,9 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
     let mut store = Store::open_in_memory().unwrap();
     store.migrate().unwrap();
     let key = store.apply_initial_seed(1).unwrap().unwrap();
-    let import_files_dir = std::env::temp_dir().join(format!(
-        "powder-server-import-files-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
     let state = AppState {
         config: Arc::new(Config {
             db_path: PathBuf::from(":memory:"),
-            import_files_dir,
             auth_mode,
             public_base_url: None,
             home_url: None,

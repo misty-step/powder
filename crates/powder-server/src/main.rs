@@ -3,9 +3,9 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
-    env, fs,
+    env,
     net::SocketAddr,
-    path::{Component, Path as StdPath, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -25,10 +25,10 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate,
-    Priority, ReadyQuery, RunId,
+    Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
+    ReadyQuery, RunId,
 };
-use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
+use powder_shell::unix_now;
 use powder_store::{
     ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig, RepositoryTier,
     RepositoryUpsert, RepositoryVisibility, Store, StoreError,
@@ -61,7 +61,6 @@ struct AppState {
 #[derive(Debug, Clone)]
 struct Config {
     db_path: PathBuf,
-    import_files_dir: PathBuf,
     auth_mode: AuthMode,
     public_base_url: Option<String>,
     home_url: Option<String>,
@@ -104,12 +103,16 @@ impl Config {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect::<BTreeMap<_, _>>();
+        let retired_import_dir = concat!("POWDER_", "IMPORT_FILES_DIR");
+        if vars.contains_key(retired_import_dir) {
+            return Err(ConfigError::new(
+                retired_import_dir,
+                "retired; remove the repository-ingestion setting",
+            ));
+        }
         let db_path = env_value(&vars, "POWDER_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
-        let import_files_dir = env_value(&vars, "POWDER_IMPORT_FILES_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_import_files_dir(&db_path));
         let port = match env_value(&vars, "PORT") {
             Some(value) => value
                 .parse::<u16>()
@@ -140,7 +143,6 @@ impl Config {
 
         Ok(Self {
             db_path,
-            import_files_dir,
             auth_mode,
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
             home_url: env_value(&vars, "POWDER_HOME_URL").map(ToOwned::to_owned),
@@ -191,14 +193,6 @@ fn field_note_config_from_env(
         proof_min_chars,
         weekly_budget,
     })
-}
-
-fn default_import_files_dir(db_path: &StdPath) -> PathBuf {
-    db_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| StdPath::new("."))
-        .join("imported-backlog.d")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,30 +282,6 @@ struct DetailParams {
 #[derive(Debug, Deserialize)]
 struct ListRepositoriesParams {
     include_hidden: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ImportFile {
-    path: String,
-    contents: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ImportRequest {
-    /// A backlog.d directory on the *server's* own filesystem (e.g. this
-    /// instance's own baked-in backlog.d). Mutually exclusive with `files`.
-    path: Option<String>,
-    /// Raw markdown content parsed server-side, for a remote client (a
-    /// private/flycast-only deployed instance has no access to another
-    /// repo's local checkout) pushing a repo's backlog.d over the wire
-    /// instead of pointing at a path this instance can read. Mutually
-    /// exclusive with `path`.
-    files: Option<Vec<ImportFile>>,
-    /// When set, namespaces every card id `{repo-slug}-{original-id}` and
-    /// tags `card.repo`, so cards from independently numbered repos never
-    /// collide in one instance (see `powder_shell::namespace_cards_for_repo`).
-    repo: Option<String>,
-    dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,7 +558,6 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/stats", get(board_stats))
         .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
-        .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
         .route(
             "/api/v1/repositories",
@@ -879,107 +848,6 @@ async fn merge_repository_alias(
     Ok(Json(json!(outcome)))
 }
 
-async fn import_cards(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ImportRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = require_admin(&state, &headers)?;
-    let now = unix_now();
-    let mut inline_files = None;
-    let mut cards = match (&request.path, request.files) {
-        (Some(_), Some(_)) => {
-            return Err(ApiError::bad_request(
-                "import accepts either path or files, not both",
-            ));
-        }
-        (Some(path), None) => {
-            load_backlog_dir(path, now).map_err(|err| ApiError::bad_request(err.to_string()))?
-        }
-        (None, Some(mut files)) => {
-            files.sort_by(|left, right| left.path.cmp(&right.path));
-            let cards = files
-                .iter()
-                .map(|file| {
-                    parse_backlog_card(&file.path, &file.contents, now)
-                        .map_err(|err| ApiError::bad_request(err.to_string()))
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            inline_files = Some(files);
-            cards
-        }
-        (None, None) => {
-            return Err(ApiError::bad_request("import requires path or files"));
-        }
-    };
-    if let Some(repo) = request.repo.as_deref() {
-        cards = namespace_cards_for_repo(cards, repo)
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    }
-    let dry_run = request.dry_run.unwrap_or(false);
-    let outcome = if dry_run {
-        let outcome = lock_store(&state)?.preview_import(&cards)?;
-        outcome
-    } else {
-        if let Some(files) = inline_files.as_deref() {
-            persist_inline_import_files(&state.config.import_files_dir, files)?;
-        }
-        let mut store = lock_store(&state)?;
-        store.import_cards_with_events(cards, &actor.display_name, now)?
-    };
-    Ok(Json(json!(outcome)))
-}
-
-fn persist_inline_import_files(root: &StdPath, files: &[ImportFile]) -> Result<(), ApiError> {
-    for file in files {
-        let relative = safe_inline_import_path(&file.path)?;
-        let destination = root.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                ApiError::internal(format!(
-                    "could not create import file directory {}: {err}",
-                    parent.display()
-                ))
-            })?;
-        }
-        fs::write(&destination, file.contents.as_bytes()).map_err(|err| {
-            ApiError::internal(format!(
-                "could not write import file {}: {err}",
-                destination.display()
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-fn safe_inline_import_path(raw: &str) -> Result<PathBuf, ApiError> {
-    let path = StdPath::new(raw);
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(ApiError::bad_request(format!(
-            "invalid import file path: {raw}"
-        )));
-    }
-
-    let mut relative = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => relative.push(part),
-            Component::CurDir => {}
-            _ => {
-                return Err(ApiError::bad_request(format!(
-                    "invalid import file path: {raw}"
-                )));
-            }
-        }
-    }
-    if relative.as_os_str().is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "invalid import file path: {raw}"
-        )));
-    }
-    Ok(relative)
-}
-
 async fn get_card(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1001,8 +869,7 @@ async fn create_card(
 ) -> Result<Json<Value>, ApiError> {
     // powder-925: single-card authoring is agent-accessible, same as
     // claim/status/comment/complete -- a scoped (non-admin) key can carry
-    // the operator's mobile quick-add flow without holding admin. Bulk
-    // import (many cards, no per-card review) stays admin-only below.
+    // the operator's mobile quick-add flow without holding admin.
     let actor = authorize(&state, &headers)?;
     let now = unix_now();
     // Default status reflects whether a real oracle exists: empty

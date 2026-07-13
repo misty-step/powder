@@ -27,12 +27,6 @@ pub const ROUTES: &[ApiRoute] = &[
         ),
     },
     ApiRoute {
-        method: "POST",
-        path: "/api/v1/cards/import",
-        intent: "import backlog.d markdown into the instance database, from a server-local path or raw file contents in the body, optionally namespaced by repo",
-        body_shape: None,
-    },
-    ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
         intent: "list ready cards for an agent to claim; optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more}",
@@ -298,7 +292,7 @@ mod tests {
         let paths = ROUTES.iter().map(|route| route.path).collect::<Vec<_>>();
 
         assert!(paths.contains(&"/api/v1/cards"));
-        assert!(paths.contains(&"/api/v1/cards/import"));
+        assert!(!paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
         assert!(paths.contains(&"/api/v1/approvals"));
         assert!(paths.contains(&"/api/v1/repositories"));

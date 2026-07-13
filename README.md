@@ -41,22 +41,20 @@ Current local smoke paths:
 DB=/tmp/powder-smoke/powder.db
 cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret
 cargo run -q -p powder-cli -- create-card --db "$DB" --id smoke-proof --title "Proof plan smoke" --acceptance "detail renders" --proof-plan "PR + HTTP smoke"
-cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/legacy-board-source --db "$DB"
 cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
-CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex)
+CLAIM=$(cargo run -q -p powder-cli -- claim smoke-proof --db "$DB" --agent codex)
 printf "%s" "$CLAIM"
 RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
-cargo run -q -p powder-cli -- heartbeat 001 --db "$DB" --run "$RUN_ID"
-cargo run -q -p powder-cli -- renew-claim 001 --db "$DB" --run "$RUN_ID" --ttl 3600
-cargo run -q -p powder-cli -- update-relations 001 --db "$DB" --related 002 --blocks 003 --blocked-by 000
-cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status running
+cargo run -q -p powder-cli -- heartbeat smoke-proof --db "$DB" --run "$RUN_ID"
+cargo run -q -p powder-cli -- renew-claim smoke-proof --db "$DB" --run "$RUN_ID" --ttl 3600
+cargo run -q -p powder-cli -- update-status smoke-proof --db "$DB" --status running
 cargo run -q -p powder-cli -- request-input "$RUN_ID" --db "$DB" --question "Approve completion?"
 cargo run -q -p powder-cli -- list-awaiting-input --db "$DB"
 cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator --answer approved
-cargo run -q -p powder-cli -- check-criterion 001 --db "$DB" --criterion 0 --actor operator
-cargo run -q -p powder-cli -- get-card 001 --db "$DB"
+cargo run -q -p powder-cli -- check-criterion smoke-proof --db "$DB" --criterion 0 --actor operator
+cargo run -q -p powder-cli -- get-card smoke-proof --db "$DB"
 cargo run -q -p powder-cli -- get-run "$RUN_ID" --db "$DB"
-cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --criterion-proof 0=https://example.test/proof
+cargo run -q -p powder-cli -- complete-card smoke-proof --db "$DB" --criterion-proof 0=https://example.test/proof
 cargo run -q -p powder-cli -- repository-list --db "$DB" --include-hidden
 cargo run -q -p powder-cli -- repository-upsert --db "$DB" --name canary --aliases misty-step/canary --tier active
 cargo run -q -p powder-cli -- repository-merge-alias --db "$DB" --alias misty-step/canary --into canary --actor operator
@@ -80,7 +78,7 @@ as a bare `missing --db` on a command the checkout has long since covered.
 
 | Command | `--db` transport | Remote env transport | Output shape |
 | --- | --- | --- | --- |
-| `list-ready` | SQLite query, or backlog.d preview when a path is supplied | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
+| `list-ready` | SQLite query | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
 | `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\tautonomy\ttitle` or `no-cards` |
 | `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
 | `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus\tautonomy` |
@@ -101,20 +99,10 @@ as a bare `missing --db` on a command the checkout has long since covered.
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
 falling back to ephemeral state. `update-relations`, `get-run`,
-`list-awaiting-input`, `answer-input`, `repository-*`, `import*`, `key-*`, and
+`list-awaiting-input`, `answer-input`, `repository-*`, `import-github-issues`, `key-*`, and
 `subscription-*` remain `--db`-only (bulk/admin operations or reads with no
 remote-mode demand yet); omitting `--db` on those still fails with a bare
 `missing --db`.
-
-Remote `POST /api/v1/cards/import` calls may submit inline markdown through
-the `files` request body when the server cannot see the caller's checkout. A
-successful non-dry-run inline import writes those files into the instance-owned
-`POWDER_IMPORT_FILES_DIR` before importing them into SQLite, preserving the
-same relative `card.source.path` returned by `GET /api/v1/cards/{id}`. By
-default this directory is `imported-backlog.d` beside `POWDER_DB_PATH`; on Fly
-with the default `/data/powder.db`, that means `/data/imported-backlog.d`.
-To edit existing card content, edit the markdown file under that directory and
-reimport it, rather than patching reconstructed JSON back into the database.
 
 MCP can also run against a local or deployed `powder-server` over HTTP instead
 of opening SQLite directly:
@@ -141,7 +129,7 @@ A hidden-tool call returns an error naming `POWDER_MCP_TOOLSETS`.
 DB=/tmp/powder-http-smoke/powder.db
 mkdir -p "$(dirname "$DB")"
 KEY=$(cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret | awk -F '\t' '/bootstrap-key/ {print $4}')
-cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/legacy-board-source --db "$DB"
+cargo run -q -p powder-cli -- create-card --db "$DB" --id smoke-proof --title "HTTP smoke" --acceptance "lifecycle works" --status ready
 POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 cargo run -q -p powder-server
 
 # in another shell
@@ -149,8 +137,8 @@ export POWDER_API_BASE_URL=http://127.0.0.1:4017
 export POWDER_API_KEY="$KEY"
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_ready","arguments":{"limit":1}}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manage_claim","arguments":{"card_id":"001","action":"claim","agent":"codex","ttl_seconds":60}}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"complete_card","arguments":{"card_id":"001","proof":"http://example.test/proof"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manage_claim","arguments":{"card_id":"smoke-proof","action":"claim","agent":"codex","ttl_seconds":60}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"complete_card","arguments":{"card_id":"smoke-proof","proof":"http://example.test/proof"}}}' \
   | cargo run -q -p powder-mcp
 ```
 
@@ -242,7 +230,6 @@ Powder follows the Canary-style deployment pattern:
 
 - one Rust service image
 - SQLite database at `POWDER_DB_PATH`
-- inline import markdown persisted at `POWDER_IMPORT_FILES_DIR`
 - dual-stack/private-Fly listener at `POWDER_BIND_ADDR`
 - Fly volume mounted at `/data`
 - optional Litestream replication to Fly Tigris
@@ -261,7 +248,7 @@ POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 
 Board read routes are reachable without a key in `api-key` mode; the private
 Flycast/Tailscale network is the read perimeter. Mutations, card status and
-relation changes, claim lifecycle, card authoring, imports, comments, links,
+relation changes, claim lifecycle, card authoring, comments, links,
 answer-loop writes, and key management require `Authorization: Bearer <key>` in
 `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
@@ -353,7 +340,7 @@ with no such portal leave it unset and see no change.
 
 The board's write actions (quick-add a card, change a card's status, claim,
 comment, complete) only need `agent` scope, not `admin` -- `admin` is
-reserved for bulk import, repository management, and key management, none
+reserved for repository management and key management, neither
 of which the board UI's phone surface exposes. Mint a dedicated,
 independently-revocable `agent`-scope key for this instead of pasting the
 admin key into Safari:

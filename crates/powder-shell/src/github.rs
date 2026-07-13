@@ -1,6 +1,6 @@
-//! GitHub issue import adapter (backlog.d/007): maps a GitHub issue into a
-//! `Card` and routes it through the same digest-aware, repo-namespaced,
-//! reimport-safe pipeline `import-repo` already uses for backlog.d files.
+//! GitHub issue import adapter: maps an explicitly exported GitHub issue into
+//! a digest-aware, repository-namespaced `Card` for a one-time migration or
+//! deliberate synchronization.
 //!
 //! Deliberately file-based, not a live GitHub API client: powder stays a
 //! deterministic board (per VISION.md, it never calls out to a model, and
@@ -37,13 +37,11 @@ pub struct GitHubIssue {
     pub url: String,
 }
 
-/// Map one already-fetched GitHub issue into a `Card`, namespaced the same
-/// way `namespace_cards_for_repo` namespaces backlog.d cards
-/// (`{repo-slug}-{number}`), so issues and backlog.d tickets from different
-/// repos never collide in one instance.
+/// Map one already-fetched GitHub issue into a `Card`, namespaced as
+/// `{repo-slug}-{number}` so issues from different repositories never collide.
 ///
 /// `acceptance` is deliberately left empty: GitHub issues don't carry a
-/// backlog.d-style Oracle section, and fabricating acceptance criteria that
+/// Powder acceptance oracle, and fabricating acceptance criteria that
 /// weren't actually written by anyone would violate "ready is a query, not
 /// vibes." An imported issue stays unclaimable (`is_ready_at` requires
 /// non-empty acceptance) until an operator or agent adds real criteria via
@@ -51,10 +49,9 @@ pub struct GitHubIssue {
 ///
 /// `status` maps open -> `Backlog` (needs acceptance criteria before it is
 /// genuinely ready) and closed -> `Done`. The source digest is computed over
-/// title, body, labels, and state, so `Card::merge_reimport`'s digest
-/// comparison (backlog.d/007's reimport-safety fix) reports drift when any
-/// of those change on GitHub, and -- just like backlog.d reimport -- a
-/// closed-then-reopened issue can never clobber an in-flight Powder claim.
+/// title, body, labels, and state, so `Card::merge_reimport` reports drift
+/// when any of those change on GitHub and a closed-then-reopened issue can
+/// never clobber an in-flight Powder claim.
 pub fn github_issue_to_card(issue: &GitHubIssue, repo: &str, now: i64) -> ShellResult<Card> {
     let id_prefix = validate_repo_slug(repo)?;
     let repo = repo.trim().trim_end_matches('/').to_string();
@@ -90,8 +87,7 @@ pub fn github_issue_to_card(issue: &GitHubIssue, repo: &str, now: i64) -> ShellR
 
 /// Read a `gh issue list --json number,title,body,labels,state,url` style
 /// JSON array from `path` and map every issue into a namespaced `Card`,
-/// ready for `Store::import_cards`/`preview_import` exactly like
-/// `load_backlog_dir_for_repo`'s cards.
+/// ready for `Store::import_cards`/`preview_import`.
 pub fn load_github_issues_file(
     path: impl AsRef<Path>,
     repo: &str,

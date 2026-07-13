@@ -36,7 +36,7 @@ instance as a work board — this skill is for agents building Powder itself.
 
 | Changed area | Surface | Verification path |
 |---|---|---|
-| `crates/powder-core`, `powder-shell`, `powder-store` | Domain rules, ports, SQLite persistence | `cargo test --workspace` (or `-p <crate>` narrowed) |
+| `crates/powder-core`, `powder-shell`, `powder-store` | Domain rules, adapters, SQLite persistence | `cargo test --workspace` (or `-p <crate>` narrowed) |
 | `crates/powder-api`, `powder-cli` | `powder` CLI over the card/run lifecycle | Local CLI smoke below against a throwaway DB |
 | `crates/powder-mcp` | MCP tool contract | `POWDER_DB_PATH=<db> cargo run -q -p powder-mcp`, then register with a harness and replay a tool call |
 | `crates/powder-server` | HTTP API, single deployable app | `POWDER_DB_PATH=<db> cargo run -p powder-server`, then `/healthz` + `/readyz` |
@@ -52,12 +52,12 @@ cargo test --workspace
 ```
 
 Live CLI lifecycle smoke against a throwaway DB (README's own convention —
-uses the repo's test fixture backlog, never real card/instance data):
+creates synthetic state directly, never real card/instance data):
 
 ```sh
 DB=/tmp/powder-smoke/powder.db
 cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret
-cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
+cargo run -q -p powder-cli -- create-card --db "$DB" --id 001 --title "Lifecycle smoke" --acceptance "proof exists" --status ready
 cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
 CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex)
 RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
@@ -93,13 +93,12 @@ curl -s localhost:4000/readyz
   must point at the *same* `--db`/`POWDER_DB_PATH` — Powder is a single
   SQLite writer per instance, same footgun class as Canary's single-writer
   invariant.
-- **Never commit real card/run/claim/instance data** to this repo — the
-  fixture backlog under `crates/powder-core/tests/fixtures/backlog.d` is the
-  only backlog data allowed in the tree; a throwaway `/tmp` DB is the
-  correct target for any live smoke.
-- **MCP falls back to an in-memory fixture** if `POWDER_DB_PATH` is unset —
-  a QA run against MCP with no DB path set is silently testing fixture data,
-  not the real store; always set it.
+- **Never commit real card/run/claim/instance data** to this repo. A throwaway
+  `/tmp` DB populated through `create-card` is the correct target for any live
+  smoke.
+- **MCP requires an explicit persistence mode.** Set `POWDER_DB_PATH` for a
+  local QA run; startup fails closed when neither a DB nor remote API is
+  configured.
 - **`api-key` mode binds claims to the authenticated actor** — a
   request-body `agent` value is only accepted when it matches that actor;
   do not "QA" auth by spoofing a different agent name in the body.

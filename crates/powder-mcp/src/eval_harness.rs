@@ -661,7 +661,6 @@ impl McpProcess {
             .env("POWDER_DB_PATH", db_path)
             .env_remove("POWDER_API_BASE_URL")
             .env_remove("POWDER_API_KEY")
-            .env_remove("POWDER_BACKLOG_DIR")
             .env_remove("POWDER_MCP_TOOLSETS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

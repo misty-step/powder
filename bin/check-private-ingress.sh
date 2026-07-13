@@ -1,5 +1,5 @@
 #!/bin/bash
-# Conformance check for backlog.d/005: prove the deployed app has no public
+# Conformance check: prove the deployed app has no public
 # IP addresses, so it is reachable only over Fly's private network
 # (powder.internal / powder.flycast). Requires flyctl auth; not run in CI.
 set -euo pipefail

@@ -14,9 +14,8 @@ import {
    powder-server, at /board) — the render-time invariants from
    @misty-step/aesthetic/law, proven on the real UI instead of eyeballed
    per PR (aesthetic 011/015). playwright.config.ts boots powder-server
-   against a throwaway DB seeded with the repo's own import fixture
-   (crates/powder-core/tests/fixtures/legacy-board-source), so the board renders a
-   real card rather than an empty shell. */
+   against a throwaway DB seeded through the public card-creation command, so
+   the board renders real cards rather than an empty shell. */
 
 const MODES = ["light", "dark"] as const;
 const CARD_ROUTE_VIEWPORTS = [
@@ -117,7 +116,7 @@ for (const mode of MODES) {
     await card.click();
     await expect(page).toHaveURL(/\/c\/001$/);
     await expect(page.locator("#powder-card-app")).toBeVisible();
-    await expect(page.locator("#detail-body")).toContainText("Import example backlog ticket");
+    await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
     await assertLaw(page, { consoleErrors: errors });
     await page.goBack();
     await expect(page).toHaveURL(/\/board$/);
@@ -143,7 +142,7 @@ for (const mode of MODES) {
       await page.setViewportSize(viewport.size);
       const errors = await boot(page, mode, "/c/001");
       await expect(page.locator("#powder-card-app")).toBeVisible();
-      await expect(page.locator("#detail-body")).toContainText("Import example backlog ticket");
+      await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
       await expect(page.locator("#detail-body")).toContainText("ACCEPTANCE");
       // powder-942: home affordance present next to the existing "board"
       // link at every viewport this route is tested at, mobile included.
