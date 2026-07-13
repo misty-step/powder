@@ -24,26 +24,14 @@ The Bitterblossom router reads `autonomy` to choose between autonomous merge
 and approval-request routing. Other machine consumers should treat omitted
 class support as `review`, but current Powder payloads do not omit the field.
 
-## Approval Queue
+## Human input
 
-The approval queue is a read surface over existing awaiting-input primitives.
-It does not add lifecycle states or a new approval object. A queue row is an
-`awaiting_input` run joined with its card id, title, autonomy class, latest
-question text, run id, and packet links.
-
-Packet links are ordinary card links whose `label` starts with `approval`.
-`approval/packet` is the preferred label for generated approval packets.
-
-`answer_input` is the green button. Answering the awaiting-input run records
-the actor-attributed answer, resumes the run, and removes the row from the
-approval queue.
+Powder does not own approval queues or human-input lifecycle. An external
+runtime such as Bitterblossom owns asks, answers, and resume semantics. Powder
+cards retain their autonomy class and may link to an external approval packet;
+a claim may carry the runtime's opaque identifier in `runtime_ref`.
 
 ## Coordination Constraints
-
-This contract intentionally does not reshape run or `awaiting_input` machinery;
-it only reads through existing run, activity, and link primitives. A later
-cleanup may replace that machinery, but this queue must not introduce parallel
-state.
 
 This contract also does not add lifecycle states. `auto` and `review` are card
 classes, not statuses, so they remain compatible with the three-state direction.

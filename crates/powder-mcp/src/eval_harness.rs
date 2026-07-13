@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use powder_core::{Authority, Card, CardId, CardStatus, DetailLevel, Priority, RunId, RunState};
+use powder_core::{Card, CardId, CardStatus, DetailLevel, Priority};
 use powder_store::{RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store};
 use serde_json::{json, Value};
 
@@ -145,7 +145,6 @@ pub fn run_eval(command: McpCommand) -> EvalReport {
     let scenarios = vec![
         run_grooming_scan(&command, &mut temp),
         run_work_loop(&command, &mut temp),
-        run_input_loop(&command, &mut temp),
         run_error_recovery(&command, &mut temp),
     ];
     EvalReport { scenarios }
@@ -192,10 +191,11 @@ fn run_work_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioMe
                 "card_id": "work-loop",
                 "action": "claim",
                 "agent": AGENT,
+                "runtime_ref": "bb-run-eval-42",
                 "ttl_seconds": 600
             }),
         )?;
-        let run_id = required_str(claimed.payload()?, "run_id")?;
+        let claim_id = required_str(claimed.payload()?, "claim_id")?;
 
         mcp.call_tool(
             recorder,
@@ -205,7 +205,7 @@ fn run_work_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioMe
                 "agent": AGENT,
                 "model": "eval",
                 "harness": "powder-mcp-eval",
-                "run_id": run_id,
+                "runtime_ref": "bb-run-eval-42",
                 "body": "Implemented deterministic proof path for eval fixture."
             }),
         )?;
@@ -229,74 +229,7 @@ fn run_work_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioMe
         )?;
 
         mcp.shutdown()?;
-        assert_work_loop_end_state(&db_path, &run_id)?;
-        Ok(())
-    })
-}
-
-fn run_input_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioMetric {
-    run_scenario("input loop", |recorder| {
-        let db_path = temp.db_path("input-loop")?;
-        let run_id = seed_input_loop(&db_path)?;
-        let mut mcp = McpProcess::spawn(command, &db_path)?;
-
-        mcp.call_tool(
-            recorder,
-            "request_input",
-            json!({
-                "run_id": run_id,
-                "question": "Should the eval fixture continue?"
-            }),
-        )?;
-        let awaiting = mcp.call_tool(recorder, "list_awaiting_input", json!({"limit": 10}))?;
-        let awaiting_payload = awaiting.payload()?;
-        let awaiting_items = awaiting_payload
-            .as_array()
-            .ok_or_else(|| "list_awaiting_input payload is not an array".to_string())?;
-        if !awaiting_items.iter().any(|item| {
-            item["run"]["id"] == run_id
-                && item["question"]["payload"] == "Should the eval fixture continue?"
-        }) {
-            return Err("awaiting-input list did not include the requested question".to_string());
-        }
-
-        mcp.call_tool(
-            recorder,
-            "answer_input",
-            json!({
-                "run_id": run_id,
-                "actor": "operator",
-                "answer": "Approved for eval baseline."
-            }),
-        )?;
-        let run = mcp.call_tool(
-            recorder,
-            "get_run",
-            json!({"run_id": run_id, "detail": "detailed"}),
-        )?;
-        let run_payload = run.payload()?;
-        expect_eq(
-            run_payload["run"]["state"].as_str(),
-            Some("active"),
-            "get_run state",
-        )?;
-        expect_eq(
-            run_payload["card"]["status"].as_str(),
-            Some("running"),
-            "get_run card status",
-        )?;
-        let activities = run_payload["activities"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if !activities.iter().any(|activity| {
-            activity["payload"] == "answered by operator: Approved for eval baseline."
-        }) {
-            return Err("get_run readback did not include the operator answer".to_string());
-        }
-
-        mcp.shutdown()?;
-        assert_input_loop_end_state(&db_path, &run_id)?;
+        assert_work_loop_end_state(&db_path, &claim_id)?;
         Ok(())
     })
 }
@@ -413,33 +346,6 @@ fn seed_work_loop(db_path: &Path) -> EvalResult<()> {
     })
 }
 
-fn seed_input_loop(db_path: &Path) -> EvalResult<String> {
-    let mut run_id = None;
-    with_seed_store(db_path, |store| {
-        upsert_active_repository(store, TARGET_REPO)?;
-        seed_card(
-            store,
-            CardSeed::new("input-loop", "Input loop card", CardStatus::Ready)
-                .priority(Priority::P0)
-                .repo(TARGET_REPO)
-                .acceptance(&["operator input is handled"])
-                .created_at(SEED_NOW),
-        )?;
-        let receipt = store
-            .claim_card(
-                &card_id("input-loop")?,
-                AGENT,
-                SEED_NOW + 1,
-                600,
-                &Authority::unchecked(),
-            )
-            .map_err(to_string)?;
-        run_id = Some(receipt.run_id.to_string());
-        Ok(())
-    })?;
-    run_id.ok_or_else(|| "input-loop setup did not create a run".to_string())
-}
-
 fn seed_error_recovery(db_path: &Path) -> EvalResult<()> {
     with_seed_store(db_path, |store| {
         upsert_active_repository(store, TARGET_REPO)?;
@@ -541,7 +447,7 @@ fn upsert_active_repository(store: &mut Store, name: &str) -> EvalResult<()> {
     Ok(())
 }
 
-fn assert_work_loop_end_state(db_path: &Path, run_id: &str) -> EvalResult<()> {
+fn assert_work_loop_end_state(db_path: &Path, _claim_id: &str) -> EvalResult<()> {
     let store = Store::open(db_path).map_err(to_string)?;
     let detail = store
         .get_card_detail(&card_id("work-loop")?, DetailLevel::Detailed)
@@ -562,51 +468,14 @@ fn assert_work_loop_end_state(db_path: &Path, run_id: &str) -> EvalResult<()> {
         .first()
         .and_then(|criterion| criterion.checked_by.as_deref());
     expect_eq(checked, Some(AGENT), "checked criterion actor")?;
-    if !detail.work_log.iter().any(|entry| {
-        entry.agent == AGENT
-            && entry
-                .run_id
-                .as_ref()
-                .is_some_and(|id| id.as_str() == run_id)
-    }) {
-        return Err("work-loop work_log entry was not persisted with the run id".to_string());
-    }
-    let run_id = run_id_value(run_id)?;
-    let run = store
-        .get_run_detail(&run_id, DetailLevel::Detailed)
-        .map_err(to_string)?
-        .ok_or_else(|| "work-loop run missing after completion".to_string())?;
-    if run.run.state != RunState::Complete {
-        return Err(format!(
-            "work-loop run state was {}, expected complete",
-            run.run.state.as_str()
-        ));
-    }
-    expect_eq(
-        run.run.proof.as_deref(),
-        Some("https://example.test/powder-mcp-eval/work-loop"),
-        "work-loop proof",
-    )
-}
-
-fn assert_input_loop_end_state(db_path: &Path, run_id: &str) -> EvalResult<()> {
-    let store = Store::open(db_path).map_err(to_string)?;
-    let run_id = run_id_value(run_id)?;
-    let run = store
-        .get_run_detail(&run_id, DetailLevel::Detailed)
-        .map_err(to_string)?
-        .ok_or_else(|| "input-loop run missing after scenario".to_string())?;
-    if run.run.state != RunState::Active {
-        return Err(format!(
-            "input-loop run state was {}, expected active",
-            run.run.state.as_str()
-        ));
-    }
-    if run.card.status != CardStatus::Running {
-        return Err(format!(
-            "input-loop card status was {}, expected running",
-            run.card.status.as_str()
-        ));
+    if !detail
+        .work_log
+        .iter()
+        .any(|entry| entry.agent == AGENT && entry.runtime_ref.as_deref() == Some("bb-run-eval-42"))
+    {
+        return Err(
+            "work-loop work_log entry was not persisted with its runtime reference".to_string(),
+        );
     }
     Ok(())
 }
@@ -888,10 +757,6 @@ fn assert_eq_string_slices(actual: &[String], expected: &[&str]) -> EvalResult<(
 
 fn card_id(raw: &str) -> EvalResult<CardId> {
     CardId::new(raw).map_err(to_string)
-}
-
-fn run_id_value(raw: &str) -> EvalResult<RunId> {
-    RunId::new(raw).map_err(to_string)
 }
 
 fn to_string(error: impl std::fmt::Display) -> String {

@@ -2,8 +2,8 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel,
-    Estimate, Priority, ReadyQuery, RunId,
+    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, ClaimId,
+    DetailLevel, Estimate, Priority, ReadyQuery,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -28,7 +28,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder is the durable card and claim ledger; worker runtime and human input live outside it. Use list_ready before claiming work and claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card before working. A claim may carry runtime_ref pointing at the external worker runtime. Append append_work_log frequently while working. Heartbeat or renew before lease expiry; release when stopping. Complete only when the card criteria are satisfied and include reviewable proof. Admin tools are hidden unless POWDER_MCP_TOOLSETS enables them.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -39,7 +39,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_cards",
         description: "Scan card summaries by optional status/autonomy/repo/estimate filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1}}}"#,
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -49,12 +49,12 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, repository, estimate, and initial status; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
         description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, autonomy, priority, estimate, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. In remote mode the deployed instance requires an admin-scope key.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -78,38 +78,18 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "manage_claim",
-        description: "Manage the claim lease for one card. action=claim requires agent and returns run_id; action=renew, heartbeat, release, or transfer requires run_id; action=transfer also requires to_agent. ttl_seconds applies to claim, renew, and transfer. actor/admin are optional local-store authority args. Heartbeat or renew before lease expiry.",
-        input_schema: r#"{"type":"object","required":["card_id","action"],"properties":{"card_id":{"type":"string"},"action":{"type":"string","enum":["claim","renew","heartbeat","release","transfer"]},"agent":{"type":"string"},"to_agent":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Manage the claim lease for one card. action=claim requires agent, accepts optional runtime_ref, and returns claim_id. Other actions require claim_id; transfer also requires to_agent.",
+        input_schema: r#"{"type":"object","required":["card_id","action"],"properties":{"card_id":{"type":"string"},"action":{"type":"string","enum":["claim","renew","heartbeat","release","transfer"]},"agent":{"type":"string"},"runtime_ref":{"type":"string"},"to_agent":{"type":"string"},"claim_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "get_card",
-        description: "Read one card with runs, activities, links, comments, and claim state. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
+        description: "Read one card with events, work log, links, comments, and claim state. detail defaults to concise; detailed returns full history.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
-    },
-    ToolDef {
-        name: "get_run",
-        description: "Read one run with its card, activities, links, comments, and run state. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
-        input_schema: r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
-    },
-    ToolDef {
-        name: "list_awaiting_input",
-        description: "List runs currently paused for human or agent input.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
-    },
-    ToolDef {
-        name: "list_approvals",
-        description: "List awaiting-input runs with card autonomy, latest question text, run id, and approval-prefixed packet links.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
-    },
-    ToolDef {
-        name: "answer_input",
-        description: "Answer an awaiting-input run with an actor-attributed response and resume it.",
-        input_schema: r#"{"type":"object","required":["run_id","actor","answer"],"properties":{"run_id":{"type":"string"},"actor":{"type":"string"},"answer":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_status",
         description: "Set a card to any status in one call and record an audit event; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","claimed","running","blocked","done","shipped","abandoned"]},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "check_criterion",
@@ -128,18 +108,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "add_comment",
-        description: "Attach an actor-attributed comment to a card, visible immediately via get_card/get_run.",
+        description: "Attach an actor-attributed comment to a card, visible immediately via get_card.",
         input_schema: r#"{"type":"object","required":["card_id","author","body"],"properties":{"card_id":{"type":"string"},"author":{"type":"string"},"body":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "append_work_log",
-        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution you can supply. body is scrubbed for known secret shapes server-side before storage.",
-        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
-    },
-    ToolDef {
-        name: "request_input",
-        description: "Pause a run in awaiting_input with the exact operator question. Optional actor/admin are checked against the claim holder.",
-        input_schema: r#"{"type":"object","required":["run_id","question"],"properties":{"run_id":{"type":"string"},"question":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Append a high-frequency, fully-attributed work_log entry. runtime_ref may point at the external worker runtime.",
+        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"runtime_ref":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "complete_card",
@@ -535,31 +510,6 @@ pub fn call_tool_store(
                 })?;
             card_detail_payload(&detail)?
         }
-        "get_run" => {
-            let run_id = run_id(args, "run_id")?;
-            json!(store
-                .get_run_detail(&run_id, detail_arg(args)?)
-                .map_err(to_string)?
-                .ok_or_else(|| format!(
-                    "run not found: {run_id}; use list_cards then get_card to enumerate run ids"
-                ))?)
-        }
-        "list_awaiting_input" => {
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            json!(store.list_awaiting_input(limit).map_err(to_string)?)
-        }
-        "list_approvals" => {
-            let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            json!({"approvals": store.list_approvals(limit).map_err(to_string)?})
-        }
-        "answer_input" => {
-            let run_id = run_id(args, "run_id")?;
-            let actor = required_str(args, "actor")?;
-            let answer = required_str(args, "answer")?;
-            json!(store
-                .answer_input(&run_id, actor, answer, now, &authority_arg(args))
-                .map_err(to_string)?)
-        }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = parse_status(required_str(args, "status")?)?;
@@ -616,17 +566,10 @@ pub fn call_tool_store(
                 model: optional_str(args, "model"),
                 reasoning: optional_str(args, "reasoning"),
                 harness: optional_str(args, "harness"),
-                run_id: optional_str(args, "run_id"),
+                runtime_ref: optional_str(args, "runtime_ref"),
             };
             json!(store
                 .append_work_log(&card_id, agent, attribution, body, now)
-                .map_err(to_string)?)
-        }
-        "request_input" => {
-            let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
-            let question = required_str(args, "question")?;
-            json!(store
-                .request_input(&run_id, question, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "complete_card" => {
@@ -825,32 +768,39 @@ fn manage_claim_store(store: &mut Store, args: &Value, now: i64) -> Result<Value
         ClaimAction::Claim => {
             let agent = required_claim_arg(args, action, "agent")?;
             json!(store
-                .claim_card(&card_id, agent, now, ttl_seconds, &authority)
+                .claim_card(
+                    &card_id,
+                    agent,
+                    optional_str(args, "runtime_ref"),
+                    now,
+                    ttl_seconds,
+                    &authority,
+                )
                 .map_err(to_string)?)
         }
         ClaimAction::Renew => {
-            let run_id = run_id_for_claim(args, action)?;
+            let claim_id = claim_id_for_action(args, action)?;
             json!(store
-                .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority)
+                .renew_claim(&card_id, &claim_id, now, ttl_seconds, &authority)
                 .map_err(to_string)?)
         }
         ClaimAction::Heartbeat => {
-            let run_id = run_id_for_claim(args, action)?;
+            let claim_id = claim_id_for_action(args, action)?;
             json!(store
-                .heartbeat_claim(&card_id, &run_id, now, &authority)
+                .heartbeat_claim(&card_id, &claim_id, now, &authority)
                 .map_err(to_string)?)
         }
         ClaimAction::Release => {
-            let run_id = run_id_for_claim(args, action)?;
+            let claim_id = claim_id_for_action(args, action)?;
             json!(store
-                .release_claim(&card_id, &run_id, now, &authority)
+                .release_claim(&card_id, &claim_id, now, &authority)
                 .map_err(to_string)?)
         }
         ClaimAction::Transfer => {
-            let run_id = run_id_for_claim(args, action)?;
+            let claim_id = claim_id_for_action(args, action)?;
             let to_agent = required_claim_arg(args, action, "to_agent")?;
             json!(store
-                .transfer_claim(&card_id, &run_id, to_agent, now, ttl_seconds, &authority)
+                .transfer_claim(&card_id, &claim_id, to_agent, now, ttl_seconds, &authority)
                 .map_err(to_string)?)
         }
     })
@@ -875,16 +825,12 @@ fn required_claim_arg<'a>(
         .map_err(|_| format!("{} requires {key} ({})", action.as_str(), field_role(key)))
 }
 
-fn run_id_for_claim(args: &Value, action: ClaimAction) -> Result<RunId, String> {
-    RunId::new(required_claim_arg(args, action, "run_id")?).map_err(to_string)
+fn claim_id_for_action(args: &Value, action: ClaimAction) -> Result<ClaimId, String> {
+    ClaimId::new(required_claim_arg(args, action, "claim_id")?).map_err(to_string)
 }
 
 fn card_id(args: &Value, key: &'static str) -> Result<CardId, String> {
     CardId::new(required_str(args, key)?).map_err(to_string)
-}
-
-fn run_id(args: &Value, key: &'static str) -> Result<RunId, String> {
-    RunId::new(required_str(args, key)?).map_err(to_string)
 }
 
 fn card_ids_array(args: &Value, key: &'static str) -> Result<Vec<CardId>, String> {
@@ -1080,7 +1026,6 @@ fn field_role(key: &'static str) -> &'static str {
     match key {
         "id" => "card id for the new card",
         "card_id" => "card id to read or mutate",
-        "run_id" => "run id to read or mutate",
         "title" => "card title",
         "name" => "repository name",
         "alias" => "repository alias to merge",
@@ -1089,14 +1034,12 @@ fn field_role(key: &'static str) -> &'static str {
         "agent" => "agent identity for the claim or work log",
         "to_agent" => "agent identity receiving the transferred claim",
         "actor" => "actor recorded for the audit event",
-        "answer" => "answer text for the awaiting-input run",
         "status" => "target card status",
         "criterion" => "acceptance criterion index",
         "label" => "link label",
         "url" => "link or webhook URL",
         "author" => "comment author",
         "body" => "comment or work-log body",
-        "question" => "operator question for the awaiting-input run",
         "subscription_id" => "webhook subscription id",
         _ => "required input",
     }
@@ -1148,7 +1091,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 20);
+        assert_eq!(default_tools.len(), 15);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1172,11 +1115,6 @@ mod tests {
             .unwrap();
         assert_eq!(
             get_card["inputSchema"]["properties"]["detail"]["enum"],
-            json!(["concise", "detailed"])
-        );
-        let get_run = tools.iter().find(|tool| tool["name"] == "get_run").unwrap();
-        assert_eq!(
-            get_run["inputSchema"]["properties"]["detail"]["enum"],
             json!(["concise", "detailed"])
         );
         let manage_claim = tools
@@ -1267,21 +1205,16 @@ mod tests {
                 "list_repositories",
                 "manage_claim",
                 "get_card",
-                "get_run",
-                "list_awaiting_input",
-                "list_approvals",
-                "answer_input",
                 "update_status",
                 "check_criterion",
                 "update_relations",
                 "add_link",
                 "add_comment",
                 "append_work_log",
-                "request_input",
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 20);
+        assert_eq!(default_names.len(), 15);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1293,7 +1226,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 29);
+        assert_eq!(admin_names.len(), 24);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -1428,7 +1361,7 @@ mod tests {
             assert!(instructions.contains("list_ready"));
             assert!(instructions.contains("claim exactly one card"));
             assert!(instructions.contains("get_card"));
-            assert!(instructions.contains("complete_card"));
+            assert!(instructions.contains("Complete"));
         }
     }
 
@@ -1497,28 +1430,28 @@ Expose tools against the DB.
         )
         .unwrap();
         let claimed_text = claimed["content"][0]["text"].as_str().unwrap();
-        assert!(claimed_text.contains("run-"));
+        assert!(claimed_text.contains("claim-"));
         let claimed_json = tool_payload(&claimed);
-        let run_id = claimed_json["run_id"].as_str().unwrap();
+        let claim_id = claimed_json["claim_id"].as_str().unwrap();
 
         call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "heartbeat", "run_id": run_id}),
+            &json!({"card_id": "005", "action": "heartbeat", "claim_id": claim_id}),
             12,
         )
         .unwrap();
         call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "renew", "run_id": run_id, "ttl_seconds": 60}),
+            &json!({"card_id": "005", "action": "renew", "claim_id": claim_id, "ttl_seconds": 60}),
             13,
         )
         .unwrap();
         let transferred = call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "transfer", "run_id": run_id, "to_agent": "codex-b", "ttl_seconds": 60}),
+            &json!({"card_id": "005", "action": "transfer", "claim_id": claim_id, "to_agent": "codex-b", "ttl_seconds": 60}),
             13,
         )
         .unwrap();
@@ -1531,33 +1464,8 @@ Expose tools against the DB.
             .contains("codex-b"));
         call_tool_store(
             &mut store,
-            "request_input",
-            &json!({"run_id": run_id, "question": "Need approval?"}),
-            14,
-        )
-        .unwrap();
-        let awaiting =
-            call_tool_store(&mut store, "list_awaiting_input", &json!({"limit": 10}), 15).unwrap();
-        assert!(awaiting["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Need approval?"));
-        call_tool_store(
-            &mut store,
-            "answer_input",
-            &json!({"run_id": run_id, "actor": "operator", "answer": "Approved"}),
-            16,
-        )
-        .unwrap();
-        let run = call_tool_store(&mut store, "get_run", &json!({"run_id": run_id}), 17).unwrap();
-        assert!(run["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Approved"));
-        call_tool_store(
-            &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "release", "run_id": run_id}),
+            &json!({"card_id": "005", "action": "release", "claim_id": claim_id}),
             18,
         )
         .unwrap();
@@ -1595,22 +1503,19 @@ Expose tools against the DB.
             "claim requires agent (agent identity for the claim or work log)"
         );
 
-        let missing_run_id = call_tool_store(
+        let missing_claim_id = call_tool_store(
             &mut store,
             "manage_claim",
             &json!({"card_id": "005", "action": "renew"}),
             10,
         )
         .unwrap_err();
-        assert_eq!(
-            missing_run_id,
-            "renew requires run_id (run id to read or mutate)"
-        );
+        assert_eq!(missing_claim_id, "renew requires claim_id (required input)");
 
         let missing_to_agent = call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "transfer", "run_id": "run-005"}),
+            &json!({"card_id": "005", "action": "transfer", "claim_id": "claim-005"}),
             10,
         )
         .unwrap_err();
@@ -1717,7 +1622,7 @@ Expose tools against the DB.
             .unwrap_err();
         assert_eq!(
             invalid,
-            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|blocked|done|shipped|abandoned"
         );
     }
 
@@ -1782,7 +1687,7 @@ Expose tools against the DB.
         .unwrap_err();
         assert_eq!(
             invalid_status,
-            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|blocked|done|shipped|abandoned"
         );
 
         let invalid_priority = call_tool_store(
@@ -1818,111 +1723,12 @@ Expose tools against the DB.
         );
     }
 
-    #[test]
-    fn mcp_list_approvals_surfaces_packet_links_and_drains_after_answer() {
-        let mut store = Store::open_in_memory().unwrap();
-        store.migrate().unwrap();
-        call_tool_store(
-            &mut store,
-            "create_card",
-            &json!({
-                "id": "approval-card",
-                "title": "Approval card",
-                "acceptance": ["proof"],
-                "status": "ready",
-                "autonomy": "review"
-            }),
-            1,
-        )
-        .unwrap();
-        let claimed = call_tool_store(
-            &mut store,
-            "manage_claim",
-            &json!({"card_id": "approval-card", "action": "claim", "agent": "agent-a"}),
-            2,
-        )
-        .unwrap();
-        let run_id = tool_payload(&claimed)["run_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        call_tool_store(
-            &mut store,
-            "update_status",
-            &json!({"card_id": "approval-card", "status": "running"}),
-            3,
-        )
-        .unwrap();
-        call_tool_store(
-            &mut store,
-            "add_link",
-            &json!({
-                "card_id": "approval-card",
-                "label": "approval/packet",
-                "url": "https://example.test/packet"
-            }),
-            4,
-        )
-        .unwrap();
-        call_tool_store(
-            &mut store,
-            "request_input",
-            &json!({"run_id": run_id, "question": "Approve?"}),
-            5,
-        )
-        .unwrap();
-
-        let approvals = call_tool_store(&mut store, "list_approvals", &json!({}), 6).unwrap();
-        let payload = tool_payload(&approvals);
-        assert_eq!(payload["approvals"][0]["card_id"], "approval-card");
-        assert_eq!(payload["approvals"][0]["question"], "Approve?");
-        assert_eq!(
-            payload["approvals"][0]["packet_links"][0]["url"],
-            "https://example.test/packet"
-        );
-
-        call_tool_store(
-            &mut store,
-            "answer_input",
-            &json!({"run_id": run_id, "actor": "operator", "answer": "Approved"}),
-            7,
-        )
-        .unwrap();
-        let approvals = call_tool_store(&mut store, "list_approvals", &json!({}), 8).unwrap();
-        assert!(tool_payload(&approvals)["approvals"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-    }
-
     fn autonomy_values() -> Vec<&'static str> {
         AutonomyClass::ALL
             .iter()
             .copied()
             .map(AutonomyClass::as_str)
             .collect()
-    }
-
-    #[test]
-    fn mcp_missing_card_and_run_errors_suggest_enumeration_tools() {
-        let mut store = Store::open_in_memory().unwrap();
-        store.migrate().unwrap();
-
-        let missing_card =
-            call_tool_store(&mut store, "get_card", &json!({"card_id": "missing"}), 10)
-                .unwrap_err();
-        assert_eq!(
-            missing_card,
-            "card not found: missing; use list_cards to enumerate ids"
-        );
-
-        let missing_run =
-            call_tool_store(&mut store, "get_run", &json!({"run_id": "run-missing"}), 10)
-                .unwrap_err();
-        assert_eq!(
-            missing_run,
-            "run not found: run-missing; use list_cards then get_card to enumerate run ids"
-        );
     }
 
     #[test]

@@ -12,7 +12,6 @@ pub const CARD_EVENT_SCHEMA_VERSION: &str = "powder.card_event.v1";
 pub const EVENT_TYPES: &[&str] = &[
     "card-created",
     "moved-to-ready",
-    "awaiting-input",
     "claim-expired",
     "completed",
     "comment-added",
@@ -422,8 +421,6 @@ pub(super) fn outbound_event_for_status_change(
 ) -> Option<&'static str> {
     if previous != CardStatus::Ready && next == CardStatus::Ready {
         Some("moved-to-ready")
-    } else if previous != CardStatus::AwaitingInput && next == CardStatus::AwaitingInput {
-        Some("awaiting-input")
     } else if !previous.is_terminal() && next.is_terminal() {
         Some("completed")
     } else {

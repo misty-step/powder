@@ -2,8 +2,8 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
-    ReadyQuery, RunId,
+    Authority, AutonomyClass, Board, Card, CardId, CardStatus, ClaimId, DetailLevel, Estimate,
+    Priority, ReadyQuery,
 };
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
@@ -39,16 +39,11 @@ pub const COMMANDS: &[&str] = &[
     "transfer-claim",
     "heartbeat",
     "get-card",
-    "get-run",
-    "list-approvals",
-    "list-awaiting-input",
-    "answer-input",
     "update-status",
     "check-criterion",
     "add-link",
     "add-comment",
     "append-work-log",
-    "request-input",
     "complete-card",
     "subscription-create",
     "subscription-list",
@@ -128,16 +123,11 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "transfer-claim" => transfer_claim(rest, remote_env),
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest, remote_env),
         [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
-        [command, rest @ ..] if command == "get-run" => get_run(rest),
-        [command, rest @ ..] if command == "list-approvals" => list_approvals(rest, remote_env),
-        [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
-        [command, rest @ ..] if command == "answer-input" => answer_input(rest, remote_env),
         [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
         [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
         [command, rest @ ..] if command == "add-link" => add_link(rest, remote_env),
         [command, rest @ ..] if command == "add-comment" => add_comment(rest, remote_env),
         [command, rest @ ..] if command == "append-work-log" => append_work_log(rest, remote_env),
-        [command, rest @ ..] if command == "request-input" => request_input(rest, remote_env),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest, remote_env),
         [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
         [command, rest @ ..] if command == "subscription-list" => subscription_list(rest),
@@ -207,19 +197,16 @@ pub fn help() -> String {
     help.push_str(
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000\n",
     );
-    help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
-    help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
-    help.push_str("  powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600\n");
     help.push_str(
-        "  powder transfer-claim 001 --db ./data/powder.db --run run-id --to-agent codex --ttl 3600\n",
+        "  powder claim 001 --db ./data/powder.db --agent codex --runtime-ref bb-run-42\n",
     );
-    help.push_str("  powder release-claim 001 --db ./data/powder.db --run run-id\n");
+    help.push_str("  powder heartbeat 001 --db ./data/powder.db --claim claim-id\n");
+    help.push_str("  powder renew-claim 001 --db ./data/powder.db --claim claim-id --ttl 3600\n");
+    help.push_str(
+        "  powder transfer-claim 001 --db ./data/powder.db --claim claim-id --to-agent codex --ttl 3600\n",
+    );
+    help.push_str("  powder release-claim 001 --db ./data/powder.db --claim claim-id\n");
     help.push_str("  powder get-card 001 --db ./data/powder.db\n");
-    help.push_str("  powder list-approvals --db ./data/powder.db\n");
-    help.push_str("  powder list-awaiting-input --db ./data/powder.db\n");
-    help.push_str(
-        "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
-    );
     help.push_str("  powder update-status 001 --db ./data/powder.db --status running\n");
     help.push_str(
         "  powder check-criterion 001 --db ./data/powder.db --criterion 0 --actor operator [--unchecked]\n",
@@ -228,7 +215,7 @@ pub fn help() -> String {
         "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
     );
     help.push_str(
-        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id]\n",
+        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--runtime-ref bb-run-42]\n",
     );
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof]\n",
@@ -245,7 +232,7 @@ pub fn help() -> String {
     );
     help.push_str(
         "authority:\n  add --actor <name> to audit status, relation, and completion changes. \
-         Claim impersonation and lease mutations (release/renew/heartbeat/request-input) still \
+         Claim impersonation and lease mutations (release/renew/heartbeat) still \
          check the caller against the claim holder unless --admin is supplied. Omitting --actor \
          keeps direct-DB-access trust and records unchecked audit events.\n\n",
     );
@@ -848,17 +835,25 @@ fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> 
     let now = unix_now();
     let card_id = positional_card_id(args, "claim")?;
     let agent = required_flag(args, "--agent")?;
+    let runtime_ref = flag_value(args, "--runtime-ref");
     let ttl_seconds = optional_ttl(args)?;
     let claim = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .claim_card(&card_id, agent, now, ttl_seconds, &authority(args))
+            .claim_card(
+                &card_id,
+                agent,
+                runtime_ref,
+                now,
+                ttl_seconds,
+                &authority(args)
+            )
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
             .post(
                 &format!("/api/v1/cards/{card_id}/claim"),
-                json!({"agent": agent, "ttl_seconds": ttl_seconds}),
+                json!({"agent": agent, "runtime_ref": runtime_ref, "ttl_seconds": ttl_seconds}),
             )
             .map_err(remote_err)?
     } else {
@@ -867,7 +862,7 @@ fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> 
     Ok(format!(
         "claimed\t{}\t{}\t{}\n",
         json_string(&claim, "card_id")?,
-        json_string(&claim, "run_id")?,
+        json_string(&claim, "claim_id")?,
         json_i64(&claim, "expires_at")?
     ))
 }
@@ -875,79 +870,84 @@ fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> 
 fn release_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "release-claim")?;
-    let run_id = required_run_flag(args)?;
-    let (released_card_id, released_run_id) = if let Some(db) = flag_value(args, "--db") {
+    let claim_id = required_claim_flag(args)?;
+    let (released_card_id, released_claim_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .release_claim(&card_id, &run_id, now, &authority(args))
+            .release_claim(&card_id, &claim_id, now, &authority(args))
             .map_err(store_err)?;
-        (claim.card_id.to_string(), claim.run_id.to_string())
+        (claim.card_id.to_string(), claim.claim_id.to_string())
     } else if let Some(client) = remote_env.client() {
         let released = client
             .post(
                 &format!("/api/v1/cards/{card_id}/release"),
-                json!({"run_id": run_id.as_str()}),
+                json!({"claim_id": claim_id.as_str()}),
             )
             .map_err(remote_err)?;
         (
             json_string(&released, "card_id")?,
-            json_string(&released, "run_id")?,
+            json_string(&released, "claim_id")?,
         )
     } else {
         return Err(missing_transport("release-claim"));
     };
-    Ok(format!("released\t{released_card_id}\t{released_run_id}\n"))
+    Ok(format!(
+        "released\t{released_card_id}\t{released_claim_id}\n"
+    ))
 }
 
 fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "renew-claim")?;
-    let run_id = required_run_flag(args)?;
+    let claim_id = required_claim_flag(args)?;
     let ttl_seconds = optional_ttl(args)?;
-    let (renewed_card_id, renewed_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
+    let (renewed_card_id, renewed_claim_id, expires_at) = if let Some(db) = flag_value(args, "--db")
+    {
         let mut store = open_store(db)?;
         let claim = store
-            .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
+            .renew_claim(&card_id, &claim_id, now, ttl_seconds, &authority(args))
             .map_err(store_err)?;
         (
             claim.card_id.to_string(),
-            claim.run_id.to_string(),
+            claim.claim_id.to_string(),
             claim.expires_at,
         )
     } else if let Some(client) = remote_env.client() {
         let renewed = client
             .post(
                 &format!("/api/v1/cards/{card_id}/renew"),
-                json!({"run_id": run_id.as_str(), "ttl_seconds": ttl_seconds}),
+                json!({"claim_id": claim_id.as_str(), "ttl_seconds": ttl_seconds}),
             )
             .map_err(remote_err)?;
         (
             json_string(&renewed, "card_id")?,
-            json_string(&renewed, "run_id")?,
+            json_string(&renewed, "claim_id")?,
             json_i64(&renewed, "expires_at")?,
         )
     } else {
         return Err(missing_transport("renew-claim"));
     };
     Ok(format!(
-        "renewed\t{renewed_card_id}\t{renewed_run_id}\t{expires_at}\n"
+        "renewed\t{renewed_card_id}\t{renewed_claim_id}\t{expires_at}\n"
     ))
 }
 
 fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "transfer-claim")?;
-    let run_id = required_run_flag(args)?;
+    let claim_id = required_claim_flag(args)?;
     let to_agent = required_flag(args, "--to-agent")?;
     let ttl_seconds = optional_ttl(args)?;
-    let (transferred_card_id, transferred_run_id, transferred_agent, expires_at) = if let Some(db) =
+    let (transferred_card_id, transferred_claim_id, transferred_agent, expires_at) = if let Some(
+        db,
+    ) =
         flag_value(args, "--db")
     {
         let mut store = open_store(db)?;
         let claim = store
             .transfer_claim(
                 &card_id,
-                &run_id,
+                &claim_id,
                 to_agent,
                 now,
                 ttl_seconds,
@@ -956,7 +956,7 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
             .map_err(store_err)?;
         (
             claim.card_id.to_string(),
-            claim.run_id.to_string(),
+            claim.claim_id.to_string(),
             claim.agent,
             claim.expires_at,
         )
@@ -964,12 +964,12 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
         let transferred = client
                 .post(
                     &format!("/api/v1/cards/{card_id}/transfer"),
-                    json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
+                    json!({"claim_id": claim_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
                 )
                 .map_err(remote_err)?;
         (
             json_string(&transferred, "card_id")?,
-            json_string(&transferred, "run_id")?,
+            json_string(&transferred, "claim_id")?,
             json_string(&transferred, "agent")?,
             json_i64(&transferred, "expires_at")?,
         )
@@ -977,41 +977,41 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
         return Err(missing_transport("transfer-claim"));
     };
     Ok(format!(
-        "transferred\t{transferred_card_id}\t{transferred_run_id}\t{transferred_agent}\t{expires_at}\n"
+        "transferred\t{transferred_card_id}\t{transferred_claim_id}\t{transferred_agent}\t{expires_at}\n"
     ))
 }
 
 fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "heartbeat")?;
-    let run_id = required_run_flag(args)?;
-    let (beat_card_id, beat_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
+    let claim_id = required_claim_flag(args)?;
+    let (beat_card_id, beat_claim_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .heartbeat_claim(&card_id, &run_id, now, &authority(args))
+            .heartbeat_claim(&card_id, &claim_id, now, &authority(args))
             .map_err(store_err)?;
         (
             claim.card_id.to_string(),
-            claim.run_id.to_string(),
+            claim.claim_id.to_string(),
             claim.expires_at,
         )
     } else if let Some(client) = remote_env.client() {
         let beat = client
             .post(
                 &format!("/api/v1/cards/{card_id}/heartbeat"),
-                json!({"run_id": run_id.as_str()}),
+                json!({"claim_id": claim_id.as_str()}),
             )
             .map_err(remote_err)?;
         (
             json_string(&beat, "card_id")?,
-            json_string(&beat, "run_id")?,
+            json_string(&beat, "claim_id")?,
             json_i64(&beat, "expires_at")?,
         )
     } else {
         return Err(missing_transport("heartbeat"));
     };
     Ok(format!(
-        "heartbeat\t{beat_card_id}\t{beat_run_id}\t{expires_at}\n"
+        "heartbeat\t{beat_card_id}\t{beat_claim_id}\t{expires_at}\n"
     ))
 }
 
@@ -1032,75 +1032,6 @@ fn get_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     } else {
         Err(missing_transport("get-card"))
     }
-}
-
-fn get_run(args: &[String]) -> Result<String, ShellError> {
-    let run_id = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("get-run requires a run id".to_string()))
-        .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
-    let store = open_store(required_flag(args, "--db")?)?;
-    let detail = store
-        .get_run_detail(&run_id, DetailLevel::Detailed)
-        .map_err(store_err)?
-        .ok_or_else(|| ShellError::NotFound(format!("run not found: {run_id}")))?;
-    to_pretty_json(&detail)
-}
-
-fn list_approvals(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let limit = parse_limit(args).unwrap_or(20);
-    let approvals = if let Some(db) = flag_value(args, "--db") {
-        let store = open_store(db)?;
-        json!(store.list_approvals(limit).map_err(store_err)?)
-    } else if let Some(client) = remote_env.client() {
-        client
-            .get(&format!("/api/v1/approvals?limit={limit}"))
-            .map_err(remote_err)?["approvals"]
-            .clone()
-    } else {
-        return Err(missing_transport("list-approvals"));
-    };
-    to_pretty_json(&serde_json::json!({ "approvals": approvals }))
-}
-
-fn list_awaiting_input(args: &[String]) -> Result<String, ShellError> {
-    let store = open_store(required_flag(args, "--db")?)?;
-    let awaiting = store
-        .list_awaiting_input(parse_limit(args).unwrap_or(20))
-        .map_err(store_err)?;
-    to_pretty_json(&serde_json::json!({ "awaiting": awaiting }))
-}
-
-fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let now = unix_now();
-    let run_id = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("answer-input requires a run id".to_string()))
-        .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
-    let actor = required_flag(args, "--actor")?;
-    let answer = required_flag(args, "--answer")?;
-    let run = if let Some(db) = flag_value(args, "--db") {
-        let mut store = open_store(db)?;
-        json!(store
-            .answer_input(&run_id, actor, answer, now, &authority(args))
-            .map_err(store_err)?)
-    } else if let Some(client) = remote_env.client() {
-        client
-            .post(
-                &format!("/api/v1/runs/{run_id}/answer"),
-                json!({"actor": actor, "answer": answer}),
-            )
-            .map_err(remote_err)?
-    } else {
-        return Err(missing_transport("answer-input"));
-    };
-    Ok(format!(
-        "answered-input\t{}\t{}\n",
-        json_string(&run, "id")?,
-        json_string(&run, "card_id")?
-    ))
 }
 
 fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1221,12 +1152,12 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let model = flag_value(args, "--model");
     let reasoning = flag_value(args, "--reasoning");
     let harness = flag_value(args, "--harness");
-    let run_id = flag_value(args, "--run-id");
+    let runtime_ref = flag_value(args, "--runtime-ref");
     let attribution = powder_store::WorkLogAttribution {
         model,
         reasoning,
         harness,
-        run_id,
+        runtime_ref,
     };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
@@ -1243,7 +1174,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                     "model": model,
                     "reasoning": reasoning,
                     "harness": harness,
-                    "run_id": run_id,
+                    "runtime_ref": runtime_ref,
                 }),
             )
             .map_err(remote_err)?
@@ -1255,36 +1186,6 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
         json_string(&entry, "card_id")?,
         json_string(&entry, "agent")?,
         json_string(&entry, "body")?
-    ))
-}
-
-fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let now = unix_now();
-    let run_id = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("request-input requires a run id".to_string()))
-        .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
-    let question = required_flag(args, "--question")?;
-    let (awaiting_run_id, awaiting_card_id) = if let Some(db) = flag_value(args, "--db") {
-        let mut store = open_store(db)?;
-        let run = store
-            .request_input(&run_id, question, now, &authority(args))
-            .map_err(store_err)?;
-        (run.id.to_string(), run.card_id.to_string())
-    } else if let Some(client) = remote_env.client() {
-        let run = client
-            .post(
-                &format!("/api/v1/runs/{run_id}/input"),
-                json!({"question": question}),
-            )
-            .map_err(remote_err)?;
-        (json_string(&run, "id")?, json_string(&run, "card_id")?)
-    } else {
-        return Err(missing_transport("request-input"));
-    };
-    Ok(format!(
-        "awaiting-input\t{awaiting_run_id}\t{awaiting_card_id}\n"
     ))
 }
 
@@ -1424,8 +1325,8 @@ fn positional_card_id(args: &[String], command: &str) -> Result<CardId, ShellErr
         .and_then(|id| CardId::new(id).map_err(ShellError::from))
 }
 
-fn required_run_flag(args: &[String]) -> Result<RunId, ShellError> {
-    required_flag(args, "--run").and_then(|id| RunId::new(id).map_err(ShellError::from))
+fn required_claim_flag(args: &[String]) -> Result<ClaimId, ShellError> {
+    required_flag(args, "--claim").and_then(|id| ClaimId::new(id).map_err(ShellError::from))
 }
 
 fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, ShellError> {
@@ -1646,46 +1547,6 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    #[test]
-    fn cli_names_the_instance_workflow() {
-        assert!(COMMANDS.contains(&"version"));
-        assert!(COMMANDS.contains(&"init-db"));
-        assert!(COMMANDS.contains(&"key-list"));
-        assert!(COMMANDS.contains(&"key-revoke"));
-        assert!(COMMANDS.contains(&"import"));
-        assert!(COMMANDS.contains(&"import-repo"));
-        assert!(COMMANDS.contains(&"import-github-issues"));
-        assert!(COMMANDS.contains(&"update-card"));
-        assert!(COMMANDS.contains(&"list-ready"));
-        assert!(COMMANDS.contains(&"list-cards"));
-        assert!(COMMANDS.contains(&"repository-list"));
-        assert!(COMMANDS.contains(&"repository-get"));
-        assert!(COMMANDS.contains(&"repository-upsert"));
-        assert!(COMMANDS.contains(&"repository-merge-alias"));
-        assert!(COMMANDS.contains(&"repository-delete"));
-        assert!(COMMANDS.contains(&"update-relations"));
-        assert!(COMMANDS.contains(&"claim"));
-        assert!(COMMANDS.contains(&"release-claim"));
-        assert!(COMMANDS.contains(&"renew-claim"));
-        assert!(COMMANDS.contains(&"transfer-claim"));
-        assert!(COMMANDS.contains(&"heartbeat"));
-        assert!(COMMANDS.contains(&"get-card"));
-        assert!(COMMANDS.contains(&"get-run"));
-        assert!(COMMANDS.contains(&"list-approvals"));
-        assert!(COMMANDS.contains(&"list-awaiting-input"));
-        assert!(COMMANDS.contains(&"answer-input"));
-        assert!(COMMANDS.contains(&"add-comment"));
-        assert!(COMMANDS.contains(&"append-work-log"));
-        assert!(COMMANDS.contains(&"check-criterion"));
-        assert!(COMMANDS.contains(&"request-input"));
-        assert!(COMMANDS.contains(&"complete-card"));
-        assert!(COMMANDS.contains(&"subscription-create"));
-        assert!(COMMANDS.contains(&"subscription-list"));
-        assert!(COMMANDS.contains(&"subscription-disable"));
-        assert!(COMMANDS.contains(&"dead-letter-list"));
-        assert!(COMMANDS.contains(&"event-tail"));
-    }
-
     /// The whole point of `version` is catching a stale installed binary
     /// before a lane starts (powder-924): it must report the exact commit
     /// this build compiled from, not just an unchanging crate version that
@@ -1719,139 +1580,6 @@ mod tests {
             ]),
             vec!["001"]
         );
-    }
-
-    #[test]
-    fn cli_rejects_invalid_ttl_values() {
-        let claim_err = run(&args([
-            "claim",
-            "ttl-test",
-            "--db",
-            "/tmp/not-opened.db",
-            "--agent",
-            "codex",
-            "--ttl",
-            "not-a-number",
-        ]))
-        .unwrap_err();
-        assert!(matches!(
-            claim_err,
-            ShellError::Invalid(message) if message == "invalid --ttl: not-a-number"
-        ));
-
-        let renew_err = run(&args([
-            "renew-claim",
-            "ttl-test",
-            "--db",
-            "/tmp/not-opened.db",
-            "--run",
-            "run-1",
-            "--ttl",
-            "not-a-number",
-        ]))
-        .unwrap_err();
-        assert!(matches!(
-            renew_err,
-            ShellError::Invalid(message) if message == "invalid --ttl: not-a-number"
-        ));
-    }
-
-    #[test]
-    fn cli_runs_persisted_card_lifecycle() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "cli-test",
-            "--title",
-            "CLI test",
-            "--acceptance",
-            "proof exists",
-            "--status",
-            "ready",
-        ]))
-        .unwrap();
-        let ready = run(&args(["list-ready", "--db", &db])).unwrap();
-        assert!(ready.contains("cli-test"));
-
-        let claimed = run(&args([
-            "claim", "cli-test", "--db", &db, "--agent", "codex", "--ttl", "3600",
-        ]))
-        .unwrap();
-        let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
-        let heartbeat = run(&args([
-            "heartbeat",
-            "cli-test",
-            "--db",
-            &db,
-            "--run",
-            &run_id,
-        ]))
-        .unwrap();
-        assert!(heartbeat.contains("heartbeat\tcli-test"));
-        let renewed = run(&args([
-            "renew-claim",
-            "cli-test",
-            "--db",
-            &db,
-            "--run",
-            &run_id,
-            "--ttl",
-            "3600",
-        ]))
-        .unwrap();
-        assert!(renewed.contains("renewed\tcli-test"));
-        run(&args([
-            "update-status",
-            "cli-test",
-            "--db",
-            &db,
-            "--status",
-            "running",
-        ]))
-        .unwrap();
-        run(&args([
-            "add-link",
-            "cli-test",
-            "--db",
-            &db,
-            "--label",
-            "proof",
-            "--url",
-            "https://example.test/proof",
-        ]))
-        .unwrap();
-        run(&args([
-            "request-input",
-            &run_id,
-            "--db",
-            &db,
-            "--question",
-            "Approve completion?",
-        ]))
-        .unwrap();
-        let completed = run(&args([
-            "complete-card",
-            "cli-test",
-            "--db",
-            &db,
-            "--proof",
-            "https://example.test/proof",
-        ]))
-        .unwrap();
-
-        assert!(completed.contains("completed\tcli-test\tdone"));
     }
 
     #[test]
@@ -2664,142 +2392,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_release_claim_makes_the_card_ready_again() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-release-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "release-test",
-            "--title",
-            "Release test",
-            "--acceptance",
-            "proof exists",
-            "--status",
-            "ready",
-        ]))
-        .unwrap();
-        let claimed = run(&args([
-            "claim",
-            "release-test",
-            "--db",
-            &db,
-            "--agent",
-            "codex",
-            "--ttl",
-            "3600",
-        ]))
-        .unwrap();
-        let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
-        let released = run(&args([
-            "release-claim",
-            "release-test",
-            "--db",
-            &db,
-            "--run",
-            &run_id,
-        ]))
-        .unwrap();
-
-        assert!(released.contains("released\trelease-test"));
-        let ready = run(&args(["list-ready", "--db", &db])).unwrap();
-        assert!(ready.contains("release-test"));
-    }
-
-    #[test]
-    fn cli_transfer_claim_hands_off_the_lease_and_release_reclaim_still_works() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-transfer-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "transfer-test",
-            "--title",
-            "Transfer test",
-            "--acceptance",
-            "proof exists",
-            "--status",
-            "ready",
-        ]))
-        .unwrap();
-        let claimed = run(&args([
-            "claim",
-            "transfer-test",
-            "--db",
-            &db,
-            "--agent",
-            "lane-a",
-            "--ttl",
-            "3600",
-        ]))
-        .unwrap();
-        let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
-
-        let transferred = run(&args([
-            "transfer-claim",
-            "transfer-test",
-            "--db",
-            &db,
-            "--run",
-            &run_id,
-            "--to-agent",
-            "lane-b",
-            "--ttl",
-            "1800",
-        ]))
-        .unwrap();
-        assert!(transferred.starts_with(&format!("transferred\ttransfer-test\t{run_id}\tlane-b\t")));
-
-        let card = run(&args(["get-card", "transfer-test", "--db", &db])).unwrap();
-        assert!(card.contains("\"agent\": \"lane-b\""));
-
-        // Release-then-reclaim still works unchanged after a transfer.
-        let released = run(&args([
-            "release-claim",
-            "transfer-test",
-            "--db",
-            &db,
-            "--run",
-            &run_id,
-        ]))
-        .unwrap();
-        assert!(released.contains("released\ttransfer-test"));
-
-        let reclaimed = run(&args([
-            "claim",
-            "transfer-test",
-            "--db",
-            &db,
-            "--agent",
-            "lane-c",
-            "--ttl",
-            "3600",
-        ]))
-        .unwrap();
-        assert!(reclaimed.starts_with("claimed\ttransfer-test"));
-    }
-
-    #[test]
     fn cli_actor_flag_enforces_claim_holder_like_http_and_mcp() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-holder-{}.db",
@@ -2921,522 +2513,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_exposes_answer_loop_details() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-answer-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "answer-test",
-            "--title",
-            "Answer test",
-            "--acceptance",
-            "proof exists",
-            "--status",
-            "ready",
-        ]))
-        .unwrap();
-        let claimed = run(&args([
-            "claim",
-            "answer-test",
-            "--db",
-            &db,
-            "--agent",
-            "codex",
-        ]))
-        .unwrap();
-        let run_id = claimed.split('\t').nth(2).expect("run id").to_owned();
-        run(&args([
-            "update-status",
-            "answer-test",
-            "--db",
-            &db,
-            "--status",
-            "running",
-        ]))
-        .unwrap();
-        run(&args([
-            "add-link",
-            "answer-test",
-            "--db",
-            &db,
-            "--label",
-            "approval/packet",
-            "--url",
-            "https://example.test/packet",
-        ]))
-        .unwrap();
-        run(&args([
-            "request-input",
-            &run_id,
-            "--db",
-            &db,
-            "--question",
-            "Approve?\nwith\ttab",
-        ]))
-        .unwrap();
-
-        let awaiting = run(&args(["list-awaiting-input", "--db", &db])).unwrap();
-        assert!(awaiting.contains("\"awaiting\""));
-        assert!(awaiting.contains("answer-test"));
-        assert!(awaiting.contains("Approve?\\nwith\\ttab"));
-
-        let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
-        assert!(approvals.contains("\"approvals\""));
-        assert!(approvals.contains("\"card_id\": \"answer-test\""));
-        assert!(approvals.contains("\"autonomy\": \"review\""));
-        assert!(approvals.contains("https://example.test/packet"));
-
-        let card = run(&args(["get-card", "answer-test", "--db", &db])).unwrap();
-        assert!(card.contains("\"activities\""));
-        assert!(card.contains("Approve?\\nwith\\ttab"));
-
-        let answered = run(&args([
-            "answer-input",
-            &run_id,
-            "--db",
-            &db,
-            "--actor",
-            "operator",
-            "--answer",
-            "Approved",
-        ]))
-        .unwrap();
-        assert!(answered.contains("answered-input"));
-
-        let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
-        assert!(approvals.contains("\"approvals\": []"));
-
-        let run_detail = run(&args(["get-run", &run_id, "--db", &db])).unwrap();
-        assert!(run_detail.contains("\"state\": \"active\""));
-        assert!(run_detail.contains("operator"));
-        assert!(run_detail.contains("Approved"));
-    }
-
-    #[test]
-    fn cli_remote_mode_uses_http_for_the_accepted_card_commands() {
-        let (base_url, recorded) = spawn_test_server(vec![
-            (
-                200,
-                json!({
-                    "cards": [{"id": "remote-1", "priority": "p0", "title": "Remote ready"}],
-                    "total_count": 1,
-                    "has_more": false
-                }),
-            ),
-            (
-                200,
-                json!({
-                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "autonomy": "review", "title": "Blocked"}],
-                    "total_count": 1,
-                    "has_more": false
-                }),
-            ),
-            (
-                200,
-                json!({"card": {"id": "remote-1", "title": "Remote ready"}, "runs": [], "activities": [], "events": [], "links": [], "comments": []}),
-            ),
-            (
-                200,
-                json!({"id": "remote-created", "priority": "p1", "status": "ready", "autonomy": "review", "title": "Remote created"}),
-            ),
-            (
-                200,
-                json!({"card_id": "remote-created", "run_id": "run-remote", "agent": "codex", "expires_at": 100}),
-            ),
-            (
-                200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
-            ),
-            (
-                200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
-            ),
-            (
-                200,
-                json!({"card_id": "remote-created", "author": "operator", "body": "looks good", "created_at": 101}),
-            ),
-        ]);
-
-        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
-        let ready = run_with_env(&args(["list-ready", "--limit", "1"]), &env).unwrap();
-        assert_eq!(ready, "remote-1\tP0\tRemote ready\n");
-
-        let cards = run_with_env(
-            &args([
-                "list-cards",
-                "--limit",
-                "2",
-                "--status",
-                "blocked",
-                "--repo",
-                "misty-step/powder",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(cards, "blocked-1\tP2\tblocked\treview\tBlocked\n");
-
-        let detail = run_with_env(&args(["get-card", "remote-1"]), &env).unwrap();
-        assert!(detail.contains("\"id\": \"remote-1\""));
-
-        let created = run_with_env(
-            &args([
-                "create-card",
-                "--id",
-                "remote-created",
-                "--title",
-                "Remote created",
-                "--body",
-                "body",
-                "--acceptance",
-                "proof exists",
-                "--proof-plan",
-                "PR plus smoke",
-                "--status",
-                "ready",
-                "--priority",
-                "p1",
-                "--repo",
-                "misty-step/powder",
-                "--related",
-                "remote-1",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(created, "created\tremote-created\tP1\tready\treview\n");
-
-        let claimed = run_with_env(
-            &args(["claim", "remote-created", "--agent", "codex", "--ttl", "60"]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(claimed, "claimed\tremote-created\trun-remote\t100\n");
-
-        let status = run_with_env(
-            &args(["update-status", "remote-created", "--status", "running"]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(status, "status\tremote-created\trunning\n");
-
-        let criterion = run_with_env(
-            &args([
-                "check-criterion",
-                "remote-created",
-                "--criterion",
-                "0",
-                "--actor",
-                "operator",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(criterion, "criterion\tremote-created\t0\tchecked\n");
-
-        let comment = run_with_env(
-            &args([
-                "add-comment",
-                "remote-created",
-                "--author",
-                "operator",
-                "--body",
-                "looks good",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(comment, "comment\tremote-created\toperator\tlooks good\n");
-
-        let requests = recorded.lock().unwrap();
-        let paths = requests
-            .iter()
-            .map(|request| format!("{} {}", request.method, request.path))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            paths,
-            vec![
-                "GET /api/v1/cards/ready?limit=1",
-                "GET /api/v1/cards?limit=2&status=blocked&repo=misty-step%2Fpowder",
-                "GET /api/v1/cards/remote-1?detail=detailed",
-                "POST /api/v1/cards",
-                "POST /api/v1/cards/remote-created/claim",
-                "POST /api/v1/cards/remote-created/status",
-                "POST /api/v1/cards/remote-created/criteria/check",
-                "POST /api/v1/cards/remote-created/comments",
-            ]
-        );
-        assert!(requests
-            .iter()
-            .all(|request| { request.authorization.as_deref() == Some("Bearer sk_powder_test") }));
-        assert_eq!(
-            requests[3].body,
-            Some(json!({
-                "id": "remote-created",
-                "title": "Remote created",
-                "body": "body",
-                "acceptance": ["proof exists"],
-                "proof_plan": ["PR plus smoke"],
-                "status": "ready",
-                "autonomy": "review",
-                "priority": "P1",
-                "related": ["remote-1"],
-                "blocks": [],
-                "blocked_by": [],
-                "repo": "misty-step/powder",
-            }))
-        );
-        assert_eq!(
-            requests[4].body,
-            Some(json!({"agent": "codex", "ttl_seconds": 60}))
-        );
-        assert_eq!(requests[5].body, Some(json!({"status": "running"})));
-        assert_eq!(
-            requests[6].body,
-            Some(json!({"criterion": 0, "actor": "operator", "checked": true}))
-        );
-        assert_eq!(
-            requests[7].body,
-            Some(json!({"author": "operator", "body": "looks good"}))
-        );
-    }
-
-    /// A lane maintaining a claim lease against a deployed instance (no
-    /// local SQLite file at all) must be able to heartbeat, renew, and
-    /// release without ever passing `--db` -- the stale-binary friction this
-    /// covers was `heartbeat` returning verbatim `missing --db` even with
-    /// `POWDER_API_BASE_URL` set (powder-924).
-    #[test]
-    fn cli_remote_mode_maintains_a_claim_lease_without_db() {
-        let (base_url, recorded) = spawn_test_server(vec![
-            (
-                200,
-                json!({"card_id": "lease-1", "run_id": "run-lease", "expires_at": 200}),
-            ),
-            (
-                200,
-                json!({"card_id": "lease-1", "run_id": "run-lease", "expires_at": 260}),
-            ),
-            (200, json!({"card_id": "lease-1", "run_id": "run-lease"})),
-        ]);
-        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
-
-        let beat =
-            run_with_env(&args(["heartbeat", "lease-1", "--run", "run-lease"]), &env).unwrap();
-        assert_eq!(beat, "heartbeat\tlease-1\trun-lease\t200\n");
-
-        let renewed = run_with_env(
-            &args([
-                "renew-claim",
-                "lease-1",
-                "--run",
-                "run-lease",
-                "--ttl",
-                "3600",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(renewed, "renewed\tlease-1\trun-lease\t260\n");
-
-        let released = run_with_env(
-            &args(["release-claim", "lease-1", "--run", "run-lease"]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(released, "released\tlease-1\trun-lease\n");
-
-        let requests = recorded.lock().unwrap();
-        let paths = requests
-            .iter()
-            .map(|request| format!("{} {}", request.method, request.path))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            paths,
-            vec![
-                "POST /api/v1/cards/lease-1/heartbeat",
-                "POST /api/v1/cards/lease-1/renew",
-                "POST /api/v1/cards/lease-1/release",
-            ]
-        );
-        assert_eq!(requests[0].body, Some(json!({"run_id": "run-lease"})));
-        assert_eq!(
-            requests[1].body,
-            Some(json!({"run_id": "run-lease", "ttl_seconds": 3600}))
-        );
-        assert_eq!(requests[2].body, Some(json!({"run_id": "run-lease"})));
-    }
-
-    /// powder-936: a holder hands its claim to a fresh agent against a
-    /// deployed instance with no `--db` -- the same remote-mode requirement
-    /// as every other lease-lifecycle command.
-    #[test]
-    fn cli_remote_mode_transfers_a_claim_without_db() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({"card_id": "handoff-1", "run_id": "run-handoff", "agent": "lane-b", "expires_at": 1800}),
-        )]);
-        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
-
-        let transferred = run_with_env(
-            &args([
-                "transfer-claim",
-                "handoff-1",
-                "--run",
-                "run-handoff",
-                "--to-agent",
-                "lane-b",
-                "--ttl",
-                "1800",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(
-            transferred,
-            "transferred\thandoff-1\trun-handoff\tlane-b\t1800\n"
-        );
-
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests[0].method, "POST");
-        assert_eq!(requests[0].path, "/api/v1/cards/handoff-1/transfer");
-        assert_eq!(
-            requests[0].body,
-            Some(json!({"run_id": "run-handoff", "to_agent": "lane-b", "ttl_seconds": 1800}))
-        );
-    }
-
-    /// A lane closing out a card against a deployed instance needs
-    /// request-input, add-link, and complete-card without `--db` too
-    /// (powder-924, powder-926): the closeout path a campaign lane actually
-    /// walks -- pause for a question, attach the PR/proof link, mark done.
-    #[test]
-    fn cli_remote_mode_closes_out_a_card_without_db() {
-        let (base_url, recorded) = spawn_test_server(vec![
-            (200, json!({"id": "run-closeout", "card_id": "closeout-1"})),
-            (
-                200,
-                json!({"card_id": "closeout-1", "id": "link-1", "label": "pr", "url": "https://example.test/pr"}),
-            ),
-            (200, json!({"id": "closeout-1", "status": "done"})),
-        ]);
-        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
-
-        let awaiting = run_with_env(
-            &args([
-                "request-input",
-                "run-closeout",
-                "--question",
-                "Approve completion?",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(awaiting, "awaiting-input\trun-closeout\tcloseout-1\n");
-
-        let link = run_with_env(
-            &args([
-                "add-link",
-                "closeout-1",
-                "--label",
-                "pr",
-                "--url",
-                "https://example.test/pr",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(link, "link\tcloseout-1\tlink-1\n");
-
-        let completed = run_with_env(
-            &args([
-                "complete-card",
-                "closeout-1",
-                "--proof",
-                "https://example.test/pr",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(completed, "completed\tcloseout-1\tdone\n");
-
-        let requests = recorded.lock().unwrap();
-        let paths = requests
-            .iter()
-            .map(|request| format!("{} {}", request.method, request.path))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            paths,
-            vec![
-                "POST /api/v1/runs/run-closeout/input",
-                "POST /api/v1/cards/closeout-1/links",
-                "POST /api/v1/cards/closeout-1/complete",
-            ]
-        );
-        assert_eq!(
-            requests[0].body,
-            Some(json!({"question": "Approve completion?"}))
-        );
-        assert_eq!(
-            requests[1].body,
-            Some(json!({"label": "pr", "url": "https://example.test/pr"}))
-        );
-        assert_eq!(
-            requests[2].body,
-            Some(json!({"proof": "https://example.test/pr"}))
-        );
-    }
-
-    #[test]
-    fn cli_remote_mode_answers_input_without_db() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({"id": "run-approval", "card_id": "approval-1", "state": "active"}),
-        )]);
-        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
-
-        let answered = run_with_env(
-            &args([
-                "answer-input",
-                "run-approval",
-                "--actor",
-                "operator",
-                "--answer",
-                "Approved",
-            ]),
-            &env,
-        )
-        .unwrap();
-        assert_eq!(answered, "answered-input\trun-approval\tapproval-1\n");
-
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            format!("{} {}", requests[0].method, requests[0].path),
-            "POST /api/v1/runs/run-approval/answer"
-        );
-        assert_eq!(
-            requests[0].authorization.as_deref(),
-            Some("Bearer sk_powder_test")
-        );
-        assert_eq!(
-            requests[0].body,
-            Some(json!({"actor": "operator", "answer": "Approved"}))
-        );
-    }
-
-    #[test]
     fn cli_db_flag_wins_over_remote_environment() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
@@ -3542,6 +2618,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     struct RecordedRequest {
         method: String,
         path: String,
@@ -3617,5 +2694,80 @@ mod tests {
         });
 
         (format!("http://{addr}"), recorded)
+    }
+}
+
+#[cfg(test)]
+mod claim_contract_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn deleted_runtime_commands_are_absent() {
+        for removed in [
+            "get-run",
+            "list-approvals",
+            "list-awaiting-input",
+            "answer-input",
+            "request-input",
+        ] {
+            assert!(!COMMANDS.contains(&removed));
+        }
+    }
+
+    #[test]
+    fn cli_claim_round_trip_uses_claim_id_and_runtime_ref() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db = std::env::temp_dir().join(format!("powder-cli-claim-{unique}.db"));
+        let db = db.to_str().unwrap();
+        run(&args(&["init-db", "--db", db])).unwrap();
+        run(&args(&[
+            "create-card",
+            "--db",
+            db,
+            "--id",
+            "claim-contract",
+            "--title",
+            "Claim contract",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+
+        let claimed = run(&args(&[
+            "claim",
+            "claim-contract",
+            "--db",
+            db,
+            "--agent",
+            "cli-test",
+            "--runtime-ref",
+            "bb-run-42",
+        ]))
+        .unwrap();
+        let claim_id = claimed.split('\t').nth(2).unwrap().to_string();
+        assert!(claim_id.starts_with("claim-"));
+
+        let detail = run(&args(&["get-card", "claim-contract", "--db", db])).unwrap();
+        assert!(detail.contains("bb-run-42"));
+        run(&args(&[
+            "release-claim",
+            "claim-contract",
+            "--db",
+            db,
+            "--claim",
+            &claim_id,
+        ]))
+        .unwrap();
+        let _ = std::fs::remove_file(db);
     }
 }

@@ -25,8 +25,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate,
-    Priority, ReadyQuery, RunId,
+    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, ClaimId, DetailLevel,
+    Estimate, Priority, ReadyQuery,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
@@ -417,18 +417,19 @@ struct ClaimRequest {
     // the same gap for admin-scoped keys, who can still claim as anyone --
     // they just have to say who.
     agent: String,
+    runtime_ref: Option<String>,
     ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct LeaseRequest {
-    run_id: String,
+    claim_id: String,
     ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TransferRequest {
-    run_id: String,
+    claim_id: String,
     to_agent: String,
     ttl_seconds: Option<u64>,
 }
@@ -463,19 +464,8 @@ struct WorkLogRequest {
     model: Option<String>,
     reasoning: Option<String>,
     harness: Option<String>,
-    run_id: Option<String>,
+    runtime_ref: Option<String>,
     body: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct InputRequest {
-    question: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnswerRequest {
-    actor: String,
-    answer: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -586,7 +576,6 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/onboarding", get(onboarding))
         .route("/api/v1/routes", get(routes))
         .route("/api/v1/stats", get(board_stats))
-        .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/import", post(import_cards))
         .route("/api/v1/cards/ready", get(list_ready))
@@ -617,10 +606,6 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/work-log", post(append_work_log))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
-        .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
-        .route("/api/v1/runs/{id}", get(get_run))
-        .route("/api/v1/runs/{id}/input", post(request_input))
-        .route("/api/v1/runs/{id}/answer", post(answer_input))
         .route(
             "/api/v1/events/subscriptions",
             post(create_event_subscription).get(list_event_subscriptions),
@@ -771,17 +756,6 @@ fn card_list_page_json(cards: Vec<Card>, total_count: usize) -> serde_json::Valu
         "total_count": total_count,
         "has_more": has_more,
     })
-}
-
-async fn list_approvals(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<ReadyParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let limit = params.limit.unwrap_or(20).max(1);
-    let approvals = lock_store(&state)?.list_approvals(limit)?;
-    Ok(Json(json!({ "approvals": approvals })))
 }
 
 async fn board_stats(
@@ -1093,6 +1067,7 @@ async fn claim_card(
     let receipt = lock_store(&state)?.claim_card(
         &card_id,
         &request.agent,
+        request.runtime_ref.as_deref(),
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
         &actor.authority(),
@@ -1108,9 +1083,9 @@ async fn release_claim(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let run_id = RunId::new(request.run_id)?;
+    let claim_id = ClaimId::new(request.claim_id)?;
     let receipt =
-        lock_store(&state)?.release_claim(&card_id, &run_id, unix_now(), &actor.authority())?;
+        lock_store(&state)?.release_claim(&card_id, &claim_id, unix_now(), &actor.authority())?;
     Ok(Json(json!(receipt)))
 }
 
@@ -1122,10 +1097,10 @@ async fn renew_claim(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let run_id = RunId::new(request.run_id)?;
+    let claim_id = ClaimId::new(request.claim_id)?;
     let receipt = lock_store(&state)?.renew_claim(
         &card_id,
-        &run_id,
+        &claim_id,
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
         &actor.authority(),
@@ -1141,9 +1116,9 @@ async fn heartbeat_claim(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let run_id = RunId::new(request.run_id)?;
+    let claim_id = ClaimId::new(request.claim_id)?;
     let receipt =
-        lock_store(&state)?.heartbeat_claim(&card_id, &run_id, unix_now(), &actor.authority())?;
+        lock_store(&state)?.heartbeat_claim(&card_id, &claim_id, unix_now(), &actor.authority())?;
     Ok(Json(json!(receipt)))
 }
 
@@ -1159,10 +1134,10 @@ async fn transfer_claim(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let run_id = RunId::new(request.run_id)?;
+    let claim_id = ClaimId::new(request.claim_id)?;
     let receipt = lock_store(&state)?.transfer_claim(
         &card_id,
-        &run_id,
+        &claim_id,
         &request.to_agent,
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
@@ -1260,7 +1235,7 @@ async fn append_work_log(
         model: request.model.as_deref(),
         reasoning: request.reasoning.as_deref(),
         harness: request.harness.as_deref(),
-        run_id: request.run_id.as_deref(),
+        runtime_ref: request.runtime_ref.as_deref(),
     };
     let entry = lock_store(&state)?.append_work_log(
         &card_id,
@@ -1270,66 +1245,6 @@ async fn append_work_log(
         unix_now(),
     )?;
     Ok(Json(json!(entry)))
-}
-
-async fn request_input(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(request): Json<InputRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
-    let run_id = RunId::new(id)?;
-    let run = lock_store(&state)?.request_input(
-        &run_id,
-        &request.question,
-        unix_now(),
-        &actor.authority(),
-    )?;
-    Ok(Json(json!(run)))
-}
-
-async fn answer_input(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(request): Json<AnswerRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
-    let run_id = RunId::new(id)?;
-    let run = lock_store(&state)?.answer_input(
-        &run_id,
-        &request.actor,
-        &request.answer,
-        unix_now(),
-        &actor.authority(),
-    )?;
-    Ok(Json(json!(run)))
-}
-
-async fn get_run(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(params): Query<DetailParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let run_id = RunId::new(id)?;
-    let detail = lock_store(&state)?
-        .get_run_detail(&run_id, params.detail.unwrap_or_default())?
-        .ok_or_else(|| powder_core::DomainError::not_found("run", run_id.to_string()))?;
-    Ok(Json(json!(detail)))
-}
-
-async fn list_awaiting_input(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<ReadyParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let limit = params.limit.unwrap_or(20).max(1);
-    let awaiting = lock_store(&state)?.list_awaiting_input(limit)?;
-    Ok(Json(json!({ "awaiting": awaiting })))
 }
 
 async fn complete_card(

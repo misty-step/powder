@@ -13,8 +13,8 @@ Powder should feel like the narrow missing tool between "a chat thread full of
 tasks" and "a hosted project-management system that assumes humans are the
 primary workers." It is not the operator's backlog, not an instance-data dump,
 and not a private Factory board. It is the public product someone deploys so
-their work can be claimed, paused, audited, related, and completed with or
-without proof.
+their work can be claimed, audited, related, and completed with or without
+proof.
 Powder never calls a model. Intelligence belongs in orchestrators such as
 Bitterblossom workloads that read and write through Powder's deterministic
 interfaces.
@@ -26,9 +26,8 @@ Agent work needs durable coordination primitives:
 - a card with enough context and an acceptance oracle
 - a ready query that deterministic code can answer
 - an expiring claim so duplicate agents do not collide
-- a run timeline that survives handoff, crash, and compaction
+- a card event trail that survives handoff, crash, and compaction
 - proof links, completion records, and audit events a human can inspect
-- an explicit awaiting-input state instead of invented approvals
 
 Hosted task tools can store tickets, but they usually treat agents as API
 clients bolted onto a human workflow. Orchestrators can remember their own
@@ -66,10 +65,10 @@ replication, health/readiness routes, first-run onboarding, and configuration
 through environment variables.
 
 **One semantic contract.** HTTP, CLI, MCP, and the shipped skill are adapters
-over the same domain language: cards, runs, activity, audit events, claims,
-relations, links, comments, ready work, input requests, and optional proof.
+over the same domain language: cards, card events, claims, relations, links,
+comments, ready work, work logs, and optional proof.
 
-**A board, not a runner.** Powder stores work, locks, session state, timelines,
+**A board, not a runner.** Powder stores work, coordination locks, timelines,
 events, and evidence. Codex, Herdr, Sprites, cron jobs, Bitterblossom agents,
 or other dispatchers may claim work from Powder and execute elsewhere, but the
 dispatch loop and every model call are outside the core.
@@ -77,12 +76,12 @@ dispatch loop and every model call are outside the core.
 **A human face on the same state.** The API/MCP/CLI contract comes first, but
 the product should still feel excellent to operate. The human UI is a thin,
 gorgeous Kanban board over the same cards, claims, timelines, relations,
-blockers, awaiting-input states, and proof links that agents consume. It is not a
+blockers, and proof links that agents consume. It is not a
 separate human-only project-management system.
 
 **Instance data stays in instances.** The public repo may contain Powder's own
 product-development epics, synthetic fixtures, and sample config. Imported or
-operator/customer backlog, card, run, claim, activity, and proof data belongs in
+operator/customer backlog, card, claim, event, and proof data belongs in
 a deployed database and must not be committed here.
 
 ## Product Principles
@@ -95,8 +94,9 @@ a deployed database and must not be committed here.
 3. **Audit beats enforcement.** Completion may include evidence: a PR,
    artifact, CI run, transcript, or other reviewable link. Powder records the
    actor, time, and change even when proof is absent.
-4. **Human input is a state.** Awaiting a decision is part of the run model,
-   not a buried comment convention.
+4. **Runtime state belongs to runtimes.** Claims may carry an optional opaque
+   `runtime_ref`, but execution sessions and human-input asks live in an
+   external runtime such as Bitterblossom.
 5. **Adapters stay thin.** Business rules live in `powder-core`; API, CLI, MCP,
    and skill surfaces should not grow separate semantics.
 6. **Private by deployment, public by repo.** Powder is a public product for
@@ -114,7 +114,7 @@ a deployed database and must not be committed here.
 The current scaffold establishes the intended shape, but the contract is not
 yet trustworthy enough for a fleet to depend on:
 
-- `powder-core` defines cards, runs, activity, audit events, relations, links,
+- `powder-core` defines cards, audit events, relations, links,
   comments, ready eligibility, expiring claims, permissive status changes,
   optional completion proof, and markdown backlog parsing.
 - `powder-store` persists the instance database in SQLite, enables WAL, owns
@@ -123,7 +123,7 @@ yet trustworthy enough for a fleet to depend on:
 - `powder-cli` can initialize an instance database, import backlog markdown
   into it, create cards, list ready work, claim, transition, and complete cards.
 - `powder-mcp` exposes `list_ready`, `manage_claim`, `update_status`,
-  `update_relations`, `add_link`, `request_input`, and `complete_card` over
+  `update_relations`, `add_link`, and `complete_card` over
   stdio using the same domain model; it uses SQLite when `POWDER_DB_PATH` is
   set.
 - `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
@@ -133,13 +133,13 @@ yet trustworthy enough for a fleet to depend on:
 
 The important remaining gaps are not polish. The audit trail needs to stay
 consistent across SQLite, HTTP, CLI, MCP, and the Kanban board; relations and
-webhooks need live-operator proof; the answer loop, real identity and
-authority, private-ingress conformance, deterministic event emission, and a
+webhooks need live-operator proof; real identity and authority,
+private-ingress conformance, deterministic event emission, and a
 Kanban surface must keep making the same state legible to humans.
 
 ## Non-Goals
 
-- No real operator backlog, run, claim, or activity data in this repository.
+- No real operator backlog, claim, event, or work-log data in this repository.
 - No dispatch daemon inside `powder-core`.
 - No model calls inside Powder.
 - No hidden dependency on Gradient, Hermes, or any one operator's `kanban.db`.
@@ -158,8 +158,8 @@ safely ask:
 > What exists, what is ready, can I claim it, what context matters, and what
 > history or proof explains its current state?
 
-Humans inspect the same state agents use. Each run and card change leaves a
-durable trail.
+Humans inspect the same state agents use. Each card change leaves a durable
+trail.
 Private backlog data stays in the deployment that owns it. External workers can
 make intelligent judgments, but Powder remains the boring source of truth for
 what work exists, who holds it, what happened, and what proof settled it.

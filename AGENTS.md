@@ -4,7 +4,7 @@ Powder is a Rust-first, public, self-hostable agent work application. It is the
 tool people deploy to host their own backlog data; it is not a repository that
 stores the operator's backlog.
 
-Read `VISION.md` before changing product scope, the card/run model, the runner
+Read `VISION.md` before changing product scope, the card/claim model, the runner
 boundary, or the self-hosting/deployment shape.
 
 ## Architecture
@@ -24,8 +24,8 @@ boundary, or the self-hosting/deployment shape.
   `ready` cards later, but it is not in the core.
 - MCP tools are designed around agent intent, not one-to-one REST wrappers.
 - Root `backlog.d/` may contain Powder product-development epics in the house
-  Goal/Oracle format. Do not commit imported/operator/customer card, run,
-  claim, activity, or instance export data; fixtures belong under tests only.
+  Goal/Oracle format. Do not commit imported/operator/customer card, claim,
+  event, work-log, or instance export data; fixtures belong under tests only.
   Instance data lives in the deployed SQLite database.
 - Follow the Canary-style deployment shape: one deployable Rust service, SQLite
   path from env, WAL, Fly volume at `/data`, Litestream optional replication,

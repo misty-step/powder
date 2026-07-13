@@ -174,8 +174,7 @@ macro_rules! id_type {
 }
 
 id_type!(CardId, "card_id");
-id_type!(RunId, "run_id");
-id_type!(ActivityId, "activity_id");
+id_type!(ClaimId, "claim_id");
 id_type!(CardEventId, "card_event_id");
 id_type!(LinkId, "link_id");
 
@@ -283,7 +282,6 @@ pub enum CardStatus {
     Ready,
     Claimed,
     Running,
-    AwaitingInput,
     Blocked,
     Done,
     Shipped,
@@ -291,12 +289,11 @@ pub enum CardStatus {
 }
 
 impl CardStatus {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::Backlog,
         Self::Ready,
         Self::Claimed,
         Self::Running,
-        Self::AwaitingInput,
         Self::Blocked,
         Self::Done,
         Self::Shipped,
@@ -309,7 +306,6 @@ impl CardStatus {
             "ready" => Some(Self::Ready),
             "claimed" => Some(Self::Claimed),
             "running" | "in-progress" | "in_progress" => Some(Self::Running),
-            "awaiting-input" | "awaiting_input" => Some(Self::AwaitingInput),
             "blocked" => Some(Self::Blocked),
             "done" => Some(Self::Done),
             "shipped" => Some(Self::Shipped),
@@ -330,7 +326,7 @@ impl CardStatus {
     /// card into a claim-bound state it doesn't actually hold (crucible-905:
     /// 13 cards landed `running` with `claim: null` this way).
     pub fn requires_active_claim(self) -> bool {
-        matches!(self, Self::Claimed | Self::Running | Self::AwaitingInput)
+        matches!(self, Self::Claimed | Self::Running)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -339,7 +335,6 @@ impl CardStatus {
             Self::Ready => "ready",
             Self::Claimed => "claimed",
             Self::Running => "running",
-            Self::AwaitingInput => "awaiting_input",
             Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Shipped => "shipped",
@@ -366,78 +361,6 @@ impl CardStatus {
                 self.as_str(),
                 next.as_str()
             )))
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunState {
-    Active,
-    AwaitingInput,
-    Released,
-    Error,
-    Complete,
-    Stale,
-}
-
-impl RunState {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "active" => Some(Self::Active),
-            "awaiting-input" | "awaiting_input" => Some(Self::AwaitingInput),
-            "released" => Some(Self::Released),
-            "error" => Some(Self::Error),
-            "complete" => Some(Self::Complete),
-            "stale" => Some(Self::Stale),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::AwaitingInput => "awaiting_input",
-            Self::Released => "released",
-            Self::Error => "error",
-            Self::Complete => "complete",
-            Self::Stale => "stale",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActivityType {
-    Thought,
-    Action,
-    Response,
-    Elicitation,
-    Error,
-    Prompt,
-}
-
-impl ActivityType {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "thought" => Some(Self::Thought),
-            "action" => Some(Self::Action),
-            "response" => Some(Self::Response),
-            "elicitation" => Some(Self::Elicitation),
-            "error" => Some(Self::Error),
-            "prompt" => Some(Self::Prompt),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Thought => "thought",
-            Self::Action => "action",
-            Self::Response => "response",
-            Self::Elicitation => "elicitation",
-            Self::Error => "error",
-            Self::Prompt => "prompt",
         }
     }
 }
@@ -480,7 +403,9 @@ impl AcceptanceCriterion {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub agent: String,
-    pub run_id: RunId,
+    pub id: ClaimId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_ref: Option<String>,
     pub acquired_at: i64,
     pub expires_at: i64,
 }
@@ -872,16 +797,13 @@ impl Card {
     }
 
     /// Whether this card's lifecycle (status + claim) must survive a
-    /// backlog.d reimport: an active claim, a claimed/running/awaiting-input
+    /// backlog.d reimport: an active claim, a claimed/running
     /// status, or a terminal outcome. A backlog/ready/blocked card with no
     /// claim has no live lifecycle to protect, so a reimport may refresh its
     /// status along with its content.
     pub fn protects_lifecycle_on_reimport(&self) -> bool {
         self.claim.is_some()
-            || matches!(
-                self.status,
-                CardStatus::Claimed | CardStatus::Running | CardStatus::AwaitingInput
-            )
+            || matches!(self.status, CardStatus::Claimed | CardStatus::Running)
             || self.status.is_terminal()
     }
 
@@ -947,7 +869,8 @@ impl Card {
     pub fn apply_claim(
         &mut self,
         agent: impl Into<String>,
-        run_id: RunId,
+        claim_id: ClaimId,
+        runtime_ref: Option<String>,
         now: i64,
         ttl_seconds: u64,
         blocker_is_terminal: impl Fn(&CardId) -> bool,
@@ -968,7 +891,10 @@ impl Card {
 
         let claim = Claim {
             agent,
-            run_id,
+            id: claim_id,
+            runtime_ref: runtime_ref
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
             acquired_at: now,
             expires_at: now + ttl_seconds as i64,
         };
@@ -1008,12 +934,12 @@ impl Card {
         self.updated_at = now;
     }
 
-    pub fn release_claim(&mut self, run_id: &RunId, now: i64) -> Result<Claim, DomainError> {
+    pub fn release_claim(&mut self, claim_id: &ClaimId, now: i64) -> Result<Claim, DomainError> {
         self.status.validate_transition(CardStatus::Ready)?;
         let claim = self.claim.as_ref().ok_or_else(|| {
             DomainError::conflict(format!("card {} has no active claim", self.id))
         })?;
-        validate_claim_run_ignoring_expiry(&self.id, claim, run_id)?;
+        validate_claim_id_ignoring_expiry(&self.id, claim, claim_id)?;
         let claim = claim.clone();
         self.claim = None;
         self.status = CardStatus::Ready;
@@ -1023,20 +949,20 @@ impl Card {
 
     pub fn renew_claim(
         &mut self,
-        run_id: &RunId,
+        claim_id: &ClaimId,
         now: i64,
         ttl_seconds: u64,
     ) -> Result<Claim, DomainError> {
         validate_ttl(ttl_seconds)?;
-        let claim = self.matching_active_claim_mut(run_id, now)?;
+        let claim = self.matching_active_claim_mut(claim_id, now)?;
         claim.expires_at = now + ttl_seconds as i64;
         let claim = claim.clone();
         self.updated_at = now;
         Ok(claim)
     }
 
-    pub fn heartbeat_claim(&mut self, run_id: &RunId, now: i64) -> Result<Claim, DomainError> {
-        let claim = self.matching_active_claim(run_id, now)?.clone();
+    pub fn heartbeat_claim(&mut self, claim_id: &ClaimId, now: i64) -> Result<Claim, DomainError> {
+        let claim = self.matching_active_claim(claim_id, now)?.clone();
         self.updated_at = now;
         Ok(claim)
     }
@@ -1048,14 +974,14 @@ impl Card {
     /// haven't had the claim aging on them, so their clock starts clean.
     pub fn transfer_claim(
         &mut self,
-        run_id: &RunId,
+        claim_id: &ClaimId,
         to_agent: impl Into<String>,
         now: i64,
         ttl_seconds: u64,
     ) -> Result<Claim, DomainError> {
         validate_ttl(ttl_seconds)?;
         let to_agent = non_empty("agent", to_agent.into())?;
-        let claim = self.matching_active_claim_mut(run_id, now)?;
+        let claim = self.matching_active_claim_mut(claim_id, now)?;
         claim.agent = to_agent;
         claim.expires_at = now + ttl_seconds as i64;
         let claim = claim.clone();
@@ -1063,47 +989,25 @@ impl Card {
         Ok(claim)
     }
 
-    fn matching_active_claim(&self, run_id: &RunId, now: i64) -> Result<&Claim, DomainError> {
+    fn matching_active_claim(&self, claim_id: &ClaimId, now: i64) -> Result<&Claim, DomainError> {
         let claim = self.claim.as_ref().ok_or_else(|| {
             DomainError::conflict(format!("card {} has no active claim", self.id))
         })?;
-        validate_claim_run(&self.id, claim, run_id, now)?;
+        validate_claim_id(&self.id, claim, claim_id, now)?;
         Ok(claim)
     }
 
     fn matching_active_claim_mut(
         &mut self,
-        run_id: &RunId,
+        claim_id: &ClaimId,
         now: i64,
     ) -> Result<&mut Claim, DomainError> {
         let claim = self.claim.as_mut().ok_or_else(|| {
             DomainError::conflict(format!("card {} has no active claim", self.id))
         })?;
-        validate_claim_run(&self.id, claim, run_id, now)?;
+        validate_claim_id(&self.id, claim, claim_id, now)?;
         Ok(claim)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Run {
-    pub id: RunId,
-    pub card_id: CardId,
-    pub state: RunState,
-    pub agent: String,
-    pub claim_expires_at: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proof: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Activity {
-    pub id: ActivityId,
-    pub run_id: RunId,
-    pub activity_type: ActivityType,
-    pub payload: String,
-    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1136,7 +1040,7 @@ pub struct Comment {
 /// A high-frequency, fully-attributed entry an agent appends while actively
 /// working a card -- context, current activity, encountered issues, chain of
 /// thought -- as a first-class field distinct from `Comment` (powder-943).
-/// Only `agent` is required; `model`/`reasoning`/`harness`/`run_id` are
+/// Only `agent` is required; `model`/`reasoning`/`harness`/`runtime_ref` are
 /// whatever attribution the calling surface can supply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkLogEntry {
@@ -1149,7 +1053,7 @@ pub struct WorkLogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<RunId>,
+    pub runtime_ref: Option<String>,
     pub body: String,
     pub created_at: i64,
 }
@@ -1183,14 +1087,6 @@ impl DetailLevel {
 pub struct CardDetail {
     pub card: Card,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub runs: Vec<Run>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runs_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activities: Vec<Activity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activities_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<CardEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events_total: Option<usize>,
@@ -1208,46 +1104,6 @@ pub struct CardDetail {
     pub work_log_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunDetail {
-    pub run: Run,
-    pub card: Card,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activities: Vec<Activity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activities_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub links: Vec<Link>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub links_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub comments: Vec<Comment>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comments_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AwaitingInput {
-    pub card: Card,
-    pub run: Run,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub question: Option<Activity>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalQueueRow {
-    pub card_id: CardId,
-    pub title: String,
-    pub autonomy: AutonomyClass,
-    pub run_id: RunId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub question: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub packet_links: Vec<Link>,
 }
 
 pub fn non_empty(field: &'static str, value: String) -> Result<String, DomainError> {
@@ -1313,15 +1169,15 @@ fn validate_ttl(ttl_seconds: u64) -> Result<(), DomainError> {
     }
 }
 
-fn validate_claim_run(
+fn validate_claim_id(
     card_id: &CardId,
     claim: &Claim,
-    run_id: &RunId,
+    claim_id: &ClaimId,
     now: i64,
 ) -> Result<(), DomainError> {
-    if claim.run_id != *run_id {
+    if claim.id != *claim_id {
         return Err(DomainError::conflict(format!(
-            "card {card_id} is claimed by a different run"
+            "card {card_id} is held by a different claim"
         )));
     }
     if claim.is_expired(now) {
@@ -1333,18 +1189,18 @@ fn validate_claim_run(
     Ok(())
 }
 
-/// Same run-identity check as `validate_claim_run`, but without the expiry
+/// Same identity check as `validate_claim_id`, but without the expiry
 /// check: release is the one mutation where an already-expired claim held by
-/// the same run should succeed as a no-op rather than 409 (powder-938) --
+/// the same claim should succeed as a no-op rather than 409 (powder-938) --
 /// releasing a claim that's already gone is idempotent, not a conflict.
-fn validate_claim_run_ignoring_expiry(
+fn validate_claim_id_ignoring_expiry(
     card_id: &CardId,
     claim: &Claim,
-    run_id: &RunId,
+    claim_id: &ClaimId,
 ) -> Result<(), DomainError> {
-    if claim.run_id != *run_id {
+    if claim.id != *claim_id {
         return Err(DomainError::conflict(format!(
-            "card {card_id} is claimed by a different run"
+            "card {card_id} is held by a different claim"
         )));
     }
     Ok(())
@@ -1387,7 +1243,8 @@ mod tests {
         let mut current = card("001", CardStatus::Running);
         current.claim = Some(Claim {
             agent: "agent-a".to_string(),
-            run_id: RunId::new("run-1").unwrap(),
+            id: ClaimId::new("claim-1").unwrap(),
+            runtime_ref: Some("bb-run-1".to_string()),
             acquired_at: 5,
             expires_at: 100,
         });
@@ -1608,7 +1465,6 @@ mod tests {
         assert!(!card("001", CardStatus::Blocked).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Claimed).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Running).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::AwaitingInput).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Done).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Shipped).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Abandoned).protects_lifecycle_on_reimport());

@@ -46,12 +46,6 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
-        path: "/api/v1/approvals",
-        intent: "list awaiting-input runs with card autonomy, latest question, run id, and any approval-prefixed packet links",
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
         path: "/api/v1/stats",
         intent: "return compact board status counts by repository plus totals; optional repo and include_hidden query params",
         body_shape: None,
@@ -95,7 +89,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/{id}",
-        intent: "read one card with runs, activity, links, comments, and claim state; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
+        intent: "read one card with events, work log, links, comments, and claim state; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
         body_shape: None,
     },
     ApiRoute {
@@ -109,9 +103,9 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/claim",
-        intent: "claim one card and open a run",
+        intent: "claim one card with an expiring lease and optional external runtime reference",
         body_shape: Some(
-            r#"{"agent":"...","ttl_seconds":null} -- agent is required and is never inferred from the caller's own identity (linejam-906: an admin-scoped key claiming with agent omitted must not silently record the claim under its own display name)"#,
+            r#"{"agent":"...","runtime_ref":null,"ttl_seconds":null} -- agent is required; runtime_ref optionally points at the external worker runtime"#,
         ),
     },
     ApiRoute {
@@ -137,7 +131,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/transfer",
         intent: "atomically hand an active claim to a named agent -- no release-then-race window for a handoff",
         body_shape: Some(
-            r#"{"run_id":"...","to_agent":"...","ttl_seconds":null} -- run_id and to_agent are required; caller must hold the claim or be admin; the receiving agent gets a fresh ttl from now, not the outgoing agent's remaining time"#,
+            r#"{"claim_id":"...","to_agent":"...","ttl_seconds":null} -- claim_id and to_agent are required; caller must hold the claim or be admin; the receiving agent gets a fresh ttl from now, not the outgoing agent's remaining time"#,
         ),
     },
     ApiRoute {
@@ -169,7 +163,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/comments",
-        intent: "attach an actor-attributed comment to a card, visible immediately via get_card/get_run",
+        intent: "attach an actor-attributed comment to a card, visible immediately via get_card",
         body_shape: None,
     },
     ApiRoute {
@@ -177,32 +171,8 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/work-log",
         intent: "append a high-frequency, fully-attributed work_log entry while actively working a card (powder-943) -- context, current activity, issues, chain of thought, distinct from the low-frequency human-facing comments field",
         body_shape: Some(
-            r#"{"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; body is scrubbed for known secret shapes server-side before storage"#,
+            r#"{"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"runtime_ref":null} -- agent and body are required; runtime_ref may point at the external worker runtime; body is scrubbed for known secret shapes server-side before storage"#,
         ),
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/runs/{id}/input",
-        intent: "pause a run for human input",
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/runs/{id}/answer",
-        intent: "answer an awaiting-input run and resume it",
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/runs/{id}",
-        intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/runs/awaiting-input",
-        intent: "list runs waiting on human or agent input",
-        body_shape: None,
     },
     ApiRoute {
         method: "POST",
@@ -300,7 +270,6 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards"));
         assert!(paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
-        assert!(paths.contains(&"/api/v1/approvals"));
         assert!(paths.contains(&"/api/v1/repositories"));
         assert!(paths.contains(&"/api/v1/repositories/{name}"));
         assert!(paths.contains(&"/api/v1/repositories/{name}/merge-alias"));
@@ -313,10 +282,7 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards/{id}/relations"));
         assert!(paths.contains(&"/api/v1/cards/{id}/criteria/check"));
         assert!(paths.contains(&"/api/v1/cards/{id}"));
-        assert!(paths.contains(&"/api/v1/runs/{id}"));
-        assert!(paths.contains(&"/api/v1/runs/awaiting-input"));
-        assert!(paths.contains(&"/api/v1/runs/{id}/input"));
-        assert!(paths.contains(&"/api/v1/runs/{id}/answer"));
+        assert!(!paths.iter().any(|path| path.starts_with("/api/v1/runs")));
         assert!(paths.contains(&"/api/v1/events/subscriptions"));
         assert!(paths.contains(&"/api/v1/events/subscriptions/{id}/disable"));
         assert!(paths.contains(&"/api/v1/events/dead-letter"));

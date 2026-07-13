@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS cards (
   source_path TEXT,
   source_digest TEXT,
   claim_agent TEXT,
-  claim_run_id TEXT,
+  claim_id TEXT,
+  claim_runtime_ref TEXT,
   claim_acquired_at INTEGER,
   claim_expires_at INTEGER,
   created_at INTEGER NOT NULL,
@@ -74,27 +75,6 @@ CREATE TABLE IF NOT EXISTS repository_aliases (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_repository_aliases_repository ON repository_aliases(repository_name, alias);
-
-CREATE TABLE IF NOT EXISTS runs (
-  id TEXT PRIMARY KEY,
-  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
-  state TEXT NOT NULL,
-  agent TEXT NOT NULL,
-  claim_expires_at INTEGER NOT NULL,
-  proof TEXT,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_runs_card_created ON runs(card_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS activities (
-  id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-  activity_type TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_activities_run_created ON activities(run_id, created_at);
 
 CREATE TABLE IF NOT EXISTS card_events (
   id TEXT PRIMARY KEY,
@@ -129,7 +109,7 @@ CREATE TABLE IF NOT EXISTS work_log_entries (
   model TEXT,
   reasoning TEXT,
   harness TEXT,
-  run_id TEXT,
+  runtime_ref TEXT,
   body TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
@@ -364,20 +344,25 @@ pub const MIGRATE_12_TO_13: &str = r#"
 ALTER TABLE cards ADD COLUMN estimate TEXT;
 "#;
 
+/// powder-939: claims are opaque board leases, while execution belongs to an
+/// external runtime. The guarded Rust migration records legacy run proof as
+/// card history before applying these destructive schema changes.
+pub const MIGRATE_13_TO_14: &str = r#"
+DROP TABLE IF EXISTS activities;
+DROP TABLE IF EXISTS runs;
+"#;
+
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name, source_path,
-source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
+source_digest, claim_agent, claim_id, claim_runtime_ref, claim_acquired_at, claim_expires_at,
 created_at, updated_at";
 
 pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
-source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
+source_path, source_digest, claim_agent, claim_id, claim_runtime_ref, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards WHERE id = ?1";
 
 pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
-source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
+source_path, source_digest, claim_agent, claim_id, claim_runtime_ref, claim_acquired_at,
 claim_expires_at, created_at, updated_at FROM cards";
-
-pub const RUN_SELECT_SQL: &str = "SELECT id, card_id, state, agent, claim_expires_at, proof,
-created_at, updated_at FROM runs WHERE id = ?1";

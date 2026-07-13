@@ -1,8 +1,9 @@
 # Powder
 
 Powder is a public, self-hostable work-management app for agent-driven teams: a
-durable board for cards, claims, runs, audit events, relations, links,
-comments, a high-frequency attributed work_log, and human-in-loop pauses.
+durable board for cards, claims, audit events, relations, links, comments, and
+a high-frequency attributed work_log. Runtime sessions and human-input asks
+belong to external orchestrators such as Bitterblossom.
 
 The repo ships the application. A deployment owns the data.
 
@@ -43,19 +44,15 @@ cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret
 cargo run -q -p powder-cli -- create-card --db "$DB" --id smoke-proof --title "Proof plan smoke" --acceptance "detail renders" --proof-plan "PR + HTTP smoke"
 cargo run -q -p powder-cli -- import crates/powder-core/tests/fixtures/backlog.d --db "$DB"
 cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
-CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex)
+CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex --runtime-ref bb-run-42)
 printf "%s" "$CLAIM"
-RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
-cargo run -q -p powder-cli -- heartbeat 001 --db "$DB" --run "$RUN_ID"
-cargo run -q -p powder-cli -- renew-claim 001 --db "$DB" --run "$RUN_ID" --ttl 3600
+CLAIM_ID=$(printf "%s" "$CLAIM" | cut -f3)
+cargo run -q -p powder-cli -- heartbeat 001 --db "$DB" --claim "$CLAIM_ID"
+cargo run -q -p powder-cli -- renew-claim 001 --db "$DB" --claim "$CLAIM_ID" --ttl 3600
 cargo run -q -p powder-cli -- update-relations 001 --db "$DB" --related 002 --blocks 003 --blocked-by 000
 cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status running
-cargo run -q -p powder-cli -- request-input "$RUN_ID" --db "$DB" --question "Approve completion?"
-cargo run -q -p powder-cli -- list-awaiting-input --db "$DB"
-cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator --answer approved
 cargo run -q -p powder-cli -- check-criterion 001 --db "$DB" --criterion 0 --actor operator
 cargo run -q -p powder-cli -- get-card 001 --db "$DB"
-cargo run -q -p powder-cli -- get-run "$RUN_ID" --db "$DB"
 cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --criterion-proof 0=https://example.test/proof
 cargo run -q -p powder-cli -- repository-list --db "$DB" --include-hidden
 cargo run -q -p powder-cli -- repository-upsert --db "$DB" --name canary --aliases misty-step/canary --tier active
@@ -85,23 +82,20 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
 | `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus\tautonomy` |
 | `update-card` | SQLite patch write | `PATCH /api/v1/cards/{id}` | `updated\tid\tpriority\tstatus\tautonomy` |
-| `list-approvals` | SQLite approval queue read | `GET /api/v1/approvals` | Pretty JSON approval queue |
-| `claim` | SQLite claim lifecycle | `POST /api/v1/cards/{id}/claim` | `claimed\tcard_id\trun_id\texpires_at` |
-| `heartbeat` | SQLite lease liveness | `POST /api/v1/cards/{id}/heartbeat` | `heartbeat\tcard_id\trun_id\texpires_at` |
-| `renew-claim` | SQLite lease extension | `POST /api/v1/cards/{id}/renew` | `renewed\tcard_id\trun_id\texpires_at` |
-| `release-claim` | SQLite lease release | `POST /api/v1/cards/{id}/release` | `released\tcard_id\trun_id` |
+| `claim` | SQLite claim lifecycle | `POST /api/v1/cards/{id}/claim` | `claimed\tcard_id\tclaim_id\texpires_at` |
+| `heartbeat` | SQLite lease liveness | `POST /api/v1/cards/{id}/heartbeat` | `heartbeat\tcard_id\tclaim_id\texpires_at` |
+| `renew-claim` | SQLite lease extension | `POST /api/v1/cards/{id}/renew` | `renewed\tcard_id\tclaim_id\texpires_at` |
+| `release-claim` | SQLite lease release | `POST /api/v1/cards/{id}/release` | `released\tcard_id\tclaim_id` |
 | `update-status` | SQLite status lifecycle | `POST /api/v1/cards/{id}/status` | `status\tid\tstatus` |
 | `check-criterion` | SQLite criterion write | `POST /api/v1/cards/{id}/criteria/check` | `criterion\tid\tindex\tchecked|unchecked` |
 | `add-link` | SQLite link write | `POST /api/v1/cards/{id}/links` | `link\tcard_id\tid` |
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
 | `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | `work-log\tcard_id\tagent\tbody` |
-| `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
-falling back to ephemeral state. `update-relations`, `get-run`,
-`list-awaiting-input`, `answer-input`, `repository-*`, `import*`, `key-*`, and
+falling back to ephemeral state. `update-relations`, `repository-*`, `import*`, `key-*`, and
 `subscription-*` remain `--db`-only (bulk/admin operations or reads with no
 remote-mode demand yet); omitting `--db` on those still fails with a bare
 `missing --db`.
@@ -125,8 +119,8 @@ pre-1.0 MCP break: the former `claim_card`, `renew_claim`, `heartbeat`,
 `release_claim`, and `transfer_claim` tools are removed from `tools/list`.
 
 By default, `powder-mcp` advertises the agent persona only: card discovery,
-card/runs reads, card creation/update, status/relations/criteria writes,
-claim management, comments, work logs, links, input requests/answers,
+card reads, card creation/update, status/relations/criteria writes,
+claim management, comments, work logs, links,
 completion, and `list_repositories` for repo filters. Operator/admin tools are
 hidden from both `tools/list` and `tools/call`: `create_event_subscription`,
 `list_event_subscriptions`, `disable_event_subscription`, `list_dead_letters`,
@@ -178,7 +172,7 @@ cutover, powder-965's class of incident) instead.
 
 The repo also includes a deterministic MCP tool-use eval harness. It creates
 throwaway fixture SQLite DBs, starts the real `powder-mcp` binary over stdio,
-runs four scripted scenarios, and prints one compact baseline table. `response
+runs three scripted scenarios, and prints one compact baseline table. `response
 chars` is the total visible tool-result JSON text, plus JSON-RPC error message
 text for recovery scenarios:
 

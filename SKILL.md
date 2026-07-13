@@ -1,11 +1,10 @@
 ---
 name: powder
 description: |
-  Use when an agent needs to inspect, claim, update, request input for, or
-  complete work cards in a Powder instance. Powder is the self-hostable,
-  agent-first work board: a durable card store with run sessions, activity,
-  audit events, relations, optional proof, and human-in-loop states.
-argument-hint: "[list-ready|claim|update-status|update-relations|request-input|complete-card]"
+  Use when an agent needs to inspect, claim, update, or complete work cards in
+  a Powder instance. Powder is the self-hostable, agent-first work board: a
+  durable card store with claims, audit events, relations, and optional proof.
+argument-hint: "[list-ready|claim|update-status|update-relations|complete-card]"
 ---
 
 # Powder
@@ -14,7 +13,7 @@ Powder is a self-hostable work tool. It exposes one core through API, CLI, MCP,
 and this skill. Treat cards as context objects with acceptance oracles, not
 status rows. Real card data belongs in a deployed instance database, not in the
 product repository. Read `VISION.md` before changing Powder's product scope,
-card/run model, runner boundary, or self-hosting assumptions.
+card/claim model, runner boundary, or self-hosting assumptions.
 
 For local MCP use, set `POWDER_DB_PATH` to the instance SQLite database. A
 `POWDER_BACKLOG_DIR` value imports markdown into that database on startup. To
@@ -53,21 +52,17 @@ Default agent persona:
   `action` set to `claim`, `renew`, `heartbeat`, `release`, or `transfer`.
   This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
   `heartbeat`, `release_claim`, and `transfer_claim` tools.
-- `get_card`: read one card with runs, activities, links, comments, and claim state.
-- `get_run`: read one run with its card, activities, links, comments, and run state.
-- `list_awaiting_input`: list runs paused for human or agent input.
-- `answer_input`: append an actor-attributed answer and resume the run.
+- `get_card`: read one card with events, links, comments, work log, and claim state.
 - `update_status`: set a card to any status in one call and record an audit event.
 - `update_relations`: replace a card's `related`, `blocks`, and `blocked_by`
   relation lists.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `add_comment`: attach an actor-attributed comment, visible immediately via
-  `get_card`/`get_run`.
+  `get_card`.
 - `append_work_log`: append a high-frequency, fully-attributed work_log entry
-  (agent, model, reasoning, harness, run_id, body) while actively working a
+  (agent, model, reasoning, harness, runtime_ref, body) while actively working a
   card -- call this often, not just at completion; `body` is scrubbed for
   known secret shapes server-side before storage.
-- `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
 - `update_card`: patch title, body, acceptance, proof_plan, status, priority,
   or labels on an existing card. Requires an admin-scope key in remote mode
@@ -94,7 +89,7 @@ Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all`:
 with `POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`,
 `list-cards`, `get-card`, `create-card`, `claim`, `heartbeat`, `renew-claim`,
 `transfer-claim`, `release-claim`, `update-status`, `check-criterion`, `add-link`,
-`add-comment`, `append-work-log`, `request-input`, and `complete-card` all operate against the
+`add-comment`, `append-work-log`, and `complete-card` all operate against the
 deployed instance when `--db` is omitted -- there is no separate "remote
 closeout" wrapper to reach for; the same commands used against `--db` work
 unchanged against a deployed instance. `--db` always wins when supplied, so a
@@ -117,8 +112,8 @@ powder add-comment 001 --author codex --body "shipped, PR linked above"
 powder complete-card 001 --proof https://github.com/misty-step/example/pull/1
 ```
 
-`update-relations`, `get-run`, `list-awaiting-input`, `answer-input`,
-`repository-*`, `import*`, `key-*`, and `subscription-*` remain `--db`-only:
+`update-relations`, `repository-*`, `import*`, `key-*`, and
+`subscription-*` remain `--db`-only:
 they are either bulk/admin operations or read paths with no remote-mode
 demand yet. Omitting `--db` on those fails with a bare `missing --db`, not
 yet the command-specific transport error the remote-capable commands give.
@@ -130,18 +125,14 @@ powder list-ready --db ./data/powder.db --limit 10
 powder repository-list --db ./data/powder.db --include-hidden
 powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary --visibility visible --tier active --import-provenance manual
 powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator
-powder claim 001 --db ./data/powder.db --agent codex
-powder heartbeat 001 --db ./data/powder.db --run run-id
-powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600
-powder transfer-claim 001 --db ./data/powder.db --run run-id --to-agent codex --ttl 3600
-powder release-claim 001 --db ./data/powder.db --run run-id
+powder claim 001 --db ./data/powder.db --agent codex --runtime-ref bb-run-42
+powder heartbeat 001 --db ./data/powder.db --claim claim-id
+powder renew-claim 001 --db ./data/powder.db --claim claim-id --ttl 3600
+powder transfer-claim 001 --db ./data/powder.db --claim claim-id --to-agent codex --ttl 3600
+powder release-claim 001 --db ./data/powder.db --claim claim-id
 powder get-card 001 --db ./data/powder.db
 powder update-relations 001 --db ./data/powder.db --related 002 --blocks 003 --blocked-by 000
 powder update-status 001 --db ./data/powder.db --status running
-powder request-input run-id --db ./data/powder.db --question "Approve?"
-powder list-awaiting-input --db ./data/powder.db
-powder answer-input run-id --db ./data/powder.db --actor operator --answer approved
-powder get-run run-id --db ./data/powder.db
 powder complete-card 001 --db ./data/powder.db
 ```
 

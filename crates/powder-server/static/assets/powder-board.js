@@ -5,7 +5,6 @@ const RAW_STATUSES = [
   "ready",
   "claimed",
   "running",
-  "awaiting_input",
   "blocked",
   "done",
   "shipped",
@@ -274,7 +273,7 @@ function normalizeCard(card) {
 }
 
 function displayStatus(status) {
-  if (["claimed", "running", "awaiting_input"].includes(status)) {
+  if (["claimed", "running"].includes(status)) {
     return "in_progress";
   }
   if (status === "done" || status === "shipped" || status === "abandoned") {
@@ -472,7 +471,6 @@ function statusCountsHTML(counts) {
     "blocked",
     "claimed",
     "running",
-    "awaiting_input",
     "done",
     "shipped",
     "abandoned",
@@ -977,7 +975,6 @@ function doneRowHTML(card) {
 
 function statusText(status) {
   return {
-    awaiting_input: "awaiting input",
     in_progress: "in progress",
   }[status] || String(status || "unknown").replaceAll("_", " ");
 }
@@ -986,7 +983,6 @@ function statusGlyph(status) {
   const glyph = (id, tone = "") =>
     `<span class="pw-g"><svg class="ae-icon ${tone}" aria-hidden="true"><use href="#${id}"></use></svg></span>`;
   if (status === "done" || status === "shipped") return glyph("i-check", "ae-ok");
-  if (status === "awaiting_input") return glyph("i-ask", "ae-warn");
   if (status === "blocked" || status === "abandoned") return glyph("i-block", "ae-warn");
   if (status === "running") return glyph("i-play");
   if (status === "claimed") return glyph("i-hand");
@@ -1038,7 +1034,6 @@ function detailError(cardId, message) {
 function detailHTML(card, detail = {}) {
   const normalized = normalizeCard(card);
   const meta = repoMeta(normalized.repoKey);
-  const latestRun = latestRunFor(normalized, detail.runs || []);
   const timeline = timelineItems(detail);
   const parts = [];
   parts.push(`
@@ -1056,17 +1051,12 @@ function detailHTML(card, detail = {}) {
       <p id="detail-status-message" class="ae-chrome" aria-live="polite"></p>
     </section>
   `);
-  const awaiting = (detail.activities || []).filter((activity) => activity.activity_type === "elicitation");
-  if (normalized.status === "awaiting_input" && awaiting[0]) {
-    const approvalLinks = approvalPacketLinksHTML(detail.links || []);
-    parts.push(`<div class="pw-ask"><p class="pw-ask-cap"><svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg>INPUT REQUESTED</p><p>${escapeHtml(awaiting[0].payload)}</p>${approvalLinks}</div>`);
-  }
   parts.push(`
     <div class="pw-detail-grid">
       <div class="pw-detail-primary">
         ${section("DESCRIPTION", markdownHTML(normalized.body))}
         ${section("ACCEPTANCE", acceptanceHTML(normalized))}
-        ${section("PROOF PLAN / EVIDENCE", proofEvidenceHTML(normalized, detail.links || [], detail.runs || []))}
+        ${section("PROOF PLAN / EVIDENCE", proofEvidenceHTML(normalized, detail.links || []))}
         ${section("WORK LOG", workLogHTML(detail.work_log || []))}
         ${section("COMMENTS", trailHTML((detail.comments || []).map((comment) => ({
           head: `${comment.author} · ${formatDate(comment.created_at)}`,
@@ -1076,7 +1066,7 @@ function detailHTML(card, detail = {}) {
       </div>
       <aside class="pw-detail-side">
         ${section("RELATIONS", relationsHTML(normalized))}
-        ${section("CLAIM / RUN HISTORY", runHistoryHTML(normalized, detail.runs || [], latestRun))}
+        ${section("CLAIM", claimHTML(normalized))}
         ${section("SOURCE", definitionHTML([
           ["Repo / Source", normalized.repo || normalized.source?.path || "local"],
           ["Digest", normalized.source?.digest || "none"],
@@ -1126,7 +1116,7 @@ function trailHTML(items, fallback) {
 function workLogHTML(entries) {
   if (!entries.length) return empty("No work log entries yet.");
   return `<ul class="pw-worklog">${entries.map((entry) => {
-    const head = [entry.agent, entry.model, entry.reasoning, entry.harness]
+    const head = [entry.agent, entry.model, entry.reasoning, entry.harness, entry.runtime_ref]
       .filter(Boolean)
       .map(escapeHtml)
       .join(" · ");
@@ -1138,9 +1128,9 @@ function definitionHTML(rows) {
   return `<dl>${rows.map(([term, value]) => `<div class="pw-def-row"><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>`;
 }
 
-function proofEvidenceHTML(card, links, runs) {
+function proofEvidenceHTML(card, links) {
   const plan = Array.isArray(card.proof_plan) ? card.proof_plan : [];
-  const proofLinks = linksHTML(links, runs);
+  const proofLinks = linksHTML(links);
   const planHTML = plan.length
     ? `<ul class="pw-acc-list">${plan.map((item) => `<li class="pw-acc-item"><span class="pw-g"><svg class="ae-icon" aria-hidden="true"><use href="#i-proof"></use></svg></span><span>${escapeHtml(item)}</span></li>`).join("")}</ul>`
     : "";
@@ -1148,13 +1138,9 @@ function proofEvidenceHTML(card, links, runs) {
   return `${planHTML}${proofLinks}`;
 }
 
-function linksHTML(links, runs) {
-  const proof = runs
-    .filter((run) => run.proof)
-    .map((run) => ({ label: `run proof · ${run.id}`, url: run.proof }));
-  const allLinks = [...links, ...proof];
-  if (!allLinks.length) return "";
-  return allLinks.map((link) => {
+function linksHTML(links) {
+  if (!links.length) return "";
+  return links.map((link) => {
     const safe = safeUrl(link.url);
     const target = safe
       ? `<a href="${escapeHtml(safe)}" target="_blank" rel="noreferrer">${escapeHtml(link.url)}</a>`
@@ -1163,46 +1149,22 @@ function linksHTML(links, runs) {
   }).join("");
 }
 
-function approvalPacketLinksHTML(links) {
-  const approvalLinks = links.filter((link) =>
-    String(link.label || "").trimStart().toLowerCase().startsWith("approval"),
-  );
-  if (!approvalLinks.length) return "";
-  return `<div class="pw-approval-links">${linksHTML(approvalLinks, [])}</div>`;
-}
-
-function runHistoryHTML(card, runs, latestRun) {
-  const summary = definitionHTML([
+function claimHTML(card) {
+  return definitionHTML([
     ["Claim holder", card.claim?.agent || "unclaimed"],
-    ["Active run", card.claim?.run_id || latestRun?.id || "none"],
+    ["Claim ID", card.claim?.id || "none"],
+    ["Runtime reference", card.claim?.runtime_ref || "none"],
     ["Lease expiry", card.claim?.expires_at ? formatDate(card.claim.expires_at) : "none"],
-    ["Latest state", latestRun?.state || "none"],
-    ["Latest update", latestRun?.updated_at ? formatDate(latestRun.updated_at) : "none"],
   ]);
-  if (!runs.length) return summary + empty("No runs recorded.");
-  const rows = [...runs]
-    .sort((left, right) => (right.updated_at || 0) - (left.updated_at || 0))
-    .map((run) => `
-      <li>
-        <p class="pw-trail-head">${escapeHtml(run.id)} · ${escapeHtml(run.state)} · ${formatDate(run.updated_at)}</p>
-        <p>${escapeHtml(run.agent)}${run.proof ? ` · ${linkOrText(run.proof)}` : ""}</p>
-      </li>
-    `);
-  return `${summary}<ul class="pw-trail pw-run-list">${rows.join("")}</ul>`;
 }
 
 function timelineItems(detail) {
-  const activities = (detail.activities || []).map((activity) => ({
-    time: Number(activity.created_at || 0),
-    head: `${activity.activity_type} · ${formatDate(activity.created_at)}`,
-    body: activity.payload,
-  }));
   const events = (detail.events || []).map((event) => ({
     time: Number(event.created_at || 0),
     head: `${event.event_type} · ${event.actor} · ${formatDate(event.created_at)}`,
     body: event.payload,
   }));
-  return [...activities, ...events].sort((left, right) => right.time - left.time);
+  return events.sort((left, right) => right.time - left.time);
 }
 
 function timelineHTML(items) {
@@ -1285,16 +1247,6 @@ function linkOrText(raw) {
   const safe = safeUrl(raw);
   if (!safe) return escapeHtml(raw);
   return `<a href="${escapeHtml(safe)}" target="_blank" rel="noreferrer">${escapeHtml(raw)}</a>`;
-}
-
-function latestRunFor(card, runs) {
-  if (!runs.length) return null;
-  const claimRunId = card.claim?.run_id;
-  if (claimRunId) {
-    const run = runs.find((candidate) => candidate.id === claimRunId);
-    if (run) return run;
-  }
-  return [...runs].sort((left, right) => (right.updated_at || 0) - (left.updated_at || 0))[0];
 }
 
 function safeUrl(raw) {

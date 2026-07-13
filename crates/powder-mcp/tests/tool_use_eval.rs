@@ -9,5 +9,5 @@ fn tool_use_eval_runs_all_scenarios_over_stdio() {
         report.failures(),
         report.table()
     );
-    assert_eq!(report.scenarios.len(), 4);
+    assert_eq!(report.scenarios.len(), 3);
 }

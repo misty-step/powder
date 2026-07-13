@@ -4,10 +4,9 @@ use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
-    CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId,
-    RunState, WorkLogEntry,
+    AcceptanceCriterion, Authority, AutonomyClass, Card, CardEvent, CardEventId, CardId,
+    CardSource, CardStatus, Claim, ClaimId, ClaimReceipt, Comment, CriterionProof, DomainError,
+    Estimate, Link, LinkId, Priority, ReadyQuery, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -19,7 +18,6 @@ mod identity;
 mod repositories;
 mod schema;
 mod secrets;
-pub mod status_model_020;
 #[cfg(test)]
 mod tests;
 
@@ -36,9 +34,9 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5,
-    MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10,
-    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4,
+    MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
+    MIGRATE_9_TO_10, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -166,8 +164,6 @@ pub struct BoardStatsCounts {
     #[serde(skip_serializing_if = "is_zero")]
     pub running: usize,
     #[serde(skip_serializing_if = "is_zero")]
-    pub awaiting_input: usize,
-    #[serde(skip_serializing_if = "is_zero")]
     pub blocked: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub done: usize,
@@ -188,7 +184,6 @@ impl BoardStatsCounts {
             CardStatus::Ready => self.ready += cards,
             CardStatus::Claimed => self.claimed += cards,
             CardStatus::Running => self.running += cards,
-            CardStatus::AwaitingInput => self.awaiting_input += cards,
             CardStatus::Blocked => self.blocked += cards,
             CardStatus::Done => self.done += cards,
             CardStatus::Shipped => self.shipped += cards,
@@ -233,7 +228,7 @@ pub struct WorkLogAttribution<'a> {
     pub model: Option<&'a str>,
     pub reasoning: Option<&'a str>,
     pub harness: Option<&'a str>,
-    pub run_id: Option<&'a str>,
+    pub runtime_ref: Option<&'a str>,
 }
 
 impl Store {
@@ -336,6 +331,10 @@ impl Store {
                     self.migrate_12_to_13()?;
                     13
                 }
+                13 => {
+                    self.migrate_13_to_14()?;
+                    14
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -360,12 +359,98 @@ impl Store {
         Ok(())
     }
 
+    fn migrate_13_to_14(&mut self) -> Result<()> {
+        let has_card_status = self.table_has_column("cards", "status")?;
+        let has_run_state = self.table_has_column("runs", "state")?;
+        let has_runs = self.table_exists("runs")?;
+        let has_card_events = self.table_exists("card_events")?;
+        let has_claim_run_id = self.table_has_column("cards", "claim_run_id")?;
+        let has_claim_runtime_ref = self.table_has_column("cards", "claim_runtime_ref")?;
+        let has_work_log_run_id = self.table_has_column("work_log_entries", "run_id")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let awaiting_cards: i64 = if has_card_status {
+            transaction.query_row(
+                "SELECT COUNT(*) FROM cards WHERE status = 'awaiting_input'",
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        let awaiting_runs: i64 = if has_run_state {
+            transaction.query_row(
+                "SELECT COUNT(*) FROM runs WHERE state = 'awaiting_input'",
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        if awaiting_cards != 0 || awaiting_runs != 0 {
+            return Err(DomainError::conflict(format!(
+                "schema v14 migration refused: {awaiting_cards} card(s) and {awaiting_runs} run(s) still have awaiting_input state; resolve them before removing run/input state"
+            ))
+            .into());
+        }
+
+        if has_runs && has_card_events {
+            transaction.execute(
+                "INSERT INTO card_events (id, card_id, event_type, actor, payload, created_at)
+                 SELECT 'event-legacy-run-proof-' || id,
+                        card_id,
+                        'proof',
+                        'schema-v14-migration',
+                        proof,
+                        updated_at
+                 FROM runs
+                 WHERE proof IS NOT NULL AND trim(proof) <> ''",
+                [],
+            )?;
+        }
+        if has_claim_run_id {
+            transaction
+                .execute_batch("ALTER TABLE cards RENAME COLUMN claim_run_id TO claim_id")?;
+        }
+        if !has_claim_runtime_ref {
+            transaction.execute_batch("ALTER TABLE cards ADD COLUMN claim_runtime_ref TEXT")?;
+        }
+        if has_work_log_run_id {
+            transaction.execute_batch(
+                "ALTER TABLE work_log_entries RENAME COLUMN run_id TO runtime_ref",
+            )?;
+        }
+        transaction.execute_batch(MIGRATE_13_TO_14)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn cards_has_column(&self, column: &str) -> Result<bool> {
-        let mut statement = self.connection.prepare("PRAGMA table_info(cards)")?;
+        self.table_has_column("cards", column)
+    }
+
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(columns.iter().any(|name| name.eq_ignore_ascii_case(column)))
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Opts this `Store` into the field-note seed generator (see
@@ -743,14 +828,6 @@ impl Store {
             .transpose()
     }
 
-    pub fn get_run(&self, run_id: &RunId) -> Result<Option<Run>> {
-        let record = self
-            .connection
-            .query_row(RUN_SELECT_SQL, [run_id.as_str()], RunRecord::from_row)
-            .optional()?;
-        record.map(RunRecord::into_run).transpose()
-    }
-
     pub fn list_ready(&self, query: ReadyQuery) -> Result<Vec<Card>> {
         Ok(self.list_ready_page(query)?.cards)
     }
@@ -938,6 +1015,7 @@ impl Store {
         &mut self,
         card_id: &CardId,
         agent: &str,
+        runtime_ref: Option<&str>,
         now: i64,
         ttl_seconds: u64,
         authority: &Authority,
@@ -963,22 +1041,27 @@ impl Store {
             return Ok(receipt);
         }
 
-        transaction.execute(
-            "UPDATE runs
-             SET state = 'stale', updated_at = ?2
-             WHERE card_id = ?1
-               AND state = 'active'
-               AND claim_expires_at <= ?2",
-            params![card_id.as_str(), now],
-        )?;
         if let Some(expired) = card.claim.as_ref().filter(|claim| claim.is_expired(now)) {
+            append_card_event(
+                &transaction,
+                card_id,
+                "claim",
+                &expired.agent,
+                &format!(
+                    "expired claim_id={} runtime_ref={}",
+                    expired.id,
+                    expired.runtime_ref.as_deref().unwrap_or("")
+                ),
+                now,
+            )?;
             events::append_outbound_card_event(
                 &transaction,
                 &card,
                 "claim-expired",
                 &expired.agent,
                 json!({
-                    "run_id": expired.run_id.as_str(),
+                    "claim_id": expired.id.as_str(),
+                    "runtime_ref": expired.runtime_ref,
                     "agent": expired.agent.as_str(),
                     "expired_at": expired.expires_at
                 }),
@@ -995,39 +1078,32 @@ impl Store {
             }
         }
 
-        let run_id = RunId::new(format!("run-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?;
+        let claim_id = ClaimId::new(format!("claim-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?;
         ensure_ready_repository_allowed(&transaction, &card)?;
-        let claim = card.apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds, |id| {
-            terminal_blockers.contains(id)
-        })?;
+        let claim = card.apply_claim(
+            agent.clone(),
+            claim_id,
+            runtime_ref.map(str::to_owned),
+            now,
+            ttl_seconds,
+            |id| terminal_blockers.contains(id),
+        )?;
         persist_card(&transaction, &card)?;
-
-        let run = Run {
-            id: run_id.clone(),
-            card_id: card_id.clone(),
-            state: RunState::Active,
-            agent: agent.clone(),
-            claim_expires_at: claim.expires_at,
-            proof: None,
-            created_at: now,
-            updated_at: now,
-        };
-        persist_run(&transaction, &run)?;
-        append_activity(
+        append_card_event(
             &transaction,
-            &run_id,
-            ActivityType::Action,
-            &format!("claimed {card_id}"),
+            card_id,
+            "claim",
+            &authority.actor_label(),
+            &format!(
+                "acquired claim_id={} agent={} runtime_ref={}",
+                claim.id,
+                claim.agent,
+                claim.runtime_ref.as_deref().unwrap_or("")
+            ),
             now,
         )?;
         transaction.commit()?;
-
-        Ok(ClaimReceipt {
-            card_id: card_id.clone(),
-            run_id,
-            agent,
-            expires_at: claim.expires_at,
-        })
+        Ok(claim_receipt(card_id, &claim))
     }
 
     pub fn update_status(
@@ -1045,18 +1121,8 @@ impl Store {
         if status == CardStatus::Ready {
             ensure_ready_repository_allowed(&transaction, &card)?;
         }
-        let released_claim = card.apply_status(status, now)?;
+        card.apply_status(status, now)?;
         persist_card(&transaction, &card)?;
-        if let Some(claim) = released_claim {
-            close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
-            append_activity(
-                &transaction,
-                &claim.run_id,
-                ActivityType::Action,
-                &format!("status set {card_id} to {}", status.as_str()),
-                now,
-            )?;
-        }
         append_card_event(
             &transaction,
             card_id,
@@ -1115,7 +1181,7 @@ impl Store {
     pub fn release_claim(
         &mut self,
         card_id: &CardId,
-        run_id: &RunId,
+        claim_id: &ClaimId,
         now: i64,
         authority: &Authority,
     ) -> Result<ClaimReceipt> {
@@ -1125,14 +1191,14 @@ impl Store {
         let mut card = load_card(&transaction, card_id)?;
         authority.require_holder(card.claim_holder())?;
         ensure_ready_repository_allowed(&transaction, &card)?;
-        let claim = card.release_claim(run_id, now)?;
+        let claim = card.release_claim(claim_id, now)?;
         persist_card(&transaction, &card)?;
-        release_run(&transaction, run_id, now)?;
-        append_activity(
+        append_card_event(
             &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("released {card_id}"),
+            card_id,
+            "claim",
+            &authority.actor_label(),
+            &format!("released claim_id={claim_id} agent={}", claim.agent),
             now,
         )?;
         events::append_outbound_card_event(
@@ -1140,7 +1206,7 @@ impl Store {
             &card,
             "moved-to-ready",
             &authority.actor_label(),
-            json!({"source": "release_claim", "run_id": run_id.as_str()}),
+            json!({"source": "release_claim", "claim_id": claim_id.as_str()}),
             now,
         )?;
         transaction.commit()?;
@@ -1150,7 +1216,7 @@ impl Store {
     pub fn renew_claim(
         &mut self,
         card_id: &CardId,
-        run_id: &RunId,
+        claim_id: &ClaimId,
         now: i64,
         ttl_seconds: u64,
         authority: &Authority,
@@ -1160,22 +1226,17 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         authority.require_holder(card.claim_holder())?;
-        let claim = card.renew_claim(run_id, now, ttl_seconds)?;
+        let claim = card.renew_claim(claim_id, now, ttl_seconds)?;
         persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET claim_expires_at = ?2, updated_at = ?3
-             WHERE id = ?1",
-            params![run_id.as_str(), claim.expires_at, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity(
+        append_card_event(
             &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("renewed {card_id} until {}", claim.expires_at),
+            card_id,
+            "claim",
+            &authority.actor_label(),
+            &format!(
+                "renewed claim_id={claim_id} expires_at={}",
+                claim.expires_at
+            ),
             now,
         )?;
         transaction.commit()?;
@@ -1185,7 +1246,7 @@ impl Store {
     pub fn heartbeat_claim(
         &mut self,
         card_id: &CardId,
-        run_id: &RunId,
+        claim_id: &ClaimId,
         now: i64,
         authority: &Authority,
     ) -> Result<ClaimReceipt> {
@@ -1194,22 +1255,17 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         authority.require_holder(card.claim_holder())?;
-        let claim = card.heartbeat_claim(run_id, now)?;
+        let claim = card.heartbeat_claim(claim_id, now)?;
         persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET updated_at = ?2
-             WHERE id = ?1",
-            params![run_id.as_str(), now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity(
+        append_card_event(
             &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("heartbeat {card_id}"),
+            card_id,
+            "claim",
+            &authority.actor_label(),
+            &format!(
+                "heartbeat claim_id={claim_id} expires_at={}",
+                claim.expires_at
+            ),
             now,
         )?;
         transaction.commit()?;
@@ -1220,13 +1276,13 @@ impl Store {
     /// no release-then-race window where a third party could grab the card
     /// between the release and the intended recipient's claim. Invocable by
     /// the current holder or an admin, same as renew/release/heartbeat.
-    /// Same run id throughout -- this is a handoff on the existing lease,
+    /// Same claim id throughout -- this is a handoff on the existing lease,
     /// not a new claim -- so the activity trail records one transfer event
     /// naming both agents rather than a release paired with a claim.
     pub fn transfer_claim(
         &mut self,
         card_id: &CardId,
-        run_id: &RunId,
+        claim_id: &ClaimId,
         to_agent: &str,
         now: i64,
         ttl_seconds: u64,
@@ -1238,22 +1294,14 @@ impl Store {
         let mut card = load_card(&transaction, card_id)?;
         authority.require_holder(card.claim_holder())?;
         let from_agent = card.claim_holder().unwrap_or_default().to_string();
-        let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
+        let claim = card.transfer_claim(claim_id, to_agent, now, ttl_seconds)?;
         persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET agent = ?2, claim_expires_at = ?3, updated_at = ?4
-             WHERE id = ?1",
-            params![run_id.as_str(), to_agent, claim.expires_at, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity(
+        append_card_event(
             &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("transferred {card_id} from {from_agent} to {to_agent}"),
+            card_id,
+            "claim",
+            &authority.actor_label(),
+            &format!("transferred claim_id={claim_id} from {from_agent} to {to_agent}"),
             now,
         )?;
         transaction.commit()?;
@@ -1332,21 +1380,24 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let card = load_card(&transaction, card_id)?;
-        let run_id = attribution.run_id.map(RunId::new).transpose()?;
+        let runtime_ref = attribution
+            .runtime_ref
+            .map(|value| non_empty("runtime_ref", value))
+            .transpose()?;
         let entry = WorkLogEntry {
             card_id: card_id.clone(),
             agent: non_empty("agent", agent)?,
             model: attribution.model.map(str::to_owned),
             reasoning: attribution.reasoning.map(str::to_owned),
             harness: attribution.harness.map(str::to_owned),
-            run_id,
+            runtime_ref,
             body: secrets::scrub_secrets(&non_empty("body", body)?),
             created_at: now,
         };
         let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
         transaction.execute(
             "INSERT INTO work_log_entries
-             (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
+             (id, card_id, agent, model, reasoning, harness, runtime_ref, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
@@ -1355,7 +1406,7 @@ impl Store {
                 entry.model,
                 entry.reasoning,
                 entry.harness,
-                entry.run_id.as_ref().map(RunId::as_str),
+                entry.runtime_ref,
                 entry.body,
                 entry.created_at,
             ],
@@ -1376,58 +1427,6 @@ impl Store {
         Ok(entry)
     }
 
-    pub fn request_input(
-        &mut self,
-        run_id: &RunId,
-        question: &str,
-        now: i64,
-        authority: &Authority,
-    ) -> Result<Run> {
-        let question = non_empty("question", question)?;
-        let mut run = self
-            .get_run(run_id)?
-            .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?;
-        let mut card = load_card(&self.connection, &run.card_id)?;
-        authority.require_holder(card.claim_holder())?;
-
-        card.status.validate_transition(CardStatus::AwaitingInput)?;
-        card.status = CardStatus::AwaitingInput;
-        card.updated_at = now;
-        run.state = RunState::AwaitingInput;
-        run.updated_at = now;
-
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        persist_card(&transaction, &card)?;
-        persist_run(&transaction, &run)?;
-        append_activity(
-            &transaction,
-            run_id,
-            ActivityType::Elicitation,
-            &question,
-            now,
-        )?;
-        append_card_event(
-            &transaction,
-            &card.id,
-            "status",
-            &authority.actor_label(),
-            "awaiting input",
-            now,
-        )?;
-        events::append_outbound_card_event(
-            &transaction,
-            &card,
-            "awaiting-input",
-            &authority.actor_label(),
-            json!({"run_id": run_id.as_str(), "question": question}),
-            now,
-        )?;
-        transaction.commit()?;
-        Ok(run)
-    }
-
     pub fn complete_card(
         &mut self,
         card_id: &CardId,
@@ -1445,8 +1444,6 @@ impl Store {
         let mut card = load_card(&transaction, card_id)?;
 
         let previous = card.status;
-        let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
-
         card.status = CardStatus::Done;
         card.claim = None;
         for criterion_proof in criterion_proofs {
@@ -1459,23 +1456,13 @@ impl Store {
         }
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        if let Some(run_id) = run_id {
-            close_run_for_status(
+        if let Some(proof) = proof.as_deref() {
+            append_card_event(
                 &transaction,
-                &run_id,
-                CardStatus::Done,
-                now,
-                proof.as_deref(),
-            )?;
-            append_activity(
-                &transaction,
-                &run_id,
-                ActivityType::Response,
-                proof
-                    .as_deref()
-                    .map(|proof| format!("completed: {proof}"))
-                    .unwrap_or_else(|| "completed without proof".to_string())
-                    .as_str(),
+                card_id,
+                "proof",
+                &authority.actor_label(),
+                proof,
                 now,
             )?;
         }
@@ -1666,14 +1653,18 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
         .transpose()?
         .flatten();
     let claim_agent = card.claim.as_ref().map(|claim| claim.agent.as_str());
-    let claim_run_id = card.claim.as_ref().map(|claim| claim.run_id.as_str());
+    let claim_id = card.claim.as_ref().map(|claim| claim.id.as_str());
+    let claim_runtime_ref = card
+        .claim
+        .as_ref()
+        .and_then(|claim| claim.runtime_ref.as_deref());
     let claim_acquired_at = card.claim.as_ref().map(|claim| claim.acquired_at);
     let claim_expires_at = card.claim.as_ref().map(|claim| claim.expires_at);
 
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -1695,7 +1686,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                source_path = excluded.source_path,
                source_digest = excluded.source_digest,
                claim_agent = excluded.claim_agent,
-               claim_run_id = excluded.claim_run_id,
+               claim_id = excluded.claim_id,
+               claim_runtime_ref = excluded.claim_runtime_ref,
                claim_acquired_at = excluded.claim_acquired_at,
                claim_expires_at = excluded.claim_expires_at,
                created_at = excluded.created_at,
@@ -1723,7 +1715,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             source_path,
             source_digest,
             claim_agent,
-            claim_run_id,
+            claim_id,
+            claim_runtime_ref,
             claim_acquired_at,
             claim_expires_at,
             card.created_at,
@@ -1731,65 +1724,6 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
         ],
     )?;
     Ok(())
-}
-
-fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
-    connection.execute(
-        "INSERT INTO runs (
-            id, card_id, state, agent, claim_expires_at, proof,
-            created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(id) DO UPDATE SET
-           card_id = excluded.card_id,
-           state = excluded.state,
-           agent = excluded.agent,
-           claim_expires_at = excluded.claim_expires_at,
-           proof = excluded.proof,
-           created_at = excluded.created_at,
-           updated_at = excluded.updated_at",
-        params![
-            run.id.as_str(),
-            run.card_id.as_str(),
-            run.state.as_str(),
-            run.agent,
-            run.claim_expires_at,
-            run.proof,
-            run.created_at,
-            run.updated_at
-        ],
-    )?;
-    Ok(())
-}
-
-fn append_activity(
-    connection: &Connection,
-    run_id: &RunId,
-    activity_type: ActivityType,
-    payload: &str,
-    now: i64,
-) -> Result<Activity> {
-    let activity = Activity {
-        id: ActivityId::new(format!(
-            "activity-{}",
-            nanoid::nanoid!(12, &API_KEY_ALPHABET)
-        ))?,
-        run_id: run_id.clone(),
-        activity_type,
-        payload: payload.to_owned(),
-        created_at: now,
-    };
-    connection.execute(
-        "INSERT INTO activities (id, run_id, activity_type, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            activity.id.as_str(),
-            activity.run_id.as_str(),
-            activity.activity_type.as_str(),
-            activity.payload,
-            activity.created_at
-        ],
-    )?;
-    Ok(activity)
 }
 
 fn append_card_event(
@@ -1823,50 +1757,11 @@ fn append_card_event(
     Ok(event)
 }
 
-fn release_run(connection: &Connection, run_id: &RunId, now: i64) -> Result<()> {
-    let updated = connection.execute(
-        "UPDATE runs
-         SET state = 'released', claim_expires_at = ?2, updated_at = ?2
-         WHERE id = ?1",
-        params![run_id.as_str(), now],
-    )?;
-    if updated == 0 {
-        return Err(DomainError::not_found("run", run_id.to_string()).into());
-    }
-    Ok(())
-}
-
-fn close_run_for_status(
-    connection: &Connection,
-    run_id: &RunId,
-    status: CardStatus,
-    now: i64,
-    proof: Option<&str>,
-) -> Result<()> {
-    let state = if status.is_terminal() {
-        RunState::Complete
-    } else {
-        RunState::Released
-    };
-    let updated = connection.execute(
-        "UPDATE runs
-         SET state = ?2,
-             claim_expires_at = CASE WHEN ?2 = 'released' THEN ?3 ELSE claim_expires_at END,
-             proof = COALESCE(?4, proof),
-             updated_at = ?3
-         WHERE id = ?1",
-        params![run_id.as_str(), state.as_str(), now, proof],
-    )?;
-    if updated == 0 {
-        return Err(DomainError::not_found("run", run_id.to_string()).into());
-    }
-    Ok(())
-}
-
 fn claim_receipt(card_id: &CardId, claim: &Claim) -> ClaimReceipt {
     ClaimReceipt {
         card_id: card_id.clone(),
-        run_id: claim.run_id.clone(),
+        claim_id: claim.id.clone(),
+        runtime_ref: claim.runtime_ref.clone(),
         agent: claim.agent.clone(),
         expires_at: claim.expires_at,
     }
@@ -2062,7 +1957,8 @@ struct CardRecord {
     source_path: Option<String>,
     source_digest: Option<String>,
     claim_agent: Option<String>,
-    claim_run_id: Option<String>,
+    claim_id: Option<String>,
+    claim_runtime_ref: Option<String>,
     claim_acquired_at: Option<i64>,
     claim_expires_at: Option<i64>,
     created_at: i64,
@@ -2093,11 +1989,12 @@ impl CardRecord {
             source_path: row.get(18)?,
             source_digest: row.get(19)?,
             claim_agent: row.get(20)?,
-            claim_run_id: row.get(21)?,
-            claim_acquired_at: row.get(22)?,
-            claim_expires_at: row.get(23)?,
-            created_at: row.get(24)?,
-            updated_at: row.get(25)?,
+            claim_id: row.get(21)?,
+            claim_runtime_ref: row.get(22)?,
+            claim_acquired_at: row.get(23)?,
+            claim_expires_at: row.get(24)?,
+            created_at: row.get(25)?,
+            updated_at: row.get(26)?,
         })
     }
 
@@ -2159,61 +2056,23 @@ impl CardRecord {
         };
         card.claim = match (
             self.claim_agent,
-            self.claim_run_id,
+            self.claim_id,
+            self.claim_runtime_ref,
             self.claim_acquired_at,
             self.claim_expires_at,
         ) {
-            (Some(agent), Some(run_id), Some(acquired_at), Some(expires_at)) => Some(Claim {
-                agent,
-                run_id: RunId::new(run_id)?,
-                acquired_at,
-                expires_at,
-            }),
+            (Some(agent), Some(claim_id), runtime_ref, Some(acquired_at), Some(expires_at)) => {
+                Some(Claim {
+                    agent,
+                    id: ClaimId::new(claim_id)?,
+                    runtime_ref,
+                    acquired_at,
+                    expires_at,
+                })
+            }
             _ => None,
         };
         card.updated_at = self.updated_at;
         Ok(card)
-    }
-}
-
-struct RunRecord {
-    id: String,
-    card_id: String,
-    state: String,
-    agent: String,
-    claim_expires_at: i64,
-    proof: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-impl RunRecord {
-    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            card_id: row.get(1)?,
-            state: row.get(2)?,
-            agent: row.get(3)?,
-            claim_expires_at: row.get(4)?,
-            proof: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
-        })
-    }
-
-    fn into_run(self) -> Result<Run> {
-        Ok(Run {
-            id: RunId::new(self.id)?,
-            card_id: CardId::new(self.card_id)?,
-            state: RunState::parse(&self.state).ok_or(StoreError::InvalidStoredValue {
-                field: "runs.state",
-                value: self.state,
-            })?,
-            agent: self.agent,
-            claim_expires_at: self.claim_expires_at,
-            proof: self.proof,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        })
     }
 }

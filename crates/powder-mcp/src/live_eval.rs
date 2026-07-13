@@ -7,7 +7,7 @@
 //! and both of those are exactly the kind of change that can quietly make an
 //! agent worse at picking cards or recovering older facts even while every
 //! scripted assertion stays green. This module gives an actual model the MCP
-//! tool surface over stdio and grades the resulting card/run state -- no LLM
+//! tool surface over stdio and grades the resulting card state -- no LLM
 //! judge, just SQLite-backed end states and exact string matches on the
 //! model's final reply.
 //!
@@ -785,11 +785,13 @@ fn grade_claim_ergonomics(mcp: &mut LiveMcpProcess, _run: &AgentRun) -> (bool, S
     let status = card["card"]["status"].as_str();
     let status_ok = status == Some("done");
     let criterion_checked = card["card"]["criteria"][0]["checked_by"].is_string();
-    let has_proof = card["runs"]
+    let has_proof = card["events"]
         .as_array()
-        .map(|runs| {
-            runs.iter()
-                .any(|run| run["proof"].as_str() == Some("https://example.test/eval-proof"))
+        .map(|events| {
+            events.iter().any(|event| {
+                event["event_type"].as_str() == Some("proof")
+                    && event["payload"].as_str() == Some("https://example.test/eval-proof")
+            })
         })
         .unwrap_or(false);
     if status_ok && criterion_checked && has_proof {
