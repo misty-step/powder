@@ -62,6 +62,15 @@ fn config_rejects_a_non_numeric_field_note_proof_min_chars() {
 }
 
 #[test]
+fn config_rejects_the_retired_import_files_setting() {
+    let retired_import_dir = concat!("POWDER_", "IMPORT_FILES_DIR");
+    let err = Config::from_pairs([(retired_import_dir, "/tmp/retired")]).unwrap_err();
+
+    assert_eq!(err.variable, retired_import_dir);
+    assert!(err.message.contains("retired"));
+}
+
+#[test]
 fn config_accepts_tailnet_and_none_modes() {
     let tailnet = Config::from_pairs([
         ("POWDER_AUTH_MODE", "tailnet"),
@@ -1743,6 +1752,25 @@ async fn api_routes_are_not_shadowed_by_the_board_shell() {
         .starts_with("application/json"));
     let body = response_json(response).await;
     assert_eq!(body["auth_mode"], "none");
+}
+
+#[tokio::test]
+async fn retired_bulk_import_route_is_not_served() {
+    let (state, _) = test_state(AuthMode::None);
+    let response = app(state)
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/import",
+            None,
+            "{}",
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        response.status(),
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+    ));
 }
 
 #[tokio::test]

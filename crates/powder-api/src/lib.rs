@@ -292,6 +292,7 @@ mod tests {
         let paths = ROUTES.iter().map(|route| route.path).collect::<Vec<_>>();
 
         assert!(paths.contains(&"/api/v1/cards"));
+        assert!(!paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
         assert!(paths.contains(&"/api/v1/approvals"));
         assert!(paths.contains(&"/api/v1/repositories"));

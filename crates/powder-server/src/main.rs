@@ -103,6 +103,13 @@ impl Config {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect::<BTreeMap<_, _>>();
+        let retired_import_dir = concat!("POWDER_", "IMPORT_FILES_DIR");
+        if vars.contains_key(retired_import_dir) {
+            return Err(ConfigError::new(
+                retired_import_dir,
+                "retired; remove the repository-ingestion setting",
+            ));
+        }
         let db_path = env_value(&vars, "POWDER_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));

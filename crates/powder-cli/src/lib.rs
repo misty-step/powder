@@ -1558,6 +1558,8 @@ mod tests {
         assert!(COMMANDS.contains(&"init-db"));
         assert!(COMMANDS.contains(&"key-list"));
         assert!(COMMANDS.contains(&"key-revoke"));
+        assert!(!COMMANDS.contains(&"import"));
+        assert!(!COMMANDS.contains(&"import-repo"));
         assert!(COMMANDS.contains(&"import-github-issues"));
         assert!(COMMANDS.contains(&"update-card"));
         assert!(COMMANDS.contains(&"list-ready"));
@@ -1583,6 +1585,13 @@ mod tests {
         assert!(COMMANDS.contains(&"check-criterion"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
+
+        for retired in ["import", "import-repo"] {
+            let err = run(&[retired.to_string()]).unwrap_err();
+            assert!(
+                matches!(err, ShellError::Invalid(message) if message == format!("unknown command: {retired}"))
+            );
+        }
         assert!(COMMANDS.contains(&"subscription-create"));
         assert!(COMMANDS.contains(&"subscription-list"));
         assert!(COMMANDS.contains(&"subscription-disable"));

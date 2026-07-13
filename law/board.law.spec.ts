@@ -116,7 +116,7 @@ for (const mode of MODES) {
     await card.click();
     await expect(page).toHaveURL(/\/c\/001$/);
     await expect(page.locator("#powder-card-app")).toBeVisible();
-    await expect(page.locator("#detail-body")).toContainText("Import example backlog ticket");
+    await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
     await assertLaw(page, { consoleErrors: errors });
     await page.goBack();
     await expect(page).toHaveURL(/\/board$/);
@@ -142,7 +142,7 @@ for (const mode of MODES) {
       await page.setViewportSize(viewport.size);
       const errors = await boot(page, mode, "/c/001");
       await expect(page.locator("#powder-card-app")).toBeVisible();
-      await expect(page.locator("#detail-body")).toContainText("Import example backlog ticket");
+      await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
       await expect(page.locator("#detail-body")).toContainText("ACCEPTANCE");
       // powder-942: home affordance present next to the existing "board"
       // link at every viewport this route is tested at, mobile included.

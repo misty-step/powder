@@ -6,6 +6,14 @@ use powder_store::Store;
 use serde_json::Value;
 
 fn main() {
+    let retired_source_env = concat!("POWDER_", "BACKLOG_DIR");
+    if std::env::var_os(retired_source_env).is_some() {
+        eprintln!(
+            "powder-mcp: {retired_source_env} is retired; migrate cards into Powder and remove the repository-ingestion setting"
+        );
+        std::process::exit(1);
+    }
+
     let toolset = match Toolset::from_env() {
         Ok(toolset) => toolset,
         Err(err) => {

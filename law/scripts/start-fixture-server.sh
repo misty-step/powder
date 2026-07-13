@@ -18,7 +18,7 @@ export PORT="${PORT:-4100}"
 export POWDER_HOME_URL="https://sanctum.example.test"
 
 cargo run -q -p powder-cli -- init-db --db "$DB" >/dev/null
-cargo run -q -p powder-cli -- create-card --db "$DB" --id ready-card --title "Ready card" --acceptance "proof exists" --status ready >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id 001 --title "Lifecycle example card" --acceptance "proof exists" --status ready >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id blocked-card --title "Blocked card" --acceptance "dependency clears" --status blocked >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id done-card --title "Done card" --acceptance "proof exists" --status done >/dev/null
 

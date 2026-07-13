@@ -248,7 +248,7 @@ POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 
 Board read routes are reachable without a key in `api-key` mode; the private
 Flycast/Tailscale network is the read perimeter. Mutations, card status and
-relation changes, claim lifecycle, card authoring, imports, comments, links,
+relation changes, claim lifecycle, card authoring, comments, links,
 answer-loop writes, and key management require `Authorization: Bearer <key>` in
 `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
@@ -340,7 +340,7 @@ with no such portal leave it unset and see no change.
 
 The board's write actions (quick-add a card, change a card's status, claim,
 comment, complete) only need `agent` scope, not `admin` -- `admin` is
-reserved for bulk import, repository management, and key management, none
+reserved for repository management and key management, neither
 of which the board UI's phone surface exposes. Mint a dedicated,
 independently-revocable `agent`-scope key for this instead of pasting the
 admin key into Safari:

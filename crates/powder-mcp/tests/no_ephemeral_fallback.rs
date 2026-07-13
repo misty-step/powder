@@ -32,3 +32,23 @@ fn refuses_to_start_without_a_persistence_mode() {
         "must not emit any JSON-RPC output"
     );
 }
+
+#[test]
+fn rejects_the_retired_repository_ingestion_setting() {
+    let binary = env!("CARGO_BIN_EXE_powder-mcp");
+    let retired_source_env = concat!("POWDER_", "BACKLOG_DIR");
+
+    let output = Command::new(binary)
+        .env("POWDER_DB_PATH", "/tmp/powder-retired-source-test.db")
+        .env(retired_source_env, "/tmp/retired-source")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn powder-mcp");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(retired_source_env));
+    assert!(stderr.contains("retired"));
+}
