@@ -12,7 +12,6 @@ fn refuses_to_start_without_a_persistence_mode() {
     let output = Command::new(binary)
         .env_remove("POWDER_API_BASE_URL")
         .env_remove("POWDER_DB_PATH")
-        .env_remove("POWDER_BACKLOG_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

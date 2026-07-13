@@ -14,9 +14,8 @@ Valid values:
 - `review`: the conservative default. The work still must be fully verified by
   agents; the operator only supplies the explicit approval answer.
 
-The class can be set when a card is created, revised later through the safe
-card patch/update surfaces, or supplied in backlog.d as `Autonomy: auto` or
-`Autonomy: review`. GitHub issue imports do not map autonomy yet; they rely on
+The class can be set when a card is created or revised later through the safe
+card patch/update surfaces. GitHub issue imports do not map autonomy yet; they rely on
 the conservative `review` default. Powder does not infer class and never calls
 a model to classify it.
 

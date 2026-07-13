@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Write};
 
 use powder_mcp::{RemoteClient, Toolset};
-use powder_shell::{load_backlog_dir, unix_now};
+use powder_shell::unix_now;
 use powder_store::Store;
 use serde_json::Value;
 
@@ -49,11 +49,6 @@ fn main() {
 fn run_persistent(db_path: &str, toolset: Toolset) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open(db_path)?;
     store.migrate()?;
-    if let Ok(path) = std::env::var("POWDER_BACKLOG_DIR") {
-        let cards = load_backlog_dir(path, unix_now())?;
-        store.import_cards(cards)?;
-    }
-
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {

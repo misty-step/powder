@@ -607,7 +607,7 @@ fn create_card_with_events_rejects_repo_that_conflicts_with_numeric_id_prefix() 
 
 #[test]
 fn estimate_round_trips_through_persist_and_load_and_filters_list_and_ready() -> Result<()> {
-    // powder-964: backlog.d's Estimate: S/M/L/XL header has a Powder
+    // powder-964: source file's Estimate: S/M/L/XL header has a Powder
     // equivalent now -- optional, round-trips, and both list-ready and
     // list-cards can filter on it so an autonomous chewer can self-select
     // for low-complexity work without reading full card bodies.
@@ -1432,7 +1432,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("patch-protected")?;
-    let mut card = backlog_card("patch-protected", 2, "sha256:v1");
+    let mut card = sourced_card("patch-protected", 2, "sha256:v1");
     card.branch_name = Some("codex/powder-901".to_string());
     card.workspace_path = Some("/tmp/powder-workspace".to_string());
     store.import_cards(vec![card])?;
@@ -1511,7 +1511,7 @@ fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("powder-905")?;
-    store.import_cards(vec![backlog_card("powder-905", 2, "sha256:v1")])?;
+    store.import_cards(vec![sourced_card("powder-905", 2, "sha256:v1")])?;
     let claim = store.claim_card(
         &card_id,
         "import-worker",
@@ -2206,7 +2206,7 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
             );
             -- a real v1 database already had the original runs shape
             -- (predating the identity/hash-algorithm migrations entirely),
-            -- including the columns backlog.d/018 later dropped.
+            -- including the columns source file/018 later dropped.
             CREATE TABLE runs (
               id TEXT PRIMARY KEY,
               card_id TEXT NOT NULL,
@@ -2314,7 +2314,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
               updated_at INTEGER NOT NULL
             );
             -- a real v2 database already had the original runs shape,
-            -- including the columns backlog.d/018 later dropped.
+            -- including the columns source file/018 later dropped.
             CREATE TABLE runs (
               id TEXT PRIMARY KEY,
               card_id TEXT NOT NULL,
@@ -2674,10 +2674,10 @@ fn answer_input_rejects_actor_impersonation() -> Result<()> {
     Ok(())
 }
 
-fn backlog_card(id: &str, created_at: i64, digest: &str) -> Card {
+fn sourced_card(id: &str, created_at: i64, digest: &str) -> Card {
     let mut card = ready_card(id, created_at);
     card.source = Some(CardSource {
-        path: format!("backlog.d/{id}-test.md"),
+        path: format!("migration/{id}.json"),
         digest: digest.to_string(),
     });
     card
@@ -2688,7 +2688,7 @@ fn reimport_over_a_claimed_card_preserves_claim_and_status() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("001")?;
-    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
     let claim = store.claim_card(
         &card_id,
         "agent-a",
@@ -2703,9 +2703,9 @@ fn reimport_over_a_claimed_card_preserves_claim_and_status() -> Result<()> {
         &Authority::actor("agent-a", false),
     )?;
 
-    // a stale reimport of the same backlog.d file (still says "ready", no
+    // a stale reimport of the same source file file (still says "ready", no
     // claim) must not clobber the live claim or status.
-    let outcome = store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    let outcome = store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
 
     let card = store.get_card(&card_id)?.expect("card");
     assert_eq!(card.status, CardStatus::Running);
@@ -2729,7 +2729,7 @@ fn reimport_over_a_terminal_card_keeps_its_outcome() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("001")?;
-    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
     store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
     store.complete_card(
@@ -2740,7 +2740,7 @@ fn reimport_over_a_terminal_card_keeps_its_outcome() -> Result<()> {
         &Authority::unchecked(),
     )?;
 
-    let outcome = store.import_cards(vec![backlog_card("001", 2, "sha256:v2-edited")])?;
+    let outcome = store.import_cards(vec![sourced_card("001", 2, "sha256:v2-edited")])?;
 
     let card = store.get_card(&card_id)?.expect("card");
     assert_eq!(card.status, CardStatus::Done, "shipped work stays shipped");
@@ -2762,9 +2762,9 @@ fn reimport_over_a_quiescent_card_refreshes_content_and_status() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("001")?;
-    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
 
-    let mut edited = backlog_card("001", 999, "sha256:v2-edited");
+    let mut edited = sourced_card("001", 999, "sha256:v2-edited");
     edited.status = CardStatus::Blocked;
     edited.title = "Edited title".to_string();
     let outcome = store.import_cards(vec![edited])?;
@@ -2788,119 +2788,12 @@ fn reimport_over_a_quiescent_card_refreshes_content_and_status() -> Result<()> {
 }
 
 #[test]
-fn backlog_autonomy_import_round_trips_and_reimport_tracks_status_semantics() -> Result<()> {
-    let mut store = Store::open_in_memory()?;
-    store.migrate()?;
-    let card_id = CardId::new("001")?;
-
-    let auto = powder_core::parse_backlog_card(
-        "backlog.d/001-autonomy.md",
-        "# Autonomy fixture\n\nPriority: P1 | Status: ready | Autonomy: auto\n\n## Goal\nShip it.\n\n## Oracle\n- [ ] proof\n",
-        1,
-    )
-    .unwrap();
-    store.import_cards(vec![auto])?;
-    assert_eq!(
-        store.get_card(&card_id)?.expect("card").autonomy,
-        AutonomyClass::Auto
-    );
-
-    let review = powder_core::parse_backlog_card(
-        "backlog.d/001-autonomy.md",
-        "# Autonomy fixture edited\n\nPriority: P1 | Status: blocked | Autonomy: review\n\n## Goal\nShip it after review.\n\n## Oracle\n- [ ] proof\n",
-        2,
-    )
-    .unwrap();
-    store.import_cards(vec![review])?;
-    let card = store.get_card(&card_id)?.expect("card");
-    assert_eq!(card.status, CardStatus::Blocked);
-    assert_eq!(card.autonomy, AutonomyClass::Review);
-
-    store.update_status(&card_id, CardStatus::Ready, 3, &Authority::unchecked())?;
-    let claim = store.claim_card(&card_id, "agent-a", 4, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 5, &Authority::unchecked())?;
-    let stale = powder_core::parse_backlog_card(
-        "backlog.d/001-autonomy.md",
-        "# Autonomy fixture stale\n\nPriority: P1 | Status: ready | Autonomy: auto\n\n## Goal\nStale copy.\n\n## Oracle\n- [ ] proof\n",
-        6,
-    )
-    .unwrap();
-    let outcome = store.import_cards(vec![stale])?;
-
-    let card = store.get_card(&card_id)?.expect("card");
-    assert_eq!(card.status, CardStatus::Running);
-    assert_eq!(card.autonomy, AutonomyClass::Review);
-    assert_eq!(card.claim.as_ref().map(|c| &c.run_id), Some(&claim.run_id));
-    assert_eq!(
-        outcome,
-        ImportOutcome {
-            preserved: 1,
-            ..Default::default()
-        }
-    );
-    Ok(())
-}
-
-#[test]
-fn reimport_through_a_malformed_backlog_file_neither_wipes_content_nor_corrupts_status(
-) -> Result<()> {
-    // end-to-end reproduction of crucible-905 through the real import path
-    // (powder_core::parse_backlog_card -> Store::import_cards), not just the
-    // isolated merge_reimport unit: an epic card with 60+ lines of real
-    // content gets reimported from a file using non-standard headings
-    // ("## Premise"/"## Acceptance" instead of "## Goal"/"## Oracle", the
-    // exact convention crucible-034/035 used) and an inline
-    // "Status: in-progress" label meant as a project-management note, not a
-    // claim assertion. Neither the content nor the status corruption from
-    // the real incident should be reproducible after the fix.
-    let mut store = Store::open_in_memory()?;
-    store.migrate()?;
-    let card_id = CardId::new("034")?;
-    store.import_cards(vec![powder_core::parse_backlog_card(
-        "backlog.d/034-harbor-task-runner-seam.md",
-        "# 034 - Harbor task runner seam\n\nPriority: P1\n\n## Goal\nCrucible should own the benchmark run ledger.\n\n## Oracle\n- [ ] harbor runner family exists\n- [ ] result.json is parsed into run records\n",
-        1,
-    ).unwrap()])?;
-
-    let malformed_reimport = powder_core::parse_backlog_card(
-        "backlog.d/034-harbor-task-runner-seam.md",
-        "# 034 - Harbor task runner seam\n\nPriority: P1 \u{b7} Status: in-progress \u{b7} Estimate: XL\n\n## Premise\nHarbor is now the official harness for a broader benchmark framework.\n\n## Acceptance\n- Add a harbor_task runner family.\n- Parse job/trial result.json into run records.\n",
-        999,
-    )
-    .unwrap();
-    store.import_cards(vec![malformed_reimport])?;
-
-    let card = store.get_card(&card_id)?.expect("card");
-    assert_eq!(
-        card.body, "Crucible should own the benchmark run ledger.",
-        "the malformed file's missing ## Goal section must not wipe the real body"
-    );
-    assert_eq!(
-        card.acceptance,
-        vec![
-            "harbor runner family exists".to_string(),
-            "result.json is parsed into run records".to_string()
-        ],
-        "the malformed file's missing ## Oracle section must not wipe the real acceptance"
-    );
-    assert_eq!(
-        card.status,
-        CardStatus::Ready,
-        "Status: in-progress must not promote an unclaimed card to Running, and restoring \
-         the real acceptance must re-derive Ready rather than leaving it at the malformed \
-         file's own empty-oracle default of Backlog"
-    );
-    assert!(card.claim.is_none());
-    Ok(())
-}
-
-#[test]
 fn reimport_with_no_content_change_is_reported_unchanged() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
-    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
 
-    let outcome = store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    let outcome = store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
 
     assert_eq!(
         outcome,
@@ -2914,7 +2807,7 @@ fn reimport_with_no_content_change_is_reported_unchanged() -> Result<()> {
 
 #[test]
 fn reimport_with_same_digest_but_repaired_acceptance_is_flagged_content_repaired() -> Result<()> {
-    // powder-963: a parser fix can change what a byte-identical backlog.d
+    // powder-963: a parser fix can change what a byte-identical source file
     // file parses into (e.g. absorbing a previously-truncated continuation
     // line) without the file itself changing, so `source.digest` stays the
     // same across the reimport. `content_repaired` is the audit signal an
@@ -2923,11 +2816,11 @@ fn reimport_with_same_digest_but_repaired_acceptance_is_flagged_content_repaired
     // every card against its source file.
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
-    let mut truncated = backlog_card("001", 2, "sha256:v1");
+    let mut truncated = sourced_card("001", 2, "sha256:v1");
     truncated.acceptance = vec!["The list/shuffle (`assets/route.ts`), and similar".to_string()];
     store.import_cards(vec![truncated])?;
 
-    let mut repaired = backlog_card("001", 2, "sha256:v1");
+    let mut repaired = sourced_card("001", 2, "sha256:v1");
     repaired.acceptance = vec![
         "The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) read paths \
          return `thumbnailUrl`."
@@ -2955,11 +2848,11 @@ fn reimport_with_a_changed_digest_never_counts_as_content_repaired() -> Result<(
     // make the audit signal noisy on every normal reimport.
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
-    let mut original = backlog_card("001", 2, "sha256:v1");
+    let mut original = sourced_card("001", 2, "sha256:v1");
     original.acceptance = vec!["original wording".to_string()];
     store.import_cards(vec![original])?;
 
-    let mut edited = backlog_card("001", 2, "sha256:v2");
+    let mut edited = sourced_card("001", 2, "sha256:v2");
     edited.acceptance = vec!["a genuinely different criterion".to_string()];
     let outcome = store.import_cards(vec![edited])?;
 
@@ -2979,9 +2872,9 @@ fn import_reports_create_update_preserve_and_unchanged_together() -> Result<()> 
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     store.import_cards(vec![
-        backlog_card("001", 1, "sha256:v1"), // will stay unchanged
-        backlog_card("002", 1, "sha256:v1"), // will be edited
-        backlog_card("003", 1, "sha256:v1"), // will be claimed then reimported
+        sourced_card("001", 1, "sha256:v1"), // will stay unchanged
+        sourced_card("002", 1, "sha256:v1"), // will be edited
+        sourced_card("003", 1, "sha256:v1"), // will be claimed then reimported
     ])?;
     store.claim_card(
         &CardId::new("003")?,
@@ -2991,13 +2884,13 @@ fn import_reports_create_update_preserve_and_unchanged_together() -> Result<()> 
         &Authority::unchecked(),
     )?;
 
-    let mut edited_002 = backlog_card("002", 1, "sha256:v2");
+    let mut edited_002 = sourced_card("002", 1, "sha256:v2");
     edited_002.title = "Edited".to_string();
     let outcome = store.import_cards(vec![
-        backlog_card("001", 1, "sha256:v1"),
+        sourced_card("001", 1, "sha256:v1"),
         edited_002,
-        backlog_card("003", 1, "sha256:v1"),
-        backlog_card("004", 1, "sha256:v1"),
+        sourced_card("003", 1, "sha256:v1"),
+        sourced_card("004", 1, "sha256:v1"),
     ])?;
 
     assert_eq!(
@@ -3019,11 +2912,11 @@ fn preview_import_reports_without_mutating_the_store() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("001")?;
-    store.import_cards(vec![backlog_card("001", 2, "sha256:v1")])?;
+    store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
     store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
     store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
 
-    let preview = store.preview_import(&[backlog_card("001", 2, "sha256:v2-edited")])?;
+    let preview = store.preview_import(&[sourced_card("001", 2, "sha256:v2-edited")])?;
     assert_eq!(
         preview,
         ImportOutcome {
@@ -3411,7 +3304,7 @@ fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()
     );
 
     // Real, no proof at all: `crucible-010`'s actual completion shape live
-    // right now -- imported from backlog.d, moved straight to done with no
+    // right now -- imported from source file, moved straight to done with no
     // `proof` ever recorded on the run.
     let no_proof_id = CardId::new("replay-real-no-proof")?;
     store.create_card_with_events(

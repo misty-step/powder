@@ -394,11 +394,11 @@ impl Store {
             .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?)
     }
 
-    /// Import backlog.d cards without clobbering live lifecycle state: a
+    /// Upsert externally sourced cards without clobbering live lifecycle state: a
     /// card that is claimed, running, awaiting input, or already at a
     /// terminal outcome keeps its stored status/claim, while its content
     /// (title, body, acceptance, labels, source digest, ...) still refreshes
-    /// from the freshly parsed file. See [`Card::merge_reimport`].
+    /// from the incoming source. See [`Card::merge_reimport`].
     pub fn import_cards(&mut self, cards: Vec<Card>) -> Result<ImportOutcome> {
         let transaction = self
             .connection
@@ -494,12 +494,9 @@ impl Store {
 
     /// Compute what [`Store::import_cards`] would do to `cards` without
     /// writing anything, so a caller can show a create/update/preserve/
-    /// unchanged report before committing to the import. `content_repaired`
-    /// (powder-963) surfaces cards whose source file digest is unchanged but
-    /// whose re-parsed acceptance text now differs from what's stored -- the
-    /// audit signal for a parser fix landing on already-imported cards
-    /// (e.g. the hard-wrapped-continuation truncation bug) without a manual
-    /// per-card diff against the backlog.d source.
+    /// unchanged report before committing to the upsert. `content_repaired`
+    /// surfaces cards whose source digest is unchanged but whose acceptance
+    /// text differs from what is stored.
     pub fn preview_import(&self, cards: &[Card]) -> Result<ImportOutcome> {
         let mut outcome = ImportOutcome::default();
         for incoming in cards {
@@ -1942,10 +1939,10 @@ fn classify_reimport(current: &Card, incoming: &Card) -> ReimportClass {
     }
 }
 
-/// Counts of what a backlog.d import did (or, from
+/// Counts of what an external-source batch upsert did (or, from
 /// [`Store::preview_import`], would do) to each card: newly created, content
 /// refreshed, lifecycle preserved against a stale reimport, or left
-/// untouched because the source file hasn't changed.
+/// untouched because the source has not changed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ImportOutcome {
     pub created: usize,
@@ -1953,15 +1950,13 @@ pub struct ImportOutcome {
     pub preserved: usize,
     pub unchanged: usize,
     /// Cards whose acceptance text actually changed on this reimport even
-    /// though the source file's digest did NOT (powder-963): a parser fix
-    /// repairing previously-truncated criteria on already-imported cards.
+    /// though the source digest did not: an adapter fix repairing previously
+    /// malformed criteria on already-sourced cards.
     /// Scoped to `ReimportClass::Unchanged` specifically -- an ordinary
     /// source edit changes the digest too (`ReimportClass::Updated`), and
     /// that acceptance-text delta is expected, not damage, so it must not
-    /// inflate this counter. Audit an already-imported repo for backlog.d
-    /// parser damage by running `preview_import` (or `import-repo
-    /// --dry-run` from the CLI) after a parser fix ships and reading this
-    /// count instead of hand-diffing every card against its source file.
+    /// inflate this counter. `preview_import` exposes the repair count before
+    /// a batch is written.
     pub content_repaired: usize,
 }
 

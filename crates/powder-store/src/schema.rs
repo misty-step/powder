@@ -356,7 +356,7 @@ pub const MIGRATE_11_TO_12: &str = r#"
 ALTER TABLE cards ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'review';
 "#;
 
-/// powder-964: backlog.d's `Estimate: S/M/L/XL` header has no Powder
+/// powder-964: source file's `Estimate: S/M/L/XL` header has no Powder
 /// equivalent, so an autonomous chewer has to read a full card body to
 /// gauge complexity. Nullable/optional: existing cards are not required to
 /// backfill it.

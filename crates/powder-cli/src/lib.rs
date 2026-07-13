@@ -2,12 +2,10 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
+    Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
     ReadyQuery, RunId,
 };
-use powder_shell::{
-    load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
-};
+use powder_shell::{load_github_issues_file, unix_now, ShellError};
 use powder_store::{
     ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
     Store, StoreError,
@@ -20,8 +18,6 @@ pub const COMMANDS: &[&str] = &[
     "key-create",
     "key-list",
     "key-revoke",
-    "import",
-    "import-repo",
     "import-github-issues",
     "create-card",
     "update-card",
@@ -109,8 +105,6 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "key-create" => key_create(rest),
         [command, rest @ ..] if command == "key-list" => key_list(rest),
         [command, rest @ ..] if command == "key-revoke" => key_revoke(rest),
-        [command, rest @ ..] if command == "import" => import(rest),
-        [command, rest @ ..] if command == "import-repo" => import_repo(rest),
         [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
         [command, rest @ ..] if command == "update-card" => update_card(rest, remote_env),
@@ -179,10 +173,6 @@ pub fn help() -> String {
     help.push_str("  powder key-create --db ./data/powder.db --name codex --scope agent\n");
     help.push_str("  powder key-list --db ./data/powder.db\n");
     help.push_str("  powder key-revoke key-id --db ./data/powder.db\n");
-    help.push_str("  powder import backlog.d --db ./data/powder.db\n");
-    help.push_str(
-        "  powder import-repo ../bitterblossom/backlog.d --repo misty-step/bitterblossom --db ./data/powder.db\n",
-    );
     help.push_str(
         "  gh issue list --json number,title,body,labels,state,url --repo misty-step/bitterblossom > issues.json\n",
     );
@@ -336,46 +326,6 @@ fn key_revoke(args: &[String]) -> Result<String, ShellError> {
     Ok(format!("revoked\t{key_id}\n"))
 }
 
-fn import(args: &[String]) -> Result<String, ShellError> {
-    let dry_run = has_flag(args, "--dry-run");
-    let now = unix_now();
-    let path = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("import requires a backlog.d path".to_string()))?;
-    let cards = load_backlog_dir(path, now)?;
-    let mut out = String::new();
-
-    match (dry_run, flag_value(args, "--db")) {
-        (true, None) => {
-            out.push_str(&format!("dry-run\t{}\n", cards.len()));
-        }
-        (true, Some(db)) => {
-            let store = open_store(db)?;
-            let outcome = store.preview_import(&cards).map_err(store_err)?;
-            out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
-        }
-        (false, _) => {
-            let mut store = open_store(required_flag(args, "--db")?)?;
-            let outcome = store
-                .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
-                .map_err(store_err)?;
-            out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
-        }
-    }
-
-    for card in cards {
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
-            card.id,
-            card.priority.as_str(),
-            card.status.as_str(),
-            card.title
-        ));
-    }
-    Ok(out)
-}
-
 fn outcome_line(outcome: &powder_store::ImportOutcome) -> String {
     format!(
         "total={}\tcreated={}\tupdated={}\tpreserved={}\tunchanged={}\tcontent_repaired={}",
@@ -386,45 +336,6 @@ fn outcome_line(outcome: &powder_store::ImportOutcome) -> String {
         outcome.unchanged,
         outcome.content_repaired
     )
-}
-
-/// Import one Factory repo's backlog.d into a shared instance database: card
-/// ids are namespaced `{repo-slug}-{original-id}` and tagged with `--repo`
-/// so cards from independently numbered repos (every repo's backlog.d
-/// starts its own `001-*.md`) can coexist without id collisions. Run once
-/// per repo to migrate the fleet's backlog into one Powder instance.
-fn import_repo(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let path = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("import-repo requires a backlog.d path".to_string()))?;
-    let repo = required_flag(args, "--repo")?;
-    let cards = load_backlog_dir_for_repo(path, repo, now)?;
-    let mut out = String::new();
-
-    if has_flag(args, "--dry-run") {
-        let store = open_store(required_flag(args, "--db")?)?;
-        let outcome = store.preview_import(&cards).map_err(store_err)?;
-        out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
-    } else {
-        let mut store = open_store(required_flag(args, "--db")?)?;
-        let outcome = store
-            .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
-            .map_err(store_err)?;
-        out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
-    }
-
-    for card in cards {
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
-            card.id,
-            card.priority.as_str(),
-            card.status.as_str(),
-            card.title
-        ));
-    }
-    Ok(out)
 }
 
 /// Import a GitHub repo's issues from a local JSON file (the shape produced
@@ -669,11 +580,6 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let ready = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         json!(store.list_ready(query).map_err(store_err)?)
-    } else if let Some(path) = positional(args).first().copied() {
-        let cards = load_backlog_dir(path, now)?;
-        let mut board = Board::default();
-        board.import_cards(cards);
-        json!(board.list_ready(query))
     } else if let Some(client) = remote_env.client() {
         let mut url = format!("/api/v1/cards/ready?limit={limit}");
         if let Some(estimate) = estimate {
@@ -683,7 +589,7 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         list_page_cards(page)?
     } else {
         return Err(ShellError::Invalid(
-            "list-ready requires --db, POWDER_API_BASE_URL, or a backlog.d path".to_string(),
+            "list-ready requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments".to_string(),
         ));
     };
 
@@ -1652,8 +1558,6 @@ mod tests {
         assert!(COMMANDS.contains(&"init-db"));
         assert!(COMMANDS.contains(&"key-list"));
         assert!(COMMANDS.contains(&"key-revoke"));
-        assert!(COMMANDS.contains(&"import"));
-        assert!(COMMANDS.contains(&"import-repo"));
         assert!(COMMANDS.contains(&"import-github-issues"));
         assert!(COMMANDS.contains(&"update-card"));
         assert!(COMMANDS.contains(&"list-ready"));
@@ -1921,116 +1825,6 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.to_string().contains("invalid --estimate"));
-    }
-
-    #[test]
-    fn cli_reimport_over_a_claimed_card_preserves_the_claim() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let db = std::env::temp_dir().join(format!("powder-cli-import-{nanos}.db"));
-        let db = db.to_string_lossy().to_string();
-        let backlog_dir = std::env::temp_dir().join(format!("powder-cli-import-backlog-{nanos}"));
-        std::fs::create_dir_all(&backlog_dir).unwrap();
-        let ticket_path = backlog_dir.join("001-reimport-test.md");
-        let ticket = "# Reimport test\n\nPriority: P0 | Status: ready\n\n## Goal\nProve reimport safety.\n\n## Oracle\n- [ ] reimport preserves an active claim\n";
-        std::fs::write(&ticket_path, ticket).unwrap();
-        let backlog_dir = backlog_dir.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-
-        let first_import = run(&args(["import", &backlog_dir, "--db", &db])).unwrap();
-        assert!(first_import
-            .contains("imported\ttotal=1\tcreated=1\tupdated=0\tpreserved=0\tunchanged=0"));
-
-        run(&args(["claim", "001", "--db", &db, "--agent", "codex"])).unwrap();
-        run(&args([
-            "update-status",
-            "001",
-            "--db",
-            &db,
-            "--status",
-            "running",
-        ]))
-        .unwrap();
-
-        // re-importing the exact same, unedited backlog.d file must not
-        // clobber the active claim/status.
-        let second_import = run(&args(["import", &backlog_dir, "--db", &db])).unwrap();
-        assert!(second_import
-            .contains("imported\ttotal=1\tcreated=0\tupdated=0\tpreserved=1\tunchanged=0"));
-
-        let card = run(&args(["get-card", "001", "--db", &db])).unwrap();
-        assert!(card.contains("\"status\": \"running\""));
-        assert!(card.contains("\"agent\": \"codex\""));
-
-        // a dry-run against the same --db reports what would happen without
-        // mutating anything.
-        let dry_run = run(&args(["import", &backlog_dir, "--db", &db, "--dry-run"])).unwrap();
-        assert!(
-            dry_run.contains("dry-run\ttotal=1\tcreated=0\tupdated=0\tpreserved=1\tunchanged=0")
-        );
-        let card_after_dry_run = run(&args(["get-card", "001", "--db", &db])).unwrap();
-        assert_eq!(
-            card, card_after_dry_run,
-            "dry-run must not mutate the store"
-        );
-    }
-
-    #[test]
-    fn cli_import_repo_namespaces_ids_so_two_repos_never_collide() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let db = std::env::temp_dir().join(format!("powder-cli-import-repo-{nanos}.db"));
-        let db = db.to_string_lossy().to_string();
-
-        let repo_a = std::env::temp_dir().join(format!("powder-cli-repo-a-{nanos}"));
-        std::fs::create_dir_all(&repo_a).unwrap();
-        std::fs::write(
-            repo_a.join("001-first.md"),
-            "# Repo A ticket one\n\nPriority: P0 | Status: ready\n\n## Goal\nA.\n\n## Oracle\n- [ ] a\n",
-        )
-        .unwrap();
-
-        let repo_b = std::env::temp_dir().join(format!("powder-cli-repo-b-{nanos}"));
-        std::fs::create_dir_all(&repo_b).unwrap();
-        std::fs::write(
-            repo_b.join("001-first.md"),
-            "# Repo B ticket one\n\nPriority: P0 | Status: ready\n\n## Goal\nB.\n\n## Oracle\n- [ ] b\n",
-        )
-        .unwrap();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        let import_a = run(&args([
-            "import-repo",
-            repo_a.to_str().unwrap(),
-            "--repo",
-            "misty-step/repo-a",
-            "--db",
-            &db,
-        ]))
-        .unwrap();
-        assert!(import_a.contains("repo-a-001"));
-        let import_b = run(&args([
-            "import-repo",
-            repo_b.to_str().unwrap(),
-            "--repo",
-            "misty-step/repo-b",
-            "--db",
-            &db,
-        ]))
-        .unwrap();
-        assert!(import_b.contains("repo-b-001"));
-
-        // both survive independently: no id collision even though both
-        // repos number their tickets starting from 001.
-        let card_a = run(&args(["get-card", "repo-a-001", "--db", &db])).unwrap();
-        assert!(card_a.contains("Repo A ticket one"));
-        let card_b = run(&args(["get-card", "repo-b-001", "--db", &db])).unwrap();
-        assert!(card_b.contains("Repo B ticket one"));
     }
 
     #[test]
@@ -2552,7 +2346,7 @@ mod tests {
         // issue is a terminal (Done) card, so its *status* is protected from
         // a stale reimport the same way a claim is -- even if the issue is
         // reopened on GitHub afterward (content like title/body still
-        // refreshes on reimport, same as backlog.d; only status/claim are
+        // refreshes on reimport, same as source file; only status/claim are
         // frozen, per Card::merge_reimport -- reopening can't silently
         // revert a card Powder already recorded as done).
         std::fs::write(
@@ -2584,7 +2378,7 @@ mod tests {
         );
         assert!(
             closed_card_after.contains("\"title\": \"Reopened issue\""),
-            "content still refreshes on reimport, same as backlog.d: {closed_card_after}"
+            "content still refreshes on reimport, same as source file: {closed_card_after}"
         );
     }
 
@@ -3473,42 +3267,6 @@ mod tests {
         assert!(
             recorded.lock().unwrap().is_empty(),
             "--db must use SQLite and must not contact POWDER_API_BASE_URL"
-        );
-    }
-
-    #[test]
-    fn cli_list_ready_path_preview_wins_over_remote_environment() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({
-                "cards": [{"id": "wrong-remote", "priority": "p0", "title": "Wrong remote"}],
-                "total_count": 1,
-                "has_more": false
-            }),
-        )]);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let backlog_dir = std::env::temp_dir().join(format!("powder-cli-preview-{nanos}"));
-        std::fs::create_dir_all(&backlog_dir).unwrap();
-        std::fs::write(
-            backlog_dir.join("001-preview.md"),
-            "# Preview card\n\nPriority: P0 | Status: ready\n\n## Goal\nPreview locally.\n\n## Oracle\n- [ ] local preview wins\n",
-        )
-        .unwrap();
-        let backlog_dir = backlog_dir.to_string_lossy().to_string();
-
-        let output = run_with_env(
-            &args(["list-ready", &backlog_dir]),
-            &remote_env(Some(&base_url), Some("sk_powder_test")),
-        )
-        .unwrap();
-
-        assert_eq!(output, "001\tP0\tPreview card\n");
-        assert!(
-            recorded.lock().unwrap().is_empty(),
-            "positional backlog.d preview must not contact POWDER_API_BASE_URL"
         );
     }
 

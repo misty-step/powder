@@ -212,11 +212,9 @@ impl Priority {
     }
 }
 
-/// A coarse size signal, matching backlog.d's `Estimate: S/M/L/XL` header
-/// convention (powder-964): a cheap, structured way for an autonomous
-/// chewer to filter for low-complexity work before spending tokens reading
-/// a full card body. Optional everywhere -- cards imported before this
-/// field existed are not required to backfill it.
+/// A coarse size signal: a cheap, structured way for an autonomous consumer
+/// to filter for low-complexity work before spending tokens reading a full
+/// card body. Optional everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Estimate {
@@ -323,12 +321,9 @@ impl CardStatus {
     }
 
     /// Whether this status can only be true while an agent actually holds a
-    /// live claim on the card. A backlog.d file has no way to express a real
-    /// claim -- claims are runtime-only, minted by `claim_card` -- so a
-    /// `Status:` field parsed out of a file can never honestly assert one of
-    /// these; the importer must not let a source file unilaterally promote a
-    /// card into a claim-bound state it doesn't actually hold (crucible-905:
-    /// 13 cards landed `running` with `claim: null` this way).
+    /// live claim on the card. Claims are runtime-only, minted by
+    /// `claim_card`; an external source must not unilaterally promote a card
+    /// into a claim-bound state it does not actually hold.
     pub fn requires_active_claim(self) -> bool {
         matches!(self, Self::Claimed | Self::Running | Self::AwaitingInput)
     }
@@ -872,7 +867,7 @@ impl Card {
     }
 
     /// Whether this card's lifecycle (status + claim) must survive a
-    /// backlog.d reimport: an active claim, a claimed/running/awaiting-input
+    /// source refresh: an active claim, a claimed/running/awaiting-input
     /// status, or a terminal outcome. A backlog/ready/blocked card with no
     /// claim has no live lifecycle to protect, so a reimport may refresh its
     /// status along with its content.
@@ -885,7 +880,7 @@ impl Card {
             || self.status.is_terminal()
     }
 
-    /// Merge freshly parsed backlog.d content (`incoming`) onto this card's
+    /// Merge refreshed external content (`incoming`) onto this card's
     /// stored state: `created_at` always survives, and when
     /// [`protects_lifecycle_on_reimport`](Self::protects_lifecycle_on_reimport)
     /// is true, this card's live `status`/`claim` survive too instead of
@@ -912,7 +907,7 @@ impl Card {
             merged.acceptance = self.acceptance.clone();
             merged.criteria = self.criteria.clone();
             // The incoming file's own oracle was empty, so any status it
-            // landed on came from parse_backlog_card's empty-oracle default
+            // landed on came from the source adapter's empty-oracle default
             // (Backlog). Restoring real acceptance above makes that default
             // stale -- but only correct it back to what this card already
             // was (Ready) before this reimport, never to any other status.
@@ -932,11 +927,11 @@ impl Card {
             }
         } else if !merged.criteria.is_empty() {
             // powder-963 follow-up: the freshly parsed `incoming` criteria
-            // always start with no checked/proof state (`parse_backlog_card`
+            // always start with no checked/proof state (the source adapter
             // builds them fresh from raw oracle text every time), so a plain
             // reimport used to wipe completion evidence off every criterion
             // on the card -- including ones whose text never changed --
-            // every single time a backlog.d file was reimported. Preserve
+            // every single time external content was refreshed. Preserve
             // state by criterion identity instead of overwriting wholesale.
             merged.criteria = merge_criteria_state(&self.criteria, merged.criteria);
         }
@@ -1411,7 +1406,7 @@ mod tests {
 
     #[test]
     fn reimport_never_shrinks_body_or_acceptance_to_empty() {
-        // crucible-905: a heading-convention mismatch made parse_backlog_card
+        // crucible-905: a heading-convention mismatch made a source adapter
         // produce an empty body and empty acceptance for two real cards on
         // reimport, silently destroying 60+ lines of existing content. A
         // reimport that finds nothing where something already existed must
@@ -1506,7 +1501,7 @@ mod tests {
     #[test]
     fn reimport_preserves_checked_and_proof_state_by_criterion_identity() {
         // A reimport used to wipe checked_by/checked_at/proof_links off
-        // every criterion, because parse_backlog_card always builds a fresh
+        // every criterion, because a source adapter always builds a fresh
         // AcceptanceCriterion with no state, and merge_reimport used to take
         // that fresh vector wholesale -- so a byte-identical reimport (e.g.
         // running `import` again for an unrelated reason) silently erased

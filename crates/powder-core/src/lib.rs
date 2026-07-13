@@ -1,11 +1,9 @@
 #![forbid(unsafe_code)]
 
-mod backlog;
 mod board;
 mod model;
 mod repository;
 
-pub use backlog::{parse_backlog_card, BacklogParseError};
 pub use board::{Board, ClaimReceipt, ReadyQuery};
 pub use model::{
     AcceptanceCriterion, Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority,

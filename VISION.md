@@ -116,12 +116,12 @@ yet trustworthy enough for a fleet to depend on:
 
 - `powder-core` defines cards, runs, activity, audit events, relations, links,
   comments, ready eligibility, expiring claims, permissive status changes,
-  optional completion proof, and markdown backlog parsing.
+  and optional completion proof.
 - `powder-store` persists the instance database in SQLite, enables WAL, owns
   migrations, stores hashed API keys, seeds the first bootstrap key once, and
   runs transactional card lifecycle operations.
-- `powder-cli` can initialize an instance database, import backlog markdown
-  into it, create cards, list ready work, claim, transition, and complete cards.
+- `powder-cli` can initialize an instance database, create cards, list ready
+  work, claim, transition, and complete cards.
 - `powder-mcp` exposes `list_ready`, `manage_claim`, `update_status`,
   `update_relations`, `add_link`, `request_input`, and `complete_card` over
   stdio using the same domain model; it uses SQLite when `POWDER_DB_PATH` is
@@ -151,8 +151,8 @@ Kanban surface must keep making the same state legible to humans.
 
 Powder is the obvious self-hosted work ledger for agentic software teams. A new
 operator can deploy it on Fly, mount SQLite storage, choose tailnet or shared
-secret auth, complete first-run onboarding, import their own backlog markdown,
-configure rules and webhooks, inspect a beautiful Kanban board, and let agents
+secret auth, complete first-run onboarding, create or integrate cards through
+explicit APIs, configure rules and webhooks, inspect a beautiful Kanban board, and let agents
 safely ask:
 
 > What exists, what is ready, can I claim it, what context matters, and what

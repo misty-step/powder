@@ -1124,10 +1124,18 @@ fn to_string(err: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use powder_core::parse_backlog_card;
     use powder_store::{
         RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store, WorkLogAttribution,
     };
+
+    fn seeded_card(id: &str, title: &str, status: CardStatus, created_at: i64) -> Card {
+        Card::new(CardId::new(id).unwrap(), title, "G.")
+            .unwrap()
+            .with_priority(Priority::P0)
+            .with_status(status)
+            .with_acceptance(["g".to_string()])
+            .with_created_at(created_at)
+    }
 
     /// `complete_card`'s hand-written `input_schema` string had a missing
     /// closing brace that made every `tool_defs_json()` call -- and
@@ -1462,25 +1470,15 @@ mod tests {
 
     #[test]
     fn mcp_tools_can_operate_against_sqlite_store() {
-        let text = r#"# Ship persistent MCP tools
-
-Priority: P0 | Status: ready | Estimate: M
-
-## Goal
-Expose tools against the DB.
-
-## Oracle
-- [ ] tool flow works
-"#;
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store
-            .import_cards(vec![parse_backlog_card(
-                "backlog.d/005-persistent-mcp-tools.md",
-                text,
+            .import_cards(vec![seeded_card(
+                "005",
+                "Ship persistent MCP tools",
+                CardStatus::Ready,
                 1,
-            )
-            .unwrap()])
+            )])
             .unwrap();
 
         let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 1}), 10).unwrap();
@@ -1678,12 +1676,12 @@ Expose tools against the DB.
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store
-            .import_cards(vec![parse_backlog_card(
-                "backlog.d/blocked.md",
-                "# Blocked\n\nPriority: P0 | Status: blocked\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+            .import_cards(vec![seeded_card(
+                "blocked",
+                "Blocked",
+                CardStatus::Blocked,
                 1,
-            )
-            .unwrap()])
+            )])
             .unwrap();
 
         let all = call_tool_store(&mut store, "list_cards", &json!({}), 10).unwrap();
@@ -2275,12 +2273,7 @@ Expose tools against the DB.
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store
-            .import_cards(vec![parse_backlog_card(
-                "backlog.d/007-editable.md",
-                "# Editable\n\nPriority: P0 | Status: ready\n\n## Goal\nOriginal.\n\n## Oracle\n- [ ] g\n",
-                1,
-            )
-            .unwrap()])
+            .import_cards(vec![seeded_card("007", "Editable", CardStatus::Ready, 1)])
             .unwrap();
 
         let patched = call_tool_store(
@@ -2411,12 +2404,7 @@ Expose tools against the DB.
         assert_eq!(repository["import_provenance"], "manual");
 
         store
-            .import_cards(vec![parse_backlog_card(
-                "legacy.md",
-                "# Legacy\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
-                11,
-            )
-            .unwrap()])
+            .import_cards(vec![seeded_card("legacy", "Legacy", CardStatus::Ready, 11)])
             .unwrap();
         let mut card = store
             .get_card(&CardId::new("legacy").unwrap())
@@ -2473,18 +2461,8 @@ Expose tools against the DB.
         store.migrate().unwrap();
         store
             .import_cards(vec![
-                parse_backlog_card(
-                    "powder.md",
-                    "# Powder\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
-                    1,
-                )
-                .unwrap(),
-                parse_backlog_card(
-                    "sploot.md",
-                    "# Sploot\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
-                    2,
-                )
-                .unwrap(),
+                seeded_card("powder", "Powder", CardStatus::Ready, 1),
+                seeded_card("sploot", "Sploot", CardStatus::Ready, 2),
             ])
             .unwrap();
         let mut powder = store
@@ -2511,12 +2489,12 @@ Expose tools against the DB.
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store
-            .import_cards(vec![parse_backlog_card(
-                "commented.md",
-                "# Commented\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+            .import_cards(vec![seeded_card(
+                "commented",
+                "Commented",
+                CardStatus::Ready,
                 1,
-            )
-            .unwrap()])
+            )])
             .unwrap();
 
         let response = call_tool_store(
@@ -2540,12 +2518,12 @@ Expose tools against the DB.
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store
-            .import_cards(vec![parse_backlog_card(
-                "worklogged.md",
-                "# Worklogged\n\nPriority: P0 | Status: ready\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
+            .import_cards(vec![seeded_card(
+                "worklogged",
+                "Worklogged",
+                CardStatus::Ready,
                 1,
-            )
-            .unwrap()])
+            )])
             .unwrap();
 
         let response = call_tool_store(
@@ -2639,24 +2617,15 @@ Expose tools against the DB.
 
     #[test]
     fn mcp_updates_relations_and_non_holder_can_set_status() {
-        let text = r#"# Holder enforcement
-Priority: P0 | Status: ready | Estimate: M
-
-## Goal
-Expose tools against the DB.
-
-## Oracle
-- [ ] tool flow works
-"#;
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store
-            .import_cards(vec![parse_backlog_card(
-                "backlog.d/006-holder-enforcement.md",
-                text,
+            .import_cards(vec![seeded_card(
+                "006",
+                "Holder enforcement",
+                CardStatus::Ready,
                 1,
-            )
-            .unwrap()])
+            )])
             .unwrap();
 
         call_tool_store(
@@ -2759,12 +2728,7 @@ Expose tools against the DB.
         );
 
         store
-            .import_cards(vec![parse_backlog_card(
-                "event.md",
-                "# Event\n\nPriority: P0 | Status: backlog\n\n## Goal\nG.\n\n## Oracle\n- [ ] g\n",
-                1,
-            )
-            .unwrap()])
+            .import_cards(vec![seeded_card("event", "Event", CardStatus::Backlog, 1)])
             .unwrap();
         call_tool_store(
             &mut store,
