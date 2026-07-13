@@ -378,7 +378,7 @@ cargo test --workspace
 ```
 
 Pull requests run the same gate through GitHub Actions as
-`Rust CI / fmt-clippy-test`. The `main` branch protection rule requires that
+`Rust CI / fmt-clippy-test`. The `master` branch protection rule requires that
 status check with strict status checks and admin enforcement enabled. The
 Landmark release-note workflow remains release-only and does not replace the
 Rust gate.

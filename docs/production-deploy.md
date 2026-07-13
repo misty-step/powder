@@ -59,7 +59,7 @@ tailscale ssh root@<box-hostname>   # the droplet is on the tailnet; ssh works f
 The box runs plain host binaries -- there is no image build and no Fly step.
 Shipping a merged powder PR to the live instance (verified 2026-07-09):
 
-1. **Cross-compile from a checkout at the merged `main` SHA** (the box
+1. **Cross-compile from a checkout at the merged `master` SHA** (the box
    carries no toolchain, deliberately):
 
    ```sh
