@@ -11,8 +11,8 @@ boundary, or the self-hosting/deployment shape.
 
 - `powder-core` owns domain rules and imports no adapter, shell, runtime, DB,
   network, filesystem, or process-launching crates.
-- `powder-shell` owns filesystem-facing import/parsing helpers (backlog.d
-  loading, repo id-namespacing, the GitHub issue adapter) and the shared
+- `powder-shell` owns filesystem-facing import/parsing helpers (legacy
+  Markdown migration, repo id-namespacing, the GitHub issue adapter) and the shared
   adapter error type. `powder-store::Store` is called concretely by every
   face; there is no effect-trait/port indirection layer, so do not
   reintroduce one without a concrete second implementation that needs it.
@@ -23,10 +23,11 @@ boundary, or the self-hosting/deployment shape.
 - The board store is separate from the runner. A dispatch daemon may consume
   `ready` cards later, but it is not in the core.
 - MCP tools are designed around agent intent, not one-to-one REST wrappers.
-- Root `backlog.d/` may contain Powder product-development epics in the house
-  Goal/Oracle format. Do not commit imported/operator/customer card, run,
-  claim, activity, or instance export data; fixtures belong under tests only.
-  Instance data lives in the deployed SQLite database.
+- Repository-local ticket directories are forbidden. Powder product work lives
+  in the deployed Powder instance; R90 work lives in Habitat. Do not commit
+  imported/operator/customer card, run, claim, activity, or instance export
+  data; synthetic migration fixtures belong under tests only. Instance data
+  lives in the deployed SQLite database.
 - Follow the Canary-style deployment shape: one deployable Rust service, SQLite
   path from env, WAL, Fly volume at `/data`, Litestream optional replication,
   health and readiness routes, first-run bootstrap key, and tailnet-friendly
@@ -37,6 +38,7 @@ boundary, or the self-hosting/deployment shape.
 Run before claiming completion:
 
 ```sh
+test -z "$(find . -type d -name backlog.d -not -path './.git/*' -print -quit)"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -49,5 +51,6 @@ enforcement enabled; `master` runs the same gate after merge.
 ## Red Lines
 
 - Do not add personal/operator backlog data to the repo.
+- Do not create a repository-local ticket or Kanban ledger.
 - Do not lower gates or add mocked internal collaborators to get green.
 - Do not add a dispatch loop to the core.
