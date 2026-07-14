@@ -6,7 +6,10 @@ use std::{
     env,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::Duration,
 };
 
@@ -36,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 mod canary;
 
@@ -55,11 +59,25 @@ const DELIVERY_BATCH_LIMIT: usize = 25;
 /// configured. See `authorize()` and docs/operations.md's trust-boundary
 /// section.
 const PROXY_SECRET_HEADER: &str = "x-powder-proxy-secret";
+/// `/readyz`'s dead-letter-backlog gate (powder-epic-truthful-ops): a
+/// handful of dead letters is normal operational noise (a receiver blipped
+/// for six minutes); a backlog in the hundreds means webhooks are
+/// structurally broken (bad URL, revoked credential on the receiving end)
+/// and an operator should be paged, not just able to `dead-letter-list` and
+/// notice eventually. 100 is a starting default, not a measured threshold --
+/// tune via `POWDER_READYZ_DEAD_LETTER_THRESHOLD` per deployment.
+const DEFAULT_READYZ_DEAD_LETTER_THRESHOLD: i64 = 100;
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
     store: Arc<Mutex<Store>>,
+    /// Count of times `lock_store` has recovered a poisoned mutex (see its
+    /// doc comment). Surfaced on `/readyz` so a poisoning event -- which
+    /// means some request handler panicked mid-mutation -- gets an operator's
+    /// attention via the readiness gate even though the process kept serving
+    /// requests instead of crash-looping.
+    poison_count: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +103,9 @@ struct Config {
     /// mode's original all-admin behavior; `POWDER_TAILNET_ADMIN=false` makes
     /// tailnet-authenticated callers ordinary non-admin actors instead.
     tailnet_admin: bool,
+    /// `/readyz`'s dead-letter backlog gate. See
+    /// `DEFAULT_READYZ_DEAD_LETTER_THRESHOLD`.
+    dead_letter_ready_threshold: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -165,6 +186,16 @@ impl Config {
             env_value(&vars, "POWDER_TAILNET_ADMIN"),
         )?
         .unwrap_or(true);
+        let dead_letter_ready_threshold =
+            match env_value(&vars, "POWDER_READYZ_DEAD_LETTER_THRESHOLD") {
+                Some(value) => value.parse::<i64>().map_err(|err| {
+                    ConfigError::new(
+                        "POWDER_READYZ_DEAD_LETTER_THRESHOLD",
+                        format!("expected i64: {err}"),
+                    )
+                })?,
+                None => DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
+            };
 
         Ok(Self {
             db_path,
@@ -176,6 +207,7 @@ impl Config {
             field_note,
             tailnet_proxy_secret,
             tailnet_admin,
+            dead_letter_ready_threshold,
         })
     }
 }
@@ -257,11 +289,30 @@ struct Health {
 // detail with no operational value to a caller and no reason to be legible
 // to an unauthenticated request. `schema_version` alone already proves the
 // database is open and migrated.
+//
+// powder-epic-truthful-ops: `ok` used to mean only "the store answered a
+// `SELECT 1`" -- true even against a read-only file, a schema several
+// versions behind, or a webhook backlog nobody is draining. `ok` now means
+// every one of `writable`, `schema_version == schema_version_expected`,
+// `dead_letter_count < dead_letter_threshold`, and `poison_count == 0`
+// holds; each is still reported individually so an operator (or an alert
+// rule) can see *which* gate failed instead of a bare false.
 #[derive(Debug, Serialize)]
 struct Ready {
     ok: bool,
     auth_mode: AuthMode,
     schema_version: Option<u32>,
+    schema_version_expected: u32,
+    /// Result of `Store::writable_probe` (`BEGIN IMMEDIATE; ROLLBACK;`):
+    /// `false` if the probe itself could not even run (store lock or open
+    /// failure), distinct from `ok` so a caller can tell "the DB answered
+    /// but isn't currently writable" apart from "the DB didn't answer".
+    writable: bool,
+    dead_letter_count: Option<i64>,
+    dead_letter_threshold: i64,
+    /// See `AppState::poison_count`. Always present (unlike the DB-derived
+    /// fields above) since it never requires a store lock to read.
+    poison_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -512,8 +563,19 @@ struct TailParams {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // powder-epic-truthful-ops: `EnvFilter::from_default_env()` fell back to
+    // *no logging at all* when `RUST_LOG` was unset -- the common case for
+    // an operator who just followed the quickstart -- so a running instance
+    // was silent by default even though `tracing::info!`/`tracing::warn!`
+    // calls exist throughout this file (the webhook-delivery-failure warn,
+    // the startup line below, TraceLayer's own request logging). `RUST_LOG`
+    // still wins when set; only the fallback changes, from "nothing" to
+    // "info".
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let config = Config::from_env().inspect_err(|err| {
@@ -543,10 +605,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = config.bind_addr;
+    // Read once before `config` moves into the shared `AppState` below --
+    // this is exactly the "schema version" a truthful startup line has to
+    // report, and it must come from the just-migrated store, not a
+    // hardcoded constant, so a database wedged short of `SCHEMA_VERSION`
+    // (see `Store::migrate`'s own `UnsupportedSchema` guard, which would
+    // already have returned above) is never misreported as current.
+    let schema_version = store.schema_version().inspect_err(|err| {
+        let msg = format!("store schema_version: {err:#}");
+        tracing::error!("{msg}");
+        canary::report_error("powder.store.schema_version", &msg);
+    })?;
     let state = AppState {
         config: Arc::new(config),
         store: Arc::new(Mutex::new(store)),
+        poison_count: Arc::new(AtomicU64::new(0)),
     };
+
+    // powder-epic-truthful-ops: the only way to answer "what is actually
+    // running" for a given instance used to be `curl /readyz` (schema
+    // version only) plus tribal knowledge of which SHA got `scp`'d to the
+    // box last (see docs/production-deploy.md's "there is currently no
+    // Sanctum-side record of the deployed SHA" note). This line is the
+    // in-process source of truth: every one of version, git SHA, bind
+    // address, DB path, schema version, and auth mode a deploy needs to
+    // confirm, in the first few lines of `journalctl -u sanctum` after a
+    // restart.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_sha = env!("POWDER_SERVER_GIT_SHA"),
+        git_dirty = env!("POWDER_SERVER_GIT_DIRTY"),
+        bind_addr = %addr,
+        db_path = %state.config.db_path.display(),
+        schema_version,
+        auth_mode = ?state.config.auth_mode,
+        "powder-server starting"
+    );
+
     tokio::spawn(delivery_loop(state.clone()));
     let app = app(state);
 
@@ -559,7 +654,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // serve v4 traffic fine — a known cosmetic false positive, not a real
     // reachability gap. Don't switch to `0.0.0.0` to silence it: that binds
     // v4-only and breaks the private (Flycast/`.internal`) path instead.
-    tracing::info!("starting powder-server on {addr}");
     let listener = TcpListener::bind(addr).await.inspect_err(|err| {
         let msg = format!("bind {addr}: {err:#}");
         tracing::error!("{msg}");
@@ -637,14 +731,27 @@ fn app(state: AppState) -> Router {
             post(disable_event_subscription),
         )
         .route("/api/v1/events/dead-letter", get(list_dead_letters))
+        .route(
+            "/api/v1/events/dead-letter/replay",
+            post(replay_dead_letters),
+        )
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .with_state(state)
         // Method/path/status/latency per request via the tracing crate
         // already in use; never touches headers or bodies, so bearer keys
-        // and card content never reach the log.
-        .layer(TraceLayer::new_for_http())
+        // and card content never reach the log. Explicit INFO levels
+        // (powder-epic-truthful-ops): tower-http's own defaults are DEBUG,
+        // which the new default `RUST_LOG`-unset-means-"info" filter would
+        // silently drop -- without this, "observable by default" would be
+        // true for this file's own `tracing::info!`/`warn!` calls but false
+        // for every HTTP request the server serves.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
 }
 
 async fn board_index() -> impl IntoResponse {
@@ -682,28 +789,58 @@ async fn healthz() -> Json<Health> {
     })
 }
 
+/// Gates readiness on four independent checks (powder-epic-truthful-ops):
+/// the DB accepts a write lock, its schema is exactly `SCHEMA_VERSION` (not
+/// merely "some version `PRAGMA user_version` returns"), the dead-letter
+/// backlog is under `dead_letter_ready_threshold`, and no store-mutex
+/// poisoning has been recovered from. `/healthz` stays a trivial liveness
+/// probe on purpose -- this is the only route that can turn "the process is
+/// running" into "and it should be receiving traffic".
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let poison_count = state.poison_count.load(Ordering::SeqCst);
     let result = (|| {
         let store = lock_store(&state)?;
-        store.readiness_check()?;
-        Ok::<_, ApiError>(store.schema_version()?)
+        store.writable_probe()?;
+        let schema_version = store.schema_version()?;
+        let dead_letter_count = store.count_dead_letter_deliveries()?;
+        Ok::<_, ApiError>((schema_version, dead_letter_count))
     })();
 
     match result {
-        Ok(schema_version) => (
-            StatusCode::OK,
-            Json(Ready {
-                ok: true,
-                auth_mode: state.config.auth_mode,
-                schema_version: Some(schema_version),
-            }),
-        ),
+        Ok((schema_version, dead_letter_count)) => {
+            let schema_ok = schema_version == powder_store::SCHEMA_VERSION;
+            let dead_letter_ok = dead_letter_count < state.config.dead_letter_ready_threshold;
+            let poison_ok = poison_count == 0;
+            let ok = schema_ok && dead_letter_ok && poison_ok;
+            (
+                if ok {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                Json(Ready {
+                    ok,
+                    auth_mode: state.config.auth_mode,
+                    schema_version: Some(schema_version),
+                    schema_version_expected: powder_store::SCHEMA_VERSION,
+                    writable: true,
+                    dead_letter_count: Some(dead_letter_count),
+                    dead_letter_threshold: state.config.dead_letter_ready_threshold,
+                    poison_count,
+                }),
+            )
+        }
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(Ready {
                 ok: false,
                 auth_mode: state.config.auth_mode,
                 schema_version: None,
+                schema_version_expected: powder_store::SCHEMA_VERSION,
+                writable: false,
+                dead_letter_count: None,
+                dead_letter_threshold: state.config.dead_letter_ready_threshold,
+                poison_count,
             }),
         ),
     }
@@ -1344,6 +1481,30 @@ async fn list_dead_letters(
     Ok(Json(json!({ "dead_letters": dead_letters })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DeadLetterReplayRequest {
+    subscription_id: Option<String>,
+}
+
+/// Requeues dead-lettered webhook deliveries so the delivery loop retries
+/// them on its next tick (powder-epic-truthful-ops): the extended backoff
+/// schedule on `WEBHOOK_MAX_ATTEMPTS` still gives up after ~5.7 minutes, and
+/// a receiver that was down for longer than that has no other way back into
+/// delivery short of an operator manually requeuing it. Admin-scoped like
+/// every other operator-only route (`list_keys`, repository management) --
+/// this is a bulk, unaudited-per-delivery mutation, not a single card's
+/// authored change.
+async fn replay_dead_letters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeadLetterReplayRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let replayed =
+        lock_store(&state)?.replay_dead_letters(request.subscription_id.as_deref(), unix_now())?;
+    Ok(Json(json!({ "replayed": replayed })))
+}
+
 async fn tail_events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1750,11 +1911,36 @@ fn compute_signature(secret: &str, body: &[u8]) -> Result<String, String> {
     ))
 }
 
+/// powder-epic-truthful-ops: a poisoned `Mutex<Store>` used to mean a
+/// permanent 500 on every subsequent request -- one panicking handler
+/// (a bug, an unwrap on unexpected input) took the whole instance down for
+/// good even though `/healthz` kept reporting 200. `Store`'s own mutations
+/// that matter go through SQLite transactions (`self.connection.transaction()`,
+/// committed or rolled back as a unit); a panic mid-mutation leaves the
+/// in-progress Rust-level transaction dropped (and therefore rolled back by
+/// `rusqlite`'s own `Drop` impl) and the on-disk database in whatever
+/// consistent state its last *committed* transaction left it in. The
+/// `Store` value itself carries no other mutable invariant a panic could
+/// have left torn. Recovering via `PoisonError::into_inner` and continuing
+/// to serve is therefore safe -- the alternative (permanent 500) protects
+/// against a data-corruption scenario that structurally cannot happen here.
+/// Every recovery increments `poison_count` and logs a warning so a poisoning
+/// event -- which does mean some handler panicked and deserves investigation
+/// -- surfaces on `/readyz` instead of vanishing silently.
 fn lock_store(state: &AppState) -> Result<MutexGuard<'_, Store>, ApiError> {
-    state
-        .store
-        .lock()
-        .map_err(|_| ApiError::internal("store lock poisoned"))
+    match state.store.lock() {
+        Ok(guard) => Ok(guard),
+        Err(poisoned) => {
+            let count = state.poison_count.fetch_add(1, Ordering::SeqCst) + 1;
+            tracing::warn!(
+                poison_count = count,
+                "store mutex was poisoned by a panicking request handler; recovering via \
+                 PoisonError::into_inner (SQLite transactions keep on-disk state consistent) \
+                 and continuing to serve -- see this instance's /readyz for the running total"
+            );
+            Ok(poisoned.into_inner())
+        }
+    }
 }
 
 #[derive(Debug)]

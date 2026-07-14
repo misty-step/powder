@@ -239,6 +239,14 @@ pub const ROUTES: &[ApiRoute] = &[
         body_shape: None,
     },
     ApiRoute {
+        method: "POST",
+        path: "/api/v1/events/dead-letter/replay",
+        intent: "requeue dead-lettered webhook deliveries for redelivery (admin scope only)",
+        body_shape: Some(
+            r#"{"subscription_id":null} -- optional; omit or set null to replay every dead letter across all subscriptions, or set it to replay only one subscription's"#,
+        ),
+    },
+    ApiRoute {
         method: "GET",
         path: "/api/v1/events/tail",
         intent: "tail durable card events as Server-Sent Events",
@@ -324,6 +332,7 @@ mod tests {
         assert!(paths.contains(&"/api/v1/events/subscriptions"));
         assert!(paths.contains(&"/api/v1/events/subscriptions/{id}/disable"));
         assert!(paths.contains(&"/api/v1/events/dead-letter"));
+        assert!(paths.contains(&"/api/v1/events/dead-letter/replay"));
         assert!(paths.contains(&"/api/v1/events/tail"));
         assert!(paths.contains(&"/api/v1/keys"));
         assert!(paths.contains(&"/api/v1/keys/{id}/revoke"));

@@ -182,31 +182,13 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_delivery_attempts(delivery_id, attempt_number);
 "#;
 
-pub const MIGRATE_1_TO_2: &str = r#"
-CREATE TABLE IF NOT EXISTS actors (
-  id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  display_name TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-
-ALTER TABLE api_keys ADD COLUMN actor_id TEXT;
-
-INSERT OR IGNORE INTO actors (id, kind, display_name, created_at)
-SELECT
-  'actor-' || id,
-  CASE scope WHEN 'agent' THEN 'agent' ELSE 'user' END,
-  name,
-  created_at
-FROM api_keys
-WHERE actor_id IS NULL;
-
-UPDATE api_keys
-SET actor_id = 'actor-' || id
-WHERE actor_id IS NULL;
-
-CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
-"#;
+// The `MIGRATE_1_TO_2` step (create `actors`, add `api_keys.actor_id`,
+// backfill an actor per key + point each key at it, index) moved inline into
+// `Store::migrate_1_to_2`: it is DDL *plus* backfill, and `execute_batch`
+// autocommits per statement, so a single all-or-nothing constant guarded on
+// column existence would skip the backfill forever after a crash between the
+// ALTER and the backfill. See that function's doc comment for the
+// three-phase, per-effect idempotency it needs instead.
 
 /// Existing keys were bcrypt-hashed; tag them explicitly so `verify_api_key`
 /// keeps using bcrypt for them (they never break) while every newly created
@@ -222,30 +204,17 @@ ALTER TABLE api_keys ADD COLUMN hash_algorithm TEXT NOT NULL DEFAULT 'bcrypt';
 /// the store's own `ON CONFLICT ... = excluded.*` upsert. Dead columns since
 /// the day this schema was written; `proof` is untouched, since
 /// `complete_card` genuinely writes it.
-pub const MIGRATE_3_TO_4: &str = r#"
-ALTER TABLE runs DROP COLUMN model;
-ALTER TABLE runs DROP COLUMN turn_count;
-ALTER TABLE runs DROP COLUMN token_count;
-ALTER TABLE runs DROP COLUMN consecutive_failures;
-ALTER TABLE runs DROP COLUMN last_error;
-ALTER TABLE runs DROP COLUMN result;
-"#;
-
-pub const MIGRATE_4_TO_5: &str = r#"
-ALTER TABLE cards ADD COLUMN related_json TEXT NOT NULL DEFAULT '[]';
-ALTER TABLE cards ADD COLUMN blocks_json TEXT NOT NULL DEFAULT '[]';
-
-CREATE TABLE IF NOT EXISTS card_events (
-  id TEXT PRIMARY KEY,
-  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
-  event_type TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);
-"#;
-
+///
+/// powder-epic-truthful-ops: this step's SQL used to live here as
+/// `MIGRATE_3_TO_4`, run unconditionally. It now lives inline in
+/// `Store::migrate_3_to_4`, one `DROP COLUMN` per dead column, each guarded
+/// by `table_has_column` -- a crash partway through the six drops needs to
+/// finish only the columns still present on retry, which a single
+/// all-or-nothing batch constant can't express. See that function's doc
+/// comment.
+///
+/// The `MIGRATE_4_TO_5` step (the two `cards` `ADD COLUMN`s plus the
+/// `card_events` table) moved the same way, into `Store::migrate_4_to_5`.
 pub const MIGRATE_5_TO_6: &str = r#"
 CREATE TABLE IF NOT EXISTS event_subscriptions (
   id TEXT PRIMARY KEY,
@@ -318,10 +287,10 @@ ALTER TABLE repositories ADD COLUMN tier TEXT NOT NULL DEFAULT 'backburner';
 CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories(tier, name);
 "#;
 
-pub const MIGRATE_8_TO_9: &str = r#"
-ALTER TABLE cards ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';
-ALTER TABLE cards ADD COLUMN proof_plan_json TEXT NOT NULL DEFAULT '[]';
-"#;
+// The `MIGRATE_8_TO_9` step (the two `cards` `ADD COLUMN`s for
+// `criteria_json`/`proof_plan_json`) moved into `Store::migrate_8_to_9` for
+// the same per-column-guard reason as `MIGRATE_3_TO_4`/`MIGRATE_4_TO_5`
+// above.
 
 /// powder-931: key hygiene is currently a manual, error-prone audit against
 /// a list with no signal for "is anything still using this". Recording the

@@ -33,12 +33,17 @@ pub use repositories::{
     RepositoryMergeOutcome, RepositoryNormalizeChange, RepositoryNormalizeOutcome,
     RepositorySummary, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
 };
+/// The current on-disk schema version `Store::migrate` converges to.
+/// Public so a caller (`/readyz`'s schema-match gate is the motivating one)
+/// can compare a database's actual `schema_version()` against what this
+/// build of `powder-store` expects, rather than only being able to ask "did
+/// migration succeed" after the fact.
+pub use schema::SCHEMA_VERSION;
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_1_TO_2,
-    MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8,
-    MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_2_TO_3,
+    MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -334,19 +339,19 @@ impl Store {
                     SCHEMA_VERSION
                 }
                 1 => {
-                    self.connection.execute_batch(MIGRATE_1_TO_2)?;
+                    self.migrate_1_to_2()?;
                     2
                 }
                 2 => {
-                    self.connection.execute_batch(MIGRATE_2_TO_3)?;
+                    self.migrate_2_to_3()?;
                     3
                 }
                 3 => {
-                    self.connection.execute_batch(MIGRATE_3_TO_4)?;
+                    self.migrate_3_to_4()?;
                     4
                 }
                 4 => {
-                    self.connection.execute_batch(MIGRATE_4_TO_5)?;
+                    self.migrate_4_to_5()?;
                     5
                 }
                 5 => {
@@ -359,16 +364,16 @@ impl Store {
                     7
                 }
                 7 => {
-                    self.connection.execute_batch(MIGRATE_7_TO_8)?;
+                    self.migrate_7_to_8()?;
                     self.apply_ratified_repository_tier_seed()?;
                     8
                 }
                 8 => {
-                    self.connection.execute_batch(MIGRATE_8_TO_9)?;
+                    self.migrate_8_to_9()?;
                     9
                 }
                 9 => {
-                    self.connection.execute_batch(MIGRATE_9_TO_10)?;
+                    self.migrate_9_to_10()?;
                     10
                 }
                 10 => {
@@ -400,6 +405,179 @@ impl Store {
             self.connection
                 .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
+    }
+
+    /// powder-epic-truthful-ops: steps 1-10 originally ran their DDL
+    /// unconditionally, unlike the `cards_has_column`-guarded steps below
+    /// (11-16). A process crash (OOM kill, host reboot, `pkill -9`) between a
+    /// step's DDL and its `PRAGMA user_version` bump left the DB schema
+    /// ahead of its recorded version; the next boot would re-run the same
+    /// `ALTER TABLE ... ADD COLUMN` and fail with "duplicate column name",
+    /// wedging every subsequent boot until a human intervened by hand. These
+    /// wrappers close that gap the same way 11-16 already do: check whether
+    /// the DDL's effect is already present before re-issuing it. Table
+    /// creation and index statements already use `IF NOT EXISTS` and are
+    /// naturally idempotent, so only the bare `ALTER TABLE` steps need a
+    /// guard.
+    /// powder-epic-truthful-ops (review fix): `MIGRATE_1_TO_2` is DDL *plus*
+    /// two backfill statements, and `execute_batch` autocommits per
+    /// statement -- so guarding the whole batch on `actor_id`'s existence was
+    /// wrong. A crash after the `ALTER TABLE ... ADD COLUMN actor_id` commits
+    /// but before the two backfills run leaves the column present with every
+    /// value NULL; on retry the single column-existence guard would see the
+    /// column and skip the backfills *forever*. That is not cosmetic:
+    /// `verify_api_key` INNER JOINs `api_keys` to `actors`, so a permanently
+    /// unbackfilled `actor_id` silently stops every pre-existing key from
+    /// authenticating. Decomposed into three independently-idempotent phases,
+    /// mirroring `migrate_3_to_4`'s per-effect guards:
+    ///
+    /// 1. `actors` table + the `api_keys` index are `CREATE ... IF NOT
+    ///    EXISTS`, safe to re-run unconditionally.
+    /// 2. the `ADD COLUMN` is guarded on column existence (an `ALTER ... ADD
+    ///    COLUMN` cannot be re-run).
+    /// 3. the backfill is guarded on its own *effect* -- whether any row is
+    ///    still `actor_id IS NULL` -- not on the column's existence, so an
+    ///    interrupted backfill is finished on the next boot. (The backfill's
+    ///    own `WHERE actor_id IS NULL` also makes re-running it harmless; the
+    ///    completeness guard just avoids a pointless full-table UPDATE when
+    ///    there is nothing left to do.)
+    fn migrate_1_to_2(&mut self) -> Result<()> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );",
+        )?;
+        if !self.table_has_column("api_keys", "actor_id")? {
+            self.connection
+                .execute_batch("ALTER TABLE api_keys ADD COLUMN actor_id TEXT;")?;
+        }
+        let backfill_incomplete = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM api_keys WHERE actor_id IS NULL LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if backfill_incomplete {
+            self.connection.execute_batch(
+                "INSERT OR IGNORE INTO actors (id, kind, display_name, created_at)
+                 SELECT
+                   'actor-' || id,
+                   CASE scope WHEN 'agent' THEN 'agent' ELSE 'user' END,
+                   name,
+                   created_at
+                 FROM api_keys
+                 WHERE actor_id IS NULL;
+
+                 UPDATE api_keys
+                 SET actor_id = 'actor-' || id
+                 WHERE actor_id IS NULL;",
+            )?;
+        }
+        self.connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_2_to_3(&mut self) -> Result<()> {
+        if !self.table_has_column("api_keys", "hash_algorithm")? {
+            self.connection.execute_batch(MIGRATE_2_TO_3)?;
+        }
+        Ok(())
+    }
+
+    /// Unlike the ADD-COLUMN steps above, this step drops six columns from
+    /// `runs` in one batch -- a crash could leave some already dropped and
+    /// others not. Each column is checked and dropped independently
+    /// (mirroring `migrate_14_to_15`'s partial-drop recovery) instead of
+    /// guarding the whole batch behind a single column, which would either
+    /// re-run a `DROP COLUMN` against an already-missing column (error) or
+    /// skip columns that still need dropping.
+    fn migrate_3_to_4(&mut self) -> Result<()> {
+        for column in [
+            "model",
+            "turn_count",
+            "token_count",
+            "consecutive_failures",
+            "last_error",
+            "result",
+        ] {
+            if self.table_has_column("runs", column)? {
+                self.connection
+                    .execute_batch(&format!("ALTER TABLE runs DROP COLUMN {column};"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn migrate_4_to_5(&mut self) -> Result<()> {
+        if !self.cards_has_column("related_json")? {
+            self.connection.execute_batch(
+                "ALTER TABLE cards ADD COLUMN related_json TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
+        if !self.cards_has_column("blocks_json")? {
+            self.connection.execute_batch(
+                "ALTER TABLE cards ADD COLUMN blocks_json TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
+        // The table/index half of MIGRATE_4_TO_5 already uses `IF NOT
+        // EXISTS` and is safe to run unconditionally regardless of which
+        // ALTER above just ran.
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS card_events (
+              id TEXT PRIMARY KEY,
+              card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+              event_type TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_7_to_8(&mut self) -> Result<()> {
+        if !self.table_has_column("repositories", "tier")? {
+            self.connection.execute_batch(MIGRATE_7_TO_8)?;
+        } else {
+            // MIGRATE_7_TO_8 also creates idx_repositories_tier; if a prior
+            // run added the column but crashed before the index, the guard
+            // above would skip both. `IF NOT EXISTS` makes re-issuing the
+            // index safe on its own.
+            self.connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories(tier, name);",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_8_to_9(&mut self) -> Result<()> {
+        if !self.cards_has_column("criteria_json")? {
+            self.connection.execute_batch(
+                "ALTER TABLE cards ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
+        if !self.cards_has_column("proof_plan_json")? {
+            self.connection.execute_batch(
+                "ALTER TABLE cards ADD COLUMN proof_plan_json TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_9_to_10(&mut self) -> Result<()> {
+        if !self.table_has_column("api_keys", "last_used_at")? {
+            self.connection.execute_batch(MIGRATE_9_TO_10)?;
+        }
+        Ok(())
     }
 
     fn migrate_11_to_12(&mut self) -> Result<()> {
@@ -449,7 +627,17 @@ impl Store {
     }
 
     fn cards_has_column(&self, column: &str) -> Result<bool> {
-        let mut statement = self.connection.prepare("PRAGMA table_info(cards)")?;
+        self.table_has_column("cards", column)
+    }
+
+    /// `table` is always an internal, hardcoded literal from a call site in
+    /// this module -- never caller/user-controlled -- so interpolating it
+    /// into the `PRAGMA table_info(...)` statement (which cannot bind table
+    /// names as parameters) carries no injection risk.
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -467,6 +655,21 @@ impl Store {
 
     pub fn readiness_check(&self) -> Result<()> {
         self.connection.query_row("SELECT 1", [], |_| Ok(()))?;
+        Ok(())
+    }
+
+    /// Proves the database file itself is writable, not just readable --
+    /// `readiness_check`'s bare `SELECT 1` succeeds even against a
+    /// read-only file, a full disk that still permits reads, or a
+    /// replication target mid-restore. `BEGIN IMMEDIATE` acquires SQLite's
+    /// write lock up front (unlike a deferred `BEGIN`, which only acquires
+    /// it on the first write and would let a read-only file pass), so
+    /// failure here means an actual write is currently impossible. The
+    /// transaction never writes anything and always rolls back -- this is a
+    /// probe, not a mutation.
+    pub fn writable_probe(&self) -> Result<()> {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")?;
         Ok(())
     }
 

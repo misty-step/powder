@@ -18,26 +18,41 @@ use regex::Regex;
 static PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     let compile = |re: &str| Regex::new(re).expect("secret pattern is valid regex");
     vec![
-        ("openai-key", compile(r"sk-[A-Za-z0-9]{20,}")),
+        // Powder's own API key and webhook signing-secret shapes MUST run
+        // before the generic vendor patterns below (powder-epic-truthful-ops
+        // review fix). A Powder key is `sk_powder_<32-char nanoid>`, and the
+        // nanoid alphabet (`API_KEY_ALPHABET`) includes `s`, `k`, and `-`, so
+        // a random body can contain the substring `sk-<20+ alnum>`. If the
+        // generic `openai-key` pattern (`sk-[A-Za-z0-9]{20,}`) ran first it
+        // would splice that substring out of the *middle* of a real Powder
+        // key, redacting only the tail and leaving the `sk_powder_<prefix
+        // chars>` head -- real credential material -- unredacted, while the
+        // `powder-api-key` pattern (now looking at a broken string) never
+        // matched. Specific-before-generic closes that partial-leak gap; it
+        // was the true cause of the intermittently-failing scrub test.
+        //
+        // (`sk_powder_...` / `whsec_powder_...` are minted by
+        // `identity::Store::create_api_key` /
+        // `events::create_event_subscription` with a 32-char nanoid body --
+        // well over the 20-char floor. No `Bearer`/prefix requirement: these
+        // must fire mid-line in a bare env-dump paste like
+        // `POWDER_API_KEY=sk_powder_...`, not only after a header-style
+        // label.)
+        ("powder-api-key", compile(r"sk_powder_[A-Za-z0-9_\-]{20,}")),
+        (
+            "powder-webhook-secret",
+            compile(r"whsec_powder_[A-Za-z0-9_\-]{20,}"),
+        ),
+        // `anthropic-key` (prefix `sk-ant-`) before `openai-key` (`sk-`) for
+        // the same specific-before-generic reason.
         ("anthropic-key", compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")),
+        ("openai-key", compile(r"sk-[A-Za-z0-9]{20,}")),
         ("github-token", compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
         ("aws-access-key-id", compile(r"AKIA[0-9A-Z]{16}")),
         ("slack-token", compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}")),
         (
             "bearer-token",
             compile(r"(?i)bearer\s+[A-Za-z0-9\-_.]{20,}"),
-        ),
-        // Powder's own API key and webhook signing-secret shapes
-        // (`sk_powder_...` / `whsec_powder_...`, minted by
-        // `identity::Store::create_api_key` / `events::create_event_subscription`
-        // with a 32-char nanoid body -- well over the 20-char floor here).
-        // No `Bearer`/prefix requirement: these patterns must fire mid-line
-        // in a bare env-dump paste like `POWDER_API_KEY=sk_powder_...`, not
-        // only after a header-style label.
-        ("powder-api-key", compile(r"sk_powder_[A-Za-z0-9_\-]{20,}")),
-        (
-            "powder-webhook-secret",
-            compile(r"whsec_powder_[A-Za-z0-9_\-]{20,}"),
         ),
         (
             "private-key-block",
@@ -144,5 +159,38 @@ mod tests {
         // survive scrubbing untouched.
         let body = "the sk_powder_ prefix identifies Powder-issued API keys";
         assert_eq!(scrub_secrets(body), body);
+    }
+
+    /// powder-epic-truthful-ops (review fix): a Powder key whose random body
+    /// happens to contain `sk-<20+ alnum>` (legal: the nanoid alphabet
+    /// includes `s`, `k`, `-`) must be redacted *whole*, not partially. With
+    /// the old ordering the generic `openai-key` pattern spliced the `sk-...`
+    /// tail out of the middle and the `sk_powder_` head survived -- a real
+    /// partial credential leak. This pins the specific-before-generic
+    /// ordering deterministically (no reliance on a randomly-generated key
+    /// occasionally landing on the collision).
+    #[test]
+    fn a_powder_key_whose_body_contains_sk_dash_is_redacted_whole_not_spliced() {
+        // 32-char body containing the `sk-` + 20-alnum shape the openai
+        // pattern would otherwise grab.
+        let body = "aaaaaaaaask-bbbbbbbbbbbbbbbbbbbb";
+        assert_eq!(body.len(), 32);
+        let key = format!("sk_powder_{body}");
+        let scrubbed = scrub_secrets(&format!("POWDER_API_KEY={key}"));
+
+        assert!(
+            scrubbed.contains("[REDACTED:powder-api-key]"),
+            "the full key must be caught by the powder pattern, got: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("sk_powder_"),
+            "no head fragment of the key may survive, got: {scrubbed}"
+        );
+        // Belt-and-suspenders: no contiguous run of the original key body
+        // survives either.
+        assert!(
+            !scrubbed.contains("aaaaaaaaa"),
+            "no body fragment of the key may survive, got: {scrubbed}"
+        );
     }
 }
