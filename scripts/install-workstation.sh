@@ -120,8 +120,13 @@ install_from_source() {
     # --force" version check would otherwise make every install after the
     # first a silent no-op -- exactly the staleness this script exists to
     # eliminate. --locked: build exactly what CI built, from this repo's
-    # own committed Cargo.lock.
-    cargo install --path "crates/$crate" --locked --force
+    # own committed Cargo.lock. --target-dir: share this workspace's normal
+    # target/ across all crates this loop installs, instead of `cargo
+    # install`'s own default of an isolated build dir per invocation --
+    # cuts a 3-binary install from three full dependency-graph compiles
+    # (powder-core, tokio, rustls, sqlite... each duplicated three times)
+    # down to one.
+    cargo install --path "crates/$crate" --locked --force --target-dir "$ROOT/target"
   done
 }
 
