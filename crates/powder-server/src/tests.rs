@@ -1134,8 +1134,10 @@ async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
                     field_note: FieldNoteConfig::default(),
                     tailnet_proxy_secret: None,
                     tailnet_admin: true,
+                    dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
                 }),
                 store: Arc::new(Mutex::new(store)),
+                poison_count: Arc::new(AtomicU64::new(0)),
             },
             key.raw_key,
         )
