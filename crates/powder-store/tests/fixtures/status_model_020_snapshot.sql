@@ -27,8 +27,8 @@ expanded(status, n, total, claim_total) AS (
 )
 INSERT INTO cards (
   id, title, body, acceptance_json, status, priority, labels_json,
-  assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path,
-  branch_name, source_path, source_digest, claim_agent, claim_run_id,
+  assignee, related_json, blocks_json, blocked_by_json, repo,
+  source_path, source_digest, claim_agent, claim_run_id,
   claim_acquired_at, claim_expires_at, created_at, updated_at
 )
 SELECT
@@ -50,8 +50,6 @@ SELECT
   END,
   '[]',
   CASE WHEN n % 3 = 0 THEN 'powder' ELSE NULL END,
-  NULL,
-  NULL,
   NULL,
   NULL,
   CASE

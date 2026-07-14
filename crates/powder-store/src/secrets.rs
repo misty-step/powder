@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn redacts_an_anthropic_style_key() {
-        let scrubbed = scrub_secrets("ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz");
+        let scrubbed = scrub_secrets("ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz"); // leak-gate:allow synthetic fixture, not a live credential
         assert!(!scrubbed.contains("sk-ant-api03-abcdefghijklmnopqrstuvwxyz"));
         assert!(scrubbed.contains("[REDACTED:anthropic-key]"));
     }

@@ -206,7 +206,6 @@ impl Store {
             ))
             .into());
         }
-        card.status.validate_transition(CardStatus::Running)?;
         card.status = CardStatus::Running;
         card.updated_at = now;
         run.state = RunState::Active;

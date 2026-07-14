@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -44,8 +44,6 @@ CREATE TABLE IF NOT EXISTS cards (
   blocks_json TEXT NOT NULL,
   blocked_by_json TEXT NOT NULL,
   repo TEXT,
-  workspace_path TEXT,
-  branch_name TEXT,
   source_path TEXT,
   source_digest TEXT,
   claim_agent TEXT,
@@ -375,18 +373,28 @@ ALTER TABLE cards ADD COLUMN parent TEXT;
 CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent);
 "#;
 
+/// powder-epic-one-card-model: `workspace_path`/`branch_name` were written
+/// by a repo-checkout workflow this instance never ran end to end -- every
+/// production card carries null in both. `assignee` is untouched; its fate
+/// belongs to a different epic. Follows the `MIGRATE_3_TO_4` precedent of
+/// dropping dead columns outright rather than carrying them forever.
+pub const MIGRATE_14_TO_15: &str = r#"
+ALTER TABLE cards DROP COLUMN workspace_path;
+ALTER TABLE cards DROP COLUMN branch_name;
+"#;
+
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,
-assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name, source_path,
+assignee, related_json, blocks_json, blocked_by_json, repo, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
 created_at, updated_at, parent";
 
 pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
-labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
+labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at, parent FROM cards WHERE id = ?1";
 
 pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
-labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
+labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at, parent FROM cards";
 

@@ -1400,8 +1400,6 @@ function detailHTML(card, detail = {}) {
         ${section("SOURCE", definitionHTML([
           ["Repo / Source", normalized.repo || normalized.source?.path || "local"],
           ["Digest", normalized.source?.digest || "none"],
-          ["Workspace", normalized.workspace_path || "none"],
-          ["Branch", normalized.branch_name || "none"],
           ["Created", formatDate(normalized.created_at)],
           ["Updated", formatDate(normalized.updated_at)],
         ]))}
