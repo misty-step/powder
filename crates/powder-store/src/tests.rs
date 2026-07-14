@@ -5,8 +5,8 @@ use powder_core::{
 
 use crate::{
     ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
-    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError,
-    WorkLogAttribution, API_KEY_ALPHABET,
+    RelationField, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
+    StoreError, WorkLogAttribution, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -1867,6 +1867,294 @@ fn card_relations_round_trip_through_store_and_detail() -> Result<()> {
     Ok(())
 }
 
+// powder-dogfood-2026-07-14-nonreciprocal-relations: update_relations and
+// create_card_with_events mirror the delta of a relations write onto every
+// touched peer, atomically, in the same transaction as the primary write.
+// The tests below prove reciprocity add/remove, related's symmetry, that a
+// peer's unrelated existing edges survive a mirror write untouched, that a
+// dangling or self-referencing id is tolerated (skipped, not an error), and
+// that create_card mirrors a card's initial relations onto its peers.
+
+#[test]
+fn update_relations_mirrors_blocks_and_blocked_by_onto_the_peer() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    store.update_relations(
+        &a,
+        vec![],
+        vec![x.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    // A blocks X -> X is blocked_by A, mirrored atomically, no follow-up
+    // call on X required.
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.blocked_by, vec![a.clone()]);
+    assert!(x_detail.events.iter().any(|event| {
+        event.event_type == "relations" && event.payload.contains("mirrored add blocked_by a")
+    }));
+
+    // The inverse direction mirrors too: blocked_by mirrors onto blocks.
+    store.update_relations(
+        &a,
+        vec![],
+        vec![],
+        vec![x.clone()],
+        30,
+        &Authority::actor("operator", true),
+    )?;
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert!(x_detail.card.blocks.contains(&a));
+    Ok(())
+}
+
+#[test]
+fn update_relations_related_is_symmetric() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    store.update_relations(
+        &a,
+        vec![x.clone()],
+        vec![],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.related, vec![a]);
+    Ok(())
+}
+
+#[test]
+fn update_relations_removal_unmirrors_the_peer() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    store.update_relations(
+        &a,
+        vec![],
+        vec![x.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.blocked_by, vec![a.clone()]);
+
+    // Replacing A's blocks with an empty list removes the mirror on X too.
+    store.update_relations(
+        &a,
+        vec![],
+        vec![],
+        vec![],
+        30,
+        &Authority::actor("operator", true),
+    )?;
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert!(x_detail.card.blocked_by.is_empty());
+    assert!(x_detail.events.iter().any(|event| {
+        event.event_type == "relations" && event.payload.contains("mirrored remove blocked_by a")
+    }));
+    Ok(())
+}
+
+#[test]
+fn update_relations_delta_does_not_clobber_the_peers_other_relations() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("a", 10),
+        ready_card("x", 11),
+        ready_card("other", 12),
+    ])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    let other = CardId::new("other")?;
+
+    // X already blocks "other" independently of anything A does.
+    store.update_relations(
+        &x,
+        vec![],
+        vec![other.clone()],
+        vec![],
+        15,
+        &Authority::actor("operator", true),
+    )?;
+
+    // A adds X to its own blocked_by -- mirrors onto X.blocks as an
+    // *addition*, not a replacement of X's list.
+    store.update_relations(
+        &a,
+        vec![],
+        vec![],
+        vec![x.clone()],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    let mut blocks: Vec<String> = x_detail
+        .card
+        .blocks
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    blocks.sort();
+    assert_eq!(blocks, vec!["a".to_string(), "other".to_string()]);
+    Ok(())
+}
+
+#[test]
+fn update_relations_skips_mirroring_a_dangling_target() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10)])?;
+
+    let a = CardId::new("a")?;
+    let ghost = CardId::new("ghost")?;
+    // No card named "ghost" exists. This must not error -- relation targets
+    // have never been existence-checked -- and must not panic trying to
+    // mirror onto a card that isn't there.
+    let card = store.update_relations(
+        &a,
+        vec![],
+        vec![ghost.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+    assert_eq!(card.blocks, vec![ghost]);
+    Ok(())
+}
+
+#[test]
+fn update_relations_skips_mirroring_a_self_edge() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10)])?;
+
+    let a = CardId::new("a")?;
+    // A naming itself has no meaningful "other side"; this must not panic
+    // or double-apply anything.
+    let card = store.update_relations(
+        &a,
+        vec![],
+        vec![a.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+    assert_eq!(card.blocks, vec![a]);
+    Ok(())
+}
+
+#[test]
+fn create_card_mirrors_initial_relations_onto_existing_peers() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("blocker", 10)])?;
+
+    let blocker = CardId::new("blocker")?;
+    let mut born = Card::new(CardId::new("born")?, "Born blocked", "do it")
+        .unwrap()
+        .with_status(CardStatus::Backlog)
+        .with_acceptance(["proof exists".to_string()])
+        .with_created_at(20);
+    born.blocked_by = vec![blocker.clone()];
+
+    store.create_card_with_events(born, "operator", 20)?;
+
+    // The pre-existing blocker gets `blocks` mirrored onto it at creation
+    // time, with no follow-up update_relations call.
+    let blocker_detail = store
+        .get_card_detail(&blocker, DetailLevel::Detailed, 1_000_000)?
+        .expect("blocker detail");
+    assert_eq!(blocker_detail.card.blocks, vec![CardId::new("born")?]);
+    assert!(blocker_detail.events.iter().any(|event| {
+        event.event_type == "relations" && event.payload.contains("mirrored add blocks born")
+    }));
+    Ok(())
+}
+
+#[test]
+fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    // Simulate data written before reciprocal-atomic writes existed (or
+    // written directly against the database): A names X in blocks, but X's
+    // blocked_by was never updated to agree, the same way
+    // `normalize_repository_strings`'s test simulates a legacy row with a
+    // raw SQL write bypassing the store's own write path.
+    store.connection.execute(
+        "UPDATE cards SET blocks_json = '[\"x\"]' WHERE id = 'a'",
+        [],
+    )?;
+
+    let report = store.relations_doctor("operator", 50, false)?;
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.issue_count(), 1);
+    let issue = &report.issues[0];
+    assert_eq!(issue.card_id.as_str(), "a");
+    assert_eq!(issue.field, RelationField::Blocks);
+    assert_eq!(issue.target_id.as_str(), "x");
+    assert_eq!(issue.expected_mirror_field, RelationField::BlockedBy);
+    assert!(!issue.repaired);
+
+    // Report-only mode must not have written anything.
+    let x_detail = store
+        .get_card_detail(&CardId::new("x")?, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert!(x_detail.card.blocked_by.is_empty());
+
+    let repaired = store.relations_doctor("operator", 60, true)?;
+    assert_eq!(repaired.issue_count(), 1);
+    assert!(repaired.issues[0].repaired);
+
+    let x_detail = store
+        .get_card_detail(&CardId::new("x")?, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.blocked_by, vec![CardId::new("a")?]);
+    assert!(x_detail.events.iter().any(|event| {
+        event.event_type == "relations"
+            && event.actor == "operator"
+            && event.payload.contains("mirrored add blocked_by a")
+    }));
+
+    // Idempotent: nothing left to repair.
+    let second = store.relations_doctor("operator", 70, true)?;
+    assert_eq!(second.issue_count(), 0);
+    Ok(())
+}
+
 #[test]
 fn blockers_resolve_against_terminality_not_mere_presence() -> Result<()> {
     let mut store = Store::open_in_memory()?;
@@ -3147,8 +3435,134 @@ fn created_agent_key_verifies_with_agent_scope() -> Result<()> {
 
     assert_eq!(verified.scope, ApiKeyScope::Agent);
     assert_eq!(verified.name, "agent");
-    assert_eq!(verified.actor.display_name, "agent");
-    assert_eq!(verified.actor.kind.as_str(), "agent");
+    assert_eq!(verified.principal, "agent");
+    Ok(())
+}
+
+#[test]
+fn migration_17_to_18_preserves_keys_claims_and_runs_while_deleting_actor_kind() -> Result<()> {
+    let path = temp_db("principal-worker-run-v18");
+    let card_id = CardId::new("principal-migration")?;
+    let (raw_key, key_id, revoked_raw_key, revoked_key_id, run_id) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        let key = store.create_api_key("roster", ApiKeyScope::Agent, 1)?;
+        store
+            .verify_api_key(&key.raw_key, 2)?
+            .expect("key verifies");
+        let revoked = store.create_api_key("retired-roster", ApiKeyScope::Agent, 1)?;
+        store
+            .verify_api_key(&revoked.raw_key, 2)?
+            .expect("key verifies before revocation");
+        store.revoke_api_key(&revoked.id, 3)?;
+        store.import_cards(vec![ready_card(card_id.as_str(), 3)])?;
+        let claim = store.claim_card(
+            &card_id,
+            "roster",
+            4,
+            600,
+            &Authority::actor("roster", false),
+        )?;
+        (
+            key.raw_key,
+            key.id,
+            revoked.raw_key,
+            revoked.id,
+            claim.run_id,
+        )
+    };
+
+    // Reconstruct the exact identity/lease columns schema 17 carried so the
+    // production migration, rather than fresh-schema creation, is exercised.
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            INSERT INTO actors (id, kind, display_name, created_at)
+              SELECT 'actor-' || id, 'agent', principal, created_at FROM api_keys;
+            CREATE TABLE api_keys_v17 (
+              id TEXT PRIMARY KEY,
+              actor_id TEXT NOT NULL REFERENCES actors(id),
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER,
+              last_used_at INTEGER
+            );
+            INSERT INTO api_keys_v17
+              (id, actor_id, name, key_prefix, key_hash, hash_algorithm,
+               scope, created_at, revoked_at, last_used_at)
+              SELECT id, 'actor-' || id, name, key_prefix, key_hash,
+                     hash_algorithm, scope, created_at, revoked_at, last_used_at
+              FROM api_keys;
+            DROP TABLE api_keys;
+            ALTER TABLE api_keys_v17 RENAME TO api_keys;
+            CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            ALTER TABLE cards DROP COLUMN claim_principal;
+            ALTER TABLE runs DROP COLUMN principal;
+            PRAGMA user_version = 17;
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+
+    let summaries = store.list_api_keys()?;
+    let active_summary = summaries
+        .iter()
+        .find(|key| key.id == key_id)
+        .expect("active key summary");
+    assert_eq!(active_summary.last_used_at, Some(2));
+    assert_eq!(active_summary.revoked_at, None);
+    let revoked_summary = summaries
+        .iter()
+        .find(|key| key.id == revoked_key_id)
+        .expect("revoked key summary");
+    assert_eq!(revoked_summary.principal, "retired-roster");
+    assert_eq!(revoked_summary.last_used_at, Some(2));
+    assert_eq!(revoked_summary.revoked_at, Some(3));
+    assert!(store.verify_api_key(&revoked_raw_key, 5)?.is_none());
+
+    let verified = store
+        .verify_api_key(&raw_key, 5)?
+        .expect("legacy key remains valid");
+    assert_eq!(verified.id, key_id);
+    assert_eq!(verified.principal, "roster");
+    let summary = store
+        .list_api_keys()?
+        .into_iter()
+        .find(|key| key.id == key_id)
+        .expect("key summary");
+    assert_eq!(summary.last_used_at, Some(5));
+
+    let card = store.get_card(&card_id)?.expect("card survives");
+    let claim = card.claim.expect("claim survives");
+    assert_eq!(claim.principal, "roster");
+    assert_eq!(claim.agent, "roster");
+    assert_eq!(claim.run_id, run_id);
+    let run = store.get_run(&run_id)?.expect("run survives");
+    assert_eq!(run.principal, "roster");
+    assert_eq!(run.agent, "roster");
+
+    let actors_left: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'actors'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(actors_left, 0, "the one-actor-per-key table is deleted");
     Ok(())
 }
 
@@ -3169,7 +3583,7 @@ fn list_api_keys_reports_metadata_never_secrets() -> Result<()> {
     assert_eq!(keys[0].last_used_at, None);
     assert_eq!(keys[1].id, agent.id);
     assert_eq!(keys[1].name, "codex");
-    assert_eq!(keys[1].actor.display_name, "codex");
+    assert_eq!(keys[1].principal, "codex");
     assert_eq!(keys[1].revoked_at, None);
     assert_eq!(keys[1].key_prefix, agent.key_prefix);
     assert_eq!(keys[1].last_used_at, None);
@@ -3360,16 +3774,13 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
     // pre-existing rows), proving the loop didn't skip a step.
     let verified = store.verify_api_key(raw_key, 21)?.expect("migrated key");
     assert_eq!(verified.name, "legacy-agent");
-    assert_eq!(verified.actor.id, "actor-key-legacy");
-    assert_eq!(verified.actor.display_name, "legacy-agent");
-    assert_eq!(verified.actor.kind.as_str(), "agent");
+    assert_eq!(verified.principal, "legacy-agent");
 
     let created = store.create_api_key("new-agent", ApiKeyScope::Agent, 20)?;
     let verified = store
         .verify_api_key(&created.raw_key, 22)?
         .expect("new key after migration");
-    assert_eq!(verified.actor.display_name, "new-agent");
-    assert_eq!(verified.actor.kind.as_str(), "agent");
+    assert_eq!(verified.principal, "new-agent");
     Ok(())
 }
 
@@ -3469,13 +3880,13 @@ fn migration_1_to_2_finishes_a_backfill_that_crashed_after_the_column_add() -> R
 
     // The interrupted backfill must have been finished: no key left NULL,
     // and an actor row minted for the legacy key.
-    let null_actor_ids: i64 = store.connection.query_row(
-        "SELECT COUNT(*) FROM api_keys WHERE actor_id IS NULL",
+    let null_principals: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM api_keys WHERE principal IS NULL OR principal = ''",
         [],
         |row| row.get(0),
     )?;
     assert_eq!(
-        null_actor_ids, 0,
+        null_principals, 0,
         "the completeness guard must finish the backfill the crash interrupted"
     );
 
@@ -3486,8 +3897,7 @@ fn migration_1_to_2_finishes_a_backfill_that_crashed_after_the_column_add() -> R
         .verify_api_key(raw_key, 21)?
         .expect("legacy key must still authenticate after the finished backfill");
     assert_eq!(verified.name, "legacy-agent");
-    assert_eq!(verified.actor.id, "actor-key-legacy");
-    assert_eq!(verified.actor.display_name, "legacy-agent");
+    assert_eq!(verified.principal, "legacy-agent");
     Ok(())
 }
 
@@ -3583,7 +3993,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
     // switching new keys to sha256 must never break a key that already
     // exists in the wild on a deployed instance.
     let verified = store.verify_api_key(raw_key, 21)?.expect("legacy v2 key");
-    assert_eq!(verified.actor.display_name, "v2-agent");
+    assert_eq!(verified.principal, "v2-agent");
 
     // a key created after the migration is hashed with sha256, not bcrypt.
     let created = store.create_api_key("post-migration-agent", ApiKeyScope::Agent, 30)?;
@@ -3596,7 +4006,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
     let verified = store
         .verify_api_key(&created.raw_key, 31)?
         .expect("new sha256 key");
-    assert_eq!(verified.actor.display_name, "post-migration-agent");
+    assert_eq!(verified.principal, "post-migration-agent");
     Ok(())
 }
 
@@ -3856,7 +4266,7 @@ fn migration_3_to_4_finishes_a_half_applied_run_column_drop() -> Result<()> {
     Ok(())
 }
 
-/// Every migration step from 1->16 must tolerate being invoked twice in a
+/// Every migration step from 1->18 must tolerate being invoked twice in a
 /// row against a database that already has its target schema (the shape a
 /// crash-and-retry boot produces once a step has fully applied but before
 /// `migrate()`'s loop reaches `SCHEMA_VERSION`) without erroring. Steps 11+
@@ -3892,6 +4302,10 @@ fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
     store.migrate_14_to_15()?;
     store.migrate_15_to_16()?;
     store.migrate_15_to_16()?;
+    store.migrate_16_to_17()?;
+    store.migrate_16_to_17()?;
+    store.migrate_17_to_18()?;
+    store.migrate_17_to_18()?;
 
     // Re-running every step twice must not have perturbed the fully
     // migrated schema: still at SCHEMA_VERSION, still able to round-trip a
@@ -3998,27 +4412,76 @@ fn admin_authority_bypasses_claim_ownership() -> Result<()> {
 }
 
 #[test]
-fn claim_card_rejects_agent_impersonation() -> Result<()> {
+fn claim_card_records_principal_separately_from_worker() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("001")?;
     store.import_cards(vec![ready_card("001", 2)])?;
 
-    let err = store.claim_card(
+    let receipt = store.claim_card(
         &card_id,
         "agent-a",
         10,
         3600,
         &Authority::actor("agent-b", false),
+    )?;
+    assert_eq!(receipt.principal, "agent-b");
+    assert_eq!(receipt.agent, "agent-a");
+
+    let wrong_principal = store.release_claim(
+        &card_id,
+        &receipt.run_id,
+        11,
+        &Authority::actor("agent-a", false),
     );
     assert!(matches!(
-        err,
+        wrong_principal,
         Err(StoreError::Domain(DomainError::Forbidden(_)))
     ));
-    assert!(store
-        .list_ready(ReadyQuery::new(10, 10))?
-        .iter()
-        .any(|card| card.id == card_id));
+    store.release_claim(
+        &card_id,
+        &receipt.run_id,
+        12,
+        &Authority::actor("agent-b", false),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn request_input_rejects_a_released_run_after_same_principal_reclaims_as_another_worker(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+    let principal = Authority::principal("roster", false);
+
+    let first = store.claim_card(&card_id, "worker-a", 10, 3600, &principal)?;
+    store.release_claim(&card_id, &first.run_id, 11, &principal)?;
+    let second = store.claim_card(&card_id, "worker-b", 12, 3600, &principal)?;
+    store.update_status(&card_id, CardStatus::InProgress, 13, &principal)?;
+
+    let error = store
+        .request_input(&first.run_id, "Approve stale run?", 14, &principal)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not the current claim"),
+        "error was: {error}"
+    );
+    assert_eq!(
+        store.get_run(&first.run_id)?.expect("first run").state,
+        RunState::Released
+    );
+    assert_eq!(
+        store.get_run(&second.run_id)?.expect("second run").state,
+        RunState::Active
+    );
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::InProgress);
+    assert_eq!(
+        card.claim.as_ref().map(|claim| &claim.run_id),
+        Some(&second.run_id)
+    );
     Ok(())
 }
 

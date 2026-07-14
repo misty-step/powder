@@ -30,6 +30,7 @@ impl ReadyQuery {
 pub struct ClaimReceipt {
     pub card_id: CardId,
     pub run_id: RunId,
+    pub principal: String,
     pub agent: String,
     pub expires_at: i64,
 }
@@ -53,11 +54,13 @@ mod tests {
         let receipt = ClaimReceipt {
             card_id: CardId::new("001").unwrap(),
             run_id: RunId::new("run-1").unwrap(),
+            principal: "roster".to_string(),
             agent: "agent-a".to_string(),
             expires_at: 100,
         };
         assert_eq!(receipt.card_id.as_str(), "001");
         assert_eq!(receipt.run_id.as_str(), "run-1");
+        assert_eq!(receipt.principal, "roster");
         assert_eq!(receipt.agent, "agent-a");
         assert_eq!(receipt.expires_at, 100);
     }

@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -6,16 +6,9 @@ CREATE TABLE IF NOT EXISTS seed_runs (
   applied_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS actors (
-  id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  display_name TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS api_keys (
   id TEXT PRIMARY KEY,
-  actor_id TEXT NOT NULL REFERENCES actors(id),
+  principal TEXT NOT NULL,
   name TEXT NOT NULL,
   key_prefix TEXT NOT NULL,
   key_hash TEXT NOT NULL,
@@ -45,6 +38,7 @@ CREATE TABLE IF NOT EXISTS cards (
   repo TEXT,
   source_path TEXT,
   source_digest TEXT,
+  claim_principal TEXT,
   claim_agent TEXT,
   claim_run_id TEXT,
   claim_acquired_at INTEGER,
@@ -78,6 +72,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   state TEXT NOT NULL,
+  principal TEXT NOT NULL,
   agent TEXT NOT NULL,
   claim_expires_at INTEGER NOT NULL,
   proof TEXT,
@@ -363,18 +358,19 @@ ALTER TABLE cards DROP COLUMN autonomy;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, source_path,
-source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
+source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
 created_at, updated_at, parent";
 
 pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
-source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
+source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at, parent FROM cards WHERE id = ?1";
 
 pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
-source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
+source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at, parent FROM cards";
 
-pub const RUN_SELECT_SQL: &str = "SELECT id, card_id, state, agent, claim_expires_at, proof,
+pub const RUN_SELECT_SQL: &str =
+    "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,
 created_at, updated_at FROM runs WHERE id = ?1";

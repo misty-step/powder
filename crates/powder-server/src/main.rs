@@ -461,18 +461,9 @@ struct RepositoryMergeRequest {
 
 #[derive(Debug, Deserialize)]
 struct ClaimRequest {
-    // Required, not `Option`: a caller that omits `agent` (linejam-906 --
-    // a raw curl claim with no `agent` field) must get a deserialize error,
-    // not a silent fallback to the *authenticated actor's own* display
-    // name. For a shared admin-scoped key that fallback recorded the claim
-    // under "operator-admin" with no validation error at all, so the
-    // caller's later renew (as its own real identity) correctly 409'd
-    // against a claim it never actually held -- a claim recorded under the
-    // wrong identity, not a lock-ordering race. `Authority::require_identity`
-    // already refuses this same silent-substitution shape for non-admin
-    // callers (api_key_claim_rejects_cross_agent_impersonation); this closes
-    // the same gap for admin-scoped keys, who can still claim as anyone --
-    // they just have to say who.
+    // Required, not `Option`: the authenticated principal and semantic worker
+    // are deliberately different identities. A caller must always declare
+    // the worker; Powder never guesses it from the credential label.
     agent: String,
     ttl_seconds: Option<u64>,
 }
@@ -1074,7 +1065,7 @@ async fn merge_repository_alias(
     Json(request): Json<RepositoryMergeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = require_admin(&state, &headers)?;
-    let merge_actor = request.actor.unwrap_or(actor.display_name);
+    let merge_actor = request.actor.unwrap_or(actor.principal);
     let outcome = lock_store(&state)?.merge_repository_alias(
         &request.alias,
         &name,
@@ -1151,7 +1142,7 @@ async fn create_card(
     card.repo = request.repo;
     let card = {
         let mut store = lock_store(&state)?;
-        store.create_card_with_events(card, &actor.display_name, now)?
+        store.create_card_with_events(card, &actor.principal, now)?
     };
     let mut payload = json!(card);
     if card.acceptance.is_empty() {
@@ -1176,7 +1167,7 @@ async fn patch_card(
     let card = lock_store(&state)?.patch_card(
         &card_id,
         request.into_patch()?,
-        &actor.display_name,
+        &actor.principal,
         unix_now(),
     )?;
     Ok(Json(card))
@@ -1591,7 +1582,7 @@ struct KeySummaryResponse {
     id: String,
     name: String,
     scope: &'static str,
-    actor: String,
+    principal: String,
     key_prefix: String,
     created_at: i64,
     revoked_at: Option<i64>,
@@ -1604,7 +1595,7 @@ impl From<powder_store::ApiKeySummary> for KeySummaryResponse {
             id: key.id,
             name: key.name,
             scope: key.scope.as_str(),
-            actor: key.actor.display_name,
+            principal: key.principal,
             key_prefix: key.key_prefix,
             created_at: key.created_at,
             revoked_at: key.revoked_at,
@@ -1638,7 +1629,7 @@ async fn revoke_key(
 
 #[derive(Debug, Clone)]
 struct AuthorizedActor {
-    display_name: String,
+    principal: String,
     enforces_identity: bool,
     is_admin: bool,
     /// The presented API key's non-secret lookup prefix, when auth mode is
@@ -1653,7 +1644,7 @@ impl AuthorizedActor {
     /// that `Store` mutation methods check claim ownership against.
     fn authority(&self) -> Authority {
         if self.enforces_identity {
-            Authority::actor(self.display_name.clone(), self.is_admin)
+            Authority::actor(self.principal.clone(), self.is_admin)
         } else {
             Authority::unchecked()
         }
@@ -1663,7 +1654,7 @@ impl AuthorizedActor {
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
     match state.config.auth_mode {
         AuthMode::None => Ok(AuthorizedActor {
-            display_name: "anonymous".to_string(),
+            principal: "anonymous".to_string(),
             enforces_identity: false,
             is_admin: false,
             key_prefix: None,
@@ -1682,7 +1673,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             }
             if let Some(identity) = trusted_tailnet_identity(headers) {
                 Ok(AuthorizedActor {
-                    display_name: identity.to_string(),
+                    principal: identity.to_string(),
                     enforces_identity: true,
                     is_admin: state.config.tailnet_admin,
                     key_prefix: None,
@@ -1702,7 +1693,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             };
             if key.scope.allows_agent() {
                 Ok(AuthorizedActor {
-                    display_name: key.actor.display_name,
+                    principal: key.principal,
                     enforces_identity: true,
                     is_admin: key.scope == ApiKeyScope::Admin,
                     key_prefix: Some(key.key_prefix),
@@ -1710,7 +1701,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             } else {
                 Err(ApiError::forbidden(format!(
                     "{} (key {}, prefix {}) has scope {} which cannot access agent routes",
-                    key.actor.display_name,
+                    key.principal,
                     key.name,
                     key.key_prefix,
                     key.scope.as_str()
@@ -1747,8 +1738,8 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActo
         // staring at a 403 needs to know *which* credential came up short
         // without grepping logs (powder-918).
         let presented = match actor.key_prefix.as_deref() {
-            Some(prefix) => format!("{} (key prefix {prefix})", actor.display_name),
-            None => actor.display_name.clone(),
+            Some(prefix) => format!("{} (key prefix {prefix})", actor.principal),
+            None => actor.principal.clone(),
         };
         Err(ApiError::forbidden(format!(
             "{presented} requires admin scope"

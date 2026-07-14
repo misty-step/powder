@@ -702,6 +702,90 @@ async fn card_relations_round_trip_through_http_api() {
     }));
 }
 
+/// powder-dogfood-2026-07-14-nonreciprocal-relations: a relations write
+/// against one card must be atomically reciprocal on the other -- reading
+/// either card back through the HTTP API shows the same edge, with no
+/// second call required.
+#[tokio::test]
+async fn card_relations_reciprocity_visible_on_both_sides_via_http_api() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    for id in ["recip-a", "recip-b"] {
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&raw_key),
+                &format!(r#"{{"id":"{id}","title":"Recip {id}","acceptance":["proof"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+    }
+
+    let updated = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/recip-a/relations",
+            Some(&raw_key),
+            r#"{"related":[],"blocks":[],"blocked_by":["recip-b"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let peer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/recip-b")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let peer = response_json(peer).await;
+    assert_eq!(peer["card"]["blocks"][0], "recip-a");
+    assert!(peer["events"].as_array().unwrap().iter().any(|event| {
+        event["event_type"] == "relations"
+            && event["payload"]
+                .to_string()
+                .contains("mirrored add blocks recip-a")
+    }));
+
+    // Removing the edge from recip-a's side unmirrors it from recip-b too.
+    let cleared = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/recip-a/relations",
+            Some(&raw_key),
+            r#"{"related":[],"blocks":[],"blocked_by":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+
+    let peer = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/recip-b")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let peer = response_json(peer).await;
+    assert!(peer["card"].get("blocks").is_none());
+}
+
 #[tokio::test]
 async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -2579,53 +2663,73 @@ async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
 }
 
 #[tokio::test]
-async fn api_key_claim_rejects_cross_agent_impersonation() {
+async fn one_integration_principal_can_claim_as_distinct_workers() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state
         .store
         .lock()
         .unwrap()
-        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .create_api_key("roster", ApiKeyScope::Agent, 1)
         .unwrap()
         .raw_key;
     let app = app(state);
 
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&admin_key),
-            r#"{"id":"api-identity","title":"API identity","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
+    for (id, worker) in [("api-worker-a", "worker-a"), ("api-worker-b", "worker-b")] {
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&admin_key),
+                &format!(
+                    r#"{{"id":"{id}","title":"API identity","body":"","acceptance":["proof exists"],"status":"ready","priority":"P0"}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
 
-    let impersonated = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/api-identity/claim",
-            Some(&agent_key),
-            r#"{"agent":"someone-else","ttl_seconds":3600}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(impersonated.status(), StatusCode::FORBIDDEN);
+        let claimed = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/api/v1/cards/{id}/claim"),
+                Some(&agent_key),
+                &format!(r#"{{"agent":"{worker}","ttl_seconds":3600}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let claimed = response_json(claimed).await;
+        assert_eq!(claimed["principal"], "roster");
+        assert_eq!(claimed["agent"], worker);
 
-    let claimed = app
+        let detail = app
+            .clone()
+            .oneshot(json_request(
+                Method::GET,
+                &format!("/api/v1/cards/{id}"),
+                Some(&agent_key),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail = response_json(detail).await;
+        assert_eq!(detail["card"]["claim"]["principal"], "roster");
+        assert_eq!(detail["card"]["claim"]["agent"], worker);
+    }
+
+    let collision = app
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/cards/api-identity/claim",
+            "/api/v1/cards/api-worker-a/claim",
             Some(&agent_key),
-            r#"{"agent":"codex","ttl_seconds":3600}"#,
+            r#"{"agent":"worker-c","ttl_seconds":3600}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(claimed.status(), StatusCode::OK);
-    let claimed = response_json(claimed).await;
-    assert_eq!(claimed["agent"], "codex");
+    assert_eq!(collision.status(), StatusCode::CONFLICT);
 }
 
 /// linejam-906: a claim response being `200 OK` is not itself proof the
@@ -2692,13 +2796,9 @@ async fn claim_then_get_card_then_renew_round_trips_for_same_identity() {
 
 /// linejam-906's actual root cause: a claim request that omits `agent`
 /// entirely (the exact shape of the raw-curl repro that triggered this
-/// card) must be rejected, not silently recorded under the authenticated
-/// actor's own display name. Before the fix this was a silent 200 with
-/// `agent == "operator-admin"` for the shared admin-scoped seed key --
-/// `Authority::require_identity` already refuses this same silent-
-/// substitution shape for non-admin callers
-/// (`api_key_claim_rejects_cross_agent_impersonation`, above), but was a
-/// no-op for admin authority.
+/// card) must be rejected, not silently inferred from the authenticated
+/// principal. Principal and worker are separate, so omission is always an
+/// invalid request even when the key has admin scope.
 #[tokio::test]
 async fn admin_key_claim_without_explicit_agent_is_rejected_not_silently_self_assigned() {
     let (state, admin_key) = test_state(AuthMode::ApiKey); // seed key is admin-scoped
@@ -3531,6 +3631,8 @@ async fn admin_can_list_and_revoke_a_key_which_then_loses_access_immediately() {
         .find(|key| key["name"] == "codex")
         .expect("agent key listed");
     assert_eq!(agent_entry["scope"], "agent");
+    assert_eq!(agent_entry["principal"], "codex");
+    assert!(agent_entry.get("actor").is_none());
     assert!(agent_entry["revoked_at"].is_null());
     let agent_key_id = agent_entry["id"].as_str().unwrap().to_string();
 
@@ -3619,6 +3721,7 @@ async fn list_keys_surfaces_key_prefix_and_last_used_at_over_http() {
         .iter()
         .find(|key| key["name"] == "codex")
         .expect("agent key listed");
+    assert_eq!(agent_before["principal"], "codex");
     assert!(agent_before["last_used_at"].is_null());
     let prefix = agent_before["key_prefix"].as_str().unwrap().to_string();
     assert!(
@@ -4481,7 +4584,7 @@ fn proxy_secret_set_and_header_wrong_is_unauthorized() {
 fn proxy_secret_set_and_header_correct_is_authorized() {
     let state = test_state_with_tailnet_backstop(Some("correct-horse"), true);
     let actor = authorize(&state, &proxy_secret_header("correct-horse")).unwrap();
-    assert_eq!(actor.display_name, "operator");
+    assert_eq!(actor.principal, "operator");
     assert!(actor.is_admin);
 }
 
@@ -4491,7 +4594,7 @@ fn proxy_secret_unset_preserves_current_behavior() {
     // No X-Powder-Proxy-Secret header at all -- unset config must not
     // require one.
     let actor = authorize(&state, &identity_headers("operator")).unwrap();
-    assert_eq!(actor.display_name, "operator");
+    assert_eq!(actor.principal, "operator");
     assert!(actor.is_admin);
 
     let err = authorize(&state, &HeaderMap::new()).unwrap_err();
