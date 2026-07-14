@@ -2,12 +2,29 @@
 # Classify remote Powder failures without exposing credentials.
 set -euo pipefail
 
-EXPECTED_API_BASE_URL="${POWDER_EXPECTED_API_BASE_URL:-https://sanctum.tail5f5eb4.ts.net:10001}"
-SANCTUM_ROOT_URL="${POWDER_SANCTUM_ROOT_URL:-https://sanctum.tail5f5eb4.ts.net/}"
+EXPECTED_API_BASE_URL="${POWDER_EXPECTED_API_BASE_URL:-}"
+SANCTUM_ROOT_URL="${POWDER_SANCTUM_ROOT_URL:-}"
 CARD_ID="${POWDER_DOCTOR_CARD_ID:-powder-agent-reachability}"
 SECRETS_FILE="${POWDER_SECRETS_FILE:-$HOME/.secrets}"
 POWDER_BIN="${POWDER_DOCTOR_POWDER_BIN:-powder}"
 CURL_BIN="${POWDER_DOCTOR_CURL_BIN:-curl}"
+
+# powder-ci-leak-gate: this script used to bake in the operator's tailnet
+# hostname as a fallback default, which put an operator-topology literal in
+# a public repo. There is no repo-wide default anymore -- every deployment
+# target, including the operator's own, must come from the caller's
+# environment (harness bootstrap, 1Password item, shell profile), never
+# from this file.
+if [[ -z "$EXPECTED_API_BASE_URL" ]]; then
+  printf 'FAIL CONFIG_MISSING variable=POWDER_EXPECTED_API_BASE_URL\n' >&2
+  printf 'guidance: set POWDER_EXPECTED_API_BASE_URL to this deployment'\''s API base URL before running the doctor; there is no built-in default\n' >&2
+  exit 19
+fi
+if [[ -z "$SANCTUM_ROOT_URL" ]]; then
+  printf 'FAIL CONFIG_MISSING variable=POWDER_SANCTUM_ROOT_URL\n' >&2
+  printf 'guidance: set POWDER_SANCTUM_ROOT_URL to this deployment'\''s root URL before running the doctor; there is no built-in default\n' >&2
+  exit 19
+fi
 
 if [[ -f "$SECRETS_FILE" ]]; then
   # shellcheck source=/dev/null

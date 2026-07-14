@@ -122,10 +122,12 @@ yet trustworthy enough for a fleet to depend on:
   runs transactional card lifecycle operations.
 - `powder-cli` can initialize an instance database, create cards, list ready
   work, claim, transition, and complete cards.
-- `powder-mcp` exposes `list_ready`, `manage_claim`, `update_status`,
-  `update_relations`, `add_link`, `request_input`, and `complete_card` over
-  stdio using the same domain model; it uses SQLite when `POWDER_DB_PATH` is
-  set.
+- `powder-mcp` exposes the full agent toolset (20 default tools plus a
+  9-tool admin add-on gated by `POWDER_MCP_TOOLSETS`) over stdio using the
+  same domain model; it uses SQLite when `POWDER_DB_PATH` is set, or a
+  deployed instance over HTTP when `POWDER_API_BASE_URL`/`POWDER_API_KEY`
+  are set instead. See `SKILL.md`'s "Expected MCP Tools" for the current
+  list.
 - `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
   first-run onboarding state, API-key auth, and tailnet/none modes.
 - Docker, Fly, Litestream, and env examples follow the Canary-style

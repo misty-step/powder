@@ -1241,6 +1241,78 @@ mod tests {
         );
     }
 
+    /// powder-skill-drift-gate: `SKILL.md`'s "Expected MCP Tools" section is
+    /// hand-written prose, not generated from `TOOLS`, so it has already
+    /// drifted once (16 documented vs. 20 default-persona tools). This test
+    /// extracts every `` `tool_name`: `` bullet from that section (matching
+    /// the exact bullet shape SKILL.md uses for every tool entry) and
+    /// asserts it names every default-persona tool (`TOOLS` minus
+    /// `ADMIN_TOOL_NAMES`) and no stale/renamed tool name.
+    #[test]
+    fn skill_md_expected_tools_match_default_persona() {
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("powder-mcp lives two levels below the repo root")
+            .to_path_buf();
+        let skill_md =
+            std::fs::read_to_string(root.join("SKILL.md")).expect("read repo-root SKILL.md");
+
+        const HEADING: &str = "## Expected MCP Tools";
+        let section_start = skill_md
+            .find(HEADING)
+            .expect("SKILL.md must have an `## Expected MCP Tools` section");
+        let after_heading = &skill_md[section_start + HEADING.len()..];
+        let section_end = after_heading.find("\n## ").unwrap_or(after_heading.len());
+        let section = &after_heading[..section_end];
+
+        // Every tool entry in this section is a top-level bullet shaped
+        // exactly `- \`tool_name\`: description` -- unlike the many other
+        // backtick spans in this section (enum values, field names, route
+        // paths), which never start a line right after `- `.
+        let mut documented: BTreeSet<&str> = BTreeSet::new();
+        for line in section.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("- `") else {
+                continue;
+            };
+            let Some(end) = rest.find('`') else {
+                continue;
+            };
+            let (name, tail) = rest.split_at(end);
+            if tail.starts_with("`:") {
+                documented.insert(name);
+            }
+        }
+
+        let all_tool_names: BTreeSet<&str> = TOOLS.iter().map(|t| t.name).collect();
+        let default_tool_names: BTreeSet<&str> = TOOLS
+            .iter()
+            .map(|t| t.name)
+            .filter(|name| !ADMIN_TOOL_NAMES.contains(name))
+            .collect();
+
+        let missing: Vec<&str> = default_tool_names
+            .iter()
+            .filter(|name| !documented.contains(*name))
+            .copied()
+            .collect();
+        let extra: Vec<&str> = documented
+            .iter()
+            .filter(|name| !all_tool_names.contains(*name))
+            .copied()
+            .collect();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "SKILL.md's `## Expected MCP Tools` section has drifted from powder-mcp's TOOLS array.\n\
+             missing (default-persona tools not documented in SKILL.md): {missing:?}\n\
+             extra (documented names that are not current tool names): {extra:?}"
+        );
+    }
+
     #[test]
     fn schema_enums_match_domain_parse_sets() {
         let listed = tool_defs_json_for(Toolset::WithAdmin);

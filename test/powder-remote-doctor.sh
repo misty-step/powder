@@ -36,14 +36,35 @@ run_doctor() {
     PATH="$TMP:/usr/bin:/bin" \
     POWDER_SECRETS_FILE=/dev/null \
     POWDER_EXPECTED_API_BASE_URL=https://sanctum.example:10001 \
+    POWDER_SANCTUM_ROOT_URL=https://sanctum.example/ \
     "$@" \
     "$DOCTOR"
 }
 
+# powder-ci-leak-gate: the doctor no longer bakes in an operator tailnet
+# default, so both POWDER_EXPECTED_API_BASE_URL and POWDER_SANCTUM_ROOT_URL
+# must come from the caller -- assert it fails closed, with guidance, when
+# either is missing, before exercising the rest of the classification tree.
+if run_doctor POWDER_EXPECTED_API_BASE_URL= POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key \
+  >"$TMP/config_missing_expected.out" 2>&1; then
+  echo "expected missing POWDER_EXPECTED_API_BASE_URL to fail" >&2
+  exit 1
+fi
+grep -q 'CONFIG_MISSING' "$TMP/config_missing_expected.out"
+grep -q 'POWDER_EXPECTED_API_BASE_URL' "$TMP/config_missing_expected.out"
+
+if run_doctor POWDER_SANCTUM_ROOT_URL= POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key \
+  >"$TMP/config_missing_root.out" 2>&1; then
+  echo "expected missing POWDER_SANCTUM_ROOT_URL to fail" >&2
+  exit 1
+fi
+grep -q 'CONFIG_MISSING' "$TMP/config_missing_root.out"
+grep -q 'POWDER_SANCTUM_ROOT_URL' "$TMP/config_missing_root.out"
+
 success="$(run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key)"
 grep -q 'PASS powder_remote' <<<"$success"
 
-if run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key >"$TMP/drift.out" 2>&1; then
+if run_doctor POWDER_API_BASE_URL=https://drifted.example:10001 POWDER_API_KEY=test-key >"$TMP/drift.out" 2>&1; then
   echo "expected endpoint drift to fail" >&2
   exit 1
 fi
