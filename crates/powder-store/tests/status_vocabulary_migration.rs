@@ -177,16 +177,17 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
         );
     }
 
-    // claimed(9) + running(45) both collapse to in_progress. Of the 18
-    // blocked rows: only the 2 carrying real blocked_by relations become
-    // ready (78 already-ready + 2 = 80); the 15 relation-less rows and the
-    // single empty-acceptance row re-triage to backlog (170 + 16 = 186) --
-    // blocking that exists only as prose must not become claimable without
-    // a human wiring relations or promoting deliberately (adversarial
-    // review of PR #134). Everything else is untouched.
-    assert_eq!(after_status_counts.get("backlog").copied(), Some(186));
-    assert_eq!(after_status_counts.get("ready").copied(), Some(80));
-    assert_eq!(after_status_counts.get("in_progress").copied(), Some(54));
+    // Only the 7 claimed + 16 running rows with complete claims collapse to
+    // in_progress. The 30 claimless/partial-claim rows carrying a real oracle
+    // return to ready; the one claimless running row with no oracle returns to
+    // backlog. This prevents legacy active statuses from becoming stranded in
+    // in_progress when there is no claim a worker can resume or replace. Of
+    // the 18 blocked rows: only the 2 carrying real blocked_by relations become
+    // ready; the 15 relation-less rows and the single empty-acceptance row
+    // re-triage to backlog. Everything else is untouched.
+    assert_eq!(after_status_counts.get("backlog").copied(), Some(187));
+    assert_eq!(after_status_counts.get("ready").copied(), Some(110));
+    assert_eq!(after_status_counts.get("in_progress").copied(), Some(23));
     assert_eq!(after_status_counts.get("awaiting_input").copied(), Some(2));
     assert_eq!(after_status_counts.get("done").copied(), Some(49));
     assert_eq!(after_status_counts.get("shipped").copied(), Some(10));
@@ -248,6 +249,32 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
          list_ready keeps excluding it until the blocker resolves"
     );
     assert_eq!(status_of("blocked-resolved-blocker-001"), "ready");
+    assert_eq!(
+        status_of("claimed-001"),
+        "in_progress",
+        "a complete legacy claim remains active"
+    );
+    assert_eq!(
+        status_of("claimed-008"),
+        "ready",
+        "a claimless legacy claimed card with an oracle returns to ready"
+    );
+    assert_eq!(
+        status_of("claimed-009"),
+        "ready",
+        "a malformed partial claim is treated as claimless without being repaired"
+    );
+    assert_eq!(
+        status_of("running-017"),
+        "ready",
+        "a claimless legacy running card with an oracle returns to ready"
+    );
+    assert_eq!(
+        status_of("running-044"),
+        "backlog",
+        "a claimless legacy running card without an oracle returns to backlog"
+    );
+    assert_eq!(status_of("running-045"), "ready");
 
     // The migration audit events exist, name both statuses plus the
     // relation-less re-triage rationale, and are attributed to the
@@ -280,6 +307,23 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
         relation_payload,
         "status-vocabulary migration: blocked -> ready"
     );
+    let (_, active_payload) = event_for("running-001");
+    assert_eq!(
+        active_payload,
+        "status-vocabulary migration: running -> in_progress"
+    );
+    let (_, claimless_payload) = event_for("claimed-008");
+    assert_eq!(
+        claimless_payload,
+        "status-vocabulary migration: claimed -> ready \
+         (no valid claim; acceptance oracle present)"
+    );
+    let (_, no_oracle_payload) = event_for("running-044");
+    assert_eq!(
+        no_oracle_payload,
+        "status-vocabulary migration: running -> backlog \
+         (no valid claim or acceptance oracle)"
+    );
 
     // powder-status-vocabulary regression (acceptance #3): a former-blocked
     // card whose blocker is still live must NOT surface in list_ready even
@@ -307,6 +351,18 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
             !ready.iter().any(|card| card.id.as_str() == "blocked-001"),
             "a relation-less former-blocked card re-triaged to backlog must not \
              surface in list_ready either"
+        );
+        assert!(
+            ready.iter().any(|card| card.id.as_str() == "claimed-008"),
+            "a claimless legacy claimed card with an oracle must become dispatchable again"
+        );
+        assert!(
+            ready.iter().any(|card| card.id.as_str() == "running-045"),
+            "a partial legacy claim must not strand an otherwise-ready card"
+        );
+        assert!(
+            !ready.iter().any(|card| card.id.as_str() == "running-044"),
+            "a claimless legacy active card without an oracle must not become claimable"
         );
     }
 

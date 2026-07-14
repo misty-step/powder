@@ -643,14 +643,20 @@ impl Store {
     }
 
     /// powder-status-vocabulary: collapses the nine-status vocabulary to
-    /// seven. `claimed`/`running` both become `in_progress` -- the claim
-    /// struct already carries who/lease/liveness, so a status bit
-    /// distinguishing "claimed but not yet running" from "running" was a
-    /// second, driftable copy of claim presence. `blocked` is dropped
-    /// entirely: blocking eligibility is already derived from `blocked_by`
-    /// relations at claim time ([`powder_core::Card::claim_readiness`])
-    /// regardless of status, so an explicit `blocked` status was a second,
-    /// driftable copy of that derived fact.
+    /// seven. A `claimed`/`running` card with a complete claim becomes
+    /// `in_progress` -- the claim struct already carries who/lease/liveness,
+    /// so a status bit distinguishing "claimed but not yet running" from
+    /// "running" was a second, driftable copy of claim presence. A claimless
+    /// legacy card instead returns to `ready` when it carries an acceptance
+    /// oracle, or `backlog` when it does not; otherwise it would be stranded
+    /// in `in_progress`, where neither `list_ready` nor a fresh claim can
+    /// recover it. Malformed partial claim columns count as claimless, exactly
+    /// as [`CardRecord::into_card`] already interprets them, and their stored
+    /// bytes remain untouched. `blocked` is dropped entirely: blocking
+    /// eligibility is already derived from `blocked_by` relations at claim
+    /// time ([`powder_core::Card::claim_readiness`]) regardless of status, so
+    /// an explicit `blocked` status was a second, driftable copy of that
+    /// derived fact.
     ///
     /// Where a former-`blocked` card lands depends on what it actually
     /// carries:
@@ -699,7 +705,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut statement = transaction.prepare(
-                "SELECT id, status, acceptance_json, blocked_by_json FROM cards
+                "SELECT id, status, acceptance_json, blocked_by_json,
+                        claim_agent, claim_run_id, claim_acquired_at, claim_expires_at
+                 FROM cards
                  WHERE status IN ('claimed', 'running', 'blocked')
                  ORDER BY id",
             )?;
@@ -710,17 +718,49 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            for (card_id, old_status, acceptance_json, blocked_by_json) in affected {
-                let empty_acceptance = acceptance_json.trim() == "[]";
-                let relation_less = blocked_by_json.trim() == "[]";
+            for (
+                card_id,
+                old_status,
+                acceptance_json,
+                blocked_by_json,
+                claim_agent,
+                claim_run_id,
+                claim_acquired_at,
+                claim_expires_at,
+            ) in affected
+            {
+                let acceptance =
+                    from_json::<Vec<String>>("cards.acceptance_json", acceptance_json)?;
+                let has_acceptance = acceptance.iter().any(|item| !item.trim().is_empty());
+                let blocked_by =
+                    from_json::<Vec<String>>("cards.blocked_by_json", blocked_by_json)?;
+                let has_blocked_by = blocked_by.iter().any(|id| !id.trim().is_empty());
+                let has_valid_claim = matches!(
+                    (
+                        claim_agent.as_deref(),
+                        claim_run_id.as_deref(),
+                        claim_acquired_at,
+                        claim_expires_at,
+                    ),
+                    (Some(agent), Some(run_id), Some(_), Some(_))
+                        if !agent.trim().is_empty() && !run_id.trim().is_empty()
+                );
                 let (new_status, detail) = match old_status.as_str() {
-                    "claimed" | "running" => ("in_progress", ""),
-                    "blocked" if empty_acceptance => ("backlog", " (empty acceptance)"),
-                    "blocked" if relation_less => (
+                    "claimed" | "running" if has_valid_claim => ("in_progress", ""),
+                    "claimed" | "running" if has_acceptance => {
+                        ("ready", " (no valid claim; acceptance oracle present)")
+                    }
+                    "claimed" | "running" => ("backlog", " (no valid claim or acceptance oracle)"),
+                    "blocked" if !has_acceptance => ("backlog", " (empty acceptance)"),
+                    "blocked" if !has_blocked_by => (
                         "backlog",
                         " (no blocked_by relations; re-triage before claiming)",
                     ),

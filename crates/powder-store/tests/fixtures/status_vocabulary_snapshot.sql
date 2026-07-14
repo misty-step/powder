@@ -12,7 +12,7 @@ status_counts(status, total, claim_total) AS (
     ('awaiting_input', 2, 2),
     ('backlog', 170, 0),
     ('blocked', 15, 0),
-    ('claimed', 9, 9),
+    ('claimed', 9, 7),
     ('done', 49, 0),
     ('ready', 78, 0),
     ('running', 45, 16),
@@ -65,6 +65,16 @@ SELECT
   1700000000 + n,
   1700000100 + n
 FROM expanded;
+
+-- Adversarial legacy claim shapes. `claimed-008` has no claim at all;
+-- `claimed-009` and `running-045` carry malformed partial claim tuples that
+-- the current card loader already treats as claimless. The migration must
+-- classify from a complete, valid tuple without repairing or erasing any of
+-- these bytes. `running-044` proves that a claimless legacy active status with
+-- no real oracle returns to backlog instead of being stranded in progress.
+UPDATE cards SET claim_agent = 'partial-claimed-agent' WHERE id = 'claimed-009';
+UPDATE cards SET acceptance_json = '["   "]' WHERE id = 'running-044';
+UPDATE cards SET claim_agent = 'partial-running-agent' WHERE id = 'running-045';
 
 -- powder-status-vocabulary: one extra legacy `blocked` card with an empty
 -- acceptance oracle, distinct from the 15 generated above (which all carry

@@ -208,7 +208,7 @@ pub fn help() -> String {
         "  powder update-card canary-001 --db ./data/powder.db --acceptance \"a\" --acceptance \"b\"  (repeatable; replaces the full criteria list)\n",
     );
     help.push_str(
-        "  powder list-cards --db ./data/powder.db --status blocked --repo misty-step/example\n",
+        "  powder list-cards --db ./data/powder.db --status ready --repo misty-step/example\n",
     );
     help.push_str("  powder repository-list --db ./data/powder.db --include-hidden\n");
     help.push_str(
@@ -247,7 +247,7 @@ pub fn help() -> String {
     help.push_str(
         "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
     );
-    help.push_str("  powder update-status 001 --db ./data/powder.db --status running\n");
+    help.push_str("  powder update-status 001 --db ./data/powder.db --status in_progress\n");
     help.push_str(
         "  powder check-criterion 001 --db ./data/powder.db --criterion 0 --actor operator [--unchecked]\n",
     );
@@ -269,7 +269,7 @@ pub fn help() -> String {
     help.push_str("  powder dead-letter-replay --db ./data/powder.db [--subscription sub-id]\n");
     help.push_str("  powder event-tail --db ./data/powder.db --after 0 --limit 20\n");
     help.push_str(
-        "  powder update-status 001 --db ./data/powder.db --status running --actor codex\n\n",
+        "  powder update-status 001 --db ./data/powder.db --status in_progress --actor codex\n\n",
     );
     help.push_str(
         "authority:\n  add --actor <name> to audit status, relation, and completion changes. \
@@ -1764,6 +1764,32 @@ mod tests {
         assert!(COMMANDS.contains(&"dead-letter-list"));
         assert!(COMMANDS.contains(&"dead-letter-replay"));
         assert!(COMMANDS.contains(&"event-tail"));
+    }
+
+    #[test]
+    fn cli_help_examples_only_advertise_current_statuses() {
+        let help = help();
+        let status_values = help
+            .lines()
+            .filter_map(|line| {
+                let words = line.split_whitespace().collect::<Vec<_>>();
+                words
+                    .windows(2)
+                    .find(|pair| pair[0] == "--status")
+                    .map(|pair| pair[1])
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            !status_values.is_empty(),
+            "the help should keep at least one copy-pasteable --status example"
+        );
+        for status in status_values {
+            assert!(
+                CardStatus::parse(status).is_some(),
+                "help advertises retired or invalid --status value {status}"
+            );
+        }
     }
 
     /// The whole point of `version` is catching a stale installed binary
