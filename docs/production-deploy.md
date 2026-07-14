@@ -44,6 +44,42 @@ never a public URL:
   POWDER_DISCLOSE_BOOTSTRAP_KEY=false
   ```
 
+  `POWDER_DISCLOSE_BOOTSTRAP_KEY=false` means the very first admin key
+  `powder-server` seeds on an empty database is created **redacted** --
+  nothing but `"Powder bootstrap API key created and redacted."` reaches
+  stderr, so the raw key never lands in `journald` for the box's lifetime.
+  This is a deliberate production-only posture; the code's own default
+  (`true`, unset) stays unchanged so a self-hoster running the binary with
+  zero config still sees their first key.
+
+  The seed only ever runs once (it's guarded by a `seed_runs` row) --
+  flipping the env var back to `true` and redeploying **after** the first
+  boot does nothing; the seed has already applied and there is no raw value
+  left to print. Get a usable admin key on a freshly bootstrapped production
+  box one of two ways, decided *before* or *at* that first boot:
+
+  - **`init-db --show-secret` on the box (preferred: never touches logs).**
+    SSH to the box and run `powder init-db --db <path> --show-secret`
+    yourself, once, before `powder-server` ever starts against that
+    database. This applies the one-time seed and prints the raw key
+    directly to your SSH session. Then start (or redeploy) `powder-server`
+    normally with `POWDER_DISCLOSE_BOOTSTRAP_KEY=false` already set --
+    its own call to the same seed finds it already applied and no-ops.
+  - **Disclose once, then rotate.** If `powder-server` already auto-seeded
+    the database (the common case), the raw bootstrap value is gone for
+    good -- there is no "re-disclose" path. Mint a fresh admin key instead
+    via the operator-key flow already documented in
+    [`docs/operations.md`](operations.md#self-hosting) (`powder key-create
+    --db <path> --name operator --scope admin --show-secret` over SSH),
+    confirm it authenticates, then `powder key-revoke <bootstrap-key-id>`
+    (its id is visible via `key-list`, which never needs the secret) to
+    retire the now-permanently-unrecoverable original.
+
+  Either way, store the captured key per the durable key-drop convention in
+  [`docs/operations.md`](operations.md#api-key-lifecycle-minting-storage-and-whats-recoverable-powder-918)
+  -- hand-out-at-mint-only, into the consumer's own secret store, never
+  parked on the box.
+
 **Verify before trusting this document over live state** -- Sanctum's own
 `README.md` "powder — the agent work board" section, in the Sanctum repo, is
 the canonical, detailed, and current source; this is a pointer for agents who

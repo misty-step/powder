@@ -1452,6 +1452,11 @@ struct AuthorizedActor {
     display_name: String,
     enforces_identity: bool,
     is_admin: bool,
+    /// The presented API key's non-secret lookup prefix, when auth mode is
+    /// `ApiKey` -- `None` for tailnet-header or disabled auth, which never
+    /// see a key. Threaded through so a 403 can name which key came up
+    /// short instead of a bare "admin scope required" (powder-918).
+    key_prefix: Option<String>,
 }
 
 impl AuthorizedActor {
@@ -1472,6 +1477,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             display_name: "anonymous".to_string(),
             enforces_identity: false,
             is_admin: false,
+            key_prefix: None,
         }),
         AuthMode::TailscaleHeader => {
             if let Some(expected) = state.config.tailnet_proxy_secret.as_deref() {
@@ -1490,6 +1496,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                     display_name: identity.to_string(),
                     enforces_identity: true,
                     is_admin: state.config.tailnet_admin,
+                    key_prefix: None,
                 })
             } else {
                 Err(ApiError::unauthorized(
@@ -1509,11 +1516,16 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                     display_name: key.actor.display_name,
                     enforces_identity: true,
                     is_admin: key.scope == ApiKeyScope::Admin,
+                    key_prefix: Some(key.key_prefix),
                 })
             } else {
-                Err(ApiError::forbidden(
-                    "api key scope cannot access agent routes",
-                ))
+                Err(ApiError::forbidden(format!(
+                    "{} (key {}, prefix {}) has scope {} which cannot access agent routes",
+                    key.actor.display_name,
+                    key.name,
+                    key.key_prefix,
+                    key.scope.as_str()
+                )))
             }
         }
     }
@@ -1541,7 +1553,17 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActo
     if !actor.enforces_identity || actor.is_admin {
         Ok(actor)
     } else {
-        Err(ApiError::forbidden("admin scope required"))
+        // Name the presented key (or tailnet identity) and the scope it was
+        // missing rather than a bare "admin scope required" -- an operator
+        // staring at a 403 needs to know *which* credential came up short
+        // without grepping logs (powder-918).
+        let presented = match actor.key_prefix.as_deref() {
+            Some(prefix) => format!("{} (key prefix {prefix})", actor.display_name),
+            None => actor.display_name.clone(),
+        };
+        Err(ApiError::forbidden(format!(
+            "{presented} requires admin scope"
+        )))
     }
 }
 
