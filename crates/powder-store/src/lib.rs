@@ -591,6 +591,16 @@ impl Store {
     ) -> Result<Card> {
         let actor = non_empty("actor", actor)?;
         let card_id = card.id.clone();
+        card.title = secrets::scrub_secrets(&card.title);
+        card.body = secrets::scrub_secrets(&card.body);
+        // `acceptance` and `criteria` carry the same author-supplied text
+        // (with_acceptance derives one from the other); scrub both with the
+        // same deterministic function so they stay consistent.
+        card.acceptance = scrub_string_list(std::mem::take(&mut card.acceptance));
+        for criterion in &mut card.criteria {
+            criterion.text = secrets::scrub_secrets(&criterion.text);
+        }
+        card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
         if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
             match card.repo.as_deref() {
                 Some(repo) if !canonical_repo_matches(repo, &derived_repo) => {
@@ -660,19 +670,19 @@ impl Store {
         let mut patched_fields = Vec::new();
 
         if let Some(title) = patch.title {
-            card.title = non_empty("title", &title)?;
+            card.title = non_empty_scrubbed("title", &title)?;
             patched_fields.push("title");
         }
         if let Some(body) = patch.body {
-            card.body = body;
+            card.body = secrets::scrub_secrets(&body);
             patched_fields.push("body");
         }
         if let Some(acceptance) = patch.acceptance {
-            card = card.with_acceptance(acceptance);
+            card = card.with_acceptance(scrub_string_list(acceptance));
             patched_fields.push("acceptance");
         }
         if let Some(proof_plan) = patch.proof_plan {
-            card = card.with_proof_plan(proof_plan);
+            card = card.with_proof_plan(scrub_string_list(proof_plan));
             patched_fields.push("proof_plan");
         }
         if let Some(priority) = patch.priority {
@@ -1388,8 +1398,8 @@ impl Store {
         let card = load_card(&transaction, card_id)?;
         let comment = Comment {
             card_id: card_id.clone(),
-            author: non_empty("author", author)?,
-            body: non_empty("body", body)?,
+            author: non_empty_scrubbed("author", author)?,
+            body: non_empty_scrubbed("body", body)?,
             created_at: now,
         };
         let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
@@ -1441,11 +1451,14 @@ impl Store {
         let entry = WorkLogEntry {
             card_id: card_id.clone(),
             agent: non_empty("agent", agent)?,
-            model: attribution.model.map(str::to_owned),
-            reasoning: attribution.reasoning.map(str::to_owned),
-            harness: attribution.harness.map(str::to_owned),
+            // Attribution fields are caller-supplied free text too --
+            // `reasoning` especially is documented chain-of-thought, the
+            // highest-risk leak class this module's scrub exists for.
+            model: attribution.model.map(secrets::scrub_secrets),
+            reasoning: attribution.reasoning.map(secrets::scrub_secrets),
+            harness: attribution.harness.map(secrets::scrub_secrets),
             run_id,
-            body: secrets::scrub_secrets(&non_empty("body", body)?),
+            body: non_empty_scrubbed("body", body)?,
             created_at: now,
         };
         let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
@@ -1488,7 +1501,7 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Run> {
-        let question = non_empty("question", question)?;
+        let question = non_empty_scrubbed("question", question)?;
         let mut run = self
             .get_run(run_id)?
             .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?;
@@ -1540,7 +1553,9 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
-        let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
+        let proof = proof
+            .map(|value| non_empty_scrubbed("proof", value))
+            .transpose()?;
         let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
         let field_note_config = self.field_note_config.clone();
         let transaction = self
@@ -1757,7 +1772,7 @@ fn insert_link(
     let link = Link {
         id: LinkId::new(format!("link-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
         card_id: card_id.clone(),
-        label: non_empty("label", label)?,
+        label: non_empty_scrubbed("label", label)?,
         url: non_empty("url", url)?,
         created_at: now,
     };
@@ -2152,6 +2167,28 @@ fn non_empty(field: &'static str, value: &str) -> Result<String> {
     } else {
         Ok(trimmed.to_owned())
     }
+}
+
+/// `non_empty` plus [`secrets::scrub_secrets`] in one call: the write-boundary
+/// helper for every agent/human free-text field (powder-scrub-write-boundary).
+/// Scrubbing happens here, inside the store's own write functions, rather
+/// than in any adapter, so there is exactly one seam credential-shaped text
+/// must cross on its way into persistence -- outbound event payloads built
+/// from the already-scrubbed value are clean for free.
+fn non_empty_scrubbed(field: &'static str, value: &str) -> Result<String> {
+    Ok(secrets::scrub_secrets(&non_empty(field, value)?))
+}
+
+/// [`secrets::scrub_secrets`] over a list of free-text items (acceptance
+/// criteria, proof-plan steps) at the same write boundary as
+/// [`non_empty_scrubbed`]. Lives here rather than in `powder-core`'s
+/// `with_acceptance`/`with_proof_plan` because core imports no adapter or
+/// scrubbing machinery -- persistence-side sanitization is the store's job.
+fn scrub_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| secrets::scrub_secrets(&item))
+        .collect()
 }
 
 fn clean_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {

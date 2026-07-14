@@ -51,6 +51,11 @@ const DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS: usize = 120;
 const DEFAULT_FIELD_NOTE_WEEKLY_BUDGET: usize = 7;
 const SIGNATURE_HEADER: &str = "X-Signature-256";
 const DELIVERY_BATCH_LIMIT: usize = 25;
+/// Header a trusted tailnet ingress sets to prove a `tailscale-header`-mode
+/// request actually passed through it, when `POWDER_TAILNET_PROXY_SECRET` is
+/// configured. See `authorize()` and docs/operations.md's trust-boundary
+/// section.
+const PROXY_SECRET_HEADER: &str = "x-powder-proxy-secret";
 
 #[derive(Clone)]
 struct AppState {
@@ -67,6 +72,20 @@ struct Config {
     bind_addr: SocketAddr,
     disclose_bootstrap_key: bool,
     field_note: FieldNoteConfig,
+    /// In-code backstop for `tailscale-header` auth (powder-tailnet-backstop):
+    /// when set, a header-auth request must also carry a matching
+    /// `X-Powder-Proxy-Secret` header, so a request that reaches
+    /// `powder-server` without passing through the trusted tailnet ingress
+    /// (a misrouted request, a bypassed proxy) is rejected instead of
+    /// silently trusted on the strength of a spoofable identity header
+    /// alone. `None` (unset) preserves the original behavior: any request
+    /// bearing a trusted identity header is authorized.
+    tailnet_proxy_secret: Option<String>,
+    /// Whether a `tailscale-header`-authenticated identity is granted admin
+    /// scope. Defaults to `true` (unset or explicit `true`) to preserve the
+    /// mode's original all-admin behavior; `POWDER_TAILNET_ADMIN=false` makes
+    /// tailnet-authenticated callers ordinary non-admin actors instead.
+    tailnet_admin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -140,6 +159,13 @@ impl Config {
             None => SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], port)),
         };
         let field_note = field_note_config_from_env(&vars)?;
+        let tailnet_proxy_secret =
+            env_value(&vars, "POWDER_TAILNET_PROXY_SECRET").map(ToOwned::to_owned);
+        let tailnet_admin = parse_bool(
+            "POWDER_TAILNET_ADMIN",
+            env_value(&vars, "POWDER_TAILNET_ADMIN"),
+        )?
+        .unwrap_or(true);
 
         Ok(Self {
             db_path,
@@ -149,6 +175,8 @@ impl Config {
             bind_addr,
             disclose_bootstrap_key,
             field_note,
+            tailnet_proxy_secret,
+            tailnet_admin,
         })
     }
 }
@@ -1416,11 +1444,22 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             is_admin: false,
         }),
         AuthMode::TailscaleHeader => {
+            if let Some(expected) = state.config.tailnet_proxy_secret.as_deref() {
+                let provided = headers
+                    .get(PROXY_SECRET_HEADER)
+                    .and_then(|value| value.to_str().ok());
+                let matches = provided.is_some_and(|provided| constant_time_eq(provided, expected));
+                if !matches {
+                    return Err(ApiError::unauthorized(format!(
+                        "missing or invalid {PROXY_SECRET_HEADER} header"
+                    )));
+                }
+            }
             if let Some(identity) = trusted_tailnet_identity(headers) {
                 Ok(AuthorizedActor {
                     display_name: identity.to_string(),
                     enforces_identity: true,
-                    is_admin: true,
+                    is_admin: state.config.tailnet_admin,
                 })
             } else {
                 Err(ApiError::unauthorized(
@@ -1483,6 +1522,21 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.trim().strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Constant-time byte comparison so a proxy-secret check does not leak the
+/// secret's length or contents through response-timing side channels.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (byte_left, byte_right) in left.iter().zip(right.iter()) {
+        diff |= byte_left ^ byte_right;
+    }
+    diff == 0
 }
 
 fn trusted_tailnet_identity(headers: &HeaderMap) -> Option<&str> {

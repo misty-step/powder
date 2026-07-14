@@ -3697,3 +3697,261 @@ fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()
 
     Ok(())
 }
+
+// powder-scrub-write-boundary: every agent/human free-text write routes
+// through `secrets::scrub_secrets` at the store's own write boundary, not in
+// any adapter. These are the anti-regression tests the card demands: mint a
+// *real* credential through the store's own generators (not a hand-typed
+// fixture) and assert it never survives a write, end to end -- including the
+// outbound webhook payload a comment or work-log entry feeds.
+
+#[test]
+fn scrub_secrets_redacts_a_freshly_minted_api_key() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let created = store.create_api_key("ci-bot", ApiKeyScope::Agent, 10)?;
+    assert!(created.raw_key.starts_with("sk_powder_"));
+
+    let scrubbed = crate::secrets::scrub_secrets(&created.raw_key);
+    assert!(!scrubbed.contains(&created.raw_key));
+    assert!(scrubbed.contains("[REDACTED:powder-api-key]"));
+    Ok(())
+}
+
+#[test]
+fn scrub_secrets_redacts_a_freshly_minted_webhook_signing_secret() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let created =
+        store.create_event_subscription("http://127.0.0.1:9000/hooks/powder", Vec::new(), 10)?;
+    assert!(created.signing_secret.starts_with("whsec_powder_"));
+
+    let scrubbed = crate::secrets::scrub_secrets(&created.signing_secret);
+    assert!(!scrubbed.contains(&created.signing_secret));
+    assert!(scrubbed.contains("[REDACTED:powder-webhook-secret]"));
+    Ok(())
+}
+
+#[test]
+fn comment_carrying_a_fresh_api_key_reads_back_scrubbed_everywhere() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    // A subscription watching comment-added, so the outbound webhook payload
+    // for this exact write is inspectable too.
+    store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["comment-added".to_string()],
+        5,
+    )?;
+
+    let card_id = CardId::new("scrub-comment")?;
+    store.create_card_with_events(ready_card("scrub-comment", 10), "operator", 10)?;
+
+    // A real, freshly minted key -- not a hand-typed fixture -- accidentally
+    // pasted into a comment.
+    let leaked = store.create_api_key("leaked-in-comment", ApiKeyScope::Agent, 11)?;
+    let comment_body = format!("oops, wrong window: {}", leaked.raw_key);
+
+    let comment = store.add_comment(&card_id, "agent-a", &comment_body, 20)?;
+    assert!(!comment.body.contains(&leaked.raw_key));
+    assert!(comment.body.contains("[REDACTED:powder-api-key]"));
+
+    // Readback via get_card_detail must be scrubbed too -- it reads whatever
+    // was actually persisted, so this mostly confirms the write-time scrub
+    // is durable, not read-time.
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed, 30)?
+        .expect("card detail");
+    assert_eq!(detail.comments.len(), 1);
+    assert!(!detail.comments[0].body.contains(&leaked.raw_key));
+    assert!(detail.comments[0]
+        .body
+        .contains("[REDACTED:powder-api-key]"));
+
+    // The outbound webhook payload embeds the comment body in `change`
+    // (lib.rs's add_comment). Because scrubbing happens at write time before
+    // the event is enqueued, the payload is clean by construction -- assert
+    // it anyway per the card's instruction, since this is the regression a
+    // future refactor could silently reintroduce.
+    let due = store.due_webhook_deliveries(20, 10)?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].event_type, "comment-added");
+    assert!(!due[0].payload_json.contains(&leaked.raw_key));
+    assert!(due[0].payload_json.contains("[REDACTED:powder-api-key]"));
+
+    Ok(())
+}
+
+#[test]
+fn request_input_question_carrying_a_fresh_key_is_scrubbed_in_activity_and_webhook() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    // Watch awaiting-input so the queued outbound payload for this exact
+    // write is inspectable -- the powder-968 incident class was a raw
+    // question embedding a credential into the webhook payload.
+    store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["awaiting-input".to_string()],
+        5,
+    )?;
+
+    let card_id = CardId::new("scrub-question")?;
+    store.create_card_with_events(ready_card("scrub-question", 10), "operator", 10)?;
+    let claim = store.claim_card(&card_id, "agent-a", 11, 3600, &Authority::unchecked())?;
+
+    let leaked = store.create_api_key("leaked-in-question", ApiKeyScope::Agent, 12)?;
+    let question = format!("should I rotate {} or keep it?", leaked.raw_key);
+    store.request_input(&claim.run_id, &question, 20, &Authority::unchecked())?;
+
+    // The elicitation activity is the durable copy of the question.
+    let detail = store
+        .get_run_detail(&claim.run_id, DetailLevel::Detailed)?
+        .expect("run detail");
+    let elicitation = detail
+        .activities
+        .iter()
+        .find(|activity| activity.payload.contains("rotate"))
+        .expect("elicitation activity");
+    assert!(!elicitation.payload.contains(&leaked.raw_key));
+    assert!(elicitation.payload.contains("[REDACTED:powder-api-key]"));
+
+    // And the queued webhook payload embeds the same question -- scrubbed
+    // at write time, so clean here by construction; assert it anyway.
+    let due = store.due_webhook_deliveries(20, 10)?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].event_type, "awaiting-input");
+    assert!(!due[0].payload_json.contains(&leaked.raw_key));
+    assert!(due[0].payload_json.contains("[REDACTED:powder-api-key]"));
+
+    Ok(())
+}
+
+#[test]
+fn acceptance_and_proof_plan_carrying_a_fresh_key_read_back_scrubbed() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let leaked = store.create_api_key("leaked-in-criteria", ApiKeyScope::Agent, 5)?;
+
+    // Create path: acceptance (and the criteria derived from it) plus
+    // proof_plan arrive on the card itself.
+    let card_id = CardId::new("scrub-criteria")?;
+    let card = ready_card("scrub-criteria", 10)
+        .with_acceptance([format!("verify {} still authenticates", leaked.raw_key)])
+        .with_proof_plan([format!("curl with {}", leaked.raw_key)]);
+    let saved = store.create_card_with_events(card, "operator", 10)?;
+    for text in saved
+        .acceptance
+        .iter()
+        .chain(saved.proof_plan.iter())
+        .chain(saved.criteria.iter().map(|criterion| &criterion.text))
+    {
+        assert!(!text.contains(&leaked.raw_key));
+        assert!(text.contains("[REDACTED:powder-api-key]"));
+    }
+
+    // Patch path: replacement acceptance/proof_plan lists get the same scrub.
+    let patched = store.patch_card(
+        &card_id,
+        CardPatch {
+            acceptance: Some(vec![format!("rotate {} afterwards", leaked.raw_key)]),
+            proof_plan: Some(vec![format!("readback without {}", leaked.raw_key)]),
+            ..Default::default()
+        },
+        "operator",
+        20,
+    )?;
+    for text in patched
+        .acceptance
+        .iter()
+        .chain(patched.proof_plan.iter())
+        .chain(patched.criteria.iter().map(|criterion| &criterion.text))
+    {
+        assert!(!text.contains(&leaked.raw_key));
+        assert!(text.contains("[REDACTED:powder-api-key]"));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn work_log_attribution_fields_carrying_a_fresh_key_are_scrubbed() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("scrub-attribution")?;
+    store.create_card_with_events(ready_card("scrub-attribution", 10), "operator", 10)?;
+
+    let leaked = store.create_api_key("leaked-in-reasoning", ApiKeyScope::Agent, 11)?;
+    let reasoning = format!("tried auth with {} before realizing", leaked.raw_key);
+    let entry = store.append_work_log(
+        &card_id,
+        "agent-a",
+        WorkLogAttribution {
+            model: Some("claude-sonnet-5"),
+            reasoning: Some(&reasoning),
+            harness: Some("Claude Code"),
+            run_id: None,
+        },
+        "progress note",
+        20,
+    )?;
+    let reasoning_stored = entry.reasoning.expect("reasoning persisted");
+    assert!(!reasoning_stored.contains(&leaked.raw_key));
+    assert!(reasoning_stored.contains("[REDACTED:powder-api-key]"));
+    // Benign attribution survives byte for byte.
+    assert_eq!(entry.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(entry.harness.as_deref(), Some("Claude Code"));
+
+    Ok(())
+}
+
+#[test]
+fn repository_import_provenance_carrying_a_fresh_key_is_scrubbed() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let leaked = store.create_api_key("leaked-in-provenance", ApiKeyScope::Agent, 5)?;
+
+    let summary = store.upsert_repository(
+        RepositoryUpsert {
+            name: "scrub-repo".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: Some(format!("imported via {}", leaked.raw_key)),
+        },
+        10,
+    )?;
+    let provenance = summary.import_provenance.expect("provenance persisted");
+    assert!(!provenance.contains(&leaked.raw_key));
+    assert!(provenance.contains("[REDACTED:powder-api-key]"));
+
+    Ok(())
+}
+
+#[test]
+fn scrub_write_boundary_leaves_short_prose_mentions_untouched_end_to_end() -> Result<()> {
+    // The anti-false-positive companion to the redaction tests above: a work
+    // log that merely *discusses* the key-shape prefix in prose (well under
+    // the 20-char floor after the prefix) must survive the write boundary
+    // byte for byte, not just in the unit-level secrets::scrub_secrets tests.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("scrub-prose")?;
+    store.create_card_with_events(ready_card("scrub-prose", 10), "operator", 10)?;
+
+    let prose = "confirmed the sk_powder_ prefix is what identifies a Powder-issued key";
+    let entry = store.append_work_log(
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        prose,
+        20,
+    )?;
+    assert_eq!(entry.body, prose);
+
+    let comment = store.add_comment(&card_id, "agent-a", prose, 21)?;
+    assert_eq!(comment.body, prose);
+
+    Ok(())
+}
