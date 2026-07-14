@@ -2743,6 +2743,68 @@ async fn agent_scoped_key_can_author_a_card() {
 }
 
 #[tokio::test]
+async fn agent_scoped_key_can_patch_card_fields_and_the_patch_is_audited() {
+    // powder-ruling-patch-scope: recording an operator ruling
+    // (priority/acceptance/body) must not require the admin key; single-card
+    // patches follow the powder-925 authoring rule and stay fully audited.
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("lead-daybook", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"ruled","title":"Before ruling","body":"old","acceptance":["old oracle"],"status":"ready","priority":"P2"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let patched = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/ruled",
+            Some(&agent_key),
+            r#"{"title":"After ruling","body":"escalated per operator","acceptance":["new oracle"],"priority":"P0"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched = response_json(patched).await;
+    assert_eq!(patched["title"], "After ruling");
+    assert_eq!(patched["priority"], "p0");
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ruled?detail=detailed",
+            Some(&agent_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["event_type"] == "patch"
+            && event["actor"] == "lead-daybook"
+            && event["payload"]
+                .as_str()
+                .unwrap()
+                .contains("title, body, acceptance, priority")
+    }));
+}
+
+#[tokio::test]
 async fn agent_scoped_key_cannot_list_or_revoke_keys() {
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state

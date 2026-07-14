@@ -938,7 +938,11 @@ async fn patch_card(
     Path(id): Path<String>,
     Json(request): Json<PatchCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let actor = require_admin(&state, &headers)?;
+    // powder-ruling-patch-scope: single-card field patches follow the same
+    // rule as single-card authoring (powder-925) -- an actor-scoped key can
+    // record an operator ruling (title/body/acceptance/priority) without the
+    // admin key; every patch is audited with actor and field list.
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let card = lock_store(&state)?.patch_card(
         &card_id,
@@ -1442,8 +1446,9 @@ fn authorize_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError>
 /// management) that are not scoped to any single claim and so cannot be
 /// checked via claim ownership. Agent-scoped API keys are rejected; trusted
 /// tailnet callers and disabled auth pass through. Single-card authoring
-/// moved to `authorize()` (powder-925) -- it's reviewable one card at a
-/// time, unlike bulk import.
+/// (powder-925) and single-card field patches (powder-ruling-patch-scope)
+/// moved to `authorize()` -- they're reviewable one card at a time and fully
+/// audited, unlike bulk import.
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
     let actor = authorize(state, headers)?;
     if !actor.enforces_identity || actor.is_admin {
