@@ -593,6 +593,14 @@ impl Store {
         let card_id = card.id.clone();
         card.title = secrets::scrub_secrets(&card.title);
         card.body = secrets::scrub_secrets(&card.body);
+        // `acceptance` and `criteria` carry the same author-supplied text
+        // (with_acceptance derives one from the other); scrub both with the
+        // same deterministic function so they stay consistent.
+        card.acceptance = scrub_string_list(std::mem::take(&mut card.acceptance));
+        for criterion in &mut card.criteria {
+            criterion.text = secrets::scrub_secrets(&criterion.text);
+        }
+        card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
         if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
             match card.repo.as_deref() {
                 Some(repo) if !canonical_repo_matches(repo, &derived_repo) => {
@@ -670,11 +678,11 @@ impl Store {
             patched_fields.push("body");
         }
         if let Some(acceptance) = patch.acceptance {
-            card = card.with_acceptance(acceptance);
+            card = card.with_acceptance(scrub_string_list(acceptance));
             patched_fields.push("acceptance");
         }
         if let Some(proof_plan) = patch.proof_plan {
-            card = card.with_proof_plan(proof_plan);
+            card = card.with_proof_plan(scrub_string_list(proof_plan));
             patched_fields.push("proof_plan");
         }
         if let Some(priority) = patch.priority {
@@ -1443,9 +1451,12 @@ impl Store {
         let entry = WorkLogEntry {
             card_id: card_id.clone(),
             agent: non_empty("agent", agent)?,
-            model: attribution.model.map(str::to_owned),
-            reasoning: attribution.reasoning.map(str::to_owned),
-            harness: attribution.harness.map(str::to_owned),
+            // Attribution fields are caller-supplied free text too --
+            // `reasoning` especially is documented chain-of-thought, the
+            // highest-risk leak class this module's scrub exists for.
+            model: attribution.model.map(secrets::scrub_secrets),
+            reasoning: attribution.reasoning.map(secrets::scrub_secrets),
+            harness: attribution.harness.map(secrets::scrub_secrets),
             run_id,
             body: non_empty_scrubbed("body", body)?,
             created_at: now,
@@ -1490,7 +1501,7 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Run> {
-        let question = non_empty("question", question)?;
+        let question = non_empty_scrubbed("question", question)?;
         let mut run = self
             .get_run(run_id)?
             .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?;
@@ -2166,6 +2177,18 @@ fn non_empty(field: &'static str, value: &str) -> Result<String> {
 /// from the already-scrubbed value are clean for free.
 fn non_empty_scrubbed(field: &'static str, value: &str) -> Result<String> {
     Ok(secrets::scrub_secrets(&non_empty(field, value)?))
+}
+
+/// [`secrets::scrub_secrets`] over a list of free-text items (acceptance
+/// criteria, proof-plan steps) at the same write boundary as
+/// [`non_empty_scrubbed`]. Lives here rather than in `powder-core`'s
+/// `with_acceptance`/`with_proof_plan` because core imports no adapter or
+/// scrubbing machinery -- persistence-side sanitization is the store's job.
+fn scrub_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| secrets::scrub_secrets(&item))
+        .collect()
 }
 
 fn clean_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {

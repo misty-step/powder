@@ -4,7 +4,7 @@ use powder_core::{canonical_repo_label, CardStatus, DomainError};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::{non_empty, Result, Store, StoreError};
+use crate::{non_empty, non_empty_scrubbed, Result, Store, StoreError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -215,7 +215,7 @@ impl Store {
         let import_provenance = upsert
             .import_provenance
             .as_deref()
-            .map(|value| non_empty("import_provenance", value))
+            .map(|value| non_empty_scrubbed("import_provenance", value))
             .transpose()?;
 
         let transaction = self
