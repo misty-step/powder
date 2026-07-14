@@ -220,6 +220,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             repo: None,
             autonomy: None,
             estimate: None,
+            ..CardFilter::default()
         },
         20,
     )?;
@@ -234,6 +235,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             repo: Some("other".to_string()),
             autonomy: None,
             estimate: None,
+            ..CardFilter::default()
         },
         20,
     )?;
@@ -247,6 +249,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             repo: Some("misty-step/other".to_string()),
             autonomy: None,
             estimate: None,
+            ..CardFilter::default()
         },
         20,
     )?;
@@ -261,6 +264,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             repo: Some("misty-step/other".to_string()),
             autonomy: None,
             estimate: None,
+            ..CardFilter::default()
         },
         20,
     )?;
@@ -272,6 +276,7 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
             repo: None,
             autonomy: Some(AutonomyClass::Auto),
             estimate: None,
+            ..CardFilter::default()
         },
         20,
     )?;
@@ -293,6 +298,76 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     let page = store.list_cards_page(&CardFilter::default(), 1)?;
     assert_eq!(page.cards.len(), 1);
     assert_eq!(page.total_count, 3);
+    Ok(())
+}
+
+/// powder-mcp-unfiltered-enumeration: `include_terminal: false` hides
+/// `Done`/`Shipped`/`Abandoned` cards from an unfiltered (`status: None`)
+/// query while `total_count` still reports every card that matched the
+/// *other* explicit filters -- the store-level half of the MCP-facing
+/// contract (`powder-mcp` builds the envelope on top of this). An explicit
+/// `status` filter is authoritative and always wins over
+/// `include_terminal`.
+#[test]
+fn list_cards_page_include_terminal_hides_terminal_cards_but_total_count_still_counts_them(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut done = ready_card("done-1", 10);
+    done.status = CardStatus::Done;
+    store.import_cards(vec![done, ready_card("ready-1", 20)])?;
+
+    let excluded = store.list_cards_page(
+        &CardFilter {
+            include_terminal: false,
+            ..CardFilter::default()
+        },
+        20,
+    )?;
+    assert_eq!(
+        excluded
+            .cards
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ready-1"]
+    );
+    assert_eq!(
+        excluded.total_count, 2,
+        "total_count reports the full board even though the done card is hidden"
+    );
+    // rev-125 fix: the held-back count is reported separately so envelope
+    // builders can distinguish "raise limit" from "pass include_terminal"
+    // instead of lumping both into one misleading number.
+    assert_eq!(excluded.excluded_terminal_count, 1);
+
+    let included = store.list_cards_page(
+        &CardFilter {
+            include_terminal: true,
+            ..CardFilter::default()
+        },
+        20,
+    )?;
+    assert_eq!(included.cards.len(), 2);
+    assert_eq!(included.total_count, 2);
+    assert_eq!(included.excluded_terminal_count, 0);
+
+    // An explicit status filter overrides include_terminal: asking for
+    // status: done must still return the done card even with
+    // include_terminal: false.
+    let explicit_done = store.list_cards_page(
+        &CardFilter {
+            status: Some(CardStatus::Done),
+            include_terminal: false,
+            ..CardFilter::default()
+        },
+        20,
+    )?;
+    assert_eq!(explicit_done.cards.len(), 1);
+    assert_eq!(explicit_done.cards[0].id.as_str(), "done-1");
+    assert_eq!(explicit_done.excluded_terminal_count, 0);
+
+    assert_eq!(store.card_count()?, 2);
     Ok(())
 }
 
@@ -574,6 +649,7 @@ fn list_cards_repo_filter_surfaces_legacy_repo_null_cards_with_numeric_id_prefix
             repo: Some("misty-step".to_string()),
             autonomy: None,
             estimate: None,
+            ..CardFilter::default()
         },
         20,
     )?;
@@ -676,6 +752,137 @@ fn upsert_card_returns_the_canonical_repo_label_it_persists() -> Result<()> {
     Ok(())
 }
 
+/// powder-904: `create_card_with_events` is the `create_card` write path
+/// (MCP/API/CLI all funnel through it); an alias or org-prefixed repo string
+/// must land canonical in the `cards.repo` column itself, not merely resolve
+/// canonical on read via `resolve_repository_name`. Query the raw column
+/// directly (bypassing `card_from_record`'s read-time resolution) so this
+/// test cannot pass on read-time resolution alone.
+#[test]
+fn create_card_with_events_normalizes_alias_repo_string_at_write_time() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("alias-create", 10);
+    card.repo = Some("misty-step/canary".to_string());
+
+    let saved = store.create_card_with_events(card, "operator", 10)?;
+    assert_eq!(saved.repo.as_deref(), Some("canary"));
+
+    let stored_repo: String = store.connection.query_row(
+        "SELECT repo FROM cards WHERE id = 'alias-create'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        stored_repo, "canary",
+        "the stored repo column must already be canonical, not merely resolved on read"
+    );
+
+    // Readback via both the alias and the canonical form must find the card.
+    let by_canonical = store.list_cards(
+        &CardFilter {
+            repo: Some("canary".to_string()),
+            ..CardFilter::default()
+        },
+        20,
+    )?;
+    assert_eq!(by_canonical.len(), 1);
+    assert_eq!(by_canonical[0].id.as_str(), "alias-create");
+
+    let by_alias = store.list_cards(
+        &CardFilter {
+            repo: Some("misty-step/canary".to_string()),
+            ..CardFilter::default()
+        },
+        20,
+    )?;
+    assert_eq!(by_alias.len(), 1);
+    assert_eq!(by_alias[0].id.as_str(), "alias-create");
+    Ok(())
+}
+
+/// powder-904: the import path (`import_cards`, used by the GitHub issue
+/// adapter and legacy Markdown migration) must canonicalize just like
+/// `create_card_with_events` -- same write-time guarantee, different entry
+/// point.
+#[test]
+fn import_cards_normalizes_alias_repo_string_at_write_time() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("alias-import", 10);
+    card.repo = Some("misty-step/canary".to_string());
+    store.import_cards(vec![card])?;
+
+    let stored_repo: String = store.connection.query_row(
+        "SELECT repo FROM cards WHERE id = 'alias-import'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_repo, "canary");
+    Ok(())
+}
+
+/// powder-904: the one-time cleanup sweep normalizes pre-existing rows
+/// written before write-time canonicalization existed (or via a path that
+/// bypassed it, simulated here with a raw SQL write), and audits every
+/// change with a `repository`-typed card event -- the same event shape
+/// `merge_repository_alias` already uses. A second sweep over an
+/// already-normalized board is a no-op (idempotent).
+#[test]
+fn normalize_repository_strings_sweeps_legacy_rows_and_audits_each_change() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("legacy-repo-card", 10)])?;
+    // Simulate a pre-normalization row: bypass persist_card's canonicalization
+    // with a direct SQL write, the way a row from before this feature
+    // existed would look.
+    store.connection.execute(
+        "UPDATE cards SET repo = 'misty-step/canary' WHERE id = 'legacy-repo-card'",
+        [],
+    )?;
+    let raw_before: String = store.connection.query_row(
+        "SELECT repo FROM cards WHERE id = 'legacy-repo-card'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(raw_before, "misty-step/canary");
+
+    let outcome = store.normalize_repository_strings("operator", 50)?;
+    assert_eq!(outcome.scanned, 1);
+    assert_eq!(outcome.normalized(), 1);
+    assert_eq!(outcome.changes[0].card_id, "legacy-repo-card");
+    assert_eq!(outcome.changes[0].previous_repo, "misty-step/canary");
+    assert_eq!(outcome.changes[0].canonical_repo, "canary");
+
+    let raw_after: String = store.connection.query_row(
+        "SELECT repo FROM cards WHERE id = 'legacy-repo-card'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(raw_after, "canary");
+
+    let detail = store
+        .get_card_detail(
+            &CardId::new("legacy-repo-card")?,
+            DetailLevel::Detailed,
+            1_000_000,
+        )?
+        .expect("detail");
+    assert!(detail.events.iter().any(|event| {
+        event.event_type == "repository"
+            && event.actor == "operator"
+            && event.payload.contains("repository-normalize")
+            && event.payload.contains("misty-step/canary")
+            && event.payload.contains("canary")
+    }));
+
+    // Idempotent: nothing left to normalize.
+    let second = store.normalize_repository_strings("operator", 60)?;
+    assert_eq!(second.scanned, 1);
+    assert_eq!(second.normalized(), 0);
+    Ok(())
+}
+
 #[test]
 fn criteria_check_and_completion_proofs_are_persisted_and_audited() -> Result<()> {
     let mut store = Store::open_in_memory()?;
@@ -749,6 +956,7 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
             repo: Some("misty-step/canary".to_string()),
             autonomy: None,
             estimate: None,
+            ..CardFilter::default()
         },
         20,
     )?;
@@ -890,6 +1098,37 @@ fn repository_upsert_without_tier_preserves_existing_tier() -> Result<()> {
     )?;
 
     assert_eq!(updated.tier, RepositoryTier::Active);
+    Ok(())
+}
+
+/// rev-121 follow-up: `list_ready`'s documented sort is priority first, age
+/// (`created_at`) second, id third -- this test pins all three tiebreak
+/// levels in one pass so a regression in any one of them fails loudly.
+/// `p0-late` outranks `p1-early` on priority alone despite being created
+/// later; `p0-early`/`p0-mid` then order purely by age; `p0-mid`/`p0-mid-b`
+/// share both priority and age, so id is the final tiebreak.
+#[test]
+fn list_ready_orders_by_priority_then_age_then_id() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let p1_early = ready_card("p1-early", 5).with_priority(Priority::P1);
+    let p0_late = ready_card("p0-late", 50).with_priority(Priority::P0);
+    let p0_early = ready_card("p0-early", 10).with_priority(Priority::P0);
+    let p0_mid_b = ready_card("p0-mid-b", 20).with_priority(Priority::P0);
+    let p0_mid = ready_card("p0-mid", 20).with_priority(Priority::P0);
+    store.import_cards(vec![p1_early, p0_late, p0_early, p0_mid_b, p0_mid])?;
+
+    let ready = store.list_ready(ReadyQuery::new(1_000, 10))?;
+    let ids = ready
+        .iter()
+        .map(|card| card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec!["p0-early", "p0-mid", "p0-mid-b", "p0-late", "p1-early"],
+        "expected priority asc, then created_at asc, then id asc"
+    );
     Ok(())
 }
 
@@ -2027,6 +2266,75 @@ fn heartbeat_claim_on_an_already_expired_claim_returns_a_distinct_recoverable_er
         heartbeat,
         Err(StoreError::Domain(DomainError::ClaimExpired(_)))
     ));
+    Ok(())
+}
+
+/// rev-121 follow-up: a card whose claim references a run row that no
+/// longer exists (the run was deleted out from under the card, e.g. by a
+/// data-repair script or a bug elsewhere) is an orphan claim. `release_claim`
+/// must fail closed -- error without mutating the card -- rather than
+/// silently clearing the claim while `release_run` 404s underneath it.
+/// `release_claim` mutates its in-memory `card` and calls `persist_card`
+/// *before* `release_run`'s not-found check; this test locks in that the
+/// surrounding `TransactionBehavior::Immediate` transaction rolls the write
+/// back when `release_run` errors, so the card is left exactly as it was.
+#[test]
+fn release_claim_errors_without_mutating_the_card_when_the_run_is_orphaned() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+    let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
+
+    let before = store.get_card(&card_id)?.expect("card before");
+    assert!(before.claim.is_some());
+
+    // Orphan the claim: delete the run row the card's claim still names.
+    store
+        .connection
+        .execute("DELETE FROM runs WHERE id = ?1", [claim.run_id.as_str()])?;
+
+    let released = store.release_claim(&card_id, &claim.run_id, 20, &Authority::unchecked());
+    assert!(matches!(
+        released,
+        Err(StoreError::Domain(DomainError::NotFound { .. }))
+    ));
+
+    let after = store.get_card(&card_id)?.expect("card after");
+    assert_eq!(
+        after, before,
+        "a failed release must not mutate the card's claim state"
+    );
+    Ok(())
+}
+
+/// rev-121 follow-up: same fail-closed guarantee for `renew_claim` against
+/// an orphaned run row.
+#[test]
+fn renew_claim_errors_without_mutating_the_card_when_the_run_is_orphaned() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+    let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
+
+    let before = store.get_card(&card_id)?.expect("card before");
+
+    store
+        .connection
+        .execute("DELETE FROM runs WHERE id = ?1", [claim.run_id.as_str()])?;
+
+    let renewed = store.renew_claim(&card_id, &claim.run_id, 20, 3600, &Authority::unchecked());
+    assert!(matches!(
+        renewed,
+        Err(StoreError::Domain(DomainError::NotFound { .. }))
+    ));
+
+    let after = store.get_card(&card_id)?.expect("card after");
+    assert_eq!(
+        after, before,
+        "a failed renew must not mutate the card's claim state"
+    );
     Ok(())
 }
 
@@ -3369,6 +3677,7 @@ fn field_note_generator_spawns_exactly_one_draft_for_a_qualifying_completion() -
             repo: Some("content".to_string()),
             autonomy: None,
             estimate: None,
+            ..CardFilter::default()
         },
         50,
     )?;
@@ -3694,6 +4003,264 @@ fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()
             .is_none(),
         "backlog-imported cards completed with no proof (crucible-010's real shape) must not qualify"
     );
+
+    Ok(())
+}
+
+// powder-scrub-write-boundary: every agent/human free-text write routes
+// through `secrets::scrub_secrets` at the store's own write boundary, not in
+// any adapter. These are the anti-regression tests the card demands: mint a
+// *real* credential through the store's own generators (not a hand-typed
+// fixture) and assert it never survives a write, end to end -- including the
+// outbound webhook payload a comment or work-log entry feeds.
+
+#[test]
+fn scrub_secrets_redacts_a_freshly_minted_api_key() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let created = store.create_api_key("ci-bot", ApiKeyScope::Agent, 10)?;
+    assert!(created.raw_key.starts_with("sk_powder_"));
+
+    let scrubbed = crate::secrets::scrub_secrets(&created.raw_key);
+    assert!(!scrubbed.contains(&created.raw_key));
+    assert!(scrubbed.contains("[REDACTED:powder-api-key]"));
+    Ok(())
+}
+
+#[test]
+fn scrub_secrets_redacts_a_freshly_minted_webhook_signing_secret() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let created =
+        store.create_event_subscription("http://127.0.0.1:9000/hooks/powder", Vec::new(), 10)?;
+    assert!(created.signing_secret.starts_with("whsec_powder_"));
+
+    let scrubbed = crate::secrets::scrub_secrets(&created.signing_secret);
+    assert!(!scrubbed.contains(&created.signing_secret));
+    assert!(scrubbed.contains("[REDACTED:powder-webhook-secret]"));
+    Ok(())
+}
+
+#[test]
+fn comment_carrying_a_fresh_api_key_reads_back_scrubbed_everywhere() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    // A subscription watching comment-added, so the outbound webhook payload
+    // for this exact write is inspectable too.
+    store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["comment-added".to_string()],
+        5,
+    )?;
+
+    let card_id = CardId::new("scrub-comment")?;
+    store.create_card_with_events(ready_card("scrub-comment", 10), "operator", 10)?;
+
+    // A real, freshly minted key -- not a hand-typed fixture -- accidentally
+    // pasted into a comment.
+    let leaked = store.create_api_key("leaked-in-comment", ApiKeyScope::Agent, 11)?;
+    let comment_body = format!("oops, wrong window: {}", leaked.raw_key);
+
+    let comment = store.add_comment(&card_id, "agent-a", &comment_body, 20)?;
+    assert!(!comment.body.contains(&leaked.raw_key));
+    assert!(comment.body.contains("[REDACTED:powder-api-key]"));
+
+    // Readback via get_card_detail must be scrubbed too -- it reads whatever
+    // was actually persisted, so this mostly confirms the write-time scrub
+    // is durable, not read-time.
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed, 30)?
+        .expect("card detail");
+    assert_eq!(detail.comments.len(), 1);
+    assert!(!detail.comments[0].body.contains(&leaked.raw_key));
+    assert!(detail.comments[0]
+        .body
+        .contains("[REDACTED:powder-api-key]"));
+
+    // The outbound webhook payload embeds the comment body in `change`
+    // (lib.rs's add_comment). Because scrubbing happens at write time before
+    // the event is enqueued, the payload is clean by construction -- assert
+    // it anyway per the card's instruction, since this is the regression a
+    // future refactor could silently reintroduce.
+    let due = store.due_webhook_deliveries(20, 10)?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].event_type, "comment-added");
+    assert!(!due[0].payload_json.contains(&leaked.raw_key));
+    assert!(due[0].payload_json.contains("[REDACTED:powder-api-key]"));
+
+    Ok(())
+}
+
+#[test]
+fn request_input_question_carrying_a_fresh_key_is_scrubbed_in_activity_and_webhook() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    // Watch awaiting-input so the queued outbound payload for this exact
+    // write is inspectable -- the powder-968 incident class was a raw
+    // question embedding a credential into the webhook payload.
+    store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["awaiting-input".to_string()],
+        5,
+    )?;
+
+    let card_id = CardId::new("scrub-question")?;
+    store.create_card_with_events(ready_card("scrub-question", 10), "operator", 10)?;
+    let claim = store.claim_card(&card_id, "agent-a", 11, 3600, &Authority::unchecked())?;
+
+    let leaked = store.create_api_key("leaked-in-question", ApiKeyScope::Agent, 12)?;
+    let question = format!("should I rotate {} or keep it?", leaked.raw_key);
+    store.request_input(&claim.run_id, &question, 20, &Authority::unchecked())?;
+
+    // The elicitation activity is the durable copy of the question.
+    let detail = store
+        .get_run_detail(&claim.run_id, DetailLevel::Detailed)?
+        .expect("run detail");
+    let elicitation = detail
+        .activities
+        .iter()
+        .find(|activity| activity.payload.contains("rotate"))
+        .expect("elicitation activity");
+    assert!(!elicitation.payload.contains(&leaked.raw_key));
+    assert!(elicitation.payload.contains("[REDACTED:powder-api-key]"));
+
+    // And the queued webhook payload embeds the same question -- scrubbed
+    // at write time, so clean here by construction; assert it anyway.
+    let due = store.due_webhook_deliveries(20, 10)?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].event_type, "awaiting-input");
+    assert!(!due[0].payload_json.contains(&leaked.raw_key));
+    assert!(due[0].payload_json.contains("[REDACTED:powder-api-key]"));
+
+    Ok(())
+}
+
+#[test]
+fn acceptance_and_proof_plan_carrying_a_fresh_key_read_back_scrubbed() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let leaked = store.create_api_key("leaked-in-criteria", ApiKeyScope::Agent, 5)?;
+
+    // Create path: acceptance (and the criteria derived from it) plus
+    // proof_plan arrive on the card itself.
+    let card_id = CardId::new("scrub-criteria")?;
+    let card = ready_card("scrub-criteria", 10)
+        .with_acceptance([format!("verify {} still authenticates", leaked.raw_key)])
+        .with_proof_plan([format!("curl with {}", leaked.raw_key)]);
+    let saved = store.create_card_with_events(card, "operator", 10)?;
+    for text in saved
+        .acceptance
+        .iter()
+        .chain(saved.proof_plan.iter())
+        .chain(saved.criteria.iter().map(|criterion| &criterion.text))
+    {
+        assert!(!text.contains(&leaked.raw_key));
+        assert!(text.contains("[REDACTED:powder-api-key]"));
+    }
+
+    // Patch path: replacement acceptance/proof_plan lists get the same scrub.
+    let patched = store.patch_card(
+        &card_id,
+        CardPatch {
+            acceptance: Some(vec![format!("rotate {} afterwards", leaked.raw_key)]),
+            proof_plan: Some(vec![format!("readback without {}", leaked.raw_key)]),
+            ..Default::default()
+        },
+        "operator",
+        20,
+    )?;
+    for text in patched
+        .acceptance
+        .iter()
+        .chain(patched.proof_plan.iter())
+        .chain(patched.criteria.iter().map(|criterion| &criterion.text))
+    {
+        assert!(!text.contains(&leaked.raw_key));
+        assert!(text.contains("[REDACTED:powder-api-key]"));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn work_log_attribution_fields_carrying_a_fresh_key_are_scrubbed() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("scrub-attribution")?;
+    store.create_card_with_events(ready_card("scrub-attribution", 10), "operator", 10)?;
+
+    let leaked = store.create_api_key("leaked-in-reasoning", ApiKeyScope::Agent, 11)?;
+    let reasoning = format!("tried auth with {} before realizing", leaked.raw_key);
+    let entry = store.append_work_log(
+        &card_id,
+        "agent-a",
+        WorkLogAttribution {
+            model: Some("claude-sonnet-5"),
+            reasoning: Some(&reasoning),
+            harness: Some("Claude Code"),
+            run_id: None,
+        },
+        "progress note",
+        20,
+    )?;
+    let reasoning_stored = entry.reasoning.expect("reasoning persisted");
+    assert!(!reasoning_stored.contains(&leaked.raw_key));
+    assert!(reasoning_stored.contains("[REDACTED:powder-api-key]"));
+    // Benign attribution survives byte for byte.
+    assert_eq!(entry.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(entry.harness.as_deref(), Some("Claude Code"));
+
+    Ok(())
+}
+
+#[test]
+fn repository_import_provenance_carrying_a_fresh_key_is_scrubbed() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let leaked = store.create_api_key("leaked-in-provenance", ApiKeyScope::Agent, 5)?;
+
+    let summary = store.upsert_repository(
+        RepositoryUpsert {
+            name: "scrub-repo".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: Some(format!("imported via {}", leaked.raw_key)),
+        },
+        10,
+    )?;
+    let provenance = summary.import_provenance.expect("provenance persisted");
+    assert!(!provenance.contains(&leaked.raw_key));
+    assert!(provenance.contains("[REDACTED:powder-api-key]"));
+
+    Ok(())
+}
+
+#[test]
+fn scrub_write_boundary_leaves_short_prose_mentions_untouched_end_to_end() -> Result<()> {
+    // The anti-false-positive companion to the redaction tests above: a work
+    // log that merely *discusses* the key-shape prefix in prose (well under
+    // the 20-char floor after the prefix) must survive the write boundary
+    // byte for byte, not just in the unit-level secrets::scrub_secrets tests.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("scrub-prose")?;
+    store.create_card_with_events(ready_card("scrub-prose", 10), "operator", 10)?;
+
+    let prose = "confirmed the sk_powder_ prefix is what identifies a Powder-issued key";
+    let entry = store.append_work_log(
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        prose,
+        20,
+    )?;
+    assert_eq!(entry.body, prose);
+
+    let comment = store.add_comment(&card_id, "agent-a", prose, 21)?;
+    assert_eq!(comment.body, prose);
 
     Ok(())
 }

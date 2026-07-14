@@ -46,8 +46,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_cards",
-        description: "Scan card summaries by optional status/autonomy/repo/estimate filter, not just ready-eligible ones. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1}}}"#,
+        description: "Scan card summaries by optional status/autonomy/repo/estimate filter, not just ready-eligible ones. With no status filter, done/shipped/abandoned cards are hidden by default (set include_terminal:true to see them too); total_count in the response always reports the full matching count, terminal cards included, so a hidden card is never mistaken for a nonexistent one. An explicit status filter (e.g. status:done) always returns matching cards regardless of include_terminal. Use get_card for full card detail before implementation.",
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -406,18 +406,28 @@ pub fn call_tool_store(
                 .map(parse_estimate)
                 .transpose()?;
             let repo = args["repo"].as_str().map(str::to_string);
-            let page = store
-                .list_cards_page(
-                    &CardFilter {
-                        status,
-                        repo,
-                        autonomy,
-                        estimate,
-                    },
-                    limit,
-                )
-                .map_err(to_string)?;
-            card_summary_page_payload(&page.cards, page.total_count)
+            // powder-mcp-unfiltered-enumeration: an unfiltered (no explicit
+            // status) query hides done/shipped/abandoned cards by default --
+            // include_terminal:true restores the full sweep. An explicit
+            // status filter is authoritative either way (see
+            // `list_cards_page`'s doc comment).
+            let include_terminal =
+                status.is_some() || args["include_terminal"].as_bool().unwrap_or(false);
+            let filter = CardFilter {
+                status,
+                repo,
+                autonomy,
+                estimate,
+                include_terminal,
+            };
+            let page = store.list_cards_page(&filter, limit).map_err(to_string)?;
+            list_cards_envelope(
+                store,
+                args,
+                &page.cards,
+                page.total_count,
+                page.excluded_terminal_count,
+            )?
         }
         "board_stats" => json!(store
             .board_stats(BoardStatsQuery {
@@ -748,6 +758,98 @@ fn card_summary_page_payload(cards: &[Card], total_count: usize) -> Value {
         ));
     }
     payload
+}
+
+/// `list_cards`-specific envelope (powder-mcp-unfiltered-enumeration):
+/// `total_count` is always the count matching the caller's explicit
+/// status/repo/autonomy/estimate filters -- see `list_cards_page`'s doc
+/// comment -- so it never undercounts just because `include_terminal:false`
+/// (the tool's default with no explicit `status`) held terminal cards back
+/// from `cards`. Beyond the plain `card_summary_page_payload` shape:
+/// - a genuinely empty filtered match (`total_count == 0`) names the active
+///   filter and the board's raw total, so a narrow filter never reads as an
+///   empty board;
+/// - otherwise the hint comes from [`list_cards_hint`], which keeps "more
+///   matches beyond `limit`" and "matches hidden by the terminal exclusion"
+///   separate -- they have different remedies.
+fn list_cards_envelope(
+    store: &Store,
+    args: &Value,
+    cards: &[Card],
+    total_count: usize,
+    excluded_terminal_count: usize,
+) -> Result<Value, String> {
+    let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
+    let has_more = total_count > summaries.len();
+    let mut payload = json!({
+        "cards": summaries,
+        "total_count": total_count,
+        "has_more": has_more,
+    });
+    if summaries.is_empty() && total_count == 0 {
+        let board_total = store.card_count().map_err(to_string)?;
+        if board_total > 0 {
+            payload["hint"] = json!(format!(
+                "0 matches for {}; board has {board_total} cards",
+                active_filter_description(args)
+            ));
+        }
+    } else if let Some(hint) =
+        list_cards_hint(summaries.len(), total_count, excluded_terminal_count)
+    {
+        payload["hint"] = json!(hint);
+    }
+    Ok(payload)
+}
+
+/// Hint text for a truncated or terminal-filtered `list_cards` page, shared
+/// by the local (store-backed) and remote (HTTP-backed) dispatch paths.
+///
+/// The two shortfalls have different remedies and must never be conflated:
+/// raising `limit` recovers matches beyond the page size, while only
+/// `include_terminal:true` recovers terminal-hidden matches. An earlier
+/// version subtracted the terminal-exclusive returned count from the
+/// terminal-inclusive total and always said "raise limit" -- on a board of
+/// 1 done + 1 ready with limit 10 that read "1 more cards; ... raise
+/// limit", where raising the limit does nothing, sending an agent in a
+/// retry loop.
+pub(crate) fn list_cards_hint(
+    returned: usize,
+    total_count: usize,
+    excluded_terminal_count: usize,
+) -> Option<String> {
+    let beyond_limit = total_count
+        .saturating_sub(excluded_terminal_count)
+        .saturating_sub(returned);
+    match (beyond_limit > 0, excluded_terminal_count > 0) {
+        (true, true) => Some(format!(
+            "{beyond_limit} more non-terminal cards (raise limit); \
+             {excluded_terminal_count} terminal hidden (include_terminal:true)"
+        )),
+        (true, false) => Some(format!(
+            "{beyond_limit} more cards; filter by status/repo or raise limit"
+        )),
+        (false, true) => Some(format!(
+            "{excluded_terminal_count} terminal cards hidden (done/shipped/abandoned); \
+             pass include_terminal:true to see them"
+        )),
+        (false, false) => None,
+    }
+}
+
+/// Renders the caller's active `list_cards` filter as `{key:value, ...}` for
+/// the empty-match hint, e.g. `{status:done, repo:mint}`. Reads the raw
+/// argument strings (not the parsed/canonicalized enum values) since this is
+/// echoing back what the caller asked for.
+fn active_filter_description(args: &Value) -> String {
+    let parts = ["status", "repo", "autonomy", "estimate"]
+        .into_iter()
+        .filter_map(|key| {
+            let value = args[key].as_str()?.trim();
+            (!value.is_empty()).then(|| format!("{key}:{value}"))
+        })
+        .collect::<Vec<_>>();
+    format!("{{{}}}", parts.join(", "))
 }
 
 fn card_detail_payload(detail: &CardDetail) -> Result<Value, String> {
@@ -1837,6 +1939,14 @@ mod tests {
             )])
             .unwrap();
 
+        // powder-mcp-unfiltered-enumeration: `blocked` is not a terminal
+        // status, so it is unaffected by the new default-terminal-exclusion
+        // behavior below -- this assertion still holds unchanged. The
+        // terminal-exclusion behavior itself (done/shipped/abandoned hidden
+        // from an unfiltered `{}` call, total_count still counting them) has
+        // its own dedicated coverage:
+        // `mcp_list_cards_hides_terminal_by_default_but_total_count_counts_all`
+        // and `mcp_list_cards_include_terminal_true_restores_the_full_sweep`.
         let all = call_tool_store(&mut store, "list_cards", &json!({}), 10).unwrap();
         assert!(tool_payload(&all)["cards"]
             .as_array()
@@ -1869,6 +1979,137 @@ mod tests {
         assert_eq!(
             invalid,
             "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+        );
+    }
+
+    /// powder-mcp-unfiltered-enumeration: an unfiltered `list_cards {}` call
+    /// on a board with both a `done` and a `ready` card must hide the
+    /// terminal card from `cards`, but `total_count` must still count it --
+    /// an agent scanning "what's on the board" should never mistake a
+    /// hidden-by-default card for a nonexistent one.
+    #[test]
+    fn mcp_list_cards_hides_terminal_by_default_but_total_count_counts_all() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![
+                seeded_card("done-1", "Done", CardStatus::Done, 1),
+                seeded_card("ready-1", "Ready", CardStatus::Ready, 2),
+            ])
+            .unwrap();
+
+        let unfiltered = call_tool_store(&mut store, "list_cards", &json!({}), 10).unwrap();
+        let payload = tool_payload(&unfiltered);
+        let ids = payload["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["ready-1"], "the done card must be hidden");
+        assert_eq!(
+            payload["total_count"], 2,
+            "total_count must still report the full board so the hidden card is never mistaken for a nonexistent one"
+        );
+        assert_eq!(payload["has_more"], true);
+        // rev-125 fix: the hint must NOT say "raise limit" here -- the
+        // shortfall is entirely terminal-hidden cards, and raising the
+        // limit recovers none of them (the original conflated hint sent an
+        // agent in a retry loop on exactly this 1 done + 1 ready board).
+        assert_eq!(
+            payload["hint"],
+            "1 terminal cards hidden (done/shipped/abandoned); pass include_terminal:true to see them"
+        );
+
+        // Both shortfalls at once: three ready cards behind limit 1 AND a
+        // hidden done card -- the hint must name each remedy with its own
+        // accurate count instead of one lumped "raise limit" number.
+        for index in 2..=3 {
+            store
+                .import_cards(vec![seeded_card(
+                    &format!("ready-{index}"),
+                    "Ready",
+                    CardStatus::Ready,
+                    2 + index,
+                )])
+                .unwrap();
+        }
+        let truncated =
+            call_tool_store(&mut store, "list_cards", &json!({"limit": 1}), 10).unwrap();
+        let payload = tool_payload(&truncated);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["total_count"], 4);
+        assert_eq!(
+            payload["hint"],
+            "2 more non-terminal cards (raise limit); 1 terminal hidden (include_terminal:true)"
+        );
+
+        // An explicit status filter is authoritative regardless of the
+        // default terminal exclusion.
+        let explicit_done =
+            call_tool_store(&mut store, "list_cards", &json!({"status": "done"}), 10).unwrap();
+        let payload = tool_payload(&explicit_done);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["cards"][0]["id"], "done-1");
+    }
+
+    /// powder-mcp-unfiltered-enumeration: `include_terminal: true` restores
+    /// the pre-this-card full sweep, terminal cards included.
+    #[test]
+    fn mcp_list_cards_include_terminal_true_restores_the_full_sweep() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![
+                seeded_card("done-1", "Done", CardStatus::Done, 1),
+                seeded_card("ready-1", "Ready", CardStatus::Ready, 2),
+            ])
+            .unwrap();
+
+        let everything = call_tool_store(
+            &mut store,
+            "list_cards",
+            &json!({"include_terminal": true}),
+            10,
+        )
+        .unwrap();
+        let payload = tool_payload(&everything);
+        let mut ids = payload["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["done-1", "ready-1"]);
+        assert_eq!(payload["total_count"], 2);
+        assert_eq!(payload["has_more"], false);
+    }
+
+    /// powder-mcp-unfiltered-enumeration: a filtered query that matches
+    /// nothing names the active filter and the board's nonzero total in its
+    /// hint, so a narrow filter is never mistaken for an empty board.
+    #[test]
+    fn mcp_list_cards_empty_filtered_result_names_filter_and_board_total() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![seeded_card("ready-1", "Ready", CardStatus::Ready, 1)])
+            .unwrap();
+
+        let empty = call_tool_store(
+            &mut store,
+            "list_cards",
+            &json!({"status": "done", "repo": "mint"}),
+            10,
+        )
+        .unwrap();
+        let payload = tool_payload(&empty);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["total_count"], 0);
+        assert_eq!(
+            payload["hint"], "0 matches for {status:done, repo:mint}; board has 1 cards",
+            "hint was: {payload}"
         );
     }
 

@@ -51,6 +51,11 @@ const DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS: usize = 120;
 const DEFAULT_FIELD_NOTE_WEEKLY_BUDGET: usize = 7;
 const SIGNATURE_HEADER: &str = "X-Signature-256";
 const DELIVERY_BATCH_LIMIT: usize = 25;
+/// Header a trusted tailnet ingress sets to prove a `tailscale-header`-mode
+/// request actually passed through it, when `POWDER_TAILNET_PROXY_SECRET` is
+/// configured. See `authorize()` and docs/operations.md's trust-boundary
+/// section.
+const PROXY_SECRET_HEADER: &str = "x-powder-proxy-secret";
 
 #[derive(Clone)]
 struct AppState {
@@ -67,6 +72,20 @@ struct Config {
     bind_addr: SocketAddr,
     disclose_bootstrap_key: bool,
     field_note: FieldNoteConfig,
+    /// In-code backstop for `tailscale-header` auth (powder-tailnet-backstop):
+    /// when set, a header-auth request must also carry a matching
+    /// `X-Powder-Proxy-Secret` header, so a request that reaches
+    /// `powder-server` without passing through the trusted tailnet ingress
+    /// (a misrouted request, a bypassed proxy) is rejected instead of
+    /// silently trusted on the strength of a spoofable identity header
+    /// alone. `None` (unset) preserves the original behavior: any request
+    /// bearing a trusted identity header is authorized.
+    tailnet_proxy_secret: Option<String>,
+    /// Whether a `tailscale-header`-authenticated identity is granted admin
+    /// scope. Defaults to `true` (unset or explicit `true`) to preserve the
+    /// mode's original all-admin behavior; `POWDER_TAILNET_ADMIN=false` makes
+    /// tailnet-authenticated callers ordinary non-admin actors instead.
+    tailnet_admin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -140,6 +159,13 @@ impl Config {
             None => SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], port)),
         };
         let field_note = field_note_config_from_env(&vars)?;
+        let tailnet_proxy_secret =
+            env_value(&vars, "POWDER_TAILNET_PROXY_SECRET").map(ToOwned::to_owned);
+        let tailnet_admin = parse_bool(
+            "POWDER_TAILNET_ADMIN",
+            env_value(&vars, "POWDER_TAILNET_ADMIN"),
+        )?
+        .unwrap_or(true);
 
         Ok(Self {
             db_path,
@@ -149,6 +175,8 @@ impl Config {
             bind_addr,
             disclose_bootstrap_key,
             field_note,
+            tailnet_proxy_secret,
+            tailnet_admin,
         })
     }
 }
@@ -266,6 +294,14 @@ struct ListCardsParams {
     repo: Option<String>,
     estimate: Option<String>,
     limit: Option<usize>,
+    /// powder-mcp-unfiltered-enumeration: `false` hides
+    /// done/shipped/abandoned cards when no explicit `status` is requested
+    /// (an explicit `status` always wins; see `CardFilter`). Defaults to
+    /// `true`, so HTTP callers that never send it keep the historical
+    /// whole-board behavior byte-for-byte unchanged; the remote MCP
+    /// dispatch path sends `false` for an unfiltered `list_cards` so remote
+    /// mode matches local (store-backed) MCP mode.
+    include_terminal: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,7 +744,11 @@ async fn list_ready(
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
     let query = ReadyQuery::new(unix_now(), limit).with_estimate(estimate);
     let page = lock_store(&state)?.list_ready_page(query)?;
-    Ok(Json(card_list_page_json(page.cards, page.total_count)))
+    Ok(Json(card_list_page_json(
+        page.cards,
+        page.total_count,
+        page.excluded_terminal_count,
+    )))
 }
 
 /// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
@@ -736,18 +776,36 @@ async fn list_cards(
         autonomy,
         estimate,
         repo: params.repo,
+        include_terminal: params.include_terminal.unwrap_or(true),
     };
     let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
-    Ok(Json(card_list_page_json(page.cards, page.total_count)))
+    Ok(Json(card_list_page_json(
+        page.cards,
+        page.total_count,
+        page.excluded_terminal_count,
+    )))
 }
 
-fn card_list_page_json(cards: Vec<Card>, total_count: usize) -> serde_json::Value {
+fn card_list_page_json(
+    cards: Vec<Card>,
+    total_count: usize,
+    excluded_terminal_count: usize,
+) -> serde_json::Value {
     let has_more = total_count > cards.len();
-    json!({
+    let mut payload = json!({
         "cards": cards,
         "total_count": total_count,
         "has_more": has_more,
-    })
+    });
+    // Additive, opt-in-only field: nonzero exactly when the caller sent
+    // `include_terminal=false` and terminal cards were held back, so the
+    // historical response shape for every existing caller is unchanged.
+    // Remote MCP dispatch uses it to build an accurate "hidden vs. beyond
+    // limit" hint (see powder-mcp's list_cards_hint).
+    if excluded_terminal_count > 0 {
+        payload["excluded_terminal_count"] = json!(excluded_terminal_count);
+    }
+    payload
 }
 
 async fn list_approvals(
@@ -1394,6 +1452,11 @@ struct AuthorizedActor {
     display_name: String,
     enforces_identity: bool,
     is_admin: bool,
+    /// The presented API key's non-secret lookup prefix, when auth mode is
+    /// `ApiKey` -- `None` for tailnet-header or disabled auth, which never
+    /// see a key. Threaded through so a 403 can name which key came up
+    /// short instead of a bare "admin scope required" (powder-918).
+    key_prefix: Option<String>,
 }
 
 impl AuthorizedActor {
@@ -1414,13 +1477,26 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             display_name: "anonymous".to_string(),
             enforces_identity: false,
             is_admin: false,
+            key_prefix: None,
         }),
         AuthMode::TailscaleHeader => {
+            if let Some(expected) = state.config.tailnet_proxy_secret.as_deref() {
+                let provided = headers
+                    .get(PROXY_SECRET_HEADER)
+                    .and_then(|value| value.to_str().ok());
+                let matches = provided.is_some_and(|provided| constant_time_eq(provided, expected));
+                if !matches {
+                    return Err(ApiError::unauthorized(format!(
+                        "missing or invalid {PROXY_SECRET_HEADER} header"
+                    )));
+                }
+            }
             if let Some(identity) = trusted_tailnet_identity(headers) {
                 Ok(AuthorizedActor {
                     display_name: identity.to_string(),
                     enforces_identity: true,
-                    is_admin: true,
+                    is_admin: state.config.tailnet_admin,
+                    key_prefix: None,
                 })
             } else {
                 Err(ApiError::unauthorized(
@@ -1440,11 +1516,16 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                     display_name: key.actor.display_name,
                     enforces_identity: true,
                     is_admin: key.scope == ApiKeyScope::Admin,
+                    key_prefix: Some(key.key_prefix),
                 })
             } else {
-                Err(ApiError::forbidden(
-                    "api key scope cannot access agent routes",
-                ))
+                Err(ApiError::forbidden(format!(
+                    "{} (key {}, prefix {}) has scope {} which cannot access agent routes",
+                    key.actor.display_name,
+                    key.name,
+                    key.key_prefix,
+                    key.scope.as_str()
+                )))
             }
         }
     }
@@ -1472,7 +1553,17 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActo
     if !actor.enforces_identity || actor.is_admin {
         Ok(actor)
     } else {
-        Err(ApiError::forbidden("admin scope required"))
+        // Name the presented key (or tailnet identity) and the scope it was
+        // missing rather than a bare "admin scope required" -- an operator
+        // staring at a 403 needs to know *which* credential came up short
+        // without grepping logs (powder-918).
+        let presented = match actor.key_prefix.as_deref() {
+            Some(prefix) => format!("{} (key prefix {prefix})", actor.display_name),
+            None => actor.display_name.clone(),
+        };
+        Err(ApiError::forbidden(format!(
+            "{presented} requires admin scope"
+        )))
     }
 }
 
@@ -1483,6 +1574,21 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.trim().strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Constant-time byte comparison so a proxy-secret check does not leak the
+/// secret's length or contents through response-timing side channels.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (byte_left, byte_right) in left.iter().zip(right.iter()) {
+        diff |= byte_left ^ byte_right;
+    }
+    diff == 0
 }
 
 fn trusted_tailnet_identity(headers: &HeaderMap) -> Option<&str> {

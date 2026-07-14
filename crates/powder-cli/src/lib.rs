@@ -30,6 +30,7 @@ pub const COMMANDS: &[&str] = &[
     "repository-upsert",
     "repository-merge-alias",
     "repository-delete",
+    "repository-normalize",
     "claim",
     "release-claim",
     "renew-claim",
@@ -118,6 +119,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "repository-upsert" => repository_upsert(rest),
         [command, rest @ ..] if command == "repository-merge-alias" => repository_merge_alias(rest),
         [command, rest @ ..] if command == "repository-delete" => repository_delete(rest),
+        [command, rest @ ..] if command == "repository-normalize" => repository_normalize(rest),
         [command, rest @ ..] if command == "claim" => claim(rest, remote_env),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest, remote_env),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest, remote_env),
@@ -172,7 +174,18 @@ pub fn help() -> String {
         "  powder version   # confirm the installed binary's build against `git rev-parse --short=12 HEAD` before starting a lane\n",
     );
     help.push_str("  powder init-db --db ./data/powder.db --show-secret\n");
-    help.push_str("  powder key-create --db ./data/powder.db --name codex --scope agent\n");
+    help.push_str(
+        "  powder key-create --db ./data/powder.db --name codex --scope agent --show-secret  \
+         (prints the raw secret once — store it immediately, it cannot be recovered)\n",
+    );
+    help.push_str(
+        "  powder key-create --db ./data/powder.db --name codex --scope agent --redacted  \
+         (mints the key but discards the secret; only use this if you don't need the raw value)\n",
+    );
+    help.push_str(
+        "  key-create requires exactly one of --show-secret or --redacted; it refuses to mint \
+         without an explicit choice\n",
+    );
     help.push_str("  powder key-list --db ./data/powder.db\n");
     help.push_str("  powder key-revoke key-id --db ./data/powder.db\n");
     help.push_str(
@@ -201,6 +214,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator\n",
+    );
+    help.push_str(
+        "  powder repository-normalize --db ./data/powder.db --actor operator  (one-time sweep: canonicalizes any legacy non-canonical cards.repo rows and audits each change)\n",
     );
     help.push_str(
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000\n",
@@ -278,6 +294,32 @@ fn init_db(args: &[String]) -> Result<String, ShellError> {
 
 fn key_create(args: &[String]) -> Result<String, ShellError> {
     let show_secret = has_flag(args, "--show-secret");
+    let redacted = has_flag(args, "--redacted");
+
+    // The raw secret exists only in the instant `create_api_key` returns; the
+    // store persists nothing but a sha256 hash, so a key minted without
+    // capturing that value is gone forever (the dogfood incident: minting
+    // without --show-secret printed "redacted" and the secret was
+    // unrecoverable). Require the caller to make an explicit choice before
+    // we mint, rather than defaulting to either a silent discard or an
+    // unsolicited secret print.
+    match (show_secret, redacted) {
+        (true, true) => {
+            return Err(ShellError::Invalid(
+                "key-create: pass exactly one of --show-secret or --redacted, not both".to_string(),
+            ))
+        }
+        (false, false) => {
+            return Err(ShellError::Invalid(
+                "key-create: refusing to mint a key without an explicit secret-handling choice; \
+                 pass --show-secret to print the raw key once (store it immediately, it cannot \
+                 be recovered) or --redacted to acknowledge the secret will be discarded"
+                    .to_string(),
+            ))
+        }
+        _ => {}
+    }
+
     let name = flag_value(args, "--name").unwrap_or("agent");
     let scope = flag_value(args, "--scope")
         .and_then(ApiKeyScope::parse)
@@ -287,6 +329,13 @@ fn key_create(args: &[String]) -> Result<String, ShellError> {
     let key = store.create_api_key(name, scope, now).map_err(store_err)?;
 
     if show_secret {
+        // The warning is for the human; stdout stays machine-readable so
+        // `... | cut -f4` captures exactly the secret (the lease-race demo
+        // broke when this warning shared stdout with the key line).
+        eprintln!(
+            "WARNING: this is the only time this secret is shown. Store it now \
+             (consumer secret store: keychain, 1Password, etc.) — it cannot be recovered."
+        );
         Ok(format!(
             "api-key\t{}\t{}\t{}\n",
             key.id,
@@ -682,6 +731,10 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
             autonomy,
             estimate,
             repo: repo.clone(),
+            // powder-mcp-unfiltered-enumeration: only the MCP `list_cards`
+            // tool defaults to hiding terminal cards; the CLI keeps its
+            // existing whole-board behavior unchanged.
+            include_terminal: true,
         };
         json!(store.list_cards(&filter, limit).map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
@@ -797,6 +850,22 @@ fn repository_delete(args: &[String]) -> Result<String, ShellError> {
     let mut store = open_store(required_flag(args, "--db")?)?;
     store.delete_repository(name).map_err(store_err)?;
     Ok(format!("deleted\t{name}\n"))
+}
+
+/// powder-904: admin-ish, local-db-only sweep -- normalizes every card
+/// whose stored `repo` column is an alias or org-prefixed string (predating
+/// write-time canonicalization, or written by a path that bypassed it) to
+/// its canonical short name, auditing each change with a card event. No
+/// remote/API-mode equivalent: this reaches into one instance's own SQLite
+/// file, the same shape as `key-create`/`key-list`/`key-revoke`.
+fn repository_normalize(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let actor = flag_value(args, "--actor").unwrap_or("operator");
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let outcome = store
+        .normalize_repository_strings(actor, now)
+        .map_err(store_err)?;
+    to_pretty_json(&outcome)
 }
 
 fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1586,7 +1655,12 @@ fn positional(args: &[String]) -> Vec<&str> {
 fn flag_takes_value(flag: &str) -> bool {
     !matches!(
         flag,
-        "--dry-run" | "--show-secret" | "--admin" | "--include-hidden" | "--unchecked"
+        "--dry-run"
+            | "--show-secret"
+            | "--redacted"
+            | "--admin"
+            | "--include-hidden"
+            | "--unchecked"
     )
 }
 
@@ -1630,6 +1704,7 @@ mod tests {
         assert!(COMMANDS.contains(&"repository-upsert"));
         assert!(COMMANDS.contains(&"repository-merge-alias"));
         assert!(COMMANDS.contains(&"repository-delete"));
+        assert!(COMMANDS.contains(&"repository-normalize"));
         assert!(COMMANDS.contains(&"update-relations"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
@@ -2188,6 +2263,59 @@ mod tests {
         assert!(card.contains("legacy-canary -> canary"));
     }
 
+    /// powder-904: `repository-normalize` is admin-ish/local-db-only, wired
+    /// straight to `Store::normalize_repository_strings`. Every write path
+    /// already canonicalizes `cards.repo` at write time (see
+    /// `powder-store::tests::create_card_with_events_normalizes_alias_repo_string_at_write_time`),
+    /// so there is no way to produce a non-canonical row through this CLI's
+    /// own public commands to normalize away -- the sweep's actual
+    /// rewrite-and-audit behavior against a legacy (pre-normalization) row
+    /// is covered at the store level
+    /// (`normalize_repository_strings_sweeps_legacy_rows_and_audits_each_change`).
+    /// This test instead locks in the CLI plumbing: the subcommand is
+    /// registered, accepts `--db`/`--actor`, and returns the sweep's JSON
+    /// shape for an already-canonical board (a real no-op run, not a stub).
+    #[test]
+    fn cli_repository_normalize_sweeps_an_already_canonical_board_as_a_no_op() {
+        assert!(COMMANDS.contains(&"repository-normalize"));
+
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-repository-normalize-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "already-canonical",
+            "--title",
+            "Already canonical",
+            "--acceptance",
+            "proof exists",
+            "--repo",
+            "misty-step/canary",
+        ]))
+        .unwrap();
+
+        let output = run(&args([
+            "repository-normalize",
+            "--db",
+            &db,
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert!(output.contains("\"scanned\": 1"), "output was: {output}");
+        assert!(output.contains("\"changes\": []"), "output was: {output}");
+    }
+
     #[test]
     fn cli_add_comment_appears_in_get_card() {
         let db = std::env::temp_dir().join(format!(
@@ -2525,6 +2653,94 @@ mod tests {
 
         let missing = run(&args(["key-revoke", "key-does-not-exist", "--db", &db])).unwrap_err();
         assert!(matches!(missing, ShellError::NotFound(_)));
+    }
+
+    /// powder-918: minting a key without saying what to do with the secret
+    /// used to silently print "redacted" and throw the only copy away
+    /// forever (the store never persists the raw value). `key-create` must
+    /// refuse rather than guess, and the refusal must name both flags so an
+    /// agent hitting this cold learns what to pass without reading source.
+    #[test]
+    fn cli_key_create_refuses_without_an_explicit_secret_choice() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-key-create-refusal-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+
+        let err = run(&args(["key-create", "--db", &db, "--name", "codex"])).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("--show-secret") && message.contains("--redacted"),
+            "refusal must name both flags: {message}"
+        );
+
+        let err_both = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex",
+            "--show-secret",
+            "--redacted",
+        ]))
+        .unwrap_err();
+        assert!(
+            err_both.to_string().contains("--show-secret")
+                && err_both.to_string().contains("--redacted"),
+            "conflicting flags must also be refused: {err_both}"
+        );
+
+        // no "codex" key was minted by either refused call (init-db already
+        // seeds an unrelated bootstrap key, so the list is not itself empty).
+        let listed = run(&args(["key-list", "--db", &db])).unwrap();
+        assert!(
+            !listed.contains("codex"),
+            "a refused key-create must not persist a key: {listed}"
+        );
+
+        let redacted = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex",
+            "--redacted",
+        ]))
+        .unwrap();
+        assert!(redacted.contains("redacted"));
+        assert!(
+            !redacted.to_lowercase().contains("sk_"),
+            "redacted output must never carry the raw secret: {redacted}"
+        );
+
+        let shown = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex2",
+            "--show-secret",
+        ]))
+        .unwrap();
+        // The store-it-now warning moved to stderr so stdout stays
+        // machine-readable (`cut -f4` captures exactly the secret); stdout
+        // must be the single tab-separated key line and nothing else.
+        assert!(
+            !shown.contains("WARNING"),
+            "warning must not pollute machine-readable stdout: {shown}"
+        );
+        assert_eq!(
+            shown.lines().count(),
+            1,
+            "stdout must be exactly one tab-separated line: {shown}"
+        );
+        assert!(shown.starts_with("api-key\t"));
+        assert_eq!(shown.trim_end().split('\t').count(), 4);
     }
 
     #[test]

@@ -15,9 +15,13 @@ Generated via harness-kit's repo-local skill generation pattern
 (skills/harness-engineering/references/repo-local-skill-generation.md).
 Source repo: misty-step/powder @ f948307 (origin/main). Generated: 2026-07-01.
 Generator ref: harness-kit@cbe82137.
-Facts below are repo-derived at generation time, not invented. Re-verify
-commands against the live repo before trusting this if it has aged — a
-generated skill is a snapshot, not a live view.
+Refreshed: 2026-07-14 (powder-self-hosting-docs stale-docs sweep) -- `master`
+is now the repo's primary branch (`main` retired), the CLI smoke below was
+re-run verbatim against a fresh checkout, and the `cp .env.example .env`
+step was replaced (there is no dotenv loader in powder-server).
+Facts below are repo-derived at generation/refresh time, not invented.
+Re-verify commands against the live repo before trusting this if it has
+aged further — a generated skill is a snapshot, not a live view.
 -->
 
 # powder-qa
@@ -25,7 +29,7 @@ generated skill is a snapshot, not a live view.
 `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D
 warnings && cargo test --workspace` is the deterministic gate — this exact
 sequence runs in CI (`.github/workflows/ci.yml`, `Rust CI / fmt-clippy-test`,
-required by `main` branch protection). It is **necessary but not sufficient**:
+required by `master` branch protection). It is **necessary but not sufficient**:
 unit tests exercise fixtures, not the live claim/lease/lifecycle path across
 CLI ↔ store ↔ API, and not the MCP tool surface an agent actually calls. Do
 not confuse this generated QA skill with the repo's own root `SKILL.md`,
@@ -70,10 +74,11 @@ cargo run -q -p powder-cli -- get-card 001 --db "$DB"
 cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --proof https://example.test/proof
 ```
 
-HTTP server smoke:
+HTTP server smoke (there is no dotenv loader in `powder-server` -- load
+`.env.example` into the shell, don't just copy it):
 
 ```sh
-cp .env.example .env
+set -a; source .env.example; set +a
 POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 # separate shell:
 curl -s localhost:4000/healthz
@@ -86,9 +91,15 @@ curl -s localhost:4000/readyz
   for a throwaway `/tmp` smoke DB; never run that flag against a real
   instance DB in a transcript or log you don't control.
 - **CI is real now, not honor-system** — `.github/workflows/ci.yml` runs the
-  exact fmt/clippy/test sequence above on every PR and push to `main`, and
-  `main` branch protection requires the `Rust CI / fmt-clippy-test` check.
-  Do not treat the local gate as optional or as the only signal.
+  exact fmt/clippy/test sequence above on every PR and push to `master`, and
+  `master` branch protection requires the `Rust CI / fmt-clippy-test` check
+  (strict status checks, admin enforcement). Do not treat the local gate as
+  optional or as the only signal.
+- **The lease-race demo is also a CI gate** — `scripts/lease-race-demo.sh`
+  (run via the `Quickstart` workflow's `lease-race-demo` job) boots a real
+  `powder-server`, drives a crash + reclaim race, and asserts the audit
+  trail. A change to claim/lease semantics that breaks this is a real
+  regression, not a flaky test.
 - **`mint-key`-equivalent / DB targeting**: every CLI/MCP/server invocation
   must point at the *same* `--db`/`POWDER_DB_PATH` — Powder is a single
   SQLite writer per instance, same footgun class as Canary's single-writer

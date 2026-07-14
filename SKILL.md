@@ -47,7 +47,18 @@ Default agent persona (20 tools):
   (`S`/`M`/`L`/`XL`).
 - `list_cards`: enumerate cards by optional status/autonomy/repo/`estimate`
   filter, including `blocked`, `review`, and `done` cards `list_ready` never
-  surfaces.
+  surfaces. With no `status` filter, `done`/`shipped`/`abandoned` cards are
+  hidden by default (in both local `POWDER_DB_PATH` and remote
+  `POWDER_API_BASE_URL` modes) -- pass `include_terminal: true` to restore
+  the full sweep; an explicit `status` filter (e.g. `status: done`) always
+  returns matching cards regardless of `include_terminal`. `total_count` in
+  the response always reports the full matching count, terminal cards
+  included, so a hidden card is never mistaken for a nonexistent one. The
+  `hint` keeps the two shortfalls separate because they have different
+  remedies: "N more non-terminal cards (raise limit)" vs. "N terminal
+  hidden (include_terminal:true)"; a filtered query that matches nothing
+  names the active filter and the board's total (e.g. `0 matches for
+  {status:done, repo:mint}; board has 214 cards`).
 - `board_stats`: return board-shape counts (by status and repo), not card
   contents; call this before `list_cards` when you only need the shape of
   the board.
@@ -85,8 +96,9 @@ Default agent persona (20 tools):
   relation lists untouched. Parent edges never block and child completion
   never completes the parent -- parent acceptance stays authoritative.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
-- `add_comment`: attach an actor-attributed comment, visible immediately via
-  `get_card`/`get_run`.
+- `add_comment`: attach an actor-attributed comment (`author`, `body` --
+  both required), visible immediately via `get_card`/`get_run`; `body` is
+  scrubbed for known secret shapes server-side before storage.
 - `append_work_log`: append a high-frequency, fully-attributed work_log entry
   (agent, model, reasoning, harness, run_id, body) while actively working a
   card -- call this often, not just at completion; `body` is scrubbed for

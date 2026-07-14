@@ -139,6 +139,15 @@
   background: var(--ae-wash);
 }
 
+.msk-lease-race-cast {
+  display: block;
+  width: 100%;
+  max-width: 860px;
+  height: auto;
+  border: 1px solid var(--ae-line);
+  background: var(--ae-wash);
+}
+
 .msk-release-slot {
   max-width: 42rem;
 }

@@ -34,8 +34,11 @@ kill_timeout = "30s"
   # Fail boot loudly if Litestream backup configuration is ever missing or
   # incomplete, instead of silently running an unreplicated instance (the
   # entrypoint's default behavior otherwise: a warning on stderr, easy to
-  # miss). The required secrets (BUCKET_NAME, AWS_*) are already deployed;
-  # see docs/litestream-restore-drill.md for the restore proof and drill.
+  # miss). Requires the BUCKET_NAME + AWS_* secrets; for the replication
+  # config, restore-on-boot behavior, and the non-destructive restore drill,
+  # see docs/self-hosting.md#backup-and-restore-litestream--s3
+  # (docs/litestream-restore-drill.md is a tombstoned pointer now -- the
+  # Fly instance it drilled against was destroyed 2026-07-07).
   POWDER_REQUIRE_LITESTREAM = "1"
   PORT = "4000"
 

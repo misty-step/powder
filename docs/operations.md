@@ -46,15 +46,35 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
 | `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | `work-log\tcard_id\tagent\tbody` |
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
+| `answer-input` | SQLite run resume | `POST /api/v1/runs/{id}/answer` | `answered-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
-falling back to ephemeral state. `update-relations`, `get-run`,
-`list-awaiting-input`, `answer-input`, `repository-*`, `import-github-issues`, `key-*`, and
-`subscription-*` remain `--db`-only (bulk/admin operations or reads with no
-remote-mode demand yet); omitting `--db` on those still fails with a bare
-`missing --db`.
+falling back to ephemeral state. `update-relations`, `set-parent`, `get-run`,
+`list-awaiting-input`, `repository-*`, `import-github-issues`,
+`key-*`, `subscription-*`, `dead-letter-list`, and `event-tail` remain
+`--db`-only (bulk/admin operations, hierarchy/webhook management, or reads
+with no remote-mode demand yet); omitting `--db` on those still fails with a
+bare `missing --db`.
+
+Commands with no remote-mode transport, verified against `COMMANDS` in
+`crates/powder-cli/src/lib.rs`:
+
+| Command | Purpose | Example |
+| --- | --- | --- |
+| `set-parent` | Link or clear a card's explicit `parent` edge (epic decomposition) | `powder set-parent 002 --db ./data/powder.db --parent 001` / `powder set-parent 002 --db ./data/powder.db --clear` |
+| `repository-get` | Read one repository entity by canonical name or alias | `powder repository-get canary --db ./data/powder.db` |
+| `repository-delete` | Delete an unused repository entity and its aliases | `powder repository-delete canary --db ./data/powder.db` |
+| `subscription-create` | Register a signed webhook subscription (prints the signing secret once with `--show-secret`) | `powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret` |
+| `subscription-list` | List webhook subscriptions without disclosing signing secrets | `powder subscription-list --db ./data/powder.db` |
+| `subscription-disable` | Disable a subscription while preserving its delivery history | `powder subscription-disable sub-id --db ./data/powder.db` |
+| `dead-letter-list` | List webhook deliveries that exhausted retry attempts | `powder dead-letter-list --db ./data/powder.db` |
+| `event-tail` | Page through durable outbound card events (the same feed `GET /api/v1/events/tail` streams as SSE) after a given sequence number | `powder event-tail --db ./data/powder.db --after 0 --limit 20` |
+
+See [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks) for a full
+`subscription-create` -> trigger an event -> `event-tail`/`dead-letter-list`
+readback walkthrough against a real local server.
 
 MCP can also run against a local or deployed `powder-server` over HTTP instead
 of opening SQLite directly:
@@ -178,6 +198,11 @@ profiles:
 
 ## Self-Hosting
 
+For the copy-pasteable quickstart (Docker, release binary, bare-host +
+systemd, Fly), the full env-var reference, and the backup/restore story, see
+[`docs/self-hosting.md`](self-hosting.md). This section stays focused on the
+production posture and lore specific to this repo's own history.
+
 Powder follows the Canary-style deployment pattern:
 
 - one Rust service image
@@ -187,14 +212,17 @@ Powder follows the Canary-style deployment pattern:
 - optional Litestream replication to Fly Tigris
 - `/healthz`, `/readyz`, and `/api/v1/onboarding`
 - auth configured by env (`api-key`, `tailscale-header`, or `none`)
-- change webhooks configured by `POWDER_WEBHOOK_URLS` (comma- or newline-separated)
+- change webhooks configured at runtime via `POST /api/v1/events/subscriptions`
+  (`powder subscription-create`), not an env var -- see
+  [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks)
 - first-run bootstrap API key, printed once unless
   `POWDER_DISCLOSE_BOOTSTRAP_KEY=false`
 
-Local setup:
+Local setup (there is no dotenv loader -- `cp .env.example .env` alone does
+nothing until the file is loaded into the process environment):
 
 ```sh
-cp .env.example .env
+set -a; source .env; set +a
 POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 ```
 
@@ -206,6 +234,43 @@ answer-loop writes, and key management require `Authorization: Bearer <key>` in
 `tailscale-header` only behind a trusted ingress that injects one of the
 supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.
+
+### Trust boundary for `tailscale-header` auth (powder-tailnet-backstop)
+
+`tailscale-header` mode trusts any request bearing one of four identity
+headers (`Tailscale-User-Login`, `X-Tailscale-User-Login`,
+`Tailscale-User-Name`, `X-Forwarded-User`) as an authenticated actor. That is
+only as safe as the ingress in front of `powder-server`: the proxy must
+
+- **strip** all four identity headers from anything a client sends itself,
+  so a request cannot forge an identity by setting the header before the
+  proxy would have;
+- **set** exactly one of the four headers itself, sourced only from its own
+  verified tailnet peer identity (e.g. Tailscale Serve's own
+  `Tailscale-User-Login`), never copied from request-supplied data.
+
+`powder-server` cannot independently verify a header its process boundary
+receives came from that proxy rather than a client that reached it directly
+(a misrouted request, a bypassed ingress, a proxy misconfiguration). Set
+`POWDER_TAILNET_PROXY_SECRET` to add an in-code backstop for that gap: when
+set, every `tailscale-header`-mode request must also carry a matching
+`X-Powder-Proxy-Secret` header (compared in constant time), and requests
+missing it or carrying the wrong value are rejected with `401` before the
+identity header is even consulted. Configure the trusted proxy to set this
+header on every request it forwards, from a value only it and
+`powder-server` know. Leaving it unset preserves the original behavior
+(any request with a trusted identity header is authorized) -- exactly as
+before this backstop existed.
+
+`POWDER_TAILNET_ADMIN` controls the scope granted to a `tailscale-header`
+identity. Default (unset, or explicit `true`): every authenticated tailnet
+identity gets `admin` scope, matching the mode's original all-admin
+behavior -- no config change means no behavior change. Set
+`POWDER_TAILNET_ADMIN=false` once a deployment fronts multiple tailnet users
+who should not all hold `admin` (repository management, key management,
+bulk import): tailnet-authenticated callers still authenticate and can use
+claim-scoped routes, but `require_admin`-gated routes reject them with
+`403`.
 
 **Ratified posture (powder-931, 2026-07-06):** the deployed instance runs
 `api-key` mode with unauthenticated reads, reachable only over its private
@@ -225,8 +290,12 @@ matches that actor.
 Powder is audit-first, not lifecycle-enforcing: any authorized actor may set any
 card status in one call. Claims remain useful leases for coordination, but
 status correction and completion do not require the actor to hold the claim or
-provide proof. When configured, card create/update/status changes POST
-`{"event":"card.*","card":{...}}` to each URL in `POWDER_WEBHOOK_URLS`.
+provide proof. Card create/update/status/claim-expiry/completion changes are
+delivered to any URL registered via `POST /api/v1/events/subscriptions`
+(`powder subscription-create --url ... [--event-filter ...]`), each with its
+own HMAC signing secret and independent retry/dead-letter tracking -- see
+[`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks) for the full
+contract and a working local example.
 
 ### Field-note seed generator (powder-921)
 
@@ -287,6 +356,31 @@ Set `POWDER_HOME_URL` (unset by default) to render a plain text link back to
 that URL in the board's always-visible chrome -- for a deployment fronted by
 a portal/home surface Powder itself doesn't own (powder-942). Self-hosters
 with no such portal leave it unset and see no change.
+
+### API key lifecycle: minting, storage, and what's recoverable (powder-918)
+
+**Durable key-drop convention: hand-out-at-mint-only.** `powder key-create`
+and `powder init-db --show-secret` print a raw secret exactly once, at the
+moment of minting, and the store never persists it (see below) -- there is no
+"look it up later" recovery path. Capture it directly into the *consumer's*
+own secret store (macOS/Linux keychain, 1Password, a CI secret store) in the
+same breath as minting it. Do not park a raw key anywhere on the box itself as
+a hand-off mechanism -- not a dotfile, not `/tmp`, not `/var/run`. **Incident
+(2026-07-04):** a key was left in `/var/run` to hand off between processes;
+`/var/run` is `tmpfs` and is wiped on every reboot and every supervisor
+restart, so the key silently vanished on the next deploy and had to be
+re-minted. If a key needs to reach a second consumer, mint a fresh key for
+that consumer and hand it out at mint time again -- never try to relay an
+already-minted raw value you no longer hold.
+
+Because there is no durable drop location, `key-create` refuses to mint at
+all unless the caller passes exactly one of `--show-secret` (print the raw
+key once, with a store-it-now warning) or `--redacted` (explicit
+acknowledgment that the secret will be discarded). Minting with neither flag
+used to silently print `redacted` and throw the only copy away; refusing is
+the honest behavior; a default that prints secrets unasked is worse.
+
+See [docs/self-hosting.md](self-hosting.md#secrets-at-rest) for what is and isn't recoverable at rest.
 
 ### A scoped key for the board UI on a phone (powder-925)
 
