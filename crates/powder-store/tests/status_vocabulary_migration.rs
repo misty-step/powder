@@ -1,6 +1,6 @@
 //! powder-status-vocabulary: rehearses the real schema v16->v17 migration
 //! (`Store::migrate`'s `migrate_16_to_17` step) against a sanitized,
-//! synthetic 407-card snapshot shaped like a real deployed instance still on
+//! synthetic 408-card snapshot shaped like a real deployed instance still on
 //! the nine-status vocabulary.
 //!
 //! This replaces the dormant `status_model_020` rehearsal machinery
@@ -137,14 +137,14 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
     assert_eq!(before_status_counts.get("abandoned").copied(), Some(27));
     assert_eq!(before_status_counts.get("awaiting_input").copied(), Some(2));
     assert_eq!(before_status_counts.get("backlog").copied(), Some(170));
-    assert_eq!(before_status_counts.get("blocked").copied(), Some(17));
+    assert_eq!(before_status_counts.get("blocked").copied(), Some(18));
     assert_eq!(before_status_counts.get("claimed").copied(), Some(9));
     assert_eq!(before_status_counts.get("done").copied(), Some(49));
     assert_eq!(before_status_counts.get("ready").copied(), Some(78));
     assert_eq!(before_status_counts.get("running").copied(), Some(45));
     assert_eq!(before_status_counts.get("shipped").copied(), Some(10));
     let before_total: usize = before_status_counts.values().sum();
-    assert_eq!(before_total, 407);
+    assert_eq!(before_total, 408);
 
     // Run the real production migration -- current is 16, so this
     // exercises `migrate_16_to_17` for real, not a simulation of it.
@@ -173,12 +173,15 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
         );
     }
 
-    // claimed(9) + running(45) both collapse to in_progress; the 16
-    // blocked-with-real-acceptance rows plus 78 already-ready rows become
-    // ready; the single blocked-with-empty-acceptance row joins backlog;
-    // everything else is untouched.
-    assert_eq!(after_status_counts.get("backlog").copied(), Some(171));
-    assert_eq!(after_status_counts.get("ready").copied(), Some(94));
+    // claimed(9) + running(45) both collapse to in_progress. Of the 18
+    // blocked rows: only the 2 carrying real blocked_by relations become
+    // ready (78 already-ready + 2 = 80); the 15 relation-less rows and the
+    // single empty-acceptance row re-triage to backlog (170 + 16 = 186) --
+    // blocking that exists only as prose must not become claimable without
+    // a human wiring relations or promoting deliberately (adversarial
+    // review of PR #134). Everything else is untouched.
+    assert_eq!(after_status_counts.get("backlog").copied(), Some(186));
+    assert_eq!(after_status_counts.get("ready").copied(), Some(80));
     assert_eq!(after_status_counts.get("in_progress").copied(), Some(54));
     assert_eq!(after_status_counts.get("awaiting_input").copied(), Some(2));
     assert_eq!(after_status_counts.get("done").copied(), Some(49));
@@ -207,65 +210,79 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
             "table {table} must be untouched by the status-vocabulary migration"
         );
     }
-    let changed_cards = 17 /* blocked */ + 9 /* claimed */ + 45 /* running */;
+    let changed_cards = 18 /* blocked */ + 9 /* claimed */ + 45 /* running */;
     assert_eq!(
         table_count(&connection, "card_events"),
         before_table_counts["card_events"] + changed_cards,
         "exactly one audit event per status-changed card"
     );
 
-    // Spot-check the two blocked branches by id.
-    let blocked_empty_status: String = connection
-        .query_row(
-            "SELECT status FROM cards WHERE id = 'blocked-empty-001'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("blocked-empty-001 status");
+    // Spot-check every blocked branch by id.
+    let status_of = |id: &str| -> String {
+        connection
+            .query_row("SELECT status FROM cards WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap_or_else(|_| panic!("status of {id}"))
+    };
     assert_eq!(
-        blocked_empty_status, "backlog",
+        status_of("blocked-empty-001"),
+        "backlog",
         "a blocked card with no acceptance oracle becomes backlog, mirroring \
          CardStatus::default_for_acceptance"
     );
-    let blocked_with_oracle_status: String = connection
-        .query_row(
-            "SELECT status FROM cards WHERE id = 'blocked-001'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("blocked-001 status");
-    assert_eq!(blocked_with_oracle_status, "ready");
+    assert_eq!(
+        status_of("blocked-001"),
+        "backlog",
+        "a blocked card whose blocking existed only as prose (no blocked_by \
+         relations) re-triages to backlog instead of becoming fleet-claimable"
+    );
+    assert_eq!(
+        status_of("blocked-live-blocker-001"),
+        "ready",
+        "a blocked card with a real blocker relation becomes ready -- \
+         list_ready keeps excluding it until the blocker resolves"
+    );
+    assert_eq!(status_of("blocked-resolved-blocker-001"), "ready");
 
-    // The migration audit event exists, names both statuses, and is
-    // attributed to the migration rather than any operator/agent actor.
-    let (event_actor, event_payload): (String, String) = connection
-        .query_row(
-            "SELECT actor, payload FROM card_events
-             WHERE card_id = 'blocked-empty-001' AND event_type = 'status'
-             ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("migration audit event for blocked-empty-001");
+    // The migration audit events exist, name both statuses plus the
+    // relation-less re-triage rationale, and are attributed to the
+    // migration rather than any operator/agent actor.
+    let event_for = |card_id: &str| -> (String, String) {
+        connection
+            .query_row(
+                "SELECT actor, payload FROM card_events
+                 WHERE card_id = ?1 AND event_type = 'status'
+                 ORDER BY created_at DESC LIMIT 1",
+                [card_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_else(|_| panic!("migration audit event for {card_id}"))
+    };
+    let (event_actor, event_payload) = event_for("blocked-empty-001");
     assert_eq!(event_actor, "system:status-vocabulary-migration");
     assert_eq!(
         event_payload,
-        "status-vocabulary migration: blocked -> backlog"
+        "status-vocabulary migration: blocked -> backlog (empty acceptance)"
+    );
+    let (_, relation_less_payload) = event_for("blocked-001");
+    assert_eq!(
+        relation_less_payload,
+        "status-vocabulary migration: blocked -> backlog \
+         (no blocked_by relations; re-triage before claiming)"
+    );
+    let (_, relation_payload) = event_for("blocked-live-blocker-001");
+    assert_eq!(
+        relation_payload,
+        "status-vocabulary migration: blocked -> ready"
     );
 
     // powder-status-vocabulary regression (acceptance #3): a former-blocked
     // card whose blocker is still live must NOT surface in list_ready even
     // though its status is now `ready` -- eligibility is derived from the
-    // unresolved `blocked_by` relation, not from any status bit.
+    // unresolved `blocked_by` relation, not from any status bit. Its
+    // resolved-blocker sibling is the positive control: it must surface.
     {
-        let former_blocked_status: String = connection
-            .query_row(
-                "SELECT status FROM cards WHERE id = 'blocked-live-blocker-001'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("blocked-live-blocker-001 status");
-        assert_eq!(former_blocked_status, "ready");
         let store = Store::open(&path).expect("open migrated store for list_ready");
         let ready = store
             .list_ready(ReadyQuery::new(1_800_000_000, 1_000))
@@ -277,8 +294,15 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
             "a former-blocked card with a live blocker must not surface in list_ready"
         );
         assert!(
-            ready.iter().any(|card| card.id.as_str() == "blocked-001"),
-            "a former-blocked card with no blocker relation becomes genuinely ready"
+            ready
+                .iter()
+                .any(|card| card.id.as_str() == "blocked-resolved-blocker-001"),
+            "a former-blocked card whose only blocker is terminal is genuinely claimable"
+        );
+        assert!(
+            !ready.iter().any(|card| card.id.as_str() == "blocked-001"),
+            "a relation-less former-blocked card re-triaged to backlog must not \
+             surface in list_ready either"
         );
     }
 

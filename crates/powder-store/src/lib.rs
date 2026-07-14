@@ -465,20 +465,36 @@ impl Store {
     /// entirely: blocking eligibility is already derived from `blocked_by`
     /// relations at claim time ([`powder_core::Card::claim_readiness`])
     /// regardless of status, so an explicit `blocked` status was a second,
-    /// driftable copy of that derived fact. A former-`blocked` card becomes
-    /// `ready`, or `backlog` if its acceptance oracle is empty -- mirroring
-    /// [`CardStatus::default_for_acceptance`], the same rule a freshly
-    /// created card is defaulted by ("ready is a query, not vibes",
-    /// VISION.md). Every other status (`backlog`, `ready`,
-    /// `awaiting_input`, `done`, `shipped`, `abandoned`) is untouched --
-    /// `awaiting_input` stays first-class and queryable, and the three
-    /// terminal outcomes stay distinguishable (operator ruling,
-    /// 2026-07-14). Claims/runs/relations/events are never touched by this
-    /// migration; only the `status` column on affected cards changes, plus
-    /// one audit `card_events` row per changed card. Idempotent: guarded by
-    /// the surrounding `migrate()` loop, which only ever runs the 16->17
-    /// step once (a database already at or past schema 17 never re-enters
-    /// this function), and the whole step commits atomically so a crash
+    /// driftable copy of that derived fact.
+    ///
+    /// Where a former-`blocked` card lands depends on what it actually
+    /// carries:
+    /// - real `blocked_by` relations -> `ready`: `list_ready`/claiming keep
+    ///   excluding it until every blocker resolves, so nothing becomes
+    ///   claimable that was not already;
+    /// - non-empty acceptance but NO `blocked_by` relations -> `backlog`:
+    ///   on the live board most blocked cards record their blocker only as
+    ///   prose (operator timers, missing secrets, vendor bugs, pending
+    ///   decisions) with zero relations wired, and mapping those to `ready`
+    ///   would make them immediately claimable by the fleet with no
+    ///   compensating control. Backlog forces a human re-triage: wire the
+    ///   relations or promote deliberately (adversarial review of PR #134,
+    ///   ratified 2026-07-14);
+    /// - empty acceptance -> `backlog`, mirroring
+    ///   [`CardStatus::default_for_acceptance`], the same rule a freshly
+    ///   created card is defaulted by ("ready is a query, not vibes",
+    ///   VISION.md).
+    ///
+    /// Every other status (`backlog`, `ready`, `awaiting_input`, `done`,
+    /// `shipped`, `abandoned`) is untouched -- `awaiting_input` stays
+    /// first-class and queryable, and the three terminal outcomes stay
+    /// distinguishable (operator ruling, 2026-07-14). Claims/runs/
+    /// relations/events are never touched by this migration; only the
+    /// `status` column on affected cards changes, plus one audit
+    /// `card_events` row per changed card. Idempotent: guarded by the
+    /// surrounding `migrate()` loop, which only ever runs the 16->17 step
+    /// once (a database already at or past schema 17 never re-enters this
+    /// function), and the whole step commits atomically so a crash
     /// mid-migration leaves the prior schema version to retry cleanly
     /// rather than a half-applied status column.
     fn migrate_16_to_17(&mut self) -> Result<()> {
@@ -498,7 +514,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut statement = transaction.prepare(
-                "SELECT id, status, acceptance_json FROM cards
+                "SELECT id, status, acceptance_json, blocked_by_json FROM cards
                  WHERE status IN ('claimed', 'running', 'blocked')
                  ORDER BY id",
             )?;
@@ -508,16 +524,23 @@ impl Store {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            for (card_id, old_status, acceptance_json) in affected {
-                let new_status = match old_status.as_str() {
-                    "claimed" | "running" => "in_progress",
-                    "blocked" if acceptance_json.trim() == "[]" => "backlog",
-                    "blocked" => "ready",
-                    other => other,
+            for (card_id, old_status, acceptance_json, blocked_by_json) in affected {
+                let empty_acceptance = acceptance_json.trim() == "[]";
+                let relation_less = blocked_by_json.trim() == "[]";
+                let (new_status, detail) = match old_status.as_str() {
+                    "claimed" | "running" => ("in_progress", ""),
+                    "blocked" if empty_acceptance => ("backlog", " (empty acceptance)"),
+                    "blocked" if relation_less => (
+                        "backlog",
+                        " (no blocked_by relations; re-triage before claiming)",
+                    ),
+                    "blocked" => ("ready", ""),
+                    other => (other, ""),
                 };
                 transaction.execute(
                     "UPDATE cards SET status = ?1 WHERE id = ?2",
@@ -528,7 +551,9 @@ impl Store {
                     &CardId::new(card_id)?,
                     "status",
                     "system:status-vocabulary-migration",
-                    &format!("status-vocabulary migration: {old_status} -> {new_status}"),
+                    &format!(
+                        "status-vocabulary migration: {old_status} -> {new_status}{detail}"
+                    ),
                     now,
                 )?;
             }

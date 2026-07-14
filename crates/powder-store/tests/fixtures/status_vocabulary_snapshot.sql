@@ -133,6 +133,43 @@ INSERT INTO cards (
   1700000610
 );
 
+-- powder-status-vocabulary: one extra legacy `blocked` card whose only
+-- blocker relation is already terminal (done-001). This card genuinely maps
+-- to `ready` AND surfaces in `list_ready` after migration -- the positive
+-- half of the relation-derived eligibility rule. It is deliberately the
+-- only blocked card that lands claimable: the 15 generated blocked rows
+-- carry no relations at all and re-triage to `backlog` instead (their
+-- blocking existed only as prose on the live board, so mapping them to
+-- `ready` would have made them immediately claimable with no compensating
+-- control -- adversarial review of PR #134).
+INSERT INTO cards (
+  id, title, body, acceptance_json, status, priority, labels_json,
+  assignee, related_json, blocks_json, blocked_by_json, repo,
+  source_path, source_digest, claim_agent, claim_run_id,
+  claim_acquired_at, claim_expires_at, created_at, updated_at
+) VALUES (
+  'blocked-resolved-blocker-001',
+  'Synthetic blocked card whose blocker already resolved',
+  'Sanitized fixture body for status-vocabulary rehearsal.',
+  '["synthetic acceptance oracle"]',
+  'blocked',
+  'P0',
+  '["synthetic","status-vocabulary"]',
+  NULL,
+  '[]',
+  '[]',
+  '["done-001"]',
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  1700000520,
+  1700000620
+);
+
 INSERT INTO runs (
   id, card_id, state, agent, claim_expires_at, proof, created_at, updated_at
 )
