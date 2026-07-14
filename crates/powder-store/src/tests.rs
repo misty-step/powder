@@ -2350,6 +2350,59 @@ fn replay_dead_letters_requeues_and_records_an_audit_attempt() -> Result<()> {
     Ok(())
 }
 
+/// powder-epic-truthful-ops (review fix): a disabled subscription's dead
+/// letters must NOT be requeued -- `due_webhook_deliveries` filters on
+/// `disabled_at IS NULL`, so a requeued row would sit `pending` forever with
+/// nothing able to drain it. Replay must skip them (leaving them
+/// dead-lettered) rather than strand them.
+#[test]
+fn replay_dead_letters_skips_disabled_subscriptions() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let sub = store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/disabled",
+        vec!["completed".to_string()],
+        5,
+    )?;
+    store.import_cards(vec![ready_card("dlq-disabled", 10)])?;
+    store.complete_card(
+        &CardId::new("dlq-disabled")?,
+        None,
+        Vec::new(),
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    // Drive the delivery to dead-letter, then disable the subscription.
+    let mut now = 20_i64;
+    for _ in 0..6 {
+        for due in store.due_webhook_deliveries(now, 10)? {
+            store.record_webhook_delivery_failure(&due.id, Some(500), "forced failure", now)?;
+        }
+        now += 300;
+    }
+    assert_eq!(store.list_dead_letter_deliveries(10)?.len(), 1);
+    store.disable_event_subscription(&sub.subscription.id, now)?;
+
+    // Replay (both filtered and unfiltered) must be a no-op: the dead letter
+    // stays dead-lettered, nothing is requeued to a dead-end pending state.
+    assert_eq!(
+        store.replay_dead_letters(Some(&sub.subscription.id), now)?,
+        0
+    );
+    assert_eq!(store.replay_dead_letters(None, now)?, 0);
+    assert_eq!(
+        store.list_dead_letter_deliveries(10)?.len(),
+        1,
+        "the disabled subscription's dead letter must remain dead-lettered, not requeued"
+    );
+    assert!(
+        store.due_webhook_deliveries(now, 10)?.is_empty(),
+        "nothing should be pending/due for a disabled subscription"
+    );
+    Ok(())
+}
+
 #[test]
 fn create_card_with_events_enqueues_card_created_transactionally() -> Result<()> {
     let mut store = Store::open_in_memory()?;
@@ -3267,6 +3320,124 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
         .expect("new key after migration");
     assert_eq!(verified.actor.display_name, "new-agent");
     assert_eq!(verified.actor.kind.as_str(), "agent");
+    Ok(())
+}
+
+/// powder-epic-truthful-ops (review fix): the exact crash the old
+/// single-column guard on `migrate_1_to_2` could not recover from. A v1
+/// database that crashed *after* `ALTER TABLE api_keys ADD COLUMN actor_id`
+/// committed but *before* the backfill ran leaves the column present and
+/// every value NULL, with `user_version` still 1. The buggy guard saw the
+/// column, skipped the backfill forever, and `verify_api_key`'s INNER JOIN
+/// on `actors` then rejected every pre-existing key. The completeness guard
+/// must finish the backfill on the next `migrate()` and restore
+/// authentication.
+#[test]
+fn migration_1_to_2_finishes_a_backfill_that_crashed_after_the_column_add() -> Result<()> {
+    let path = temp_db("v1-half-backfilled-actor-id");
+    let raw_key = "sk_powder_legacy_key_present_column_unrun_backfill";
+    let key_hash = bcrypt::hash(raw_key, bcrypt::DEFAULT_COST)?;
+    let key_prefix = raw_key.chars().take(12).collect::<String>();
+
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            -- The actors table and the actor_id column already exist (the
+            -- `CREATE TABLE IF NOT EXISTS` and the `ALTER ... ADD COLUMN`
+            -- committed), but the two backfill statements never ran and the
+            -- version bump to 2 never happened -- the interrupted-migration
+            -- state.
+            CREATE TABLE actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE api_keys (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER,
+              actor_id TEXT
+            );
+            CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            CREATE TABLE cards (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              priority TEXT NOT NULL,
+              labels_json TEXT NOT NULL,
+              assignee TEXT,
+              blocked_by_json TEXT NOT NULL,
+              repo TEXT,
+              workspace_path TEXT,
+              branch_name TEXT,
+              source_path TEXT,
+              source_digest TEXT,
+              claim_agent TEXT,
+              claim_run_id TEXT,
+              claim_acquired_at INTEGER,
+              claim_expires_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE runs (
+              id TEXT PRIMARY KEY,
+              card_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              agent TEXT NOT NULL,
+              model TEXT,
+              claim_expires_at INTEGER NOT NULL,
+              turn_count INTEGER NOT NULL,
+              token_count INTEGER NOT NULL,
+              consecutive_failures INTEGER NOT NULL,
+              last_error TEXT,
+              result TEXT,
+              proof TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 1;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO api_keys (id, name, key_prefix, key_hash, scope, created_at, revoked_at, actor_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+            rusqlite::params!["key-legacy", "legacy-agent", key_prefix, key_hash, "agent", 10_i64],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+
+    // The interrupted backfill must have been finished: no key left NULL,
+    // and an actor row minted for the legacy key.
+    let null_actor_ids: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM api_keys WHERE actor_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        null_actor_ids, 0,
+        "the completeness guard must finish the backfill the crash interrupted"
+    );
+
+    // The load-bearing consequence: the pre-existing key authenticates again
+    // (verify_api_key INNER JOINs actors, so an unbackfilled actor_id would
+    // silently fail this).
+    let verified = store
+        .verify_api_key(raw_key, 21)?
+        .expect("legacy key must still authenticate after the finished backfill");
+    assert_eq!(verified.name, "legacy-agent");
+    assert_eq!(verified.actor.id, "actor-key-legacy");
+    assert_eq!(verified.actor.display_name, "legacy-agent");
     Ok(())
 }
 

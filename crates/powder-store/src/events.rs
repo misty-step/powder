@@ -387,6 +387,14 @@ impl Store {
     /// the replay to one subscription's dead letters; `None` replays every
     /// dead letter across every subscription.
     ///
+    /// Dead letters belonging to a *disabled* subscription are skipped
+    /// (powder-epic-truthful-ops review fix): `due_webhook_deliveries` never
+    /// picks up a disabled subscription's rows (`subscriptions.disabled_at IS
+    /// NULL`), so requeuing them to `pending` would only strand permanent
+    /// stale `pending` rows the delivery loop can never drain -- worse than
+    /// leaving them dead-lettered. Re-enable the subscription first if you
+    /// actually want its backlog redelivered.
+    ///
     /// Each requeue also inserts a synthetic `attempt_number = 0` row into
     /// `webhook_delivery_attempts` recording the replay itself (no
     /// `status_code`, `error` holds a human-readable note) -- an operator
@@ -403,10 +411,13 @@ impl Store {
         let transaction = self.connection.transaction()?;
         let delivery_ids: Vec<String> = {
             let mut statement = transaction.prepare(
-                "SELECT id FROM webhook_deliveries
-                 WHERE status = 'dead_letter'
-                   AND (?1 IS NULL OR subscription_id = ?1)
-                 ORDER BY updated_at ASC, id ASC",
+                "SELECT deliveries.id FROM webhook_deliveries deliveries
+                 JOIN event_subscriptions subscriptions
+                   ON subscriptions.id = deliveries.subscription_id
+                 WHERE deliveries.status = 'dead_letter'
+                   AND subscriptions.disabled_at IS NULL
+                   AND (?1 IS NULL OR deliveries.subscription_id = ?1)
+                 ORDER BY deliveries.updated_at ASC, deliveries.id ASC",
             )?;
             let rows = statement
                 .query_map(params![subscription_id], |row| row.get::<_, String>(0))?

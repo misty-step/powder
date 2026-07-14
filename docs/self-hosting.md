@@ -254,7 +254,15 @@ curl -s http://localhost:4000/readyz
   process keeps serving -- see the `lock_store` doc comment in
   `crates/powder-server/src/main.rs` for why that's safe), but `/readyz`
   fails until a restart clears it, so an orchestrator's readiness gate
-  (not its liveness gate) notices and can page someone.
+  (not its liveness gate) notices and can page someone. The counter is
+  deliberately **monotonic and process-lived**: it only resets when the
+  process restarts, and nothing auto-restarts on a `/readyz` failure. That
+  is the intended human-in-the-loop semantics -- a recovered panic is a bug
+  worth a human's eyes, so even a single transient one holds `/readyz`
+  not-ready until an operator has looked and restarted, rather than
+  self-clearing and hiding the event. If you want automatic recovery, wire
+  `/readyz` to an orchestrator restart policy; do not expect the counter to
+  decay on its own.
 
 ## Webhooks
 

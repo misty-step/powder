@@ -175,6 +175,18 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    step for whoever drove the deploy to do against the real instance --
    nothing in this repo can exercise it.
 
+> **Poison counter is cleared only by a restart.** If `/readyz` reports
+> `poison_count` > 0 (a request handler panicked and the store mutex was
+> recovered), the process keeps serving but stays not-ready until it
+> restarts -- the counter is monotonic within a process lifetime by design,
+> so a transient panic can't self-clear and hide itself. Investigate the
+> panic (check `journalctl -u sanctum` for the `store mutex was poisoned`
+> warn line and whatever panicked before it), then clear the counter the
+> only way there is: `pkill -x powder-server` and let the supervisor respawn
+> it (the same respawn step the deploy uses). This is intended
+> human-in-the-loop behavior, not a bug -- do not add an auto-restart that
+> would paper over recurring panics.
+
 A merged PR on `misty-step/powder` alone changes nothing in production until
 the steps above happen. `powder version` on a locally installed CLI reports
 the commit *your local build* came from; it says nothing about what commit

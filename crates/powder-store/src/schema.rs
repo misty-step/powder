@@ -182,31 +182,13 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_delivery_attempts(delivery_id, attempt_number);
 "#;
 
-pub const MIGRATE_1_TO_2: &str = r#"
-CREATE TABLE IF NOT EXISTS actors (
-  id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  display_name TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-
-ALTER TABLE api_keys ADD COLUMN actor_id TEXT;
-
-INSERT OR IGNORE INTO actors (id, kind, display_name, created_at)
-SELECT
-  'actor-' || id,
-  CASE scope WHEN 'agent' THEN 'agent' ELSE 'user' END,
-  name,
-  created_at
-FROM api_keys
-WHERE actor_id IS NULL;
-
-UPDATE api_keys
-SET actor_id = 'actor-' || id
-WHERE actor_id IS NULL;
-
-CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
-"#;
+// The `MIGRATE_1_TO_2` step (create `actors`, add `api_keys.actor_id`,
+// backfill an actor per key + point each key at it, index) moved inline into
+// `Store::migrate_1_to_2`: it is DDL *plus* backfill, and `execute_batch`
+// autocommits per statement, so a single all-or-nothing constant guarded on
+// column existence would skip the backfill forever after a crash between the
+// ALTER and the backfill. See that function's doc comment for the
+// three-phase, per-effect idempotency it needs instead.
 
 /// Existing keys were bcrypt-hashed; tag them explicitly so `verify_api_key`
 /// keeps using bcrypt for them (they never break) while every newly created

@@ -42,9 +42,8 @@ pub use schema::SCHEMA_VERSION;
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_1_TO_2,
-    MIGRATE_2_TO_3, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_9_TO_10,
-    RUN_SELECT_SQL, SCHEMA,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_2_TO_3,
+    MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -420,10 +419,69 @@ impl Store {
     /// creation and index statements already use `IF NOT EXISTS` and are
     /// naturally idempotent, so only the bare `ALTER TABLE` steps need a
     /// guard.
+    /// powder-epic-truthful-ops (review fix): `MIGRATE_1_TO_2` is DDL *plus*
+    /// two backfill statements, and `execute_batch` autocommits per
+    /// statement -- so guarding the whole batch on `actor_id`'s existence was
+    /// wrong. A crash after the `ALTER TABLE ... ADD COLUMN actor_id` commits
+    /// but before the two backfills run leaves the column present with every
+    /// value NULL; on retry the single column-existence guard would see the
+    /// column and skip the backfills *forever*. That is not cosmetic:
+    /// `verify_api_key` INNER JOINs `api_keys` to `actors`, so a permanently
+    /// unbackfilled `actor_id` silently stops every pre-existing key from
+    /// authenticating. Decomposed into three independently-idempotent phases,
+    /// mirroring `migrate_3_to_4`'s per-effect guards:
+    ///
+    /// 1. `actors` table + the `api_keys` index are `CREATE ... IF NOT
+    ///    EXISTS`, safe to re-run unconditionally.
+    /// 2. the `ADD COLUMN` is guarded on column existence (an `ALTER ... ADD
+    ///    COLUMN` cannot be re-run).
+    /// 3. the backfill is guarded on its own *effect* -- whether any row is
+    ///    still `actor_id IS NULL` -- not on the column's existence, so an
+    ///    interrupted backfill is finished on the next boot. (The backfill's
+    ///    own `WHERE actor_id IS NULL` also makes re-running it harmless; the
+    ///    completeness guard just avoids a pointless full-table UPDATE when
+    ///    there is nothing left to do.)
     fn migrate_1_to_2(&mut self) -> Result<()> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );",
+        )?;
         if !self.table_has_column("api_keys", "actor_id")? {
-            self.connection.execute_batch(MIGRATE_1_TO_2)?;
+            self.connection
+                .execute_batch("ALTER TABLE api_keys ADD COLUMN actor_id TEXT;")?;
         }
+        let backfill_incomplete = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM api_keys WHERE actor_id IS NULL LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if backfill_incomplete {
+            self.connection.execute_batch(
+                "INSERT OR IGNORE INTO actors (id, kind, display_name, created_at)
+                 SELECT
+                   'actor-' || id,
+                   CASE scope WHEN 'agent' THEN 'agent' ELSE 'user' END,
+                   name,
+                   created_at
+                 FROM api_keys
+                 WHERE actor_id IS NULL;
+
+                 UPDATE api_keys
+                 SET actor_id = 'actor-' || id
+                 WHERE actor_id IS NULL;",
+            )?;
+        }
+        self.connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);",
+        )?;
         Ok(())
     }
 
