@@ -9,7 +9,7 @@ use powder_core::{
     DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
     WorkLogEntry,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
 
@@ -78,6 +78,66 @@ pub enum StoreError {
 pub struct Store {
     connection: Connection,
     field_note_config: Option<FieldNoteConfig>,
+}
+
+/// Validates every schema-v17 key-to-actor mapping before the migration can
+/// create, drop, or rewrite any table. Revoked keys are intentionally included:
+/// silently deleting a revoked credential would still make the migration
+/// lossy and would hide corrupt identity state from the operator.
+fn preflight_schema_17_key_actors(transaction: &Transaction<'_>) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT api_keys.id, api_keys.actor_id, actors.id,
+                actors.kind, actors.display_name
+         FROM api_keys
+         LEFT JOIN actors ON actors.id = api_keys.actor_id
+         ORDER BY api_keys.id",
+    )?;
+    let mappings = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    let mut defects = Vec::new();
+    for (key_id, actor_id, joined_actor_id, actor_kind, display_name) in mappings {
+        let mut classes = Vec::new();
+        if actor_id.is_none() {
+            classes.push("null_actor_id");
+        } else if joined_actor_id.is_none() {
+            classes.push("dangling_actor_id");
+        } else {
+            if display_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+            {
+                classes.push("blank_display_name");
+            }
+            if actor_kind.as_deref().is_none_or(|kind| {
+                !matches!(kind.trim().to_ascii_lowercase().as_str(), "agent" | "user")
+            }) {
+                classes.push("invalid_actor_kind");
+            }
+        }
+        if !classes.is_empty() {
+            defects.push(format!("{key_id} [{}]", classes.join(", ")));
+        }
+    }
+
+    if defects.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidStoredValue {
+            field: "schema v17 api key actor mapping",
+            value: defects.join("; "),
+        })
+    }
 }
 
 /// Config for the field-note seed generator (powder-921, content-harness
@@ -807,6 +867,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if has_legacy_keys {
+            preflight_schema_17_key_actors(&transaction)?;
             transaction.execute_batch(
                 "CREATE TABLE api_keys_v18 (
                    id TEXT PRIMARY KEY,
