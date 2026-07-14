@@ -329,10 +329,15 @@ fn key_create(args: &[String]) -> Result<String, ShellError> {
     let key = store.create_api_key(name, scope, now).map_err(store_err)?;
 
     if show_secret {
+        // The warning is for the human; stdout stays machine-readable so
+        // `... | cut -f4` captures exactly the secret (the lease-race demo
+        // broke when this warning shared stdout with the key line).
+        eprintln!(
+            "WARNING: this is the only time this secret is shown. Store it now \
+             (consumer secret store: keychain, 1Password, etc.) — it cannot be recovered."
+        );
         Ok(format!(
-            "api-key\t{}\t{}\t{}\n\
-             WARNING: this is the only time this secret is shown. Store it now \
-             (consumer secret store: keychain, 1Password, etc.) — it cannot be recovered.\n",
+            "api-key\t{}\t{}\t{}\n",
             key.id,
             key.scope.as_str(),
             key.raw_key
@@ -2722,10 +2727,20 @@ mod tests {
             "--show-secret",
         ]))
         .unwrap();
+        // The store-it-now warning moved to stderr so stdout stays
+        // machine-readable (`cut -f4` captures exactly the secret); stdout
+        // must be the single tab-separated key line and nothing else.
         assert!(
-            shown.contains("Store it now"),
-            "showing the secret must carry a store-it-now warning: {shown}"
+            !shown.contains("WARNING"),
+            "warning must not pollute machine-readable stdout: {shown}"
         );
+        assert_eq!(
+            shown.lines().count(),
+            1,
+            "stdout must be exactly one tab-separated line: {shown}"
+        );
+        assert!(shown.starts_with("api-key\t"));
+        assert_eq!(shown.trim_end().split('\t').count(), 4);
     }
 
     #[test]

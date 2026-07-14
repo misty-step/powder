@@ -159,8 +159,8 @@ curl -fsS -X POST "$BASE_URL/api/v1/cards" \
   | jq -c '{id: .id, status: .status}'
 
 say "[setup] minting one agent-scope key per actor (powder key-create --db, the documented operator pattern)"
-KEY_A="$("$POWDER_CLI" key-create --db "$DB" --name codex-agent --scope agent --show-secret | cut -f4 | tr -d '\n')"
-KEY_B="$("$POWDER_CLI" key-create --db "$DB" --name human-with-curl --scope agent --show-secret | cut -f4 | tr -d '\n')"
+KEY_A="$("$POWDER_CLI" key-create --db "$DB" --name codex-agent --scope agent --show-secret 2>/dev/null | grep -oE 'sk_powder_[A-Za-z0-9_-]{25,}' | head -1)"
+KEY_B="$("$POWDER_CLI" key-create --db "$DB" --name human-with-curl --scope agent --show-secret 2>/dev/null | grep -oE 'sk_powder_[A-Za-z0-9_-]{25,}' | head -1)"
 if [ -z "$KEY_A" ] || [ -z "$KEY_B" ]; then
   echo "key-create did not return a secret for one of the actors" >&2
   exit 1
