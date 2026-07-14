@@ -137,6 +137,7 @@ jobs:
           images: ghcr.io/misty-step/powder
           tags: |
             type=match,pattern=v(.*),group=1
+            type=ref,event=tag
             type=raw,value=latest
 
       # linux/amd64 only for now: the Dockerfile compiles Rust inside the
@@ -156,7 +157,7 @@ jobs:
 
   release:
     name: publish GitHub release
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-macos, docker]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

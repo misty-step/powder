@@ -63,8 +63,8 @@ curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
 ```
 
 That's the whole loop: a card exists, is claimable, and carries a
-`run_id`/`expires_at` lease the moment it's claimed. This exact sequence runs
-in CI on every change (see `.github/workflows/quickstart.yml`), so it can't
+`run_id`/`expires_at` lease the moment it's claimed. CI runs this sequence (and more)
+on every change (see `.github/workflows/quickstart.yml`), so it can't
 silently drift from what's in this README.
 
 ## Why Powder
