@@ -116,7 +116,10 @@ yet trustworthy enough for a fleet to depend on:
 
 - `powder-core` defines cards, runs, activity, audit events, relations, links,
   comments, ready eligibility, expiring claims, permissive status changes,
-  and optional completion proof.
+  and optional completion proof. The card status vocabulary is seven states
+  (`backlog`, `ready`, `in_progress`, `awaiting_input`, `done`, `shipped`,
+  `abandoned`); see `docs/status-vocabulary.md` for the ratified decision,
+  the 9->7 migration mapping, and the rejected alternatives.
 - `powder-store` persists the instance database in SQLite, enables WAL, owns
   migrations, stores hashed API keys, seeds the first bootstrap key once, and
   runs transactional card lifecycle operations.

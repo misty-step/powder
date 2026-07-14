@@ -177,7 +177,7 @@ printf "%s" "$CLAIM"
 RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
 cargo run -q -p powder-cli -- heartbeat smoke-proof --db "$DB" --run "$RUN_ID"
 cargo run -q -p powder-cli -- renew-claim smoke-proof --db "$DB" --run "$RUN_ID" --ttl 3600
-cargo run -q -p powder-cli -- update-status smoke-proof --db "$DB" --status running
+cargo run -q -p powder-cli -- update-status smoke-proof --db "$DB" --status in_progress
 cargo run -q -p powder-cli -- request-input "$RUN_ID" --db "$DB" --question "Approve completion?"
 cargo run -q -p powder-cli -- list-awaiting-input --db "$DB"
 cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator --answer approved
