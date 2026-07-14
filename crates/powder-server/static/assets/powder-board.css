@@ -1,6 +1,22 @@
 :root {
   --ae-accent: #2643d0;
   --ae-accent-dark: #8c9eff;
+  /* powder-903: the one duration/easing the board <-> backlog <-> both view
+     switch uses everywhere -- the rail/board grid split, the rail's own
+     fade+slide, and the board's fade+slide all reference this so the three
+     stay visually synchronized instead of drifting out of step. */
+  --pw-view-duration: 220ms;
+}
+
+/* powder-903: prefers-reduced-motion collapses every view-switch transition
+   to effectively instant by way of this one custom property, rather than a
+   media query duplicated at each of the three rules that reference it (or a
+   JS matchMedia branch -- the old rail-share animation used one; this
+   removes the need for it entirely). */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --pw-view-duration: 0.01ms;
+  }
 }
 
 html,
@@ -203,9 +219,31 @@ html:not([data-pw-route='card']) .pw-detail-app {
   margin: 0 0 0.45em;
 }
 
+/* powder-915: pairs the repository count with the zero-card "show empty"
+   toggle without disturbing the existing space-between two-child layout
+   above. */
+.pw-settings-head-meta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.8em;
+}
+
 .pw-repo-list {
   max-height: 9.5rem;
   overflow-y: auto;
+}
+
+/* powder-915: a tier badge next to the repo name -- RepositorySummary
+   carries no `description` field (see PR design notes), so the honest
+   legibility gain here is the tier at a glance, not fabricated copy.
+   Grouped with the name in its own flex box so the row's outer
+   `justify-content: space-between` (name group vs. count) doesn't strand
+   the badge in the middle of the row. */
+.pw-repo-main-left {
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 0.6em;
 }
 
 .pw-repo-create,
@@ -462,6 +500,15 @@ html:not([data-pw-route='card']) .pw-detail-app {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));
+  /* powder-903: the whole board <-> backlog <-> both switch is now one
+     declarative CSS transition on the resolved grid track sizes, driven by
+     `--pw-rail-share` (set once, instantly, in JS -- see setView/
+     setRailShare in powder-board.js). No JS animation loop writes styles
+     every frame, so the transition is non-blocking by construction: board
+     controls stay responsive to clicks throughout (see the law spec), and
+     it is symmetric for free since both directions play the exact same
+     transition. */
+  transition: grid-template-columns var(--pw-view-duration) var(--ae-ease);
 }
 
 .pw-rail-wrap {
@@ -469,7 +516,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   min-height: 0;
   border-right: 1px solid var(--ae-line);
   overflow: hidden;
-  transition: border-color var(--ae-soft) var(--ae-ease);
+  transition: border-color var(--pw-view-duration) var(--ae-ease);
 }
 
 .pw-main[data-view='board'] .pw-rail-wrap,
@@ -488,10 +535,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
   opacity: 1;
   transform: translateX(0);
   transition:
-    opacity 150ms var(--ae-ease),
-    transform 190ms var(--ae-ease),
-    padding 190ms var(--ae-ease),
-    width 190ms var(--ae-ease);
+    opacity var(--pw-view-duration) var(--ae-ease),
+    transform var(--pw-view-duration) var(--ae-ease),
+    padding var(--pw-view-duration) var(--ae-ease),
+    width var(--pw-view-duration) var(--ae-ease);
 }
 
 .pw-main[data-view='board'] .pw-rail-inner {
@@ -577,9 +624,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
   opacity: 1;
   transform: translateX(0);
   transition:
-    padding 190ms var(--ae-ease),
-    opacity 150ms var(--ae-ease),
-    transform 190ms var(--ae-ease);
+    padding var(--pw-view-duration) var(--ae-ease),
+    opacity var(--pw-view-duration) var(--ae-ease),
+    transform var(--pw-view-duration) var(--ae-ease);
 }
 
 .pw-main[data-view='backlog'] .pw-board {
@@ -783,6 +830,34 @@ html:not([data-pw-route='card']) .pw-detail-app {
   font-size: 13px;
   color: var(--ae-ink-faint);
   padding: 0.4em 0;
+}
+
+/* powder-ui-keyboard-firstrun: the brand-new-instance welcome state --
+   distinct from the plain "nothing under this filter" .pw-empty text so a
+   genuinely empty board reads as an onboarding moment, not a dead end. */
+.pw-empty-firstrun {
+  color: var(--ae-ink-muted);
+  max-width: 32rem;
+}
+
+.pw-empty-firstrun .ae-h {
+  color: var(--ae-ink);
+  margin-bottom: 0.5em;
+}
+
+.pw-empty-firstrun p {
+  margin-top: 0.6em;
+}
+
+.pw-empty-firstrun code {
+  display: inline-block;
+  max-width: 100%;
+  margin-top: 0.35em;
+  padding: 0.35em 0.5em;
+  overflow-x: auto;
+  border: 1px solid var(--ae-line);
+  background: var(--ae-wash);
+  white-space: nowrap;
 }
 
 .pw-detail-top {
@@ -1197,6 +1272,113 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-card-live-changed {
   outline: 2px solid var(--ae-accent);
   outline-offset: 2px;
+}
+
+/* powder-ui-keyboard-firstrun: the ⌘K/Ctrl-K jump-to-card palette -- a
+   modal listbox filtering the board's own already-loaded card list (see PR
+   design notes). Plain fixed-overlay + panel, no motion beyond the
+   existing hover/focus treatments already covered by :focus-visible. */
+.pw-cmdk {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+}
+
+.pw-cmdk[hidden] {
+  display: none;
+}
+
+.pw-cmdk-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.pw-cmdk-panel {
+  position: relative;
+  width: min(34rem, 90vw);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--ae-surface);
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius);
+  box-shadow: 0 1.2em 3em rgba(0, 0, 0, 0.28);
+}
+
+.pw-cmdk-combobox {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  padding: 0.9em 1.1em;
+  border-bottom: 1px solid var(--ae-line);
+}
+
+.pw-cmdk-combobox .ae-icon {
+  width: 1em;
+  height: 1em;
+  flex: none;
+  color: var(--ae-ink-muted);
+}
+
+.pw-cmdk-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: 14px;
+  color: var(--ae-ink);
+}
+
+.pw-cmdk-input:focus-visible {
+  outline: none;
+}
+
+.pw-cmdk-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0.4em;
+}
+
+.pw-cmdk-item {
+  display: flex;
+  align-items: baseline;
+  gap: 0.7em;
+  padding: 0.55em 0.7em;
+  border-radius: var(--ae-radius);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.pw-cmdk-item.is-active {
+  background: var(--ae-wash);
+  color: var(--ae-ink);
+}
+
+.pw-cmdk-item-id {
+  flex: none;
+  color: var(--ae-ink-faint);
+}
+
+.pw-cmdk-item-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pw-cmdk-empty {
+  padding: 0.7em 1.1em;
 }
 
 .ae-cat-0 { color: var(--ae-cat-0); }

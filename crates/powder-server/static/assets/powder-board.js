@@ -77,6 +77,7 @@ const els = {
   authPanel: document.getElementById("auth-panel"),
   repoSettingsCount: document.getElementById("repo-settings-count"),
   repoSettingsList: document.getElementById("repo-settings-list"),
+  repoEmptyToggle: document.getElementById("repo-empty-toggle"),
   repoCreateForm: document.getElementById("repo-create-form"),
   repoCreateName: document.getElementById("repo-create-name"),
   repoCreateAliases: document.getElementById("repo-create-aliases"),
@@ -114,6 +115,11 @@ const els = {
   readyCount: document.getElementById("rd-count"),
   inProgressCount: document.getElementById("ip-count"),
   doneCount: document.getElementById("dn-count"),
+  cmdkToggle: document.getElementById("cmdk-toggle"),
+  cmdk: document.getElementById("cmdk"),
+  cmdkInput: document.getElementById("cmdk-input"),
+  cmdkList: document.getElementById("cmdk-list"),
+  cmdkEmpty: document.getElementById("cmdk-empty"),
 };
 
 const state = {
@@ -127,6 +133,7 @@ const state = {
   selectedId: null,
   view: "both",
   showAllTiers: false,
+  showEmptyRepos: false,
   loading: true,
   error: "",
   errorKind: "",
@@ -139,7 +146,6 @@ const state = {
 };
 
 let railShare = 24;
-let viewAnimation = 0;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -694,13 +700,35 @@ function deriveRepositoriesFromCards() {
   return [...summaries.values()].sort((left, right) => left.repo.localeCompare(right.repo));
 }
 
+// powder-915: registered repositories carry no `description` field in the
+// store (`RepositorySummary` in powder-store/src/repositories.rs) -- see PR
+// design notes. The honest scope here is card counts, a tier badge, and
+// hiding zero-card repositories by default (an explicit "show empty" toggle
+// reveals them) rather than fabricating description copy the schema never
+// had.
 function renderRepositorySettings() {
   const repositories = state.repositories.length
     ? state.repositories
     : deriveRepositoriesFromCards();
+  const hiddenEmpty = repositories.filter((summary) => summary.card_count === 0).length;
+  const visible = repositories.filter(
+    (summary) => state.showEmptyRepos || summary.card_count > 0,
+  );
   els.repoSettingsCount.textContent = repositories.length;
+  if (els.repoEmptyToggle) {
+    els.repoEmptyToggle.hidden = hiddenEmpty === 0 && !state.showEmptyRepos;
+    els.repoEmptyToggle.setAttribute("aria-pressed", String(state.showEmptyRepos));
+    els.repoEmptyToggle.textContent = state.showEmptyRepos
+      ? "hide empty"
+      : `show empty (${hiddenEmpty})`;
+  }
   els.repoSettingsList.innerHTML =
-    repositories.map(repositoryRowHTML).join("") || empty("No repositories.");
+    visible.map(repositoryRowHTML).join("") ||
+    empty(
+      hiddenEmpty
+        ? `${hiddenEmpty} ${hiddenEmpty === 1 ? "repository has" : "repositories have"} no cards yet -- toggle "show empty" to see them.`
+        : "No repositories.",
+    );
 }
 
 function repositoryRowHTML(summary) {
@@ -711,7 +739,10 @@ function repositoryRowHTML(summary) {
   return `
     <div class="pw-repo-row" data-repo-name="${escapeHtml(summary.repo)}">
       <div class="pw-repo-main">
-        <span class="pw-repo-name">${repoIcon(summary.repo, `ae-cat-${meta.cat}`)}${escapeHtml(summary.repo)}</span>
+        <span class="pw-repo-main-left">
+          <span class="pw-repo-name">${repoIcon(summary.repo, `ae-cat-${meta.cat}`)}${escapeHtml(summary.repo)}</span>
+          <span class="ae-tag pw-repo-tier-badge" data-tier="${escapeHtml(summary.tier)}">${escapeHtml(summary.tier)}</span>
+        </span>
         <span class="ae-num">${summary.card_count}</span>
       </div>
       ${counts}
@@ -1086,6 +1117,46 @@ function bucket() {
   };
 }
 
+// powder-ui-keyboard-firstrun: "Nothing ready under this filter" used to
+// render unconditionally, even on a brand-new instance with zero cards and
+// zero filters -- indistinguishable from a filtered-to-nothing board and
+// dishonest about what's actually going on. This splits the two cases: a
+// genuinely empty instance gets an onboarding nudge (the key-mint command,
+// copied verbatim from the auth panel, plus a pointer at the "file card"
+// button); a filter that matches nothing names the filters actually active
+// so the operator knows what to clear.
+function activeFilterDescriptors() {
+  const parts = [];
+  for (const repo of [...state.filters.repos].sort()) parts.push(`repo:${repo}`);
+  for (const prio of [...state.filters.prios].sort()) parts.push(prio);
+  const search = state.filters.search.trim();
+  if (search) parts.push(`"${search}"`);
+  return parts;
+}
+
+function firstRunEmptyHTML(rich) {
+  if (!rich) {
+    return empty("This board is empty -- file your first card to get started.");
+  }
+  return `
+    <div class="pw-empty pw-empty-firstrun">
+      <p class="ae-h">Welcome -- this board is empty.</p>
+      <p>File your first card with the <strong>file card</strong> button above, or mint a write key and use the CLI:</p>
+      <code>${escapeHtml(KEY_MINT_COMMAND)}</code>
+      <p><button type="button" class="ae-button ae-button-compact" data-firstrun-file-card>file the first card</button></p>
+    </div>
+  `;
+}
+
+function boardEmptyCopy(kindLabel, rich = false) {
+  if (!state.cards.length) return firstRunEmptyHTML(rich);
+  const filters = activeFilterDescriptors();
+  if (filters.length) {
+    return empty(`No matches for ${filters.join(" + ")} -- clear filters.`);
+  }
+  return empty(`Nothing ${kindLabel} yet.`);
+}
+
 function render() {
   renderAwaitingStrip();
   if (state.loading) {
@@ -1099,14 +1170,14 @@ function render() {
 
   const buckets = bucket();
   els.laneReady.innerHTML =
-    (buckets.ready.map(cardHTML).join("") || empty("Nothing ready under this filter.")) +
+    (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true)) +
     (buckets.blocked.length
       ? `<p class="ae-plate-cap pw-blocked-cap">BLOCKED · ${buckets.blocked.length}</p>${buckets.blocked.map(cardHTML).join("")}`
       : "");
   els.laneInProgress.innerHTML =
-    buckets.inProgress.map(cardHTML).join("") || empty("Nothing in flight under this filter.");
+    buckets.inProgress.map(cardHTML).join("") || boardEmptyCopy("in flight");
   els.laneDone.innerHTML =
-    buckets.done.map(doneRowHTML).join("") || empty("Nothing shipped under this filter.");
+    buckets.done.map(doneRowHTML).join("") || boardEmptyCopy("shipped");
   renderRail(buckets.backlog);
   renderCounts(buckets);
   placeIndicator();
@@ -1153,7 +1224,7 @@ function renderRail(cards) {
       </a>`,
     );
   }
-  els.railList.innerHTML = groups.join("") || empty("Nothing queued under this filter.");
+  els.railList.innerHTML = groups.join("") || boardEmptyCopy("queued");
 }
 
 function renderCounts(buckets) {
@@ -1760,7 +1831,19 @@ function setView(view) {
   for (const [key, tab] of Object.entries(tabs)) {
     tab.setAttribute("aria-selected", String(key === view));
   }
-  animateRailShare(targetShare);
+  // powder-903: the rail/board split used to be animated frame-by-frame in
+  // JS (a `requestAnimationFrame` loop writing `--pw-rail-share` every
+  // tick), which forces a synchronous layout recalculation on every frame
+  // since `grid-template-columns` depends on it -- exactly the "layout
+  // jank" this card exists to remove. Setting the target share once and
+  // letting the CSS `transition: grid-template-columns` on `.pw-main` (see
+  // powder-board.css) interpolate it is equivalent visually, is symmetric
+  // in both directions for free (same declarative transition either way),
+  // never blocks the main thread mid-transition (so board controls stay
+  // clickable while it plays -- see the law spec), and honors
+  // prefers-reduced-motion via a plain CSS media query instead of a JS
+  // branch.
+  setRailShare(targetShare);
   placeIndicator();
 }
 
@@ -1772,29 +1855,6 @@ function setLane(lane) {
   for (const button of els.laneSwitch.querySelectorAll("button[data-lane]")) {
     button.setAttribute("aria-selected", String(button.dataset.lane === target));
   }
-}
-
-function animateRailShare(targetShare) {
-  cancelAnimationFrame(viewAnimation);
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    setRailShare(targetShare);
-    return;
-  }
-  const startShare = railShare;
-  const delta = targetShare - startShare;
-  const startedAt = performance.now();
-  const duration = 190;
-  const step = (now) => {
-    const t = Math.min(1, (now - startedAt) / duration);
-    const eased = 1 - Math.pow(1 - t, 3);
-    setRailShare(startShare + delta * eased);
-    if (t < 1) {
-      viewAnimation = requestAnimationFrame(step);
-    } else {
-      setRailShare(targetShare);
-    }
-  };
-  viewAnimation = requestAnimationFrame(step);
 }
 
 function setRailShare(value) {
@@ -1811,6 +1871,129 @@ function placeIndicator() {
 
 function anchorId(cardId) {
   return `card-${cardId}`;
+}
+
+// powder-ui-keyboard-firstrun: card-level keyboard nav -----------------
+//
+// Roving focus across every currently-visible card link (board lanes, the
+// backlog rail, and the done list all share the `[data-card-link]` marker
+// already used for click-driven board-state saving) in DOM order. j/k or
+// the arrow keys move focus; Enter is left to the browser's native
+// activation of the focused `<a>` rather than reimplemented, so it keeps
+// working identically with a mouse, a screen reader, or a keyboard. Escape
+// returns from the card detail route to the board (see the keydown
+// listener below) -- the return half of the same "Enter opens detail,
+// Escape returns to board" loop.
+//
+// `checkVisibility()` (widely supported in evergreen browsers) is used
+// instead of an `offsetParent` check because the view-switch transition
+// (backlog/both/board) hides the rail or the board lanes via `opacity` on
+// an ancestor, which `offsetParent` does not detect but `checkVisibility`
+// does.
+function isCardLinkVisible(el) {
+  if (typeof el.checkVisibility === "function") {
+    return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+  }
+  return el.offsetParent !== null;
+}
+
+function visibleCardLinks() {
+  return [...document.querySelectorAll("[data-card-link]")].filter(isCardLinkVisible);
+}
+
+function moveCardFocus(direction) {
+  const links = visibleCardLinks();
+  if (!links.length) return;
+  const current = links.indexOf(document.activeElement);
+  const next =
+    current === -1
+      ? direction > 0
+        ? 0
+        : links.length - 1
+      : (current + direction + links.length) % links.length;
+  links[next].focus();
+}
+
+// --- command palette (powder-ui-keyboard-firstrun) ----------------------
+//
+// Simplest honest design: a modal listbox filtering the board's own
+// already-loaded `state.cards` (the same data the text-search filter reads),
+// not a second index or a server round-trip. Complements the existing
+// `/`-focuses-search shortcut rather than fighting it -- search narrows the
+// board in place, the palette jumps straight to one card's detail route.
+const CMDK_MATCH_LIMIT = 50;
+let paletteMatches = [];
+let paletteActiveIndex = -1;
+
+function isPaletteOpen() {
+  return Boolean(els.cmdk && !els.cmdk.hidden);
+}
+
+function openCommandPalette() {
+  if (!els.cmdk) return;
+  els.cmdk.hidden = false;
+  els.cmdkInput.value = "";
+  filterPalette("");
+  els.cmdkInput.focus();
+}
+
+function closeCommandPalette() {
+  if (!els.cmdk) return;
+  els.cmdk.hidden = true;
+  paletteMatches = [];
+  paletteActiveIndex = -1;
+}
+
+function toggleCommandPalette() {
+  if (isPaletteOpen()) closeCommandPalette();
+  else openCommandPalette();
+}
+
+function filterPalette(query) {
+  const q = query.trim().toLowerCase();
+  const pool = q
+    ? state.cards.filter(
+        (card) => card.id.toLowerCase().includes(q) || card.title.toLowerCase().includes(q),
+      )
+    : state.cards;
+  paletteMatches = pool.slice(0, CMDK_MATCH_LIMIT);
+  paletteActiveIndex = paletteMatches.length ? 0 : -1;
+  renderPaletteList();
+}
+
+function renderPaletteList() {
+  if (!els.cmdkList) return;
+  els.cmdkEmpty.hidden = paletteMatches.length > 0;
+  els.cmdkList.innerHTML = paletteMatches
+    .map(
+      (card, index) => `
+        <li id="cmdk-opt-${index}" role="option" aria-selected="${index === paletteActiveIndex}" class="pw-cmdk-item${index === paletteActiveIndex ? " is-active" : ""}" data-index="${index}">
+          <span class="pw-cmdk-item-id ae-num">${escapeHtml(card.id)}</span>
+          <span class="pw-cmdk-item-title">${escapeHtml(card.title)}</span>
+        </li>
+      `,
+    )
+    .join("");
+  els.cmdkInput.setAttribute(
+    "aria-activedescendant",
+    paletteActiveIndex >= 0 ? `cmdk-opt-${paletteActiveIndex}` : "",
+  );
+}
+
+function movePaletteActive(direction) {
+  if (!paletteMatches.length) return;
+  paletteActiveIndex = (paletteActiveIndex + direction + paletteMatches.length) % paletteMatches.length;
+  renderPaletteList();
+  els.cmdkList
+    .querySelector(`#cmdk-opt-${paletteActiveIndex}`)
+    ?.scrollIntoView({ block: "nearest" });
+}
+
+function activatePaletteSelection(index = paletteActiveIndex) {
+  const card = paletteMatches[index];
+  if (!card) return;
+  saveBoardState();
+  window.location.href = cardHref(card.id);
 }
 
 els.filterButton.addEventListener("click", () => toggleFilters());
@@ -1832,6 +2015,10 @@ els.tierToggle.addEventListener("click", () => {
   state.showAllTiers = !state.showAllTiers;
   buildFilters();
   render();
+});
+els.repoEmptyToggle?.addEventListener("click", () => {
+  state.showEmptyRepos = !state.showEmptyRepos;
+  renderRepositorySettings();
 });
 els.textFilter.addEventListener("input", (event) => {
   state.filters.search = event.target.value;
@@ -1925,11 +2112,58 @@ els.awaitingBadge?.addEventListener("click", () => {
   });
   els.awaitingList?.querySelector("input, textarea")?.focus();
 });
+els.cmdkToggle?.addEventListener("click", () => toggleCommandPalette());
+els.cmdk?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-cmdk-dismiss]")) closeCommandPalette();
+});
+els.cmdkInput?.addEventListener("input", (event) => filterPalette(event.target.value));
+els.cmdkInput?.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    event.stopPropagation();
+    movePaletteActive(1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    event.stopPropagation();
+    movePaletteActive(-1);
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    event.stopPropagation();
+    activatePaletteSelection();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeCommandPalette();
+  }
+});
+els.cmdkList?.addEventListener("click", (event) => {
+  const item = event.target.closest("[data-index]");
+  if (!item) return;
+  activatePaletteSelection(Number(item.dataset.index));
+});
 document.addEventListener("click", (event) => {
   const link = event.target.closest("[data-card-link]");
   if (link) saveBoardState();
+  if (event.target.closest("[data-firstrun-file-card]")) showQuickAdd();
 });
 document.addEventListener("keydown", (event) => {
+  // ⌘K/Ctrl-K opens the command palette from the board (not the card
+  // detail route -- state.cards, the palette's search pool, is only
+  // populated there). Checked first because it needs the modifier keys
+  // the generic bail-out below rejects.
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k" && !cardRouteId()) {
+    event.preventDefault();
+    toggleCommandPalette();
+    return;
+  }
+  if (isPaletteOpen()) return; // the palette's own input owns its keys
+  // Escape returns from the card detail route to the board regardless of
+  // focus target -- the other half of "Enter opens detail" below.
+  if (event.key === "Escape" && cardRouteId()) {
+    if (els.detailBoardLink) els.detailBoardLink.click();
+    else window.location.href = boardRoute();
+    return;
+  }
   if (cardRouteId()) return;
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const tag = (event.target.tagName || "").toLowerCase();
@@ -1942,6 +2176,12 @@ document.addEventListener("keydown", (event) => {
     toggleFilters(true);
     event.preventDefault();
     els.textFilter.focus();
+  } else if (event.key === "j" || event.key === "ArrowDown") {
+    event.preventDefault();
+    moveCardFocus(1);
+  } else if (event.key === "k" || event.key === "ArrowUp") {
+    event.preventDefault();
+    moveCardFocus(-1);
   }
 });
 window.addEventListener("resize", placeIndicator);
