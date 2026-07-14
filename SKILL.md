@@ -47,10 +47,13 @@ Default agent persona (20 tools):
   blocks (topological over `blocks`/`blocked_by` among the returned set),
   ties broken by priority, age, and identifier; optionally filtered by
   `estimate` (`S`/`M`/`L`/`XL`). Eligibility itself stays direct-blocker-only
-  (unchanged); a `blocks`/`blocked_by` cycle among the returned cards falls
-  back to the stable tie-break order and is named in an additive
-  `cycle_card_ids` field. `get_card`'s `transitive_blocked_by`/
-  `blocked_by_cycle` fields explain a *blocked* card's chain past one hop.
+  (unchanged). Only the true members of a `blocks`/`blocked_by` cycle lose
+  topological ordering: they are emitted as a group in the tie-break order
+  at the cycle's own position and named in an additive `cycle_card_ids`
+  field (computed over the full eligible set, before `limit` truncation);
+  cards downstream of a cycle stay dependency-ordered after it. `get_card`'s
+  `transitive_blocked_by`/`blocked_by_cycle` fields explain a *blocked*
+  card's chain past one hop.
 - `list_cards`: enumerate cards by optional status/autonomy/repo/`estimate`
   filter, including `blocked`, `review`, and `done` cards `list_ready` never
   surfaces. With no `status` filter, `done`/`shipped`/`abandoned` cards are

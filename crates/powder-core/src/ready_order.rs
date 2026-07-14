@@ -32,10 +32,11 @@ use crate::model::CardId;
 
 /// The tie-break ordering `list_ready` has always used: priority (P0
 /// first), then age (`created_at` ascending, oldest first), then id.
-/// [`order_ready_cards`] uses this both to seed Kahn's algorithm (so an
+/// [`order_ready_cards`] uses this both to seed its topological pass (so an
 /// eligible set with no `blocks`/`blocked_by` edges among its members
-/// orders exactly as it always has) and as the fallback order for any card
-/// that cannot be given a topological position (a cycle).
+/// orders exactly as it always has) and as the internal order of a cycle's
+/// own members, which are the only cards a cycle leaves without a defined
+/// relative order.
 pub fn ready_sort_cmp(left: &Card, right: &Card) -> Ordering {
     left.priority
         .cmp(&right.priority)
@@ -44,9 +45,12 @@ pub fn ready_sort_cmp(left: &Card, right: &Card) -> Ordering {
 }
 
 /// Output of [`order_ready_cards`]: `cards` in dependency-safe order, and
-/// `cycle_card_ids` naming which of those cards could not be given a
-/// consistent topological position because they sit on (or downstream of) a
-/// `blocks`/`blocked_by` cycle confined to this eligible set. Empty
+/// `cycle_card_ids` naming exactly the cards that sit **on** a
+/// `blocks`/`blocked_by` cycle confined to this eligible set (the members
+/// of a strongly connected component of size >= 2) -- the only cards whose
+/// relative order cannot be topological. Cards merely *downstream* of a
+/// cycle are not members: they keep a genuine topological position (after
+/// the cycle that blocks them) and are never listed here. Empty
 /// `cycle_card_ids` means the eligible subgraph was acyclic.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyOrder {
@@ -72,99 +76,122 @@ pub struct ReadyOrder {
 ///
 /// # Determinism
 ///
-/// Implemented as Kahn's algorithm seeded with `cards` pre-sorted by
-/// [`ready_sort_cmp`]: at every step, of the cards with no remaining
-/// unemitted predecessor in this set, the one earliest in that stable order
-/// is emitted next. An eligible set with no edges among its members
-/// therefore orders exactly as `list_ready` always has -- this function is
-/// a strict refinement of the historical sort, not a replacement for it.
+/// Implemented as Kahn's algorithm over the strongly-connected-component
+/// condensation of the edge graph (which is always a DAG), with `cards`
+/// pre-sorted by [`ready_sort_cmp`]: at every step, of the components with
+/// no remaining unemitted predecessor, the one whose best-ranked member is
+/// earliest in that stable order is emitted next. An eligible set with no
+/// edges among its members therefore orders exactly as `list_ready` always
+/// has -- every component is a singleton and this degenerates to the
+/// historical sort -- so this function is a strict refinement of that
+/// sort, not a replacement for it.
 ///
 /// # Cycles
 ///
 /// A `blocks`/`blocked_by` cycle among eligible cards has no valid
-/// topological position. Kahn's algorithm leaves every card on (or
-/// downstream of) such a cycle with permanently nonzero in-degree; rather
-/// than hang or panic, this function appends those cards afterward, in
-/// `ready_sort_cmp` order, and reports their ids via `cycle_card_ids` so a
-/// cycle is always an explicit, checkable fact about the response rather
-/// than a silently-wrong order.
+/// topological order **among its own members** -- and only among them.
+/// Rather than hang or panic, the cycle's members (one strongly connected
+/// component) are emitted as a contiguous group in [`ready_sort_cmp`]
+/// order at the component's own topological position, and their ids are
+/// reported via `cycle_card_ids` so a cycle is always an explicit,
+/// checkable fact about the response rather than a silently-wrong order.
+/// Every card *not* on a cycle -- including cards downstream of one, whose
+/// blockers transit the cycle -- keeps a genuine topological position:
+/// after everything that transitively blocks it (the earlier stable-dump
+/// fallback lost exactly this guarantee for downstream-of-cycle cards, and
+/// wrongly named them in `cycle_card_ids` too).
 pub fn order_ready_cards(mut cards: Vec<Card>) -> ReadyOrder {
     cards.sort_by(ready_sort_cmp);
+    let count = cards.len();
 
-    let eligible: HashSet<CardId> = cards.iter().map(|card| card.id.clone()).collect();
-    let mut indegree: HashMap<CardId, usize> =
-        cards.iter().map(|card| (card.id.clone(), 0)).collect();
-    let mut successors: HashMap<CardId, Vec<CardId>> = HashMap::new();
-    let mut edges: HashSet<(CardId, CardId)> = HashSet::new();
-
-    for card in &cards {
-        for blocker in &card.blocked_by {
-            if eligible.contains(blocker) {
-                add_edge(
-                    blocker.clone(),
-                    card.id.clone(),
-                    &mut indegree,
-                    &mut successors,
-                    &mut edges,
-                );
+    // Dense index-based successor lists, deduplicated, self-edges dropped.
+    // Indices double as stable ranks: `cards` is already in stable order.
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); count];
+    {
+        let index_of: HashMap<&str, usize> = cards
+            .iter()
+            .enumerate()
+            .map(|(index, card)| (card.id.as_str(), index))
+            .collect();
+        let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
+        for (index, card) in cards.iter().enumerate() {
+            for blocker in &card.blocked_by {
+                if let Some(&from) = index_of.get(blocker.as_str()) {
+                    if from != index && seen_edges.insert((from, index)) {
+                        successors[from].push(index);
+                    }
+                }
             }
-        }
-        for blocked in &card.blocks {
-            if eligible.contains(blocked) {
-                add_edge(
-                    card.id.clone(),
-                    blocked.clone(),
-                    &mut indegree,
-                    &mut successors,
-                    &mut edges,
-                );
-            }
-        }
-    }
-
-    let index_of: HashMap<CardId, usize> = cards
-        .iter()
-        .enumerate()
-        .map(|(index, card)| (card.id.clone(), index))
-        .collect();
-    let mut queue: BTreeSet<usize> = cards
-        .iter()
-        .enumerate()
-        .filter(|(_, card)| indegree[&card.id] == 0)
-        .map(|(index, _)| index)
-        .collect();
-
-    let mut emitted_order: Vec<usize> = Vec::with_capacity(cards.len());
-    let mut emitted: HashSet<usize> = HashSet::with_capacity(cards.len());
-    while let Some(&index) = queue.iter().next() {
-        queue.remove(&index);
-        emitted_order.push(index);
-        emitted.insert(index);
-        if let Some(next_ids) = successors.get(&cards[index].id) {
-            for next_id in next_ids {
-                let next_index = index_of[next_id];
-                let remaining = indegree.get_mut(next_id).expect("known card id");
-                *remaining -= 1;
-                if *remaining == 0 {
-                    queue.insert(next_index);
+            for blocked in &card.blocks {
+                if let Some(&to) = index_of.get(blocked.as_str()) {
+                    if to != index && seen_edges.insert((index, to)) {
+                        successors[index].push(to);
+                    }
                 }
             }
         }
     }
 
-    let cycle_indices: Vec<usize> = (0..cards.len()).filter(|i| !emitted.contains(i)).collect();
-    let cycle_card_ids = cycle_indices
-        .iter()
-        .map(|&index| cards[index].id.clone())
+    let component_of = strongly_connected_components(count, &successors);
+    let component_count = component_of.iter().copied().max().map_or(0, |max| max + 1);
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); component_count];
+    for (index, &component) in component_of.iter().enumerate() {
+        // Ascending index push order keeps each component's member list in
+        // stable rank order for free.
+        members[component].push(index);
+    }
+
+    // Condensation: edges between distinct components, deduplicated. This
+    // graph is a DAG by construction, so the Kahn's pass below always
+    // emits every component -- there is no leftover to dump.
+    let mut component_successors: Vec<Vec<usize>> = vec![Vec::new(); component_count];
+    let mut component_indegree: Vec<usize> = vec![0; component_count];
+    let mut seen_component_edges: HashSet<(usize, usize)> = HashSet::new();
+    for (from, next_indices) in successors.iter().enumerate() {
+        for &to in next_indices {
+            let (from_component, to_component) = (component_of[from], component_of[to]);
+            if from_component != to_component
+                && seen_component_edges.insert((from_component, to_component))
+            {
+                component_successors[from_component].push(to_component);
+                component_indegree[to_component] += 1;
+            }
+        }
+    }
+
+    // Kahn's over components, popping by each component's best member rank
+    // (its lowest stable index -- `members[c][0]`), which is unique per
+    // component, so the (rank, component) pairs never collide.
+    let mut ready: BTreeSet<(usize, usize)> = (0..component_count)
+        .filter(|&component| component_indegree[component] == 0)
+        .map(|component| (members[component][0], component))
+        .collect();
+    let mut ordered_indices: Vec<usize> = Vec::with_capacity(count);
+    while let Some(&(rank, component)) = ready.iter().next() {
+        ready.remove(&(rank, component));
+        ordered_indices.extend(members[component].iter().copied());
+        for &next in &component_successors[component] {
+            component_indegree[next] -= 1;
+            if component_indegree[next] == 0 {
+                ready.insert((members[next][0], next));
+            }
+        }
+    }
+    debug_assert_eq!(
+        ordered_indices.len(),
+        count,
+        "condensation is a DAG; Kahn's must emit every component"
+    );
+
+    let cycle_card_ids: Vec<CardId> = (0..count)
+        .filter(|&index| members[component_of[index]].len() > 1)
+        .map(|index| cards[index].id.clone())
         .collect();
 
-    let mut final_order = emitted_order;
-    final_order.extend(cycle_indices);
-
     let mut slots: Vec<Option<Card>> = cards.into_iter().map(Some).collect();
-    let ordered_cards = final_order
+    let ordered_cards = ordered_indices
         .into_iter()
-        .map(|index| slots[index].take().expect("each index visited once"))
+        .map(|index| slots[index].take().expect("each index emitted once"))
         .collect();
 
     ReadyOrder {
@@ -173,23 +200,65 @@ pub fn order_ready_cards(mut cards: Vec<Card>) -> ReadyOrder {
     }
 }
 
-fn add_edge(
-    from: CardId,
-    to: CardId,
-    indegree: &mut HashMap<CardId, usize>,
-    successors: &mut HashMap<CardId, Vec<CardId>>,
-    edges: &mut HashSet<(CardId, CardId)>,
-) {
-    if from == to {
-        return;
+/// Iterative Tarjan: assigns every node `0..count` a strongly-connected-
+/// component id. A cycle is exactly a component of size >= 2 (self-edges
+/// were already dropped when `successors` was built, so a singleton is
+/// always cycle-free). Iterative rather than recursive so a deep blocker
+/// chain can never overflow the stack.
+fn strongly_connected_components(count: usize, successors: &[Vec<usize>]) -> Vec<usize> {
+    const UNVISITED: usize = usize::MAX;
+    let mut discovery = vec![UNVISITED; count];
+    let mut lowlink = vec![0usize; count];
+    let mut on_stack = vec![false; count];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut component_of = vec![UNVISITED; count];
+    let mut next_discovery = 0usize;
+    let mut component_count = 0usize;
+    let mut frames: Vec<(usize, usize)> = Vec::new();
+
+    for root in 0..count {
+        if discovery[root] != UNVISITED {
+            continue;
+        }
+        frames.push((root, 0));
+        while let Some(frame) = frames.last_mut() {
+            let (node, child) = *frame;
+            if child == 0 {
+                discovery[node] = next_discovery;
+                lowlink[node] = next_discovery;
+                next_discovery += 1;
+                stack.push(node);
+                on_stack[node] = true;
+            }
+            if child < successors[node].len() {
+                frame.1 = child + 1;
+                let next = successors[node][child];
+                if discovery[next] == UNVISITED {
+                    frames.push((next, 0));
+                } else if on_stack[next] {
+                    lowlink[node] = lowlink[node].min(discovery[next]);
+                }
+            } else {
+                frames.pop();
+                if let Some(&(parent, _)) = frames.last() {
+                    lowlink[parent] = lowlink[parent].min(lowlink[node]);
+                }
+                if lowlink[node] == discovery[node] {
+                    loop {
+                        let member = stack.pop().expect("tarjan stack holds every open node");
+                        on_stack[member] = false;
+                        component_of[member] = component_count;
+                        if member == node {
+                            break;
+                        }
+                    }
+                    component_count += 1;
+                }
+            }
+        }
     }
-    if !edges.insert((from.clone(), to.clone())) {
-        return;
-    }
-    if let Some(count) = indegree.get_mut(&to) {
-        *count += 1;
-    }
-    successors.entry(from).or_default().push(to);
+
+    component_of
 }
 
 /// Result of [`transitive_blocked_by`]: the non-terminal blockers found
@@ -343,6 +412,49 @@ mod tests {
             .collect();
         cycle_ids.sort();
         assert_eq!(cycle_ids, vec!["cycle-x", "cycle-y"]);
+    }
+
+    /// Regression for the rev-130 probe: cards *downstream* of a cycle but
+    /// not on it must keep their topological order and must not be named
+    /// as cycle members. Graph: a <-> b (the cycle); b blocks d; d blocks
+    /// e (a pure DAG edge that never touches the cycle); unrelated clean
+    /// c. `e` deliberately outranks `d` on the stable sort (same priority,
+    /// earlier created_at), so the old stable-order dump of everything
+    /// Kahn's stalled on emitted e before d -- violating d -> e -- and
+    /// wrongly reported d and e in `cycle_card_ids`.
+    #[test]
+    fn cards_downstream_of_a_cycle_keep_topological_order_and_are_not_cycle_members() {
+        let mut a = card("cyc-a", Priority::P1, 10);
+        let mut b = card("cyc-b", Priority::P1, 11);
+        a.blocks = vec![CardId::new("cyc-b").unwrap()];
+        b.blocks = vec![
+            CardId::new("cyc-a").unwrap(),
+            CardId::new("down-d").unwrap(),
+        ];
+        let mut d = card("down-d", Priority::P1, 30);
+        d.blocks = vec![CardId::new("down-e").unwrap()];
+        let e = card("down-e", Priority::P1, 20); // stable rank beats d's
+        let c = card("clean-c", Priority::P0, 1);
+
+        let order = order_ready_cards(vec![a, b, c, d, e]);
+        let ids: Vec<_> = order.cards.iter().map(|card| card.id.as_str()).collect();
+        let position = |id: &str| ids.iter().position(|x| *x == id).unwrap();
+        assert!(
+            position("down-d") < position("down-e"),
+            "d transitively blocks e and both are downstream of the cycle, \
+             so d must precede e; got {ids:?}"
+        );
+        assert!(
+            position("cyc-a") < position("down-d") && position("cyc-b") < position("down-d"),
+            "the cycle blocks d, so both members must precede it; got {ids:?}"
+        );
+        assert_eq!(ids[0], "clean-c", "unrelated P0 card keeps first place");
+        let cycle_ids: Vec<_> = order.cycle_card_ids.iter().map(|id| id.as_str()).collect();
+        assert_eq!(
+            cycle_ids,
+            vec!["cyc-a", "cyc-b"],
+            "only true cycle members may be reported, never downstream cards"
+        );
     }
 
     #[test]
@@ -533,9 +645,15 @@ mod tests {
                 "seed {seed}: output must be a permutation of the input"
             );
 
-            // Topological property: for every forward edge collected while
-            // building the fixture, if neither endpoint is a cycle member,
-            // the blocker must appear strictly before the card it blocks.
+            // Topological property: every forward edge collected while
+            // building the fixture must be honored -- the blocker strictly
+            // before the card it blocks -- unless BOTH endpoints are true
+            // cycle members (an edge inside a strongly connected component
+            // genuinely has no orderable direction). Exempting an edge
+            // merely *touching* a cycle member would hide exactly the
+            // rev-130 downstream-of-a-cycle bug this loop exists to catch:
+            // edges into and out of a cycle, and among its downstream, are
+            // all still orderable and must be asserted.
             let position: HashMap<&str, usize> = order
                 .cards
                 .iter()
@@ -545,7 +663,7 @@ mod tests {
             let cycle_members: StdHashSet<&str> =
                 order.cycle_card_ids.iter().map(|id| id.as_str()).collect();
             for (from, to) in &forward_edges {
-                if cycle_members.contains(from.as_str()) || cycle_members.contains(to.as_str()) {
+                if cycle_members.contains(from.as_str()) && cycle_members.contains(to.as_str()) {
                     continue;
                 }
                 assert!(

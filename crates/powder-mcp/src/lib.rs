@@ -41,7 +41,7 @@ pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
-        description: "Scan claimable card summaries, dependency-ordered so no card appears after another card in the response it transitively blocks (ties broken by priority, age, identifier); a blocks/blocked_by cycle among the returned cards falls back to that tie-break order and is named in cycle_card_ids. Use get_card for full card detail before implementation.",
+        description: "Scan claimable card summaries, dependency-ordered so no card appears after another card in the response it transitively blocks (ties broken by priority, age, identifier). Only true members of a blocks/blocked_by cycle lose topological ordering -- emitted as a group in tie-break order and named in cycle_card_ids (computed before limit truncation); cards downstream of a cycle stay dependency-ordered after it. Use get_card for full card detail before implementation.",
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"estimate":{"type":"string","enum":["S","M","L","XL"]}}}"#,
     },
     ToolDef {

@@ -169,9 +169,13 @@ pub struct CardListPage {
     pub excluded_terminal_count: usize,
     /// powder-epic-ready-plan: ids from `cards`' *full eligible set* (before
     /// `limit` truncation, mirroring how `total_count` already describes
-    /// the untruncated set) that sit on a `blocks`/`blocked_by` cycle among
-    /// that eligible set and therefore fell back to the stable
-    /// priority/age/id order instead of a topological one. Always empty for
+    /// the untruncated set) that sit **on** a `blocks`/`blocked_by` cycle
+    /// among that eligible set -- the members of a strongly connected
+    /// component, the only cards whose relative order cannot be
+    /// topological (they order among themselves by the stable
+    /// priority/age/id sort instead). Cards merely *downstream* of a cycle
+    /// are never listed here: they keep a genuine topological position
+    /// after the cycle that blocks them. Always empty for
     /// [`Store::list_cards_page`] (it never computes a topological order);
     /// populated only by [`Store::list_ready_page`]. See
     /// [`powder_core::order_ready_cards`] for why a cycle is reported here
@@ -852,10 +856,12 @@ impl Store {
     /// [`powder_core::order_ready_cards`]'s doc comment for the full
     /// eligibility-vs-ordering-vs-explanation design); an eligible set with
     /// no such edges among its members orders exactly as it always has --
-    /// priority, then age, then id. `cycle_card_ids` names any eligible
-    /// cards a `blocks`/`blocked_by` cycle left without a topological
-    /// position; those cards still appear in `cards` (in the stable
-    /// fallback order), nothing is dropped.
+    /// priority, then age, then id. `cycle_card_ids` names exactly the
+    /// eligible cards **on** a `blocks`/`blocked_by` cycle; those cards
+    /// still appear in `cards` (grouped, in the stable order, at the
+    /// cycle's own topological position) and every other card -- including
+    /// cards downstream of a cycle -- keeps a genuine topological position,
+    /// so nothing is dropped and no orderable edge is ignored.
     pub fn list_ready_page(&self, query: ReadyQuery) -> Result<CardListPage> {
         let all_cards = load_all_cards(&self.connection)?;
         // reuses the same full scan already loaded above, rather than a
