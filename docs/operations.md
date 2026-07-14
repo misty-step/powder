@@ -380,34 +380,7 @@ acknowledgment that the secret will be discarded). Minting with neither flag
 used to silently print `redacted` and throw the only copy away; refusing is
 the honest behavior; a default that prints secrets unasked is worse.
 
-**What's recoverable at rest, and what isn't:**
-
-- **API keys are not recoverable.** `api_keys.key_hash` stores a one-way
-  sha256 hash of the raw key (bcrypt for keys minted before the sha256
-  migration -- see `crates/powder-store/src/identity.rs`); the raw value is
-  never written to the database. A lost raw key means `powder key-revoke`
-  the old id and mint a replacement -- there is no database query that gets
-  it back.
-- **Webhook signing secrets are recoverable.** Unlike API keys,
-  `event_subscriptions.signing_secret` is stored in **plaintext**
-  (`crates/powder-store/src/events.rs`) because delivery has to compute an
-  HMAC signature against it on every webhook POST. The table also carries a
-  `signing_secret_hash` column that nothing in the codebase reads back --
-  vestigial from an earlier design. Dropping it needs a schema migration;
-  that migration is deferred to a follow-up rather than folded into this
-  change, to avoid colliding with another lane's `SCHEMA_VERSION` bump (see
-  the powder-918 PR notes).
-- **The bootstrap admin key** follows the API-key rule above (hashed, not
-  recoverable) but has its own disclosure knob, separate from `key-create`:
-  `POWDER_DISCLOSE_BOOTSTRAP_KEY` (default `true`, unset) controls whether
-  `powder-server`'s first-run seed prints the raw bootstrap key to stderr.
-  Production sets this to `false` (see
-  [`docs/production-deploy.md`](production-deploy.md)) so the very first
-  admin key never lands in `journald`. The code default stays `true` --
-  self-hosters running `cargo run -p powder-server` with zero config still
-  need to see their first key -- only the production posture changes; see
-  production-deploy.md for how an operator gets a usable admin key on a box
-  configured with `POWDER_DISCLOSE_BOOTSTRAP_KEY=false`.
+See [docs/self-hosting.md](self-hosting.md#secrets-at-rest) for what is and isn't recoverable at rest.
 
 ### A scoped key for the board UI on a phone (powder-925)
 
