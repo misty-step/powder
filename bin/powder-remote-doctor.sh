@@ -92,4 +92,36 @@ if ! grep -Fq "\"id\": \"$CARD_ID\"" "$result" &&
   exit 26
 fi
 
+# powder-workstation-cli-convergence: a healthy, correctly-configured
+# server told nobody that the *workstation's* `powder` binary was several
+# merges behind -- 0.1.0 git 1d1ded8 vs. a checkout at 414ac7f, silently
+# missing the repeated-`--acceptance` fix, and a live card lost four
+# criteria before anyone noticed. This is a warning, not a new FAIL class:
+# the doctor's job stays reachability/credential classification, and a
+# version mismatch is neither "unreachable" nor "misconfigured" -- it is
+# purely informational, so it must never change this script's exit code.
+# `powder version` probes the remote /readyz itself when
+# POWDER_API_BASE_URL is set, and binaries predating the RemoteClient
+# read-timeout fix would hang that probe forever against a server that
+# accepts connections but never responds -- the very state this doctor
+# exists to classify. So the call gets the same bounded-time treatment as
+# every curl in this script (--connect-timeout 3 --max-time 8). `timeout`
+# is coreutils and absent from stock macOS (brew installs it as gtimeout):
+# with neither present, fall back to the unwrapped call rather than
+# failing -- a current binary bounds its own I/O anyway.
+version_timeout="${POWDER_DOCTOR_VERSION_TIMEOUT_SECS:-10}"
+timeout_bin="$(command -v timeout || command -v gtimeout || true)"
+if [[ -n "$timeout_bin" ]]; then
+  version_output="$("$timeout_bin" "$version_timeout" "$POWDER_BIN" version 2>/dev/null || true)"
+else
+  version_output="$("$POWDER_BIN" version 2>/dev/null || true)"
+fi
+local_sha="$(printf '%s' "$version_output" | sed -n 's/.*(git \([0-9a-f]\{6,\}\).*/\1/p')"
+server_readyz="$("$CURL_BIN" --connect-timeout 3 --max-time 8 -fsS "$api_base/readyz" 2>/dev/null || true)"
+server_sha="$(printf '%s' "$server_readyz" | sed -n 's/.*"git_sha":"\([^"]*\)".*/\1/p')"
+if [[ -n "$local_sha" && -n "$server_sha" && "$server_sha" != "unknown" && "$local_sha" != "$server_sha" ]]; then
+  printf 'WARN VERSION_DRIFT installed=%s server=%s\n' "$local_sha" "$server_sha" >&2
+  printf 'guidance: run scripts/install-workstation.sh to converge the workstation binary with the deployed server\n' >&2
+fi
+
 printf 'PASS powder_remote endpoint=%s sanctum=up health=up ready=up auth_probe=up card=%s\n' "$api_base" "$CARD_ID"

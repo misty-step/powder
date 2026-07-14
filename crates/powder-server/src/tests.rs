@@ -4013,6 +4013,11 @@ async fn readyz_reports_every_gate_when_healthy() {
         DEFAULT_READYZ_DEAD_LETTER_THRESHOLD
     );
     assert_eq!(body["poison_count"], 0);
+    // powder-workstation-cli-convergence: `powder version` compares these
+    // against the installed CLI's own build sha to surface a DRIFT warning;
+    // prove they are the real compile-time constants, not placeholders.
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["git_sha"], env!("POWDER_SERVER_GIT_SHA"));
 }
 
 /// The dead-letter backlog gate trips `/readyz` to 503 once the count meets

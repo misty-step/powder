@@ -11,6 +11,50 @@ For the five-minute path to a running instance, see the
 production instance actually runs, see
 [`docs/production-deploy.md`](production-deploy.md).
 
+## Workstation binary installation
+
+The canonical local install location for `powder`, `powder-mcp`, and (if you
+run it locally) `powder-server` is `~/.cargo/bin` -- the same directory
+`cargo install --path` has always used, and the directory a normal `cargo
+install` puts first on `PATH`. There is exactly one supported way to bring
+those binaries in sync with a checkout:
+
+```sh
+scripts/install-workstation.sh                # builds powder + powder-mcp from HEAD
+scripts/install-workstation.sh --with-server   # also installs powder-server
+scripts/install-workstation.sh --verify        # installs, then proves the installed
+                                                # binary keeps every repeated
+                                                # --acceptance criterion (see below)
+```
+
+It refuses to run against a dirty working tree (`--allow-dirty` overrides
+that), prints the before/after `version` of each binary it touches, and on a
+checkout whose `HEAD` is exactly a published release tag, installs the
+matching checksummed release tarball (see `.github/workflows/release.yml`)
+instead of building from source -- falling back to a source build with a
+clear notice if no published asset matches the local platform. It is
+idempotent: running it again with nothing to update is a no-op past the
+before/after report.
+
+This exists because a workstation `powder` binary can silently drift behind
+the checkout it was built from: `cargo install`'s own version check treats an
+unchanged crate version (this workspace's crates stay at `0.1.0` between
+releases) as "nothing to do," so a plain re-run of the historical `cargo
+install --path crates/powder-cli` command can look like it worked while
+actually reinstalling nothing. A stale binary built before a merged fix has
+no way to announce that it predates the fix -- which is exactly how a live
+card once lost four `--acceptance` criteria to a bug (`powder-cli-repeated-
+acceptance`) that had already been fixed in the checkout for days. `--verify`
+reproduces that exact regression class through the freshly installed binary
+itself (not just `cargo test` inside the checkout) as a final proof step.
+
+`powder version` also reports this drift directly, not just at install time:
+with `POWDER_API_BASE_URL` set, it fetches the deployed server's own
+`version`/`git_sha` (from `/readyz`) and prints a `DRIFT` line when they
+disagree with the installed binary's own build commit, so a stale local
+binary is visible from the same command a lane already runs before claiming
+work -- see the `powder version` note just below.
+
 ## CLI remote-mode transport
 
 The CLI can target either SQLite directly or a deployed `powder-server`. The
@@ -23,10 +67,15 @@ against it.
 In remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
 `POWDER_API_KEY`; `--db` always wins when supplied. Run `powder version`
 before a lane starts: it reports the exact git commit the installed binary
-was built from (`cargo install --path crates/powder-cli` after every pull
-keeps it current), so a stale `~/.cargo/bin/powder` that predates a
-command's remote-mode support is obvious up front instead of surfacing mid-lane
-as a bare `missing --db` on a command the checkout has long since covered.
+was built from (`scripts/install-workstation.sh` after every pull keeps it
+current -- see "Workstation binary installation" above), so a stale
+`~/.cargo/bin/powder` that predates a command's remote-mode support is
+obvious up front instead of surfacing mid-lane as a bare `missing --db` on a
+command the checkout has long since covered. With `POWDER_API_BASE_URL` set,
+`powder version` also compares the installed binary's git commit against the
+deployed server's own (from `/readyz`) and prints a `DRIFT` line on
+mismatch -- unreachable or too-old a server just degrades to a plain note,
+never an error.
 
 | Command | `--db` transport | Remote env transport | Output shape |
 | --- | --- | --- | --- |
