@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicU32, Ordering},
         Mutex,
     },
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -30,6 +31,24 @@ const KEY_PREFIX_LEN: usize = 12;
 /// route resolves (no transport error) but 404s because the deployed
 /// instance moved to a new hostname.
 const STALE_BASE_URL_404_STREAK: u32 = 3;
+
+/// Bounded I/O for every remote call. ureq's default agent carries NO
+/// read/write timeout, so a server that accepted the TCP connection and
+/// then went silent (wedged process, half-dead tailnet peer) hung the
+/// caller forever -- including `powder version`'s drift probe and the
+/// doctor's VERSION_DRIFT check that shells out to it, exactly when the
+/// doctor exists to classify a wedged server. 8 seconds matches the
+/// doctor's own `curl --max-time 8` convention
+/// (`bin/powder-remote-doctor.sh`). Safe for every RemoteClient caller:
+/// CLI remote mode and MCP remote mode are both plain request/response
+/// JSON (even `tail_events` is a paged GET, not a long poll), so no
+/// endpoint legitimately needs an unbounded read.
+const IO_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Tightened from ureq's 30-second default: this client only ever talks
+/// to a self-hosted tailnet/LAN deployment, where five seconds of failed
+/// TCP establishment means "down", not "slow".
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct RemoteClient {
@@ -71,7 +90,11 @@ impl RemoteClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: Mutex::new(resolved),
             key_cmd,
-            agent: ureq::AgentBuilder::new().build(),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(CONNECT_TIMEOUT)
+                .timeout_read(IO_TIMEOUT)
+                .timeout_write(IO_TIMEOUT)
+                .build(),
             consecutive_404s: AtomicU32::new(0),
         }
     }
@@ -330,6 +353,44 @@ mod tests {
 
         let no_key = diagnosable_401("http 401: invalid bearer token", None);
         assert!(no_key.contains("key prefix used: none"));
+    }
+
+    /// The regression this pins: RemoteClient once built its ureq agent
+    /// with no read timeout, so a server that accepted the connection and
+    /// then stalled hung the caller forever. The existing
+    /// unreachable-server tests only cover *refused* connections; this one
+    /// holds an accepted socket open without ever writing a byte of
+    /// response, and requires the client to surface an error within its
+    /// read timeout (~8s). The channel bound turns a reintroduced hang
+    /// into a clean assertion failure instead of a hung test binary. No
+    /// assertion on the error text: the timeout surfaces as an OS-level
+    /// read error whose message differs across platforms.
+    #[test]
+    fn get_against_a_server_that_accepts_and_stalls_errors_instead_of_hanging() {
+        use std::sync::mpsc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stall listener");
+        let addr = listener.local_addr().expect("stall listener addr");
+        std::thread::spawn(move || {
+            // Accept and hold every connection open, never reading the
+            // request or writing a response -- a wedged server, not a
+            // dead one.
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let client = RemoteClient::new(format!("http://{addr}"), None);
+            tx.send(client.get("/readyz")).ok();
+        });
+
+        let result = rx
+            .recv_timeout(IO_TIMEOUT + Duration::from_secs(20))
+            .expect("get() must return within its read timeout against a stalled server");
+        result.expect_err("a stalled server must surface an error, not a response");
     }
 
     #[test]

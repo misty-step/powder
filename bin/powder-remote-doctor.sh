@@ -100,10 +100,23 @@ fi
 # the doctor's job stays reachability/credential classification, and a
 # version mismatch is neither "unreachable" nor "misconfigured" -- it is
 # purely informational, so it must never change this script's exit code.
-local_sha=""
-if version_output="$("$POWDER_BIN" version 2>/dev/null)"; then
-  local_sha="$(printf '%s' "$version_output" | sed -n 's/.*(git \([0-9a-f]\{6,\}\).*/\1/p')"
+# `powder version` probes the remote /readyz itself when
+# POWDER_API_BASE_URL is set, and binaries predating the RemoteClient
+# read-timeout fix would hang that probe forever against a server that
+# accepts connections but never responds -- the very state this doctor
+# exists to classify. So the call gets the same bounded-time treatment as
+# every curl in this script (--connect-timeout 3 --max-time 8). `timeout`
+# is coreutils and absent from stock macOS (brew installs it as gtimeout):
+# with neither present, fall back to the unwrapped call rather than
+# failing -- a current binary bounds its own I/O anyway.
+version_timeout="${POWDER_DOCTOR_VERSION_TIMEOUT_SECS:-10}"
+timeout_bin="$(command -v timeout || command -v gtimeout || true)"
+if [[ -n "$timeout_bin" ]]; then
+  version_output="$("$timeout_bin" "$version_timeout" "$POWDER_BIN" version 2>/dev/null || true)"
+else
+  version_output="$("$POWDER_BIN" version 2>/dev/null || true)"
 fi
+local_sha="$(printf '%s' "$version_output" | sed -n 's/.*(git \([0-9a-f]\{6,\}\).*/\1/p')"
 server_readyz="$("$CURL_BIN" --connect-timeout 3 --max-time 8 -fsS "$api_base/readyz" 2>/dev/null || true)"
 server_sha="$(printf '%s' "$server_readyz" | sed -n 's/.*"git_sha":"\([^"]*\)".*/\1/p')"
 if [[ -n "$local_sha" && -n "$server_sha" && "$server_sha" != "unknown" && "$local_sha" != "$server_sha" ]]; then
