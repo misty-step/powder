@@ -36,7 +36,9 @@ impl Drop for ChildGuard {
 /// race (another process could grab the same port between the drop and the
 /// server's own `bind()`); accepted for a single-process local/CI test suite
 /// where that window is a handful of microseconds, over adding a
-/// log-scraping dependency for a smoke test.
+/// log-scraping dependency for a smoke test. If more socket-level tests
+/// appear, lift this helper (and `ChildGuard`) into a shared test-support
+/// module rather than copy-pasting the race into each new file.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port to find one free");
     listener.local_addr().expect("read local addr").port()
