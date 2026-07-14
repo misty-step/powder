@@ -729,9 +729,7 @@ impl Store {
                     &CardId::new(card_id)?,
                     "status",
                     "system:status-vocabulary-migration",
-                    &format!(
-                        "status-vocabulary migration: {old_status} -> {new_status}{detail}"
-                    ),
+                    &format!("status-vocabulary migration: {old_status} -> {new_status}{detail}"),
                     now,
                 )?;
             }
