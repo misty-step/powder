@@ -922,8 +922,6 @@ fn non_allowed_card_diff_sql() -> String {
         "blocks_json",
         "blocked_by_json",
         "repo",
-        "workspace_path",
-        "branch_name",
         "source_path",
         "source_digest",
         "claim_agent",

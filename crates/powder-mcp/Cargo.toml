@@ -12,6 +12,16 @@ path = "src/lib.rs"
 name = "powder-mcp"
 path = "src/main.rs"
 
+[features]
+# Gates eval_harness/live_eval out of the shipped binary (powder-epic-one-
+# card-model): those modules and their subprocess/network machinery have no
+# production caller, only the CI subprocess eval and the manual live-model
+# harness. The self-referential dev-dependency below turns this feature on
+# automatically for `cargo test`/`cargo clippy --all-targets` (which build
+# tests/examples and therefore pull in dev-dependencies) without it ever
+# reaching a plain `cargo build --bin powder-mcp`.
+eval = ["dep:ureq"]
+
 [dependencies]
 powder-api = { path = "../powder-api" }
 powder-core = { path = "../powder-core" }
@@ -20,5 +30,25 @@ powder-store = { path = "../powder-store" }
 serde_json = "1"
 # Only exercised by the env-gated live-model harness (src/live_eval.rs) to
 # call the OpenRouter chat-completions API; every other build path never
-# opens a socket. Already a workspace dependency of powder-api.
-ureq = { version = "2", features = ["json"] }
+# opens a socket. Already a workspace dependency of powder-api. Optional so
+# a plain `cargo build --bin powder-mcp` never links it in; the "eval"
+# feature (see [dev-dependencies] below) pulls it back in for tests.
+ureq = { version = "2", features = ["json"], optional = true }
+
+[dev-dependencies]
+# Self-dependency trick: activates the "eval" feature for this crate's own
+# tests/examples without it ever being part of the normal (non-dev) build
+# graph used by `cargo build --bin powder-mcp`.
+powder-mcp = { path = ".", features = ["eval"] }
+
+# Belt-and-suspenders alongside the self-dependency above: a `cargo build
+# --example ...` invocation that somehow doesn't unify "eval" (e.g. a future
+# resolver change) fails with a clear "required-features" skip/error instead
+# of a confusing missing-module compile error.
+[[example]]
+name = "eval"
+required-features = ["eval"]
+
+[[example]]
+name = "live_ab_eval"
+required-features = ["eval"]

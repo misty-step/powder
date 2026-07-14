@@ -342,25 +342,19 @@ impl CardStatus {
         }
     }
 
-    pub fn can_transition_to(self, next: Self) -> bool {
-        let _ = next;
-        true
-    }
-
-    pub fn can_complete(self) -> bool {
-        let _ = self;
-        true
-    }
-
-    pub fn validate_transition(self, next: Self) -> Result<(), DomainError> {
-        if self.can_transition_to(next) {
-            Ok(())
+    /// The status a newly created card gets when none is given explicitly.
+    /// Empty acceptance can never default to `Ready` ("ready is a query,
+    /// not vibes", VISION.md) -- a card with no oracle starts in
+    /// `Backlog`; any real acceptance defaults it to `Ready`. This is the
+    /// single home for that rule (powder-epic-one-card-model): every face
+    /// used to carry its own copy of this exact if/else, and an explicit
+    /// `status` argument bypasses this entirely -- it only decides the
+    /// *default* when none is given.
+    pub fn default_for_acceptance(acceptance: &[String]) -> Self {
+        if acceptance.is_empty() {
+            Self::Backlog
         } else {
-            Err(DomainError::conflict(format!(
-                "invalid card status transition: {} -> {}",
-                self.as_str(),
-                next.as_str()
-            )))
+            Self::Ready
         }
     }
 }
@@ -536,10 +530,6 @@ pub struct Card {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<CardSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<Claim>,
@@ -624,10 +614,6 @@ struct CardFields {
     #[serde(default)]
     repo: Option<String>,
     #[serde(default)]
-    workspace_path: Option<String>,
-    #[serde(default)]
-    branch_name: Option<String>,
-    #[serde(default)]
     source: Option<CardSource>,
     #[serde(default)]
     claim: Option<Claim>,
@@ -659,8 +645,6 @@ impl<'de> Deserialize<'de> for Card {
             blocked_by: fields.blocked_by,
             parent: fields.parent,
             repo: fields.repo,
-            workspace_path: fields.workspace_path,
-            branch_name: fields.branch_name,
             source: fields.source,
             claim: fields.claim,
             created_at: fields.created_at,
@@ -716,8 +700,6 @@ impl Card {
             blocked_by: Vec::new(),
             parent: None,
             repo: None,
-            workspace_path: None,
-            branch_name: None,
             source: None,
             claim: None,
             created_at: 0,
@@ -988,12 +970,11 @@ impl Card {
         Ok(claim)
     }
 
-    pub fn apply_status(
-        &mut self,
-        status: CardStatus,
-        now: i64,
-    ) -> Result<Option<Claim>, DomainError> {
-        self.status.validate_transition(status)?;
+    /// Sets `status` unconditionally: Powder is unopinionated about which
+    /// transitions are legal (audit over enforcement, powder-epic-one-card-
+    /// model) -- any status is settable from any status. Releases the claim
+    /// when the new status is one a claim cannot survive.
+    pub fn apply_status(&mut self, status: CardStatus, now: i64) -> Option<Claim> {
         let released_claim =
             if matches!(status, CardStatus::Ready | CardStatus::Blocked) || status.is_terminal() {
                 self.claim.take()
@@ -1002,7 +983,7 @@ impl Card {
             };
         self.status = status;
         self.updated_at = now;
-        Ok(released_claim)
+        released_claim
     }
 
     pub fn apply_relations(
@@ -1019,7 +1000,6 @@ impl Card {
     }
 
     pub fn release_claim(&mut self, run_id: &RunId, now: i64) -> Result<Claim, DomainError> {
-        self.status.validate_transition(CardStatus::Ready)?;
         let claim = self.claim.as_ref().ok_or_else(|| {
             DomainError::conflict(format!("card {} has no active claim", self.id))
         })?;
@@ -1928,5 +1908,43 @@ mod tests {
     fn claim_readiness_ok_when_criteria_present_and_unblocked() {
         let card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
         assert!(card.claim_readiness(10, |_| true).is_ok());
+    }
+
+    #[test]
+    fn default_for_acceptance_is_backlog_when_empty_and_ready_when_not() {
+        assert_eq!(CardStatus::default_for_acceptance(&[]), CardStatus::Backlog);
+        assert_eq!(
+            CardStatus::default_for_acceptance(&["prove it".to_string()]),
+            CardStatus::Ready
+        );
+    }
+
+    #[test]
+    fn apply_status_accepts_any_transition_unconditionally() {
+        // powder-epic-one-card-model: Powder is unopinionated about status
+        // transitions -- audit over enforcement. A card can jump straight
+        // from Backlog to Done, skip Ready/Claimed/Running entirely, or go
+        // "backwards" from Done to Backlog; none of it is rejected.
+        let mut card = card("001", CardStatus::Backlog);
+        card.apply_status(CardStatus::Done, 10);
+        assert_eq!(card.status, CardStatus::Done);
+
+        card.apply_status(CardStatus::Backlog, 20);
+        assert_eq!(card.status, CardStatus::Backlog);
+    }
+
+    #[test]
+    fn apply_status_releases_claim_on_ready_blocked_or_terminal() {
+        let mut card = card("001", CardStatus::Running).with_acceptance(["prove it".to_string()]);
+        card.claim = Some(Claim {
+            agent: "agent-a".to_string(),
+            run_id: RunId::new("run-1").unwrap(),
+            acquired_at: 0,
+            expires_at: 100,
+        });
+
+        let released = card.apply_status(CardStatus::Ready, 30);
+        assert!(released.is_some());
+        assert!(card.claim.is_none());
     }
 }
