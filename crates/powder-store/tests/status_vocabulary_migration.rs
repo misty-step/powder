@@ -17,7 +17,7 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use powder_core::ReadyQuery;
-use powder_store::Store;
+use powder_store::{Store, SCHEMA_VERSION};
 use rusqlite::Connection;
 
 fn temp_db(name: &str) -> PathBuf {
@@ -100,10 +100,10 @@ fn table_count(connection: &Connection, table: &str) -> usize {
 fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
     let path = temp_db("snapshot");
 
-    // Bring a fresh database all the way to the current schema first, so
-    // the fixture below can assume every current-shape column and table
-    // already exists (the migration itself adds no columns -- it is a
-    // pure data transform).
+    // Bring a fresh database all the way to the current schema first, then
+    // remove the v18 principal columns so the fixture exercises the real
+    // v16 -> v17 -> v18 path rather than inserting legacy rows into a newer
+    // NOT NULL run shape.
     {
         let mut store = Store::open(&path).expect("open fresh store");
         store.migrate().expect("migrate fresh store to current");
@@ -115,7 +115,11 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
     {
         let connection = Connection::open(&path).expect("raw connection for fixture load");
         connection
-            .execute_batch("PRAGMA user_version = 16;")
+            .execute_batch(
+                "ALTER TABLE cards DROP COLUMN claim_principal;
+                 ALTER TABLE runs DROP COLUMN principal;
+                 PRAGMA user_version = 16;",
+            )
             .expect("rewind schema version");
         connection
             .execute_batch(include_str!("fixtures/status_vocabulary_snapshot.sql"))
@@ -154,7 +158,7 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
         store.migrate().expect("run status-vocabulary migration");
         assert_eq!(
             store.schema_version().expect("schema version after"),
-            17,
+            SCHEMA_VERSION,
             "migration must land the database on the current schema version"
         );
     }

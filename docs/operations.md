@@ -283,9 +283,13 @@ changes (public listener, non-tailnet ingress), this posture must be
 re-reviewed before that change ships — read routes are not currently
 closed behind read-scope keys.
 
-API keys are bound to actor records. In `api-key` mode, claiming work uses the
-authenticated actor; a request-body `agent` value is accepted only when it
-matches that actor.
+API keys authenticate a neutral principal. Claims and runs separately record
+that principal, the explicit request-body `agent` worker label, and the unique
+`run_id`. One integration principal may therefore coordinate multiple workers
+without per-worker credentials; lease mutations authorize against the
+principal that acquired the run, while operator-facing claim state continues
+to name the worker. Key scope controls route access only and carries no
+human-versus-agent classification.
 
 Powder is audit-first, not lifecycle-enforcing: any authorized actor may set any
 card status in one call. Claims remain useful leases for coordination, but

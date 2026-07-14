@@ -103,9 +103,9 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/claim",
-        intent: "claim one card and open a run",
+        intent: "claim one card and open a run, persisting the authenticated principal separately from the declared worker and run id",
         body_shape: Some(
-            r#"{"agent":"...","ttl_seconds":null} -- agent is required and is never inferred from the caller's own identity (linejam-906: an admin-scoped key claiming with agent omitted must not silently record the claim under its own display name)"#,
+            r#"{"agent":"...","ttl_seconds":null} -- agent is the required semantic worker label and is never inferred from the authenticated principal; one integration principal may declare multiple workers, and the response/readback includes principal+agent+run_id"#,
         ),
     },
     ApiRoute {

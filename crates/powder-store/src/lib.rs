@@ -26,7 +26,7 @@ pub use events::{
     CardEventEnvelope, DeadLetterDelivery, EventSubscription, EventSubscriptionCreated,
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
-pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
+pub use identity::{ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 use repositories::{ensure_repository_entity, resolve_repository_name};
 pub use repositories::{
     RepositoryMergeOutcome, RepositoryNormalizeChange, RepositoryNormalizeOutcome,
@@ -409,6 +409,10 @@ impl Store {
                     self.migrate_16_to_17()?;
                     17
                 }
+                17 => {
+                    self.migrate_17_to_18()?;
+                    18
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -733,6 +737,72 @@ impl Store {
                     now,
                 )?;
             }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Separates credential principal from semantic worker/run identity.
+    /// Existing keys retain their hashes, prefixes, scopes, revocation and
+    /// last-used metadata; the former actor display name becomes the neutral
+    /// principal. Existing live leases use their worker label as the best
+    /// lossless legacy principal because older schemas recorded no other
+    /// authenticated identity on the claim or run.
+    fn migrate_17_to_18(&mut self) -> Result<()> {
+        let has_legacy_keys = self.table_has_column("api_keys", "actor_id")?;
+        let needs_card_principal =
+            self.cards_has_column("claim_agent")? && !self.cards_has_column("claim_principal")?;
+        let needs_run_principal = self.table_has_column("runs", "agent")?
+            && !self.table_has_column("runs", "principal")?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if has_legacy_keys {
+            transaction.execute_batch(
+                "CREATE TABLE api_keys_v18 (
+                   id TEXT PRIMARY KEY,
+                   principal TEXT NOT NULL,
+                   name TEXT NOT NULL,
+                   key_prefix TEXT NOT NULL,
+                   key_hash TEXT NOT NULL,
+                   hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
+                   scope TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   revoked_at INTEGER,
+                   last_used_at INTEGER
+                 );
+                 INSERT INTO api_keys_v18
+                   (id, principal, name, key_prefix, key_hash, hash_algorithm,
+                    scope, created_at, revoked_at, last_used_at)
+                 SELECT api_keys.id, actors.display_name, api_keys.name,
+                        api_keys.key_prefix, api_keys.key_hash,
+                        api_keys.hash_algorithm, api_keys.scope,
+                        api_keys.created_at, api_keys.revoked_at,
+                        api_keys.last_used_at
+                 FROM api_keys
+                 JOIN actors ON actors.id = api_keys.actor_id;
+                 DROP TABLE api_keys;
+                 ALTER TABLE api_keys_v18 RENAME TO api_keys;
+                 CREATE INDEX idx_api_keys_prefix
+                   ON api_keys(key_prefix, revoked_at);
+                 DROP TABLE actors;",
+            )?;
+        }
+        if needs_card_principal {
+            transaction.execute_batch(
+                "ALTER TABLE cards ADD COLUMN claim_principal TEXT;
+                 UPDATE cards
+                 SET claim_principal = claim_agent
+                 WHERE claim_agent IS NOT NULL;",
+            )?;
+        }
+        if needs_run_principal {
+            transaction.execute_batch(
+                "ALTER TABLE runs
+                   ADD COLUMN principal TEXT NOT NULL DEFAULT 'legacy';
+                 UPDATE runs SET principal = agent;",
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -1380,7 +1450,7 @@ impl Store {
         authority: &Authority,
     ) -> Result<ClaimReceipt> {
         let agent = non_empty("agent", agent)?;
-        authority.require_identity(&agent)?;
+        let principal = authority.actor_label();
         if ttl_seconds == 0 {
             return Err(DomainError::validation(
                 "ttl_seconds",
@@ -1394,7 +1464,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
 
-        if let Some(claim) = card.active_claim_for_agent(&agent, now) {
+        if let Some(claim) = card.claim.as_ref().filter(|claim| {
+            claim.principal == principal && claim.agent == agent && !claim.is_expired(now)
+        }) {
             let receipt = claim_receipt(card_id, claim);
             transaction.commit()?;
             return Ok(receipt);
@@ -1413,8 +1485,9 @@ impl Store {
                 &transaction,
                 &card,
                 "claim-expired",
-                &expired.agent,
+                &expired.principal,
                 json!({
+                    "principal": expired.principal.as_str(),
                     "run_id": expired.run_id.as_str(),
                     "agent": expired.agent.as_str(),
                     "expired_at": expired.expires_at
@@ -1433,15 +1506,21 @@ impl Store {
         }
 
         let run_id = RunId::new(format!("run-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?;
-        let claim = card.apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds, |id| {
-            terminal_blockers.contains(id)
-        })?;
+        let claim = card.apply_claim(
+            principal.clone(),
+            agent.clone(),
+            run_id.clone(),
+            now,
+            ttl_seconds,
+            |id| terminal_blockers.contains(id),
+        )?;
         persist_card(&transaction, &card)?;
 
         let run = Run {
             id: run_id.clone(),
             card_id: card_id.clone(),
             state: RunState::Active,
+            principal: principal.clone(),
             agent: agent.clone(),
             claim_expires_at: claim.expires_at,
             proof: None,
@@ -1461,6 +1540,7 @@ impl Store {
         Ok(ClaimReceipt {
             card_id: card_id.clone(),
             run_id,
+            principal,
             agent,
             expires_at: claim.expires_at,
         })
@@ -1633,7 +1713,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_holder())?;
+        authority.require_holder(card.claim_principal())?;
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
@@ -1668,7 +1748,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_holder())?;
+        authority.require_holder(card.claim_principal())?;
         let claim = card.renew_claim(run_id, now, ttl_seconds)?;
         persist_card(&transaction, &card)?;
         let updated = transaction.execute(
@@ -1702,7 +1782,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_holder())?;
+        authority.require_holder(card.claim_principal())?;
         let claim = card.heartbeat_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         let updated = transaction.execute(
@@ -1745,7 +1825,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_holder())?;
+        authority.require_holder(card.claim_principal())?;
         let from_agent = card.claim_holder().unwrap_or_default().to_string();
         let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
         persist_card(&transaction, &card)?;
@@ -1900,7 +1980,7 @@ impl Store {
             .get_run(run_id)?
             .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?;
         let mut card = load_card(&self.connection, &run.card_id)?;
-        authority.require_holder(card.claim_holder())?;
+        authority.require_holder(card.claim_principal())?;
 
         card.status = CardStatus::AwaitingInput;
         card.updated_at = now;
@@ -2193,6 +2273,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
         .map(|repo| ensure_repository_entity(connection, repo, card.updated_at, Some("card repo")))
         .transpose()?
         .flatten();
+    let claim_principal = card.claim.as_ref().map(|claim| claim.principal.as_str());
     let claim_agent = card.claim.as_ref().map(|claim| claim.agent.as_str());
     let claim_run_id = card.claim.as_ref().map(|claim| claim.run_id.as_str());
     let claim_acquired_at = card.claim.as_ref().map(|claim| claim.acquired_at);
@@ -2201,7 +2282,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -2219,6 +2300,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                repo = excluded.repo,
                source_path = excluded.source_path,
                source_digest = excluded.source_digest,
+               claim_principal = excluded.claim_principal,
                claim_agent = excluded.claim_agent,
                claim_run_id = excluded.claim_run_id,
                claim_acquired_at = excluded.claim_acquired_at,
@@ -2245,6 +2327,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             repo,
             source_path,
             source_digest,
+            claim_principal,
             claim_agent,
             claim_run_id,
             claim_acquired_at,
@@ -2260,12 +2343,13 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
 fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     connection.execute(
         "INSERT INTO runs (
-            id, card_id, state, agent, claim_expires_at, proof,
+            id, card_id, state, principal, agent, claim_expires_at, proof,
             created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET
            card_id = excluded.card_id,
            state = excluded.state,
+           principal = excluded.principal,
            agent = excluded.agent,
            claim_expires_at = excluded.claim_expires_at,
            proof = excluded.proof,
@@ -2275,6 +2359,7 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
             run.id.as_str(),
             run.card_id.as_str(),
             run.state.as_str(),
+            run.principal,
             run.agent,
             run.claim_expires_at,
             run.proof,
@@ -2391,6 +2476,7 @@ fn claim_receipt(card_id: &CardId, claim: &Claim) -> ClaimReceipt {
     ClaimReceipt {
         card_id: card_id.clone(),
         run_id: claim.run_id.clone(),
+        principal: claim.principal.clone(),
         agent: claim.agent.clone(),
         expires_at: claim.expires_at,
     }
@@ -2653,6 +2739,7 @@ struct CardRecord {
     repo: Option<String>,
     source_path: Option<String>,
     source_digest: Option<String>,
+    claim_principal: Option<String>,
     claim_agent: Option<String>,
     claim_run_id: Option<String>,
     claim_acquired_at: Option<i64>,
@@ -2682,13 +2769,14 @@ impl CardRecord {
             repo: row.get(14)?,
             source_path: row.get(15)?,
             source_digest: row.get(16)?,
-            claim_agent: row.get(17)?,
-            claim_run_id: row.get(18)?,
-            claim_acquired_at: row.get(19)?,
-            claim_expires_at: row.get(20)?,
-            created_at: row.get(21)?,
-            updated_at: row.get(22)?,
-            parent: row.get(23)?,
+            claim_principal: row.get(17)?,
+            claim_agent: row.get(18)?,
+            claim_run_id: row.get(19)?,
+            claim_acquired_at: row.get(20)?,
+            claim_expires_at: row.get(21)?,
+            created_at: row.get(22)?,
+            updated_at: row.get(23)?,
+            parent: row.get(24)?,
         })
     }
 
@@ -2742,17 +2830,21 @@ impl CardRecord {
             _ => None,
         };
         card.claim = match (
+            self.claim_principal,
             self.claim_agent,
             self.claim_run_id,
             self.claim_acquired_at,
             self.claim_expires_at,
         ) {
-            (Some(agent), Some(run_id), Some(acquired_at), Some(expires_at)) => Some(Claim {
-                agent,
-                run_id: RunId::new(run_id)?,
-                acquired_at,
-                expires_at,
-            }),
+            (Some(principal), Some(agent), Some(run_id), Some(acquired_at), Some(expires_at)) => {
+                Some(Claim {
+                    principal,
+                    agent,
+                    run_id: RunId::new(run_id)?,
+                    acquired_at,
+                    expires_at,
+                })
+            }
             _ => None,
         };
         card.updated_at = self.updated_at;
@@ -2764,6 +2856,7 @@ struct RunRecord {
     id: String,
     card_id: String,
     state: String,
+    principal: String,
     agent: String,
     claim_expires_at: i64,
     proof: Option<String>,
@@ -2777,11 +2870,12 @@ impl RunRecord {
             id: row.get(0)?,
             card_id: row.get(1)?,
             state: row.get(2)?,
-            agent: row.get(3)?,
-            claim_expires_at: row.get(4)?,
-            proof: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            principal: row.get(3)?,
+            agent: row.get(4)?,
+            claim_expires_at: row.get(5)?,
+            proof: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
         })
     }
 
@@ -2793,6 +2887,7 @@ impl RunRecord {
                 field: "runs.state",
                 value: self.state,
             })?,
+            principal: self.principal,
             agent: self.agent,
             claim_expires_at: self.claim_expires_at,
             proof: self.proof,
