@@ -212,6 +212,49 @@
           </section>
 
           <section
+            class="msk-section"
+            id="lease-race"
+            aria-labelledby="lease-race-title"
+          >
+            <div class="msk-section-head">
+              <h2 class="ae-h" id="lease-race-title">
+                The failure git-native trackers can't solve
+              </h2>
+              <p class="ae-dim">
+                A committed Markdown/YAML backlog has no lease and no clock:
+                when the agent holding a task dies mid-work, its claim on that
+                file just sits there until a human notices and edits it by
+                hand. Powder's claims expire on their own. This is a real,
+                deterministic run of that recovery, captured verbatim &mdash;
+                not staged copy.
+              </p>
+            </div>
+            <img
+              class="msk-lease-race-cast"
+              src="assets/lease-race-demo.svg"
+              alt="Terminal recording: an agent claims a card with a 2-second lease, crashes without heartbeating, and a second actor reclaims the same card automatically once the lease expires, then completes it with a full claim / claim-expired / claim / completed audit trail"
+              width="860"
+              height="581"
+              loading="lazy"
+            />
+            <p class="ae-dim">
+              Reproduce it yourself with
+              <a
+                href="https://github.com/misty-step/powder/blob/master/scripts/lease-race-demo.sh"
+                ><code>scripts/lease-race-demo.sh</code></a
+              >
+              (it boots a real <code>powder-server</code> against a throwaway
+              database and asserts the reclaim and audit trail on every run,
+              including in CI). The stdout of the run captured above is
+              checked in at
+              <a
+                href="https://github.com/misty-step/powder/blob/master/docs/lease-race-transcript.txt"
+                ><code>docs/lease-race-transcript.txt</code></a
+              >.
+            </p>
+          </section>
+
+          <section
             class="msk-section msk-release-slot"
             aria-labelledby="release-title"
           >

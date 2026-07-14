@@ -1,0 +1,43 @@
+=== Powder lease-race demo ===
+card: lease-race-demo-1784053706
+claim TTL: 2s | poll timeout: 10s
+----------------------------------------------------------------------
+[boot] building powder-server (release)
+    Finished `release` profile [optimized] target(s) in 0.32s
+[boot] starting powder-server on http://127.0.0.1:52152 against a fresh ephemeral DB
+[boot] server is up
+[boot] minted nothing -- using the first-run bootstrap key
+----------------------------------------------------------------------
+[setup] creating card lease-race-demo-1784053706
+{"id":"lease-race-demo-1784053706","status":"ready"}
+----------------------------------------------------------------------
+[actor A: codex-agent] claiming with ttl_seconds=2
+{"agent":"codex-agent","card_id":"lease-race-demo-1784053706","expires_at":1784053710,"run_id":"run-8cZe7JZuyVFX"}
+[actor A] run_id=run-8cZe7JZuyVFX expires_at=1784053710
+[actor A] appending a work-log entry, then going dark
+{"card_id":"lease-race-demo-1784053706","agent":"codex-agent"}
+[actor A] *** crash *** (no heartbeat, no release -- the lease is left to expire on its own)
+----------------------------------------------------------------------
+[actor B: human-with-curl] polling list_ready until the card returns (TTL expiry, no human unsticking it)
+[actor B] card reclaimed via list_ready after 2s (asserted < 10s)
+----------------------------------------------------------------------
+[actor B] claiming the abandoned card
+{"agent":"human-with-curl","card_id":"lease-race-demo-1784053706","expires_at":1784057310,"run_id":"run-hBGrl_pW8mY6"}
+[actor B] run_id=run-hBGrl_pW8mY6
+[actor B] completing the card with proof
+{"id":"lease-race-demo-1784053706","status":"done"}
+----------------------------------------------------------------------
+[readback] fetching card detail (detail=detailed) for the runs/work-log trail
+[readback] fetching the outbound event tail (this is where claim-expired/completed live --
+           they are webhook-delivery events, not the card_events audit rows, so a card
+           detail read alone does not show them; GET /api/v1/events/tail does)
+----------------------------------------------------------------------
+=== Race transcript (from the audit trail, not narration) ===
+at           actor            event
+1784053708   codex-agent      claim, run run-8cZe7JZuyVFX
+1784053708   codex-agent      work-log-appended
+1784053710   codex-agent      claim-expired
+1784053710   human-with-curl  claim, run run-hBGrl_pW8mY6
+1784053710   bootstrap        completed
+----------------------------------------------------------------------
+RESULT: PASS -- codex-agent crashed, its lease expired after 2s, human-with-curl reclaimed the card via list_ready in 2s with no human editing any file, and the full claim A -> claim-expired -> claim B -> completed trail is recorded against the card (runs table for both claims, outbound event tail for claim-expired and completed).
