@@ -96,6 +96,27 @@ pub struct RepositoryMergeOutcome {
     pub rehomed_cards: usize,
 }
 
+/// Result of [`Store::normalize_repository_strings`]: how many cards the
+/// sweep looked at and exactly which ones it rewrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryNormalizeOutcome {
+    pub scanned: usize,
+    pub changes: Vec<RepositoryNormalizeChange>,
+}
+
+impl RepositoryNormalizeOutcome {
+    pub fn normalized(&self) -> usize {
+        self.changes.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryNormalizeChange {
+    pub card_id: String,
+    pub previous_repo: String,
+    pub canonical_repo: String,
+}
+
 impl Store {
     pub(crate) fn apply_ratified_repository_tier_seed(&mut self) -> Result<()> {
         let transaction = self
@@ -375,6 +396,69 @@ impl Store {
             alias,
             rehomed_cards,
         })
+    }
+
+    /// One-time cleanup sweep (powder-904) for cards whose stored `repo`
+    /// column predates write-time canonicalization (or was written by a
+    /// path that bypassed it, e.g. direct SQL): rewrites every row whose raw
+    /// `repo` string resolves to a *different* canonical name, and appends a
+    /// `repository`-typed audit event per changed card, mirroring
+    /// `merge_repository_alias`'s per-card audit trail. Idempotent -- a
+    /// second run over an already-normalized board finds nothing to change.
+    /// This is deliberately a runtime sweep a caller re-invokes on demand
+    /// (see the `powder repository-normalize` CLI subcommand), not a schema
+    /// migration: unlike a migration it does not run automatically on every
+    /// `Store::migrate`, so it never blocks startup and can be re-run safely
+    /// after alias data changes.
+    pub fn normalize_repository_strings(
+        &mut self,
+        actor: &str,
+        now: i64,
+    ) -> Result<RepositoryNormalizeOutcome> {
+        let actor = non_empty("actor", actor)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = {
+            let mut statement =
+                transaction.prepare("SELECT id, repo FROM cards WHERE repo IS NOT NULL")?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let scanned = rows.len();
+        let mut changes = Vec::new();
+        for (card_id, raw_repo) in rows {
+            let canonical = resolve_repository_name(&transaction, &raw_repo)?
+                .or_else(|| canonical_repo_label(&raw_repo));
+            let Some(canonical) = canonical else {
+                continue;
+            };
+            if canonical == raw_repo {
+                continue;
+            }
+            transaction.execute(
+                "UPDATE cards SET repo = ?2, updated_at = ?3 WHERE id = ?1",
+                params![card_id, canonical, now],
+            )?;
+            append_repository_card_event(
+                &transaction,
+                &card_id,
+                &actor,
+                &format!("repository-normalize: {raw_repo} -> {canonical}"),
+                now,
+            )?;
+            changes.push(RepositoryNormalizeChange {
+                card_id,
+                previous_repo: raw_repo,
+                canonical_repo: canonical,
+            });
+        }
+        transaction.commit()?;
+        Ok(RepositoryNormalizeOutcome { scanned, changes })
     }
 
     fn list_repositories_inner(&self, include_hidden: bool) -> Result<Vec<RepositorySummary>> {

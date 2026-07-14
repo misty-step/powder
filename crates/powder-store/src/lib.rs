@@ -30,8 +30,8 @@ pub use events::{
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 use repositories::{ensure_repository_entity, resolve_repository_name};
 pub use repositories::{
-    RepositoryMergeOutcome, RepositorySummary, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility,
+    RepositoryMergeOutcome, RepositoryNormalizeChange, RepositoryNormalizeOutcome,
+    RepositorySummary, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
 };
 
 use schema::{
@@ -119,12 +119,39 @@ const FIELD_NOTE_DRAFT_LABEL: &str = "field-note-draft";
 
 /// Filter for [`Store::list_cards`]: `None` on either field means
 /// unfiltered on that dimension.
-#[derive(Debug, Clone, Default)]
+///
+/// `include_terminal` decides whether `Done`/`Shipped`/`Abandoned` cards are
+/// eligible when no explicit `status` is requested (an explicit `status`
+/// always wins -- asking for `status: done` returns `done` cards regardless
+/// of this flag; see `list_cards_page`). It defaults to `true` (the
+/// pre-powder-mcp-unfiltered-enumeration behavior: an unfiltered query sees
+/// the whole board, terminal cards included) so every existing caller of
+/// `CardFilter::default()` -- the HTTP `list_cards` route, the `powder
+/// list-cards` CLI command, and the plain-store test suite -- keeps its
+/// current behavior unchanged. Only `powder-mcp`'s `list_cards` tool opts
+/// into `include_terminal: false` by default, because an agent enumerating
+/// "what's on the board" with no filter is far more likely to be surprised
+/// by a done/shipped/abandoned card silently filling its result window than
+/// to be relying on seeing one.
+#[derive(Debug, Clone)]
 pub struct CardFilter {
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
     pub autonomy: Option<AutonomyClass>,
     pub estimate: Option<Estimate>,
+    pub include_terminal: bool,
+}
+
+impl Default for CardFilter {
+    fn default() -> Self {
+        CardFilter {
+            status: None,
+            repo: None,
+            autonomy: None,
+            estimate: None,
+            include_terminal: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -882,7 +909,18 @@ impl Store {
                 None => !repo_filter_requested,
             })
             .collect::<Vec<_>>();
+        // `total_count` reports how many cards match the caller's *explicit*
+        // status/repo/autonomy/estimate filters -- deliberately computed
+        // before the `include_terminal` exclusion below, so a caller that
+        // asks for the whole board (no explicit status) and gets terminal
+        // cards silently held back still sees the true match count rather
+        // than an undercount that reads as "the board is smaller than it
+        // is." An explicit `status` filter is authoritative and is never
+        // second-guessed by `include_terminal`.
         let total_count = cards.len();
+        if filter.status.is_none() && !filter.include_terminal {
+            cards.retain(|card| !card.status.is_terminal());
+        }
 
         cards.sort_by(|left, right| {
             left.priority
@@ -892,6 +930,17 @@ impl Store {
         });
         cards.truncate(limit.max(1));
         Ok(CardListPage { cards, total_count })
+    }
+
+    /// Raw count of every card in the store, ignoring every filter
+    /// dimension -- used by `powder-mcp`'s `list_cards` envelope to tell a
+    /// caller whose filtered query matched zero cards how large the board
+    /// actually is, so a narrow filter never reads as an empty board.
+    pub fn card_count(&self) -> Result<usize> {
+        Ok(self
+            .connection
+            .query_row("SELECT COUNT(*) FROM cards", [], |row| row.get::<_, i64>(0))?
+            as usize)
     }
 
     pub fn board_stats(&self, query: BoardStatsQuery) -> Result<BoardStats> {

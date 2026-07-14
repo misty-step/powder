@@ -1719,6 +1719,19 @@ mod tests {
     /// the authenticated request for every one of these routes and accept
     /// no client-supplied admin-bypass flag at all. Every other schema
     /// param must be forwarded.
+    ///
+    /// `list_cards`'s `include_terminal` is a different kind of exemption
+    /// from the rest of this list (which are all local-authority args with
+    /// no remote equivalent): it is a genuine local/remote behavior gap,
+    /// tracked deliberately rather than covered up. powder-mcp-unfiltered-
+    /// enumeration scoped the default-terminal-exclusion decision to the
+    /// store-backed (`call_tool_store`) dispatch path only, so the same
+    /// board reachable locally via `POWDER_DB_PATH` and remotely via
+    /// `POWDER_API_BASE_URL` can currently answer an unfiltered `list_cards`
+    /// differently. Wiring `include_terminal` onto
+    /// `GET /api/v1/cards` and forwarding it here is the natural follow-up
+    /// (`powder-server`'s `ListCardsParams` would need the matching field),
+    /// deliberately deferred rather than bundled into this change.
     const LOCAL_ONLY_PARAMS: &[(&str, &[&str])] = &[
         ("create_card", &["actor"]),
         ("update_card", &["actor"]),
@@ -1727,6 +1740,7 @@ mod tests {
         ("update_relations", &["actor", "admin"]),
         ("request_input", &["actor", "admin"]),
         ("complete_card", &["actor", "admin"]),
+        ("list_cards", &["include_terminal"]),
     ];
 
     /// Params that genuinely reach the remote server but not as a literal

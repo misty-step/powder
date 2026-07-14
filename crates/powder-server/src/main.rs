@@ -736,6 +736,10 @@ async fn list_cards(
         autonomy,
         estimate,
         repo: params.repo,
+        // powder-mcp-unfiltered-enumeration: the MCP `list_cards` tool
+        // defaults to hiding terminal cards from an unfiltered query; the
+        // HTTP route keeps its existing whole-board behavior unchanged.
+        include_terminal: true,
     };
     let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
     Ok(Json(card_list_page_json(page.cards, page.total_count)))
