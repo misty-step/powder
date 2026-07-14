@@ -22,6 +22,7 @@ pub const COMMANDS: &[&str] = &[
     "create-card",
     "update-card",
     "update-relations",
+    "set-parent",
     "list-ready",
     "list-cards",
     "repository-list",
@@ -109,6 +110,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
         [command, rest @ ..] if command == "update-card" => update_card(rest, remote_env),
         [command, rest @ ..] if command == "update-relations" => update_relations(rest),
+        [command, rest @ ..] if command == "set-parent" => set_parent(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
         [command, rest @ ..] if command == "repository-list" => repository_list(rest),
@@ -197,6 +199,8 @@ pub fn help() -> String {
     help.push_str(
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000\n",
     );
+    help.push_str("  powder set-parent 002 --db ./data/powder.db --parent 001\n");
+    help.push_str("  powder set-parent 002 --db ./data/powder.db --clear\n");
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
     help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600\n");
@@ -413,6 +417,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let related = card_ids_flag(args, "--related")?;
     let blocks = card_ids_flag(args, "--blocks")?;
     let blocked_by = card_ids_flag(args, "--blocked-by")?;
+    let parent = flag_value(args, "--parent")
+        .map(|value| CardId::new(value).map_err(|error| ShellError::Invalid(error.to_string())))
+        .transpose()?;
     let repo = flag_value(args, "--repo").map(str::to_string);
 
     let card = if let Some(db) = flag_value(args, "--db") {
@@ -433,6 +440,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         card.related = related;
         card.blocks = blocks;
         card.blocked_by = blocked_by;
+        card.parent = parent;
         card.repo = repo;
         json!(store
             .create_card_with_events(card, &authority(args).actor_label(), now)
@@ -460,6 +468,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         }
         if let Some(estimate) = estimate {
             payload["estimate"] = json!(estimate.as_str());
+        }
+        if let Some(parent) = parent {
+            payload["parent"] = json!(parent.as_str());
         }
         client.post("/api/v1/cards", payload).map_err(remote_err)?
     } else {
@@ -568,6 +579,36 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
         )
         .map_err(store_err)?;
     Ok(format!("relations\t{}\n", card.id))
+}
+
+/// `set-parent <id> --parent <parent-id>` links; `set-parent <id> --clear`
+/// clears the edge.
+fn set_parent(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "set-parent")?;
+    let parent = match (flag_value(args, "--parent"), has_flag(args, "--clear")) {
+        (Some(parent), false) => {
+            Some(CardId::new(parent).map_err(|error| ShellError::Invalid(error.to_string()))?)
+        }
+        (None, true) => None,
+        _ => {
+            return Err(ShellError::Invalid(
+                "set-parent requires exactly one of --parent <card-id> or --clear".to_string(),
+            ))
+        }
+    };
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let card = store
+        .set_parent(&card_id, parent, now, &authority(args))
+        .map_err(store_err)?;
+    Ok(format!(
+        "parent\t{}\t{}\n",
+        card.id,
+        card.parent
+            .as_ref()
+            .map(|parent| parent.as_str())
+            .unwrap_or("none")
+    ))
 }
 
 fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -926,7 +967,7 @@ fn get_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         let detail = store
-            .get_card_detail(&card_id, DetailLevel::Detailed)
+            .get_card_detail(&card_id, DetailLevel::Detailed, unix_now())
             .map_err(store_err)?
             .ok_or_else(|| ShellError::NotFound(format!("card not found: {card_id}")))?;
         to_pretty_json(&detail)
@@ -2721,6 +2762,92 @@ mod tests {
         assert!(card.contains("\"related\": [\n      \"peer-c\""));
         assert!(card.contains("\"blocked_by\": [\n      \"parent-a\""));
         assert!(card.contains("\"actor\": \"operator\""));
+    }
+
+    #[test]
+    fn cli_set_parent_links_and_get_card_shows_children_and_epic_state() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-parent-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "epic-cli",
+            "--title",
+            "Epic",
+            "--acceptance",
+            "children land",
+        ]))
+        .unwrap();
+        // Born decomposed via --parent.
+        let born = run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "child-cli-a",
+            "--title",
+            "Child A",
+            "--acceptance",
+            "proof",
+            "--parent",
+            "epic-cli",
+        ]))
+        .unwrap();
+        assert!(born.contains("created\tchild-cli-a"));
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "child-cli-b",
+            "--title",
+            "Child B",
+            "--acceptance",
+            "proof",
+        ]))
+        .unwrap();
+
+        let linked = run(&args([
+            "set-parent",
+            "child-cli-b",
+            "--db",
+            &db,
+            "--parent",
+            "epic-cli",
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert_eq!(linked, "parent\tchild-cli-b\tepic-cli\n");
+
+        let card = run(&args(["get-card", "epic-cli", "--db", &db])).unwrap();
+        assert!(card.contains("\"children_total\": 2"));
+        assert!(card.contains("\"epic_state\""));
+        assert!(card.contains("\"child-cli-a\""));
+
+        let cleared = run(&args(["set-parent", "child-cli-b", "--db", &db, "--clear"])).unwrap();
+        assert_eq!(cleared, "parent\tchild-cli-b\tnone\n");
+
+        let both = run(&args([
+            "set-parent",
+            "child-cli-b",
+            "--db",
+            &db,
+            "--parent",
+            "epic-cli",
+            "--clear",
+        ]));
+        assert!(both.is_err(), "exactly one of --parent/--clear");
     }
 
     #[test]

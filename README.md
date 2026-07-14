@@ -37,6 +37,18 @@ first, but tier never gates lifecycle. An explicitly ready card in a
 backburner or archived repository appears in ready queues and can be claimed,
 released, and promoted like any other card.
 
+Epic-shaped work is first-class without turning Powder into an execution
+engine. A card may name an explicit `parent`; children are derived by query,
+and the parent edge is distinct from `related`/`blocks`/`blocked_by` (it
+never blocks). One parent read returns bounded child summaries plus a
+deterministic `epic_state` packet -- status counts, acceptance sums, child
+evidence (run proofs and links) with card-id provenance, freshness, and
+parent/child mismatch flags -- computed by pure arithmetic, never transcript
+concatenation. Parent acceptance stays authoritative: child completion rolls
+up as an audited `rollup` event on the parent and can never complete it.
+Decomposition, linkage, and rollup are all card events. Powder still
+dispatches nothing; Bitterblossom or a human creates and routes children.
+
 Current local smoke paths:
 
 ```sh

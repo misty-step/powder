@@ -544,7 +544,7 @@ fn upsert_active_repository(store: &mut Store, name: &str) -> EvalResult<()> {
 fn assert_work_loop_end_state(db_path: &Path, run_id: &str) -> EvalResult<()> {
     let store = Store::open(db_path).map_err(to_string)?;
     let detail = store
-        .get_card_detail(&card_id("work-loop")?, DetailLevel::Detailed)
+        .get_card_detail(&card_id("work-loop")?, DetailLevel::Detailed, 0)
         .map_err(to_string)?
         .ok_or_else(|| "work-loop card missing after scenario".to_string())?;
     if detail.card.status != CardStatus::Done {

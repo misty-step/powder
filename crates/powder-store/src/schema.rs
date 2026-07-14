@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -53,9 +53,11 @@ CREATE TABLE IF NOT EXISTS cards (
   claim_acquired_at INTEGER,
   claim_expires_at INTEGER,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  parent TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent);
 
 CREATE TABLE IF NOT EXISTS repositories (
   name TEXT PRIMARY KEY,
@@ -364,20 +366,29 @@ pub const MIGRATE_12_TO_13: &str = r#"
 ALTER TABLE cards ADD COLUMN estimate TEXT;
 "#;
 
+/// powder-epic-hierarchy-rollup: explicit parent/child hierarchy edge. A
+/// child card names its parent; children are derived by query. Nullable --
+/// hierarchy is opt-in and `related`/`blocks`/`blocked_by` keep their
+/// existing semantics untouched.
+pub const MIGRATE_13_TO_14: &str = r#"
+ALTER TABLE cards ADD COLUMN parent TEXT;
+CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent);
+"#;
+
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
-created_at, updated_at";
+created_at, updated_at, parent";
 
 pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
-claim_expires_at, created_at, updated_at FROM cards WHERE id = ?1";
+claim_expires_at, created_at, updated_at, parent FROM cards WHERE id = ?1";
 
 pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo, workspace_path, branch_name,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
-claim_expires_at, created_at, updated_at FROM cards";
+claim_expires_at, created_at, updated_at, parent FROM cards";
 
 pub const RUN_SELECT_SQL: &str = "SELECT id, card_id, state, agent, claim_expires_at, proof,
 created_at, updated_at FROM runs WHERE id = ?1";

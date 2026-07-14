@@ -301,6 +301,7 @@ struct CreateCardRequest {
     related: Option<Vec<String>>,
     blocks: Option<Vec<String>>,
     blocked_by: Option<Vec<String>>,
+    parent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,6 +414,12 @@ struct RelationsRequest {
     related: Option<Vec<String>>,
     blocks: Option<Vec<String>>,
     blocked_by: Option<Vec<String>>,
+}
+
+/// `{"parent": "card-id"}` links; `{"parent": null}` (or `{}`) clears.
+#[derive(Debug, Deserialize)]
+struct ParentRequest {
+    parent: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,6 +588,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/transfer", post(transfer_claim))
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/relations", post(update_relations))
+        .route("/api/v1/cards/{id}/parent", post(set_parent))
         .route("/api/v1/cards/{id}/criteria/check", post(check_criterion))
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
@@ -857,7 +865,7 @@ async fn get_card(
     authorize_read(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let detail = lock_store(&state)?
-        .get_card_detail(&card_id, params.detail.unwrap_or_default())?
+        .get_card_detail(&card_id, params.detail.unwrap_or_default(), unix_now())?
         .ok_or_else(|| powder_core::DomainError::not_found("card", card_id.to_string()))?;
     Ok(Json(json!(detail)))
 }
@@ -919,6 +927,7 @@ async fn create_card(
     card.related = card_ids(request.related)?;
     card.blocks = card_ids(request.blocks)?;
     card.blocked_by = card_ids(request.blocked_by)?;
+    card.parent = request.parent.map(CardId::new).transpose()?;
     card.repo = request.repo;
     let card = {
         let mut store = lock_store(&state)?;
@@ -1073,6 +1082,19 @@ async fn update_relations(
         unix_now(),
         &actor.authority(),
     )?;
+    Ok(Json(card))
+}
+
+async fn set_parent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ParentRequest>,
+) -> Result<Json<Card>, ApiError> {
+    let actor = authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let parent = request.parent.map(CardId::new).transpose()?;
+    let card = lock_store(&state)?.set_parent(&card_id, parent, unix_now(), &actor.authority())?;
     Ok(Json(card))
 }
 

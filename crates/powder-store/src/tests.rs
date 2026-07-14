@@ -708,7 +708,7 @@ fn criteria_check_and_completion_proofs_are_persisted_and_audited() -> Result<()
         "https://example.test/pr"
     );
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "criterion"
@@ -760,7 +760,11 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
         .all(|card| card.repo.as_deref() == Some("canary")));
 
     let detail = store
-        .get_card_detail(&CardId::new("slug-canary")?, DetailLevel::Detailed)?
+        .get_card_detail(
+            &CardId::new("slug-canary")?,
+            DetailLevel::Detailed,
+            1_000_000,
+        )?
         .expect("rehomed card detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "repository"
@@ -959,7 +963,7 @@ fn claim_lifecycle_works_in_a_backburner_repository() -> Result<()> {
         CardStatus::Ready
     );
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert!(detail
         .activities
@@ -1001,6 +1005,209 @@ fn claim_and_ready_promotion_work_in_an_archived_repository() -> Result<()> {
 }
 
 #[test]
+fn set_parent_links_audits_and_round_trips() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("epic", 10), ready_card("child", 11)])?;
+    let child_id = CardId::new("child")?;
+    let epic_id = CardId::new("epic")?;
+
+    let child = store.set_parent(
+        &child_id,
+        Some(epic_id.clone()),
+        20,
+        &Authority::actor("operator", true),
+    )?;
+    assert_eq!(child.parent.as_ref(), Some(&epic_id));
+    assert_eq!(
+        store.get_card(&child_id)?.expect("child").parent.as_ref(),
+        Some(&epic_id),
+        "parent edge persists"
+    );
+
+    let child_detail = store
+        .get_card_detail(&child_id, DetailLevel::Detailed, 1_000_000)?
+        .expect("child detail");
+    assert!(child_detail.events.iter().any(|event| {
+        event.event_type == "hierarchy"
+            && event.actor == "operator"
+            && event.payload.contains("parent none -> epic")
+    }));
+    let epic_detail = store
+        .get_card_detail(&epic_id, DetailLevel::Detailed, 1_000_000)?
+        .expect("epic detail");
+    assert!(epic_detail.events.iter().any(|event| {
+        event.event_type == "decompose" && event.payload.contains("child child linked")
+    }));
+
+    let cleared = store.set_parent(&child_id, None, 30, &Authority::actor("operator", true))?;
+    assert_eq!(cleared.parent, None);
+    let epic_detail = store
+        .get_card_detail(&epic_id, DetailLevel::Detailed, 1_000_000)?
+        .expect("epic detail");
+    assert!(epic_detail.events.iter().any(|event| {
+        event.event_type == "hierarchy" && event.payload.contains("child child unlinked")
+    }));
+    Ok(())
+}
+
+#[test]
+fn set_parent_rejects_self_missing_and_cycles() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("epic", 10),
+        ready_card("middle", 11),
+        ready_card("leaf", 12),
+    ])?;
+    let authority = Authority::actor("operator", true);
+    let epic = CardId::new("epic")?;
+    let middle = CardId::new("middle")?;
+    let leaf = CardId::new("leaf")?;
+
+    let self_parent = store.set_parent(&epic, Some(epic.clone()), 20, &authority);
+    assert!(matches!(
+        self_parent,
+        Err(StoreError::Domain(DomainError::Validation { .. }))
+    ));
+
+    let missing = store.set_parent(&leaf, Some(CardId::new("ghost")?), 20, &authority);
+    assert!(matches!(
+        missing,
+        Err(StoreError::Domain(DomainError::NotFound { .. }))
+    ));
+
+    store.set_parent(&middle, Some(epic.clone()), 20, &authority)?;
+    store.set_parent(&leaf, Some(middle.clone()), 21, &authority)?;
+    let cycle = store.set_parent(&epic, Some(leaf.clone()), 22, &authority);
+    assert!(matches!(
+        cycle,
+        Err(StoreError::Domain(DomainError::Conflict(_)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn parent_detail_returns_children_and_deterministic_epic_state() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let authority = Authority::actor("operator", true);
+    store.import_cards(vec![
+        ready_card("epic", 10),
+        ready_card("child-a", 11),
+        ready_card("child-b", 12),
+    ])?;
+    let epic = CardId::new("epic")?;
+    let child_a = CardId::new("child-a")?;
+    let child_b = CardId::new("child-b")?;
+    store.set_parent(&child_a, Some(epic.clone()), 20, &authority)?;
+    store.set_parent(&child_b, Some(epic.clone()), 21, &authority)?;
+
+    store.claim_card(&child_a, "agent-a", 30, 600, &Authority::unchecked())?;
+    store.add_link(&child_a, "PR", "https://example.test/pr/7", 31)?;
+    store.complete_card(
+        &child_a,
+        Some("gates green; merged"),
+        Vec::new(),
+        32,
+        &authority,
+    )?;
+
+    let detail = store
+        .get_card_detail(&epic, DetailLevel::Detailed, 100)?
+        .expect("epic detail");
+    assert_eq!(detail.children_total, Some(2));
+    let child_ids = detail
+        .children
+        .iter()
+        .map(|child| child.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(child_ids, vec!["child-a", "child-b"], "creation order");
+
+    let epic_state = detail.epic_state.expect("epic state");
+    assert_eq!(epic_state.children_total, 2);
+    assert_eq!(epic_state.status_counts.get("done"), Some(&1));
+    assert_eq!(epic_state.status_counts.get("ready"), Some(&1));
+    let references = epic_state
+        .evidence
+        .iter()
+        .map(|entry| entry.reference.as_str())
+        .collect::<Vec<_>>();
+    assert!(references.contains(&"gates green; merged"), "run proof");
+    assert!(references.contains(&"https://example.test/pr/7"), "link");
+    assert!(
+        epic_state
+            .evidence
+            .iter()
+            .all(|entry| entry.child_id.as_str() == "child-a"),
+        "provenance"
+    );
+    assert!(epic_state.mismatches.is_empty());
+
+    // Child completion rolled up as an audit event on the parent -- and the
+    // parent's own status is untouched (child completion cannot complete
+    // the epic).
+    assert_eq!(detail.card.status, CardStatus::Ready);
+    assert!(detail.events.iter().any(|event| {
+        event.event_type == "rollup" && event.payload.contains("child child-a completed with proof")
+    }));
+
+    // A child card exposes no epic sections of its own.
+    let leaf_detail = store
+        .get_card_detail(&child_b, DetailLevel::Detailed, 100)?
+        .expect("leaf detail");
+    assert!(leaf_detail.children.is_empty());
+    assert_eq!(leaf_detail.children_total, None);
+    assert!(leaf_detail.epic_state.is_none());
+    Ok(())
+}
+
+#[test]
+fn create_card_with_parent_validates_and_audits_decomposition() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("epic", 10)])?;
+    let epic = CardId::new("epic")?;
+
+    let child = ready_card("born-child", 20).with_parent(Some(epic.clone()));
+    let saved = store.create_card_with_events(child, "operator", 20)?;
+    assert_eq!(saved.parent.as_ref(), Some(&epic));
+    let epic_detail = store
+        .get_card_detail(&epic, DetailLevel::Detailed, 1_000_000)?
+        .expect("epic detail");
+    assert!(epic_detail.events.iter().any(|event| {
+        event.event_type == "decompose" && event.payload.contains("child born-child created")
+    }));
+
+    let orphan = ready_card("orphan", 21).with_parent(Some(CardId::new("ghost")?));
+    let missing = store.create_card_with_events(orphan, "operator", 21);
+    assert!(matches!(
+        missing,
+        Err(StoreError::Domain(DomainError::NotFound { .. }))
+    ));
+    Ok(())
+}
+
+#[test]
+fn migration_13_to_14_adds_parent_to_existing_databases() -> Result<()> {
+    let path = temp_db("v13-parent");
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE cards (id TEXT PRIMARY KEY);
+             PRAGMA user_version = 13;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    assert!(store.cards_has_column("parent")?);
+    Ok(())
+}
+
+#[test]
 fn card_relations_round_trip_through_store_and_detail() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -1026,7 +1233,7 @@ fn card_relations_round_trip_through_store_and_detail() -> Result<()> {
     assert_eq!(card.blocked_by[0].as_str(), "blocker-parent");
 
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert_eq!(detail.card.related[0].as_str(), "neighbor");
     assert_eq!(detail.card.blocks[0].as_str(), "blocked-child");
@@ -1098,7 +1305,7 @@ fn add_comment_appears_in_get_card_detail_in_creation_order() -> Result<()> {
     let second = store.add_comment(&card_id, "codex", "second note", 20)?;
 
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert_eq!(detail.comments.len(), 2);
     assert_eq!(detail.comments[0].body, "first note");
@@ -1160,7 +1367,7 @@ fn append_work_log_appears_in_get_card_detail_in_creation_order() -> Result<()> 
     assert!(second.model.is_none());
 
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert_eq!(detail.work_log.len(), 2);
     assert_eq!(
@@ -1210,7 +1417,7 @@ fn concise_card_detail_bounds_work_log_with_totals_and_recent_order() -> Result<
     }
 
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Concise)?
+        .get_card_detail(&card_id, DetailLevel::Concise, 1_000_000)?
         .expect("card detail");
     assert_eq!(detail.work_log.len(), 20);
     assert_eq!(detail.work_log_total, Some(55));
@@ -1243,7 +1450,7 @@ fn detailed_card_detail_returns_full_work_log_in_existing_order() -> Result<()> 
     }
 
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert_eq!(detail.work_log.len(), 55);
     assert_eq!(detail.work_log_total, None);
@@ -1308,7 +1515,7 @@ fn append_work_log_scrubs_secrets_from_the_body_before_storage() -> Result<()> {
     assert!(entry.body.contains("[REDACTED:openai-key]"));
 
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert!(!detail.work_log[0]
         .body
@@ -1346,7 +1553,7 @@ fn any_status_transition_is_audited_without_matrix_enforcement() -> Result<()> {
 
     assert_eq!(card.status, CardStatus::Shipped);
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "status"
@@ -1516,7 +1723,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
         RunState::Active
     );
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "patch"
@@ -1574,7 +1781,7 @@ fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call
         RunState::Complete
     );
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert!(detail.events.iter().any(|event| {
         event.event_type == "status"
@@ -1889,7 +2096,7 @@ fn transfer_claim_moves_the_lease_to_a_new_agent_with_a_fresh_ttl() -> Result<()
 
     // Single handoff event naming both agents, not a release+claim pair.
     let detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert!(detail.activities.iter().any(|activity| {
         activity.payload.contains("agent-a") && activity.payload.contains("agent-b")
@@ -1975,7 +2182,7 @@ fn answer_input_preserves_question_and_resumes_run() -> Result<()> {
     );
 
     let card_detail = store
-        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
         .expect("card detail");
     assert_eq!(card_detail.card.status, CardStatus::AwaitingInput);
     assert_eq!(card_detail.runs.len(), 1);
@@ -3066,7 +3273,7 @@ fn field_note_generator_embeds_evidence_links_in_the_draft() -> Result<()> {
 
     let draft_id = CardId::new("field-note-source-beta")?;
     let draft_detail = store
-        .get_card_detail(&draft_id, DetailLevel::Detailed)?
+        .get_card_detail(&draft_id, DetailLevel::Detailed, 1_000_000)?
         .expect("draft card detail");
     assert!(draft_detail
         .card
