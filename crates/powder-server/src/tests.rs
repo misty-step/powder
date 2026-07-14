@@ -702,6 +702,90 @@ async fn card_relations_round_trip_through_http_api() {
     }));
 }
 
+/// powder-dogfood-2026-07-14-nonreciprocal-relations: a relations write
+/// against one card must be atomically reciprocal on the other -- reading
+/// either card back through the HTTP API shows the same edge, with no
+/// second call required.
+#[tokio::test]
+async fn card_relations_reciprocity_visible_on_both_sides_via_http_api() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    for id in ["recip-a", "recip-b"] {
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&raw_key),
+                &format!(r#"{{"id":"{id}","title":"Recip {id}","acceptance":["proof"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+    }
+
+    let updated = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/recip-a/relations",
+            Some(&raw_key),
+            r#"{"related":[],"blocks":[],"blocked_by":["recip-b"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let peer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/recip-b")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let peer = response_json(peer).await;
+    assert_eq!(peer["card"]["blocks"][0], "recip-a");
+    assert!(peer["events"].as_array().unwrap().iter().any(|event| {
+        event["event_type"] == "relations"
+            && event["payload"]
+                .to_string()
+                .contains("mirrored add blocks recip-a")
+    }));
+
+    // Removing the edge from recip-a's side unmirrors it from recip-b too.
+    let cleared = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/recip-a/relations",
+            Some(&raw_key),
+            r#"{"related":[],"blocks":[],"blocked_by":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+
+    let peer = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/recip-b")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let peer = response_json(peer).await;
+    assert!(peer["card"].get("blocks").is_none());
+}
+
 #[tokio::test]
 async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);

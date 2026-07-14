@@ -23,7 +23,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards",
         intent: "create one new card in the instance database, rejecting duplicate ids; response includes a hint field when the created card has no acceptance criteria",
         body_shape: Some(
-            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely; estimate is one of S|M|L|XL"#,
+            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely; estimate is one of S|M|L|XL; related/blocks/blocked_by are reciprocal -- naming an existing peer card mirrors the reverse edge onto it atomically (related is symmetric, blocks/blocked_by mirror each other); a peer id that doesn't exist is tolerated and simply not mirrored"#,
         ),
     },
     ApiRoute {
@@ -143,7 +143,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/relations",
-        intent: "replace a card's related, blocks, and blocked_by relation lists",
+        intent: "replace a card's related, blocks, and blocked_by relation lists; the delta (ids newly added or removed vs. the card's prior lists) is mirrored atomically onto every named peer that exists -- related is symmetric, blocks/blocked_by mirror each other -- so the two sides of an edge can never observably disagree; a dangling peer id is tolerated and just not mirrored; audited on this card and every touched peer",
         body_shape: None,
     },
     ApiRoute {

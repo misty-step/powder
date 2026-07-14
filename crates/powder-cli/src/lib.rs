@@ -21,6 +21,7 @@ pub const COMMANDS: &[&str] = &[
     "create-card",
     "update-card",
     "update-relations",
+    "relations-doctor",
     "set-parent",
     "list-ready",
     "list-cards",
@@ -111,6 +112,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
         [command, rest @ ..] if command == "update-card" => update_card(rest, remote_env),
         [command, rest @ ..] if command == "update-relations" => update_relations(rest),
+        [command, rest @ ..] if command == "relations-doctor" => relations_doctor(rest),
         [command, rest @ ..] if command == "set-parent" => set_parent(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
@@ -219,7 +221,13 @@ pub fn help() -> String {
         "  powder repository-normalize --db ./data/powder.db --actor operator  (one-time sweep: canonicalizes any legacy non-canonical cards.repo rows and audits each change)\n",
     );
     help.push_str(
-        "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000\n",
+        "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000  (mirrors reciprocally onto 002, 003, and 004 atomically)\n",
+    );
+    help.push_str(
+        "  powder relations-doctor --db ./data/powder.db  (report-only: cards whose blocks/blocked_by/related disagree with a peer)\n",
+    );
+    help.push_str(
+        "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (symmetrizes every found issue and audits each fix)\n",
     );
     help.push_str("  powder set-parent 002 --db ./data/powder.db --parent 001\n");
     help.push_str("  powder set-parent 002 --db ./data/powder.db --clear\n");
@@ -621,6 +629,22 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
         )
         .map_err(store_err)?;
     Ok(format!("relations\t{}\n", card.id))
+}
+
+/// Report (or, with `--repair`, fix) cards whose `blocks`/`blocked_by`/
+/// `related` edges disagree with a peer that names them back -- since
+/// `update-relations`/`create-card` mirror reciprocally now, this should
+/// only ever find drift from data written before that guarantee existed or
+/// written directly against the database.
+fn relations_doctor(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let actor = flag_value(args, "--actor").unwrap_or("operator");
+    let repair = has_flag(args, "--repair");
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let report = store
+        .relations_doctor(actor, now, repair)
+        .map_err(store_err)?;
+    to_pretty_json(&report)
 }
 
 /// `set-parent <id> --parent <parent-id>` links; `set-parent <id> --clear`
@@ -1659,6 +1683,7 @@ fn flag_takes_value(flag: &str) -> bool {
             | "--admin"
             | "--include-hidden"
             | "--unchecked"
+            | "--repair"
     )
 }
 
@@ -1704,6 +1729,7 @@ mod tests {
         assert!(COMMANDS.contains(&"repository-delete"));
         assert!(COMMANDS.contains(&"repository-normalize"));
         assert!(COMMANDS.contains(&"update-relations"));
+        assert!(COMMANDS.contains(&"relations-doctor"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
         assert!(COMMANDS.contains(&"renew-claim"));
@@ -2301,6 +2327,83 @@ mod tests {
         .unwrap();
         assert!(output.contains("\"scanned\": 1"), "output was: {output}");
         assert!(output.contains("\"changes\": []"), "output was: {output}");
+    }
+
+    /// powder-dogfood-2026-07-14-nonreciprocal-relations: `update-relations`
+    /// mirrors onto the peer reciprocally, so `relations-doctor` finds no
+    /// issues over a graph built entirely through the CLI's own public
+    /// commands -- and `get-card` on the peer already shows the mirrored
+    /// edge with no second `update-relations` call.
+    #[test]
+    fn cli_update_relations_mirrors_and_relations_doctor_reports_clean() {
+        assert!(COMMANDS.contains(&"relations-doctor"));
+
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-relations-doctor-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        for id in ["cli-rel-a", "cli-rel-b"] {
+            run(&args([
+                "create-card",
+                "--db",
+                &db,
+                "--id",
+                id,
+                "--title",
+                id,
+                "--acceptance",
+                "proof exists",
+            ]))
+            .unwrap();
+        }
+
+        run(&args([
+            "update-relations",
+            "cli-rel-a",
+            "--db",
+            &db,
+            "--blocked-by",
+            "cli-rel-b",
+        ]))
+        .unwrap();
+
+        let peer = run(&args(["get-card", "cli-rel-b", "--db", &db])).unwrap();
+        assert!(
+            peer.contains("\"blocks\"") && peer.contains("cli-rel-a"),
+            "peer output was: {peer}"
+        );
+
+        let report = run(&args(["relations-doctor", "--db", &db])).unwrap();
+        assert!(report.contains("\"scanned\": 2"), "report was: {report}");
+        assert!(report.contains("\"issues\": []"), "report was: {report}");
+        assert!(
+            report.contains("\"repaired\": false"),
+            "report was: {report}"
+        );
+
+        let repaired = run(&args([
+            "relations-doctor",
+            "--db",
+            &db,
+            "--repair",
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert!(
+            repaired.contains("\"issues\": []"),
+            "report was: {repaired}"
+        );
+        assert!(
+            repaired.contains("\"repaired\": true"),
+            "report was: {repaired}"
+        );
     }
 
     #[test]

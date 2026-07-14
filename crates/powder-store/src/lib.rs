@@ -16,6 +16,7 @@ use serde_json::json;
 mod answer_loop;
 mod events;
 mod identity;
+mod relations;
 mod repositories;
 mod schema;
 mod secrets;
@@ -27,6 +28,8 @@ pub use events::{
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
+use relations::{list_delta, mirror_delta, mirror_initial_relations};
+pub use relations::{RelationField, RelationsDoctorIssue, RelationsDoctorReport};
 use repositories::{ensure_repository_entity, resolve_repository_name};
 pub use repositories::{
     RepositoryMergeOutcome, RepositoryNormalizeChange, RepositoryNormalizeOutcome,
@@ -1016,6 +1019,12 @@ impl Store {
                 now,
             )?;
         }
+        // A card born with related/blocks/blocked_by already set mirrors
+        // those edges onto the named peers in the same transaction --
+        // reciprocity is a birth-time guarantee, not something the caller
+        // has to establish with follow-up update_relations calls
+        // (powder-dogfood-2026-07-14-nonreciprocal-relations).
+        mirror_initial_relations(&transaction, &saved, &actor, now)?;
         events::append_outbound_card_event(
             &transaction,
             &saved,
@@ -1524,6 +1533,17 @@ impl Store {
         Ok(card)
     }
 
+    /// Replace a card's `related`/`blocks`/`blocked_by` lists and mirror
+    /// exactly the delta onto every touched peer, atomically, in the same
+    /// transaction as the primary write
+    /// (powder-dogfood-2026-07-14-nonreciprocal-relations): an id newly
+    /// added to `blocked_by` gets this card added to its own `blocks`; an
+    /// id removed gets this card removed from its `blocks`; `related` is
+    /// symmetric both ways. Only the changed ids are touched on a peer --
+    /// its other, unrelated relations are left alone. A dangling id (no
+    /// card with that id exists) is tolerated, same as before this change;
+    /// mirroring is simply skipped for it. See the `relations` module doc
+    /// comment for the full design rationale.
     pub fn update_relations(
         &mut self,
         card_id: &CardId,
@@ -1537,19 +1557,51 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        let actor = authority.actor_label();
+
+        let related_delta = list_delta(&card.related, &related);
+        let blocks_delta = list_delta(&card.blocks, &blocks);
+        let blocked_by_delta = list_delta(&card.blocked_by, &blocked_by);
+
         card.apply_relations(related, blocks, blocked_by, now);
         persist_card(&transaction, &card)?;
         append_card_event(
             &transaction,
             card_id,
             "relations",
-            &authority.actor_label(),
+            &actor,
             &format!(
                 "related={:?} blocks={:?} blocked_by={:?}",
                 card.related, card.blocks, card.blocked_by
             ),
             now,
         )?;
+
+        mirror_delta(
+            &transaction,
+            card_id,
+            RelationField::Related,
+            &related_delta,
+            &actor,
+            now,
+        )?;
+        mirror_delta(
+            &transaction,
+            card_id,
+            RelationField::Blocks,
+            &blocks_delta,
+            &actor,
+            now,
+        )?;
+        mirror_delta(
+            &transaction,
+            card_id,
+            RelationField::BlockedBy,
+            &blocked_by_delta,
+            &actor,
+            now,
+        )?;
+
         transaction.commit()?;
         Ok(card)
     }
