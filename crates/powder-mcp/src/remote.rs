@@ -11,9 +11,8 @@ use serde_json::{json, Value};
 
 use super::{
     card_id, claim_action, missing_required, optional_repository_tier,
-    optional_repository_visibility, optional_str, parse_autonomy, parse_estimate, parse_priority,
-    parse_status, required_claim_arg, required_str, run_id, run_id_for_claim, to_string,
-    ClaimAction,
+    optional_repository_visibility, optional_str, parse_estimate, parse_priority, parse_status,
+    required_claim_arg, required_str, run_id, run_id_for_claim, to_string, ClaimAction,
 };
 
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
@@ -35,10 +34,6 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(status) = explicit_status {
                 parse_status(status)?;
                 query.push_str(&format!("&status={}", urlencode(status)));
-            }
-            if let Some(autonomy) = optional_str(args, "autonomy") {
-                parse_autonomy(autonomy)?;
-                query.push_str(&format!("&autonomy={}", urlencode(autonomy)));
             }
             if let Some(estimate) = optional_str(args, "estimate") {
                 parse_estimate(estimate)?;
@@ -90,10 +85,6 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 parse_status(value)?;
                 body["status"] = json!(value);
             }
-            if let Some(value) = optional_str(args, "autonomy") {
-                parse_autonomy(value)?;
-                body["autonomy"] = json!(value);
-            }
             if let Some(value) = optional_str(args, "priority") {
                 parse_priority(value)?;
                 body["priority"] = json!(value);
@@ -132,10 +123,6 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = optional_str(args, "status") {
                 parse_status(value)?;
                 body["status"] = json!(value);
-            }
-            if let Some(value) = optional_str(args, "autonomy") {
-                parse_autonomy(value)?;
-                body["autonomy"] = json!(value);
             }
             if let Some(value) = optional_str(args, "priority") {
                 parse_priority(value)?;
@@ -806,17 +793,6 @@ mod tests {
         assert_eq!(
             invalid_priority,
             "invalid priority \"urgent\"; valid: P0|P1|P2|P3"
-        );
-
-        let invalid_autonomy = call_tool_remote(
-            &client,
-            "create_card",
-            &json!({"id": "001", "title": "Remote", "autonomy": "robot"}),
-        )
-        .unwrap_err();
-        assert_eq!(
-            invalid_autonomy,
-            "invalid autonomy \"robot\"; valid: auto|review"
         );
 
         assert!(

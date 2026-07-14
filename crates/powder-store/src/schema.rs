@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -35,7 +35,6 @@ CREATE TABLE IF NOT EXISTS cards (
   criteria_json TEXT NOT NULL DEFAULT '[]',
   proof_plan_json TEXT NOT NULL DEFAULT '[]',
   status TEXT NOT NULL,
-  autonomy TEXT NOT NULL DEFAULT 'review',
   priority TEXT NOT NULL,
   estimate TEXT,
   labels_json TEXT NOT NULL,
@@ -383,17 +382,27 @@ ALTER TABLE cards DROP COLUMN workspace_path;
 ALTER TABLE cards DROP COLUMN branch_name;
 "#;
 
-pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,
+/// powder-autonomy-removal: `autonomy` (`auto`/`review`) gated nothing --
+/// `claim_readiness` never consulted it, and the approval queue keys on
+/// `run.state` plus approval-labeled links, not autonomy. Pure decorative
+/// metadata; dropped outright with no compatibility shim, following the
+/// `MIGRATE_3_TO_4`/`MIGRATE_14_TO_15` precedent for dead columns. Legacy
+/// values are discarded, not migrated to any replacement field.
+pub const MIGRATE_15_TO_16: &str = r#"
+ALTER TABLE cards DROP COLUMN autonomy;
+"#;
+
+pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, source_path,
 source_digest, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
 created_at, updated_at, parent";
 
-pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
+pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at, parent FROM cards WHERE id = ?1";
 
-pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate,
+pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
 source_path, source_digest, claim_agent, claim_run_id, claim_acquired_at,
 claim_expires_at, created_at, updated_at, parent FROM cards";
