@@ -22,4 +22,32 @@ cargo run -q -p powder-cli -- create-card --db "$DB" --id 001 --title "Lifecycle
 cargo run -q -p powder-cli -- create-card --db "$DB" --id blocked-card --title "Blocked card" --acceptance "dependency clears" --status blocked >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id done-card --title "Done card" --acceptance "proof exists" --status done >/dev/null
 
+# powder-ui-awaiting-you: a claimed, in-flight run parked on an operator
+# question so the awaiting-you strip/badge/answer-form law-gate specs have a
+# real elicitation to render and answer against. Deliberately no trailing
+# numeric id segment (`repo_from_numeric_card_id_prefix`, powder-core) --
+# a plain "-NNN" suffix would auto-assign a distinct repo and disturb the
+# "local"-repo sort order the existing board-card-link test's "first card
+# is 001" assumption depends on.
+cargo run -q -p powder-cli -- create-card --db "$DB" --id awaiting-answer --title "Needs an operator answer" --acceptance "operator responds" --status ready >/dev/null
+AWAITING_CLAIM="$(cargo run -q -p powder-cli -- claim awaiting-answer --db "$DB" --agent law-gate-agent --ttl 3600)"
+AWAITING_RUN_ID="$(printf '%s' "$AWAITING_CLAIM" | cut -f3)"
+cargo run -q -p powder-cli -- request-input "$AWAITING_RUN_ID" --db "$DB" --question "Ship this behind a flag or straight to prod?" >/dev/null
+
+# powder-ui-hierarchy-render: an epic with two children in different states,
+# one checked criterion, and one piece of link evidence, so detail-view
+# children/epic-state rendering and the board's "part of <epic>" child badge
+# both have real data. epic-mismatch is a second, deliberately mismatched
+# epic (parent already done while its only child is not terminal) so the
+# mismatch-as-warning styling has something real to assert against. Same
+# no-numeric-suffix id convention as above.
+cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-hierarchy --title "Epic: ship the hierarchy view" --acceptance "children roll up cleanly" --status ready >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-hierarchy-child-a --title "Child A: backend endpoint" --acceptance "endpoint returns 200" --status done --parent epic-hierarchy >/dev/null
+cargo run -q -p powder-cli -- check-criterion epic-hierarchy-child-a --db "$DB" --criterion 0 --actor law-gate-agent >/dev/null
+cargo run -q -p powder-cli -- add-link epic-hierarchy-child-a --db "$DB" --label "proof" --url "https://example.test/pr/1" >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-hierarchy-child-b --title "Child B: board UI" --acceptance "UI renders hierarchy" --status ready --parent epic-hierarchy >/dev/null
+
+cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-mismatch --title "Epic: mismatch example" --acceptance "children complete" --status done >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-mismatch-child-a --title "Child: still running" --acceptance "work finishes" --status ready --parent epic-mismatch >/dev/null
+
 exec cargo run -q -p powder-server
