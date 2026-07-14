@@ -31,7 +31,8 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mut query = format!("limit={limit}");
-            if let Some(status) = optional_str(args, "status") {
+            let explicit_status = optional_str(args, "status");
+            if let Some(status) = explicit_status {
                 parse_status(status)?;
                 query.push_str(&format!("&status={}", urlencode(status)));
             }
@@ -46,6 +47,17 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(repo) = optional_str(args, "repo") {
                 query.push_str(&format!("&repo={}", urlencode(repo)));
             }
+            // powder-mcp-unfiltered-enumeration: same default as the local
+            // (store-backed) dispatch path -- an unfiltered call hides
+            // terminal cards unless the caller passes include_terminal:true;
+            // an explicit status filter is authoritative (the server ignores
+            // include_terminal when status is set, but forwarding true keeps
+            // the wire request self-describing). Always sent explicitly
+            // because the HTTP route's own default is true (unchanged
+            // historical behavior for non-MCP HTTP callers).
+            let include_terminal =
+                explicit_status.is_some() || args["include_terminal"].as_bool().unwrap_or(false);
+            query.push_str(&format!("&include_terminal={include_terminal}"));
             let response = client.get(&format!("/api/v1/cards?{query}"))?;
             remote_card_summary_page_payload(response)?
         }
@@ -407,6 +419,15 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
 }
 
 fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
+    // The deployed server reports how many matches were held back by
+    // `include_terminal=false` (powder-mcp-unfiltered-enumeration); absent
+    // (older servers, `list_ready`, or include_terminal=true) it is 0 and
+    // the hint below degrades to the historical "raise limit" text.
+    let excluded_terminal_count = response
+        .get("excluded_terminal_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
     let page = parse_list_page(response)?;
     let total_count = page.total_count;
     let has_more = page.has_more;
@@ -418,11 +439,10 @@ fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
         "total_count": total_count,
         "has_more": has_more,
     });
-    if has_more {
-        payload["hint"] = json!(format!(
-            "{} more cards; filter by status/repo or raise limit",
-            total_count.saturating_sub(cards.len())
-        ));
+    if let Some(hint) =
+        crate::list_cards_hint(summaries.len(), total_count, excluded_terminal_count)
+    {
+        payload["hint"] = json!(hint);
     }
     Ok(payload)
 }
@@ -951,9 +971,82 @@ mod tests {
             .contains("blocked-1"));
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "GET");
+        // include_terminal=true here because an explicit status filter is
+        // authoritative (powder-mcp-unfiltered-enumeration).
         assert_eq!(
             requests[0].path,
-            "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample"
+            "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample&include_terminal=true"
+        );
+    }
+
+    /// powder-mcp-unfiltered-enumeration (rev-125 fix): production runs MCP
+    /// in remote mode, so the default terminal exclusion must reach the
+    /// deployed server as `include_terminal=false` on the wire -- an
+    /// earlier revision applied the default only in the local store-backed
+    /// dispatch path, leaving remote agents with the full terminal flood.
+    /// The exclusion itself must happen server-side (a client-side
+    /// post-filter would under-return: the server truncates to `limit`
+    /// before any client could exclude). This asserts the wire query and
+    /// that the envelope built from the server's response carries the
+    /// terminal-inclusive `total_count` plus the accurate two-remedy hint
+    /// from the server-reported `excluded_terminal_count`.
+    #[test]
+    fn unfiltered_list_cards_forwards_include_terminal_false_and_projects_the_exclusion() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({
+                    // What a deployed powder-server returns for
+                    // include_terminal=false on a board of 1 ready + 1 done:
+                    // only the non-terminal card, the full match count, and
+                    // how many of those matches were held back as terminal.
+                    "cards": [api_card("ready-1", "Ready remote", "ready", "p0", 10)],
+                    "total_count": 2,
+                    "has_more": true,
+                    "excluded_terminal_count": 1
+                }),
+            ),
+            (
+                200,
+                json!({
+                    "cards": [
+                        api_card("ready-1", "Ready remote", "ready", "p0", 10),
+                        api_card("done-1", "Done remote", "done", "p0", 5)
+                    ],
+                    "total_count": 2,
+                    "has_more": false
+                }),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, None);
+
+        let unfiltered = call_tool_remote(&client, "list_cards", &json!({})).unwrap();
+        let payload = tool_payload(&unfiltered);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["cards"][0]["id"], "ready-1");
+        assert_eq!(
+            payload["total_count"], 2,
+            "total_count must stay terminal-inclusive so absence is never mistakable"
+        );
+        assert_eq!(
+            payload["hint"],
+            "1 terminal cards hidden (done/shipped/abandoned); pass include_terminal:true to see them"
+        );
+
+        let full_sweep =
+            call_tool_remote(&client, "list_cards", &json!({"include_terminal": true})).unwrap();
+        let payload = tool_payload(&full_sweep);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 2);
+        assert!(payload.get("hint").is_none());
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            requests[0].path, "/api/v1/cards?limit=20&include_terminal=false",
+            "an unfiltered remote list_cards must ask the server to exclude terminal cards"
+        );
+        assert_eq!(
+            requests[1].path,
+            "/api/v1/cards?limit=20&include_terminal=true"
         );
     }
 
@@ -1002,7 +1095,10 @@ mod tests {
 
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].path, "/api/v1/cards/ready?limit=5&estimate=S");
-        assert_eq!(requests[1].path, "/api/v1/cards?limit=5&estimate=M");
+        assert_eq!(
+            requests[1].path,
+            "/api/v1/cards?limit=5&estimate=M&include_terminal=false"
+        );
         assert_eq!(requests[2].body.as_ref().unwrap()["estimate"], "L");
         assert_eq!(
             requests[3].body,

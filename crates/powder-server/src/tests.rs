@@ -880,6 +880,111 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     );
 }
 
+/// powder-mcp-unfiltered-enumeration (rev-125 fix): `GET /api/v1/cards`
+/// accepts an optional `include_terminal` query param so the remote MCP
+/// dispatch path can apply the same default terminal exclusion as local
+/// (store-backed) MCP mode -- the exclusion must happen server-side, since
+/// the server truncates to `limit` before any client could post-filter.
+/// Defaulting to `true` keeps every existing HTTP caller's behavior
+/// byte-for-byte unchanged (including the absence of the additive
+/// `excluded_terminal_count` field, which appears only when nonzero).
+#[tokio::test]
+async fn list_cards_include_terminal_param_hides_terminal_server_side_and_defaults_to_true() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    for body in [
+        r#"{"id":"done-1","title":"Done","acceptance":["x"],"status":"done"}"#,
+        r#"{"id":"ready-1","title":"Ready","acceptance":["x"],"status":"ready"}"#,
+    ] {
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&raw_key),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+    }
+
+    let ids_from = |value: &serde_json::Value| -> Vec<String> {
+        value["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // No param: historical whole-board behavior, no new response field.
+    let default_sweep = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(default_sweep.status(), StatusCode::OK);
+    let default_sweep = response_json(default_sweep).await;
+    assert_eq!(default_sweep["cards"].as_array().unwrap().len(), 2);
+    assert_eq!(default_sweep["total_count"], 2);
+    assert!(default_sweep.get("excluded_terminal_count").is_none());
+
+    // include_terminal=false: terminal cards excluded server-side,
+    // total_count still terminal-inclusive, held-back count reported.
+    let excluded = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?include_terminal=false",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(excluded.status(), StatusCode::OK);
+    let excluded = response_json(excluded).await;
+    assert_eq!(ids_from(&excluded), vec!["ready-1".to_string()]);
+    assert_eq!(excluded["total_count"], 2);
+    assert_eq!(excluded["has_more"], true);
+    assert_eq!(excluded["excluded_terminal_count"], 1);
+
+    // Explicit include_terminal=true: same as the default.
+    let full_sweep = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?include_terminal=true",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let full_sweep = response_json(full_sweep).await;
+    assert_eq!(full_sweep["cards"].as_array().unwrap().len(), 2);
+    assert!(full_sweep.get("excluded_terminal_count").is_none());
+
+    // An explicit status filter is authoritative over include_terminal.
+    let explicit_done = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?status=done&include_terminal=false",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let explicit_done = response_json(explicit_done).await;
+    assert_eq!(ids_from(&explicit_done), vec!["done-1".to_string()]);
+    assert!(explicit_done.get("excluded_terminal_count").is_none());
+}
+
 /// powder-966: an agent judging chewability from a list response must see
 /// the same acceptance-criterion text `get_card` would show, not a clipped
 /// preview. `GET /api/v1/cards` and `GET /api/v1/cards/ready` both serialize

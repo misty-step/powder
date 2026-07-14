@@ -30,6 +30,7 @@ pub const COMMANDS: &[&str] = &[
     "repository-upsert",
     "repository-merge-alias",
     "repository-delete",
+    "repository-normalize",
     "claim",
     "release-claim",
     "renew-claim",
@@ -118,6 +119,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "repository-upsert" => repository_upsert(rest),
         [command, rest @ ..] if command == "repository-merge-alias" => repository_merge_alias(rest),
         [command, rest @ ..] if command == "repository-delete" => repository_delete(rest),
+        [command, rest @ ..] if command == "repository-normalize" => repository_normalize(rest),
         [command, rest @ ..] if command == "claim" => claim(rest, remote_env),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest, remote_env),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest, remote_env),
@@ -201,6 +203,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator\n",
+    );
+    help.push_str(
+        "  powder repository-normalize --db ./data/powder.db --actor operator  (one-time sweep: canonicalizes any legacy non-canonical cards.repo rows and audits each change)\n",
     );
     help.push_str(
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000\n",
@@ -682,6 +687,10 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
             autonomy,
             estimate,
             repo: repo.clone(),
+            // powder-mcp-unfiltered-enumeration: only the MCP `list_cards`
+            // tool defaults to hiding terminal cards; the CLI keeps its
+            // existing whole-board behavior unchanged.
+            include_terminal: true,
         };
         json!(store.list_cards(&filter, limit).map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
@@ -797,6 +806,22 @@ fn repository_delete(args: &[String]) -> Result<String, ShellError> {
     let mut store = open_store(required_flag(args, "--db")?)?;
     store.delete_repository(name).map_err(store_err)?;
     Ok(format!("deleted\t{name}\n"))
+}
+
+/// powder-904: admin-ish, local-db-only sweep -- normalizes every card
+/// whose stored `repo` column is an alias or org-prefixed string (predating
+/// write-time canonicalization, or written by a path that bypassed it) to
+/// its canonical short name, auditing each change with a card event. No
+/// remote/API-mode equivalent: this reaches into one instance's own SQLite
+/// file, the same shape as `key-create`/`key-list`/`key-revoke`.
+fn repository_normalize(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let actor = flag_value(args, "--actor").unwrap_or("operator");
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let outcome = store
+        .normalize_repository_strings(actor, now)
+        .map_err(store_err)?;
+    to_pretty_json(&outcome)
 }
 
 fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1630,6 +1655,7 @@ mod tests {
         assert!(COMMANDS.contains(&"repository-upsert"));
         assert!(COMMANDS.contains(&"repository-merge-alias"));
         assert!(COMMANDS.contains(&"repository-delete"));
+        assert!(COMMANDS.contains(&"repository-normalize"));
         assert!(COMMANDS.contains(&"update-relations"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
@@ -2186,6 +2212,59 @@ mod tests {
         assert!(card.contains("\"repo\": \"canary\""));
         assert!(card.contains("\"event_type\": \"repository\""));
         assert!(card.contains("legacy-canary -> canary"));
+    }
+
+    /// powder-904: `repository-normalize` is admin-ish/local-db-only, wired
+    /// straight to `Store::normalize_repository_strings`. Every write path
+    /// already canonicalizes `cards.repo` at write time (see
+    /// `powder-store::tests::create_card_with_events_normalizes_alias_repo_string_at_write_time`),
+    /// so there is no way to produce a non-canonical row through this CLI's
+    /// own public commands to normalize away -- the sweep's actual
+    /// rewrite-and-audit behavior against a legacy (pre-normalization) row
+    /// is covered at the store level
+    /// (`normalize_repository_strings_sweeps_legacy_rows_and_audits_each_change`).
+    /// This test instead locks in the CLI plumbing: the subcommand is
+    /// registered, accepts `--db`/`--actor`, and returns the sweep's JSON
+    /// shape for an already-canonical board (a real no-op run, not a stub).
+    #[test]
+    fn cli_repository_normalize_sweeps_an_already_canonical_board_as_a_no_op() {
+        assert!(COMMANDS.contains(&"repository-normalize"));
+
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-repository-normalize-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "already-canonical",
+            "--title",
+            "Already canonical",
+            "--acceptance",
+            "proof exists",
+            "--repo",
+            "misty-step/canary",
+        ]))
+        .unwrap();
+
+        let output = run(&args([
+            "repository-normalize",
+            "--db",
+            &db,
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert!(output.contains("\"scanned\": 1"), "output was: {output}");
+        assert!(output.contains("\"changes\": []"), "output was: {output}");
     }
 
     #[test]
