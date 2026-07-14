@@ -30,8 +30,8 @@ pub use events::{
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 use repositories::{ensure_repository_entity, resolve_repository_name};
 pub use repositories::{
-    RepositoryMergeOutcome, RepositorySummary, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility,
+    RepositoryMergeOutcome, RepositoryNormalizeChange, RepositoryNormalizeOutcome,
+    RepositorySummary, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
 };
 
 use schema::{
@@ -119,18 +119,54 @@ const FIELD_NOTE_DRAFT_LABEL: &str = "field-note-draft";
 
 /// Filter for [`Store::list_cards`]: `None` on either field means
 /// unfiltered on that dimension.
-#[derive(Debug, Clone, Default)]
+///
+/// `include_terminal` decides whether `Done`/`Shipped`/`Abandoned` cards are
+/// eligible when no explicit `status` is requested (an explicit `status`
+/// always wins -- asking for `status: done` returns `done` cards regardless
+/// of this flag; see `list_cards_page`). It defaults to `true` (the
+/// pre-powder-mcp-unfiltered-enumeration behavior: an unfiltered query sees
+/// the whole board, terminal cards included) so every existing caller of
+/// `CardFilter::default()` -- the HTTP `list_cards` route, the `powder
+/// list-cards` CLI command, and the plain-store test suite -- keeps its
+/// current behavior unchanged. Only `powder-mcp`'s `list_cards` tool opts
+/// into `include_terminal: false` by default, because an agent enumerating
+/// "what's on the board" with no filter is far more likely to be surprised
+/// by a done/shipped/abandoned card silently filling its result window than
+/// to be relying on seeing one.
+#[derive(Debug, Clone)]
 pub struct CardFilter {
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
     pub autonomy: Option<AutonomyClass>,
     pub estimate: Option<Estimate>,
+    pub include_terminal: bool,
+}
+
+impl Default for CardFilter {
+    fn default() -> Self {
+        CardFilter {
+            status: None,
+            repo: None,
+            autonomy: None,
+            estimate: None,
+            include_terminal: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardListPage {
     pub cards: Vec<Card>,
     pub total_count: usize,
+    /// How many of `total_count` were held back by
+    /// [`CardFilter::include_terminal`]`: false` (always 0 when the filter
+    /// includes terminal cards, when an explicit `status` was requested, or
+    /// for `list_ready`). Kept separate so an envelope can distinguish "more
+    /// matches beyond `limit` -- raise the limit" from "matches hidden by
+    /// the terminal exclusion -- pass `include_terminal: true`": raising the
+    /// limit does nothing for the latter, and a hint that conflates the two
+    /// sends an agent in a loop.
+    pub excluded_terminal_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -591,6 +627,16 @@ impl Store {
     ) -> Result<Card> {
         let actor = non_empty("actor", actor)?;
         let card_id = card.id.clone();
+        card.title = secrets::scrub_secrets(&card.title);
+        card.body = secrets::scrub_secrets(&card.body);
+        // `acceptance` and `criteria` carry the same author-supplied text
+        // (with_acceptance derives one from the other); scrub both with the
+        // same deterministic function so they stay consistent.
+        card.acceptance = scrub_string_list(std::mem::take(&mut card.acceptance));
+        for criterion in &mut card.criteria {
+            criterion.text = secrets::scrub_secrets(&criterion.text);
+        }
+        card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
         if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
             match card.repo.as_deref() {
                 Some(repo) if !canonical_repo_matches(repo, &derived_repo) => {
@@ -660,19 +706,19 @@ impl Store {
         let mut patched_fields = Vec::new();
 
         if let Some(title) = patch.title {
-            card.title = non_empty("title", &title)?;
+            card.title = non_empty_scrubbed("title", &title)?;
             patched_fields.push("title");
         }
         if let Some(body) = patch.body {
-            card.body = body;
+            card.body = secrets::scrub_secrets(&body);
             patched_fields.push("body");
         }
         if let Some(acceptance) = patch.acceptance {
-            card = card.with_acceptance(acceptance);
+            card = card.with_acceptance(scrub_string_list(acceptance));
             patched_fields.push("acceptance");
         }
         if let Some(proof_plan) = patch.proof_plan {
-            card = card.with_proof_plan(proof_plan);
+            card = card.with_proof_plan(scrub_string_list(proof_plan));
             patched_fields.push("proof_plan");
         }
         if let Some(priority) = patch.priority {
@@ -828,7 +874,11 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
         });
         cards.truncate(query.limit);
-        Ok(CardListPage { cards, total_count })
+        Ok(CardListPage {
+            cards,
+            total_count,
+            excluded_terminal_count: 0,
+        })
     }
 
     /// List cards by optional `status`/`autonomy`/`repo` filter, not just ready-eligible
@@ -882,7 +932,22 @@ impl Store {
                 None => !repo_filter_requested,
             })
             .collect::<Vec<_>>();
+        // `total_count` reports how many cards match the caller's *explicit*
+        // status/repo/autonomy/estimate filters -- deliberately computed
+        // before the `include_terminal` exclusion below, so a caller that
+        // asks for the whole board (no explicit status) and gets terminal
+        // cards silently held back still sees the true match count rather
+        // than an undercount that reads as "the board is smaller than it
+        // is." An explicit `status` filter is authoritative and is never
+        // second-guessed by `include_terminal`. The number held back is
+        // reported separately as `excluded_terminal_count` so envelope
+        // builders can say exactly which remedy (raise `limit` vs. pass
+        // `include_terminal: true`) recovers which cards.
         let total_count = cards.len();
+        if filter.status.is_none() && !filter.include_terminal {
+            cards.retain(|card| !card.status.is_terminal());
+        }
+        let excluded_terminal_count = total_count - cards.len();
 
         cards.sort_by(|left, right| {
             left.priority
@@ -891,7 +956,22 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
         });
         cards.truncate(limit.max(1));
-        Ok(CardListPage { cards, total_count })
+        Ok(CardListPage {
+            cards,
+            total_count,
+            excluded_terminal_count,
+        })
+    }
+
+    /// Raw count of every card in the store, ignoring every filter
+    /// dimension -- used by `powder-mcp`'s `list_cards` envelope to tell a
+    /// caller whose filtered query matched zero cards how large the board
+    /// actually is, so a narrow filter never reads as an empty board.
+    pub fn card_count(&self) -> Result<usize> {
+        Ok(self
+            .connection
+            .query_row("SELECT COUNT(*) FROM cards", [], |row| row.get::<_, i64>(0))?
+            as usize)
     }
 
     pub fn board_stats(&self, query: BoardStatsQuery) -> Result<BoardStats> {
@@ -1388,8 +1468,8 @@ impl Store {
         let card = load_card(&transaction, card_id)?;
         let comment = Comment {
             card_id: card_id.clone(),
-            author: non_empty("author", author)?,
-            body: non_empty("body", body)?,
+            author: non_empty_scrubbed("author", author)?,
+            body: non_empty_scrubbed("body", body)?,
             created_at: now,
         };
         let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
@@ -1441,11 +1521,14 @@ impl Store {
         let entry = WorkLogEntry {
             card_id: card_id.clone(),
             agent: non_empty("agent", agent)?,
-            model: attribution.model.map(str::to_owned),
-            reasoning: attribution.reasoning.map(str::to_owned),
-            harness: attribution.harness.map(str::to_owned),
+            // Attribution fields are caller-supplied free text too --
+            // `reasoning` especially is documented chain-of-thought, the
+            // highest-risk leak class this module's scrub exists for.
+            model: attribution.model.map(secrets::scrub_secrets),
+            reasoning: attribution.reasoning.map(secrets::scrub_secrets),
+            harness: attribution.harness.map(secrets::scrub_secrets),
             run_id,
-            body: secrets::scrub_secrets(&non_empty("body", body)?),
+            body: non_empty_scrubbed("body", body)?,
             created_at: now,
         };
         let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
@@ -1488,7 +1571,7 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Run> {
-        let question = non_empty("question", question)?;
+        let question = non_empty_scrubbed("question", question)?;
         let mut run = self
             .get_run(run_id)?
             .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?;
@@ -1540,7 +1623,9 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
-        let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
+        let proof = proof
+            .map(|value| non_empty_scrubbed("proof", value))
+            .transpose()?;
         let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
         let field_note_config = self.field_note_config.clone();
         let transaction = self
@@ -1757,7 +1842,7 @@ fn insert_link(
     let link = Link {
         id: LinkId::new(format!("link-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
         card_id: card_id.clone(),
-        label: non_empty("label", label)?,
+        label: non_empty_scrubbed("label", label)?,
         url: non_empty("url", url)?,
         created_at: now,
     };
@@ -2152,6 +2237,28 @@ fn non_empty(field: &'static str, value: &str) -> Result<String> {
     } else {
         Ok(trimmed.to_owned())
     }
+}
+
+/// `non_empty` plus [`secrets::scrub_secrets`] in one call: the write-boundary
+/// helper for every agent/human free-text field (powder-scrub-write-boundary).
+/// Scrubbing happens here, inside the store's own write functions, rather
+/// than in any adapter, so there is exactly one seam credential-shaped text
+/// must cross on its way into persistence -- outbound event payloads built
+/// from the already-scrubbed value are clean for free.
+fn non_empty_scrubbed(field: &'static str, value: &str) -> Result<String> {
+    Ok(secrets::scrub_secrets(&non_empty(field, value)?))
+}
+
+/// [`secrets::scrub_secrets`] over a list of free-text items (acceptance
+/// criteria, proof-plan steps) at the same write boundary as
+/// [`non_empty_scrubbed`]. Lives here rather than in `powder-core`'s
+/// `with_acceptance`/`with_proof_plan` because core imports no adapter or
+/// scrubbing machinery -- persistence-side sanitization is the store's job.
+fn scrub_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| secrets::scrub_secrets(&item))
+        .collect()
 }
 
 fn clean_string_list(items: impl IntoIterator<Item = String>) -> Vec<String> {

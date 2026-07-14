@@ -7,8 +7,8 @@ use powder_core::{
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    append_activity, load_card, non_empty, persist_card, persist_run, schema::RUN_SELECT_SQL,
-    Result, RunRecord, Store, StoreError,
+    append_activity, load_card, non_empty, non_empty_scrubbed, persist_card, persist_run,
+    schema::RUN_SELECT_SQL, Result, RunRecord, Store, StoreError,
 };
 
 const CONCISE_DETAIL_LIMIT: i64 = 20;
@@ -187,7 +187,7 @@ impl Store {
         authority: &Authority,
     ) -> Result<Run> {
         let actor = non_empty("actor", actor)?;
-        let answer = non_empty("answer", answer)?;
+        let answer = non_empty_scrubbed("answer", answer)?;
         authority.require_identity(&actor)?;
         let transaction = self
             .connection

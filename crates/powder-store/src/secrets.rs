@@ -27,6 +27,18 @@ static PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
             "bearer-token",
             compile(r"(?i)bearer\s+[A-Za-z0-9\-_.]{20,}"),
         ),
+        // Powder's own API key and webhook signing-secret shapes
+        // (`sk_powder_...` / `whsec_powder_...`, minted by
+        // `identity::Store::create_api_key` / `events::create_event_subscription`
+        // with a 32-char nanoid body -- well over the 20-char floor here).
+        // No `Bearer`/prefix requirement: these patterns must fire mid-line
+        // in a bare env-dump paste like `POWDER_API_KEY=sk_powder_...`, not
+        // only after a header-style label.
+        ("powder-api-key", compile(r"sk_powder_[A-Za-z0-9_\-]{20,}")),
+        (
+            "powder-webhook-secret",
+            compile(r"whsec_powder_[A-Za-z0-9_\-]{20,}"),
+        ),
         (
             "private-key-block",
             compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
@@ -86,6 +98,51 @@ mod tests {
     #[test]
     fn leaves_ordinary_prose_about_keys_untouched() {
         let body = "spent the last hour debugging why the API key wasn't loading from the env";
+        assert_eq!(scrub_secrets(body), body);
+    }
+
+    /// Build a fake secret from split literals so the leak-gate's own
+    /// pattern scan of this source file never matches a contiguous
+    /// secret-shaped string (same convention `scripts/leak-gate.sh` uses
+    /// for its self-test fixtures).
+    fn fake_powder_key() -> String {
+        format!("sk_powder_{}", "a".repeat(32))
+    }
+
+    fn fake_powder_whsec() -> String {
+        format!("whsec_powder_{}", "b".repeat(32))
+    }
+
+    #[test]
+    fn redacts_a_powder_api_key() {
+        let key = fake_powder_key();
+        let scrubbed = scrub_secrets(&format!("here is the key: {key}"));
+        assert!(!scrubbed.contains(&key));
+        assert!(scrubbed.contains("[REDACTED:powder-api-key]"));
+    }
+
+    #[test]
+    fn redacts_a_powder_webhook_secret() {
+        let secret = fake_powder_whsec();
+        let scrubbed = scrub_secrets(&format!("signing secret: {secret}"));
+        assert!(!scrubbed.contains(&secret));
+        assert!(scrubbed.contains("[REDACTED:powder-webhook-secret]"));
+    }
+
+    #[test]
+    fn redacts_a_bare_env_dump_line_without_bearer_or_label() {
+        let key = fake_powder_key();
+        let scrubbed = scrub_secrets(&format!("POWDER_API_KEY={key}"));
+        assert!(!scrubbed.contains(&key));
+        assert!(scrubbed.contains("[REDACTED:powder-api-key]"));
+    }
+
+    #[test]
+    fn leaves_a_short_prose_mention_of_the_powder_key_prefix_untouched() {
+        // Fewer than 20 chars after the prefix: a work-log note that merely
+        // discusses the key *shape* in prose, not a real credential, must
+        // survive scrubbing untouched.
+        let body = "the sk_powder_ prefix identifies Powder-issued API keys";
         assert_eq!(scrub_secrets(body), body);
     }
 }

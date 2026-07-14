@@ -235,6 +235,43 @@ answer-loop writes, and key management require `Authorization: Bearer <key>` in
 supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.
 
+### Trust boundary for `tailscale-header` auth (powder-tailnet-backstop)
+
+`tailscale-header` mode trusts any request bearing one of four identity
+headers (`Tailscale-User-Login`, `X-Tailscale-User-Login`,
+`Tailscale-User-Name`, `X-Forwarded-User`) as an authenticated actor. That is
+only as safe as the ingress in front of `powder-server`: the proxy must
+
+- **strip** all four identity headers from anything a client sends itself,
+  so a request cannot forge an identity by setting the header before the
+  proxy would have;
+- **set** exactly one of the four headers itself, sourced only from its own
+  verified tailnet peer identity (e.g. Tailscale Serve's own
+  `Tailscale-User-Login`), never copied from request-supplied data.
+
+`powder-server` cannot independently verify a header its process boundary
+receives came from that proxy rather than a client that reached it directly
+(a misrouted request, a bypassed ingress, a proxy misconfiguration). Set
+`POWDER_TAILNET_PROXY_SECRET` to add an in-code backstop for that gap: when
+set, every `tailscale-header`-mode request must also carry a matching
+`X-Powder-Proxy-Secret` header (compared in constant time), and requests
+missing it or carrying the wrong value are rejected with `401` before the
+identity header is even consulted. Configure the trusted proxy to set this
+header on every request it forwards, from a value only it and
+`powder-server` know. Leaving it unset preserves the original behavior
+(any request with a trusted identity header is authorized) -- exactly as
+before this backstop existed.
+
+`POWDER_TAILNET_ADMIN` controls the scope granted to a `tailscale-header`
+identity. Default (unset, or explicit `true`): every authenticated tailnet
+identity gets `admin` scope, matching the mode's original all-admin
+behavior -- no config change means no behavior change. Set
+`POWDER_TAILNET_ADMIN=false` once a deployment fronts multiple tailnet users
+who should not all hold `admin` (repository management, key management,
+bulk import): tailnet-authenticated callers still authenticate and can use
+claim-scoped routes, but `require_admin`-gated routes reject them with
+`403`.
+
 **Ratified posture (powder-931, 2026-07-06):** the deployed instance runs
 `api-key` mode with unauthenticated reads, reachable only over its private
 tailnet hostname (see [`docs/production-deploy.md`](production-deploy.md))
