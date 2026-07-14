@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     non_empty, Activity, ActivityId, ActivityType, AwaitingInput, Card, CardDetail, CardEvent,
-    CardEventId, CardId, CardStatus, Comment, DomainError, Estimate, Link, LinkId, Run, RunDetail,
-    RunId, RunState, WorkLogEntry,
+    CardEventId, CardId, CardStatus, CardSummary, Comment, DomainError, EpicEvidence, EpicState,
+    Estimate, EvidenceKind, Link, LinkId, Run, RunDetail, RunId, RunState, WorkLogEntry,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +77,43 @@ impl Board {
 
     pub fn get_card_detail(&self, card_id: &CardId) -> Option<CardDetail> {
         let card = self.cards.get(card_id)?.clone();
+        let children = self.children_for_card(card_id);
+        let epic_state = if children.is_empty() {
+            None
+        } else {
+            let evidence = children
+                .iter()
+                .flat_map(|child| {
+                    let proofs = self.runs_for_card(&child.id).into_iter().filter_map(|run| {
+                        run.proof.map(|proof| EpicEvidence {
+                            child_id: child.id.clone(),
+                            kind: EvidenceKind::Proof,
+                            label: None,
+                            reference: EpicState::proof_snippet(&proof),
+                        })
+                    });
+                    let links =
+                        self.links_for_card(&child.id)
+                            .into_iter()
+                            .map(|link| EpicEvidence {
+                                child_id: child.id.clone(),
+                                kind: EvidenceKind::Link,
+                                label: Some(link.label),
+                                reference: link.url,
+                            });
+                    proofs.chain(links).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            // The in-memory board has no clock, so every held claim counts
+            // as active; the store recomposes against the real `now`.
+            Some(EpicState::recompose(
+                card.status,
+                &children,
+                evidence,
+                i64::MIN,
+            ))
+        };
+        let children_total = (!children.is_empty()).then_some(children.len());
         Some(CardDetail {
             card,
             runs: self.runs_for_card(card_id),
@@ -91,8 +128,25 @@ impl Board {
             comments_total: None,
             work_log: self.work_log_for_card(card_id),
             work_log_total: None,
+            children,
+            children_total,
+            epic_state,
             hint: None,
         })
+    }
+
+    fn children_for_card(&self, card_id: &CardId) -> Vec<CardSummary> {
+        let mut children = self
+            .cards
+            .values()
+            .filter(|card| card.parent.as_ref() == Some(card_id))
+            .collect::<Vec<_>>();
+        children.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        children.into_iter().map(Card::summary).collect()
     }
 
     pub fn get_run_detail(&self, run_id: &RunId) -> Option<RunDetail> {

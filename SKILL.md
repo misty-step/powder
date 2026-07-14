@@ -52,13 +52,19 @@ Default agent persona:
   `action` set to `claim`, `renew`, `heartbeat`, `release`, or `transfer`.
   This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
   `heartbeat`, `release_claim`, and `transfer_claim` tools.
-- `get_card`: read one card with runs, activities, links, comments, and claim state.
+- `get_card`: read one card with runs, activities, links, comments, and claim
+  state; a parent card also returns bounded child summaries plus a
+  deterministic `epic_state` rollup packet (status counts, acceptance sums,
+  child evidence with provenance, freshness, and parent/child mismatch flags).
 - `get_run`: read one run with its card, activities, links, comments, and run state.
 - `list_awaiting_input`: list runs paused for human or agent input.
 - `answer_input`: append an actor-attributed answer and resume the run.
 - `update_status`: set a card to any status in one call and record an audit event.
 - `update_relations`: replace a card's `related`, `blocks`, and `blocked_by`
-  relation lists.
+  relation lists, and/or set the hierarchy edge: `parent` links the card
+  under an epic, `clear_parent` unlinks it. A hierarchy-only call leaves the
+  relation lists untouched. Parent edges never block and child completion
+  never completes the parent -- parent acceptance stays authoritative.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `add_comment`: attach an actor-attributed comment, visible immediately via
   `get_card`/`get_run`.
@@ -69,9 +75,9 @@ Default agent persona:
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
 - `update_card`: patch title, body, acceptance, proof_plan, status, priority,
-  or labels on an existing card. Requires an admin-scope key in remote mode
-  (`PATCH /api/v1/cards/{id}`); grooming and editing card content from an
-  agent harness no longer requires falling back to raw HTTP.
+  or labels on an existing card (`PATCH /api/v1/cards/{id}`). Any
+  authenticated actor may patch; every patch is audited with actor and field
+  list, so recording an operator ruling never requires the admin key.
 
 Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all`:
 

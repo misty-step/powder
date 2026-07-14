@@ -2717,6 +2717,122 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
 }
 
 #[tokio::test]
+async fn parent_route_links_children_and_detail_returns_epic_state() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    for (id, title) in [("epic-http", "Epic"), ("child-http-b", "Child B")] {
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&admin_key),
+                &format!(
+                    r#"{{"id":"{id}","title":"{title}","acceptance":["proof"],"status":"ready"}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+    }
+
+    // Born decomposed: parent set at creation.
+    let born = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"child-http-a","title":"Child A","acceptance":["proof"],"status":"ready","parent":"epic-http"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(born.status(), StatusCode::OK);
+
+    // Linked after the fact via the parent route.
+    let linked = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/child-http-b/parent",
+            Some(&admin_key),
+            r#"{"parent":"epic-http"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(linked.status(), StatusCode::OK);
+    let linked = response_json(linked).await;
+    assert_eq!(linked["parent"], "epic-http");
+
+    // A cycle is rejected.
+    let cycle = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/epic-http/parent",
+            Some(&admin_key),
+            r#"{"parent":"child-http-a"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cycle.status(), StatusCode::CONFLICT);
+
+    // Complete one child, then the parent read carries children + packet.
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/child-http-a/claim",
+            Some(&admin_key),
+            r#"{"agent":"lane-a","ttl_seconds":600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let completed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/child-http-a/complete",
+            Some(&admin_key),
+            r#"{"proof":"merged and verified"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/epic-http?detail=detailed",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(detail["children_total"], 2);
+    assert_eq!(detail["children"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["epic_state"]["children_total"], 2);
+    assert_eq!(detail["epic_state"]["status_counts"]["done"], 1);
+    assert!(detail["epic_state"]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["reference"] == "merged and verified"
+            && entry["child_id"] == "child-http-a"));
+    // Child completion cannot complete the epic; drift is surfaced, not
+    // forbidden.
+    assert_eq!(detail["card"]["status"], "ready");
+    assert!(detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["event_type"] == "rollup"));
+}
+
+#[tokio::test]
 async fn agent_scoped_key_can_author_a_card() {
     // powder-925: single-card authoring moved to authorize() so a scoped
     // (non-admin) key can carry the operator's mobile quick-add flow.

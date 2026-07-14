@@ -6,8 +6,8 @@ use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId,
-    RunState, WorkLogEntry,
+    CriterionProof, DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Run,
+    RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -36,9 +36,9 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5,
-    MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10,
-    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4,
+    MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
+    MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -336,6 +336,10 @@ impl Store {
                     self.migrate_12_to_13()?;
                     13
                 }
+                13 => {
+                    self.migrate_13_to_14()?;
+                    14
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -356,6 +360,13 @@ impl Store {
     fn migrate_12_to_13(&mut self) -> Result<()> {
         if !self.cards_has_column("estimate")? {
             self.connection.execute_batch(MIGRATE_12_TO_13)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_13_to_14(&mut self) -> Result<()> {
+        if !self.cards_has_column("parent")? {
+            self.connection.execute_batch(MIGRATE_13_TO_14)?;
         }
         Ok(())
     }
@@ -580,6 +591,9 @@ impl Store {
         if load_card_optional(&transaction, &card_id)?.is_some() {
             return Err(DomainError::conflict(format!("card already exists: {card_id}")).into());
         }
+        if let Some(parent_id) = card.parent.clone() {
+            ensure_parent_linkable(&transaction, &card_id, &parent_id)?;
+        }
         persist_card(&transaction, &card)?;
         let saved = load_card(&transaction, &card_id)?;
         append_card_event(
@@ -590,6 +604,16 @@ impl Store {
             "created card",
             now,
         )?;
+        if let Some(parent_id) = saved.parent.as_ref() {
+            append_card_event(
+                &transaction,
+                parent_id,
+                "decompose",
+                &actor,
+                &format!("child {card_id} created"),
+                now,
+            )?;
+        }
         events::append_outbound_card_event(
             &transaction,
             &saved,
@@ -1065,6 +1089,15 @@ impl Store {
                 now,
             )?;
         }
+        if status.is_terminal() && !previous.is_terminal() {
+            append_parent_rollup_event(
+                &transaction,
+                &card,
+                &authority.actor_label(),
+                &format!("child {card_id} reached {}", status.as_str()),
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(card)
     }
@@ -1095,6 +1128,74 @@ impl Store {
             ),
             now,
         )?;
+        transaction.commit()?;
+        Ok(card)
+    }
+
+    /// Set or clear a card's explicit parent edge. Validates that the parent
+    /// exists and that the link cannot create a cycle; audits the change on
+    /// the child (`hierarchy`), the new parent (`decompose`), and the old
+    /// parent (`hierarchy`). The parent's own status is never touched --
+    /// decomposition is auditable coordination, not lifecycle.
+    pub fn set_parent(
+        &mut self,
+        card_id: &CardId,
+        parent: Option<CardId>,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<Card> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut card = load_card(&transaction, card_id)?;
+        let previous = card.parent.clone();
+        if previous == parent {
+            transaction.commit()?;
+            return Ok(card);
+        }
+        if let Some(new_parent) = parent.as_ref() {
+            ensure_parent_linkable(&transaction, card_id, new_parent)?;
+        }
+        card.parent = parent.clone();
+        card.updated_at = now;
+        persist_card(&transaction, &card)?;
+        let actor = authority.actor_label();
+        let label = |value: &Option<CardId>| {
+            value
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        };
+        append_card_event(
+            &transaction,
+            card_id,
+            "hierarchy",
+            &actor,
+            &format!("parent {} -> {}", label(&previous), label(&parent)),
+            now,
+        )?;
+        if let Some(old_parent) = previous.as_ref() {
+            if load_card_optional(&transaction, old_parent)?.is_some() {
+                append_card_event(
+                    &transaction,
+                    old_parent,
+                    "hierarchy",
+                    &actor,
+                    &format!("child {card_id} unlinked"),
+                    now,
+                )?;
+            }
+        }
+        if let Some(new_parent) = parent.as_ref() {
+            append_card_event(
+                &transaction,
+                new_parent,
+                "decompose",
+                &actor,
+                &format!("child {card_id} linked"),
+                now,
+            )?;
+        }
         transaction.commit()?;
         Ok(card)
     }
@@ -1487,6 +1588,21 @@ impl Store {
                 }),
                 now,
             )?;
+            append_parent_rollup_event(
+                &transaction,
+                &card,
+                &authority.actor_label(),
+                &proof
+                    .as_deref()
+                    .map(|proof| {
+                        format!(
+                            "child {card_id} completed with proof: {}",
+                            EpicState::proof_snippet(proof)
+                        )
+                    })
+                    .unwrap_or_else(|| format!("child {card_id} completed without proof")),
+                now,
+            )?;
             if let Some(config) = &field_note_config {
                 maybe_spawn_field_note_draft(&transaction, &card, proof.as_deref(), config, now)?;
             }
@@ -1659,7 +1775,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -1685,7 +1801,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                claim_acquired_at = excluded.claim_acquired_at,
                claim_expires_at = excluded.claim_expires_at,
                created_at = excluded.created_at,
-               updated_at = excluded.updated_at"
+               updated_at = excluded.updated_at,
+               parent = excluded.parent"
         ),
         params![
             card.id.as_str(),
@@ -1713,7 +1830,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             claim_acquired_at,
             claim_expires_at,
             card.created_at,
-            card.updated_at
+            card.updated_at,
+            card.parent.as_ref().map(CardId::as_str)
         ],
     )?;
     Ok(())
@@ -1882,6 +2000,66 @@ fn card_from_record(connection: &Connection, record: CardRecord) -> Result<Card>
     Ok(card)
 }
 
+/// A parent edge must point at an existing card and must not close a cycle:
+/// walking up from the proposed parent may never reach the child. A dangling
+/// ancestor edge (parent card deleted out from under a child) terminates the
+/// walk as a root rather than erroring -- reads already tolerate it.
+fn ensure_parent_linkable(
+    connection: &Connection,
+    child_id: &CardId,
+    parent_id: &CardId,
+) -> Result<()> {
+    if parent_id == child_id {
+        return Err(DomainError::validation("parent", "card cannot be its own parent").into());
+    }
+    let Some(mut ancestor) = load_card_optional(connection, parent_id)? else {
+        return Err(DomainError::not_found("card", parent_id.to_string()).into());
+    };
+    let mut hops = 0;
+    loop {
+        if ancestor.id == *child_id {
+            return Err(DomainError::conflict(format!(
+                "linking {child_id} under {parent_id} would create a hierarchy cycle"
+            ))
+            .into());
+        }
+        let Some(next_id) = ancestor.parent.clone() else {
+            return Ok(());
+        };
+        hops += 1;
+        if hops > 64 {
+            return Err(
+                DomainError::conflict("hierarchy depth limit (64) exceeded".to_string()).into(),
+            );
+        }
+        match load_card_optional(connection, &next_id)? {
+            Some(next) => ancestor = next,
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Child outcomes roll up as audit events on the parent: any child
+/// transition into a terminal status appends a `rollup` event naming the
+/// child and, for completions, a bounded proof snippet. Nothing here changes
+/// the parent's own status -- parent acceptance stays authoritative.
+fn append_parent_rollup_event(
+    connection: &Connection,
+    child: &Card,
+    actor: &str,
+    detail: &str,
+    now: i64,
+) -> Result<()> {
+    let Some(parent_id) = child.parent.as_ref() else {
+        return Ok(());
+    };
+    if load_card_optional(connection, parent_id)?.is_none() {
+        return Ok(());
+    }
+    append_card_event(connection, parent_id, "rollup", actor, detail, now)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReimportClass {
     Preserved,
@@ -2028,6 +2206,7 @@ struct CardRecord {
     claim_expires_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
+    parent: Option<String>,
 }
 
 impl CardRecord {
@@ -2059,6 +2238,7 @@ impl CardRecord {
             claim_expires_at: row.get(23)?,
             created_at: row.get(24)?,
             updated_at: row.get(25)?,
+            parent: row.get(26)?,
         })
     }
 
@@ -2111,6 +2291,7 @@ impl CardRecord {
         card.related = from_json("cards.related_json", self.related_json)?;
         card.blocks = from_json("cards.blocks_json", self.blocks_json)?;
         card.blocked_by = from_json("cards.blocked_by_json", self.blocked_by_json)?;
+        card.parent = self.parent.map(CardId::new).transpose()?;
         card.repo = self.repo.as_deref().and_then(canonical_repo_label);
         card.workspace_path = self.workspace_path;
         card.branch_name = self.branch_name;

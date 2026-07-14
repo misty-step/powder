@@ -486,7 +486,7 @@ impl Claim {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimSummary {
     pub agent: String,
     pub expires_at: i64,
@@ -527,6 +527,12 @@ pub struct Card {
     pub blocks: Vec<CardId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by: Vec<CardId>,
+    /// Explicit hierarchy edge: this card is a bounded execution projection
+    /// of the named parent card. Distinct from `related`/`blocks`/
+    /// `blocked_by`, which keep their existing semantics -- a parent edge
+    /// never blocks and never completes anything by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<CardId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -541,7 +547,7 @@ pub struct Card {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardSummary {
     pub id: CardId,
     pub title: String,
@@ -614,6 +620,8 @@ struct CardFields {
     #[serde(default)]
     blocked_by: Vec<CardId>,
     #[serde(default)]
+    parent: Option<CardId>,
+    #[serde(default)]
     repo: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
@@ -649,6 +657,7 @@ impl<'de> Deserialize<'de> for Card {
             related: fields.related,
             blocks: fields.blocks,
             blocked_by: fields.blocked_by,
+            parent: fields.parent,
             repo: fields.repo,
             workspace_path: fields.workspace_path,
             branch_name: fields.branch_name,
@@ -705,6 +714,7 @@ impl Card {
             related: Vec::new(),
             blocks: Vec::new(),
             blocked_by: Vec::new(),
+            parent: None,
             repo: None,
             workspace_path: None,
             branch_name: None,
@@ -771,6 +781,11 @@ impl Card {
     pub fn with_created_at(mut self, created_at: i64) -> Self {
         self.created_at = created_at;
         self.updated_at = created_at;
+        self
+    }
+
+    pub fn with_parent(mut self, parent: Option<CardId>) -> Self {
+        self.parent = parent;
         self
     }
 
@@ -1201,8 +1216,168 @@ pub struct CardDetail {
     pub work_log: Vec<WorkLogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_log_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<CardSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic_state: Option<EpicState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+/// One row of child evidence carried into a parent's [`EpicState`]: a proof
+/// string recorded on a child run, or a link attached to a child card. Always
+/// carries the child id as provenance -- the packet points at evidence, it
+/// never rewrites it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpicEvidence {
+    pub child_id: CardId,
+    pub kind: EvidenceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Proof,
+    Link,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpicFreshness {
+    pub oldest_update: i64,
+    pub newest_update: i64,
+}
+
+/// Deterministic recomposition packet for a parent ("epic") card: pure
+/// arithmetic and selection over child summaries and child evidence. It never
+/// concatenates transcripts and never invents a semantic conclusion. Parent
+/// acceptance stays authoritative -- `mismatches` makes parent/child drift
+/// visible instead of lifecycle-forbidding it, and nothing here completes the
+/// parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpicState {
+    pub children_total: usize,
+    pub status_counts: std::collections::BTreeMap<String, usize>,
+    pub criteria_checked: usize,
+    pub criteria_total: usize,
+    /// Children whose claim lease is unexpired at recompose time.
+    pub active_claims: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<EpicEvidence>,
+    /// Set to the full evidence count when the list above was truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<EpicFreshness>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mismatches: Vec<String>,
+}
+
+impl EpicState {
+    pub const EVIDENCE_CAP: usize = 20;
+    pub const PROOF_SNIPPET_CHARS: usize = 240;
+
+    /// Truncate a child run's proof for the packet; the full text stays on
+    /// the child run and the packet points there via `child_id`.
+    pub fn proof_snippet(proof: &str) -> String {
+        let trimmed = proof.trim();
+        if trimmed.chars().count() <= Self::PROOF_SNIPPET_CHARS {
+            trimmed.to_string()
+        } else {
+            let mut snippet: String = trimmed.chars().take(Self::PROOF_SNIPPET_CHARS).collect();
+            snippet.push('…');
+            snippet
+        }
+    }
+
+    /// Roll child outcomes into a packet. `evidence` arrives in the caller's
+    /// deterministic order (child creation order, then row creation order)
+    /// and is capped at [`Self::EVIDENCE_CAP`] with the full count preserved.
+    pub fn recompose(
+        parent_status: CardStatus,
+        children: &[CardSummary],
+        evidence: Vec<EpicEvidence>,
+        now: i64,
+    ) -> Self {
+        let mut status_counts = std::collections::BTreeMap::new();
+        let mut criteria_checked = 0;
+        let mut criteria_total = 0;
+        let mut active_claims = 0;
+        for child in children {
+            *status_counts
+                .entry(child.status.as_str().to_string())
+                .or_insert(0) += 1;
+            criteria_checked += child.criteria_checked;
+            criteria_total += child.criteria_total;
+            if child
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.expires_at > now)
+            {
+                active_claims += 1;
+            }
+        }
+        let freshness = children.iter().map(|child| child.updated_at).fold(
+            None::<EpicFreshness>,
+            |acc, updated_at| {
+                Some(match acc {
+                    None => EpicFreshness {
+                        oldest_update: updated_at,
+                        newest_update: updated_at,
+                    },
+                    Some(freshness) => EpicFreshness {
+                        oldest_update: freshness.oldest_update.min(updated_at),
+                        newest_update: freshness.newest_update.max(updated_at),
+                    },
+                })
+            },
+        );
+
+        let open_children = children
+            .iter()
+            .filter(|child| !child.status.is_terminal())
+            .count();
+        let mut mismatches = Vec::new();
+        if parent_status.is_terminal() && open_children > 0 {
+            mismatches.push(format!(
+                "parent is {} while {open_children} of {} children are not terminal",
+                parent_status.as_str(),
+                children.len()
+            ));
+        }
+        if !children.is_empty() && open_children == 0 && !parent_status.is_terminal() {
+            mismatches.push(format!(
+                "all {} children are terminal while parent is {}",
+                children.len(),
+                parent_status.as_str()
+            ));
+        }
+
+        let evidence_full = evidence.len();
+        let mut evidence = evidence;
+        let evidence_total = if evidence_full > Self::EVIDENCE_CAP {
+            evidence.truncate(Self::EVIDENCE_CAP);
+            Some(evidence_full)
+        } else {
+            None
+        };
+
+        Self {
+            children_total: children.len(),
+            status_counts,
+            criteria_checked,
+            criteria_total,
+            active_claims,
+            evidence,
+            evidence_total,
+            freshness,
+            mismatches,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1354,6 +1529,113 @@ mod tests {
             .unwrap()
             .with_status(status)
             .with_created_at(10)
+    }
+
+    fn child_summary(id: &str, status: CardStatus, checked: usize, total: usize) -> CardSummary {
+        let mut card = card(id, status).with_acceptance(
+            (0..total)
+                .map(|index| format!("criterion {index}"))
+                .collect::<Vec<_>>(),
+        );
+        for criterion in card.criteria.iter_mut().take(checked) {
+            criterion.checked_at = Some(50);
+        }
+        card.summary()
+    }
+
+    #[test]
+    fn epic_state_rolls_counts_acceptance_claims_and_freshness() {
+        let mut claimed = child_summary("child-b", CardStatus::Running, 1, 3);
+        claimed.claim = Some(ClaimSummary {
+            agent: "agent-a".to_string(),
+            expires_at: 200,
+        });
+        claimed.updated_at = 40;
+        let mut expired = child_summary("child-c", CardStatus::Claimed, 0, 2);
+        expired.claim = Some(ClaimSummary {
+            agent: "agent-b".to_string(),
+            expires_at: 90,
+        });
+        expired.updated_at = 15;
+        let done = child_summary("child-a", CardStatus::Done, 2, 2);
+
+        let state = EpicState::recompose(
+            CardStatus::Ready,
+            &[done, claimed, expired],
+            vec![EpicEvidence {
+                child_id: CardId::new("child-a").unwrap(),
+                kind: EvidenceKind::Link,
+                label: Some("PR".to_string()),
+                reference: "https://example.test/pr/1".to_string(),
+            }],
+            100,
+        );
+
+        assert_eq!(state.children_total, 3);
+        assert_eq!(state.status_counts.get("done"), Some(&1));
+        assert_eq!(state.status_counts.get("running"), Some(&1));
+        assert_eq!(state.status_counts.get("claimed"), Some(&1));
+        assert_eq!(state.criteria_checked, 3);
+        assert_eq!(state.criteria_total, 7);
+        assert_eq!(state.active_claims, 1, "expired lease is not active");
+        assert_eq!(state.evidence.len(), 1);
+        assert_eq!(state.evidence_total, None);
+        let freshness = state.freshness.unwrap();
+        assert_eq!(freshness.oldest_update, 10);
+        assert_eq!(freshness.newest_update, 40);
+        assert!(state.mismatches.is_empty());
+    }
+
+    #[test]
+    fn epic_state_surfaces_mismatches_without_forbidding_them() {
+        let open_child = child_summary("child-open", CardStatus::Running, 0, 1);
+        let terminal_parent = EpicState::recompose(
+            CardStatus::Done,
+            std::slice::from_ref(&open_child),
+            Vec::new(),
+            100,
+        );
+        assert_eq!(terminal_parent.mismatches.len(), 1);
+        assert!(terminal_parent.mismatches[0].contains("parent is done"));
+
+        let done_child = child_summary("child-done", CardStatus::Done, 1, 1);
+        let lagging_parent =
+            EpicState::recompose(CardStatus::Ready, &[done_child], Vec::new(), 100);
+        assert_eq!(lagging_parent.mismatches.len(), 1);
+        assert!(lagging_parent.mismatches[0].contains("all 1 children are terminal"));
+
+        let aligned = EpicState::recompose(CardStatus::Ready, &[open_child], Vec::new(), 100);
+        assert!(aligned.mismatches.is_empty());
+    }
+
+    #[test]
+    fn epic_state_caps_evidence_and_preserves_the_full_count() {
+        let evidence = (0..25)
+            .map(|index| EpicEvidence {
+                child_id: CardId::new(format!("child-{index}")).unwrap(),
+                kind: EvidenceKind::Proof,
+                label: None,
+                reference: format!("proof {index}"),
+            })
+            .collect::<Vec<_>>();
+        let state = EpicState::recompose(CardStatus::Ready, &[], evidence, 100);
+        assert_eq!(state.evidence.len(), EpicState::EVIDENCE_CAP);
+        assert_eq!(state.evidence_total, Some(25));
+        assert_eq!(state.evidence[0].reference, "proof 0", "order preserved");
+    }
+
+    #[test]
+    fn proof_snippet_truncates_on_char_boundaries() {
+        let short = "done: all gates green";
+        assert_eq!(EpicState::proof_snippet(short), short);
+        let long = "é".repeat(EpicState::PROOF_SNIPPET_CHARS + 10);
+        let snippet = EpicState::proof_snippet(&long);
+        assert_eq!(
+            snippet.chars().count(),
+            EpicState::PROOF_SNIPPET_CHARS + 1,
+            "cap plus ellipsis"
+        );
+        assert!(snippet.ends_with('…'));
     }
 
     fn fresh_reimport(id: &str) -> Card {

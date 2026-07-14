@@ -96,6 +96,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = optional_str(args, "repo") {
                 body["repo"] = json!(value);
             }
+            if let Some(value) = optional_str(args, "parent") {
+                body["parent"] = json!(value);
+            }
             let response = client.post("/api/v1/cards", body)?;
             remote_card_ack_payload(&response)?
         }
@@ -240,14 +243,33 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "update_relations" => {
             let id = card_id(args, "card_id")?;
-            let response = client.post(
-                &format!("/api/v1/cards/{id}/relations"),
-                json!({
-                    "related": args["related"].as_array().cloned().unwrap_or_default(),
-                    "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
-                    "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
-                }),
-            )?;
+            let parent_arg = optional_str(args, "parent");
+            let clear_parent = args["clear_parent"].as_bool().unwrap_or(false);
+            if parent_arg.is_some() && clear_parent {
+                return Err("pass either parent or clear_parent, not both".to_string());
+            }
+            let lists_present = !args["related"].is_null()
+                || !args["blocks"].is_null()
+                || !args["blocked_by"].is_null();
+            let hierarchy_requested = parent_arg.is_some() || clear_parent;
+            let mut response = None;
+            if lists_present || !hierarchy_requested {
+                response = Some(client.post(
+                    &format!("/api/v1/cards/{id}/relations"),
+                    json!({
+                        "related": args["related"].as_array().cloned().unwrap_or_default(),
+                        "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
+                        "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
+                    }),
+                )?);
+            }
+            if hierarchy_requested {
+                response = Some(client.post(
+                    &format!("/api/v1/cards/{id}/parent"),
+                    json!({ "parent": parent_arg }),
+                )?);
+            }
+            let response = response.expect("relations or hierarchy branch always runs");
             remote_relation_ack_payload(&response)?
         }
         "add_link" => {

@@ -148,6 +148,14 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/cards/{id}/parent",
+        intent: "set or clear a card's explicit parent edge; the parent card's detail then rolls this child into its bounded children list and deterministic epic_state packet",
+        body_shape: Some(
+            r#"{"parent":"card-id"} links under a parent; {"parent":null} or {} clears -- rejects a missing parent card, self-parenting, and hierarchy cycles; audited on both cards"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/cards/{id}/criteria/check",
         intent: "mark one acceptance criterion checked or unchecked and audit actor/time",
         body_shape: None,

@@ -1,7 +1,8 @@
 use powder_core::{
     Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
-    CardEvent, CardEventId, CardId, CardStatus, Comment, DetailLevel, DomainError, Link, LinkId,
-    Run, RunDetail, RunId, RunState, WorkLogEntry,
+    CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DetailLevel, DomainError,
+    EpicEvidence, EpicState, EvidenceKind, Link, LinkId, Run, RunDetail, RunId, RunState,
+    WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -23,6 +24,7 @@ impl Store {
         &self,
         card_id: &CardId,
         detail: DetailLevel,
+        now: i64,
     ) -> Result<Option<CardDetail>> {
         let Some(card) = self.get_card(card_id)? else {
             return Ok(None);
@@ -33,12 +35,29 @@ impl Store {
         let links = load_link_section_for_card(&self.connection, card_id, detail)?;
         let comments = load_comments_for_card(&self.connection, card_id, detail)?;
         let work_log = load_work_log_for_card(&self.connection, card_id, detail)?;
+        // The packet always rolls up every child; only the displayed child
+        // list is bounded in concise mode.
+        let all_children = load_children_for_card(&self.connection, card_id)?;
+        let epic_state = if all_children.is_empty() {
+            None
+        } else {
+            let evidence = load_child_evidence(&self.connection, card_id)?;
+            Some(EpicState::recompose(
+                card.status,
+                &all_children,
+                evidence,
+                now,
+            ))
+        };
+        let children_total = (!all_children.is_empty()).then_some(all_children.len());
+        let children = bound_children(all_children, detail);
         let truncated = runs.truncated()
             || activities.truncated()
             || events.truncated()
             || links.truncated()
             || comments.truncated()
-            || work_log.truncated();
+            || work_log.truncated()
+            || children_total.is_some_and(|total| total > children.len());
         Ok(Some(CardDetail {
             runs: runs.items,
             runs_total: runs.total,
@@ -52,6 +71,9 @@ impl Store {
             comments_total: comments.total,
             work_log: work_log.items,
             work_log_total: work_log.total,
+            children,
+            children_total,
+            epic_state,
             hint: detail_hint(truncated),
             card,
         }))
@@ -221,6 +243,108 @@ fn detail_hint(truncated: bool) -> Option<String> {
 
 fn truncated_total(total: usize, returned: usize) -> Option<usize> {
     (total > returned).then_some(total)
+}
+
+/// One query, oldest child first -- creation order is decomposition order.
+fn load_children_for_card(connection: &Connection, card_id: &CardId) -> Result<Vec<CardSummary>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {} FROM cards WHERE parent = ?1 ORDER BY created_at ASC, id ASC",
+        crate::schema::CARD_COLUMNS
+    ))?;
+    let records = statement
+        .query_map([card_id.as_str()], crate::CardRecord::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    records
+        .into_iter()
+        .map(|record| crate::card_from_record(connection, record).map(|card| card.summary()))
+        .collect()
+}
+
+fn bound_children(children: Vec<CardSummary>, detail: DetailLevel) -> Vec<CardSummary> {
+    match detail {
+        DetailLevel::Detailed => children,
+        DetailLevel::Concise => {
+            // Newest first, capped, matching the other concise sections.
+            let mut bounded = children;
+            bounded.reverse();
+            bounded.truncate(CONCISE_DETAIL_LIMIT as usize);
+            bounded
+        }
+    }
+}
+
+/// All child evidence in two queries (runs with proof, then links), merged
+/// into one deterministic order: child creation order, then row creation
+/// order, proofs before links per child.
+fn load_child_evidence(connection: &Connection, card_id: &CardId) -> Result<Vec<EpicEvidence>> {
+    let mut evidence: Vec<(i64, String, u8, i64, EpicEvidence)> = Vec::new();
+    let mut proofs = connection.prepare(
+        "SELECT children.created_at, children.id, runs.created_at, runs.proof
+         FROM runs JOIN cards children ON children.id = runs.card_id
+         WHERE children.parent = ?1 AND runs.proof IS NOT NULL",
+    )?;
+    let proof_rows = proofs
+        .query_map([card_id.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (child_created, child_id, row_created, proof) in proof_rows {
+        evidence.push((
+            child_created,
+            child_id.clone(),
+            0,
+            row_created,
+            EpicEvidence {
+                child_id: CardId::new(child_id)?,
+                kind: EvidenceKind::Proof,
+                label: None,
+                reference: EpicState::proof_snippet(&proof),
+            },
+        ));
+    }
+    let mut links = connection.prepare(
+        "SELECT children.created_at, children.id, links.created_at, links.label, links.url
+         FROM links JOIN cards children ON children.id = links.card_id
+         WHERE children.parent = ?1",
+    )?;
+    let link_rows = links
+        .query_map([card_id.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (child_created, child_id, row_created, label, url) in link_rows {
+        evidence.push((
+            child_created,
+            child_id.clone(),
+            1,
+            row_created,
+            EpicEvidence {
+                child_id: CardId::new(child_id)?,
+                kind: EvidenceKind::Link,
+                label: Some(label),
+                reference: url,
+            },
+        ));
+    }
+    evidence.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    Ok(evidence.into_iter().map(|entry| entry.4).collect())
 }
 
 fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run> {

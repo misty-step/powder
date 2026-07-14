@@ -48,8 +48,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "create_card",
-        description: "Create one card with optional acceptance criteria, proof plan, relations, repository, estimate, and initial status; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, and initial status; returns a minimal ack; get_card for full state.",
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
@@ -83,7 +83,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_card",
-        description: "Read one card with runs, activities, links, comments, and claim state. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
+        description: "Read one card with runs, activities, links, comments, and claim state; a parent card also returns bounded child summaries and a deterministic epic_state rollup packet. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
     },
     ToolDef {
@@ -118,8 +118,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "update_relations",
-        description: "Replace a card's related, blocks, and blocked_by relation lists; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Replace a card's related, blocks, and blocked_by relation lists, and/or set its parent edge: parent links the card under an epic, clear_parent unlinks it. Passing only parent/clear_parent leaves the relation lists untouched. Returns a minimal ack; get_card for full state.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"clear_parent":{"type":"boolean"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "add_link",
@@ -451,6 +451,10 @@ pub fn call_tool_store(
             card.related = card_ids_array(args, "related")?;
             card.blocks = card_ids_array(args, "blocks")?;
             card.blocked_by = card_ids_array(args, "blocked_by")?;
+            card.parent = optional_str(args, "parent")
+                .map(CardId::new)
+                .transpose()
+                .map_err(to_string)?;
             card.repo = optional_str(args, "repo").map(str::to_string);
             let card = store
                 .create_card_with_events(card, &authority_arg(args).actor_label(), now)
@@ -528,7 +532,7 @@ pub fn call_tool_store(
             let card_id = card_id(args, "card_id")?;
             let detail_level = detail_arg(args)?;
             let detail = store
-                .get_card_detail(&card_id, detail_level)
+                .get_card_detail(&card_id, detail_level, now)
                 .map_err(to_string)?
                 .ok_or_else(|| {
                     format!("card not found: {card_id}; use list_cards to enumerate ids")
@@ -580,16 +584,41 @@ pub fn call_tool_store(
         }
         "update_relations" => {
             let card_id = card_id(args, "card_id")?;
-            let card = store
-                .update_relations(
-                    &card_id,
-                    card_ids_array(args, "related")?,
-                    card_ids_array(args, "blocks")?,
-                    card_ids_array(args, "blocked_by")?,
-                    now,
-                    &authority_arg(args),
-                )
-                .map_err(to_string)?;
+            let parent_arg = optional_str(args, "parent");
+            let clear_parent = args["clear_parent"].as_bool().unwrap_or(false);
+            if parent_arg.is_some() && clear_parent {
+                return Err("pass either parent or clear_parent, not both".to_string());
+            }
+            // A hierarchy-only call must not silently replace the relation
+            // lists with empties.
+            let lists_present = !args["related"].is_null()
+                || !args["blocks"].is_null()
+                || !args["blocked_by"].is_null();
+            let hierarchy_requested = parent_arg.is_some() || clear_parent;
+            let mut card = None;
+            if lists_present || !hierarchy_requested {
+                card = Some(
+                    store
+                        .update_relations(
+                            &card_id,
+                            card_ids_array(args, "related")?,
+                            card_ids_array(args, "blocks")?,
+                            card_ids_array(args, "blocked_by")?,
+                            now,
+                            &authority_arg(args),
+                        )
+                        .map_err(to_string)?,
+                );
+            }
+            if hierarchy_requested {
+                let parent = parent_arg.map(CardId::new).transpose().map_err(to_string)?;
+                card = Some(
+                    store
+                        .set_parent(&card_id, parent, now, &authority_arg(args))
+                        .map_err(to_string)?,
+                );
+            }
+            let card = card.expect("relations or hierarchy branch always runs");
             relation_ack_payload(&card)
         }
         "add_link" => {
@@ -760,6 +789,10 @@ fn relation_ack_payload(card: &Card) -> Value {
         .iter()
         .map(|id| id.as_str())
         .collect::<Vec<_>>());
+    payload["parent"] = card
+        .parent
+        .as_ref()
+        .map_or(Value::Null, |parent| json!(parent.as_str()));
     payload
 }
 
@@ -2658,7 +2691,8 @@ mod tests {
                 "updated_at": 10,
                 "related": ["peer"],
                 "blocks": ["child"],
-                "blocked_by": ["parent"]
+                "blocked_by": ["parent"],
+                "parent": null
             })
         );
 
@@ -2696,6 +2730,116 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event["actor"] == "intruder"));
+    }
+
+    #[test]
+    fn mcp_hierarchy_links_children_and_rolls_up_epic_state() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "epic-1", "title": "Epic", "acceptance": ["all children land"]}),
+            10,
+        )
+        .unwrap();
+        // Born decomposed via create_card parent.
+        let born = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "child-1", "title": "Child 1", "acceptance": ["proof"], "parent": "epic-1"}),
+            11,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&born)["id"], "child-1");
+
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "child-2", "title": "Child 2", "acceptance": ["proof"]}),
+            12,
+        )
+        .unwrap();
+        // Linked after the fact -- hierarchy-only update_relations must not
+        // wipe the untouched relation lists.
+        let linked = call_tool_store(
+            &mut store,
+            "update_relations",
+            &json!({"card_id": "child-2", "parent": "epic-1"}),
+            13,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&linked)["parent"], "epic-1");
+
+        // A cycle is rejected.
+        let cycle = call_tool_store(
+            &mut store,
+            "update_relations",
+            &json!({"card_id": "epic-1", "parent": "child-1"}),
+            14,
+        );
+        assert!(cycle.unwrap_err().contains("cycle"));
+
+        let claim = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"card_id": "child-1", "action": "claim", "agent": "lane-a"}),
+            15,
+        )
+        .unwrap();
+        assert!(tool_payload(&claim)["run_id"].is_string());
+        call_tool_store(
+            &mut store,
+            "complete_card",
+            &json!({"card_id": "child-1", "proof": "merged; gates green"}),
+            16,
+        )
+        .unwrap();
+
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "epic-1", "detail": "detailed"}),
+            17,
+        )
+        .unwrap();
+        let payload = tool_payload(&detail);
+        assert_eq!(payload["children_total"], 2);
+        assert_eq!(payload["epic_state"]["children_total"], 2);
+        assert_eq!(payload["epic_state"]["status_counts"]["done"], 1);
+        assert!(payload["epic_state"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["child_id"] == "child-1"
+                && entry["reference"] == "merged; gates green"));
+        // Parent acceptance stays authoritative -- the epic is untouched by
+        // child completion, and the drift is visible in the packet.
+        assert_eq!(payload["card"]["status"], "ready");
+        assert!(payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_type"] == "rollup"));
+
+        // clear_parent unlinks.
+        let cleared = call_tool_store(
+            &mut store,
+            "update_relations",
+            &json!({"card_id": "child-2", "clear_parent": true}),
+            18,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&cleared)["parent"], Value::Null);
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "epic-1", "detail": "detailed"}),
+            19,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&detail)["children_total"], 1);
     }
 
     #[test]
