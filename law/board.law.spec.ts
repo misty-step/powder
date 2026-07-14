@@ -509,11 +509,11 @@ test("board · mobile-390 · operator can change a card's status with no CLI (po
     (response) =>
       /\/api\/v1\/cards\/001\/status$/.test(response.url()) && response.request().method() === "POST",
   );
-  await page.locator("#detail-status-change").selectOption("blocked");
+  await page.locator("#detail-status-change").selectOption("backlog");
   const response = await updated;
   expect(response.status()).toBe(200);
-  await expect(page.locator("#detail-status-change")).toHaveValue("blocked");
-  await expect(page.locator(".pw-st")).toContainText("blocked");
+  await expect(page.locator("#detail-status-change")).toHaveValue("backlog");
+  await expect(page.locator(".pw-st")).toContainText("backlog");
 
   // restore the fixture card's status so a later local run against the
   // same reused DB still finds 001 ready.

@@ -66,6 +66,73 @@ SELECT
   1700000100 + n
 FROM expanded;
 
+-- powder-status-vocabulary: one extra legacy `blocked` card with an empty
+-- acceptance oracle, distinct from the 15 generated above (which all carry
+-- a real oracle) -- the migration maps blocked-with-empty-acceptance to
+-- `backlog` and blocked-with-real-acceptance to `ready`, mirroring
+-- `CardStatus::default_for_acceptance`. This is the only row exercising the
+-- backlog branch of that rule.
+INSERT INTO cards (
+  id, title, body, acceptance_json, status, priority, labels_json,
+  assignee, related_json, blocks_json, blocked_by_json, repo,
+  source_path, source_digest, claim_agent, claim_run_id,
+  claim_acquired_at, claim_expires_at, created_at, updated_at
+) VALUES (
+  'blocked-empty-001',
+  'Synthetic blocked card with no acceptance oracle',
+  'Sanitized fixture body for status-vocabulary rehearsal.',
+  '[]',
+  'blocked',
+  'P2',
+  '["synthetic","status-vocabulary"]',
+  NULL,
+  '[]',
+  '[]',
+  '[]',
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  1700000500,
+  1700000600
+);
+
+-- powder-status-vocabulary: one extra legacy `blocked` card with a real
+-- oracle AND a live (non-terminal) blocker relation. After migration its
+-- status is `ready`, but it must never surface in `list_ready` -- blocking
+-- eligibility is derived from the unresolved `blocked_by` relation, which
+-- is exactly why the explicit `blocked` status could be dropped.
+INSERT INTO cards (
+  id, title, body, acceptance_json, status, priority, labels_json,
+  assignee, related_json, blocks_json, blocked_by_json, repo,
+  source_path, source_digest, claim_agent, claim_run_id,
+  claim_acquired_at, claim_expires_at, created_at, updated_at
+) VALUES (
+  'blocked-live-blocker-001',
+  'Synthetic blocked card with a live blocker',
+  'Sanitized fixture body for status-vocabulary rehearsal.',
+  '["synthetic acceptance oracle"]',
+  'blocked',
+  'P0',
+  '["synthetic","status-vocabulary"]',
+  NULL,
+  '[]',
+  '[]',
+  '["backlog-001"]',
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  1700000510,
+  1700000610
+);
+
 INSERT INTO runs (
   id, card_id, state, agent, claim_expires_at, proof, created_at, updated_at
 )

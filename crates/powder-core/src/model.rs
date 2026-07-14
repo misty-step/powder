@@ -247,41 +247,51 @@ impl Estimate {
     }
 }
 
+/// The status vocabulary (powder-status-vocabulary): seven statuses, down
+/// from the prior nine. `Claimed`/`Running` collapsed into a single
+/// `InProgress` -- the claim struct already carries who/lease/liveness, so a
+/// status bit distinguishing "claimed but not yet running" from "running"
+/// was a second, driftable copy of claim presence. `Blocked` was dropped
+/// entirely -- blocking eligibility is derived from `blocked_by` relations
+/// via [`Card::claim_readiness`] regardless of status, so an explicit
+/// `Blocked` status was a second, driftable copy of that derived fact. See
+/// `docs/status-vocabulary.md` for the full decision record and the 9->7
+/// migration mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardStatus {
     Backlog,
     Ready,
-    Claimed,
-    Running,
+    InProgress,
     AwaitingInput,
-    Blocked,
     Done,
     Shipped,
     Abandoned,
 }
 
 impl CardStatus {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 7] = [
         Self::Backlog,
         Self::Ready,
-        Self::Claimed,
-        Self::Running,
+        Self::InProgress,
         Self::AwaitingInput,
-        Self::Blocked,
         Self::Done,
         Self::Shipped,
         Self::Abandoned,
     ];
 
+    /// Only the current seven-status vocabulary parses. The retired names
+    /// (`claimed`, `running`, `blocked`) intentionally fall through to
+    /// `None` rather than silently aliasing onto a surviving status --
+    /// every caller of `parse` must reject them with an error naming the
+    /// current vocabulary (see `docs/status-vocabulary.md`), not translate
+    /// them quietly.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "backlog" | "pending" => Some(Self::Backlog),
             "ready" => Some(Self::Ready),
-            "claimed" => Some(Self::Claimed),
-            "running" | "in-progress" | "in_progress" => Some(Self::Running),
-            "awaiting-input" | "awaiting_input" => Some(Self::AwaitingInput),
-            "blocked" => Some(Self::Blocked),
+            "in_progress" | "in-progress" => Some(Self::InProgress),
+            "awaiting_input" | "awaiting-input" => Some(Self::AwaitingInput),
             "done" => Some(Self::Done),
             "shipped" => Some(Self::Shipped),
             "abandoned" => Some(Self::Abandoned),
@@ -298,17 +308,15 @@ impl CardStatus {
     /// `claim_card`; an external source must not unilaterally promote a card
     /// into a claim-bound state it does not actually hold.
     pub fn requires_active_claim(self) -> bool {
-        matches!(self, Self::Claimed | Self::Running | Self::AwaitingInput)
+        matches!(self, Self::InProgress | Self::AwaitingInput)
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Backlog => "backlog",
             Self::Ready => "ready",
-            Self::Claimed => "claimed",
-            Self::Running => "running",
+            Self::InProgress => "in_progress",
             Self::AwaitingInput => "awaiting_input",
-            Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Shipped => "shipped",
             Self::Abandoned => "abandoned",
@@ -778,7 +786,7 @@ impl Card {
                 .claim
                 .as_ref()
                 .is_none_or(|claim| claim.is_expired(now)),
-            CardStatus::Claimed | CardStatus::Running => self
+            CardStatus::InProgress => self
                 .claim
                 .as_ref()
                 .is_some_and(|claim| claim.is_expired(now)),
@@ -825,16 +833,13 @@ impl Card {
     }
 
     /// Whether this card's lifecycle (status + claim) must survive a
-    /// source refresh: an active claim, a claimed/running/awaiting-input
-    /// status, or a terminal outcome. A backlog/ready/blocked card with no
-    /// claim has no live lifecycle to protect, so a reimport may refresh its
-    /// status along with its content.
+    /// source refresh: an active claim, an in-progress/awaiting-input
+    /// status, or a terminal outcome. A backlog/ready card with no claim has
+    /// no live lifecycle to protect, so a reimport may refresh its status
+    /// along with its content.
     pub fn protects_lifecycle_on_reimport(&self) -> bool {
         self.claim.is_some()
-            || matches!(
-                self.status,
-                CardStatus::Claimed | CardStatus::Running | CardStatus::AwaitingInput
-            )
+            || matches!(self.status, CardStatus::InProgress | CardStatus::AwaitingInput)
             || self.status.is_terminal()
     }
 
@@ -872,9 +877,9 @@ impl Card {
             // incoming one) is what keeps this scoped to exactly the
             // regression it fixes: a Ready card must not silently read as
             // Backlog just because one reimport had a heading mismatch. It
-            // must not touch a deliberately Blocked card caught by the same
-            // malformed file -- Blocked isn't lifecycle-protected either,
-            // but "was Ready, stays Ready" is a narrower, safer claim than
+            // must not touch a deliberately Backlog card caught by the same
+            // malformed file (Backlog isn't lifecycle-protected either) --
+            // "was Ready, stays Ready" is a narrower, safer claim than
             // "any non-empty acceptance implies Ready" (that broader form
             // was a false positive: a file that deliberately keeps
             // `Status: backlog` alongside a real Oracle section never needs
@@ -924,7 +929,7 @@ impl Card {
             acquired_at: now,
             expires_at: now + ttl_seconds as i64,
         };
-        self.status = CardStatus::Claimed;
+        self.status = CardStatus::InProgress;
         self.claim = Some(claim.clone());
         self.updated_at = now;
         Ok(claim)
@@ -935,12 +940,11 @@ impl Card {
     /// model) -- any status is settable from any status. Releases the claim
     /// when the new status is one a claim cannot survive.
     pub fn apply_status(&mut self, status: CardStatus, now: i64) -> Option<Claim> {
-        let released_claim =
-            if matches!(status, CardStatus::Ready | CardStatus::Blocked) || status.is_terminal() {
-                self.claim.take()
-            } else {
-                None
-            };
+        let released_claim = if matches!(status, CardStatus::Ready) || status.is_terminal() {
+            self.claim.take()
+        } else {
+            None
+        };
         self.status = status;
         self.updated_at = now;
         released_claim
@@ -1484,13 +1488,13 @@ mod tests {
 
     #[test]
     fn epic_state_rolls_counts_acceptance_claims_and_freshness() {
-        let mut claimed = child_summary("child-b", CardStatus::Running, 1, 3);
+        let mut claimed = child_summary("child-b", CardStatus::InProgress, 1, 3);
         claimed.claim = Some(ClaimSummary {
             agent: "agent-a".to_string(),
             expires_at: 200,
         });
         claimed.updated_at = 40;
-        let mut expired = child_summary("child-c", CardStatus::Claimed, 0, 2);
+        let mut expired = child_summary("child-c", CardStatus::InProgress, 0, 2);
         expired.claim = Some(ClaimSummary {
             agent: "agent-b".to_string(),
             expires_at: 90,
@@ -1512,8 +1516,7 @@ mod tests {
 
         assert_eq!(state.children_total, 3);
         assert_eq!(state.status_counts.get("done"), Some(&1));
-        assert_eq!(state.status_counts.get("running"), Some(&1));
-        assert_eq!(state.status_counts.get("claimed"), Some(&1));
+        assert_eq!(state.status_counts.get("in_progress"), Some(&2));
         assert_eq!(state.criteria_checked, 3);
         assert_eq!(state.criteria_total, 7);
         assert_eq!(state.active_claims, 1, "expired lease is not active");
@@ -1527,7 +1530,7 @@ mod tests {
 
     #[test]
     fn epic_state_surfaces_mismatches_without_forbidding_them() {
-        let open_child = child_summary("child-open", CardStatus::Running, 0, 1);
+        let open_child = child_summary("child-open", CardStatus::InProgress, 0, 1);
         let terminal_parent = EpicState::recompose(
             CardStatus::Done,
             std::slice::from_ref(&open_child),
@@ -1590,7 +1593,7 @@ mod tests {
 
     #[test]
     fn quiescent_card_takes_the_reimported_content_and_status() {
-        let current = card("001", CardStatus::Blocked);
+        let current = card("001", CardStatus::Backlog);
         let merged = current.merge_reimport(fresh_reimport("001"));
 
         assert_eq!(merged.status, CardStatus::Ready);
@@ -1600,7 +1603,7 @@ mod tests {
 
     #[test]
     fn claimed_card_keeps_status_and_claim_across_reimport() {
-        let mut current = card("001", CardStatus::Running);
+        let mut current = card("001", CardStatus::InProgress);
         current.claim = Some(Claim {
             agent: "agent-a".to_string(),
             run_id: RunId::new("run-1").unwrap(),
@@ -1610,7 +1613,7 @@ mod tests {
 
         let merged = current.merge_reimport(fresh_reimport("001"));
 
-        assert_eq!(merged.status, CardStatus::Running);
+        assert_eq!(merged.status, CardStatus::InProgress);
         assert_eq!(merged.claim, current.claim);
         assert_eq!(merged.title, "Refreshed title", "content still refreshes");
         assert_eq!(merged.created_at, 10);
@@ -1658,18 +1661,18 @@ mod tests {
     }
 
     #[test]
-    fn reimport_restoring_acceptance_never_promotes_a_blocked_card_to_ready() {
-        // Blocked is not lifecycle-protected (see
+    fn reimport_restoring_acceptance_never_promotes_a_deliberately_backlog_card_to_ready() {
+        // A deliberately Backlog card is not lifecycle-protected (see
         // protects_lifecycle_on_reimport_covers_active_and_terminal_states
         // below), so a malformed reimport can legitimately change it --
-        // but the Backlog->Ready re-derivation above must not turn a
-        // deliberately Blocked card into Ready just because it also had to
-        // restore real acceptance underneath it. Gating the re-derivation
-        // on `self.status == Ready` specifically (not "any status the
-        // unprotected merge happened to produce") is what keeps this scoped.
+        // but the Backlog->Ready re-derivation above must not turn it into
+        // Ready just because it also had to restore real acceptance
+        // underneath it. Gating the re-derivation on `self.status == Ready`
+        // specifically (not "any status the unprotected merge happened to
+        // produce") is what keeps this scoped.
         let current = Card::new(CardId::new("001").unwrap(), "Title", "the real body")
             .unwrap()
-            .with_status(CardStatus::Blocked)
+            .with_status(CardStatus::Backlog)
             .with_acceptance(["real oracle item".to_string()])
             .with_created_at(10);
 
@@ -1685,7 +1688,8 @@ mod tests {
         assert_ne!(
             merged.status,
             CardStatus::Ready,
-            "a Blocked card must never be silently promoted to Ready by the reimport-restore path"
+            "a deliberately Backlog card must never be silently promoted to Ready by the \
+             reimport-restore path"
         );
     }
 
@@ -1821,9 +1825,7 @@ mod tests {
     fn protects_lifecycle_on_reimport_covers_active_and_terminal_states() {
         assert!(!card("001", CardStatus::Backlog).protects_lifecycle_on_reimport());
         assert!(!card("001", CardStatus::Ready).protects_lifecycle_on_reimport());
-        assert!(!card("001", CardStatus::Blocked).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::Claimed).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::Running).protects_lifecycle_on_reimport());
+        assert!(card("001", CardStatus::InProgress).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::AwaitingInput).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Done).protects_lifecycle_on_reimport());
         assert!(card("001", CardStatus::Shipped).protects_lifecycle_on_reimport());
@@ -1882,7 +1884,7 @@ mod tests {
     fn apply_status_accepts_any_transition_unconditionally() {
         // powder-epic-one-card-model: Powder is unopinionated about status
         // transitions -- audit over enforcement. A card can jump straight
-        // from Backlog to Done, skip Ready/Claimed/Running entirely, or go
+        // from Backlog to Done, skip Ready/InProgress entirely, or go
         // "backwards" from Done to Backlog; none of it is rejected.
         let mut card = card("001", CardStatus::Backlog);
         card.apply_status(CardStatus::Done, 10);
@@ -1893,8 +1895,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_status_releases_claim_on_ready_blocked_or_terminal() {
-        let mut card = card("001", CardStatus::Running).with_acceptance(["prove it".to_string()]);
+    fn apply_status_releases_claim_on_ready_or_terminal() {
+        let mut card =
+            card("001", CardStatus::InProgress).with_acceptance(["prove it".to_string()]);
         card.claim = Some(Claim {
             agent: "agent-a".to_string(),
             run_id: RunId::new("run-1").unwrap(),

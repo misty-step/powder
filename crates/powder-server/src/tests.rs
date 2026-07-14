@@ -330,7 +330,7 @@ async fn create_card_rejects_an_existing_id_without_replacing_the_card() {
             Method::POST,
             "/api/v1/cards",
             Some(&raw_key),
-            r#"{"id":"duplicate","title":"Replacement","body":"drop me","acceptance":["different"],"status":"blocked"}"#,
+            r#"{"id":"duplicate","title":"Replacement","body":"drop me","acceptance":["different"],"status":"backlog"}"#,
         ))
         .await
         .unwrap();
@@ -429,7 +429,7 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
             Method::PATCH,
             "/api/v1/cards/patchable",
             Some(&raw_key),
-            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","labels":["api","safe-update"]}"#,
+            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"in_progress","labels":["api","safe-update"]}"#,
         ))
         .await
         .unwrap();
@@ -440,7 +440,7 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
     assert!(patched_many.get("acceptance").is_none());
     assert_eq!(patched_many["criteria"][0]["text"], "new proof");
     assert_eq!(patched_many["priority"], "p0");
-    assert_eq!(patched_many["status"], "blocked");
+    assert_eq!(patched_many["status"], "in_progress");
     assert_eq!(patched_many["labels"], json!(["api", "safe-update"]));
     assert_eq!(patched_many["created_at"], before["card"]["created_at"]);
     assert_eq!(patched_many["source"], before["card"]["source"]);
@@ -572,7 +572,7 @@ async fn a_qualifying_http_completion_spawns_a_field_note_draft_in_the_review_qu
             Method::POST,
             "/api/v1/cards",
             Some(&raw_key),
-            r#"{"id":"http-field-note-source","title":"Ship the thing","acceptance":["done"],"status":"running","repo":"misty-step/powder"}"#,
+            r#"{"id":"http-field-note-source","title":"Ship the thing","acceptance":["done"],"status":"in_progress","repo":"misty-step/powder"}"#,
         ))
         .await
         .unwrap();
@@ -689,17 +689,17 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
-    let blocked = app
+    let in_progress = app
         .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards",
             Some(&raw_key),
-            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked"}"#,
+            r#"{"id":"in-progress-1","title":"t","acceptance":["x"],"status":"in_progress"}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(blocked.status(), StatusCode::OK);
+    assert_eq!(in_progress.status(), StatusCode::OK);
 
     let created = app
         .clone()
@@ -735,7 +735,7 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     assert_eq!(all.status(), StatusCode::OK);
     let all = response_json(all).await;
     let all_ids = ids_from(&all);
-    assert!(all_ids.contains(&"blocked-1".to_string()));
+    assert!(all_ids.contains(&"in-progress-1".to_string()));
     assert!(all_ids.contains(&"other-001".to_string()));
     assert_eq!(all["total_count"], 2);
     assert_eq!(all["has_more"], false);
@@ -756,19 +756,19 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     assert_eq!(limited["total_count"], 2);
     assert_eq!(limited["has_more"], true);
 
-    let blocked_only = app
+    let in_progress_only = app
         .clone()
         .oneshot(json_request(
             Method::GET,
-            "/api/v1/cards?status=blocked",
+            "/api/v1/cards?status=in_progress",
             Some(&raw_key),
             "",
         ))
         .await
         .unwrap();
     assert_eq!(
-        ids_from(&response_json(blocked_only).await),
-        vec!["blocked-1".to_string()]
+        ids_from(&response_json(in_progress_only).await),
+        vec!["in-progress-1".to_string()]
     );
 
     let other_repo = app
@@ -1159,7 +1159,7 @@ async fn board_stats_route_returns_compact_counts_without_listing_cards() {
 
     for body in [
         r#"{"id":"stats-ready","title":"Ready","acceptance":["proof"],"status":"ready","repo":"stats-repo"}"#,
-        r#"{"id":"stats-blocked","title":"Blocked","acceptance":["proof"],"status":"blocked","repo":"stats-repo"}"#,
+        r#"{"id":"stats-in-progress","title":"In progress","acceptance":["proof"],"status":"in_progress","repo":"stats-repo"}"#,
         r#"{"id":"secret-stats-ready","title":"Hidden","acceptance":["proof"],"status":"ready","repo":"secret-stats"}"#,
     ] {
         let created = app
@@ -1189,7 +1189,7 @@ async fn board_stats_route_returns_compact_counts_without_listing_cards() {
     let stats = response_json(stats).await;
     assert_eq!(stats["totals"]["cards"], 2);
     assert_eq!(stats["totals"]["ready"], 1);
-    assert_eq!(stats["totals"]["blocked"], 1);
+    assert_eq!(stats["totals"]["in_progress"], 1);
     assert_eq!(stats["repos"][0]["repo"], "stats-repo");
 
     let default_stats = app
@@ -2265,7 +2265,7 @@ async fn api_key_auth_rejects_missing_bearer_and_allows_lifecycle() {
             Method::POST,
             "/api/v1/cards/api-test/status",
             Some(&raw_key),
-            r#"{"status":"running"}"#,
+            r#"{"status":"in_progress"}"#,
         ))
         .await
         .unwrap();
@@ -2405,7 +2405,7 @@ async fn claim_then_get_card_then_renew_round_trips_for_same_identity() {
         .await
         .unwrap();
     let detail = response_json(detail).await;
-    assert_eq!(detail["card"]["status"], "claimed");
+    assert_eq!(detail["card"]["status"], "in_progress");
     assert_eq!(detail["card"]["claim"]["run_id"], run_id);
     assert_eq!(detail["card"]["claim"]["agent"], "lane-x");
 
@@ -2780,7 +2780,7 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
             Method::POST,
             "/api/v1/cards/api-answer/status",
             Some(&raw_key),
-            r#"{"status":"running"}"#,
+            r#"{"status":"in_progress"}"#,
         ))
         .await
         .unwrap();
@@ -2914,7 +2914,7 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
     assert_eq!(run.status(), StatusCode::OK);
     let run = response_json(run).await;
     assert_eq!(run["run"]["state"], "active");
-    assert_eq!(run["card"]["status"], "running");
+    assert_eq!(run["card"]["status"], "in_progress");
     let activities = run["activities"].as_array().unwrap();
     let question_position = activities
         .iter()
@@ -3307,7 +3307,7 @@ async fn admin_can_list_and_revoke_a_key_which_then_loses_access_immediately() {
             Method::POST,
             "/api/v1/cards/revoked-key-proof/status",
             Some(&agent_key_raw),
-            r#"{"status":"running"}"#,
+            r#"{"status":"in_progress"}"#,
         ))
         .await
         .unwrap();
@@ -3490,7 +3490,7 @@ async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
             Method::POST,
             "/api/v1/cards/contested/status",
             Some(&intruder_key),
-            r#"{"status":"running"}"#,
+            r#"{"status":"in_progress"}"#,
         ))
         .await
         .unwrap();

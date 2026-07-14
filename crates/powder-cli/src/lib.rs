@@ -453,7 +453,8 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .map(|value| vec![value.to_string()])
         .unwrap_or_default();
     let status = flag_value(args, "--status")
-        .and_then(CardStatus::parse)
+        .map(parse_status_flag)
+        .transpose()?
         .unwrap_or_else(|| CardStatus::default_for_acceptance(&acceptance));
     let priority = flag_value(args, "--priority")
         .and_then(Priority::parse)
@@ -542,12 +543,7 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             (!values.is_empty()).then(|| values.into_iter().map(str::to_string).collect())
         },
         proof_plan: flag_value(args, "--proof-plan").map(|value| vec![value.to_string()]),
-        status: flag_value(args, "--status")
-            .map(|raw| {
-                CardStatus::parse(raw)
-                    .ok_or_else(|| ShellError::Invalid(format!("invalid --status: {raw}")))
-            })
-            .transpose()?,
+        status: flag_value(args, "--status").map(parse_status_flag).transpose()?,
         priority: flag_value(args, "--priority")
             .map(|raw| {
                 Priority::parse(raw)
@@ -690,17 +686,12 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     Ok(out)
 }
 
-/// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`
-/// and `done` cards are otherwise invisible without opening the
-/// database file directly.
+/// Enumerate cards by status/repo, not just ready-eligible ones -- a card
+/// with an unresolved blocker, and `done` cards, are otherwise invisible
+/// without opening the database file directly.
 fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
-    let status = flag_value(args, "--status")
-        .map(|raw| {
-            CardStatus::parse(raw)
-                .ok_or_else(|| ShellError::Invalid(format!("invalid status: {raw}")))
-        })
-        .transpose()?;
+    let status = flag_value(args, "--status").map(parse_status_flag).transpose()?;
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
@@ -1106,9 +1097,14 @@ fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shell
 fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "update-status")?;
-    let status = flag_value(args, "--status")
-        .and_then(CardStatus::parse)
-        .ok_or_else(|| ShellError::Invalid("update-status requires --status".to_string()))?;
+    let status = match flag_value(args, "--status") {
+        Some(raw) => parse_status_flag(raw)?,
+        None => {
+            return Err(ShellError::Invalid(
+                "update-status requires --status".to_string(),
+            ))
+        }
+    };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
@@ -1436,6 +1432,24 @@ fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, She
         .filter(|value| !value.is_empty())
         .map(|value| CardId::new(value).map_err(ShellError::from))
         .collect()
+}
+
+/// powder-status-vocabulary: every `--status` call site routes through here
+/// so a retired status name (`claimed`, `running`, `blocked`) is rejected
+/// with an error that names the current seven-status vocabulary, not
+/// silently aliased onto a surviving status or swallowed into a default.
+fn parse_status_flag(raw: &str) -> Result<CardStatus, ShellError> {
+    CardStatus::parse(raw).ok_or_else(|| {
+        ShellError::Invalid(format!(
+            "invalid --status {raw:?}; valid: {}",
+            CardStatus::ALL
+                .iter()
+                .copied()
+                .map(CardStatus::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })
 }
 
 fn parse_estimate_flag(raw: &str) -> Result<Estimate, ShellError> {
@@ -1829,7 +1843,7 @@ mod tests {
             "--db",
             &db,
             "--status",
-            "running",
+            "in_progress",
         ]))
         .unwrap();
         run(&args([
@@ -2101,11 +2115,11 @@ mod tests {
             "--db",
             &db,
             "--id",
-            "blocked-1",
+            "in-progress-1",
             "--title",
-            "Blocked ticket",
+            "In progress ticket",
             "--status",
-            "blocked",
+            "in_progress",
         ]))
         .unwrap();
         run(&args([
@@ -2124,12 +2138,13 @@ mod tests {
         .unwrap();
 
         let all = run(&args(["list-cards", "--db", &db])).unwrap();
-        assert!(all.contains("blocked-1"));
+        assert!(all.contains("in-progress-1"));
         assert!(all.contains("ready-1"));
 
-        let blocked_only = run(&args(["list-cards", "--db", &db, "--status", "blocked"])).unwrap();
-        assert!(blocked_only.contains("blocked-1"));
-        assert!(!blocked_only.contains("ready-1"));
+        let in_progress_only =
+            run(&args(["list-cards", "--db", &db, "--status", "in_progress"])).unwrap();
+        assert!(in_progress_only.contains("in-progress-1"));
+        assert!(!in_progress_only.contains("ready-1"));
 
         let err = run(&args([
             "list-cards",
@@ -2866,12 +2881,12 @@ mod tests {
             "--db",
             &db,
             "--status",
-            "running",
+            "in_progress",
             "--actor",
             "intruder",
         ]))
         .unwrap();
-        assert!(status.contains("status\tholder-test\trunning"));
+        assert!(status.contains("status\tholder-test\tin_progress"));
 
         let completed = run(&args([
             "complete-card",
@@ -2885,7 +2900,7 @@ mod tests {
         assert!(completed.contains("completed\tholder-test\tdone"));
         let card = run(&args(["get-card", "holder-test", "--db", &db])).unwrap();
         assert!(card.contains("\"actor\": \"intruder\""));
-        assert!(card.contains("running -> done"));
+        assert!(card.contains("in_progress -> done"));
     }
 
     #[test]
@@ -3150,7 +3165,7 @@ mod tests {
             "--db",
             &db,
             "--status",
-            "running",
+            "in_progress",
         ]))
         .unwrap();
         run(&args([
@@ -3224,7 +3239,7 @@ mod tests {
             (
                 200,
                 json!({
-                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "title": "Blocked"}],
+                    "cards": [{"id": "in-progress-1", "priority": "p2", "status": "in_progress", "title": "In progress"}],
                     "total_count": 1,
                     "has_more": false
                 }),
@@ -3243,11 +3258,11 @@ mod tests {
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "in_progress", "title": "Remote created"}),
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "in_progress", "title": "Remote created"}),
             ),
             (
                 200,
@@ -3265,14 +3280,14 @@ mod tests {
                 "--limit",
                 "2",
                 "--status",
-                "blocked",
+                "in_progress",
                 "--repo",
                 "misty-step/powder",
             ]),
             &env,
         )
         .unwrap();
-        assert_eq!(cards, "blocked-1\tP2\tblocked\tBlocked\n");
+        assert_eq!(cards, "in-progress-1\tP2\tin_progress\tIn progress\n");
 
         let detail = run_with_env(&args(["get-card", "remote-1"]), &env).unwrap();
         assert!(detail.contains("\"id\": \"remote-1\""));
@@ -3312,11 +3327,11 @@ mod tests {
         assert_eq!(claimed, "claimed\tremote-created\trun-remote\t100\n");
 
         let status = run_with_env(
-            &args(["update-status", "remote-created", "--status", "running"]),
+            &args(["update-status", "remote-created", "--status", "in_progress"]),
             &env,
         )
         .unwrap();
-        assert_eq!(status, "status\tremote-created\trunning\n");
+        assert_eq!(status, "status\tremote-created\tin_progress\n");
 
         let criterion = run_with_env(
             &args([
@@ -3355,7 +3370,7 @@ mod tests {
             paths,
             vec![
                 "GET /api/v1/cards/ready?limit=1",
-                "GET /api/v1/cards?limit=2&status=blocked&repo=misty-step%2Fpowder",
+                "GET /api/v1/cards?limit=2&status=in_progress&repo=misty-step%2Fpowder",
                 "GET /api/v1/cards/remote-1?detail=detailed",
                 "POST /api/v1/cards",
                 "POST /api/v1/cards/remote-created/claim",
@@ -3387,7 +3402,7 @@ mod tests {
             requests[4].body,
             Some(json!({"agent": "codex", "ttl_seconds": 60}))
         );
-        assert_eq!(requests[5].body, Some(json!({"status": "running"})));
+        assert_eq!(requests[5].body, Some(json!({"status": "in_progress"})));
         assert_eq!(
             requests[6].body,
             Some(json!({"criterion": 0, "actor": "operator", "checked": true}))

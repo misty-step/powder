@@ -157,21 +157,21 @@ fn run_grooming_scan(command: &McpCommand, temp: &mut TempFixtureRoot) -> Scenar
         seed_grooming_scan(&db_path)?;
         let mut mcp = McpProcess::spawn(command, &db_path)?;
 
-        let response = mcp.call_tool(
-            recorder,
-            "list_cards",
-            json!({"status": "ready", "repo": TARGET_REPO, "limit": 10}),
-        )?;
+        // powder-status-vocabulary: `list_ready`, not a raw `status=ready`
+        // filter, is the eligibility query that derives blocked-ness from
+        // `blocked_by` relations -- `groom-blocked` carries Ready-shaped
+        // status but an unresolved blocker, and must still be excluded here.
+        let response = mcp.call_tool(recorder, "list_ready", json!({"limit": 50}))?;
         let payload = response.payload()?;
         let cards = required_array(payload, "cards")?;
-        let p0_ids = cards
+        let target_repo_p0_ids = cards
             .iter()
-            .filter(|card| card["priority"] == "p0")
+            .filter(|card| card["priority"] == "p0" && card["repo"] == TARGET_REPO)
             .map(|card| required_str(card, "id"))
             .collect::<EvalResult<Vec<_>>>()?;
-        assert_eq_string_slices(&p0_ids, &["groom-p0-a", "groom-p0-b"])?;
-        if cards.iter().any(|card| card["repo"] != TARGET_REPO) {
-            return Err("grooming scan returned a card outside the target repo".to_string());
+        assert_eq_string_slices(&target_repo_p0_ids, &["groom-p0-a", "groom-p0-b"])?;
+        if cards.iter().any(|card| card["id"] == "groom-blocked") {
+            return Err("list_ready surfaced a card with an unresolved blocker".to_string());
         }
 
         mcp.shutdown()?;
@@ -282,7 +282,7 @@ fn run_input_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioM
         )?;
         expect_eq(
             run_payload["card"]["status"].as_str(),
-            Some("running"),
+            Some("in_progress"),
             "get_run card status",
         )?;
         let activities = run_payload["activities"]
@@ -324,18 +324,18 @@ fn run_error_recovery(command: &McpCommand, temp: &mut TempFixtureRoot) -> Scena
             "update_status",
             json!({
                 "card_id": "error-recovery",
-                "status": "blocked",
+                "status": "awaiting_input",
                 "actor": AGENT
             }),
         )?;
         expect_eq(
             corrected.payload()?["status"].as_str(),
-            Some("blocked"),
+            Some("awaiting_input"),
             "corrected status",
         )?;
 
         mcp.shutdown()?;
-        assert_card_status(&db_path, "error-recovery", CardStatus::Blocked)?;
+        assert_card_status(&db_path, "error-recovery", CardStatus::AwaitingInput)?;
         Ok(())
     })
 }
@@ -387,13 +387,26 @@ fn seed_grooming_scan(db_path: &Path) -> EvalResult<()> {
                 .acceptance(&["other proof"])
                 .created_at(SEED_NOW + 3),
         )?;
+        // powder-status-vocabulary: blocking is expressed via an unresolved
+        // `blocked_by` relation now, not a `blocked` status -- the blocker
+        // card below is deliberately left in Backlog (non-terminal) so
+        // `groom-blocked` stays ineligible for list_ready/grooming despite
+        // carrying Ready-shaped acceptance.
         seed_card(
             store,
-            CardSeed::new("groom-blocked", "P0 target blocked", CardStatus::Blocked)
+            CardSeed::new("groom-blocked-blocker", "Blocks the P0 target", CardStatus::Backlog)
+                .priority(Priority::P0)
+                .repo(TARGET_REPO)
+                .created_at(SEED_NOW + 4),
+        )?;
+        seed_card(
+            store,
+            CardSeed::new("groom-blocked", "P0 target blocked", CardStatus::Ready)
                 .priority(Priority::P0)
                 .repo(TARGET_REPO)
                 .acceptance(&["blocked proof"])
-                .created_at(SEED_NOW + 4),
+                .blocked_by(&["groom-blocked-blocker"])
+                .created_at(SEED_NOW + 5),
         )?;
         Ok(())
     })
@@ -470,6 +483,7 @@ struct CardSeed<'a> {
     priority: Priority,
     repo: Option<&'a str>,
     acceptance: &'a [&'a str],
+    blocked_by: &'a [&'a str],
     created_at: i64,
 }
 
@@ -482,6 +496,7 @@ impl<'a> CardSeed<'a> {
             priority: Priority::P2,
             repo: None,
             acceptance: &[],
+            blocked_by: &[],
             created_at: SEED_NOW,
         }
     }
@@ -498,6 +513,15 @@ impl<'a> CardSeed<'a> {
 
     fn acceptance(mut self, acceptance: &'a [&'a str]) -> Self {
         self.acceptance = acceptance;
+        self
+    }
+
+    /// powder-status-vocabulary: blocking is expressed purely via unresolved
+    /// `blocked_by` relations now, not a status -- `list_ready`/eligibility
+    /// already derives blocked-ness from these ids regardless of status
+    /// (`Card::claim_readiness`).
+    fn blocked_by(mut self, blocked_by: &'a [&'a str]) -> Self {
+        self.blocked_by = blocked_by;
         self
     }
 
@@ -519,6 +543,11 @@ fn seed_card(store: &mut Store, seed: CardSeed<'_>) -> EvalResult<()> {
     .with_acceptance(seed.acceptance.iter().map(|item| (*item).to_string()))
     .with_created_at(seed.created_at);
     card.repo = seed.repo.map(ToOwned::to_owned);
+    card.blocked_by = seed
+        .blocked_by
+        .iter()
+        .map(|id| card_id(id))
+        .collect::<Result<Vec<_>, _>>()?;
     store
         .create_card_with_events(card, FIXTURE_ACTOR, seed.created_at)
         .map_err(to_string)?;
@@ -602,9 +631,9 @@ fn assert_input_loop_end_state(db_path: &Path, run_id: &str) -> EvalResult<()> {
             run.run.state.as_str()
         ));
     }
-    if run.card.status != CardStatus::Running {
+    if run.card.status != CardStatus::InProgress {
         return Err(format!(
-            "input-loop card status was {}, expected running",
+            "input-loop card status was {}, expected in_progress",
             run.card.status.as_str()
         ));
     }

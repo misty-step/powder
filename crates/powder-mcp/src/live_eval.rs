@@ -605,14 +605,39 @@ fn seed_card_selection(mcp: &mut LiveMcpProcess) -> Result<(), String> {
         "P0",
         "eval-target",
     )?;
+    // powder-status-vocabulary: blocked-ness is an unresolved `blocked_by`
+    // relation, not a status -- the decoy carries Ready status plus a live
+    // blocker, so it looks claimable on a naive status scan but is excluded
+    // by any eligibility-aware path (list_ready / claim).
+    create_seed_card(
+        mcp,
+        "sel-decoy-blocker",
+        "Ship the new auth design first",
+        "backlog",
+        "P0",
+        "eval-target",
+    )?;
     create_seed_card(
         mcp,
         "sel-decoy-blocked",
         "Redesign auth login flow",
-        "blocked",
+        "ready",
         "P0",
         "eval-target",
     )?;
+    let relations = mcp.call_tool(
+        "update_relations",
+        json!({
+            "card_id": "sel-decoy-blocked",
+            "blocked_by": ["sel-decoy-blocker"],
+        }),
+    );
+    if !relations.ok {
+        return Err(format!(
+            "seed update_relations sel-decoy-blocked failed: {}",
+            relations.content
+        ));
+    }
     create_seed_card(
         mcp,
         "sel-decoy-repo",

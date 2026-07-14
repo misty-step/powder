@@ -47,7 +47,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_cards",
         description: "Scan card summaries by optional status/repo/estimate filter, not just ready-eligible ones. With no status filter, done/shipped/abandoned cards are hidden by default (set include_terminal:true to see them too); total_count in the response always reports the full matching count, terminal cards included, so a hidden card is never mistaken for a nonexistent one. An explicit status filter (e.g. status:done) always returns matching cards regardless of include_terminal. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -57,12 +57,12 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, and initial status; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
         description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, estimate, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. Any authenticated actor may patch; the change is audited with actor and field list.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -117,7 +117,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "update_status",
         description: "Set a card to any status in one call and record an audit event; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "check_criterion",
@@ -1882,12 +1882,39 @@ mod tests {
             &json!({
                 "id": "explicit-status",
                 "title": "Explicit status wins",
-                "status": "blocked"
+                "status": "in_progress"
             }),
             12,
         )
         .unwrap();
-        assert_eq!(tool_payload(&explicit)["status"], "blocked");
+        assert_eq!(tool_payload(&explicit)["status"], "in_progress");
+    }
+
+    #[test]
+    fn mcp_create_card_rejects_a_retired_status_name_without_silently_aliasing() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        for retired in ["claimed", "running", "blocked"] {
+            let err = call_tool_store(
+                &mut store,
+                "create_card",
+                &json!({
+                    "id": format!("retired-{retired}"),
+                    "title": "Retired status name",
+                    "status": retired
+                }),
+                10,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "invalid status {retired:?}; valid: backlog|ready|in_progress|awaiting_input|done|shipped|abandoned"
+                ),
+                "retired status {retired} must be rejected, not silently aliased"
+            );
+        }
     }
 
     #[test]
@@ -1896,14 +1923,14 @@ mod tests {
         store.migrate().unwrap();
         store
             .import_cards(vec![seeded_card(
-                "blocked",
-                "Blocked",
-                CardStatus::Blocked,
+                "in-progress-1",
+                "In progress",
+                CardStatus::InProgress,
                 1,
             )])
             .unwrap();
 
-        // powder-mcp-unfiltered-enumeration: `blocked` is not a terminal
+        // powder-mcp-unfiltered-enumeration: `in_progress` is not a terminal
         // status, so it is unaffected by the new default-terminal-exclusion
         // behavior below -- this assertion still holds unchanged. The
         // terminal-exclusion behavior itself (done/shipped/abandoned hidden
@@ -1916,10 +1943,15 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|card| card["id"] == "blocked"));
+            .any(|card| card["id"] == "in-progress-1"));
 
-        let filtered =
-            call_tool_store(&mut store, "list_cards", &json!({"status": "blocked"}), 10).unwrap();
+        let filtered = call_tool_store(
+            &mut store,
+            "list_cards",
+            &json!({"status": "in_progress"}),
+            10,
+        )
+        .unwrap();
         let payload = tool_payload(&filtered);
         assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
         assert_eq!(payload["total_count"], 1);
@@ -1929,7 +1961,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             invalid,
-            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+            "invalid status \"not-real\"; valid: backlog|ready|in_progress|awaiting_input|done|shipped|abandoned"
         );
     }
 
@@ -2125,7 +2157,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             invalid_status,
-            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+            "invalid status \"not-real\"; valid: backlog|ready|in_progress|awaiting_input|done|shipped|abandoned"
         );
 
         let invalid_priority = call_tool_store(
@@ -2175,7 +2207,7 @@ mod tests {
         call_tool_store(
             &mut store,
             "update_status",
-            &json!({"card_id": "approval-card", "status": "running"}),
+            &json!({"card_id": "approval-card", "status": "in_progress"}),
             3,
         )
         .unwrap();
@@ -2315,7 +2347,7 @@ mod tests {
         let listed = call_tool_store(
             &mut store,
             "list_cards",
-            &json!({"status": "claimed", "limit": 1}),
+            &json!({"status": "in_progress", "limit": 1}),
             12,
         )
         .unwrap();
@@ -2972,7 +3004,7 @@ mod tests {
             relation_payload,
             json!({
                 "id": "006",
-                "status": "claimed",
+                "status": "in_progress",
                 "updated_at": 10,
                 "related": ["peer"],
                 "blocks": ["child"],
@@ -2984,13 +3016,13 @@ mod tests {
         let status = call_tool_store(
             &mut store,
             "update_status",
-            &json!({"card_id": "006", "status": "running", "actor": "intruder"}),
+            &json!({"card_id": "006", "status": "awaiting_input", "actor": "intruder"}),
             11,
         )
         .unwrap();
         assert_eq!(
             tool_payload(&status),
-            json!({"id": "006", "status": "running", "updated_at": 11})
+            json!({"id": "006", "status": "awaiting_input", "updated_at": 11})
         );
 
         let completed = call_tool_store(

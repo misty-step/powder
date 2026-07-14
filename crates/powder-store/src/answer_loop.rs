@@ -205,7 +205,7 @@ impl Store {
             ))
             .into());
         }
-        card.status = CardStatus::Running;
+        card.status = CardStatus::InProgress;
         card.updated_at = now;
         run.state = RunState::Active;
         run.updated_at = now;

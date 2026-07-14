@@ -781,7 +781,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             invalid_status,
-            "invalid status \"not-real\"; valid: backlog|ready|claimed|running|awaiting_input|blocked|done|shipped|abandoned"
+            "invalid status \"not-real\"; valid: backlog|ready|in_progress|awaiting_input|done|shipped|abandoned"
         );
 
         let invalid_priority = call_tool_remote(
@@ -927,7 +927,7 @@ mod tests {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
             json!({
-                "cards": [api_card("blocked-1", "Blocked remote", "blocked", "p1", 10)],
+                "cards": [api_card("in-progress-1", "In progress remote", "in_progress", "p1", 10)],
                 "total_count": 1,
                 "has_more": false
             }),
@@ -937,21 +937,21 @@ mod tests {
         let result = call_tool_remote(
             &client,
             "list_cards",
-            &json!({"status": "blocked", "repo": "misty-step/example", "limit": 5}),
+            &json!({"status": "in_progress", "repo": "misty-step/example", "limit": 5}),
         )
         .unwrap();
 
         assert!(result["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("blocked-1"));
+            .contains("in-progress-1"));
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "GET");
         // include_terminal=true here because an explicit status filter is
         // authoritative (powder-mcp-unfiltered-enumeration).
         assert_eq!(
             requests[0].path,
-            "/api/v1/cards?limit=5&status=blocked&repo=misty-step%2Fexample&include_terminal=true"
+            "/api/v1/cards?limit=5&status=in_progress&repo=misty-step%2Fexample&include_terminal=true"
         );
     }
 
@@ -1115,8 +1115,8 @@ mod tests {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
             json!({
-                "totals": {"cards": 2, "ready": 1, "blocked": 1},
-                "repos": [{"repo": "example", "cards": 2, "ready": 1, "blocked": 1}]
+                "totals": {"cards": 2, "ready": 1, "in_progress": 1},
+                "repos": [{"repo": "example", "cards": 2, "ready": 1, "in_progress": 1}]
             }),
         )]);
         let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
@@ -1164,8 +1164,8 @@ mod tests {
                 200,
                 json!({
                     "cards": [
-                        api_card("remote-2", "Remote two", "running", "p1", 20),
-                        api_card("remote-3", "Remote three", "blocked", "p2", 30)
+                        api_card("remote-2", "Remote two", "in_progress", "p1", 20),
+                        api_card("remote-3", "Remote three", "backlog", "p2", 30)
                     ],
                     "total_count": 7,
                     "has_more": true
@@ -1231,7 +1231,7 @@ mod tests {
                 "id": "proof-plan",
                 "title": "Edited title",
                 "body": "edited body stays out of the ack",
-                "status": "blocked",
+                "status": "in_progress",
                 "updated_at": 42,
                 "criteria": [{"text": "criteria stay out too"}]
             }),
@@ -1241,20 +1241,20 @@ mod tests {
         let result = call_tool_remote(
             &client,
             "update_card",
-            &json!({"card_id": "proof-plan", "title": "Edited title", "status": "blocked"}),
+            &json!({"card_id": "proof-plan", "title": "Edited title", "status": "in_progress"}),
         )
         .unwrap();
 
         assert_eq!(
             tool_payload(&result),
-            json!({"id": "proof-plan", "status": "blocked", "updated_at": 42})
+            json!({"id": "proof-plan", "status": "in_progress", "updated_at": 42})
         );
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "PATCH");
         assert_eq!(requests[0].path, "/api/v1/cards/proof-plan");
         assert_eq!(
             requests[0].body,
-            Some(json!({"title": "Edited title", "status": "blocked"}))
+            Some(json!({"title": "Edited title", "status": "in_progress"}))
         );
     }
 
@@ -1393,7 +1393,7 @@ mod tests {
                     "id": "006",
                     "title": "Remote holder",
                     "body": "full body is not echoed",
-                    "status": "running",
+                    "status": "in_progress",
                     "updated_at": 11,
                     "criteria": [{"text": "full criterion is not echoed"}]
                 }),
@@ -1402,7 +1402,7 @@ mod tests {
                 200,
                 json!({
                     "id": "006",
-                    "status": "running",
+                    "status": "in_progress",
                     "updated_at": 12,
                     "related": ["peer"],
                     "blocks": ["child"]
@@ -1414,12 +1414,12 @@ mod tests {
         let status = call_tool_remote(
             &client,
             "update_status",
-            &json!({"card_id": "006", "status": "running"}),
+            &json!({"card_id": "006", "status": "in_progress"}),
         )
         .unwrap();
         assert_eq!(
             tool_payload(&status),
-            json!({"id": "006", "status": "running", "updated_at": 11})
+            json!({"id": "006", "status": "in_progress", "updated_at": 11})
         );
 
         let relations = call_tool_remote(
@@ -1432,7 +1432,7 @@ mod tests {
             tool_payload(&relations),
             json!({
                 "id": "006",
-                "status": "running",
+                "status": "in_progress",
                 "updated_at": 12,
                 "related": ["peer"],
                 "blocks": ["child"],
@@ -1443,7 +1443,7 @@ mod tests {
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "POST");
         assert_eq!(requests[0].path, "/api/v1/cards/006/status");
-        assert_eq!(requests[0].body, Some(json!({"status": "running"})));
+        assert_eq!(requests[0].body, Some(json!({"status": "in_progress"})));
         assert_eq!(requests[1].method, "POST");
         assert_eq!(requests[1].path, "/api/v1/cards/006/relations");
         assert_eq!(
