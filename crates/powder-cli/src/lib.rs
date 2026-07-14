@@ -185,7 +185,13 @@ pub fn help() -> String {
     help.push_str(
         "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary [--proof-plan \"CI + PR\"]\n",
     );
+    help.push_str(
+        "  powder create-card ... --acceptance \"first criterion\" --acceptance \"second criterion\"  (repeatable; every occurrence is one criterion, in order)\n",
+    );
     help.push_str("  powder update-card canary-001 --db ./data/powder.db --autonomy auto\n");
+    help.push_str(
+        "  powder update-card canary-001 --db ./data/powder.db --acceptance \"a\" --acceptance \"b\"  (repeatable; replaces the full criteria list)\n",
+    );
     help.push_str(
         "  powder list-cards --db ./data/powder.db --status blocked --repo misty-step/example\n",
     );
@@ -390,9 +396,12 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     // still honored regardless -- status is a label, is_ready_at is the
     // independent gate -- but the *default* status must reflect whether a
     // real oracle exists.
-    let acceptance: Vec<String> = flag_value(args, "--acceptance")
-        .map(|value| vec![value.to_string()])
-        .unwrap_or_default();
+    // --acceptance is repeatable: every occurrence contributes one criterion,
+    // in order. A single occurrence keeps its historical behavior.
+    let acceptance: Vec<String> = flag_values(args, "--acceptance")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let proof_plan: Vec<String> = flag_value(args, "--proof-plan")
         .map(|value| vec![value.to_string()])
         .unwrap_or_default();
@@ -492,7 +501,10 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let patch = CardPatch {
         title: flag_value(args, "--title").map(str::to_string),
         body: flag_value(args, "--body").map(str::to_string),
-        acceptance: flag_value(args, "--acceptance").map(|value| vec![value.to_string()]),
+        acceptance: {
+            let values = flag_values(args, "--acceptance");
+            (!values.is_empty()).then(|| values.into_iter().map(str::to_string).collect())
+        },
         proof_plan: flag_value(args, "--proof-plan").map(|value| vec![value.to_string()]),
         status: flag_value(args, "--status")
             .map(|raw| {
@@ -1546,6 +1558,18 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .position(|arg| arg == flag)
         .and_then(|index| args.get(index + 1))
         .map(String::as_str)
+}
+
+/// Every value of a repeatable flag, in argument order. `flag_value` takes
+/// only the first occurrence, which silently discarded later `--acceptance`
+/// criteria (powder-cli-repeated-acceptance).
+fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_str() == flag)
+        .filter_map(|(index, _)| args.get(index + 1))
+        .map(String::as_str)
+        .collect()
 }
 
 fn positional(args: &[String]) -> Vec<&str> {
@@ -2762,6 +2786,85 @@ mod tests {
         assert!(card.contains("\"related\": [\n      \"peer-c\""));
         assert!(card.contains("\"blocked_by\": [\n      \"parent-a\""));
         assert!(card.contains("\"actor\": \"operator\""));
+    }
+
+    #[test]
+    fn repeated_acceptance_flags_preserve_every_criterion_in_order() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-repeated-acceptance-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "multi-oracle",
+            "--title",
+            "Multi oracle",
+            "--acceptance",
+            "first criterion",
+            "--acceptance",
+            "second criterion",
+        ]))
+        .unwrap();
+
+        let card = run(&args(["get-card", "multi-oracle", "--db", &db])).unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&card).unwrap();
+        let criteria = detail["card"]["criteria"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|criterion| criterion["text"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(criteria, vec!["first criterion", "second criterion"]);
+
+        // update-card: same no-silent-discard behavior, replacing the list.
+        run(&args([
+            "update-card",
+            "multi-oracle",
+            "--db",
+            &db,
+            "--acceptance",
+            "updated first",
+            "--acceptance",
+            "updated second",
+            "--acceptance",
+            "updated third",
+        ]))
+        .unwrap();
+        let card = run(&args(["get-card", "multi-oracle", "--db", &db])).unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&card).unwrap();
+        let criteria = detail["card"]["criteria"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|criterion| criterion["text"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            criteria,
+            vec!["updated first", "updated second", "updated third"]
+        );
+
+        // Single-value compatibility unchanged.
+        run(&args([
+            "update-card",
+            "multi-oracle",
+            "--db",
+            &db,
+            "--acceptance",
+            "only one",
+        ]))
+        .unwrap();
+        let card = run(&args(["get-card", "multi-oracle", "--db", &db])).unwrap();
+        assert!(card.contains("only one"));
+        assert!(!card.contains("updated second"));
     }
 
     #[test]
