@@ -70,9 +70,13 @@ pub struct ReadyOrder {
 /// to ordering the eligible set (that card is either not ready itself, in
 /// which case it is not part of "what order should an agent drain this
 /// set in", or it is a `blocks` target that has already completed).
-/// `blocks` and `blocked_by` are independently author-set (nothing keeps
-/// them mirrored on both cards), so either field alone naming an edge is
-/// enough to order it; a self-edge is ignored.
+/// `blocks` and `blocked_by` are two independent fields on the `Card`
+/// values this module is handed, so either field alone naming an edge is
+/// enough to order it; a self-edge is ignored. This module has no
+/// visibility into how a caller's store keeps the two fields in agreement
+/// across cards (or whether it does at all -- imported/migrated data can
+/// still be asymmetric), so reading both independently here is
+/// deliberate defense-in-depth, not a workaround for a known gap.
 ///
 /// # Determinism
 ///

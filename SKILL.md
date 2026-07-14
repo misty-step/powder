@@ -75,6 +75,9 @@ Default agent persona (20 tools):
 - `create_card`: create one card with optional acceptance criteria, proof
   plan, relations, parent (decomposing an epic), repository, estimate, and
   initial status; returns a minimal ack -- `get_card` for full state.
+  `related`/`blocks`/`blocked_by` set at creation mirror reciprocally onto
+  each named peer that already exists (see `update_relations`); a peer id
+  that doesn't exist yet is tolerated and simply not mirrored.
 - `list_repositories`: list repository entities with aliases, visibility,
   tier, import provenance, and status counts.
 - `manage_claim`: acquire, renew, heartbeat, release, or transfer a claim with
@@ -109,6 +112,16 @@ Default agent persona (20 tools):
   under an epic, `clear_parent` unlinks it. A hierarchy-only call leaves the
   relation lists untouched. Parent edges never block and child completion
   never completes the parent -- parent acceptance stays authoritative.
+  **Relation writes are reciprocal and atomic**: only the ids added or
+  removed versus the card's prior lists are mirrored onto each named peer
+  that exists, in the same transaction as the primary write -- `related` is
+  symmetric (A related X implies X related A), `blocks`/`blocked_by` mirror
+  each other (A blocks X implies X is blocked_by A). An id naming a card
+  that doesn't exist is tolerated and simply not mirrored (unchanged from
+  prior behavior -- relation targets have never been existence-checked).
+  Run `powder relations-doctor --db <path>` (add `--repair` to fix) to find
+  or repair graphs asymmetric from before this guarantee existed, or from
+  direct database writes that bypassed every face.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `add_comment`: attach an actor-attributed comment (`author`, `body` --
   both required), visible immediately via `get_card`/`get_run`; `body` is
@@ -186,6 +199,8 @@ powder transfer-claim 001 --db ./data/powder.db --run run-id --to-agent codex --
 powder release-claim 001 --db ./data/powder.db --run run-id
 powder get-card 001 --db ./data/powder.db
 powder update-relations 001 --db ./data/powder.db --related 002 --blocks 003 --blocked-by 000
+powder relations-doctor --db ./data/powder.db  # report-only: lists cards whose blocks/blocked_by/related disagree with a peer
+powder relations-doctor --db ./data/powder.db --repair --actor operator  # symmetrizes every found issue and audits each fix
 powder update-status 001 --db ./data/powder.db --status in_progress
 powder request-input run-id --db ./data/powder.db --question "Approve?"
 powder list-awaiting-input --db ./data/powder.db

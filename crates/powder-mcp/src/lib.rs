@@ -56,7 +56,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "create_card",
-        description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, and initial status; returns a minimal ack; get_card for full state.",
+        description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, and initial status; returns a minimal ack; get_card for full state. related/blocks/blocked_by set at creation mirror reciprocally onto each named peer that already exists (related is symmetric; blocks/blocked_by mirror each other); a peer id that doesn't exist yet is tolerated and simply not mirrored.",
         input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
@@ -126,7 +126,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "update_relations",
-        description: "Replace a card's related, blocks, and blocked_by relation lists, and/or set its parent edge: parent links the card under an epic, clear_parent unlinks it. Passing only parent/clear_parent leaves the relation lists untouched. Returns a minimal ack; get_card for full state.",
+        description: "Replace a card's related, blocks, and blocked_by relation lists, and/or set its parent edge: parent links the card under an epic, clear_parent unlinks it. Passing only parent/clear_parent leaves the relation lists untouched. Relation writes are reciprocal and atomic: only the ids added or removed vs. the card's prior lists are mirrored onto each named peer that exists (related is symmetric; blocks/blocked_by mirror each other), in the same transaction, so the two sides can never observably disagree; a dangling peer id is tolerated and simply not mirrored. Returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"clear_parent":{"type":"boolean"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
@@ -3112,6 +3112,68 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event["actor"] == "intruder"));
+    }
+
+    /// powder-dogfood-2026-07-14-nonreciprocal-relations: an update_relations
+    /// call against one card is reciprocal and atomic -- get_card on the
+    /// *other* named card shows the mirrored edge with no second tool call.
+    #[test]
+    fn mcp_update_relations_is_reciprocal_across_both_cards() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![
+                seeded_card("recip-a", "Recip A", CardStatus::Ready, 1),
+                seeded_card("recip-b", "Recip B", CardStatus::Ready, 1),
+            ])
+            .unwrap();
+
+        call_tool_store(
+            &mut store,
+            "update_relations",
+            &json!({
+                "card_id": "recip-a",
+                "blocked_by": ["recip-b"],
+                "actor": "operator"
+            }),
+            10,
+        )
+        .unwrap();
+
+        let peer = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "recip-b", "detail": "detailed"}),
+            11,
+        )
+        .unwrap();
+        let peer_payload = tool_payload(&peer);
+        assert_eq!(peer_payload["card"]["blocks"], json!(["recip-a"]));
+        assert!(peer_payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["event_type"] == "relations"
+                    && event["payload"]
+                        .as_str()
+                        .unwrap()
+                        .contains("mirrored add blocks recip-a")
+            }));
+
+        // Clearing the edge on recip-a unmirrors it from recip-b too.
+        call_tool_store(
+            &mut store,
+            "update_relations",
+            &json!({"card_id": "recip-a", "blocked_by": [], "actor": "operator"}),
+            12,
+        )
+        .unwrap();
+        let peer =
+            call_tool_store(&mut store, "get_card", &json!({"card_id": "recip-b"}), 13).unwrap();
+        // `blocks` is omitted entirely when empty (skip_serializing_if), so
+        // the unmirrored peer's card object simply has no `blocks` key.
+        assert!(tool_payload(&peer)["card"]["blocks"].is_null());
     }
 
     #[test]

@@ -170,7 +170,28 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    (powder-epic-truthful-ops) -- read it back over SSH as a second,
    independent confirmation of what actually booted, rather than trusting
    the deploy script alone.
-6. **Post-deploy checklist item (lead, not this task):** re-verify the
+6. **One-time after the reciprocal-relations deploy (PR #136): repair
+   pre-existing asymmetric relation edges.** New relations writes are
+   mirrored onto both cards atomically from this build onward, but edges
+   written *before* this deploy stay one-sided until repaired — and with
+   `blocked_by` now the sole source of blocking truth, an un-mirrored edge
+   silently mis-orders `list_ready` on the side that never heard about it.
+   Over SSH, against the live database:
+
+   ```sh
+   ssh root@<box> 'powder relations-doctor --db /data/apps/powder/powder.db'          # inspect the report first
+   ssh root@<box> 'powder relations-doctor --db /data/apps/powder/powder.db --repair --actor operator'
+   ```
+
+   Run the report *before* repairing: repair uses union semantics (it adds
+   the missing mirror edge, never deletes the one-sided edge), so it cannot
+   distinguish a missing mirror-add from a half-applied removal — if the
+   report shows an edge you know was meant to be deleted, delete it via
+   `update-relations` instead of letting repair resurrect it. The repair is
+   idempotent and audited per touched card; a clean second run reports zero
+   issues. This step is a one-time backfill, not a recurring deploy step —
+   it can be dropped from this runbook once the live board reports clean.
+7. **Post-deploy checklist item (lead, not this task):** re-verify the
    Canary heartbeat against the live box after the swap. This is a manual
    step for whoever drove the deploy to do against the real instance --
    nothing in this repo can exercise it.

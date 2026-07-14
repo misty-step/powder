@@ -5,8 +5,8 @@ use powder_core::{
 
 use crate::{
     ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
-    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError,
-    WorkLogAttribution, API_KEY_ALPHABET,
+    RelationField, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
+    StoreError, WorkLogAttribution, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -1864,6 +1864,294 @@ fn card_relations_round_trip_through_store_and_detail() -> Result<()> {
             && event.actor == "operator"
             && event.payload.contains("blocked-child")
     }));
+    Ok(())
+}
+
+// powder-dogfood-2026-07-14-nonreciprocal-relations: update_relations and
+// create_card_with_events mirror the delta of a relations write onto every
+// touched peer, atomically, in the same transaction as the primary write.
+// The tests below prove reciprocity add/remove, related's symmetry, that a
+// peer's unrelated existing edges survive a mirror write untouched, that a
+// dangling or self-referencing id is tolerated (skipped, not an error), and
+// that create_card mirrors a card's initial relations onto its peers.
+
+#[test]
+fn update_relations_mirrors_blocks_and_blocked_by_onto_the_peer() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    store.update_relations(
+        &a,
+        vec![],
+        vec![x.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    // A blocks X -> X is blocked_by A, mirrored atomically, no follow-up
+    // call on X required.
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.blocked_by, vec![a.clone()]);
+    assert!(x_detail.events.iter().any(|event| {
+        event.event_type == "relations" && event.payload.contains("mirrored add blocked_by a")
+    }));
+
+    // The inverse direction mirrors too: blocked_by mirrors onto blocks.
+    store.update_relations(
+        &a,
+        vec![],
+        vec![],
+        vec![x.clone()],
+        30,
+        &Authority::actor("operator", true),
+    )?;
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert!(x_detail.card.blocks.contains(&a));
+    Ok(())
+}
+
+#[test]
+fn update_relations_related_is_symmetric() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    store.update_relations(
+        &a,
+        vec![x.clone()],
+        vec![],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.related, vec![a]);
+    Ok(())
+}
+
+#[test]
+fn update_relations_removal_unmirrors_the_peer() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    store.update_relations(
+        &a,
+        vec![],
+        vec![x.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.blocked_by, vec![a.clone()]);
+
+    // Replacing A's blocks with an empty list removes the mirror on X too.
+    store.update_relations(
+        &a,
+        vec![],
+        vec![],
+        vec![],
+        30,
+        &Authority::actor("operator", true),
+    )?;
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert!(x_detail.card.blocked_by.is_empty());
+    assert!(x_detail.events.iter().any(|event| {
+        event.event_type == "relations" && event.payload.contains("mirrored remove blocked_by a")
+    }));
+    Ok(())
+}
+
+#[test]
+fn update_relations_delta_does_not_clobber_the_peers_other_relations() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("a", 10),
+        ready_card("x", 11),
+        ready_card("other", 12),
+    ])?;
+
+    let a = CardId::new("a")?;
+    let x = CardId::new("x")?;
+    let other = CardId::new("other")?;
+
+    // X already blocks "other" independently of anything A does.
+    store.update_relations(
+        &x,
+        vec![],
+        vec![other.clone()],
+        vec![],
+        15,
+        &Authority::actor("operator", true),
+    )?;
+
+    // A adds X to its own blocked_by -- mirrors onto X.blocks as an
+    // *addition*, not a replacement of X's list.
+    store.update_relations(
+        &a,
+        vec![],
+        vec![],
+        vec![x.clone()],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    let x_detail = store
+        .get_card_detail(&x, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    let mut blocks: Vec<String> = x_detail
+        .card
+        .blocks
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    blocks.sort();
+    assert_eq!(blocks, vec!["a".to_string(), "other".to_string()]);
+    Ok(())
+}
+
+#[test]
+fn update_relations_skips_mirroring_a_dangling_target() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10)])?;
+
+    let a = CardId::new("a")?;
+    let ghost = CardId::new("ghost")?;
+    // No card named "ghost" exists. This must not error -- relation targets
+    // have never been existence-checked -- and must not panic trying to
+    // mirror onto a card that isn't there.
+    let card = store.update_relations(
+        &a,
+        vec![],
+        vec![ghost.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+    assert_eq!(card.blocks, vec![ghost]);
+    Ok(())
+}
+
+#[test]
+fn update_relations_skips_mirroring_a_self_edge() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10)])?;
+
+    let a = CardId::new("a")?;
+    // A naming itself has no meaningful "other side"; this must not panic
+    // or double-apply anything.
+    let card = store.update_relations(
+        &a,
+        vec![],
+        vec![a.clone()],
+        vec![],
+        20,
+        &Authority::actor("operator", true),
+    )?;
+    assert_eq!(card.blocks, vec![a]);
+    Ok(())
+}
+
+#[test]
+fn create_card_mirrors_initial_relations_onto_existing_peers() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("blocker", 10)])?;
+
+    let blocker = CardId::new("blocker")?;
+    let mut born = Card::new(CardId::new("born")?, "Born blocked", "do it")
+        .unwrap()
+        .with_status(CardStatus::Backlog)
+        .with_acceptance(["proof exists".to_string()])
+        .with_created_at(20);
+    born.blocked_by = vec![blocker.clone()];
+
+    store.create_card_with_events(born, "operator", 20)?;
+
+    // The pre-existing blocker gets `blocks` mirrored onto it at creation
+    // time, with no follow-up update_relations call.
+    let blocker_detail = store
+        .get_card_detail(&blocker, DetailLevel::Detailed, 1_000_000)?
+        .expect("blocker detail");
+    assert_eq!(blocker_detail.card.blocks, vec![CardId::new("born")?]);
+    assert!(blocker_detail.events.iter().any(|event| {
+        event.event_type == "relations" && event.payload.contains("mirrored add blocks born")
+    }));
+    Ok(())
+}
+
+#[test]
+fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("a", 10), ready_card("x", 11)])?;
+
+    // Simulate data written before reciprocal-atomic writes existed (or
+    // written directly against the database): A names X in blocks, but X's
+    // blocked_by was never updated to agree, the same way
+    // `normalize_repository_strings`'s test simulates a legacy row with a
+    // raw SQL write bypassing the store's own write path.
+    store.connection.execute(
+        "UPDATE cards SET blocks_json = '[\"x\"]' WHERE id = 'a'",
+        [],
+    )?;
+
+    let report = store.relations_doctor("operator", 50, false)?;
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.issue_count(), 1);
+    let issue = &report.issues[0];
+    assert_eq!(issue.card_id.as_str(), "a");
+    assert_eq!(issue.field, RelationField::Blocks);
+    assert_eq!(issue.target_id.as_str(), "x");
+    assert_eq!(issue.expected_mirror_field, RelationField::BlockedBy);
+    assert!(!issue.repaired);
+
+    // Report-only mode must not have written anything.
+    let x_detail = store
+        .get_card_detail(&CardId::new("x")?, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert!(x_detail.card.blocked_by.is_empty());
+
+    let repaired = store.relations_doctor("operator", 60, true)?;
+    assert_eq!(repaired.issue_count(), 1);
+    assert!(repaired.issues[0].repaired);
+
+    let x_detail = store
+        .get_card_detail(&CardId::new("x")?, DetailLevel::Detailed, 1_000_000)?
+        .expect("x detail");
+    assert_eq!(x_detail.card.blocked_by, vec![CardId::new("a")?]);
+    assert!(x_detail.events.iter().any(|event| {
+        event.event_type == "relations"
+            && event.actor == "operator"
+            && event.payload.contains("mirrored add blocked_by a")
+    }));
+
+    // Idempotent: nothing left to repair.
+    let second = store.relations_doctor("operator", 70, true)?;
+    assert_eq!(second.issue_count(), 0);
     Ok(())
 }
 
