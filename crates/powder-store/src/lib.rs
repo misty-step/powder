@@ -1976,10 +1976,18 @@ impl Store {
         authority: &Authority,
     ) -> Result<Run> {
         let question = non_empty_scrubbed("question", question)?;
-        let mut run = self
-            .get_run(run_id)?
-            .ok_or_else(|| DomainError::not_found("run", run_id.to_string()))?;
-        let mut card = load_card(&self.connection, &run.card_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut run = answer_loop::load_run(&transaction, run_id)?;
+        let mut card = load_card(&transaction, &run.card_id)?;
+        if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
+            return Err(DomainError::conflict(format!(
+                "run {run_id} is not the current claim for card {}",
+                card.id
+            ))
+            .into());
+        }
         authority.require_holder(card.claim_principal())?;
 
         card.status = CardStatus::AwaitingInput;
@@ -1987,9 +1995,6 @@ impl Store {
         run.state = RunState::AwaitingInput;
         run.updated_at = now;
 
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         persist_card(&transaction, &card)?;
         persist_run(&transaction, &run)?;
         append_activity(

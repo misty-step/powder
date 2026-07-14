@@ -382,7 +382,7 @@ fn load_child_evidence(connection: &Connection, card_id: &CardId) -> Result<Vec<
     Ok(evidence.into_iter().map(|entry| entry.4).collect())
 }
 
-fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run> {
+pub(super) fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run> {
     connection
         .query_row(RUN_SELECT_SQL, [run_id.as_str()], RunRecord::from_row)
         .optional()?

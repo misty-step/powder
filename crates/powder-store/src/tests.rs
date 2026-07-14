@@ -3155,13 +3155,18 @@ fn created_agent_key_verifies_with_agent_scope() -> Result<()> {
 fn migration_17_to_18_preserves_keys_claims_and_runs_while_deleting_actor_kind() -> Result<()> {
     let path = temp_db("principal-worker-run-v18");
     let card_id = CardId::new("principal-migration")?;
-    let (raw_key, key_id, run_id) = {
+    let (raw_key, key_id, revoked_raw_key, revoked_key_id, run_id) = {
         let mut store = Store::open(&path)?;
         store.migrate()?;
         let key = store.create_api_key("roster", ApiKeyScope::Agent, 1)?;
         store
             .verify_api_key(&key.raw_key, 2)?
             .expect("key verifies");
+        let revoked = store.create_api_key("retired-roster", ApiKeyScope::Agent, 1)?;
+        store
+            .verify_api_key(&revoked.raw_key, 2)?
+            .expect("key verifies before revocation");
+        store.revoke_api_key(&revoked.id, 3)?;
         store.import_cards(vec![ready_card(card_id.as_str(), 3)])?;
         let claim = store.claim_card(
             &card_id,
@@ -3170,7 +3175,13 @@ fn migration_17_to_18_preserves_keys_claims_and_runs_while_deleting_actor_kind()
             600,
             &Authority::actor("roster", false),
         )?;
-        (key.raw_key, key.id, claim.run_id)
+        (
+            key.raw_key,
+            key.id,
+            revoked.raw_key,
+            revoked.id,
+            claim.run_id,
+        )
     };
 
     // Reconstruct the exact identity/lease columns schema 17 carried so the
@@ -3220,6 +3231,22 @@ fn migration_17_to_18_preserves_keys_claims_and_runs_while_deleting_actor_kind()
     let mut store = Store::open(&path)?;
     store.migrate()?;
     assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+
+    let summaries = store.list_api_keys()?;
+    let active_summary = summaries
+        .iter()
+        .find(|key| key.id == key_id)
+        .expect("active key summary");
+    assert_eq!(active_summary.last_used_at, Some(2));
+    assert_eq!(active_summary.revoked_at, None);
+    let revoked_summary = summaries
+        .iter()
+        .find(|key| key.id == revoked_key_id)
+        .expect("revoked key summary");
+    assert_eq!(revoked_summary.principal, "retired-roster");
+    assert_eq!(revoked_summary.last_used_at, Some(2));
+    assert_eq!(revoked_summary.revoked_at, Some(3));
+    assert!(store.verify_api_key(&revoked_raw_key, 5)?.is_none());
 
     let verified = store
         .verify_api_key(&raw_key, 5)?
@@ -4129,6 +4156,44 @@ fn claim_card_records_principal_separately_from_worker() -> Result<()> {
         12,
         &Authority::actor("agent-b", false),
     )?;
+    Ok(())
+}
+
+#[test]
+fn request_input_rejects_a_released_run_after_same_principal_reclaims_as_another_worker(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+    let principal = Authority::principal("roster", false);
+
+    let first = store.claim_card(&card_id, "worker-a", 10, 3600, &principal)?;
+    store.release_claim(&card_id, &first.run_id, 11, &principal)?;
+    let second = store.claim_card(&card_id, "worker-b", 12, 3600, &principal)?;
+    store.update_status(&card_id, CardStatus::InProgress, 13, &principal)?;
+
+    let error = store
+        .request_input(&first.run_id, "Approve stale run?", 14, &principal)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not the current claim"),
+        "error was: {error}"
+    );
+    assert_eq!(
+        store.get_run(&first.run_id)?.expect("first run").state,
+        RunState::Released
+    );
+    assert_eq!(
+        store.get_run(&second.run_id)?.expect("second run").state,
+        RunState::Active
+    );
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::InProgress);
+    assert_eq!(
+        card.claim.as_ref().map(|claim| &claim.run_id),
+        Some(&second.run_id)
+    );
     Ok(())
 }
 
