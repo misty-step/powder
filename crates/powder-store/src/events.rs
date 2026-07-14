@@ -19,7 +19,18 @@ pub const EVENT_TYPES: &[&str] = &[
     "work-log-appended",
 ];
 
-const WEBHOOK_MAX_ATTEMPTS: i64 = 3;
+/// powder-epic-truthful-ops: a receiver down for a brief blip (a redeploy, a
+/// transient network partition) used to get exactly 2 retries (1s, 2s) over
+/// ~3s before permanent dead-lettering -- too short a horizon to survive
+/// anything but an instantaneous hiccup. Extended to 6 total attempts (1
+/// initial + 5 retries) with a 4x exponential backoff -- 1s, 4s, 16s, 64s,
+/// 256s between attempts -- so the last retry lands ~341s (~5.7 minutes)
+/// after the first failure: long enough to ride out a rolling redeploy or a
+/// brief network partition on the receiving end, short enough that an
+/// operator debugging a real outage doesn't wait an hour to see the
+/// dead-letter. `replay_dead_letters` exists for the case where 5.7 minutes
+/// still wasn't enough.
+const WEBHOOK_MAX_ATTEMPTS: i64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventSubscription {
@@ -357,6 +368,88 @@ impl Store {
             .collect()
     }
 
+    /// Counts dead-lettered deliveries without paging through them --
+    /// `/readyz` needs only the count to compare against its backlog
+    /// threshold, not the payloads `list_dead_letter_deliveries` fetches.
+    pub fn count_dead_letter_deliveries(&self) -> Result<i64> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'dead_letter'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Requeues dead-lettered deliveries for redelivery: resets status to
+    /// `pending`, zeroes the attempt count and clears the last-error/status
+    /// fields so `due_webhook_deliveries` picks them up on the next
+    /// delivery-loop tick, and gets the same fresh `WEBHOOK_MAX_ATTEMPTS`
+    /// backoff schedule a brand-new delivery would. `subscription_id` scopes
+    /// the replay to one subscription's dead letters; `None` replays every
+    /// dead letter across every subscription.
+    ///
+    /// Dead letters belonging to a *disabled* subscription are skipped
+    /// (powder-epic-truthful-ops review fix): `due_webhook_deliveries` never
+    /// picks up a disabled subscription's rows (`subscriptions.disabled_at IS
+    /// NULL`), so requeuing them to `pending` would only strand permanent
+    /// stale `pending` rows the delivery loop can never drain -- worse than
+    /// leaving them dead-lettered. Re-enable the subscription first if you
+    /// actually want its backlog redelivered.
+    ///
+    /// Each requeue also inserts a synthetic `attempt_number = 0` row into
+    /// `webhook_delivery_attempts` recording the replay itself (no
+    /// `status_code`, `error` holds a human-readable note) -- an operator
+    /// inspecting a delivery's attempt history via that table sees exactly
+    /// when and how many times it was manually replayed, alongside its real
+    /// delivery attempts. This reuses the existing attempts table rather
+    /// than adding a new one, since it is already the durable per-delivery
+    /// audit trail.
+    pub fn replay_dead_letters(
+        &mut self,
+        subscription_id: Option<&str>,
+        now: i64,
+    ) -> Result<usize> {
+        let transaction = self.connection.transaction()?;
+        let delivery_ids: Vec<String> = {
+            let mut statement = transaction.prepare(
+                "SELECT deliveries.id FROM webhook_deliveries deliveries
+                 JOIN event_subscriptions subscriptions
+                   ON subscriptions.id = deliveries.subscription_id
+                 WHERE deliveries.status = 'dead_letter'
+                   AND subscriptions.disabled_at IS NULL
+                   AND (?1 IS NULL OR deliveries.subscription_id = ?1)
+                 ORDER BY deliveries.updated_at ASC, deliveries.id ASC",
+            )?;
+            let rows = statement
+                .query_map(params![subscription_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for delivery_id in &delivery_ids {
+            transaction.execute(
+                "UPDATE webhook_deliveries
+                 SET status = 'pending',
+                     attempt_count = 0,
+                     next_attempt_at = ?2,
+                     last_attempt_at = NULL,
+                     last_status = NULL,
+                     last_error = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![delivery_id, now],
+            )?;
+            insert_delivery_attempt(
+                &transaction,
+                delivery_id,
+                0,
+                None,
+                Some("replayed by operator: requeued from dead-letter"),
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(delivery_ids.len())
+    }
+
     fn delivery_attempt_count(&self, delivery_id: &str) -> Result<i64> {
         self.connection
             .query_row(
@@ -500,8 +593,14 @@ fn insert_delivery_attempt(
     Ok(())
 }
 
+/// Delay before the *next* attempt after `attempt_number` just failed: 1s,
+/// 4s, 16s, 64s, 256s for attempts 1-5 (attempt 6, `WEBHOOK_MAX_ATTEMPTS`,
+/// dead-letters immediately instead of scheduling a further wait). See the
+/// `WEBHOOK_MAX_ATTEMPTS` doc comment for the horizon this schedule adds up
+/// to and why.
 fn retry_delay_seconds(attempt_number: i64) -> i64 {
-    1_i64 << (attempt_number.saturating_sub(1).min(5) as u32)
+    let exponent = attempt_number.saturating_sub(1).clamp(0, 4) as u32;
+    4_i64.saturating_pow(exponent)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

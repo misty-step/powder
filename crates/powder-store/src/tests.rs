@@ -2227,8 +2227,15 @@ fn moved_to_ready_event_is_durable_and_filters_to_matching_subscription() -> Res
     Ok(())
 }
 
+/// powder-epic-truthful-ops: pins the extended backoff schedule (1s, 4s,
+/// 16s, 64s, 256s between attempts 1-5, attempt 6 dead-letters immediately)
+/// by driving `due_webhook_deliveries`/`record_webhook_delivery_failure`
+/// through all six attempts and asserting the delivery is neither due too
+/// early nor stuck past its scheduled retry time at each step. The exact
+/// gaps encode the ~5.7-minute retry horizon documented on
+/// `WEBHOOK_MAX_ATTEMPTS`.
 #[test]
-fn webhook_failures_retry_then_move_to_dead_letter() -> Result<()> {
+fn webhook_failures_retry_on_the_extended_backoff_schedule_then_dead_letter() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     store.create_event_subscription(
@@ -2246,25 +2253,167 @@ fn webhook_failures_retry_then_move_to_dead_letter() -> Result<()> {
         &Authority::actor("operator", true),
     )?;
 
-    let first = store.due_webhook_deliveries(20, 10)?;
-    assert_eq!(first.len(), 1);
-    store.record_webhook_delivery_failure(&first[0].id, Some(500), "forced failure", 20)?;
-    assert!(store.due_webhook_deliveries(20, 10)?.is_empty());
+    // (attempt-number-just-failed, seconds-until-next-attempt-is-due)
+    let schedule = [(1, 1), (2, 4), (3, 16), (4, 64), (5, 256)];
+    let mut now = 20_i64;
+    for (attempt_number, delay) in schedule {
+        let due = store.due_webhook_deliveries(now, 10)?;
+        assert_eq!(
+            due.len(),
+            1,
+            "attempt {attempt_number} should be due at t={now}"
+        );
+        store.record_webhook_delivery_failure(&due[0].id, Some(500), "forced failure", now)?;
+        assert!(
+            store.due_webhook_deliveries(now, 10)?.is_empty(),
+            "attempt {} must not be immediately due again at t={now}",
+            attempt_number + 1
+        );
+        assert!(
+            store
+                .due_webhook_deliveries(now + delay - 1, 10)?
+                .is_empty(),
+            "attempt {} must not be due one second before its {delay}s backoff elapses",
+            attempt_number + 1
+        );
+        now += delay;
+    }
 
-    let second = store.due_webhook_deliveries(21, 10)?;
-    assert_eq!(second.len(), 1);
-    store.record_webhook_delivery_failure(&second[0].id, Some(500), "forced failure", 21)?;
-
-    let third = store.due_webhook_deliveries(23, 10)?;
-    assert_eq!(third.len(), 1);
-    store.record_webhook_delivery_failure(&third[0].id, Some(500), "forced failure", 23)?;
+    // The 6th (final) attempt exhausts WEBHOOK_MAX_ATTEMPTS and dead-letters
+    // instead of scheduling a further retry.
+    let sixth = store.due_webhook_deliveries(now, 10)?;
+    assert_eq!(sixth.len(), 1, "6th attempt should be due at t={now}");
+    store.record_webhook_delivery_failure(&sixth[0].id, Some(500), "forced failure", now)?;
+    assert!(store.due_webhook_deliveries(now, 10)?.is_empty());
 
     let dead = store.list_dead_letter_deliveries(10)?;
     assert_eq!(dead.len(), 1);
     assert_eq!(dead[0].event_type, "completed");
-    assert_eq!(dead[0].attempt_count, 3);
+    assert_eq!(dead[0].attempt_count, 6);
     assert_eq!(dead[0].last_status, Some(500));
     assert_eq!(dead[0].payload.event_type, "completed");
+    // 1 + 4 + 16 + 64 + 256 = 341s (~5.7 minutes) from first failure to the
+    // final, dead-lettering attempt.
+    assert_eq!(now - 20, 341);
+    Ok(())
+}
+
+/// A dead-lettered delivery can be requeued by an operator (or an automated
+/// retry policy) via `replay_dead_letters`, independent of the receiver
+/// having since come back up -- the delivery loop picks it up on its next
+/// tick like a fresh delivery, with a reset attempt count and the full
+/// backoff schedule available again.
+#[test]
+fn replay_dead_letters_requeues_and_records_an_audit_attempt() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    // Two subscriptions both matching "completed" -- one card's completion
+    // fans out to a delivery per subscription, so this exercises the
+    // subscription-scoped filter without needing a second card.
+    let sub_a = store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/a",
+        vec!["completed".to_string()],
+        5,
+    )?;
+    let sub_b = store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/b",
+        vec!["completed".to_string()],
+        5,
+    )?;
+    store.import_cards(vec![ready_card("dlq-replay", 10)])?;
+    store.complete_card(
+        &CardId::new("dlq-replay")?,
+        None,
+        Vec::new(),
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    // Drive every delivery for both subscriptions straight to dead-letter.
+    let mut now = 20_i64;
+    for _ in 0..6 {
+        for due in store.due_webhook_deliveries(now, 10)? {
+            store.record_webhook_delivery_failure(&due.id, Some(500), "forced failure", now)?;
+        }
+        now += 300;
+    }
+    let dead = store.list_dead_letter_deliveries(10)?;
+    assert_eq!(dead.len(), 2);
+
+    // Replaying scoped to subscription A only requeues that one delivery.
+    let replayed = store.replay_dead_letters(Some(&sub_a.subscription.id), now)?;
+    assert_eq!(replayed, 1);
+    assert_eq!(store.list_dead_letter_deliveries(10)?.len(), 1);
+    let due_now = store.due_webhook_deliveries(now, 10)?;
+    assert_eq!(due_now.len(), 1);
+    assert_eq!(due_now[0].attempt_count, 0);
+    assert_eq!(due_now[0].url, sub_a.subscription.url);
+
+    // Replaying with no subscription filter requeues everything remaining.
+    let replayed_all = store.replay_dead_letters(None, now)?;
+    assert_eq!(replayed_all, 1);
+    assert!(store.list_dead_letter_deliveries(10)?.is_empty());
+    let due_now = store.due_webhook_deliveries(now, 10)?;
+    assert_eq!(due_now.len(), 2);
+    assert!(due_now.iter().any(|d| d.url == sub_b.subscription.url));
+
+    // Replaying with nothing dead-lettered is a legitimate no-op, not an
+    // error -- an operator retrying a stale runbook step shouldn't get a
+    // failure just because someone already cleared the backlog.
+    assert_eq!(store.replay_dead_letters(None, now)?, 0);
+    Ok(())
+}
+
+/// powder-epic-truthful-ops (review fix): a disabled subscription's dead
+/// letters must NOT be requeued -- `due_webhook_deliveries` filters on
+/// `disabled_at IS NULL`, so a requeued row would sit `pending` forever with
+/// nothing able to drain it. Replay must skip them (leaving them
+/// dead-lettered) rather than strand them.
+#[test]
+fn replay_dead_letters_skips_disabled_subscriptions() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let sub = store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/disabled",
+        vec!["completed".to_string()],
+        5,
+    )?;
+    store.import_cards(vec![ready_card("dlq-disabled", 10)])?;
+    store.complete_card(
+        &CardId::new("dlq-disabled")?,
+        None,
+        Vec::new(),
+        20,
+        &Authority::actor("operator", true),
+    )?;
+
+    // Drive the delivery to dead-letter, then disable the subscription.
+    let mut now = 20_i64;
+    for _ in 0..6 {
+        for due in store.due_webhook_deliveries(now, 10)? {
+            store.record_webhook_delivery_failure(&due.id, Some(500), "forced failure", now)?;
+        }
+        now += 300;
+    }
+    assert_eq!(store.list_dead_letter_deliveries(10)?.len(), 1);
+    store.disable_event_subscription(&sub.subscription.id, now)?;
+
+    // Replay (both filtered and unfiltered) must be a no-op: the dead letter
+    // stays dead-lettered, nothing is requeued to a dead-end pending state.
+    assert_eq!(
+        store.replay_dead_letters(Some(&sub.subscription.id), now)?,
+        0
+    );
+    assert_eq!(store.replay_dead_letters(None, now)?, 0);
+    assert_eq!(
+        store.list_dead_letter_deliveries(10)?.len(),
+        1,
+        "the disabled subscription's dead letter must remain dead-lettered, not requeued"
+    );
+    assert!(
+        store.due_webhook_deliveries(now, 10)?.is_empty(),
+        "nothing should be pending/due for a disabled subscription"
+    );
     Ok(())
 }
 
@@ -3224,6 +3373,124 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
     Ok(())
 }
 
+/// powder-epic-truthful-ops (review fix): the exact crash the old
+/// single-column guard on `migrate_1_to_2` could not recover from. A v1
+/// database that crashed *after* `ALTER TABLE api_keys ADD COLUMN actor_id`
+/// committed but *before* the backfill ran leaves the column present and
+/// every value NULL, with `user_version` still 1. The buggy guard saw the
+/// column, skipped the backfill forever, and `verify_api_key`'s INNER JOIN
+/// on `actors` then rejected every pre-existing key. The completeness guard
+/// must finish the backfill on the next `migrate()` and restore
+/// authentication.
+#[test]
+fn migration_1_to_2_finishes_a_backfill_that_crashed_after_the_column_add() -> Result<()> {
+    let path = temp_db("v1-half-backfilled-actor-id");
+    let raw_key = "sk_powder_legacy_key_present_column_unrun_backfill";
+    let key_hash = bcrypt::hash(raw_key, bcrypt::DEFAULT_COST)?;
+    let key_prefix = raw_key.chars().take(12).collect::<String>();
+
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            -- The actors table and the actor_id column already exist (the
+            -- `CREATE TABLE IF NOT EXISTS` and the `ALTER ... ADD COLUMN`
+            -- committed), but the two backfill statements never ran and the
+            -- version bump to 2 never happened -- the interrupted-migration
+            -- state.
+            CREATE TABLE actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE api_keys (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER,
+              actor_id TEXT
+            );
+            CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            CREATE TABLE cards (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              priority TEXT NOT NULL,
+              labels_json TEXT NOT NULL,
+              assignee TEXT,
+              blocked_by_json TEXT NOT NULL,
+              repo TEXT,
+              workspace_path TEXT,
+              branch_name TEXT,
+              source_path TEXT,
+              source_digest TEXT,
+              claim_agent TEXT,
+              claim_run_id TEXT,
+              claim_acquired_at INTEGER,
+              claim_expires_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE runs (
+              id TEXT PRIMARY KEY,
+              card_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              agent TEXT NOT NULL,
+              model TEXT,
+              claim_expires_at INTEGER NOT NULL,
+              turn_count INTEGER NOT NULL,
+              token_count INTEGER NOT NULL,
+              consecutive_failures INTEGER NOT NULL,
+              last_error TEXT,
+              result TEXT,
+              proof TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 1;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO api_keys (id, name, key_prefix, key_hash, scope, created_at, revoked_at, actor_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+            rusqlite::params!["key-legacy", "legacy-agent", key_prefix, key_hash, "agent", 10_i64],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+
+    // The interrupted backfill must have been finished: no key left NULL,
+    // and an actor row minted for the legacy key.
+    let null_actor_ids: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM api_keys WHERE actor_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        null_actor_ids, 0,
+        "the completeness guard must finish the backfill the crash interrupted"
+    );
+
+    // The load-bearing consequence: the pre-existing key authenticates again
+    // (verify_api_key INNER JOINs actors, so an unbackfilled actor_id would
+    // silently fail this).
+    let verified = store
+        .verify_api_key(raw_key, 21)?
+        .expect("legacy key must still authenticate after the finished backfill");
+    assert_eq!(verified.name, "legacy-agent");
+    assert_eq!(verified.actor.id, "actor-key-legacy");
+    assert_eq!(verified.actor.display_name, "legacy-agent");
+    Ok(())
+}
+
 #[test]
 fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<()> {
     let path = temp_db("v2-identity");
@@ -3461,6 +3728,177 @@ fn migrating_a_v3_database_drops_the_dead_run_columns() -> Result<()> {
         .expect("run survives column drop");
     assert_eq!(run.agent, "agent-a");
     assert_eq!(run.claim_expires_at, 100);
+    Ok(())
+}
+
+/// powder-epic-truthful-ops: a crash mid-`migrate_3_to_4` (the DROP-COLUMN
+/// step) can leave `runs` with some of the six dead columns already gone
+/// and others still present. Unlike the ADD-COLUMN steps, a single guard on
+/// one column would either error re-dropping an already-missing column or
+/// skip dropping the ones still present -- this proves the per-column loop
+/// in `migrate_3_to_4` finishes the job either way, mirroring the coverage
+/// `migration_14_to_15_finishes_a_half_applied_branch_name_drop` already has
+/// for the same failure shape.
+#[test]
+fn migration_3_to_4_finishes_a_half_applied_run_column_drop() -> Result<()> {
+    let path = temp_db("v3-half-dropped-run-columns");
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            CREATE TABLE api_keys (
+              id TEXT PRIMARY KEY,
+              actor_id TEXT NOT NULL REFERENCES actors(id),
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER
+            );
+            CREATE TABLE cards (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              priority TEXT NOT NULL,
+              labels_json TEXT NOT NULL,
+              assignee TEXT,
+              blocked_by_json TEXT NOT NULL,
+              repo TEXT,
+              workspace_path TEXT,
+              branch_name TEXT,
+              source_path TEXT,
+              source_digest TEXT,
+              claim_agent TEXT,
+              claim_run_id TEXT,
+              claim_acquired_at INTEGER,
+              claim_expires_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            -- Simulates a crash partway through migrate_3_to_4: model and
+            -- turn_count are already dropped, the other four dead columns
+            -- are not.
+            CREATE TABLE runs (
+              id TEXT PRIMARY KEY,
+              card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+              state TEXT NOT NULL,
+              agent TEXT NOT NULL,
+              claim_expires_at INTEGER NOT NULL,
+              token_count INTEGER NOT NULL,
+              consecutive_failures INTEGER NOT NULL,
+              last_error TEXT,
+              result TEXT,
+              proof TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 3;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO cards (id, title, body, acceptance_json, status, priority, labels_json,
+                                 blocked_by_json, created_at, updated_at)
+             VALUES ('001', 'Title', 'Body', '[]', 'ready', 'p2', '[]', '[]', 1, 1)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO runs (id, card_id, state, agent, claim_expires_at, token_count,
+                                consecutive_failures, last_error, result, proof,
+                                created_at, updated_at)
+             VALUES ('run-1', '001', 'active', 'agent-a', 100, 500, 1,
+                     'timeout', 'partial', NULL, 10, 10)",
+            [],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+
+    let columns: Vec<String> = {
+        let mut statement = store
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('runs')")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for dead in [
+        "model",
+        "turn_count",
+        "token_count",
+        "consecutive_failures",
+        "last_error",
+        "result",
+    ] {
+        assert!(
+            !columns.contains(&dead.to_string()),
+            "column {dead} should be gone whether it was already dropped pre-crash or dropped \
+             by this migrate() call: {columns:?}"
+        );
+    }
+
+    let run = store
+        .get_run(&RunId::new("run-1")?)?
+        .expect("run survives finishing the half-applied drop");
+    assert_eq!(run.agent, "agent-a");
+    Ok(())
+}
+
+/// Every migration step from 1->16 must tolerate being invoked twice in a
+/// row against a database that already has its target schema (the shape a
+/// crash-and-retry boot produces once a step has fully applied but before
+/// `migrate()`'s loop reaches `SCHEMA_VERSION`) without erroring. Steps 11+
+/// already had this property (`cards_has_column` guards); this pins it for
+/// every step now that 1-10 carry the same guards.
+#[test]
+fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+
+    store.migrate_1_to_2()?;
+    store.migrate_1_to_2()?;
+    store.migrate_2_to_3()?;
+    store.migrate_2_to_3()?;
+    store.migrate_3_to_4()?;
+    store.migrate_3_to_4()?;
+    store.migrate_4_to_5()?;
+    store.migrate_4_to_5()?;
+    store.migrate_7_to_8()?;
+    store.migrate_7_to_8()?;
+    store.migrate_8_to_9()?;
+    store.migrate_8_to_9()?;
+    store.migrate_9_to_10()?;
+    store.migrate_9_to_10()?;
+    store.migrate_11_to_12()?;
+    store.migrate_11_to_12()?;
+    store.migrate_12_to_13()?;
+    store.migrate_12_to_13()?;
+    store.migrate_13_to_14()?;
+    store.migrate_13_to_14()?;
+    store.migrate_14_to_15()?;
+    store.migrate_14_to_15()?;
+    store.migrate_15_to_16()?;
+    store.migrate_15_to_16()?;
+
+    // Re-running every step twice must not have perturbed the fully
+    // migrated schema: still at SCHEMA_VERSION, still able to round-trip a
+    // card through the store.
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let saved = store.upsert_card(ready_card("idempotent-migrations", 1))?;
+    assert_eq!(store.get_card(&saved.id)?, Some(saved));
     Ok(())
 }
 

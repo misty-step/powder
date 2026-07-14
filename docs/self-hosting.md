@@ -173,6 +173,8 @@ variables.
 | `POWDER_FIELD_NOTE_WEEKLY_BUDGET` | `7` | `powder-server` | Hard cap on field-note drafts spawned in a trailing 7-day window. |
 | `POWDER_REQUIRE_LITESTREAM` | `0` | `bin/entrypoint.sh` (Docker image only, not `powder-server` itself) | `1` refuses to boot the container unless `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` are all present. |
 | `BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | unset | `bin/entrypoint.sh` / `litestream.yml` (Docker image only) | S3-compatible bucket + credentials for optional Litestream replication. See [backup and restore](#backup-and-restore-litestream--s3). |
+| `POWDER_READYZ_DEAD_LETTER_THRESHOLD` | `100` | `powder-server` | `/readyz` reports not-ready once the dead-lettered webhook-delivery count meets this threshold. See [`/readyz`](#readyz-and-healthz). |
+| `RUST_LOG` | unset (defaults to `info`) | `powder-server` | Standard `tracing_subscriber::EnvFilter` syntax (e.g. `debug`, `powder_server=debug,tower_http=info`). Unset no longer means silent -- see [Observability](#observability-and-readyz) below. |
 
 **Retired, do not set:** `POWDER_IMPORT_FILES_DIR` is explicitly rejected at
 startup (`Config::from_pairs` returns a config error naming it) — repository
@@ -204,6 +206,64 @@ cargo run -p powder-server
   strips client-supplied spoofed identity headers before they reach Powder.
 - **`none`**: no auth at all. Local disposable development only.
 
+## Observability and /readyz
+
+**Logging is on by default (powder-epic-truthful-ops).** `RUST_LOG` unset
+now defaults to `info`, not silence -- earlier builds emitted nothing at all
+without an explicit `RUST_LOG=info`, which meant a self-hoster following the
+quickstart verbatim got a running instance with no logs. Every HTTP request
+(method, path, status, latency) logs at `info` via the request tracing
+layer; webhook delivery failures log at `warn`. Set `RUST_LOG=debug` (or a
+scoped filter like `powder_server=debug`) for more detail, or
+`RUST_LOG=error` to quiet it back down.
+
+On startup, one line names exactly what's running:
+
+```
+powder-server starting version=0.1.0 git_sha=abc123def456 git_dirty=false bind_addr=[::]:4000 db_path=/data/powder.db schema_version=16 auth_mode=ApiKey
+```
+
+`git_sha` is embedded at compile time from the checkout's `git rev-parse
+HEAD` (`crates/powder-server/build.rs`, mirroring
+`crates/powder-cli/build.rs`'s existing `powder version` provenance); it
+reads `unknown` if the binary was built outside a git checkout (e.g. an
+extracted release tarball with `.git` stripped).
+
+**`/healthz`** stays a trivial liveness probe: process is up, always `200`
+if it answers at all. **`/readyz`** gates readiness on four independent
+checks, each reported individually so you can see *which* failed instead of
+a bare `false`:
+
+```sh
+curl -s http://localhost:4000/readyz
+# {"ok":true,"auth_mode":"api_key","schema_version":16,"schema_version_expected":16,
+#  "writable":true,"dead_letter_count":0,"dead_letter_threshold":100,"poison_count":0}
+```
+
+- **`writable`**: a `BEGIN IMMEDIATE; ROLLBACK;` probe against the database
+  actually succeeded -- catches a read-only filesystem or a full disk that a
+  bare `SELECT 1` would miss.
+- **`schema_version` == `schema_version_expected`**: the database is
+  migrated to exactly the version this binary expects.
+- **`dead_letter_count` < `dead_letter_threshold`**: the webhook
+  dead-letter backlog is under `POWDER_READYZ_DEAD_LETTER_THRESHOLD`
+  (default 100) -- see [Webhooks](#webhooks) below for what a dead letter is
+  and how to clear one.
+- **`poison_count` == 0**: the in-process store lock has never been
+  recovered from a panic. A poisoned lock is recovered automatically (the
+  process keeps serving -- see the `lock_store` doc comment in
+  `crates/powder-server/src/main.rs` for why that's safe), but `/readyz`
+  fails until a restart clears it, so an orchestrator's readiness gate
+  (not its liveness gate) notices and can page someone. The counter is
+  deliberately **monotonic and process-lived**: it only resets when the
+  process restarts, and nothing auto-restarts on a `/readyz` failure. That
+  is the intended human-in-the-loop semantics -- a recovered panic is a bug
+  worth a human's eyes, so even a single transient one holds `/readyz`
+  not-ready until an operator has looked and restarted, rather than
+  self-clearing and hiding the event. If you want automatic recovery, wire
+  `/readyz` to an orchestrator restart policy; do not expect the counter to
+  decay on its own.
+
 ## Webhooks
 
 Webhooks are subscriptions created at runtime, not env-var config. Each
@@ -211,11 +271,36 @@ subscription gets its own HMAC-SHA256 signing secret, shown once at
 creation. Matching card events (`card-created`, `moved-to-ready`,
 `awaiting-input`, `claim-expired`, `completed`, `comment-added`,
 `work-log-appended`) are delivered as a signed POST with an
-`X-Signature-256: sha256=<hex hmac>` header, retried up to 3 attempts, and
-recorded as a dead letter if every attempt fails.
+`X-Signature-256: sha256=<hex hmac>` header.
+
+**Retry schedule (powder-epic-truthful-ops):** up to 6 attempts total (1
+initial + 5 retries) with exponential backoff between them -- 1s, 4s, 16s,
+64s, 256s -- so the final attempt lands roughly 341 seconds (~5.7 minutes)
+after the first failure before the delivery is recorded as a dead letter.
+Long enough to survive a receiver's rolling redeploy or a brief network
+partition; short enough that a genuinely broken receiver shows up as a dead
+letter within a few minutes, not silently retried forever. Proven by
+`webhook_failures_retry_on_the_extended_backoff_schedule_then_dead_letter`
+in `crates/powder-store/src/tests.rs` (the exact backoff schedule, unit
+level) and `forced_webhook_failures_retry_to_dead_letter_view` in
+`crates/powder-server/src/tests.rs` (the same schedule driven end to end
+over the HTTP delivery loop).
+
+**Dead-letter replay:** a dead letter is not necessarily gone for good --
+`powder dead-letter-replay --db "$DB" [--subscription sub-id]` (or `POST
+/api/v1/events/dead-letter/replay` with an admin-scoped key, body
+`{"subscription_id": null}` to replay every dead letter or a specific one)
+resets the delivery back to `pending` with a zeroed attempt count, so the
+delivery loop picks it up on its next tick with the full backoff schedule
+available again -- useful once a receiver that was down for longer than the
+~5.7-minute retry horizon comes back up.
 
 **Verified 2026-07-14** against a locally running `powder-server`, end to
-end, using this repo's own `scripts/demo-webhook-subscriber.py`:
+end, using this repo's own `scripts/demo-webhook-subscriber.py` (captured
+under the retry schedule at that time -- 3 attempts over ~3s; the schedule
+above supersedes the attempt count and timing shown below, the delivery
+mechanics and dead-letter shape are otherwise unchanged and are what this
+transcript demonstrates):
 
 ```sh
 powder subscription-create --db "$DB" \
@@ -230,8 +315,9 @@ powder complete-card <card-id> --db "$DB" --proof "webhook live test"
 The subscriber received, within the delivery loop's 1-second poll interval,
 a correctly signed `completed` event carrying the full card and `proof`. A
 second subscription pointed at a URL nothing was listening on
-(`http://127.0.0.1:9999/webhook`) exhausted its 3 retry attempts and showed
-up verbatim in `dead-letter-list`:
+(`http://127.0.0.1:9999/webhook`) exhausted its retry attempts and showed
+up verbatim in `dead-letter-list` (this transcript predates the retry-count
+change above, so `attempt_count` here reads `3`; a current run reads `6`):
 
 ```sh
 powder dead-letter-list --db "$DB"
@@ -242,13 +328,14 @@ powder dead-letter-list --db "$DB"
 powder event-tail --db "$DB" --after 0 --limit 20   # every durable card event, in order
 powder subscription-list --db "$DB"                  # all subscriptions, secrets redacted
 powder subscription-disable sub-... --db "$DB"        # stop delivery, keep history
+powder dead-letter-replay --db "$DB"                  # requeue every dead letter for redelivery
 ```
 
 `GET /api/v1/events/tail` streams the same feed as Server-Sent Events over
 HTTP for a remote deployment; `event-tail`/`dead-letter-list`/
-`subscription-*` are `--db`-only on the CLI (no remote-mode transport yet —
-see [`docs/operations.md`](operations.md) for the full remote-mode command
-table).
+`dead-letter-replay`/`subscription-*` are `--db`-only on the CLI (no
+remote-mode transport yet — see [`docs/operations.md`](operations.md) for
+the full remote-mode command table).
 
 ## Secrets at rest
 
@@ -322,6 +409,18 @@ is this repo's own historical drill record against the now-decommissioned
 Fly instance — it documents the *procedure* (still correct) but its "live
 proof" section is dated and Fly-specific; do not treat its recorded run as
 current evidence for any deployment other than the one it names.
+
+> **NOTE — this repo's own operator (Sanctum DigitalOcean box).** The drill
+> above is the generic, run-it-anywhere version. The operator's production
+> instance runs its own Litestream (Sanctum-owned config on the box, not
+> this repo's `litestream.yml`) replicating to DigitalOcean Spaces. The
+> DO-box-specific drill — the exact `litestream restore` to a scratch path +
+> `powder get-card` readback commands to run over `ssh`/`tailscale ssh`
+> against the live box, and the pre-swap snapshot + binary rollback steps
+> that bracket a deploy — lives in
+> [`docs/production-deploy.md`](production-deploy.md#backup-restore-drill-and-rollback-powder-epic-truthful-ops).
+> Those commands require the box and are the lead's to run; nothing in this
+> repo exercises them.
 
 ## CLI/MCP against a remote deployment
 
