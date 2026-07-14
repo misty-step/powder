@@ -79,11 +79,12 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    curl -s "$POWDER_API_BASE_URL/healthz"   # verify it came back
    ```
 
-3. **Record the deploy**: bump the Sanctum repo's `vendor/powder` pin to the
-   deployed SHA (`git -C ../powder archive --format=tar <sha> | tar -x -C
-   vendor/powder`, update `vendor/powder/SOURCE`, commit as `chore: bump
-   sanctum powder pin for <reason>`). The pin is the durable record of what
-   production runs; the binaries are what actually run it.
+3. **Record the deploy**: note the deployed `master` SHA and date on the
+   Powder card that drove the change (work log or completion proof). The
+   Sanctum repo's `vendor/powder` pin was the durable record until
+   sanctum#83 ("reduce Sanctum to host infrastructure") deleted `vendor/`
+   entirely — do not try to bump it; there is currently no Sanctum-side
+   record of the deployed SHA (verified 2026-07-13).
 
 A merged PR on `misty-step/powder` alone changes nothing in production until
 the steps above happen. `powder version` on a locally installed CLI reports
