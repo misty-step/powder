@@ -755,6 +755,18 @@ impl Card {
     /// (powder-oracle-discipline: a bare "not ready to claim" left a caller
     /// unable to tell a criteria-less card from a blocked or wrong-status
     /// one).
+    ///
+    /// powder-epic-ready-plan: eligibility stays exactly this -- direct
+    /// `blocked_by` terminality only, no transitivity -- on purpose. A card
+    /// whose blocker is itself blocked is already excluded here, because
+    /// the blocker (not yet terminal) fails this same check when it is the
+    /// one being asked about. Two related, separately-scoped concerns build
+    /// on top of this instead of folding into it: [`crate::order_ready_cards`]
+    /// topologically orders an already-eligible set by its `blocks`/
+    /// `blocked_by` edges, and [`crate::transitive_blocked_by`] walks a
+    /// single ineligible card's blocker chain past depth 1 for
+    /// `CardDetail::transitive_blocked_by` so "why is this blocked" never
+    /// goes silent past one hop.
     pub fn claim_readiness(
         &self,
         now: i64,
@@ -1166,8 +1178,27 @@ pub struct CardDetail {
     pub children_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epic_state: Option<EpicState>,
+    /// Non-terminal blockers found strictly beyond `card.blocked_by`'s own
+    /// depth-1 entries (powder-epic-ready-plan): `list_ready` deliberately
+    /// stays direct-blocker-only for both eligibility and its per-row
+    /// payload (see [`crate::order_ready_cards`]'s doc comment), so a
+    /// multi-level blocker chain is otherwise invisible past one hop. This
+    /// is that transitive depth, computed on demand for one card via
+    /// [`crate::transitive_blocked_by`]. Empty when `card.blocked_by` is
+    /// empty or every blocker beyond depth 1 is already terminal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitive_blocked_by: Vec<CardId>,
+    /// True when the walk that produced `transitive_blocked_by` looped back
+    /// to this card -- a `blocked_by`/`blocks` cycle reachable from it.
+    /// Surfaced here rather than silently truncating the walk or hanging.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blocked_by_cycle: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One row of child evidence carried into a parent's [`EpicState`]: a proof

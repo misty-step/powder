@@ -736,6 +736,7 @@ async fn list_ready(
         page.cards,
         page.total_count,
         page.excluded_terminal_count,
+        &page.cycle_card_ids,
     )))
 }
 
@@ -762,6 +763,7 @@ async fn list_cards(
         page.cards,
         page.total_count,
         page.excluded_terminal_count,
+        &page.cycle_card_ids,
     )))
 }
 
@@ -769,6 +771,7 @@ fn card_list_page_json(
     cards: Vec<Card>,
     total_count: usize,
     excluded_terminal_count: usize,
+    cycle_card_ids: &[CardId],
 ) -> serde_json::Value {
     let has_more = total_count > cards.len();
     let mut payload = json!({
@@ -783,6 +786,13 @@ fn card_list_page_json(
     // limit" hint (see powder-mcp's list_cards_hint).
     if excluded_terminal_count > 0 {
         payload["excluded_terminal_count"] = json!(excluded_terminal_count);
+    }
+    // powder-epic-ready-plan: only ever nonempty from `list_ready` (a
+    // `blocks`/`blocked_by` cycle among the eligible set) -- additive and
+    // omitted whenever empty, so `list_cards` and every existing caller's
+    // response shape is unchanged.
+    if !cycle_card_ids.is_empty() {
+        payload["cycle_card_ids"] = json!(cycle_card_ids);
     }
     payload
 }

@@ -1116,6 +1116,149 @@ fn list_ready_includes_ready_cards_from_every_repository_tier() -> Result<()> {
     Ok(())
 }
 
+/// powder-epic-ready-plan: three eligible siblings tied on priority and age
+/// -- the historical sort would emit them in id order (a, m, z) -- carry
+/// `blocks` edges requiring the opposite sequence. `list_ready` must honor
+/// the topological constraint over the id tiebreak, and report no cycle.
+#[test]
+fn list_ready_orders_topologically_over_blocks_among_tied_eligible_cards() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let mut sibling_z = ready_card("sibling-z", 10).with_priority(Priority::P1);
+    let mut sibling_m = ready_card("sibling-m", 10).with_priority(Priority::P1);
+    let sibling_a = ready_card("sibling-a", 10).with_priority(Priority::P1);
+    sibling_z.blocks = vec![CardId::new("sibling-m")?];
+    sibling_m.blocks = vec![CardId::new("sibling-a")?];
+    store.import_cards(vec![sibling_a, sibling_m, sibling_z])?;
+
+    let page = store.list_ready_page(ReadyQuery::new(20, 10))?;
+    let ids = page
+        .cards
+        .iter()
+        .map(|card| card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["sibling-z", "sibling-m", "sibling-a"]);
+    assert!(page.cycle_card_ids.is_empty());
+    Ok(())
+}
+
+/// A `blocks` cycle confined to the eligible set must never hang or panic
+/// `list_ready`: both cards still appear (nothing is dropped), in the
+/// stable priority/age/id fallback order, and the cycle is named in
+/// `cycle_card_ids` rather than silently mis-ordered.
+#[test]
+fn list_ready_reports_cycle_members_and_falls_back_without_hanging() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let mut cycle_x = ready_card("cycle-x", 10);
+    let mut cycle_y = ready_card("cycle-y", 11);
+    cycle_x.blocks = vec![CardId::new("cycle-y")?];
+    cycle_y.blocks = vec![CardId::new("cycle-x")?];
+    let clean = ready_card("clean", 1);
+    store.import_cards(vec![cycle_x, cycle_y, clean])?;
+
+    let page = store.list_ready_page(ReadyQuery::new(20, 10))?;
+    let ids = page
+        .cards
+        .iter()
+        .map(|card| card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 3, "no card may be dropped by a cycle elsewhere");
+    assert_eq!(ids[0], "clean", "an uninvolved card keeps its position");
+    let mut cycle_ids = page
+        .cycle_card_ids
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect::<Vec<_>>();
+    cycle_ids.sort();
+    assert_eq!(cycle_ids, vec!["cycle-x", "cycle-y"]);
+    Ok(())
+}
+
+/// End-to-end 3-level chain: eligibility stays direct-blocker-only even
+/// after part of the chain resolves. `chain-3` is `blocked_by` `chain-2`,
+/// which is itself `blocked_by` `chain-1`. Resolving `chain-1` unblocks
+/// `chain-2` immediately (existing behavior); `chain-3` stays excluded
+/// because *its own* direct blocker (`chain-2`) is still non-terminal --
+/// transitivity never enters eligibility, only ordering and explanation.
+/// `get_card_detail` on `chain-3` names `chain-1` as a transitive blocker
+/// while it is non-terminal, and drops it once it resolves.
+#[test]
+fn three_level_blocked_by_chain_eligibility_stays_direct_blocker_only() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let chain_1 = ready_card("chain-1", 1);
+    let mut chain_2 = ready_card("chain-2", 2);
+    chain_2.blocked_by = vec![CardId::new("chain-1")?];
+    let mut chain_3 = ready_card("chain-3", 3);
+    chain_3.blocked_by = vec![CardId::new("chain-2")?];
+    store.import_cards(vec![chain_1, chain_2, chain_3])?;
+
+    // Only chain-1 is ready: chain-2 and chain-3 are each excluded by
+    // their own direct (non-terminal) blocker.
+    let ready = store.list_ready(ReadyQuery::new(10, 10))?;
+    let ids = ready.iter().map(|c| c.id.as_str()).collect::<Vec<_>>();
+    assert_eq!(ids, vec!["chain-1"]);
+
+    // chain-3's detail already names chain-1 as a transitive (depth-2)
+    // blocker while it is still non-terminal, even though chain-3's own
+    // direct blocked_by only names chain-2.
+    let detail = store
+        .get_card_detail(&CardId::new("chain-3")?, DetailLevel::Detailed, 10)?
+        .expect("chain-3 exists");
+    assert_eq!(detail.card.blocked_by[0].as_str(), "chain-2");
+    assert_eq!(detail.transitive_blocked_by.len(), 1);
+    assert_eq!(detail.transitive_blocked_by[0].as_str(), "chain-1");
+    assert!(!detail.blocked_by_cycle);
+
+    // Resolve chain-1 -- chain-2 is immediately eligible (unchanged
+    // existing behavior), but chain-3 stays excluded because chain-2
+    // itself is still non-terminal.
+    store.update_status(
+        &CardId::new("chain-1")?,
+        CardStatus::Done,
+        20,
+        &Authority::unchecked(),
+    )?;
+    let ready = store.list_ready(ReadyQuery::new(20, 10))?;
+    let ids = ready.iter().map(|c| c.id.as_str()).collect::<Vec<_>>();
+    assert_eq!(ids, vec!["chain-2"]);
+
+    // chain-3's transitive explanation now drops chain-1 -- it is
+    // terminal -- but chain-3 remains ineligible via chain-2 alone.
+    let detail = store
+        .get_card_detail(&CardId::new("chain-3")?, DetailLevel::Detailed, 20)?
+        .expect("chain-3 exists");
+    assert!(detail.transitive_blocked_by.is_empty());
+    assert!(!detail.blocked_by_cycle);
+    Ok(())
+}
+
+/// `get_card_detail`'s transitive walk must detect and report a
+/// `blocked_by` cycle reachable from the inspected card instead of hanging.
+#[test]
+fn get_card_detail_reports_a_transitive_blocked_by_cycle() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    let mut start = ready_card("cyc-start", 1);
+    start.blocked_by = vec![CardId::new("cyc-a")?];
+    let mut a = ready_card("cyc-a", 2);
+    a.blocked_by = vec![CardId::new("cyc-b")?];
+    let mut b = ready_card("cyc-b", 3);
+    b.blocked_by = vec![CardId::new("cyc-start")?];
+    store.import_cards(vec![start, a, b])?;
+
+    let detail = store
+        .get_card_detail(&CardId::new("cyc-start")?, DetailLevel::Detailed, 10)?
+        .expect("cyc-start exists");
+    assert!(detail.blocked_by_cycle);
+    Ok(())
+}
+
 #[test]
 fn ready_promotion_succeeds_in_a_backburner_repository() -> Result<()> {
     let mut store = Store::open_in_memory()?;
