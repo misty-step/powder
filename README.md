@@ -31,9 +31,11 @@ card counts. Imports may still pass full slugs such as `misty-step/canary`;
 card JSON, board filters, and `/api/v1/repositories` return `canary`, while
 repo filters accept either spelling. Operators can merge an alias into a
 canonical repository; Powder re-homes matching cards and writes `card_events`
-entries with the old and new repository names. Ready queues only expose active
-repositories, and attempts to move backburner or archived repository cards to
-`ready` return a conflict instead of silently reactivating them.
+entries with the old and new repository names. Tier is ranking and filter
+metadata only: repository listings and board stats order active repositories
+first, but tier never gates lifecycle. An explicitly ready card in a
+backburner or archived repository appears in ready queues and can be claimed,
+released, and promoted like any other card.
 
 Current local smoke paths:
 

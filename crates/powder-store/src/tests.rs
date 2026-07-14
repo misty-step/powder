@@ -892,7 +892,7 @@ fn repository_upsert_without_tier_preserves_existing_tier() -> Result<()> {
 }
 
 #[test]
-fn list_ready_excludes_ready_cards_from_non_active_repositories() -> Result<()> {
+fn list_ready_includes_ready_cards_from_every_repository_tier() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
 
@@ -909,12 +909,12 @@ fn list_ready_excludes_ready_cards_from_non_active_repositories() -> Result<()> 
         .iter()
         .map(|card| card.id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(ids, vec!["powder-ready"]);
+    assert_eq!(ids, vec!["powder-ready", "sploot-ready", "atlas-ready"]);
     Ok(())
 }
 
 #[test]
-fn ready_promotion_is_rejected_for_backburner_repositories() -> Result<()> {
+fn ready_promotion_succeeds_in_a_backburner_repository() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("sploot-freeze")?;
@@ -923,45 +923,79 @@ fn ready_promotion_is_rejected_for_backburner_repositories() -> Result<()> {
     card.status = CardStatus::Backlog;
     store.import_cards(vec![card])?;
 
-    let err = store.update_status(&card_id, CardStatus::Ready, 20, &Authority::unchecked());
-    let message = match err {
-        Err(StoreError::Domain(DomainError::Conflict(message))) => message,
-        other => panic!("expected repository tier conflict, got {other:?}"),
-    };
-    assert!(message.contains("repository sploot is backburner"));
+    let promoted = store.update_status(&card_id, CardStatus::Ready, 20, &Authority::unchecked())?;
+    assert_eq!(promoted.status, CardStatus::Ready);
     assert_eq!(
         store.get_card(&card_id)?.expect("card").status,
-        CardStatus::Backlog
+        CardStatus::Ready
     );
     Ok(())
 }
 
 #[test]
-fn release_claim_cannot_make_a_backburner_card_ready() -> Result<()> {
+fn claim_lifecycle_works_in_a_backburner_repository() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("claimed-sploot")?;
     let mut card = ready_card("claimed-sploot", 10);
     card.repo = Some("sploot".to_string());
-    store.import_cards(vec![card])?;
-    store.connection.execute(
-        "UPDATE repositories SET tier = 'active' WHERE name = 'sploot'",
-        [],
-    )?;
-    let claim = store.claim_card(&card_id, "agent-a", 20, 60, &Authority::unchecked())?;
-    store.connection.execute(
-        "UPDATE repositories SET tier = 'backburner' WHERE name = 'sploot'",
-        [],
-    )?;
+    let mut bystander = ready_card("powder-bystander", 11);
+    bystander.repo = Some("powder".to_string());
+    store.import_cards(vec![card, bystander])?;
 
-    let err = store.release_claim(&card_id, &claim.run_id, 30, &Authority::unchecked());
+    let claim = store.claim_card(&card_id, "agent-a", 20, 60, &Authority::unchecked())?;
+    assert_eq!(claim.agent.as_str(), "agent-a");
+
+    // Lease collision stays deterministic regardless of tier.
+    let collision = store.claim_card(&card_id, "agent-b", 25, 60, &Authority::unchecked());
     assert!(matches!(
-        err,
+        collision,
         Err(StoreError::Domain(DomainError::Conflict(_)))
     ));
+
+    store.release_claim(&card_id, &claim.run_id, 30, &Authority::unchecked())?;
     assert_eq!(
         store.get_card(&card_id)?.expect("card").status,
-        CardStatus::Claimed
+        CardStatus::Ready
+    );
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert!(detail
+        .activities
+        .iter()
+        .any(|activity| activity.payload.contains("claimed claimed-sploot")));
+    assert!(detail
+        .activities
+        .iter()
+        .any(|activity| activity.payload.contains("released claimed-sploot")));
+
+    let untouched = store
+        .get_card(&CardId::new("powder-bystander")?)?
+        .expect("bystander");
+    assert_eq!(untouched.status, CardStatus::Ready);
+    assert_eq!(untouched.updated_at, 11);
+    Ok(())
+}
+
+#[test]
+fn claim_and_ready_promotion_work_in_an_archived_repository() -> Result<()> {
+    // Archived repositories get no special lifecycle rule either: archiving is
+    // ranking/visibility metadata, so an explicitly ready card stays claimable.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("atlas-frozen")?;
+    let mut card = ready_card("atlas-frozen", 10);
+    card.repo = Some("atlas".to_string());
+    card.status = CardStatus::Backlog;
+    store.import_cards(vec![card])?;
+
+    store.update_status(&card_id, CardStatus::Ready, 20, &Authority::unchecked())?;
+    let claim = store.claim_card(&card_id, "agent-a", 30, 60, &Authority::unchecked())?;
+    store.release_claim(&card_id, &claim.run_id, 40, &Authority::unchecked())?;
+    assert_eq!(
+        store.get_card(&card_id)?.expect("card").status,
+        CardStatus::Ready
     );
     Ok(())
 }

@@ -2456,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_list_ready_excludes_non_active_repositories() {
+    fn mcp_list_ready_includes_backburner_repositories() {
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         store
@@ -2481,7 +2481,7 @@ mod tests {
         let ready = call_tool_store(&mut store, "list_ready", &json!({"limit": 10}), 10).unwrap();
         let text = ready["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("powder"));
-        assert!(!text.contains("sploot"));
+        assert!(text.contains("sploot"));
     }
 
     #[test]
