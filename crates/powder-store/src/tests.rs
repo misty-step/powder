@@ -336,6 +336,10 @@ fn list_cards_page_include_terminal_hides_terminal_cards_but_total_count_still_c
         excluded.total_count, 2,
         "total_count reports the full board even though the done card is hidden"
     );
+    // rev-125 fix: the held-back count is reported separately so envelope
+    // builders can distinguish "raise limit" from "pass include_terminal"
+    // instead of lumping both into one misleading number.
+    assert_eq!(excluded.excluded_terminal_count, 1);
 
     let included = store.list_cards_page(
         &CardFilter {
@@ -346,6 +350,7 @@ fn list_cards_page_include_terminal_hides_terminal_cards_but_total_count_still_c
     )?;
     assert_eq!(included.cards.len(), 2);
     assert_eq!(included.total_count, 2);
+    assert_eq!(included.excluded_terminal_count, 0);
 
     // An explicit status filter overrides include_terminal: asking for
     // status: done must still return the done card even with
@@ -360,6 +365,7 @@ fn list_cards_page_include_terminal_hides_terminal_cards_but_total_count_still_c
     )?;
     assert_eq!(explicit_done.cards.len(), 1);
     assert_eq!(explicit_done.cards[0].id.as_str(), "done-1");
+    assert_eq!(explicit_done.excluded_terminal_count, 0);
 
     assert_eq!(store.card_count()?, 2);
     Ok(())

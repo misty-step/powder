@@ -421,7 +421,13 @@ pub fn call_tool_store(
                 include_terminal,
             };
             let page = store.list_cards_page(&filter, limit).map_err(to_string)?;
-            list_cards_envelope(store, args, &filter, &page.cards, page.total_count)?
+            list_cards_envelope(
+                store,
+                args,
+                &page.cards,
+                page.total_count,
+                page.excluded_terminal_count,
+            )?
         }
         "board_stats" => json!(store
             .board_stats(BoardStatsQuery {
@@ -759,20 +765,19 @@ fn card_summary_page_payload(cards: &[Card], total_count: usize) -> Value {
 /// status/repo/autonomy/estimate filters -- see `list_cards_page`'s doc
 /// comment -- so it never undercounts just because `include_terminal:false`
 /// (the tool's default with no explicit `status`) held terminal cards back
-/// from `cards`. Two self-describing cases beyond the plain
-/// `card_summary_page_payload` shape:
+/// from `cards`. Beyond the plain `card_summary_page_payload` shape:
 /// - a genuinely empty filtered match (`total_count == 0`) names the active
 ///   filter and the board's raw total, so a narrow filter never reads as an
 ///   empty board;
-/// - a nonempty match that's entirely hidden behind the default terminal
-///   exclusion says so explicitly, rather than implying "raise limit" will
-///   help when only `include_terminal:true` will.
+/// - otherwise the hint comes from [`list_cards_hint`], which keeps "more
+///   matches beyond `limit`" and "matches hidden by the terminal exclusion"
+///   separate -- they have different remedies.
 fn list_cards_envelope(
     store: &Store,
     args: &Value,
-    filter: &CardFilter,
     cards: &[Card],
     total_count: usize,
+    excluded_terminal_count: usize,
 ) -> Result<Value, String> {
     let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
     let has_more = total_count > summaries.len();
@@ -789,19 +794,47 @@ fn list_cards_envelope(
                 active_filter_description(args)
             ));
         }
-    } else if has_more {
-        if summaries.is_empty() && filter.status.is_none() && !filter.include_terminal {
-            payload["hint"] = json!(format!(
-                "{total_count} cards hidden as terminal (done/shipped/abandoned); pass include_terminal:true to see them"
-            ));
-        } else {
-            payload["hint"] = json!(format!(
-                "{} more cards; filter by status/repo or raise limit",
-                total_count - summaries.len()
-            ));
-        }
+    } else if let Some(hint) =
+        list_cards_hint(summaries.len(), total_count, excluded_terminal_count)
+    {
+        payload["hint"] = json!(hint);
     }
     Ok(payload)
+}
+
+/// Hint text for a truncated or terminal-filtered `list_cards` page, shared
+/// by the local (store-backed) and remote (HTTP-backed) dispatch paths.
+///
+/// The two shortfalls have different remedies and must never be conflated:
+/// raising `limit` recovers matches beyond the page size, while only
+/// `include_terminal:true` recovers terminal-hidden matches. An earlier
+/// version subtracted the terminal-exclusive returned count from the
+/// terminal-inclusive total and always said "raise limit" -- on a board of
+/// 1 done + 1 ready with limit 10 that read "1 more cards; ... raise
+/// limit", where raising the limit does nothing, sending an agent in a
+/// retry loop.
+pub(crate) fn list_cards_hint(
+    returned: usize,
+    total_count: usize,
+    excluded_terminal_count: usize,
+) -> Option<String> {
+    let beyond_limit = total_count
+        .saturating_sub(excluded_terminal_count)
+        .saturating_sub(returned);
+    match (beyond_limit > 0, excluded_terminal_count > 0) {
+        (true, true) => Some(format!(
+            "{beyond_limit} more non-terminal cards (raise limit); \
+             {excluded_terminal_count} terminal hidden (include_terminal:true)"
+        )),
+        (true, false) => Some(format!(
+            "{beyond_limit} more cards; filter by status/repo or raise limit"
+        )),
+        (false, true) => Some(format!(
+            "{excluded_terminal_count} terminal cards hidden (done/shipped/abandoned); \
+             pass include_terminal:true to see them"
+        )),
+        (false, false) => None,
+    }
 }
 
 /// Renders the caller's active `list_cards` filter as `{key:value, ...}` for
@@ -1979,6 +2012,37 @@ mod tests {
             "total_count must still report the full board so the hidden card is never mistaken for a nonexistent one"
         );
         assert_eq!(payload["has_more"], true);
+        // rev-125 fix: the hint must NOT say "raise limit" here -- the
+        // shortfall is entirely terminal-hidden cards, and raising the
+        // limit recovers none of them (the original conflated hint sent an
+        // agent in a retry loop on exactly this 1 done + 1 ready board).
+        assert_eq!(
+            payload["hint"],
+            "1 terminal cards hidden (done/shipped/abandoned); pass include_terminal:true to see them"
+        );
+
+        // Both shortfalls at once: three ready cards behind limit 1 AND a
+        // hidden done card -- the hint must name each remedy with its own
+        // accurate count instead of one lumped "raise limit" number.
+        for index in 2..=3 {
+            store
+                .import_cards(vec![seeded_card(
+                    &format!("ready-{index}"),
+                    "Ready",
+                    CardStatus::Ready,
+                    2 + index,
+                )])
+                .unwrap();
+        }
+        let truncated =
+            call_tool_store(&mut store, "list_cards", &json!({"limit": 1}), 10).unwrap();
+        let payload = tool_payload(&truncated);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["total_count"], 4);
+        assert_eq!(
+            payload["hint"],
+            "2 more non-terminal cards (raise limit); 1 terminal hidden (include_terminal:true)"
+        );
 
         // An explicit status filter is authoritative regardless of the
         // default terminal exclusion.

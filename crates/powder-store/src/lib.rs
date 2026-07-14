@@ -158,6 +158,15 @@ impl Default for CardFilter {
 pub struct CardListPage {
     pub cards: Vec<Card>,
     pub total_count: usize,
+    /// How many of `total_count` were held back by
+    /// [`CardFilter::include_terminal`]`: false` (always 0 when the filter
+    /// includes terminal cards, when an explicit `status` was requested, or
+    /// for `list_ready`). Kept separate so an envelope can distinguish "more
+    /// matches beyond `limit` -- raise the limit" from "matches hidden by
+    /// the terminal exclusion -- pass `include_terminal: true`": raising the
+    /// limit does nothing for the latter, and a hint that conflates the two
+    /// sends an agent in a loop.
+    pub excluded_terminal_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -855,7 +864,11 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
         });
         cards.truncate(query.limit);
-        Ok(CardListPage { cards, total_count })
+        Ok(CardListPage {
+            cards,
+            total_count,
+            excluded_terminal_count: 0,
+        })
     }
 
     /// List cards by optional `status`/`autonomy`/`repo` filter, not just ready-eligible
@@ -916,11 +929,15 @@ impl Store {
         // cards silently held back still sees the true match count rather
         // than an undercount that reads as "the board is smaller than it
         // is." An explicit `status` filter is authoritative and is never
-        // second-guessed by `include_terminal`.
+        // second-guessed by `include_terminal`. The number held back is
+        // reported separately as `excluded_terminal_count` so envelope
+        // builders can say exactly which remedy (raise `limit` vs. pass
+        // `include_terminal: true`) recovers which cards.
         let total_count = cards.len();
         if filter.status.is_none() && !filter.include_terminal {
             cards.retain(|card| !card.status.is_terminal());
         }
+        let excluded_terminal_count = total_count - cards.len();
 
         cards.sort_by(|left, right| {
             left.priority
@@ -929,7 +946,11 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
         });
         cards.truncate(limit.max(1));
-        Ok(CardListPage { cards, total_count })
+        Ok(CardListPage {
+            cards,
+            total_count,
+            excluded_terminal_count,
+        })
     }
 
     /// Raw count of every card in the store, ignoring every filter

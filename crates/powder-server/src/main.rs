@@ -266,6 +266,14 @@ struct ListCardsParams {
     repo: Option<String>,
     estimate: Option<String>,
     limit: Option<usize>,
+    /// powder-mcp-unfiltered-enumeration: `false` hides
+    /// done/shipped/abandoned cards when no explicit `status` is requested
+    /// (an explicit `status` always wins; see `CardFilter`). Defaults to
+    /// `true`, so HTTP callers that never send it keep the historical
+    /// whole-board behavior byte-for-byte unchanged; the remote MCP
+    /// dispatch path sends `false` for an unfiltered `list_cards` so remote
+    /// mode matches local (store-backed) MCP mode.
+    include_terminal: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,7 +716,11 @@ async fn list_ready(
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
     let query = ReadyQuery::new(unix_now(), limit).with_estimate(estimate);
     let page = lock_store(&state)?.list_ready_page(query)?;
-    Ok(Json(card_list_page_json(page.cards, page.total_count)))
+    Ok(Json(card_list_page_json(
+        page.cards,
+        page.total_count,
+        page.excluded_terminal_count,
+    )))
 }
 
 /// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
@@ -736,22 +748,36 @@ async fn list_cards(
         autonomy,
         estimate,
         repo: params.repo,
-        // powder-mcp-unfiltered-enumeration: the MCP `list_cards` tool
-        // defaults to hiding terminal cards from an unfiltered query; the
-        // HTTP route keeps its existing whole-board behavior unchanged.
-        include_terminal: true,
+        include_terminal: params.include_terminal.unwrap_or(true),
     };
     let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
-    Ok(Json(card_list_page_json(page.cards, page.total_count)))
+    Ok(Json(card_list_page_json(
+        page.cards,
+        page.total_count,
+        page.excluded_terminal_count,
+    )))
 }
 
-fn card_list_page_json(cards: Vec<Card>, total_count: usize) -> serde_json::Value {
+fn card_list_page_json(
+    cards: Vec<Card>,
+    total_count: usize,
+    excluded_terminal_count: usize,
+) -> serde_json::Value {
     let has_more = total_count > cards.len();
-    json!({
+    let mut payload = json!({
         "cards": cards,
         "total_count": total_count,
         "has_more": has_more,
-    })
+    });
+    // Additive, opt-in-only field: nonzero exactly when the caller sent
+    // `include_terminal=false` and terminal cards were held back, so the
+    // historical response shape for every existing caller is unchanged.
+    // Remote MCP dispatch uses it to build an accurate "hidden vs. beyond
+    // limit" hint (see powder-mcp's list_cards_hint).
+    if excluded_terminal_count > 0 {
+        payload["excluded_terminal_count"] = json!(excluded_terminal_count);
+    }
+    payload
 }
 
 async fn list_approvals(

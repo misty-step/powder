@@ -48,14 +48,17 @@ Default agent persona (20 tools):
 - `list_cards`: enumerate cards by optional status/autonomy/repo/`estimate`
   filter, including `blocked`, `review`, and `done` cards `list_ready` never
   surfaces. With no `status` filter, `done`/`shipped`/`abandoned` cards are
-  hidden by default -- pass `include_terminal: true` to restore the full
-  sweep; an explicit `status` filter (e.g. `status: done`) always returns
-  matching cards regardless of `include_terminal`. `total_count` in the
-  response always reports the full matching count, terminal cards included,
-  so a hidden card is never mistaken for a nonexistent one; a filtered query
-  that matches nothing names the active filter and the board's total in its
-  `hint` (e.g. `0 matches for {status:done, repo:mint}; board has 214
-  cards`).
+  hidden by default (in both local `POWDER_DB_PATH` and remote
+  `POWDER_API_BASE_URL` modes) -- pass `include_terminal: true` to restore
+  the full sweep; an explicit `status` filter (e.g. `status: done`) always
+  returns matching cards regardless of `include_terminal`. `total_count` in
+  the response always reports the full matching count, terminal cards
+  included, so a hidden card is never mistaken for a nonexistent one. The
+  `hint` keeps the two shortfalls separate because they have different
+  remedies: "N more non-terminal cards (raise limit)" vs. "N terminal
+  hidden (include_terminal:true)"; a filtered query that matches nothing
+  names the active filter and the board's total (e.g. `0 matches for
+  {status:done, repo:mint}; board has 214 cards`).
 - `board_stats`: return board-shape counts (by status and repo), not card
   contents; call this before `list_cards` when you only need the shape of
   the board.
