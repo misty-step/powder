@@ -203,6 +203,30 @@ for (const mode of MODES) {
   });
 }
 
+// Adversarial-review blocker: aria-modal="true" without focus containment
+// is a lie -- Tab used to walk straight out of the palette into the
+// visually-covered board. This proves the trap: Tab/Shift-Tab keep focus
+// inside the dialog, and closing hands focus back to the invoker.
+test("board · the command palette traps Tab focus and restores the invoker on close (powder-ui-keyboard-firstrun review)", async ({
+  page,
+}) => {
+  const errors = await boot(page, "light");
+  await page.locator("#cmdk-toggle").click();
+  await expect(page.locator("#cmdk")).toBeVisible();
+  await expect(page.locator("#cmdk-input")).toBeFocused();
+  for (const key of ["Tab", "Tab", "Shift+Tab", "Tab", "Shift+Tab"]) {
+    await page.keyboard.press(key);
+    const inside = await page.evaluate(() =>
+      document.getElementById("cmdk")!.contains(document.activeElement),
+    );
+    expect(inside, `focus must stay inside the dialog after ${key}`).toBe(true);
+  }
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#cmdk")).toBeHidden();
+  await expect(page.locator("#cmdk-toggle")).toBeFocused();
+  await assertLaw(page, { consoleErrors: errors });
+});
+
 // powder-ui-keyboard-firstrun: honest empty states -- a brand-new instance
 // (zero cards, zero filters) gets an onboarding welcome, distinct from a
 // filter that simply matches nothing. Uses the second, genuinely-empty
@@ -238,19 +262,46 @@ for (const mode of MODES) {
   });
 }
 
-// powder-903: the board <-> backlog <-> both view switch is now a plain CSS
+// powder-903: the board <-> backlog <-> both view switch is a plain CSS
 // transition on `.pw-main`'s grid-template-columns (see PR design notes),
-// not a per-frame JS animation loop -- so it can never block the main
-// thread. This fires the next switch immediately, without waiting for the
-// (220ms) transition to finish, proving the tab controls stay responsive
-// mid-transition rather than eyeballing a recording.
+// not a per-frame JS animation loop. Honest scope of this spec
+// (adversarial-review rewording): it does NOT measure jank or prove the
+// main thread never stalls -- it proves a click landing while the CSS
+// transition is verifiably mid-interpolation (the rail's resolved grid
+// track is strictly between its start and end widths at the moment of the
+// next click) is handled immediately rather than dropped or queued behind
+// the animation. The pre-PR rAF loop also kept clicks working; what this
+// pins down is that the *current* transition really is in flight when the
+// next command lands, which the earlier version of this spec never
+// sampled. `--pw-view-duration` is stretched via an injected style so the
+// mid-flight window is reliably sampleable under CI load -- same
+// declarative mechanism, longer beat.
 test("board · view switch controls stay responsive mid-transition (powder-903)", async ({
   page,
 }) => {
   const errors = await boot(page, "light");
+  await page.addStyleTag({ content: ":root { --pw-view-duration: 600ms; }" });
+  const railTrackWidth = () =>
+    page
+      .locator("#main")
+      .evaluate((el) => parseFloat(getComputedStyle(el).gridTemplateColumns));
+  const start = await railTrackWidth();
+  expect(start, "the rail track starts at its 'both' share").toBeGreaterThan(0);
+
   await page.locator("#tab-board").click();
-  await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#main")).toHaveAttribute("data-view", "board");
+  // Wait until the resolved track width has left its start value...
+  await expect
+    .poll(railTrackWidth, { intervals: [16, 16, 16, 16, 32, 32, 64] })
+    .toBeLessThan(start);
+  // ...and sample again: strictly between end (0) and start proves the CSS
+  // transition is interpolating right now, not already finished.
+  const during = await railTrackWidth();
+  expect(during, "sampled mid-interpolation, not after the transition ended").toBeGreaterThan(0);
+  expect(during).toBeLessThan(start);
+
+  // Fire the next switch while the transition is provably in flight: the
+  // click must register immediately (aria-selected and data-view flip),
+  // not be dropped or deferred until the animation ends.
   await page.locator("#tab-backlog").click();
   await expect(page.locator("#tab-backlog")).toHaveAttribute("aria-selected", "true");
   await expect(page.locator("#main")).toHaveAttribute("data-view", "backlog");
@@ -673,6 +724,20 @@ test("board · a zero-card repository is hidden until the show-empty toggle is u
   await expect(row.locator(".ae-num")).toHaveText("0");
 
   await assertLaw(page, { consoleErrors: errors });
+
+  // Review fix: showEmptyRepos persists through the same
+  // saveBoardState()/restoreBoardState() session round-trip as its sibling
+  // showAllTiers -- navigate out to a card (which saves board state) and
+  // back to the board (which restores it), then confirm the toggle is
+  // still engaged instead of silently reset.
+  await page.locator("[data-card-link]").first().click();
+  await expect(page.locator("#powder-card-app")).toBeVisible();
+  await page.locator("#detail-board-link").click();
+  await expect(page.locator("#powder-board-app")).toBeVisible();
+  await waitForSettled(page);
+  await page.locator("#settings-toggle").click();
+  await expect(page.locator("#repo-empty-toggle")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(`.pw-repo-row[data-repo-name="${repoName}"]`)).toBeVisible();
 
   const deleted = await page.request.delete(`/api/v1/repositories/${repoName}`);
   expect(deleted.ok(), "clean up the zero-card fixture repository").toBe(true);

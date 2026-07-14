@@ -246,6 +246,22 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: 0.6em;
 }
 
+/* The three tiers read differently at a glance, within the .ae-tag grammar
+   (mono, hairline, no fill, no hue -- tier is a lifecycle stage, not a
+   category, so it earns ink weight rather than a categorical hue): active
+   is full ink with a firmer hairline, backburner keeps the .ae-tag default
+   muted treatment, archived recedes to faint ink with a strike. All tokens,
+   so both themes get the same relative ordering for free. */
+.pw-repo-tier-badge[data-tier='active'] {
+  color: var(--ae-ink);
+  border-color: var(--ae-ink-muted);
+}
+
+.pw-repo-tier-badge[data-tier='archived'] {
+  color: var(--ae-ink-faint);
+  text-decoration: line-through;
+}
+
 .pw-repo-create,
 .pw-repo-edit,
 .pw-repo-merge {

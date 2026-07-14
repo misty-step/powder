@@ -1316,6 +1316,7 @@ function saveBoardState() {
         view: state.view,
         railShare,
         showAllTiers: state.showAllTiers,
+        showEmptyRepos: state.showEmptyRepos,
         filters: {
           repos: [...state.filters.repos],
           prios: [...state.filters.prios],
@@ -1339,6 +1340,7 @@ function restoreBoardState() {
       railShare = saved.railShare;
     }
     state.showAllTiers = Boolean(saved.showAllTiers);
+    state.showEmptyRepos = Boolean(saved.showEmptyRepos);
     const filters = saved.filters || {};
     state.filters.repos = new Set(Array.isArray(filters.repos) ? filters.repos : []);
     state.filters.prios = new Set(Array.isArray(filters.prios) ? filters.prios : []);
@@ -1924,6 +1926,7 @@ function moveCardFocus(direction) {
 const CMDK_MATCH_LIMIT = 50;
 let paletteMatches = [];
 let paletteActiveIndex = -1;
+let paletteInvoker = null;
 
 function isPaletteOpen() {
   return Boolean(els.cmdk && !els.cmdk.hidden);
@@ -1931,6 +1934,8 @@ function isPaletteOpen() {
 
 function openCommandPalette() {
   if (!els.cmdk) return;
+  paletteInvoker =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
   els.cmdk.hidden = false;
   els.cmdkInput.value = "";
   filterPalette("");
@@ -1942,6 +1947,47 @@ function closeCommandPalette() {
   els.cmdk.hidden = true;
   paletteMatches = [];
   paletteActiveIndex = -1;
+  // aria-modal promises focus containment AND that closing hands focus back
+  // to where the user was -- restore it to the element that opened the
+  // palette (the header button for clicks, whatever held focus for the
+  // keyboard shortcut) if it is still in the document.
+  if (paletteInvoker && paletteInvoker.isConnected) paletteInvoker.focus();
+  paletteInvoker = null;
+}
+
+// Focus trap (adversarial-review blocker): aria-modal="true" is a claim,
+// not a behavior -- without containment, Tab walked straight out of the
+// dialog into the visually-covered board. Chosen implementation: cycle
+// Tab/Shift-Tab within the dialog's own focusable elements at the dialog
+// container level. The alternative (`inert` on the background) was
+// rejected because #cmdk lives inside #powder-board-app, so inert-ing the
+// app shell would inert the palette itself; restructuring the DOM for it
+// buys nothing over the two-branch trap below.
+function paletteFocusables() {
+  return [
+    ...els.cmdk.querySelectorAll(
+      "input, button, select, textarea, a[href], [tabindex]:not([tabindex='-1'])",
+    ),
+  ].filter((el) => !el.disabled && el.offsetParent !== null);
+}
+
+function trapPaletteTab(event) {
+  const focusables = paletteFocusables();
+  if (!focusables.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const current = document.activeElement;
+  const inside = els.cmdk.contains(current);
+  if (event.shiftKey && (!inside || current === first)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (!inside || current === last)) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function toggleCommandPalette() {
@@ -2115,6 +2161,19 @@ els.awaitingBadge?.addEventListener("click", () => {
 els.cmdkToggle?.addEventListener("click", () => toggleCommandPalette());
 els.cmdk?.addEventListener("click", (event) => {
   if (event.target.closest("[data-cmdk-dismiss]")) closeCommandPalette();
+});
+// Dialog-level keys: the Tab trap must catch Tab no matter which element
+// inside the dialog holds focus, and Escape must close the dialog even if
+// focus has moved off the input (the input's own handler below covers the
+// common case and stops propagation, so this never double-fires).
+els.cmdk?.addEventListener("keydown", (event) => {
+  if (event.key === "Tab") {
+    trapPaletteTab(event);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeCommandPalette();
+  }
 });
 els.cmdkInput?.addEventListener("input", (event) => filterPalette(event.target.value));
 els.cmdkInput?.addEventListener("keydown", (event) => {
