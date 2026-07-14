@@ -96,8 +96,9 @@ Default agent persona (20 tools):
   relation lists untouched. Parent edges never block and child completion
   never completes the parent -- parent acceptance stays authoritative.
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
-- `add_comment`: attach an actor-attributed comment, visible immediately via
-  `get_card`/`get_run`.
+- `add_comment`: attach an actor-attributed comment (`author`, `body` --
+  both required), visible immediately via `get_card`/`get_run`; `body` is
+  scrubbed for known secret shapes server-side before storage.
 - `append_work_log`: append a high-frequency, fully-attributed work_log entry
   (agent, model, reasoning, harness, run_id, body) while actively working a
   card -- call this often, not just at completion; `body` is scrubbed for

@@ -85,6 +85,33 @@ fn config_accepts_tailnet_and_none_modes() {
 }
 
 #[test]
+fn config_defaults_tailnet_backstop_to_unset_secret_and_admin_true() {
+    let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
+    assert!(config.tailnet_proxy_secret.is_none());
+    assert!(
+        config.tailnet_admin,
+        "unset POWDER_TAILNET_ADMIN must preserve tailscale-header mode's original all-admin behavior"
+    );
+}
+
+#[test]
+fn config_parses_tailnet_proxy_secret_and_admin_flag() {
+    let config = Config::from_pairs([
+        ("POWDER_TAILNET_PROXY_SECRET", "shhh"),
+        ("POWDER_TAILNET_ADMIN", "false"),
+    ])
+    .unwrap();
+    assert_eq!(config.tailnet_proxy_secret.as_deref(), Some("shhh"));
+    assert!(!config.tailnet_admin);
+}
+
+#[test]
+fn config_rejects_a_non_boolean_tailnet_admin() {
+    let err = Config::from_pairs([("POWDER_TAILNET_ADMIN", "yes")]).unwrap_err();
+    assert_eq!(err.variable, "POWDER_TAILNET_ADMIN");
+}
+
+#[test]
 fn config_rejects_invalid_auth_mode() {
     let err = Config::from_pairs([("POWDER_AUTH_MODE", "open")]).unwrap_err();
 
@@ -1979,6 +2006,73 @@ async fn add_comment_appears_in_get_card_immediately() {
     assert_eq!(card["comments"][0]["body"], "looks good");
 }
 
+/// powder-927: pin the comments route's 422 contract against axum's own
+/// `Json` extractor rejection (the same mechanism `create_card_rejects_unknown_fields_by_name`
+/// and `append_work_log_appears_in_get_card_immediately`'s missing-`agent`
+/// case already exercise for other routes) -- a missing `author` or `body`
+/// must fail with 422 naming the missing field, and the full shape must
+/// still succeed with 200.
+#[tokio::test]
+async fn add_comment_422_contract_names_the_missing_field() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"comment-422","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let missing_author = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/comment-422/comments",
+            Some(&raw_key),
+            r#"{"body":"no author supplied"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_author.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_text(missing_author).await;
+    assert!(
+        body.contains("author"),
+        "missing-author rejection should name the field: {body}"
+    );
+
+    let missing_body = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/comment-422/comments",
+            Some(&raw_key),
+            r#"{"author":"operator"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_body.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = response_text(missing_body).await;
+    assert!(
+        body.contains("body"),
+        "missing-body rejection should name the field: {body}"
+    );
+
+    let full = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/comment-422/comments",
+            Some(&raw_key),
+            r#"{"author":"operator","body":"all present"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(full.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn append_work_log_appears_in_get_card_immediately() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -3673,6 +3767,8 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
             bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
             disclose_bootstrap_key: false,
             field_note: FieldNoteConfig::default(),
+            tailnet_proxy_secret: None,
+            tailnet_admin: true,
         }),
         store: Arc::new(Mutex::new(store)),
     };
@@ -3715,6 +3811,21 @@ fn test_state_with_home_url(auth_mode: AuthMode, home_url: &str) -> (AppState, S
         store: state.store,
     };
     (state, key)
+}
+
+/// `tailscale-header` auth state with the powder-tailnet-backstop knobs
+/// (`POWDER_TAILNET_PROXY_SECRET`, `POWDER_TAILNET_ADMIN`) set explicitly,
+/// for exercising `authorize()`/`require_admin()` directly.
+fn test_state_with_tailnet_backstop(proxy_secret: Option<&str>, tailnet_admin: bool) -> AppState {
+    let (state, _) = test_state(AuthMode::TailscaleHeader);
+    AppState {
+        config: Arc::new(Config {
+            tailnet_proxy_secret: proxy_secret.map(ToOwned::to_owned),
+            tailnet_admin,
+            ..(*state.config).clone()
+        }),
+        store: state.store,
+    }
 }
 
 #[derive(Debug)]
@@ -3852,4 +3963,77 @@ async fn response_json(response: Response) -> serde_json::Value {
 async fn response_text(response: Response) -> String {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+// powder-tailnet-backstop: `authorize()`'s TailscaleHeader branch trusts any
+// request bearing a known identity header as an admin actor. These tests
+// pin the in-code backstop directly against `authorize`/`require_admin`
+// (not the HTTP layer) so the auth decision itself is under test, not axum
+// routing.
+
+fn identity_headers(value: &'static str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-forwarded-user",
+        axum::http::HeaderValue::from_static(value),
+    );
+    headers
+}
+
+fn proxy_secret_header(value: &'static str) -> HeaderMap {
+    let mut headers = identity_headers("operator");
+    headers.insert(
+        PROXY_SECRET_HEADER,
+        axum::http::HeaderValue::from_static(value),
+    );
+    headers
+}
+
+#[test]
+fn proxy_secret_set_and_header_missing_is_unauthorized() {
+    let state = test_state_with_tailnet_backstop(Some("correct-horse"), true);
+    let err = authorize(&state, &identity_headers("operator")).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(err.message.contains(PROXY_SECRET_HEADER));
+}
+
+#[test]
+fn proxy_secret_set_and_header_wrong_is_unauthorized() {
+    let state = test_state_with_tailnet_backstop(Some("correct-horse"), true);
+    let err = authorize(&state, &proxy_secret_header("wrong-value")).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn proxy_secret_set_and_header_correct_is_authorized() {
+    let state = test_state_with_tailnet_backstop(Some("correct-horse"), true);
+    let actor = authorize(&state, &proxy_secret_header("correct-horse")).unwrap();
+    assert_eq!(actor.display_name, "operator");
+    assert!(actor.is_admin);
+}
+
+#[test]
+fn proxy_secret_unset_preserves_current_behavior() {
+    let state = test_state_with_tailnet_backstop(None, true);
+    // No X-Powder-Proxy-Secret header at all -- unset config must not
+    // require one.
+    let actor = authorize(&state, &identity_headers("operator")).unwrap();
+    assert_eq!(actor.display_name, "operator");
+    assert!(actor.is_admin);
+
+    let err = authorize(&state, &HeaderMap::new()).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn tailnet_admin_false_authorizes_but_require_admin_rejects() {
+    let state = test_state_with_tailnet_backstop(None, false);
+    let actor = authorize(&state, &identity_headers("operator")).unwrap();
+    assert!(
+        !actor.is_admin,
+        "POWDER_TAILNET_ADMIN=false must make tailnet identities non-admin"
+    );
+
+    let err = require_admin(&state, &identity_headers("operator")).unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
 }
