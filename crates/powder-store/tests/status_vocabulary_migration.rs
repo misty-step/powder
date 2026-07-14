@@ -16,7 +16,7 @@
 //! trustworthy than a parallel simulation of it.
 use std::{collections::BTreeMap, path::PathBuf};
 
-use powder_core::ReadyQuery;
+use powder_core::{CardId, ReadyQuery};
 use powder_store::{Store, SCHEMA_VERSION};
 use rusqlite::Connection;
 
@@ -39,6 +39,7 @@ type ClaimRow = (
     Option<i64>,
 );
 type RelationRow = (String, String, String, String);
+type OracleRow = (String, String, String);
 
 fn claim_rows(connection: &Connection) -> Vec<ClaimRow> {
     let mut statement = connection
@@ -73,6 +74,17 @@ fn relation_rows(connection: &Connection) -> Vec<RelationRow> {
         .expect("query relation rows")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect relation rows")
+}
+
+fn oracle_rows(connection: &Connection) -> Vec<OracleRow> {
+    let mut statement = connection
+        .prepare("SELECT id, acceptance_json, criteria_json FROM cards ORDER BY id")
+        .expect("prepare oracle rows");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query oracle rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect oracle rows")
 }
 
 fn status_counts(connection: &Connection) -> BTreeMap<String, usize> {
@@ -126,16 +138,23 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
             .expect("load status-vocabulary snapshot fixture");
     }
 
-    let (before_status_counts, before_claims, before_relations, before_table_counts) = {
+    let (
+        before_status_counts,
+        before_claims,
+        before_relations,
+        before_oracles,
+        before_table_counts,
+    ) = {
         let connection = Connection::open(&path).expect("raw connection for before snapshot");
         let counts = status_counts(&connection);
         let claims = claim_rows(&connection);
         let relations = relation_rows(&connection);
+        let oracles = oracle_rows(&connection);
         let tables = ["runs", "activities", "card_events", "comments", "links"]
             .into_iter()
             .map(|table| (table, table_count(&connection, table)))
             .collect::<BTreeMap<_, _>>();
-        (counts, claims, relations, tables)
+        (counts, claims, relations, oracles, tables)
     };
 
     assert_eq!(before_status_counts.get("abandoned").copied(), Some(27));
@@ -167,6 +186,7 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
     let after_status_counts = status_counts(&connection);
     let after_claims = claim_rows(&connection);
     let after_relations = relation_rows(&connection);
+    let after_oracles = oracle_rows(&connection);
 
     // No legacy status survives the migration.
     for legacy in ["claimed", "running", "blocked"] {
@@ -177,16 +197,17 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
         );
     }
 
-    // claimed(9) + running(45) both collapse to in_progress. Of the 18
-    // blocked rows: only the 2 carrying real blocked_by relations become
-    // ready (78 already-ready + 2 = 80); the 15 relation-less rows and the
-    // single empty-acceptance row re-triage to backlog (170 + 16 = 186) --
-    // blocking that exists only as prose must not become claimable without
-    // a human wiring relations or promoting deliberately (adversarial
-    // review of PR #134). Everything else is untouched.
-    assert_eq!(after_status_counts.get("backlog").copied(), Some(186));
-    assert_eq!(after_status_counts.get("ready").copied(), Some(80));
-    assert_eq!(after_status_counts.get("in_progress").copied(), Some(54));
+    // Only the 7 claimed + 16 running rows with complete claims collapse to
+    // in_progress. The 30 claimless/malformed-claim rows carrying a real oracle
+    // return to ready; the one claimless running row with no oracle returns to
+    // backlog. This prevents legacy active statuses from becoming stranded in
+    // in_progress when there is no claim a worker can resume or replace. Of
+    // the 18 blocked rows: only the 2 carrying real blocked_by relations become
+    // ready; the 15 relation-less rows and the single empty-acceptance row
+    // re-triage to backlog. Everything else is untouched.
+    assert_eq!(after_status_counts.get("backlog").copied(), Some(187));
+    assert_eq!(after_status_counts.get("ready").copied(), Some(110));
+    assert_eq!(after_status_counts.get("in_progress").copied(), Some(23));
     assert_eq!(after_status_counts.get("awaiting_input").copied(), Some(2));
     assert_eq!(after_status_counts.get("done").copied(), Some(49));
     assert_eq!(after_status_counts.get("shipped").copied(), Some(10));
@@ -203,6 +224,10 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
     assert_eq!(
         after_relations, before_relations,
         "relation columns must be untouched by the status-vocabulary migration"
+    );
+    assert_eq!(
+        after_oracles, before_oracles,
+        "acceptance and structured-criteria bytes must be untouched by the migration"
     );
 
     // Every other table is untouched too, except card_events which grows
@@ -248,6 +273,34 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
          list_ready keeps excluding it until the blocker resolves"
     );
     assert_eq!(status_of("blocked-resolved-blocker-001"), "ready");
+    assert_eq!(
+        status_of("claimed-001"),
+        "in_progress",
+        "a complete legacy claim remains active"
+    );
+    assert_eq!(
+        status_of("claimed-008"),
+        "ready",
+        "a claimless legacy claimed card with an oracle returns to ready"
+    );
+    assert_eq!(
+        status_of("claimed-009"),
+        "ready",
+        "a malformed partial claim is treated as claimless without being repaired"
+    );
+    assert_eq!(
+        status_of("running-017"),
+        "ready",
+        "a claimless legacy running card with an oracle returns to ready"
+    );
+    assert_eq!(
+        status_of("running-044"),
+        "backlog",
+        "a claimless legacy running card without an oracle returns to backlog"
+    );
+    assert_eq!(status_of("running-045"), "ready");
+    assert_eq!(status_of("running-042"), "ready");
+    assert_eq!(status_of("running-043"), "ready");
 
     // The migration audit events exist, name both statuses plus the
     // relation-less re-triage rationale, and are attributed to the
@@ -280,6 +333,23 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
         relation_payload,
         "status-vocabulary migration: blocked -> ready"
     );
+    let (_, active_payload) = event_for("running-001");
+    assert_eq!(
+        active_payload,
+        "status-vocabulary migration: running -> in_progress"
+    );
+    let (_, claimless_payload) = event_for("claimed-008");
+    assert_eq!(
+        claimless_payload,
+        "status-vocabulary migration: claimed -> ready \
+         (no valid claim; acceptance oracle present)"
+    );
+    let (_, no_oracle_payload) = event_for("running-044");
+    assert_eq!(
+        no_oracle_payload,
+        "status-vocabulary migration: running -> backlog \
+         (no valid claim or acceptance oracle)"
+    );
 
     // powder-status-vocabulary regression (acceptance #3): a former-blocked
     // card whose blocker is still live must NOT surface in list_ready even
@@ -307,6 +377,44 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
             !ready.iter().any(|card| card.id.as_str() == "blocked-001"),
             "a relation-less former-blocked card re-triaged to backlog must not \
              surface in list_ready either"
+        );
+        assert!(
+            ready.iter().any(|card| card.id.as_str() == "claimed-008"),
+            "a claimless legacy claimed card with an oracle must become dispatchable again"
+        );
+        assert!(
+            ready.iter().any(|card| card.id.as_str() == "running-045"),
+            "a partial legacy claim must not strand an otherwise-ready card"
+        );
+        for id in ["running-042", "running-043"] {
+            assert!(
+                ready.iter().any(|card| card.id.as_str() == id),
+                "a complete-but-blank legacy claim must decode claimless and remain dispatchable: {id}"
+            );
+            let card = store
+                .get_card(&CardId::new(id).expect("fixture card id"))
+                .expect("malformed complete claim remains readable")
+                .expect("fixture card exists");
+            assert!(
+                card.claim.is_none(),
+                "malformed claim must decode as absent: {id}"
+            );
+        }
+        let structured_oracle = store
+            .get_card(&CardId::new("claimed-008").expect("fixture card id"))
+            .expect("structured-oracle card remains readable")
+            .expect("fixture card exists");
+        assert_eq!(
+            structured_oracle.acceptance,
+            vec!["structured oracle survives legacy acceptance drift"]
+        );
+        assert!(
+            ready.iter().any(|card| card.id.as_str() == "claimed-008"),
+            "structured criteria must be authoritative when legacy acceptance_json is empty"
+        );
+        assert!(
+            !ready.iter().any(|card| card.id.as_str() == "running-044"),
+            "a claimless legacy active card without an oracle must not become claimable"
         );
     }
 

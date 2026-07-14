@@ -416,6 +416,10 @@ impl Store {
                     self.migrate_17_to_18()?;
                     18
                 }
+                18 => {
+                    self.migrate_18_to_19()?;
+                    19
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -643,14 +647,22 @@ impl Store {
     }
 
     /// powder-status-vocabulary: collapses the nine-status vocabulary to
-    /// seven. `claimed`/`running` both become `in_progress` -- the claim
-    /// struct already carries who/lease/liveness, so a status bit
-    /// distinguishing "claimed but not yet running" from "running" was a
-    /// second, driftable copy of claim presence. `blocked` is dropped
-    /// entirely: blocking eligibility is already derived from `blocked_by`
-    /// relations at claim time ([`powder_core::Card::claim_readiness`])
-    /// regardless of status, so an explicit `blocked` status was a second,
-    /// driftable copy of that derived fact.
+    /// seven. A `claimed`/`running` card with a complete claim becomes
+    /// `in_progress` -- the claim struct already carries who/lease/liveness,
+    /// so a status bit distinguishing "claimed but not yet running" from
+    /// "running" was a second, driftable copy of claim presence. A claimless
+    /// legacy card instead returns to `ready` when it carries an acceptance
+    /// oracle, or `backlog` when it does not; otherwise it would be stranded
+    /// in `in_progress`, where neither `list_ready` nor a fresh claim can
+    /// recover it. Malformed partial or complete-but-blank claim columns count
+    /// as claimless through the same decoder used by [`CardRecord::into_card`],
+    /// and their stored bytes remain untouched. Structured criteria are
+    /// authoritative over the legacy acceptance list through that same shared
+    /// card decoder. `blocked` is dropped entirely: blocking
+    /// eligibility is already derived from `blocked_by` relations at claim
+    /// time ([`powder_core::Card::claim_readiness`]) regardless of status, so
+    /// an explicit `blocked` status was a second, driftable copy of that
+    /// derived fact.
     ///
     /// Where a former-`blocked` card lands depends on what it actually
     /// carries:
@@ -699,7 +711,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut statement = transaction.prepare(
-                "SELECT id, status, acceptance_json, blocked_by_json FROM cards
+                "SELECT id, status, acceptance_json, criteria_json, blocked_by_json,
+                        claim_agent, claim_run_id, claim_acquired_at, claim_expires_at
+                 FROM cards
                  WHERE status IN ('claimed', 'running', 'blocked')
                  ORDER BY id",
             )?;
@@ -710,17 +724,48 @@ impl Store {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            for (card_id, old_status, acceptance_json, blocked_by_json) in affected {
-                let empty_acceptance = acceptance_json.trim() == "[]";
-                let relation_less = blocked_by_json.trim() == "[]";
+            for (
+                card_id,
+                old_status,
+                acceptance_json,
+                criteria_json,
+                blocked_by_json,
+                claim_agent,
+                claim_run_id,
+                claim_acquired_at,
+                claim_expires_at,
+            ) in affected
+            {
+                let oracle = decode_stored_oracle(acceptance_json, criteria_json)?;
+                let has_acceptance = !oracle.acceptance.is_empty();
+                let blocked_by =
+                    from_json::<Vec<String>>("cards.blocked_by_json", blocked_by_json)?;
+                let has_blocked_by = blocked_by.iter().any(|id| !id.trim().is_empty());
+                let has_valid_claim = decode_stored_claim(
+                    claim_agent.clone(),
+                    claim_agent,
+                    claim_run_id,
+                    claim_acquired_at,
+                    claim_expires_at,
+                )?
+                .is_some();
                 let (new_status, detail) = match old_status.as_str() {
-                    "claimed" | "running" => ("in_progress", ""),
-                    "blocked" if empty_acceptance => ("backlog", " (empty acceptance)"),
-                    "blocked" if relation_less => (
+                    "claimed" | "running" if has_valid_claim => ("in_progress", ""),
+                    "claimed" | "running" if has_acceptance => {
+                        ("ready", " (no valid claim; acceptance oracle present)")
+                    }
+                    "claimed" | "running" => ("backlog", " (no valid claim or acceptance oracle)"),
+                    "blocked" if !has_acceptance => ("backlog", " (empty acceptance)"),
+                    "blocked" if !has_blocked_by => (
                         "backlog",
                         " (no blocked_by relations; re-triage before claiming)",
                     ),
@@ -811,8 +856,221 @@ impl Store {
         Ok(())
     }
 
+    /// Repairs the seven claimless production cards that schema v17 moved
+    /// from `claimed`/`running` to `in_progress` before claim decoding was
+    /// unified. Selection is provenance-based rather than id-based: a card
+    /// must still be `in_progress`, carry one of the exact v17 migration
+    /// events that created that status, and decode as claimless under the
+    /// same principal/worker/run decoder used by normal card reads. The
+    /// effective acceptance oracle likewise uses the shared card decoder.
+    ///
+    /// Apart from the corrected status and one explicit repair event, every
+    /// persisted byte is left untouched. The status predicate also makes the
+    /// step safe to retry if the transaction commits before `user_version`
+    /// is advanced: repaired rows no longer match on the second pass.
+    fn migrate_18_to_19(&mut self) -> Result<()> {
+        // A database claiming schema v18 must carry every field the repair
+        // reads. Fail closed on schema drift so the outer migration loop
+        // cannot advance `user_version` while silently skipping the repair.
+        for column in [
+            "status",
+            "acceptance_json",
+            "criteria_json",
+            "claim_principal",
+            "claim_agent",
+            "claim_run_id",
+            "claim_acquired_at",
+            "claim_expires_at",
+        ] {
+            if !self.cards_has_column(column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing cards.{column}"),
+                });
+            }
+        }
+        for column in [
+            "id",
+            "card_id",
+            "event_type",
+            "actor",
+            "payload",
+            "created_at",
+        ] {
+            if !self.table_has_column("card_events", column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing card_events.{column}"),
+                });
+            }
+        }
+        for column in [
+            "id",
+            "card_id",
+            "state",
+            "principal",
+            "agent",
+            "claim_expires_at",
+            "proof",
+            "created_at",
+            "updated_at",
+        ] {
+            if !self.table_has_column("runs", column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing runs.{column}"),
+                });
+            }
+        }
+        for column in [
+            "id",
+            "principal",
+            "name",
+            "key_prefix",
+            "key_hash",
+            "hash_algorithm",
+            "scope",
+            "created_at",
+            "revoked_at",
+            "last_used_at",
+        ] {
+            if !self.table_has_column("api_keys", column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing api_keys.{column}"),
+                });
+            }
+        }
+        if self.table_exists("actors")? {
+            return Err(StoreError::InvalidStoredValue {
+                field: "schema v18",
+                value: "legacy actors table still present".to_string(),
+            });
+        }
+
+        let now = unix_now();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT c.id, c.acceptance_json, c.criteria_json,
+                        c.claim_principal, c.claim_agent, c.claim_run_id,
+                        c.claim_acquired_at, c.claim_expires_at
+                 FROM cards c
+                 WHERE c.status = 'in_progress'
+                   AND EXISTS (
+                     SELECT 1
+                     FROM card_events e
+                     WHERE e.card_id = c.id
+                       AND e.event_type = 'status'
+                       AND e.actor = 'system:status-vocabulary-migration'
+                       AND e.payload IN (
+                         'status-vocabulary migration: claimed -> in_progress',
+                         'status-vocabulary migration: running -> in_progress'
+                       )
+                       AND e.created_at = (
+                         SELECT MAX(latest.created_at)
+                         FROM card_events latest
+                         WHERE latest.card_id = c.id
+                           AND latest.event_type = 'status'
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM card_events ambiguous
+                         WHERE ambiguous.card_id = c.id
+                           AND ambiguous.event_type = 'status'
+                           AND ambiguous.created_at >= e.created_at
+                           AND ambiguous.id <> e.id
+                           AND (
+                             ambiguous.actor <> e.actor
+                             OR ambiguous.payload <> e.payload
+                           )
+                       )
+                   )
+                 ORDER BY c.id",
+            )?;
+            let candidates = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+
+            for (
+                card_id,
+                acceptance_json,
+                criteria_json,
+                claim_principal,
+                claim_agent,
+                claim_run_id,
+                claim_acquired_at,
+                claim_expires_at,
+            ) in candidates
+            {
+                if decode_stored_claim(
+                    claim_principal,
+                    claim_agent,
+                    claim_run_id,
+                    claim_acquired_at,
+                    claim_expires_at,
+                )?
+                .is_some()
+                {
+                    continue;
+                }
+
+                let oracle = decode_stored_oracle(acceptance_json, criteria_json)?;
+                let new_status = if oracle.acceptance.is_empty() {
+                    "backlog"
+                } else {
+                    "ready"
+                };
+                transaction.execute(
+                    "UPDATE cards
+                     SET status = ?1
+                     WHERE id = ?2 AND status = 'in_progress'",
+                    params![new_status, card_id],
+                )?;
+                append_card_event(
+                    &transaction,
+                    &CardId::new(card_id)?,
+                    "status",
+                    "system:status-v17-repair",
+                    &format!(
+                        "status-v17 repair: in_progress -> {new_status} \
+                         (claimless v17 migration)"
+                    ),
+                    now,
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn cards_has_column(&self, column: &str) -> Result<bool> {
         self.table_has_column("cards", column)
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = ?1
+             )",
+            [table],
+            |row| row.get(0),
+        )?)
     }
 
     /// `table` is always an internal, hardcoded literal from a call site in
@@ -2709,6 +2967,68 @@ fn from_json<T: DeserializeOwned>(field: &'static str, raw: String) -> Result<T>
     })
 }
 
+/// The effective acceptance oracle encoded by the two legacy card columns.
+/// Structured criteria are authoritative when at least one non-blank item is
+/// present; otherwise the cleaned string list remains the source of truth.
+/// Both migration classification and ordinary card materialization use this
+/// decoder so a card cannot be migrated according to an oracle `get_card`
+/// would then replace with different data.
+struct StoredOracle {
+    acceptance: Vec<String>,
+    criteria: Vec<AcceptanceCriterion>,
+}
+
+fn decode_stored_oracle(acceptance_json: String, criteria_json: String) -> Result<StoredOracle> {
+    let fallback_acceptance = clean_string_list(from_json::<Vec<String>>(
+        "cards.acceptance_json",
+        acceptance_json,
+    )?);
+    let criteria = from_json::<Vec<AcceptanceCriterion>>("cards.criteria_json", criteria_json)?
+        .into_iter()
+        .filter(|criterion| !criterion.text.trim().is_empty())
+        .collect::<Vec<_>>();
+    let acceptance = if criteria.is_empty() {
+        fallback_acceptance
+    } else {
+        criteria
+            .iter()
+            .map(|criterion| criterion.text.clone())
+            .collect()
+    };
+    Ok(StoredOracle {
+        acceptance,
+        criteria,
+    })
+}
+
+/// Decodes the persisted principal/worker/run claim tuple. Partial tuples and
+/// complete tuples with a blank identity are claimless; this leaves their raw
+/// database bytes available for diagnosis while ensuring every reader agrees
+/// with migrations about whether active work exists.
+fn decode_stored_claim(
+    principal: Option<String>,
+    agent: Option<String>,
+    run_id: Option<String>,
+    acquired_at: Option<i64>,
+    expires_at: Option<i64>,
+) -> Result<Option<Claim>> {
+    let (Some(principal), Some(agent), Some(run_id), Some(acquired_at), Some(expires_at)) =
+        (principal, agent, run_id, acquired_at, expires_at)
+    else {
+        return Ok(None);
+    };
+    if principal.trim().is_empty() || agent.trim().is_empty() || run_id.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Claim {
+        principal,
+        agent,
+        run_id: RunId::new(run_id)?,
+        acquired_at,
+        expires_at,
+    }))
+}
+
 fn non_empty(field: &'static str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2838,11 +3158,16 @@ impl CardRecord {
     }
 
     fn into_card(self) -> Result<Card> {
+        let oracle = decode_stored_oracle(self.acceptance_json, self.criteria_json)?;
+        let claim = decode_stored_claim(
+            self.claim_principal,
+            self.claim_agent,
+            self.claim_run_id,
+            self.claim_acquired_at,
+            self.claim_expires_at,
+        )?;
         let mut card = Card::new(CardId::new(self.id)?, self.title, self.body)?
-            .with_acceptance(from_json::<Vec<String>>(
-                "cards.acceptance_json",
-                self.acceptance_json,
-            )?)
+            .with_acceptance(oracle.acceptance)
             .with_status(
                 CardStatus::parse(&self.status).ok_or(StoreError::InvalidStoredValue {
                     field: "cards.status",
@@ -2866,10 +3191,8 @@ impl CardRecord {
                     .transpose()?,
             )
             .with_created_at(self.created_at);
-        let criteria =
-            from_json::<Vec<AcceptanceCriterion>>("cards.criteria_json", self.criteria_json)?;
-        if !criteria.is_empty() {
-            card = card.with_criteria(criteria);
+        if !oracle.criteria.is_empty() {
+            card = card.with_criteria(oracle.criteria);
         }
         card = card.with_proof_plan(from_json::<Vec<String>>(
             "cards.proof_plan_json",
@@ -2886,24 +3209,7 @@ impl CardRecord {
             (Some(path), Some(digest)) => Some(CardSource { path, digest }),
             _ => None,
         };
-        card.claim = match (
-            self.claim_principal,
-            self.claim_agent,
-            self.claim_run_id,
-            self.claim_acquired_at,
-            self.claim_expires_at,
-        ) {
-            (Some(principal), Some(agent), Some(run_id), Some(acquired_at), Some(expires_at)) => {
-                Some(Claim {
-                    principal,
-                    agent,
-                    run_id: RunId::new(run_id)?,
-                    acquired_at,
-                    expires_at,
-                })
-            }
-            _ => None,
-        };
+        card.claim = claim;
         card.updated_at = self.updated_at;
         Ok(card)
     }
