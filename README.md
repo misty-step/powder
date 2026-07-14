@@ -12,6 +12,18 @@ format, which is what makes the lease possible.
 
 ![Powder board overview](site/assets/screenshots/01-overview.png)
 
+**The lease in action** — a real, captured run of the failure mode above: an
+agent claims a card with a 2-second lease, crashes without ever heartbeating,
+and a second actor reclaims the *same* card automatically once the lease
+expires, with the full claim / claim-expired / claim / completed audit trail
+to prove it. Nothing here is staged copy —
+[`scripts/lease-race-demo.sh`](scripts/lease-race-demo.sh) runs this exact
+race deterministically against an ephemeral local `powder-server` on every
+CI run, and the stdout below is checked in verbatim at
+[`docs/lease-race-transcript.txt`](docs/lease-race-transcript.txt).
+
+![Lease-race demo: an agent's claim expires after it crashes, and a second actor reclaims and completes the card](site/assets/lease-race-demo.svg)
+
 ## Quickstart
 
 Run a server, mint the first-run bootstrap key, create a card, and claim it.
@@ -73,7 +85,10 @@ silently drift from what's in this README.
   crashed or hung agent's work returns to the pool automatically when the
   lease lapses — no human has to notice and manually unstick it. Git-native
   trackers have no live process to expire a lease against, so a dead agent's
-  claim is permanent until someone edits a file by hand.
+  claim is permanent until someone edits a file by hand. See the lease-race
+  demo captured above (and
+  [`scripts/lease-race-demo.sh`](scripts/lease-race-demo.sh)) for this exact
+  recovery, from a real run, not a mockup.
 - **One pool, any actor.** Cron jobs, a `curl` one-liner, a phone browser, and
   a long-running orchestrator all claim, heartbeat, and complete cards through
   the same API — no actor is a first-class citizen and no actor is left
@@ -91,9 +106,11 @@ silently drift from what's in this README.
 
 - [Marketing site](https://misty-step.github.io/powder/) — screenshots and a
   feature tour.
-- [Self-hosting and operations](docs/operations.md) — deployment shape,
-  auth modes, key rotation, remote-mode CLI/MCP transport, and production
-  runbook lore.
+- [Self-hosting](docs/self-hosting.md) — the copy-pasteable deploy guide:
+  Docker/binary/systemd/Fly, the full env-var reference, webhooks, and
+  backup/restore.
+- [Operations](docs/operations.md) — auth modes, key rotation, remote-mode
+  CLI/MCP transport, and production runbook lore.
 - [MCP contract](SKILL.md) — the shipped agent-facing usage contract.
 - [`VISION.md`](VISION.md) — product direction and scope.
 - [`AGENTS.md`](AGENTS.md) — repo contract: architecture boundaries, gates,
@@ -104,7 +121,10 @@ silently drift from what's in this README.
 The repo ships the application. A deployment owns the data.
 
 - `powder-core`: pure domain vocabulary and scheduling rules.
-- `powder-shell`: effect ports for storage, time, and ids.
+- `powder-shell`: filesystem-facing import/parsing helpers (legacy Markdown
+  migration, repo id-namespacing, the GitHub issue adapter) and the shared
+  adapter error type -- not an effect-trait/port layer; `powder-store::Store`
+  is called concretely by every face.
 - `powder-store`: SQLite persistence, migrations, API keys, and transactional
   card lifecycle operations.
 - `powder-api`: HTTP/API contract surface.

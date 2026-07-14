@@ -25,8 +25,7 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
-    ReadyQuery, RunId,
+    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, Priority, ReadyQuery, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -290,7 +289,6 @@ struct ReadyParams {
 #[serde(deny_unknown_fields)]
 struct ListCardsParams {
     status: Option<String>,
-    autonomy: Option<String>,
     repo: Option<String>,
     estimate: Option<String>,
     limit: Option<usize>,
@@ -329,7 +327,6 @@ struct CreateCardRequest {
     acceptance: Vec<String>,
     proof_plan: Option<Vec<String>>,
     status: Option<String>,
-    autonomy: Option<String>,
     priority: Option<String>,
     estimate: Option<String>,
     labels: Option<Vec<String>>,
@@ -348,7 +345,6 @@ struct PatchCardRequest {
     acceptance: Option<Vec<String>>,
     proof_plan: Option<Vec<String>>,
     status: Option<String>,
-    autonomy: Option<String>,
     priority: Option<String>,
     estimate: Option<String>,
     labels: Option<Vec<String>>,
@@ -370,7 +366,6 @@ impl PatchCardRequest {
                 Priority::parse(raw).ok_or_else(|| ApiError::bad_request("invalid priority"))
             })
             .transpose()?;
-        let autonomy = self.autonomy.as_deref().map(parse_autonomy).transpose()?;
         let estimate = self.estimate.as_deref().map(parse_estimate).transpose()?;
 
         Ok(CardPatch {
@@ -379,7 +374,6 @@ impl PatchCardRequest {
             acceptance: self.acceptance,
             proof_plan: self.proof_plan,
             status,
-            autonomy,
             priority,
             estimate,
             labels: self.labels,
@@ -769,12 +763,10 @@ async fn list_cards(
                 .ok_or_else(|| ApiError::bad_request(format!("invalid status: {raw}")))
         })
         .transpose()?;
-    let autonomy = params.autonomy.as_deref().map(parse_autonomy).transpose()?;
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
     let limit = params.limit.unwrap_or(20).max(1);
     let filter = CardFilter {
         status,
-        autonomy,
         estimate,
         repo: params.repo,
         include_terminal: params.include_terminal.unwrap_or(true),
@@ -963,12 +955,6 @@ async fn create_card(
         .as_deref()
         .and_then(Priority::parse)
         .unwrap_or_default();
-    let autonomy = request
-        .autonomy
-        .as_deref()
-        .map(parse_autonomy)
-        .transpose()?
-        .unwrap_or_default();
     let estimate = request
         .estimate
         .as_deref()
@@ -981,7 +967,6 @@ async fn create_card(
         request.body.unwrap_or_default(),
     )?
     .with_status(status)
-    .with_autonomy(autonomy)
     .with_priority(priority)
     .with_estimate(estimate)
     .with_acceptance(request.acceptance)
@@ -1462,6 +1447,11 @@ struct AuthorizedActor {
     display_name: String,
     enforces_identity: bool,
     is_admin: bool,
+    /// The presented API key's non-secret lookup prefix, when auth mode is
+    /// `ApiKey` -- `None` for tailnet-header or disabled auth, which never
+    /// see a key. Threaded through so a 403 can name which key came up
+    /// short instead of a bare "admin scope required" (powder-918).
+    key_prefix: Option<String>,
 }
 
 impl AuthorizedActor {
@@ -1482,6 +1472,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             display_name: "anonymous".to_string(),
             enforces_identity: false,
             is_admin: false,
+            key_prefix: None,
         }),
         AuthMode::TailscaleHeader => {
             if let Some(expected) = state.config.tailnet_proxy_secret.as_deref() {
@@ -1500,6 +1491,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                     display_name: identity.to_string(),
                     enforces_identity: true,
                     is_admin: state.config.tailnet_admin,
+                    key_prefix: None,
                 })
             } else {
                 Err(ApiError::unauthorized(
@@ -1519,11 +1511,16 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                     display_name: key.actor.display_name,
                     enforces_identity: true,
                     is_admin: key.scope == ApiKeyScope::Admin,
+                    key_prefix: Some(key.key_prefix),
                 })
             } else {
-                Err(ApiError::forbidden(
-                    "api key scope cannot access agent routes",
-                ))
+                Err(ApiError::forbidden(format!(
+                    "{} (key {}, prefix {}) has scope {} which cannot access agent routes",
+                    key.actor.display_name,
+                    key.name,
+                    key.key_prefix,
+                    key.scope.as_str()
+                )))
             }
         }
     }
@@ -1551,7 +1548,17 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActo
     if !actor.enforces_identity || actor.is_admin {
         Ok(actor)
     } else {
-        Err(ApiError::forbidden("admin scope required"))
+        // Name the presented key (or tailnet identity) and the scope it was
+        // missing rather than a bare "admin scope required" -- an operator
+        // staring at a 403 needs to know *which* credential came up short
+        // without grepping logs (powder-918).
+        let presented = match actor.key_prefix.as_deref() {
+            Some(prefix) => format!("{} (key prefix {prefix})", actor.display_name),
+            None => actor.display_name.clone(),
+        };
+        Err(ApiError::forbidden(format!(
+            "{presented} requires admin scope"
+        )))
     }
 }
 
@@ -1602,20 +1609,6 @@ fn card_ids(raw: Option<Vec<String>>) -> Result<Vec<CardId>, ApiError> {
         .map(CardId::new)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(ApiError::from)
-}
-
-fn parse_autonomy(raw: &str) -> Result<AutonomyClass, ApiError> {
-    AutonomyClass::parse(raw).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "invalid autonomy {raw:?}; valid: {}",
-            AutonomyClass::ALL
-                .iter()
-                .copied()
-                .map(AutonomyClass::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
 }
 
 fn parse_estimate(raw: &str) -> Result<Estimate, ApiError> {

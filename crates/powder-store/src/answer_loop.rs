@@ -175,7 +175,6 @@ impl Store {
                 Ok(ApprovalQueueRow {
                     card_id: card.id,
                     title: card.title,
-                    autonomy: card.autonomy,
                     run_id: run.id,
                     question: question.map(|question| question.payload),
                     packet_links,

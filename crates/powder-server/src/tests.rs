@@ -429,7 +429,7 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
             Method::PATCH,
             "/api/v1/cards/patchable",
             Some(&raw_key),
-            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","autonomy":"auto","labels":["api","safe-update"]}"#,
+            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","labels":["api","safe-update"]}"#,
         ))
         .await
         .unwrap();
@@ -441,7 +441,6 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
     assert_eq!(patched_many["criteria"][0]["text"], "new proof");
     assert_eq!(patched_many["priority"], "p0");
     assert_eq!(patched_many["status"], "blocked");
-    assert_eq!(patched_many["autonomy"], "auto");
     assert_eq!(patched_many["labels"], json!(["api", "safe-update"]));
     assert_eq!(patched_many["created_at"], before["card"]["created_at"]);
     assert_eq!(patched_many["source"], before["card"]["source"]);
@@ -696,13 +695,11 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
             Method::POST,
             "/api/v1/cards",
             Some(&raw_key),
-            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked","autonomy":"auto"}"#,
+            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(blocked.status(), StatusCode::OK);
-    let blocked = response_json(blocked).await;
-    assert_eq!(blocked["autonomy"], "auto");
 
     let created = app
         .clone()
@@ -774,21 +771,6 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         vec!["blocked-1".to_string()]
     );
 
-    let auto_only = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?autonomy=auto",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        ids_from(&response_json(auto_only).await),
-        vec!["blocked-1".to_string()]
-    );
-
     let other_repo = app
         .clone()
         .oneshot(json_request(
@@ -850,18 +832,6 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
-
-    let invalid_autonomy = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?autonomy=robot",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(invalid_autonomy.status(), StatusCode::BAD_REQUEST);
 
     let unknown_query = app
         .oneshot(json_request(
@@ -1013,7 +983,6 @@ async fn list_and_ready_routes_carry_full_criteria_text_not_a_clipped_preview() 
                 "title": "Long criterion",
                 "acceptance": [long_criterion],
                 "status": "ready",
-                "autonomy": "auto",
             })
             .to_string(),
         ))
@@ -2077,8 +2046,12 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(script.contains("function renderRepositorySettings("));
     assert!(script.contains("function canonicalRepoLabel("));
     assert!(script.contains("function relationBadges("));
-    assert!(script.contains("function animateRailShare("));
-    assert!(script.contains("cancelAnimationFrame(viewAnimation);"));
+    // powder-903: the board <-> backlog <-> both view switch is a plain CSS
+    // transition (see powder-board.css) driven by one instant style write,
+    // not a per-frame JS animation loop.
+    assert!(script.contains("function setRailShare("));
+    assert!(script.contains("function setView("));
+    assert!(!script.contains("function animateRailShare("));
     assert!(script.contains("write key needed"));
     assert!(!script.contains("read-only"));
 
@@ -3355,6 +3328,9 @@ async fn agent_scoped_key_can_patch_card_fields_and_the_patch_is_audited() {
     }));
 }
 
+/// powder-918: a bare "admin scope required" 403 forces an operator to grep
+/// logs to learn which key came up short. The body must name the presented
+/// key's prefix, the actor, and the scope that was required.
 #[tokio::test]
 async fn agent_scoped_key_cannot_list_or_revoke_keys() {
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
@@ -3365,6 +3341,7 @@ async fn agent_scoped_key_cannot_list_or_revoke_keys() {
         .create_api_key("codex", ApiKeyScope::Agent, 1)
         .unwrap()
         .raw_key;
+    let key_prefix: String = agent_key.chars().take(12).collect();
     let app = app(state);
 
     let listed = app
@@ -3380,6 +3357,24 @@ async fn agent_scoped_key_cannot_list_or_revoke_keys() {
         .await
         .unwrap();
     assert_eq!(listed.status(), StatusCode::FORBIDDEN);
+    let listed = response_json(listed).await;
+    let listed_error = listed["error"].as_str().unwrap();
+    assert!(
+        listed_error.contains("codex"),
+        "403 must name the authenticated actor: {listed_error}"
+    );
+    assert!(
+        listed_error.contains(&key_prefix),
+        "403 must name the presented key's prefix: {listed_error}"
+    );
+    assert!(
+        listed_error.contains("admin scope"),
+        "403 must name the required scope: {listed_error}"
+    );
+    assert!(
+        !listed_error.contains(&agent_key),
+        "403 must never leak the full raw key, only its prefix: {listed_error}"
+    );
 
     let revoked = app
         .oneshot(json_request(
@@ -3391,6 +3386,40 @@ async fn agent_scoped_key_cannot_list_or_revoke_keys() {
         .await
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+    let revoked = response_json(revoked).await;
+    let revoked_error = revoked["error"].as_str().unwrap();
+    assert!(revoked_error.contains("codex"));
+    assert!(revoked_error.contains(&key_prefix));
+    assert!(revoked_error.contains("admin scope"));
+}
+
+/// A tailnet-header identity has no API key to name, only a display name --
+/// the 403 must still degrade gracefully instead of printing a stray "(key
+/// prefix )" for a credential that never existed.
+#[tokio::test]
+async fn tailnet_identity_without_admin_gets_a_403_naming_the_identity_not_a_key() {
+    let state = test_state_with_tailnet_backstop(None, false);
+    let app = app(state);
+    let denied = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/keys")
+                .header("Tailscale-User-Login", "operator@example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied = response_json(denied).await;
+    let error = denied["error"].as_str().unwrap();
+    assert!(error.contains("operator@example.com"));
+    assert!(error.contains("admin scope"));
+    assert!(
+        !error.contains("prefix"),
+        "no API key was presented, so the message must not claim one had a prefix: {error}"
+    );
 }
 
 #[tokio::test]

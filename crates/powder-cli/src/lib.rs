@@ -2,8 +2,7 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
-    ReadyQuery, RunId,
+    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, Priority, ReadyQuery, RunId,
 };
 use powder_shell::{load_github_issues_file, unix_now, ShellError};
 use powder_store::{
@@ -174,7 +173,18 @@ pub fn help() -> String {
         "  powder version   # confirm the installed binary's build against `git rev-parse --short=12 HEAD` before starting a lane\n",
     );
     help.push_str("  powder init-db --db ./data/powder.db --show-secret\n");
-    help.push_str("  powder key-create --db ./data/powder.db --name codex --scope agent\n");
+    help.push_str(
+        "  powder key-create --db ./data/powder.db --name codex --scope agent --show-secret  \
+         (prints the raw secret once — store it immediately, it cannot be recovered)\n",
+    );
+    help.push_str(
+        "  powder key-create --db ./data/powder.db --name codex --scope agent --redacted  \
+         (mints the key but discards the secret; only use this if you don't need the raw value)\n",
+    );
+    help.push_str(
+        "  key-create requires exactly one of --show-secret or --redacted; it refuses to mint \
+         without an explicit choice\n",
+    );
     help.push_str("  powder key-list --db ./data/powder.db\n");
     help.push_str("  powder key-revoke key-id --db ./data/powder.db\n");
     help.push_str(
@@ -190,7 +200,6 @@ pub fn help() -> String {
     help.push_str(
         "  powder create-card ... --acceptance \"first criterion\" --acceptance \"second criterion\"  (repeatable; every occurrence is one criterion, in order)\n",
     );
-    help.push_str("  powder update-card canary-001 --db ./data/powder.db --autonomy auto\n");
     help.push_str(
         "  powder update-card canary-001 --db ./data/powder.db --acceptance \"a\" --acceptance \"b\"  (repeatable; replaces the full criteria list)\n",
     );
@@ -283,6 +292,32 @@ fn init_db(args: &[String]) -> Result<String, ShellError> {
 
 fn key_create(args: &[String]) -> Result<String, ShellError> {
     let show_secret = has_flag(args, "--show-secret");
+    let redacted = has_flag(args, "--redacted");
+
+    // The raw secret exists only in the instant `create_api_key` returns; the
+    // store persists nothing but a sha256 hash, so a key minted without
+    // capturing that value is gone forever (the dogfood incident: minting
+    // without --show-secret printed "redacted" and the secret was
+    // unrecoverable). Require the caller to make an explicit choice before
+    // we mint, rather than defaulting to either a silent discard or an
+    // unsolicited secret print.
+    match (show_secret, redacted) {
+        (true, true) => {
+            return Err(ShellError::Invalid(
+                "key-create: pass exactly one of --show-secret or --redacted, not both".to_string(),
+            ))
+        }
+        (false, false) => {
+            return Err(ShellError::Invalid(
+                "key-create: refusing to mint a key without an explicit secret-handling choice; \
+                 pass --show-secret to print the raw key once (store it immediately, it cannot \
+                 be recovered) or --redacted to acknowledge the secret will be discarded"
+                    .to_string(),
+            ))
+        }
+        _ => {}
+    }
+
     let name = flag_value(args, "--name").unwrap_or("agent");
     let scope = flag_value(args, "--scope")
         .and_then(ApiKeyScope::parse)
@@ -292,6 +327,13 @@ fn key_create(args: &[String]) -> Result<String, ShellError> {
     let key = store.create_api_key(name, scope, now).map_err(store_err)?;
 
     if show_secret {
+        // The warning is for the human; stdout stays machine-readable so
+        // `... | cut -f4` captures exactly the secret (the lease-race demo
+        // broke when this warning shared stdout with the key line).
+        eprintln!(
+            "WARNING: this is the only time this secret is shown. Store it now \
+             (consumer secret store: keychain, 1Password, etc.) — it cannot be recovered."
+        );
         Ok(format!(
             "api-key\t{}\t{}\t{}\n",
             key.id,
@@ -416,10 +458,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let priority = flag_value(args, "--priority")
         .and_then(Priority::parse)
         .unwrap_or_default();
-    let autonomy = flag_value(args, "--autonomy")
-        .map(parse_autonomy_flag)
-        .transpose()?
-        .unwrap_or_default();
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
@@ -441,7 +479,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         )
         .map_err(ShellError::from)?
         .with_status(status)
-        .with_autonomy(autonomy)
         .with_priority(priority)
         .with_estimate(estimate)
         .with_acceptance(acceptance)
@@ -461,7 +498,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             "title": title,
             "acceptance": acceptance,
             "status": status.as_str(),
-            "autonomy": autonomy.as_str(),
             "priority": priority.as_str(),
             "related": card_id_values(&related),
             "blocks": card_id_values(&blocks),
@@ -488,11 +524,10 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
 
     Ok(format!(
-        "created\t{}\t{}\t{}\t{}\n",
+        "created\t{}\t{}\t{}\n",
         json_string(&card, "id")?,
         json_priority(&card)?,
-        json_string(&card, "status")?,
-        json_string(&card, "autonomy")?
+        json_string(&card, "status")?
     ))
 }
 
@@ -512,9 +547,6 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
                 CardStatus::parse(raw)
                     .ok_or_else(|| ShellError::Invalid(format!("invalid --status: {raw}")))
             })
-            .transpose()?,
-        autonomy: flag_value(args, "--autonomy")
-            .map(parse_autonomy_flag)
             .transpose()?,
         priority: flag_value(args, "--priority")
             .map(|raw| {
@@ -549,9 +581,6 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         if let Some(status) = patch.status {
             payload["status"] = json!(status.as_str());
         }
-        if let Some(autonomy) = patch.autonomy {
-            payload["autonomy"] = json!(autonomy.as_str());
-        }
         if let Some(priority) = patch.priority {
             payload["priority"] = json!(priority.as_str());
         }
@@ -569,11 +598,10 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
 
     Ok(format!(
-        "updated\t{}\t{}\t{}\t{}\n",
+        "updated\t{}\t{}\t{}\n",
         json_string(&card, "id")?,
         json_priority(&card)?,
-        json_string(&card, "status")?,
-        json_string(&card, "autonomy")?
+        json_string(&card, "status")?
     ))
 }
 
@@ -662,7 +690,7 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     Ok(out)
 }
 
-/// Enumerate cards by status/autonomy/repo, not just ready-eligible ones -- `blocked`
+/// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`
 /// and `done` cards are otherwise invisible without opening the
 /// database file directly.
 fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -673,9 +701,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
                 .ok_or_else(|| ShellError::Invalid(format!("invalid status: {raw}")))
         })
         .transpose()?;
-    let autonomy = flag_value(args, "--autonomy")
-        .map(parse_autonomy_flag)
-        .transpose()?;
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
@@ -684,7 +709,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         let store = open_store(db)?;
         let filter = CardFilter {
             status,
-            autonomy,
             estimate,
             repo: repo.clone(),
             // powder-mcp-unfiltered-enumeration: only the MCP `list_cards`
@@ -697,9 +721,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         let mut query = format!("limit={limit}");
         if let Some(status) = status {
             query.push_str(&format!("&status={}", status.as_str()));
-        }
-        if let Some(autonomy) = autonomy {
-            query.push_str(&format!("&autonomy={}", autonomy.as_str()));
         }
         if let Some(estimate) = estimate {
             query.push_str(&format!("&estimate={}", estimate.as_str()));
@@ -718,11 +739,10 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let mut out = String::new();
     for card in json_array(&cards)? {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\n",
             json_string(card, "id")?,
             json_priority(card)?,
             json_string(card, "status")?,
-            json_string(card, "autonomy")?,
             json_string(card, "title")?
         ));
     }
@@ -1432,20 +1452,6 @@ fn parse_estimate_flag(raw: &str) -> Result<Estimate, ShellError> {
     })
 }
 
-fn parse_autonomy_flag(raw: &str) -> Result<AutonomyClass, ShellError> {
-    AutonomyClass::parse(raw).ok_or_else(|| {
-        ShellError::Invalid(format!(
-            "invalid --autonomy {raw:?}; valid: {}",
-            AutonomyClass::ALL
-                .iter()
-                .copied()
-                .map(AutonomyClass::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
-}
-
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -1611,7 +1617,12 @@ fn positional(args: &[String]) -> Vec<&str> {
 fn flag_takes_value(flag: &str) -> bool {
     !matches!(
         flag,
-        "--dry-run" | "--show-secret" | "--admin" | "--include-hidden" | "--unchecked"
+        "--dry-run"
+            | "--show-secret"
+            | "--redacted"
+            | "--admin"
+            | "--include-hidden"
+            | "--unchecked"
     )
 }
 
@@ -2095,8 +2106,6 @@ mod tests {
             "Blocked ticket",
             "--status",
             "blocked",
-            "--autonomy",
-            "auto",
         ]))
         .unwrap();
         run(&args([
@@ -2121,23 +2130,6 @@ mod tests {
         let blocked_only = run(&args(["list-cards", "--db", &db, "--status", "blocked"])).unwrap();
         assert!(blocked_only.contains("blocked-1"));
         assert!(!blocked_only.contains("ready-1"));
-
-        let auto_only = run(&args(["list-cards", "--db", &db, "--autonomy", "auto"])).unwrap();
-        assert!(auto_only.contains("blocked-1"));
-        assert!(auto_only.contains("\tauto\t"));
-        assert!(!auto_only.contains("ready-1"));
-
-        run(&args([
-            "update-card",
-            "blocked-1",
-            "--db",
-            &db,
-            "--autonomy",
-            "review",
-        ]))
-        .unwrap();
-        let auto_empty = run(&args(["list-cards", "--db", &db, "--autonomy", "auto"])).unwrap();
-        assert_eq!(auto_empty, "no-cards\n");
 
         let err = run(&args([
             "list-cards",
@@ -2604,6 +2596,94 @@ mod tests {
 
         let missing = run(&args(["key-revoke", "key-does-not-exist", "--db", &db])).unwrap_err();
         assert!(matches!(missing, ShellError::NotFound(_)));
+    }
+
+    /// powder-918: minting a key without saying what to do with the secret
+    /// used to silently print "redacted" and throw the only copy away
+    /// forever (the store never persists the raw value). `key-create` must
+    /// refuse rather than guess, and the refusal must name both flags so an
+    /// agent hitting this cold learns what to pass without reading source.
+    #[test]
+    fn cli_key_create_refuses_without_an_explicit_secret_choice() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-key-create-refusal-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+
+        let err = run(&args(["key-create", "--db", &db, "--name", "codex"])).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("--show-secret") && message.contains("--redacted"),
+            "refusal must name both flags: {message}"
+        );
+
+        let err_both = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex",
+            "--show-secret",
+            "--redacted",
+        ]))
+        .unwrap_err();
+        assert!(
+            err_both.to_string().contains("--show-secret")
+                && err_both.to_string().contains("--redacted"),
+            "conflicting flags must also be refused: {err_both}"
+        );
+
+        // no "codex" key was minted by either refused call (init-db already
+        // seeds an unrelated bootstrap key, so the list is not itself empty).
+        let listed = run(&args(["key-list", "--db", &db])).unwrap();
+        assert!(
+            !listed.contains("codex"),
+            "a refused key-create must not persist a key: {listed}"
+        );
+
+        let redacted = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex",
+            "--redacted",
+        ]))
+        .unwrap();
+        assert!(redacted.contains("redacted"));
+        assert!(
+            !redacted.to_lowercase().contains("sk_"),
+            "redacted output must never carry the raw secret: {redacted}"
+        );
+
+        let shown = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex2",
+            "--show-secret",
+        ]))
+        .unwrap();
+        // The store-it-now warning moved to stderr so stdout stays
+        // machine-readable (`cut -f4` captures exactly the secret); stdout
+        // must be the single tab-separated key line and nothing else.
+        assert!(
+            !shown.contains("WARNING"),
+            "warning must not pollute machine-readable stdout: {shown}"
+        );
+        assert_eq!(
+            shown.lines().count(),
+            1,
+            "stdout must be exactly one tab-separated line: {shown}"
+        );
+        assert!(shown.starts_with("api-key\t"));
+        assert_eq!(shown.trim_end().split('\t').count(), 4);
     }
 
     #[test]
@@ -3102,7 +3182,6 @@ mod tests {
         let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
         assert!(approvals.contains("\"approvals\""));
         assert!(approvals.contains("\"card_id\": \"answer-test\""));
-        assert!(approvals.contains("\"autonomy\": \"review\""));
         assert!(approvals.contains("https://example.test/packet"));
 
         let card = run(&args(["get-card", "answer-test", "--db", &db])).unwrap();
@@ -3145,7 +3224,7 @@ mod tests {
             (
                 200,
                 json!({
-                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "autonomy": "review", "title": "Blocked"}],
+                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "title": "Blocked"}],
                     "total_count": 1,
                     "has_more": false
                 }),
@@ -3156,7 +3235,7 @@ mod tests {
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "ready", "autonomy": "review", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "ready", "title": "Remote created"}),
             ),
             (
                 200,
@@ -3164,11 +3243,11 @@ mod tests {
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
             ),
             (
                 200,
@@ -3193,7 +3272,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(cards, "blocked-1\tP2\tblocked\treview\tBlocked\n");
+        assert_eq!(cards, "blocked-1\tP2\tblocked\tBlocked\n");
 
         let detail = run_with_env(&args(["get-card", "remote-1"]), &env).unwrap();
         assert!(detail.contains("\"id\": \"remote-1\""));
@@ -3223,7 +3302,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(created, "created\tremote-created\tP1\tready\treview\n");
+        assert_eq!(created, "created\tremote-created\tP1\tready\n");
 
         let claimed = run_with_env(
             &args(["claim", "remote-created", "--agent", "codex", "--ttl", "60"]),
@@ -3297,7 +3376,6 @@ mod tests {
                 "acceptance": ["proof exists"],
                 "proof_plan": ["PR plus smoke"],
                 "status": "ready",
-                "autonomy": "review",
                 "priority": "P1",
                 "related": ["remote-1"],
                 "blocks": [],
@@ -3576,7 +3654,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(output, "created\tlocal-card\tP2\tready\treview\n");
+        assert_eq!(output, "created\tlocal-card\tP2\tready\n");
 
         assert!(
             recorded.lock().unwrap().is_empty(),

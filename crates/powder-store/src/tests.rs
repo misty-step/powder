@@ -1,6 +1,6 @@
 use powder_core::{
-    AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource, CardStatus,
-    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
+    AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, DetailLevel, DomainError,
+    Estimate, Priority, ReadyQuery, RunId, RunState,
 };
 
 use crate::{
@@ -125,7 +125,6 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
         .with_criteria(criteria)
         .with_created_at(10);
     let card_json = serde_json::to_string(&card)?;
-    assert!(card_json.contains("\"autonomy\":\"review\""));
     assert!(!card_json.contains("\"acceptance\""));
     assert!(card_json.contains("\"criteria\""));
     for key in [
@@ -146,24 +145,12 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
     assert_eq!(restored, card);
     assert_eq!(restored.acceptance, vec!["proof exists".to_string()]);
     assert_eq!(restored.criteria[0].text, "proof exists");
-    assert_eq!(restored.autonomy, AutonomyClass::Review);
 
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let saved = store.upsert_card(card.clone())?;
     assert_eq!(saved, card);
     assert_eq!(store.get_card(&card.id)?.expect("stored card"), card);
-
-    let auto = card.clone().with_autonomy(AutonomyClass::Auto);
-    let saved = store.upsert_card(auto.clone())?;
-    assert_eq!(saved.autonomy, AutonomyClass::Auto);
-    assert_eq!(
-        store
-            .get_card(&auto.id)?
-            .expect("stored auto card")
-            .autonomy,
-        AutonomyClass::Auto
-    );
     Ok(())
 }
 
@@ -198,7 +185,6 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
 
     let mut done = ready_card("done-1", 20);
     done.status = CardStatus::Done;
-    done.autonomy = AutonomyClass::Auto;
     done.repo = Some("misty-step/other".to_string());
     store.import_cards(vec![done])?;
     store.connection.execute(
@@ -218,7 +204,6 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: Some(CardStatus::Blocked),
             repo: None,
-            autonomy: None,
             estimate: None,
             ..CardFilter::default()
         },
@@ -233,7 +218,6 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: None,
             repo: Some("other".to_string()),
-            autonomy: None,
             estimate: None,
             ..CardFilter::default()
         },
@@ -247,7 +231,6 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: None,
             repo: Some("misty-step/other".to_string()),
-            autonomy: None,
             estimate: None,
             ..CardFilter::default()
         },
@@ -262,26 +245,12 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
         &CardFilter {
             status: Some(CardStatus::Done),
             repo: Some("misty-step/other".to_string()),
-            autonomy: None,
             estimate: None,
             ..CardFilter::default()
         },
         20,
     )?;
     assert_eq!(done_in_other.len(), 1);
-
-    let auto_only = store.list_cards(
-        &CardFilter {
-            status: None,
-            repo: None,
-            autonomy: Some(AutonomyClass::Auto),
-            estimate: None,
-            ..CardFilter::default()
-        },
-        20,
-    )?;
-    assert_eq!(auto_only.len(), 1);
-    assert_eq!(auto_only[0].id.as_str(), "done-1");
 
     let repositories = store.list_repositories()?;
     let other_summary = repositories
@@ -377,10 +346,7 @@ fn list_approvals_surfaces_packet_links_and_drains_after_answer() -> Result<()> 
     store.migrate()?;
     let card_id = CardId::new("001")?;
     let unlinked_card_id = CardId::new("002")?;
-    store.import_cards(vec![
-        ready_card("001", 2).with_autonomy(AutonomyClass::Auto),
-        ready_card("002", 2),
-    ])?;
+    store.import_cards(vec![ready_card("001", 2), ready_card("002", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
     store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
@@ -410,7 +376,6 @@ fn list_approvals_surfaces_packet_links_and_drains_after_answer() -> Result<()> 
     assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0].card_id, card_id);
     assert_eq!(approvals[0].run_id, claim.run_id);
-    assert_eq!(approvals[0].autonomy, AutonomyClass::Auto);
     assert_eq!(approvals[0].question.as_deref(), Some("Approve merge?"));
     assert_eq!(approvals[0].packet_links.len(), 1);
     assert_eq!(approvals[0].packet_links[0].label, "approval/packet");
@@ -647,7 +612,6 @@ fn list_cards_repo_filter_surfaces_legacy_repo_null_cards_with_numeric_id_prefix
         &CardFilter {
             status: None,
             repo: Some("misty-step".to_string()),
-            autonomy: None,
             estimate: None,
             ..CardFilter::default()
         },
@@ -954,7 +918,6 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
         &CardFilter {
             status: None,
             repo: Some("misty-step/canary".to_string()),
-            autonomy: None,
             estimate: None,
             ..CardFilter::default()
         },
@@ -1727,6 +1690,128 @@ fn migration_14_to_15_finishes_a_half_applied_branch_name_drop() -> Result<()> {
 
     assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
     assert!(!store.cards_has_column("branch_name")?);
+    Ok(())
+}
+
+/// powder-autonomy-removal: `autonomy` gated nothing -- `claim_readiness`
+/// never consulted it -- so a v15 database's legacy `auto`/`review` values
+/// are discarded outright, not migrated to any replacement field. Two
+/// otherwise-identical cards that only differed by legacy autonomy value
+/// must come out of the migration behaving identically: same shape, same
+/// readiness.
+#[test]
+fn migration_15_to_16_drops_autonomy_from_existing_databases() -> Result<()> {
+    let path = temp_db("v15-autonomy");
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE cards (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL,
+              criteria_json TEXT NOT NULL DEFAULT '[]',
+              proof_plan_json TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL,
+              autonomy TEXT NOT NULL DEFAULT 'review',
+              priority TEXT NOT NULL,
+              estimate TEXT,
+              labels_json TEXT NOT NULL,
+              assignee TEXT,
+              related_json TEXT NOT NULL,
+              blocks_json TEXT NOT NULL,
+              blocked_by_json TEXT NOT NULL,
+              repo TEXT,
+              source_path TEXT,
+              source_digest TEXT,
+              claim_agent TEXT,
+              claim_run_id TEXT,
+              claim_acquired_at INTEGER,
+              claim_expires_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              parent TEXT
+            );
+            CREATE TABLE repositories (
+              name TEXT PRIMARY KEY,
+              visibility TEXT NOT NULL DEFAULT 'visible',
+              tier TEXT NOT NULL DEFAULT 'backburner',
+              import_provenance TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE repository_aliases (
+              alias TEXT PRIMARY KEY,
+              repository_name TEXT NOT NULL REFERENCES repositories(name) ON DELETE CASCADE,
+              created_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 15;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO cards (
+                id, title, body, acceptance_json, status, autonomy, priority, labels_json,
+                related_json, blocks_json, blocked_by_json, created_at, updated_at
+             ) VALUES (
+                'legacy-auto', 'Legacy auto card', 'body text', '[\"prove it\"]', 'ready', 'auto', 'p1', '[]',
+                '[]', '[]', '[]', 10, 10
+             )",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO cards (
+                id, title, body, acceptance_json, status, autonomy, priority, labels_json,
+                related_json, blocks_json, blocked_by_json, created_at, updated_at
+             ) VALUES (
+                'legacy-review', 'Legacy review card', 'body text', '[\"prove it\"]', 'ready', 'review', 'p1', '[]',
+                '[]', '[]', '[]', 11, 11
+             )",
+            [],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    assert!(!store.cards_has_column("autonomy")?);
+
+    let auto_card = store
+        .get_card(&CardId::new("legacy-auto")?)?
+        .expect("legacy auto card survives the migration");
+    let review_card = store
+        .get_card(&CardId::new("legacy-review")?)?
+        .expect("legacy review card survives the migration");
+
+    // No card/run/claim/relation/audit/proof data was lost: both rows
+    // survive with their real fields intact.
+    assert_eq!(auto_card.title, "Legacy auto card");
+    assert_eq!(review_card.title, "Legacy review card");
+    assert_eq!(auto_card.status, CardStatus::Ready);
+    assert_eq!(review_card.status, CardStatus::Ready);
+
+    // Two cards that only ever differed by legacy autonomy value are
+    // indistinguishable in readiness after the migration -- backlog vs.
+    // ready (plus blockers/claims) is the sole actionability distinction.
+    assert_eq!(
+        auto_card.is_ready_at(20, |_| false),
+        review_card.is_ready_at(20, |_| false)
+    );
+    assert!(auto_card.is_ready_at(20, |_| false));
+    assert!(review_card.is_ready_at(20, |_| false));
+
+    let ready_ids = store
+        .list_ready(ReadyQuery {
+            now: 20,
+            limit: 10,
+            estimate: None,
+        })?
+        .into_iter()
+        .map(|card| card.id.to_string())
+        .collect::<Vec<_>>();
+    assert!(ready_ids.contains(&"legacy-auto".to_string()));
+    assert!(ready_ids.contains(&"legacy-review".to_string()));
     Ok(())
 }
 
@@ -3818,7 +3903,6 @@ fn field_note_generator_spawns_exactly_one_draft_for_a_qualifying_completion() -
         &CardFilter {
             status: None,
             repo: Some("content".to_string()),
-            autonomy: None,
             estimate: None,
             ..CardFilter::default()
         },

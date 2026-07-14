@@ -7,10 +7,10 @@ mod repository;
 
 pub use model::{
     AcceptanceCriterion, Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority,
-    AutonomyClass, AwaitingInput, Card, CardDetail, CardEvent, CardEventId, CardId, CardSource,
-    CardStatus, CardSummary, Claim, ClaimSummary, Comment, CriterionProof, DetailLevel,
-    DomainError, EpicEvidence, EpicFreshness, EpicState, Estimate, EvidenceKind, Link, LinkId,
-    Priority, Run, RunDetail, RunId, RunState, WorkLogEntry,
+    AwaitingInput, Card, CardDetail, CardEvent, CardEventId, CardId, CardSource, CardStatus,
+    CardSummary, Claim, ClaimSummary, Comment, CriterionProof, DetailLevel, DomainError,
+    EpicEvidence, EpicFreshness, EpicState, Estimate, EvidenceKind, Link, LinkId, Priority, Run,
+    RunDetail, RunId, RunState, WorkLogEntry,
 };
 pub use queries::{ClaimReceipt, ReadyQuery};
 pub use ready_order::{
