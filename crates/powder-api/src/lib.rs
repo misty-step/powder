@@ -29,7 +29,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
-        intent: "list ready cards for an agent to claim; optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more}",
+        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; a cycle among them falls back to the tie-break order and is named in cycle_card_ids); optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more,cycle_card_ids?}",
         body_shape: None,
     },
     ApiRoute {

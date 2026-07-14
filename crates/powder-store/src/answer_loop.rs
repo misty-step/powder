@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use powder_core::{
     Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
     CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DetailLevel, DomainError,
@@ -7,8 +9,8 @@ use powder_core::{
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    append_activity, load_card, non_empty, non_empty_scrubbed, persist_card, persist_run,
-    schema::RUN_SELECT_SQL, Result, RunRecord, Store, StoreError,
+    append_activity, load_all_cards, load_card, non_empty, non_empty_scrubbed, persist_card,
+    persist_run, schema::RUN_SELECT_SQL, Result, RunRecord, Store, StoreError,
 };
 
 const CONCISE_DETAIL_LIMIT: i64 = 20;
@@ -58,6 +60,8 @@ impl Store {
             || comments.truncated()
             || work_log.truncated()
             || children_total.is_some_and(|total| total > children.len());
+        let (transitive_blocked_by, blocked_by_cycle) =
+            transitive_blocked_by_for(&self.connection, &card)?;
         Ok(Some(CardDetail {
             runs: runs.items,
             runs_total: runs.total,
@@ -74,6 +78,8 @@ impl Store {
             children,
             children_total,
             epic_state,
+            transitive_blocked_by,
+            blocked_by_cycle,
             hint: detail_hint(truncated),
             card,
         }))
@@ -223,6 +229,37 @@ impl Store {
         transaction.commit()?;
         Ok(run)
     }
+}
+
+/// powder-epic-ready-plan: `card.blocked_by` already shows depth-1 blockers
+/// on `card` itself, so a full-board scan for the transitive walk only pays
+/// for itself when there is a depth-1 blocker to walk past. Everything
+/// beyond depth 1 -- non-terminal blockers-of-blockers, and whether the
+/// walk loops back to `card` -- comes from [`powder_core::transitive_blocked_by`];
+/// this just supplies its board-shaped closures from one scan, the same
+/// fail-closed-on-a-missing-id convention `list_ready_page` already uses.
+fn transitive_blocked_by_for(
+    connection: &Connection,
+    card: &powder_core::Card,
+) -> Result<(Vec<CardId>, bool)> {
+    if card.blocked_by.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let all_cards = load_all_cards(connection)?;
+    let blocked_by_of: HashMap<CardId, Vec<CardId>> = all_cards
+        .iter()
+        .map(|c| (c.id.clone(), c.blocked_by.clone()))
+        .collect();
+    let terminal_of: HashMap<CardId, bool> = all_cards
+        .iter()
+        .map(|c| (c.id.clone(), c.status.is_terminal()))
+        .collect();
+    let result = powder_core::transitive_blocked_by(
+        card,
+        |id| blocked_by_of.get(id).cloned(),
+        |id| terminal_of.get(id).copied().unwrap_or(false),
+    );
+    Ok((result.blocker_ids, result.cycle))
 }
 
 struct DetailSection<T> {

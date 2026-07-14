@@ -1073,6 +1073,199 @@ async fn list_and_ready_routes_carry_full_criteria_text_not_a_clipped_preview() 
     assert_eq!(ready_card["criteria"][0]["text"], long_criterion);
 }
 
+/// powder-epic-ready-plan: MCP, HTTP, and CLI must expose the exact same
+/// `list_ready` ordering `Store::list_ready_page` computes -- none of the
+/// three faces may re-sort or otherwise diverge from it. Seeds a fixture
+/// combining all three ready-plan behaviors in one pass -- a 3-level
+/// `blocked_by` chain that stays excluded past its own direct blocker
+/// (eligibility is unchanged: direct-blocker-only), a tied `blocks` chain
+/// that must reverse the id tiebreak, and a `blocks` cycle that must fall
+/// back to the stable order and get named -- into one on-disk sqlite file,
+/// then drives all three faces against fresh `Store` handles opened on
+/// that same file (in-memory sqlite cannot be reopened from a second
+/// handle, so this uses a real temp file the way a real self-hosted
+/// deployment's CLI/MCP/HTTP faces would all point at the same
+/// `POWDER_DB_PATH`).
+#[tokio::test]
+async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
+    let db_path = std::env::temp_dir().join(format!(
+        "powder-server-ready-parity-{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    {
+        let mut seed_store = Store::open(&db_path).unwrap();
+        seed_store.migrate().unwrap();
+        seed_ready_order_fixture(&mut seed_store);
+    }
+
+    // Expected order, worked out by hand from the fixture's edges (see this
+    // test's doc comment): the untouched chain root, then the
+    // `blocks`-reversed sibling trio, then the cycle pair in stable order.
+    // chain-2/chain-3 never appear: eligibility stays direct-blocker-only.
+    let expected_ids = vec![
+        "chain-1",
+        "sibling-z",
+        "sibling-m",
+        "sibling-a",
+        "cycle-x",
+        "cycle-y",
+    ];
+
+    // Store face -- also what CLI `--db` mode and in-process MCP dispatch
+    // both call directly, so this is the ground truth the other faces are
+    // checked against.
+    let store_ids = {
+        let store = Store::open(&db_path).unwrap();
+        let page = store
+            .list_ready_page(ReadyQuery::new(unix_now(), 20))
+            .unwrap();
+        page.cards
+            .iter()
+            .map(|card| card.id.as_str().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(store_ids, expected_ids, "store face");
+
+    // HTTP face.
+    let (state, raw_key) = {
+        let mut store = Store::open(&db_path).unwrap();
+        let key = store.apply_initial_seed(1).unwrap().unwrap();
+        (
+            AppState {
+                config: Arc::new(Config {
+                    db_path: db_path.clone(),
+                    auth_mode: AuthMode::ApiKey,
+                    public_base_url: None,
+                    home_url: None,
+                    bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
+                    disclose_bootstrap_key: false,
+                    field_note: FieldNoteConfig::default(),
+                    tailnet_proxy_secret: None,
+                    tailnet_admin: true,
+                }),
+                store: Arc::new(Mutex::new(store)),
+            },
+            key.raw_key,
+        )
+    };
+    let response = app(state)
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready?limit=20",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let payload = response_json(response).await;
+    let http_ids = payload["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(http_ids, expected_ids, "http face");
+    let mut http_cycle_ids = payload["cycle_card_ids"]
+        .as_array()
+        .expect("http cycle_card_ids present")
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    http_cycle_ids.sort();
+    assert_eq!(
+        http_cycle_ids,
+        vec!["cycle-x", "cycle-y"],
+        "http cycle annotation"
+    );
+
+    // MCP face (in-process store dispatch, the same code path a locally
+    // registered MCP subprocess uses).
+    let mut mcp_store = Store::open(&db_path).unwrap();
+    let mcp_response = powder_mcp::call_tool_store(
+        &mut mcp_store,
+        "list_ready",
+        &json!({"limit": 20}),
+        unix_now(),
+    )
+    .unwrap();
+    let mcp_text = mcp_response["content"][0]["text"].as_str().unwrap();
+    let mcp_payload: serde_json::Value = serde_json::from_str(mcp_text).unwrap();
+    let mcp_ids = mcp_payload["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(mcp_ids, expected_ids, "mcp face");
+    let mut mcp_cycle_ids = mcp_payload["cycle_card_ids"]
+        .as_array()
+        .expect("mcp cycle_card_ids present")
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    mcp_cycle_ids.sort();
+    assert_eq!(
+        mcp_cycle_ids,
+        vec!["cycle-x", "cycle-y"],
+        "mcp cycle annotation"
+    );
+
+    // CLI face (in-process, `--db` transport -- the same path a locally
+    // shelled-out `powder list-ready` would take).
+    let cli_args = [
+        "list-ready".to_string(),
+        "--db".to_string(),
+        db_path_str,
+        "--limit".to_string(),
+        "20".to_string(),
+    ];
+    let cli_output = powder_cli::run(&cli_args).unwrap();
+    let cli_ids = cli_output
+        .lines()
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(cli_ids, expected_ids, "cli face");
+}
+
+fn seed_ready_order_fixture(store: &mut Store) {
+    let chain_1 = ready_order_fixture_card("chain-1", Priority::P0, 1);
+    let mut chain_2 = ready_order_fixture_card("chain-2", Priority::P0, 2);
+    chain_2.blocked_by = vec![CardId::new("chain-1").unwrap()];
+    let mut chain_3 = ready_order_fixture_card("chain-3", Priority::P0, 3);
+    chain_3.blocked_by = vec![CardId::new("chain-2").unwrap()];
+
+    let sibling_a = ready_order_fixture_card("sibling-a", Priority::P1, 10);
+    let mut sibling_m = ready_order_fixture_card("sibling-m", Priority::P1, 10);
+    let mut sibling_z = ready_order_fixture_card("sibling-z", Priority::P1, 10);
+    sibling_m.blocks = vec![CardId::new("sibling-a").unwrap()];
+    sibling_z.blocks = vec![CardId::new("sibling-m").unwrap()];
+
+    let mut cycle_x = ready_order_fixture_card("cycle-x", Priority::P2, 20);
+    let mut cycle_y = ready_order_fixture_card("cycle-y", Priority::P2, 21);
+    cycle_x.blocks = vec![CardId::new("cycle-y").unwrap()];
+    cycle_y.blocks = vec![CardId::new("cycle-x").unwrap()];
+
+    store
+        .import_cards(vec![
+            chain_1, chain_2, chain_3, sibling_a, sibling_m, sibling_z, cycle_x, cycle_y,
+        ])
+        .unwrap();
+}
+
+fn ready_order_fixture_card(id: &str, priority: Priority, created_at: i64) -> Card {
+    Card::new(CardId::new(id).unwrap(), format!("Card {id}"), "do it")
+        .unwrap()
+        .with_status(CardStatus::Ready)
+        .with_priority(priority)
+        .with_acceptance(["proof exists".to_string()])
+        .with_created_at(created_at)
+}
+
 /// Estimate round-trips through create, patch, get, and the estimate filter
 /// on both list surfaces.
 #[tokio::test]

@@ -41,7 +41,7 @@ pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
-        description: "Scan claimable card summaries sorted by priority, age, and identifier. Use get_card for full card detail before implementation.",
+        description: "Scan claimable card summaries, dependency-ordered so no card appears after another card in the response it transitively blocks (ties broken by priority, age, identifier); a blocks/blocked_by cycle among the returned cards falls back to that tie-break order and is named in cycle_card_ids. Use get_card for full card detail before implementation.",
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"estimate":{"type":"string","enum":["S","M","L","XL"]}}}"#,
     },
     ToolDef {
@@ -391,7 +391,7 @@ pub fn call_tool_store(
             let page = store
                 .list_ready_page(ReadyQuery::new(now, limit).with_estimate(estimate))
                 .map_err(to_string)?;
-            card_summary_page_payload(&page.cards, page.total_count)
+            card_summary_page_payload(&page.cards, page.total_count, &page.cycle_card_ids)
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -743,7 +743,11 @@ fn is_admin_tool(name: &str) -> bool {
     ADMIN_TOOL_NAMES.contains(&name)
 }
 
-fn card_summary_page_payload(cards: &[Card], total_count: usize) -> Value {
+fn card_summary_page_payload(
+    cards: &[Card],
+    total_count: usize,
+    cycle_card_ids: &[CardId],
+) -> Value {
     let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
     let has_more = total_count > summaries.len();
     let mut payload = json!({
@@ -756,6 +760,13 @@ fn card_summary_page_payload(cards: &[Card], total_count: usize) -> Value {
             "{} more cards; filter by status/repo or raise limit",
             total_count - summaries.len()
         ));
+    }
+    // powder-epic-ready-plan: only ever nonzero for `list_ready` (a
+    // `blocks`/`blocked_by` cycle among the eligible set) -- additive and
+    // omitted whenever empty, so every existing caller's response shape is
+    // unchanged.
+    if !cycle_card_ids.is_empty() {
+        payload["cycle_card_ids"] = json!(cycle_card_ids);
     }
     payload
 }
@@ -2874,6 +2885,61 @@ mod tests {
         let text = ready["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("powder"));
         assert!(text.contains("sploot"));
+    }
+
+    /// powder-epic-ready-plan cross-face parity (MCP half): `list_ready`
+    /// must surface the exact same dependency-ordered sequence
+    /// `Store::list_ready_page` computes, not a re-sort of its own. Three
+    /// tied siblings carry `blocks` edges requiring the reverse of id
+    /// order; the MCP summary payload must preserve it.
+    #[test]
+    fn mcp_list_ready_preserves_the_store_s_topological_order() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let mut z = seeded_card("sibling-z", "Z", CardStatus::Ready, 10);
+        let mut m = seeded_card("sibling-m", "M", CardStatus::Ready, 10);
+        let a = seeded_card("sibling-a", "A", CardStatus::Ready, 10);
+        z.blocks = vec![CardId::new("sibling-m").unwrap()];
+        m.blocks = vec![CardId::new("sibling-a").unwrap()];
+        store.import_cards(vec![a, m, z]).unwrap();
+
+        let response =
+            call_tool_store(&mut store, "list_ready", &json!({"limit": 10}), 10).unwrap();
+        let payload = tool_payload(&response);
+        let ids = payload["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["sibling-z", "sibling-m", "sibling-a"]);
+        assert!(payload.get("cycle_card_ids").is_none());
+    }
+
+    /// A `blocks` cycle among eligible cards must surface as an explicit
+    /// `cycle_card_ids` annotation on the MCP `list_ready` payload rather
+    /// than hanging, panicking, or silently mis-ordering.
+    #[test]
+    fn mcp_list_ready_annotates_a_cycle_among_eligible_cards() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let mut x = seeded_card("cycle-x", "X", CardStatus::Ready, 10);
+        let mut y = seeded_card("cycle-y", "Y", CardStatus::Ready, 11);
+        x.blocks = vec![CardId::new("cycle-y").unwrap()];
+        y.blocks = vec![CardId::new("cycle-x").unwrap()];
+        store.import_cards(vec![x, y]).unwrap();
+
+        let response =
+            call_tool_store(&mut store, "list_ready", &json!({"limit": 10}), 10).unwrap();
+        let payload = tool_payload(&response);
+        let mut cycle_ids = payload["cycle_card_ids"]
+            .as_array()
+            .expect("cycle_card_ids present")
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        cycle_ids.sort();
+        assert_eq!(cycle_ids, vec!["cycle-x", "cycle-y"]);
     }
 
     #[test]

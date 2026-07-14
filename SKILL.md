@@ -42,9 +42,15 @@ claimed).
 
 Default agent persona (20 tools):
 
-- `list_ready`: return claimable cards from active repositories sorted by
-  priority, age, and identifier; optionally filtered by `estimate`
-  (`S`/`M`/`L`/`XL`).
+- `list_ready`: return claimable cards from active repositories, ordered so
+  no card appears after another card in the response it transitively
+  blocks (topological over `blocks`/`blocked_by` among the returned set),
+  ties broken by priority, age, and identifier; optionally filtered by
+  `estimate` (`S`/`M`/`L`/`XL`). Eligibility itself stays direct-blocker-only
+  (unchanged); a `blocks`/`blocked_by` cycle among the returned cards falls
+  back to the stable tie-break order and is named in an additive
+  `cycle_card_ids` field. `get_card`'s `transitive_blocked_by`/
+  `blocked_by_cycle` fields explain a *blocked* card's chain past one hop.
 - `list_cards`: enumerate cards by optional status/autonomy/repo/`estimate`
   filter, including `blocked`, `review`, and `done` cards `list_ready` never
   surfaces. With no `status` filter, `done`/`shipped`/`abandoned` cards are
