@@ -229,6 +229,9 @@ pub fn help() -> String {
     help.push_str(
         "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (symmetrizes every found issue and audits each fix)\n",
     );
+    help.push_str(
+        "    (--repair always ADDS the missing mirror edge, never deletes the one-sided edge: a half-applied removal is indistinguishable from a missing mirror-add, so repair resurrects it. Inspect the report first; finish intended removals via update-relations.)\n",
+    );
     help.push_str("  powder set-parent 002 --db ./data/powder.db --parent 001\n");
     help.push_str("  powder set-parent 002 --db ./data/powder.db --clear\n");
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
@@ -635,7 +638,10 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
 /// `related` edges disagree with a peer that names them back -- since
 /// `update-relations`/`create-card` mirror reciprocally now, this should
 /// only ever find drift from data written before that guarantee existed or
-/// written directly against the database.
+/// written directly against the database. `--repair` uses union semantics
+/// (adds the missing mirror edge, never deletes the one-sided edge), so it
+/// resurrects a half-applied removal rather than finishing it -- inspect
+/// the report before repairing.
 fn relations_doctor(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let actor = flag_value(args, "--actor").unwrap_or("operator");

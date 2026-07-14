@@ -71,6 +71,21 @@
 //! A self-edge (a card naming itself in one of its own lists) has no
 //! meaningful "other side" to mirror onto, so it is skipped the same way
 //! `ready_order`'s topological walk already ignores self-edges.
+//!
+//! # Repair is union, not arbitration
+//!
+//! `relations_doctor`'s repair pass resolves every asymmetric edge in one
+//! direction only: it *adds* the missing mirror edge onto the
+//! non-reciprocating peer. It never deletes the one-sided edge, because an
+//! asymmetric pair is ambiguous evidence -- it looks identical whether the
+//! original write was a mirror-add that never happened (pre-guarantee
+//! data) or a removal that only landed on one card (a half-applied
+//! raw-SQL delete). The doctor cannot tell those apart from the data
+//! alone, so it picks the non-destructive reading: repairing a
+//! half-applied removal *resurrects* the edge rather than finishing the
+//! delete. Operators should inspect the report (`repair: false`) before
+//! repairing, and finish any intended removals via `update_relations`
+//! (which unmirrors atomically) instead of letting repair re-add them.
 use std::collections::{HashMap, HashSet};
 
 use powder_core::{Card, CardId};
@@ -344,6 +359,12 @@ impl Store {
     /// `update_relations`) and marks each issue `repaired: true`. A second
     /// `repair: true` run over an already-consistent graph reports zero
     /// issues (idempotent).
+    ///
+    /// Repair always resolves by *adding* the missing mirror edge, never
+    /// by deleting the one-sided edge -- see the module doc comment's
+    /// "repair is union, not arbitration": a half-applied removal is
+    /// indistinguishable from a missing mirror-add, so repair resurrects
+    /// such an edge. Inspect the report before repairing.
     pub fn relations_doctor(
         &mut self,
         actor: &str,
