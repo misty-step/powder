@@ -36,8 +36,8 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4,
-    MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
+    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
     MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
@@ -340,6 +340,10 @@ impl Store {
                     self.migrate_13_to_14()?;
                     14
                 }
+                14 => {
+                    self.migrate_14_to_15()?;
+                    15
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -367,6 +371,21 @@ impl Store {
     fn migrate_13_to_14(&mut self) -> Result<()> {
         if !self.cards_has_column("parent")? {
             self.connection.execute_batch(MIGRATE_13_TO_14)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_14_to_15(&mut self) -> Result<()> {
+        if self.cards_has_column("workspace_path")? {
+            self.connection.execute_batch(MIGRATE_14_TO_15)?;
+        } else if self.cards_has_column("branch_name")? {
+            // MIGRATE_14_TO_15 drops both columns in one batch; if a prior
+            // run crashed between the two ALTERs, workspace_path is already
+            // gone but branch_name is still there. Re-running the full
+            // batch would fail on `DROP COLUMN workspace_path` against a
+            // column that no longer exists, so finish the other half alone.
+            self.connection
+                .execute_batch("ALTER TABLE cards DROP COLUMN branch_name;")?;
         }
         Ok(())
     }
@@ -669,7 +688,6 @@ impl Store {
             patched_fields.push("labels");
         }
         if let Some(status) = patch.status {
-            card.status.validate_transition(status)?;
             card.status = status;
             patched_fields.push("status");
         }
@@ -1056,7 +1074,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         let previous = card.status;
-        let released_claim = card.apply_status(status, now)?;
+        let released_claim = card.apply_status(status, now);
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
             close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
@@ -1477,7 +1495,6 @@ impl Store {
         let mut card = load_card(&self.connection, &run.card_id)?;
         authority.require_holder(card.claim_holder())?;
 
-        card.status.validate_transition(CardStatus::AwaitingInput)?;
         card.status = CardStatus::AwaitingInput;
         card.updated_at = now;
         run.state = RunState::AwaitingInput;
@@ -1775,7 +1792,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -1792,8 +1809,6 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                blocks_json = excluded.blocks_json,
                blocked_by_json = excluded.blocked_by_json,
                repo = excluded.repo,
-               workspace_path = excluded.workspace_path,
-               branch_name = excluded.branch_name,
                source_path = excluded.source_path,
                source_digest = excluded.source_digest,
                claim_agent = excluded.claim_agent,
@@ -1821,8 +1836,6 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             to_json(&card.blocks)?,
             to_json(&card.blocked_by)?,
             repo,
-            card.workspace_path,
-            card.branch_name,
             source_path,
             source_digest,
             claim_agent,
@@ -2196,8 +2209,6 @@ struct CardRecord {
     blocks_json: String,
     blocked_by_json: String,
     repo: Option<String>,
-    workspace_path: Option<String>,
-    branch_name: Option<String>,
     source_path: Option<String>,
     source_digest: Option<String>,
     claim_agent: Option<String>,
@@ -2228,17 +2239,15 @@ impl CardRecord {
             blocks_json: row.get(13)?,
             blocked_by_json: row.get(14)?,
             repo: row.get(15)?,
-            workspace_path: row.get(16)?,
-            branch_name: row.get(17)?,
-            source_path: row.get(18)?,
-            source_digest: row.get(19)?,
-            claim_agent: row.get(20)?,
-            claim_run_id: row.get(21)?,
-            claim_acquired_at: row.get(22)?,
-            claim_expires_at: row.get(23)?,
-            created_at: row.get(24)?,
-            updated_at: row.get(25)?,
-            parent: row.get(26)?,
+            source_path: row.get(16)?,
+            source_digest: row.get(17)?,
+            claim_agent: row.get(18)?,
+            claim_run_id: row.get(19)?,
+            claim_acquired_at: row.get(20)?,
+            claim_expires_at: row.get(21)?,
+            created_at: row.get(22)?,
+            updated_at: row.get(23)?,
+            parent: row.get(24)?,
         })
     }
 
@@ -2293,8 +2302,6 @@ impl CardRecord {
         card.blocked_by = from_json("cards.blocked_by_json", self.blocked_by_json)?;
         card.parent = self.parent.map(CardId::new).transpose()?;
         card.repo = self.repo.as_deref().and_then(canonical_repo_label);
-        card.workspace_path = self.workspace_path;
-        card.branch_name = self.branch_name;
         card.source = match (self.source_path, self.source_digest) {
             (Some(path), Some(digest)) => Some(CardSource { path, digest }),
             _ => None,

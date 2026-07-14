@@ -13,9 +13,17 @@ use serde_json::{json, Value};
 
 mod remote;
 
+// powder-epic-one-card-model: no production path calls either module --
+// only the CI subprocess eval (tests/tool_use_eval.rs, examples/eval.rs)
+// and the manual live-model harness (examples/live_ab_eval.rs) do, and both
+// build with the "eval" feature active (see Cargo.toml). A plain
+// `cargo build --bin powder-mcp` never compiles this ~2000 LOC or its
+// `ureq`/subprocess machinery into the shipped binary.
+#[cfg(any(test, feature = "eval"))]
 #[doc(hidden)]
 pub mod eval_harness;
 
+#[cfg(any(test, feature = "eval"))]
 #[doc(hidden)]
 pub mod live_eval;
 
@@ -424,8 +432,7 @@ pub fn call_tool_store(
             let acceptance = string_array(args, "acceptance")?;
             let status = match optional_str(args, "status") {
                 Some(raw) => parse_status(raw)?,
-                None if acceptance.is_empty() => CardStatus::Backlog,
-                None => CardStatus::Ready,
+                None => CardStatus::default_for_acceptance(&acceptance),
             };
             let priority = optional_str(args, "priority")
                 .map(parse_priority)
@@ -1704,6 +1711,47 @@ mod tests {
         assert!(tool_payload(&with_criteria).get("hint").is_none());
     }
 
+    /// powder-epic-one-card-model: `CardStatus::default_for_acceptance` is
+    /// the single home for this rule now; exercise all three cases through
+    /// the `create_card` tool -- empty acceptance defaults to backlog, real
+    /// acceptance defaults to ready, and an explicit status always wins.
+    #[test]
+    fn create_card_status_default_covers_empty_nonempty_and_explicit_status() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let empty = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "empty-acceptance", "title": "No oracle"}),
+            10,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&empty)["status"], "backlog");
+
+        let nonempty = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id": "nonempty-acceptance", "title": "Has oracle", "acceptance": ["prove it"]}),
+            11,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&nonempty)["status"], "ready");
+
+        let explicit = call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "explicit-status",
+                "title": "Explicit status wins",
+                "status": "blocked"
+            }),
+            12,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&explicit)["status"], "blocked");
+    }
+
     #[test]
     fn mcp_list_cards_filters_by_status_and_enumerates_non_ready_cards() {
         let mut store = Store::open_in_memory().unwrap();
@@ -2104,8 +2152,6 @@ mod tests {
             "blocks",
             "blocked_by",
             "repo",
-            "workspace_path",
-            "branch_name",
             "source",
             "claim",
         ] {

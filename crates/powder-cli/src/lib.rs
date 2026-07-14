@@ -407,11 +407,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .unwrap_or_default();
     let status = flag_value(args, "--status")
         .and_then(CardStatus::parse)
-        .unwrap_or(if acceptance.is_empty() {
-            CardStatus::Backlog
-        } else {
-            CardStatus::Ready
-        });
+        .unwrap_or_else(|| CardStatus::default_for_acceptance(&acceptance));
     let priority = flag_value(args, "--priority")
         .and_then(Priority::parse)
         .unwrap_or_default();

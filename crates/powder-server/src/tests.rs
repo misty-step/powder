@@ -152,6 +152,49 @@ async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
     assert!(!ready.to_string().contains("no-acceptance"));
 }
 
+/// powder-epic-one-card-model: `CardStatus::default_for_acceptance` is now
+/// the single home for this rule; this exercises the other two cases the
+/// empty-acceptance test above doesn't cover -- a real oracle defaults to
+/// `ready`, and an explicit `status` wins regardless of acceptance.
+#[tokio::test]
+async fn create_card_with_acceptance_defaults_to_ready_and_explicit_status_overrides() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let with_acceptance = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"has-oracle","title":"Has a real oracle","acceptance":["prove it"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(with_acceptance.status(), StatusCode::OK);
+    let card = response_json(with_acceptance).await;
+    assert_eq!(
+        card["status"], "ready",
+        "a real acceptance criterion must default to ready: {card}"
+    );
+
+    let forced_backlog = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"forced-backlog","title":"Forced backlog","acceptance":["prove it"],"status":"backlog"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forced_backlog.status(), StatusCode::OK);
+    let card = response_json(forced_backlog).await;
+    assert_eq!(
+        card["status"], "backlog",
+        "an explicit status must override the acceptance-derived default: {card}"
+    );
+}
+
 #[tokio::test]
 async fn create_card_derives_repo_from_numeric_id_prefix_for_repo_filtered_lists() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);

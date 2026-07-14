@@ -749,6 +749,7 @@ version = "0.1.0"
 dependencies = [
  "powder-api",
  "powder-core",
+ "powder-mcp",
  "powder-shell",
  "powder-store",
  "serde_json",
