@@ -2,8 +2,8 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel,
-    Estimate, Priority, ReadyQuery, RunId,
+    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel, Estimate, Priority,
+    ReadyQuery, RunId,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -46,8 +46,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_cards",
-        description: "Scan card summaries by optional status/autonomy/repo/estimate filter, not just ready-eligible ones. With no status filter, done/shipped/abandoned cards are hidden by default (set include_terminal:true to see them too); total_count in the response always reports the full matching count, terminal cards included, so a hidden card is never mistaken for a nonexistent one. An explicit status filter (e.g. status:done) always returns matching cards regardless of include_terminal. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
+        description: "Scan card summaries by optional status/repo/estimate filter, not just ready-eligible ones. With no status filter, done/shipped/abandoned cards are hidden by default (set include_terminal:true to see them too); total_count in the response always reports the full matching count, terminal cards included, so a hidden card is never mistaken for a nonexistent one. An explicit status filter (e.g. status:done) always returns matching cards regardless of include_terminal. Use get_card for full card detail before implementation.",
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -57,12 +57,12 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, and initial status; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
-        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, autonomy, priority, estimate, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. Any authenticated actor may patch; the change is audited with actor and field list.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"autonomy":{"type":"string","enum":["auto","review"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, estimate, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. Any authenticated actor may patch; the change is audited with actor and field list.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","claimed","running","awaiting_input","blocked","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -106,7 +106,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_approvals",
-        description: "List awaiting-input runs with card autonomy, latest question text, run id, and approval-prefixed packet links.",
+        description: "List awaiting-input runs with card title, latest question text, run id, and approval-prefixed packet links.",
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
@@ -399,9 +399,6 @@ pub fn call_tool_store(
                 Some(raw) => Some(parse_status(raw)?),
                 None => None,
             };
-            let autonomy = optional_str(args, "autonomy")
-                .map(parse_autonomy)
-                .transpose()?;
             let estimate = optional_str(args, "estimate")
                 .map(parse_estimate)
                 .transpose()?;
@@ -416,7 +413,6 @@ pub fn call_tool_store(
             let filter = CardFilter {
                 status,
                 repo,
-                autonomy,
                 estimate,
                 include_terminal,
             };
@@ -448,10 +444,6 @@ pub fn call_tool_store(
                 .map(parse_priority)
                 .transpose()?
                 .unwrap_or_default();
-            let autonomy = optional_str(args, "autonomy")
-                .map(parse_autonomy)
-                .transpose()?
-                .unwrap_or_default();
             let estimate = optional_str(args, "estimate")
                 .map(parse_estimate)
                 .transpose()?;
@@ -460,7 +452,6 @@ pub fn call_tool_store(
                 .with_acceptance(acceptance)
                 .with_proof_plan(string_array(args, "proof_plan")?)
                 .with_status(status)
-                .with_autonomy(autonomy)
                 .with_priority(priority)
                 .with_estimate(estimate)
                 .with_created_at(now);
@@ -492,9 +483,6 @@ pub fn call_tool_store(
                 acceptance: optional_string_array(args, "acceptance")?,
                 proof_plan: optional_string_array(args, "proof_plan")?,
                 status: optional_str(args, "status").map(parse_status).transpose()?,
-                autonomy: optional_str(args, "autonomy")
-                    .map(parse_autonomy)
-                    .transpose()?,
                 priority: optional_str(args, "priority")
                     .map(parse_priority)
                     .transpose()?,
@@ -762,7 +750,7 @@ fn card_summary_page_payload(cards: &[Card], total_count: usize) -> Value {
 
 /// `list_cards`-specific envelope (powder-mcp-unfiltered-enumeration):
 /// `total_count` is always the count matching the caller's explicit
-/// status/repo/autonomy/estimate filters -- see `list_cards_page`'s doc
+/// status/repo/estimate filters -- see `list_cards_page`'s doc
 /// comment -- so it never undercounts just because `include_terminal:false`
 /// (the tool's default with no explicit `status`) held terminal cards back
 /// from `cards`. Beyond the plain `card_summary_page_payload` shape:
@@ -842,7 +830,7 @@ pub(crate) fn list_cards_hint(
 /// argument strings (not the parsed/canonicalized enum values) since this is
 /// echoing back what the caller asked for.
 fn active_filter_description(args: &Value) -> String {
-    let parts = ["status", "repo", "autonomy", "estimate"]
+    let parts = ["status", "repo", "estimate"]
         .into_iter()
         .filter_map(|key| {
             let value = args[key].as_str()?.trim();
@@ -1106,11 +1094,6 @@ fn parse_priority(raw: &str) -> Result<Priority, String> {
     Priority::parse(raw).ok_or_else(|| invalid_enum_value("priority", raw, priority_valid_values()))
 }
 
-fn parse_autonomy(raw: &str) -> Result<AutonomyClass, String> {
-    AutonomyClass::parse(raw)
-        .ok_or_else(|| invalid_enum_value("autonomy", raw, autonomy_valid_values()))
-}
-
 fn parse_estimate(raw: &str) -> Result<Estimate, String> {
     Estimate::parse(raw).ok_or_else(|| invalid_enum_value("estimate", raw, estimate_valid_values()))
 }
@@ -1174,15 +1157,6 @@ fn priority_valid_values() -> String {
         .iter()
         .copied()
         .map(Priority::as_str)
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn autonomy_valid_values() -> String {
-    AutonomyClass::ALL
-        .iter()
-        .copied()
-        .map(AutonomyClass::as_str)
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -1428,7 +1402,6 @@ mod tests {
         let tools = listed.as_array().unwrap();
         let statuses = card_status_values();
         let priorities = priority_values();
-        let autonomies = autonomy_values();
         let visibilities = repository_visibility_values();
         let tiers = repository_tier_values();
 
@@ -1440,12 +1413,6 @@ mod tests {
         }
         for value in &priorities {
             assert_eq!(Priority::parse(value).map(Priority::as_str), Some(*value));
-        }
-        for value in &autonomies {
-            assert_eq!(
-                AutonomyClass::parse(value).map(AutonomyClass::as_str),
-                Some(*value)
-            );
         }
         for value in &visibilities {
             assert_eq!(
@@ -1465,9 +1432,6 @@ mod tests {
         }
         for tool in ["create_card", "update_card"] {
             assert_schema_enum(tools, tool, "priority", &priorities);
-        }
-        for tool in ["list_cards", "create_card", "update_card"] {
-            assert_schema_enum(tools, tool, "autonomy", &autonomies);
         }
         assert_schema_enum(tools, "upsert_repository", "visibility", &visibilities);
         assert_schema_enum(tools, "upsert_repository", "tier", &tiers);
@@ -1961,19 +1925,6 @@ mod tests {
         assert_eq!(payload["total_count"], 1);
         assert_eq!(payload["has_more"], false);
 
-        call_tool_store(
-            &mut store,
-            "update_card",
-            &json!({"card_id": "blocked", "autonomy": "auto"}),
-            11,
-        )
-        .unwrap();
-        let auto =
-            call_tool_store(&mut store, "list_cards", &json!({"autonomy": "auto"}), 12).unwrap();
-        let payload = tool_payload(&auto);
-        assert_eq!(payload["cards"][0]["id"], "blocked");
-        assert_eq!(payload["cards"][0]["autonomy"], "auto");
-
         let invalid = call_tool_store(&mut store, "list_cards", &json!({"status": "not-real"}), 10)
             .unwrap_err();
         assert_eq!(
@@ -2192,22 +2143,6 @@ mod tests {
             invalid_priority,
             "invalid priority \"urgent\"; valid: P0|P1|P2|P3"
         );
-
-        let invalid_autonomy = call_tool_store(
-            &mut store,
-            "create_card",
-            &json!({
-                "id": "bad-autonomy",
-                "title": "Bad autonomy",
-                "autonomy": "robot"
-            }),
-            10,
-        )
-        .unwrap_err();
-        assert_eq!(
-            invalid_autonomy,
-            "invalid autonomy \"robot\"; valid: auto|review"
-        );
     }
 
     #[test]
@@ -2221,8 +2156,7 @@ mod tests {
                 "id": "approval-card",
                 "title": "Approval card",
                 "acceptance": ["proof"],
-                "status": "ready",
-                "autonomy": "review"
+                "status": "ready"
             }),
             1,
         )
@@ -2285,14 +2219,6 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
-    }
-
-    fn autonomy_values() -> Vec<&'static str> {
-        AutonomyClass::ALL
-            .iter()
-            .copied()
-            .map(AutonomyClass::as_str)
-            .collect()
     }
 
     #[test]

@@ -2,8 +2,7 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
-    ReadyQuery, RunId,
+    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, Priority, ReadyQuery, RunId,
 };
 use powder_shell::{load_github_issues_file, unix_now, ShellError};
 use powder_store::{
@@ -190,7 +189,6 @@ pub fn help() -> String {
     help.push_str(
         "  powder create-card ... --acceptance \"first criterion\" --acceptance \"second criterion\"  (repeatable; every occurrence is one criterion, in order)\n",
     );
-    help.push_str("  powder update-card canary-001 --db ./data/powder.db --autonomy auto\n");
     help.push_str(
         "  powder update-card canary-001 --db ./data/powder.db --acceptance \"a\" --acceptance \"b\"  (repeatable; replaces the full criteria list)\n",
     );
@@ -416,10 +414,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let priority = flag_value(args, "--priority")
         .and_then(Priority::parse)
         .unwrap_or_default();
-    let autonomy = flag_value(args, "--autonomy")
-        .map(parse_autonomy_flag)
-        .transpose()?
-        .unwrap_or_default();
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
@@ -441,7 +435,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         )
         .map_err(ShellError::from)?
         .with_status(status)
-        .with_autonomy(autonomy)
         .with_priority(priority)
         .with_estimate(estimate)
         .with_acceptance(acceptance)
@@ -461,7 +454,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             "title": title,
             "acceptance": acceptance,
             "status": status.as_str(),
-            "autonomy": autonomy.as_str(),
             "priority": priority.as_str(),
             "related": card_id_values(&related),
             "blocks": card_id_values(&blocks),
@@ -488,11 +480,10 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
 
     Ok(format!(
-        "created\t{}\t{}\t{}\t{}\n",
+        "created\t{}\t{}\t{}\n",
         json_string(&card, "id")?,
         json_priority(&card)?,
-        json_string(&card, "status")?,
-        json_string(&card, "autonomy")?
+        json_string(&card, "status")?
     ))
 }
 
@@ -512,9 +503,6 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
                 CardStatus::parse(raw)
                     .ok_or_else(|| ShellError::Invalid(format!("invalid --status: {raw}")))
             })
-            .transpose()?,
-        autonomy: flag_value(args, "--autonomy")
-            .map(parse_autonomy_flag)
             .transpose()?,
         priority: flag_value(args, "--priority")
             .map(|raw| {
@@ -549,9 +537,6 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         if let Some(status) = patch.status {
             payload["status"] = json!(status.as_str());
         }
-        if let Some(autonomy) = patch.autonomy {
-            payload["autonomy"] = json!(autonomy.as_str());
-        }
         if let Some(priority) = patch.priority {
             payload["priority"] = json!(priority.as_str());
         }
@@ -569,11 +554,10 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
 
     Ok(format!(
-        "updated\t{}\t{}\t{}\t{}\n",
+        "updated\t{}\t{}\t{}\n",
         json_string(&card, "id")?,
         json_priority(&card)?,
-        json_string(&card, "status")?,
-        json_string(&card, "autonomy")?
+        json_string(&card, "status")?
     ))
 }
 
@@ -662,7 +646,7 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     Ok(out)
 }
 
-/// Enumerate cards by status/autonomy/repo, not just ready-eligible ones -- `blocked`
+/// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`
 /// and `done` cards are otherwise invisible without opening the
 /// database file directly.
 fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -673,9 +657,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
                 .ok_or_else(|| ShellError::Invalid(format!("invalid status: {raw}")))
         })
         .transpose()?;
-    let autonomy = flag_value(args, "--autonomy")
-        .map(parse_autonomy_flag)
-        .transpose()?;
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
@@ -684,7 +665,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         let store = open_store(db)?;
         let filter = CardFilter {
             status,
-            autonomy,
             estimate,
             repo: repo.clone(),
             // powder-mcp-unfiltered-enumeration: only the MCP `list_cards`
@@ -697,9 +677,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         let mut query = format!("limit={limit}");
         if let Some(status) = status {
             query.push_str(&format!("&status={}", status.as_str()));
-        }
-        if let Some(autonomy) = autonomy {
-            query.push_str(&format!("&autonomy={}", autonomy.as_str()));
         }
         if let Some(estimate) = estimate {
             query.push_str(&format!("&estimate={}", estimate.as_str()));
@@ -718,11 +695,10 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let mut out = String::new();
     for card in json_array(&cards)? {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\n",
             json_string(card, "id")?,
             json_priority(card)?,
             json_string(card, "status")?,
-            json_string(card, "autonomy")?,
             json_string(card, "title")?
         ));
     }
@@ -1432,20 +1408,6 @@ fn parse_estimate_flag(raw: &str) -> Result<Estimate, ShellError> {
     })
 }
 
-fn parse_autonomy_flag(raw: &str) -> Result<AutonomyClass, ShellError> {
-    AutonomyClass::parse(raw).ok_or_else(|| {
-        ShellError::Invalid(format!(
-            "invalid --autonomy {raw:?}; valid: {}",
-            AutonomyClass::ALL
-                .iter()
-                .copied()
-                .map(AutonomyClass::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
-}
-
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -2095,8 +2057,6 @@ mod tests {
             "Blocked ticket",
             "--status",
             "blocked",
-            "--autonomy",
-            "auto",
         ]))
         .unwrap();
         run(&args([
@@ -2121,23 +2081,6 @@ mod tests {
         let blocked_only = run(&args(["list-cards", "--db", &db, "--status", "blocked"])).unwrap();
         assert!(blocked_only.contains("blocked-1"));
         assert!(!blocked_only.contains("ready-1"));
-
-        let auto_only = run(&args(["list-cards", "--db", &db, "--autonomy", "auto"])).unwrap();
-        assert!(auto_only.contains("blocked-1"));
-        assert!(auto_only.contains("\tauto\t"));
-        assert!(!auto_only.contains("ready-1"));
-
-        run(&args([
-            "update-card",
-            "blocked-1",
-            "--db",
-            &db,
-            "--autonomy",
-            "review",
-        ]))
-        .unwrap();
-        let auto_empty = run(&args(["list-cards", "--db", &db, "--autonomy", "auto"])).unwrap();
-        assert_eq!(auto_empty, "no-cards\n");
 
         let err = run(&args([
             "list-cards",
@@ -3102,7 +3045,6 @@ mod tests {
         let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
         assert!(approvals.contains("\"approvals\""));
         assert!(approvals.contains("\"card_id\": \"answer-test\""));
-        assert!(approvals.contains("\"autonomy\": \"review\""));
         assert!(approvals.contains("https://example.test/packet"));
 
         let card = run(&args(["get-card", "answer-test", "--db", &db])).unwrap();
@@ -3145,7 +3087,7 @@ mod tests {
             (
                 200,
                 json!({
-                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "autonomy": "review", "title": "Blocked"}],
+                    "cards": [{"id": "blocked-1", "priority": "p2", "status": "blocked", "title": "Blocked"}],
                     "total_count": 1,
                     "has_more": false
                 }),
@@ -3156,7 +3098,7 @@ mod tests {
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "ready", "autonomy": "review", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "ready", "title": "Remote created"}),
             ),
             (
                 200,
@@ -3164,11 +3106,11 @@ mod tests {
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
             ),
             (
                 200,
-                json!({"id": "remote-created", "priority": "p1", "status": "running", "autonomy": "review", "title": "Remote created"}),
+                json!({"id": "remote-created", "priority": "p1", "status": "running", "title": "Remote created"}),
             ),
             (
                 200,
@@ -3193,7 +3135,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(cards, "blocked-1\tP2\tblocked\treview\tBlocked\n");
+        assert_eq!(cards, "blocked-1\tP2\tblocked\tBlocked\n");
 
         let detail = run_with_env(&args(["get-card", "remote-1"]), &env).unwrap();
         assert!(detail.contains("\"id\": \"remote-1\""));
@@ -3223,7 +3165,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(created, "created\tremote-created\tP1\tready\treview\n");
+        assert_eq!(created, "created\tremote-created\tP1\tready\n");
 
         let claimed = run_with_env(
             &args(["claim", "remote-created", "--agent", "codex", "--ttl", "60"]),
@@ -3297,7 +3239,6 @@ mod tests {
                 "acceptance": ["proof exists"],
                 "proof_plan": ["PR plus smoke"],
                 "status": "ready",
-                "autonomy": "review",
                 "priority": "P1",
                 "related": ["remote-1"],
                 "blocks": [],
@@ -3576,7 +3517,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        assert_eq!(output, "created\tlocal-card\tP2\tready\treview\n");
+        assert_eq!(output, "created\tlocal-card\tP2\tready\n");
 
         assert!(
             recorded.lock().unwrap().is_empty(),

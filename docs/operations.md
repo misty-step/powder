@@ -31,10 +31,10 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | Command | `--db` transport | Remote env transport | Output shape |
 | --- | --- | --- | --- |
 | `list-ready` | SQLite query | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
-| `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\tautonomy\ttitle` or `no-cards` |
+| `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\ttitle` or `no-cards` |
 | `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
-| `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus\tautonomy` |
-| `update-card` | SQLite patch write | `PATCH /api/v1/cards/{id}` | `updated\tid\tpriority\tstatus\tautonomy` |
+| `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus` |
+| `update-card` | SQLite patch write | `PATCH /api/v1/cards/{id}` | `updated\tid\tpriority\tstatus` |
 | `list-approvals` | SQLite approval queue read | `GET /api/v1/approvals` | Pretty JSON approval queue |
 | `claim` | SQLite claim lifecycle | `POST /api/v1/cards/{id}/claim` | `claimed\tcard_id\trun_id\texpires_at` |
 | `heartbeat` | SQLite lease liveness | `POST /api/v1/cards/{id}/heartbeat` | `heartbeat\tcard_id\trun_id\texpires_at` |
@@ -146,7 +146,7 @@ naming required fields -- `POST /api/v1/cards` and
 trial-and-error against raw serde deserialize errors.
 
 `update_card`/`PATCH /api/v1/cards/{id}` patches title, body, acceptance,
-proof_plan, status, autonomy, priority, or labels on an existing card without
+proof_plan, status, priority, or labels on an existing card without
 replacing protected lifecycle or source metadata; it requires an admin-scope
 key.
 

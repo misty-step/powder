@@ -45,7 +45,7 @@ Default agent persona (20 tools):
 - `list_ready`: return claimable cards from active repositories sorted by
   priority, age, and identifier; optionally filtered by `estimate`
   (`S`/`M`/`L`/`XL`).
-- `list_cards`: enumerate cards by optional status/autonomy/repo/`estimate`
+- `list_cards`: enumerate cards by optional status/repo/`estimate`
   filter, including `blocked`, `review`, and `done` cards `list_ready` never
   surfaces. With no `status` filter, `done`/`shipped`/`abandoned` cards are
   hidden by default (in both local `POWDER_DB_PATH` and remote
@@ -83,7 +83,7 @@ Default agent persona (20 tools):
   history section plus totals/hint when truncated); pass `detail: detailed`
   for full history.
 - `list_awaiting_input`: list runs paused for human or agent input.
-- `list_approvals`: list awaiting-input runs with card autonomy, the latest
+- `list_approvals`: list awaiting-input runs with card title, the latest
   question text, run id, and approval-prefixed packet links -- a
   review-focused view over the same runs `list_awaiting_input` surfaces.
 - `answer_input`: append an actor-attributed answer and resume the run.

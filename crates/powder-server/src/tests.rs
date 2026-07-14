@@ -429,7 +429,7 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
             Method::PATCH,
             "/api/v1/cards/patchable",
             Some(&raw_key),
-            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","autonomy":"auto","labels":["api","safe-update"]}"#,
+            r#"{"body":"Updated body","acceptance":["new proof"],"priority":"p0","status":"blocked","labels":["api","safe-update"]}"#,
         ))
         .await
         .unwrap();
@@ -441,7 +441,6 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
     assert_eq!(patched_many["criteria"][0]["text"], "new proof");
     assert_eq!(patched_many["priority"], "p0");
     assert_eq!(patched_many["status"], "blocked");
-    assert_eq!(patched_many["autonomy"], "auto");
     assert_eq!(patched_many["labels"], json!(["api", "safe-update"]));
     assert_eq!(patched_many["created_at"], before["card"]["created_at"]);
     assert_eq!(patched_many["source"], before["card"]["source"]);
@@ -696,13 +695,11 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
             Method::POST,
             "/api/v1/cards",
             Some(&raw_key),
-            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked","autonomy":"auto"}"#,
+            r#"{"id":"blocked-1","title":"t","acceptance":["x"],"status":"blocked"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(blocked.status(), StatusCode::OK);
-    let blocked = response_json(blocked).await;
-    assert_eq!(blocked["autonomy"], "auto");
 
     let created = app
         .clone()
@@ -774,21 +771,6 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         vec!["blocked-1".to_string()]
     );
 
-    let auto_only = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?autonomy=auto",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        ids_from(&response_json(auto_only).await),
-        vec!["blocked-1".to_string()]
-    );
-
     let other_repo = app
         .clone()
         .oneshot(json_request(
@@ -850,18 +832,6 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
-
-    let invalid_autonomy = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?autonomy=robot",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(invalid_autonomy.status(), StatusCode::BAD_REQUEST);
 
     let unknown_query = app
         .oneshot(json_request(
@@ -1013,7 +983,6 @@ async fn list_and_ready_routes_carry_full_criteria_text_not_a_clipped_preview() 
                 "title": "Long criterion",
                 "acceptance": [long_criterion],
                 "status": "ready",
-                "autonomy": "auto",
             })
             .to_string(),
         ))

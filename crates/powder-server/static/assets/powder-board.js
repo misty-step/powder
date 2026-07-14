@@ -1404,8 +1404,7 @@ function detailHTML(card, detail = {}) {
         <select class="pw-sort pw-status-change" id="detail-status-change" data-card-id="${escapeHtml(normalized.id)}" aria-label="change status">
           ${RAW_STATUSES.map((status) => `<option value="${status}"${status === normalized.status ? " selected" : ""}>${escapeHtml(statusText(status))}</option>`).join("")}
         </select>
-        <span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>
-        <span class="ae-tag">${escapeHtml(normalized.autonomy || "review")}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}
+        <span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}
       </p>
       <p id="detail-status-message" class="ae-chrome" aria-live="polite"></p>
     </section>

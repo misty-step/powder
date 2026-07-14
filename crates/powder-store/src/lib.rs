@@ -4,10 +4,10 @@ use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
-    CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Run,
-    RunId, RunState, WorkLogEntry,
+    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
+    CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, CriterionProof,
+    DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
+    WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -36,9 +36,9 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
-    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
-    MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_1_TO_2,
+    MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8,
+    MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -137,7 +137,6 @@ const FIELD_NOTE_DRAFT_LABEL: &str = "field-note-draft";
 pub struct CardFilter {
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
-    pub autonomy: Option<AutonomyClass>,
     pub estimate: Option<Estimate>,
     pub include_terminal: bool,
 }
@@ -147,7 +146,6 @@ impl Default for CardFilter {
         CardFilter {
             status: None,
             repo: None,
-            autonomy: None,
             estimate: None,
             include_terminal: true,
         }
@@ -247,7 +245,6 @@ pub struct CardPatch {
     pub acceptance: Option<Vec<String>>,
     pub proof_plan: Option<Vec<String>>,
     pub status: Option<CardStatus>,
-    pub autonomy: Option<AutonomyClass>,
     pub priority: Option<Priority>,
     pub estimate: Option<Estimate>,
     pub labels: Option<Vec<String>>,
@@ -380,6 +377,10 @@ impl Store {
                     self.migrate_14_to_15()?;
                     15
                 }
+                15 => {
+                    self.migrate_15_to_16()?;
+                    16
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -422,6 +423,13 @@ impl Store {
             // column that no longer exists, so finish the other half alone.
             self.connection
                 .execute_batch("ALTER TABLE cards DROP COLUMN branch_name;")?;
+        }
+        Ok(())
+    }
+
+    fn migrate_15_to_16(&mut self) -> Result<()> {
+        if self.cards_has_column("autonomy")? {
+            self.connection.execute_batch(MIGRATE_15_TO_16)?;
         }
         Ok(())
     }
@@ -737,10 +745,6 @@ impl Store {
             card.status = status;
             patched_fields.push("status");
         }
-        if let Some(autonomy) = patch.autonomy {
-            card.autonomy = autonomy;
-            patched_fields.push("autonomy");
-        }
 
         if patched_fields.is_empty() {
             transaction.commit()?;
@@ -881,7 +885,7 @@ impl Store {
         })
     }
 
-    /// List cards by optional `status`/`autonomy`/`repo` filter, not just ready-eligible
+    /// List cards by optional `status`/`repo` filter, not just ready-eligible
     /// ones -- `list_ready` answers "what can an agent claim now"; this
     /// answers "what exists," including `blocked` and `done`
     /// cards no other surface can enumerate without opening the database
@@ -912,12 +916,6 @@ impl Store {
             .filter(|card| filter.status.map(|s| card.status == s).unwrap_or(true))
             .filter(|card| {
                 filter
-                    .autonomy
-                    .map(|autonomy| card.autonomy == autonomy)
-                    .unwrap_or(true)
-            })
-            .filter(|card| {
-                filter
                     .estimate
                     .map(|estimate| card.estimate == Some(estimate))
                     .unwrap_or(true)
@@ -933,7 +931,7 @@ impl Store {
             })
             .collect::<Vec<_>>();
         // `total_count` reports how many cards match the caller's *explicit*
-        // status/repo/autonomy/estimate filters -- deliberately computed
+        // status/repo/estimate filters -- deliberately computed
         // before the `include_terminal` exclusion below, so a caller that
         // asks for the whole board (no explicit status) and gets terminal
         // cards silently held back still sees the true match count rather
@@ -1877,7 +1875,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -1885,7 +1883,6 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                criteria_json = excluded.criteria_json,
                proof_plan_json = excluded.proof_plan_json,
                status = excluded.status,
-               autonomy = excluded.autonomy,
                priority = excluded.priority,
                estimate = excluded.estimate,
                labels_json = excluded.labels_json,
@@ -1912,7 +1909,6 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             to_json(&card.criteria)?,
             to_json(&card.proof_plan)?,
             card.status.as_str(),
-            card.autonomy.as_str(),
             card.priority.as_str(),
             card.estimate.map(Estimate::as_str),
             to_json(&card.labels)?,
@@ -2307,7 +2303,6 @@ struct CardRecord {
     criteria_json: String,
     proof_plan_json: String,
     status: String,
-    autonomy: String,
     priority: String,
     estimate: Option<String>,
     labels_json: String,
@@ -2337,24 +2332,23 @@ impl CardRecord {
             criteria_json: row.get(4)?,
             proof_plan_json: row.get(5)?,
             status: row.get(6)?,
-            autonomy: row.get(7)?,
-            priority: row.get(8)?,
-            estimate: row.get(9)?,
-            labels_json: row.get(10)?,
-            assignee: row.get(11)?,
-            related_json: row.get(12)?,
-            blocks_json: row.get(13)?,
-            blocked_by_json: row.get(14)?,
-            repo: row.get(15)?,
-            source_path: row.get(16)?,
-            source_digest: row.get(17)?,
-            claim_agent: row.get(18)?,
-            claim_run_id: row.get(19)?,
-            claim_acquired_at: row.get(20)?,
-            claim_expires_at: row.get(21)?,
-            created_at: row.get(22)?,
-            updated_at: row.get(23)?,
-            parent: row.get(24)?,
+            priority: row.get(7)?,
+            estimate: row.get(8)?,
+            labels_json: row.get(9)?,
+            assignee: row.get(10)?,
+            related_json: row.get(11)?,
+            blocks_json: row.get(12)?,
+            blocked_by_json: row.get(13)?,
+            repo: row.get(14)?,
+            source_path: row.get(15)?,
+            source_digest: row.get(16)?,
+            claim_agent: row.get(17)?,
+            claim_run_id: row.get(18)?,
+            claim_acquired_at: row.get(19)?,
+            claim_expires_at: row.get(20)?,
+            created_at: row.get(21)?,
+            updated_at: row.get(22)?,
+            parent: row.get(23)?,
         })
     }
 
@@ -2370,12 +2364,6 @@ impl CardRecord {
                     value: self.status,
                 })?,
             )
-            .with_autonomy(AutonomyClass::parse(&self.autonomy).ok_or(
-                StoreError::InvalidStoredValue {
-                    field: "cards.autonomy",
-                    value: self.autonomy,
-                },
-            )?)
             .with_priority(Priority::parse(&self.priority).ok_or(
                 StoreError::InvalidStoredValue {
                     field: "cards.priority",
