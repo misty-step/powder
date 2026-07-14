@@ -21,6 +21,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Leak gate self-test
+        run: bash scripts/leak-gate.sh --self-test
+
+      - name: Leak gate scan
+        run: bash scripts/leak-gate.sh
+
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 

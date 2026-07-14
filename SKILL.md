@@ -40,12 +40,20 @@ claimed).
 
 ## Expected MCP Tools
 
-Default agent persona:
+Default agent persona (20 tools):
 
 - `list_ready`: return claimable cards from active repositories sorted by
-  priority, age, and identifier.
-- `list_cards`: enumerate cards by optional status/repo filter, including
-  `blocked`, `review`, and `done` cards `list_ready` never surfaces.
+  priority, age, and identifier; optionally filtered by `estimate`
+  (`S`/`M`/`L`/`XL`).
+- `list_cards`: enumerate cards by optional status/autonomy/repo/`estimate`
+  filter, including `blocked`, `review`, and `done` cards `list_ready` never
+  surfaces.
+- `board_stats`: return board-shape counts (by status and repo), not card
+  contents; call this before `list_cards` when you only need the shape of
+  the board.
+- `create_card`: create one card with optional acceptance criteria, proof
+  plan, relations, parent (decomposing an epic), repository, estimate, and
+  initial status; returns a minimal ack -- `get_card` for full state.
 - `list_repositories`: list repository entities with aliases, visibility,
   tier, import provenance, and status counts.
 - `manage_claim`: acquire, renew, heartbeat, release, or transfer a claim with
@@ -55,11 +63,22 @@ Default agent persona:
 - `get_card`: read one card with runs, activities, links, comments, and claim
   state; a parent card also returns bounded child summaries plus a
   deterministic `epic_state` rollup packet (status counts, acceptance sums,
-  child evidence with provenance, freshness, and parent/child mismatch flags).
-- `get_run`: read one run with its card, activities, links, comments, and run state.
+  child evidence with provenance, freshness, and parent/child mismatch
+  flags). `detail` defaults to `concise` (newest-first, most recent 20 per
+  history section plus totals/hint when truncated); pass `detail: detailed`
+  for full history.
+- `get_run`: read one run with its card, activities, links, comments, and run
+  state. `detail` defaults to `concise` (newest-first, most recent 20 per
+  history section plus totals/hint when truncated); pass `detail: detailed`
+  for full history.
 - `list_awaiting_input`: list runs paused for human or agent input.
+- `list_approvals`: list awaiting-input runs with card autonomy, the latest
+  question text, run id, and approval-prefixed packet links -- a
+  review-focused view over the same runs `list_awaiting_input` surfaces.
 - `answer_input`: append an actor-attributed answer and resume the run.
 - `update_status`: set a card to any status in one call and record an audit event.
+- `check_criterion`: mark one acceptance criterion checked or unchecked and
+  audit actor/time; returns a minimal ack -- `get_card` for full state.
 - `update_relations`: replace a card's `related`, `blocks`, and `blocked_by`
   relation lists, and/or set the hierarchy edge: `parent` links the card
   under an epic, `clear_parent` unlinks it. A hierarchy-only call leaves the
@@ -79,7 +98,7 @@ Default agent persona:
   authenticated actor may patch; every patch is audited with actor and field
   list, so recording an operator ruling never requires the admin key.
 
-Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all`:
+Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all` (9 tools):
 
 - `upsert_repository`: create or update repository settings.
 - `merge_repository_alias`: merge duplicate repo strings into one canonical
