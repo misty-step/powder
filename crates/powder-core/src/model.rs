@@ -851,7 +851,10 @@ impl Card {
     /// along with its content.
     pub fn protects_lifecycle_on_reimport(&self) -> bool {
         self.claim.is_some()
-            || matches!(self.status, CardStatus::InProgress | CardStatus::AwaitingInput)
+            || matches!(
+                self.status,
+                CardStatus::InProgress | CardStatus::AwaitingInput
+            )
             || self.status.is_terminal()
     }
 

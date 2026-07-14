@@ -34,7 +34,7 @@ INSERT INTO cards (
 SELECT
   status || '-' || printf('%03d', n),
   'Synthetic ' || status || ' card ' || printf('%03d', n),
-  'Sanitized fixture body for status-model rehearsal.',
+  'Sanitized fixture body for status-vocabulary rehearsal.',
   '["synthetic acceptance oracle"]',
   status,
   CASE n % 4 WHEN 0 THEN 'P0' WHEN 1 THEN 'P1' WHEN 2 THEN 'P2' ELSE 'P3' END,

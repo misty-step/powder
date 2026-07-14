@@ -394,10 +394,14 @@ fn seed_grooming_scan(db_path: &Path) -> EvalResult<()> {
         // carrying Ready-shaped acceptance.
         seed_card(
             store,
-            CardSeed::new("groom-blocked-blocker", "Blocks the P0 target", CardStatus::Backlog)
-                .priority(Priority::P0)
-                .repo(TARGET_REPO)
-                .created_at(SEED_NOW + 4),
+            CardSeed::new(
+                "groom-blocked-blocker",
+                "Blocks the P0 target",
+                CardStatus::Backlog,
+            )
+            .priority(Priority::P0)
+            .repo(TARGET_REPO)
+            .created_at(SEED_NOW + 4),
         )?;
         seed_card(
             store,

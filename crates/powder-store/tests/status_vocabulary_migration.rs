@@ -1,6 +1,6 @@
 //! powder-status-vocabulary: rehearses the real schema v16->v17 migration
 //! (`Store::migrate`'s `migrate_16_to_17` step) against a sanitized,
-//! synthetic 406-card snapshot shaped like a real deployed instance still on
+//! synthetic 407-card snapshot shaped like a real deployed instance still on
 //! the nine-status vocabulary.
 //!
 //! This replaces the dormant `status_model_020` rehearsal machinery
@@ -64,9 +64,7 @@ fn claim_rows(connection: &Connection) -> Vec<ClaimRow> {
 
 fn relation_rows(connection: &Connection) -> Vec<RelationRow> {
     let mut statement = connection
-        .prepare(
-            "SELECT id, related_json, blocks_json, blocked_by_json FROM cards ORDER BY id",
-        )
+        .prepare("SELECT id, related_json, blocks_json, blocked_by_json FROM cards ORDER BY id")
         .expect("prepare relation rows");
     statement
         .query_map([], |row| {
@@ -82,7 +80,9 @@ fn status_counts(connection: &Connection) -> BTreeMap<String, usize> {
         .prepare("SELECT status, COUNT(*) FROM cards GROUP BY status ORDER BY status")
         .expect("prepare status counts");
     statement
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })
         .expect("query status counts")
         .collect::<rusqlite::Result<BTreeMap<_, _>>>()
         .expect("collect status counts")
@@ -135,10 +135,7 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
     };
 
     assert_eq!(before_status_counts.get("abandoned").copied(), Some(27));
-    assert_eq!(
-        before_status_counts.get("awaiting_input").copied(),
-        Some(2)
-    );
+    assert_eq!(before_status_counts.get("awaiting_input").copied(), Some(2));
     assert_eq!(before_status_counts.get("backlog").copied(), Some(170));
     assert_eq!(before_status_counts.get("blocked").copied(), Some(17));
     assert_eq!(before_status_counts.get("claimed").copied(), Some(9));
@@ -251,7 +248,10 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
         )
         .expect("migration audit event for blocked-empty-001");
     assert_eq!(event_actor, "system:status-vocabulary-migration");
-    assert_eq!(event_payload, "status-vocabulary migration: blocked -> backlog");
+    assert_eq!(
+        event_payload,
+        "status-vocabulary migration: blocked -> backlog"
+    );
 
     // powder-status-vocabulary regression (acceptance #3): a former-blocked
     // card whose blocker is still live must NOT surface in list_ready even

@@ -18,9 +18,10 @@ webhooks, and the SSE tail. The schema identifier is
 }
 ```
 
-`card.status` is a string. The 020 state-model collapse may change Powder's
-internal status vocabulary later, but it does not require a v1 schema break as
-long as the payload continues to carry status as a string.
+`card.status` is a string. The status-vocabulary collapse to seven states
+(schema v17; see `status-vocabulary.md`) changed which strings appear, but it
+did not require a v1 schema break because the payload carries status as a
+plain string.
 
 ## Vocabulary
 

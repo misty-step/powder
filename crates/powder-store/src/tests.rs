@@ -53,7 +53,12 @@ fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
         let card = store.get_card(&card_id)?.expect("persisted card");
         assert_eq!(card.status, CardStatus::InProgress);
         assert!(card.claim.is_some());
-        store.update_status(&card_id, CardStatus::InProgress, 20, &Authority::unchecked())?;
+        store.update_status(
+            &card_id,
+            CardStatus::InProgress,
+            20,
+            &Authority::unchecked(),
+        )?;
         let link = store.add_link(&card_id, "proof", "https://example.test/proof", 21)?;
         assert_eq!(link.card_id, card_id);
         let awaiting = store.request_input(
@@ -349,7 +354,12 @@ fn list_approvals_surfaces_packet_links_and_drains_after_answer() -> Result<()> 
     store.import_cards(vec![ready_card("001", 2), ready_card("002", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     let unlinked_claim = store.claim_card(
         &unlinked_card_id,
         "agent-b",
@@ -399,7 +409,12 @@ fn approval_queue_and_answer_input_reject_stale_awaiting_run_after_reclaim() -> 
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let first = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     store.add_link(
         &card_id,
         "approval/packet",
@@ -2399,7 +2414,12 @@ fn expired_running_claim_can_be_reclaimed_from_sqlite_store() -> Result<()> {
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let first = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let ready = store.list_ready(ReadyQuery::new(15, 10))?;
     assert_eq!(
@@ -2436,7 +2456,12 @@ fn release_claim_on_an_already_expired_claim_succeeds_as_a_no_op() -> Result<()>
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let released = store.release_claim(&card_id, &claim.run_id, 30, &Authority::unchecked())?;
 
@@ -2459,7 +2484,12 @@ fn renew_claim_on_an_already_expired_claim_returns_a_distinct_recoverable_error(
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let renewed = store.renew_claim(&card_id, &claim.run_id, 30, 60, &Authority::unchecked());
 
@@ -2485,7 +2515,12 @@ fn heartbeat_claim_on_an_already_expired_claim_returns_a_distinct_recoverable_er
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let heartbeat = store.heartbeat_claim(&card_id, &claim.run_id, 30, &Authority::unchecked());
 
@@ -2573,7 +2608,12 @@ fn release_to_ready_clears_claim_immediately() -> Result<()> {
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     let released = store.update_status(&card_id, CardStatus::Ready, 12, &Authority::unchecked())?;
 
     assert_eq!(released.status, CardStatus::Ready);
@@ -2830,7 +2870,12 @@ fn answer_input_preserves_question_and_resumes_run() -> Result<()> {
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     store.add_link(&card_id, "context", "https://example.test/context", 12)?;
     store.request_input(
         &claim.run_id,
@@ -2915,7 +2960,12 @@ fn completion_after_same_second_release_reclaim_completes_current_run() -> Resul
     let first = store.claim_card(&card_id, "agent-a", 10, 60, &Authority::unchecked())?;
     store.release_claim(&card_id, &first.run_id, 10, &Authority::unchecked())?;
     let second = store.claim_card(&card_id, "agent-b", 10, 60, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 10, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        10,
+        &Authority::unchecked(),
+    )?;
     store.complete_card(
         &card_id,
         Some("https://example.test/proof"),
@@ -3642,7 +3692,12 @@ fn reimport_over_a_terminal_card_keeps_its_outcome() -> Result<()> {
     let card_id = CardId::new("001")?;
     store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     store.complete_card(
         &card_id,
         Some("https://example.test/proof"),
@@ -3825,7 +3880,12 @@ fn preview_import_reports_without_mutating_the_store() -> Result<()> {
     let card_id = CardId::new("001")?;
     store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
     store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::InProgress, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let preview = store.preview_import(&[sourced_card("001", 2, "sha256:v2-edited")])?;
     assert_eq!(

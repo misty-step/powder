@@ -543,7 +543,9 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             (!values.is_empty()).then(|| values.into_iter().map(str::to_string).collect())
         },
         proof_plan: flag_value(args, "--proof-plan").map(|value| vec![value.to_string()]),
-        status: flag_value(args, "--status").map(parse_status_flag).transpose()?,
+        status: flag_value(args, "--status")
+            .map(parse_status_flag)
+            .transpose()?,
         priority: flag_value(args, "--priority")
             .map(|raw| {
                 Priority::parse(raw)
@@ -691,7 +693,9 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
 /// without opening the database file directly.
 fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
-    let status = flag_value(args, "--status").map(parse_status_flag).transpose()?;
+    let status = flag_value(args, "--status")
+        .map(parse_status_flag)
+        .transpose()?;
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
@@ -2141,8 +2145,14 @@ mod tests {
         assert!(all.contains("in-progress-1"));
         assert!(all.contains("ready-1"));
 
-        let in_progress_only =
-            run(&args(["list-cards", "--db", &db, "--status", "in_progress"])).unwrap();
+        let in_progress_only = run(&args([
+            "list-cards",
+            "--db",
+            &db,
+            "--status",
+            "in_progress",
+        ]))
+        .unwrap();
         assert!(in_progress_only.contains("in-progress-1"));
         assert!(!in_progress_only.contains("ready-1"));
 
