@@ -1236,7 +1236,7 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
 }
 
 #[tokio::test]
-async fn ready_promotion_in_backburner_repository_returns_conflict() {
+async fn ready_promotion_and_claim_succeed_in_backburner_repository() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
@@ -1253,6 +1253,7 @@ async fn ready_promotion_in_backburner_repository_returns_conflict() {
     assert_eq!(created.status(), StatusCode::OK);
 
     let promoted = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards/sploot-freeze/status",
@@ -1261,12 +1262,22 @@ async fn ready_promotion_in_backburner_repository_returns_conflict() {
         ))
         .await
         .unwrap();
-    assert_eq!(promoted.status(), StatusCode::CONFLICT);
+    assert_eq!(promoted.status(), StatusCode::OK);
     let promoted = response_json(promoted).await;
-    assert!(promoted["error"]
-        .as_str()
-        .unwrap()
-        .contains("repository sploot is backburner"));
+    assert_eq!(promoted["status"], "ready");
+
+    let claimed = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/sploot-freeze/claim",
+            Some(&admin_key),
+            r#"{"agent":"agent-a","ttl_seconds":60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed = response_json(claimed).await;
+    assert_eq!(claimed["agent"], "agent-a");
 }
 
 #[tokio::test]

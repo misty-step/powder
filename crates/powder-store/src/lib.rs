@@ -28,7 +28,7 @@ pub use events::{
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
 pub use identity::{Actor, ActorKind, ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
-use repositories::{ensure_repository_entity, repository_tier, resolve_repository_name};
+use repositories::{ensure_repository_entity, resolve_repository_name};
 pub use repositories::{
     RepositoryMergeOutcome, RepositorySummary, RepositoryTier, RepositoryUpsert,
     RepositoryVisibility,
@@ -645,9 +645,6 @@ impl Store {
             patched_fields.push("labels");
         }
         if let Some(status) = patch.status {
-            if status == CardStatus::Ready {
-                ensure_ready_repository_allowed(&transaction, &card)?;
-            }
             card.status.validate_transition(status)?;
             card.status = status;
             patched_fields.push("status");
@@ -776,9 +773,6 @@ impl Store {
                 .estimate
                 .is_some_and(|estimate| card.estimate != Some(estimate))
             {
-                continue;
-            }
-            if !card_repository_allows_ready(&self.connection, &card)? {
                 continue;
             }
             cards.push(card);
@@ -993,7 +987,6 @@ impl Store {
         }
 
         let run_id = RunId::new(format!("run-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?;
-        ensure_ready_repository_allowed(&transaction, &card)?;
         let claim = card.apply_claim(agent.clone(), run_id.clone(), now, ttl_seconds, |id| {
             terminal_blockers.contains(id)
         })?;
@@ -1039,9 +1032,6 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         let previous = card.status;
-        if status == CardStatus::Ready {
-            ensure_ready_repository_allowed(&transaction, &card)?;
-        }
         let released_claim = card.apply_status(status, now)?;
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
@@ -1121,7 +1111,6 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         authority.require_holder(card.claim_holder())?;
-        ensure_ready_repository_allowed(&transaction, &card)?;
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
@@ -1891,29 +1880,6 @@ fn card_from_record(connection: &Connection, record: CardRecord) -> Result<Card>
         card.repo = resolve_repository_name(connection, repo)?;
     }
     Ok(card)
-}
-
-fn card_repository_allows_ready(connection: &Connection, card: &Card) -> Result<bool> {
-    let Some(repo) = card.repo.as_deref() else {
-        return Ok(true);
-    };
-    Ok(repository_tier(connection, repo)?.allows_ready())
-}
-
-fn ensure_ready_repository_allowed(connection: &Connection, card: &Card) -> Result<()> {
-    let Some(repo) = card.repo.as_deref() else {
-        return Ok(());
-    };
-    let tier = repository_tier(connection, repo)?;
-    if tier.allows_ready() {
-        Ok(())
-    } else {
-        Err(DomainError::conflict(format!(
-            "repository {repo} is {}; only active repositories may move cards to ready",
-            tier.as_str()
-        ))
-        .into())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

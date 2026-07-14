@@ -32,6 +32,10 @@ impl RepositoryVisibility {
     }
 }
 
+/// Operator-facing shelving signal. Tier is ranking and filter metadata only:
+/// it orders repository listings and board stats, but it never gates claims,
+/// releases, or ready transitions — an explicitly ready card is claimable in
+/// any tier. Hiding a repository is the separate `visibility` axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryTier {
@@ -58,10 +62,6 @@ impl RepositoryTier {
             Self::Backburner => "backburner",
             Self::Archived => "archived",
         }
-    }
-
-    pub fn allows_ready(self) -> bool {
-        self == Self::Active
     }
 }
 
@@ -506,26 +506,6 @@ pub(crate) fn resolve_repository_name(
         return Ok(Some(name));
     }
     Ok(Some(canonical))
-}
-
-pub(crate) fn repository_tier(connection: &Connection, raw_repo: &str) -> Result<RepositoryTier> {
-    let Some(name) = resolve_repository_name(connection, raw_repo)? else {
-        return Ok(RepositoryTier::Backburner);
-    };
-    let raw_tier = connection
-        .query_row(
-            "SELECT tier FROM repositories WHERE name = ?1",
-            [name.as_str()],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let Some(raw_tier) = raw_tier else {
-        return Ok(RepositoryTier::Backburner);
-    };
-    RepositoryTier::parse(&raw_tier).ok_or_else(|| StoreError::InvalidStoredValue {
-        field: "repositories.tier",
-        value: raw_tier,
-    })
 }
 
 pub(crate) fn normalize_repository_token(raw: &str) -> Result<String> {
