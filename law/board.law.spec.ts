@@ -461,3 +461,52 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
 
   await assertLaw(page, { consoleErrors: errors });
 });
+
+// Review regression (powder-ui-awaiting-you): the header's right cluster now
+// holds up to five items -- live indicator, awaiting badge, quick-add,
+// filter, settings. Its worst case is a 390px viewport with the live
+// indicator in its long "live · last event Xs ago" form AND the awaiting
+// badge showing: before .pw-top-right learned to flex-wrap, that combination
+// pushed #settings-toggle fully off-viewport with no scrollbar to reach it
+// (the app shell is overflow:hidden). This reproduces exactly that state and
+// asserts every header control stays inside the viewport.
+test("board · mobile-390 · header controls stay on-screen with the long live indicator and awaiting badge (powder-ui-awaiting-you review)", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 900 });
+  const errors = await boot(page, "light");
+
+  // awaiting badge visible (fixture seeds one awaiting-input run)
+  await expect(page.locator("#awaiting-badge")).toBeVisible();
+
+  // force the live indicator into its long form: land a real SSE event
+  await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
+    timeout: 15_000,
+  });
+  const created = await page.request.post("/api/v1/cards", {
+    data: {
+      id: `law-gate-headerwrap-${Date.now()}x`,
+      title: "header wrap trigger card",
+      acceptance: [],
+      status: "backlog",
+    },
+  });
+  expect(created.ok()).toBe(true);
+  await expect(page.locator("#live-indicator")).toContainText("last event", {
+    timeout: 15_000,
+  });
+
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  for (const id of ["#settings-toggle", "#filter-btn", "#quick-add-toggle", "#awaiting-badge", "#live-indicator"]) {
+    const box = await page.locator(id).boundingBox();
+    expect(box, `${id} must have a bounding box`).not.toBeNull();
+    expect(box!.x, `${id} must not start left of the viewport`).toBeGreaterThanOrEqual(0);
+    expect(
+      box!.x + box!.width,
+      `${id} must end inside the ${viewport!.width}px viewport`,
+    ).toBeLessThanOrEqual(viewport!.width);
+  }
+
+  await assertLaw(page, { consoleErrors: errors });
+});

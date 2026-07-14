@@ -26,7 +26,13 @@ const KEY_MINT_COMMAND =
 // event type.
 const LIVE_RETRY_BASE_MS = 1000;
 const LIVE_RETRY_MAX_MS = 30_000;
+// Backoff only resets once a connection proves itself: one delivered SSE
+// block, or surviving this long (see connectLive).
+const LIVE_PROVEN_MS = 5_000;
 const LIVE_REFRESH_DEBOUNCE_MS = 500;
+// Debounce max-wait: under a continuous event stream, force a refresh at
+// least this often instead of trailing-edge-debouncing forever.
+const LIVE_REFRESH_MAX_WAIT_MS = 2_000;
 const LIVE_HIGHLIGHT_MS = 2_200;
 const LIVE_PRIME_LIMIT = 500;
 
@@ -365,6 +371,7 @@ let liveRetryDelay = LIVE_RETRY_BASE_MS;
 let liveCursor = 0;
 let liveGeneration = 0;
 let liveRefreshTimer = null;
+let liveRefreshDeadline = 0;
 let liveTickTimer = null;
 let lastLiveEventAt = 0;
 let liveState = "connecting";
@@ -422,7 +429,14 @@ async function connectLive() {
     scheduleLiveReconnect(generation);
     return;
   }
-  liveRetryDelay = LIVE_RETRY_BASE_MS;
+  // Do NOT reset the backoff on headers alone: a proxy that accepts the
+  // request and then kills the stream immediately would otherwise collapse
+  // the delay back to base on every attempt -- a tight ~1req/s reconnect
+  // loop forever. The connection has to prove itself first: either deliver
+  // at least one SSE block (a domain event or the server's own keep-alive
+  // both count) or survive LIVE_PROVEN_MS of wall-clock time.
+  const connectedAt = Date.now();
+  let proven = false;
   updateLiveIndicator("live");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -435,14 +449,23 @@ async function connectLive() {
       buffer += decoder.decode(value, { stream: true });
       let sep;
       while ((sep = buffer.indexOf("\n\n")) !== -1) {
-        handleLiveBlock(buffer.slice(0, sep));
+        const block = buffer.slice(0, sep);
         buffer = buffer.slice(sep + 2);
+        if (!block.trim()) continue;
+        if (!proven) {
+          proven = true;
+          liveRetryDelay = LIVE_RETRY_BASE_MS;
+        }
+        handleLiveBlock(block);
       }
     }
   } catch (_err) {
     // network drop mid-stream -- fall through to reconnect
   }
   if (generation !== liveGeneration) return;
+  if (!proven && Date.now() - connectedAt >= LIVE_PROVEN_MS) {
+    liveRetryDelay = LIVE_RETRY_BASE_MS;
+  }
   scheduleLiveReconnect(generation);
 }
 
@@ -465,11 +488,24 @@ function handleLiveBlock(block) {
   scheduleLiveRefresh();
 }
 
+// Trailing-edge debounce with a max-wait ceiling: each event pushes the
+// refresh out by LIVE_REFRESH_DEBOUNCE_MS, but a sustained stream of
+// sub-debounce-interval events can never starve the refresh past
+// LIVE_REFRESH_MAX_WAIT_MS from the first pending event -- without the
+// ceiling, a busy instance emitting events faster than the debounce window
+// would keep an out-of-date board indefinitely.
 function scheduleLiveRefresh() {
-  clearTimeout(liveRefreshTimer);
+  const now = Date.now();
+  if (liveRefreshTimer === null) {
+    liveRefreshDeadline = now + LIVE_REFRESH_MAX_WAIT_MS;
+  } else {
+    clearTimeout(liveRefreshTimer);
+  }
+  const wait = Math.max(0, Math.min(LIVE_REFRESH_DEBOUNCE_MS, liveRefreshDeadline - now));
   liveRefreshTimer = setTimeout(() => {
+    liveRefreshTimer = null;
     refreshLive();
-  }, LIVE_REFRESH_DEBOUNCE_MS);
+  }, wait);
 }
 
 function updateLiveIndicator(nextState) {

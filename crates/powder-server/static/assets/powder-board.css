@@ -98,10 +98,19 @@ html:not([data-pw-route='card']) .pw-detail-app {
   padding-bottom: 0.75em;
 }
 
+/* flex-wrap (powder-ui-awaiting-you review): this cluster now holds up to
+   five items -- live indicator (whose "last event Xs ago" long form is the
+   widest), awaiting badge, quick-add, filter, and settings. Without
+   wrapping, a 390px viewport pushes #settings-toggle past the right edge,
+   and the app shell's overflow:hidden means no scrollbar exists to reach
+   it. Wrapping costs nothing on desktop (it only engages when out of
+   space) and keeps every control on-screen at any width. */
 .pw-top-right {
   display: inline-flex;
   align-items: center;
-  gap: var(--ae-space-4);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--ae-space-2) var(--ae-space-4);
   padding-bottom: 0.65em;
 }
 
