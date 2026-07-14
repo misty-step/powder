@@ -42,7 +42,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 GITHUB_REPO="misty-step/powder"
-INSTALL_DIR="${CARGO_INSTALL_ROOT:-$HOME/.cargo}/bin"
+# Must resolve exactly like `cargo install` itself does --
+# CARGO_INSTALL_ROOT, then CARGO_HOME, then ~/.cargo -- or with CARGO_HOME
+# set, cargo would install binaries into $CARGO_HOME/bin while this
+# script's before/after reports and --verify looked in ~/.cargo/bin,
+# reporting "not installed" against a successful install.
+INSTALL_DIR="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
 CURL_BIN="${POWDER_INSTALL_CURL_BIN:-curl}"
 
 ALLOW_DIRTY=0
@@ -88,12 +93,16 @@ report_version() {
   fi
 }
 
-echo "before:"
-report_version powder "$INSTALL_DIR/powder"
-report_version powder-mcp "$INSTALL_DIR/powder-mcp"
-if [[ "$WITH_SERVER" == "1" ]]; then
-  report_version powder-server "$INSTALL_DIR/powder-server"
-fi
+report_installed() {
+  printf '%s:\n' "$1"
+  report_version powder "$INSTALL_DIR/powder"
+  report_version powder-mcp "$INSTALL_DIR/powder-mcp"
+  if [[ "$WITH_SERVER" == "1" ]]; then
+    report_version powder-server "$INSTALL_DIR/powder-server"
+  fi
+}
+
+report_installed before
 
 HEAD_SHA="$(git rev-parse --short=12 HEAD)"
 TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
@@ -126,7 +135,15 @@ install_from_source() {
     # cuts a 3-binary install from three full dependency-graph compiles
     # (powder-core, tokio, rustls, sqlite... each duplicated three times)
     # down to one.
-    cargo install --path "crates/$crate" --locked --force --target-dir "$ROOT/target"
+    if ! cargo install --path "crates/$crate" --locked --force --target-dir "$ROOT/target"; then
+      # A mid-loop failure leaves the workstation partially converged
+      # (earlier crates replaced, this one and later ones stale). Print
+      # the partial state before failing so the operator can see exactly
+      # which binaries moved, instead of guessing from a bare cargo error.
+      printf 'install-workstation: FAILED installing %s -- workstation is partially converged\n' "$crate" >&2
+      report_installed "after (partial)" >&2
+      exit 1
+    fi
   done
 }
 
@@ -175,12 +192,7 @@ else
   install_from_source
 fi
 
-echo "after:"
-report_version powder "$INSTALL_DIR/powder"
-report_version powder-mcp "$INSTALL_DIR/powder-mcp"
-if [[ "$WITH_SERVER" == "1" ]]; then
-  report_version powder-server "$INSTALL_DIR/powder-server"
-fi
+report_installed after
 
 if [[ "$VERIFY" == "1" ]]; then
   echo "verify: exercising the installed binary's repeated --acceptance handling..."

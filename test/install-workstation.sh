@@ -95,11 +95,13 @@ SH
 chmod +x "$FAKES/git"
 
 # Fake `cargo`: `install --path crates/<crate> --locked --force` drops a
-# copy of $POWDER_TEST_FAKE_BIN_TEMPLATE at the right binary name under
-# $CARGO_INSTALL_ROOT/bin (mapping crate `powder-cli` -> binary `powder`,
-# same as the real workspace), and appends one line per call to
+# copy of $POWDER_TEST_FAKE_BIN_TEMPLATE at the right binary name (mapping
+# crate `powder-cli` -> binary `powder`, same as the real workspace) under
+# the same install root real cargo would pick -- CARGO_INSTALL_ROOT, then
+# CARGO_HOME, then ~/.cargo -- and appends one line per call to
 # $POWDER_TEST_CARGO_LOG so scenarios can assert exactly which crates a
-# given run actually built.
+# given run actually built. POWDER_TEST_CARGO_FAIL_CRATE makes the install
+# of that one crate fail, to exercise mid-loop failure handling.
 cat >"$FAKES/cargo" <<'SH'
 #!/usr/bin/env bash
 if [[ "$1" == "install" ]]; then
@@ -112,11 +114,15 @@ if [[ "$1" == "install" ]]; then
     esac
   done
   crate="$(basename "$path")"
+  if [[ "$crate" == "${POWDER_TEST_CARGO_FAIL_CRATE:-}" ]]; then
+    printf 'error: fake build failure for %s\n' "$crate" >&2
+    exit 101
+  fi
   case "$crate" in
     powder-cli) bin_name="powder" ;;
     *) bin_name="$crate" ;;
   esac
-  install_dir="${CARGO_INSTALL_ROOT:-$HOME/.cargo}/bin"
+  install_dir="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
   mkdir -p "$install_dir"
   cp "$POWDER_TEST_FAKE_BIN_TEMPLATE" "$install_dir/$bin_name"
   chmod +x "$install_dir/$bin_name"
@@ -271,7 +277,37 @@ else
   echo "SKIP release-tarball scenario: no published release.yml target for $os-$arch"
 fi
 
-# 9. Unknown flags are rejected with a clear message, not silently ignored.
+# 9. CARGO_HOME (with no CARGO_INSTALL_ROOT) must resolve exactly like
+# cargo itself: binaries land in $CARGO_HOME/bin and the after-report and
+# --verify must look there too -- the historical bug had cargo installing
+# into $CARGO_HOME/bin while the script reported/verified against
+# ~/.cargo/bin.
+out="$(run_install CARGO_HOME="$TMP/cargo-home" -- --verify)"
+grep -q 'verify: OK' <<<"$out"
+grep -q 'powder 0.1.0 (git' <<<"$out"
+[[ -x "$TMP/cargo-home/bin/powder" ]]
+[[ ! -e "$TMP/.cargo/bin/powder" ]]
+
+# 10. CARGO_INSTALL_ROOT beats CARGO_HOME, same as cargo's own precedence.
+run_install CARGO_INSTALL_ROOT="$TMP/root-precedence" CARGO_HOME="$TMP/cargo-home-loser" -- >/dev/null
+[[ -x "$TMP/root-precedence/bin/powder" ]]
+[[ ! -e "$TMP/cargo-home-loser/bin/powder" ]]
+
+# 11. A mid-loop install failure must not die silently between the before
+# and after reports: it names the crate that failed and prints the partial
+# state, so the operator can see powder was replaced while powder-mcp
+# stayed stale.
+if run_install CARGO_INSTALL_ROOT="$TMP/root-midfail" POWDER_TEST_CARGO_FAIL_CRATE=powder-mcp \
+  -- >"$TMP/midfail.out" 2>&1; then
+  echo "expected a mid-loop cargo failure to fail the script" >&2
+  exit 1
+fi
+grep -q 'FAILED installing powder-mcp' "$TMP/midfail.out"
+grep -q 'after (partial):' "$TMP/midfail.out"
+grep -q 'powder 0.1.0 (git' "$TMP/midfail.out"
+grep -q 'powder-mcp: not installed' "$TMP/midfail.out"
+
+# 12. Unknown flags are rejected with a clear message, not silently ignored.
 if run_install CARGO_INSTALL_ROOT="$TMP/root-badflag" -- --not-a-real-flag \
   >"$TMP/badflag.out" 2>&1; then
   echo "expected an unrecognized flag to fail" >&2
@@ -279,7 +315,7 @@ if run_install CARGO_INSTALL_ROOT="$TMP/root-badflag" -- --not-a-real-flag \
 fi
 grep -qi 'unknown flag' "$TMP/badflag.out"
 
-# 10. --help documents itself without doing anything.
+# 13. --help documents itself without doing anything.
 out="$(run_install CARGO_INSTALL_ROOT="$TMP/root-help" -- --help)"
 grep -qi 'allow-dirty' <<<"$out"
 [[ ! -e "$TMP/root-help/bin/powder" ]]
