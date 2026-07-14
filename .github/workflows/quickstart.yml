@@ -1,0 +1,129 @@
+name: Quickstart
+
+# This workflow is the executable form of the README quickstart: it boots a
+# freshly built powder-server and drives the exact healthz -> bootstrap key
+# -> create card -> claim -> complete lifecycle the README walks a human
+# through by hand. If this job goes red, the README quickstart is lying.
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "README.md"
+      - ".github/workflows/quickstart.yml"
+  push:
+    branches: [master]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "README.md"
+      - ".github/workflows/quickstart.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quickstart-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quickstart:
+    name: boot + card lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      # Source build is fine here: this gate proves the API contract the
+      # README promises, not the release artifact pipeline (release.yml
+      # covers that separately with prebuilt cross-target binaries).
+      - name: Build powder-server
+        run: cargo build --release --locked -p powder-server
+
+      - name: Boot powder-server against a fresh DB
+        run: |
+          set -euo pipefail
+          DB="$RUNNER_TEMP/quickstart/powder.db"
+          mkdir -p "$(dirname "$DB")"
+          echo "POWDER_DB_PATH=$DB" >> "$GITHUB_ENV"
+
+          POWDER_DB_PATH="$DB" \
+          POWDER_AUTH_MODE=api-key \
+          POWDER_DISCLOSE_BOOTSTRAP_KEY=true \
+          POWDER_BIND_ADDR=127.0.0.1:4000 \
+          PORT=4000 \
+          ./target/release/powder-server > "$RUNNER_TEMP/quickstart/server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/quickstart/server.pid"
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4000/healthz > /dev/null 2>&1; then
+              echo "server is up"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:4000/healthz
+
+      - name: Drive the quickstart card lifecycle
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/quickstart/server.log"
+
+          curl -fsS http://127.0.0.1:4000/healthz | tee /dev/stderr | grep -q '"ok":true'
+          curl -fsS http://127.0.0.1:4000/readyz | tee /dev/stderr | grep -q '"ok":true'
+
+          KEY=$(grep -o 'bootstrap API key: .*' "$LOG" | head -n1 | sed 's/^bootstrap API key: //')
+          if [ -z "$KEY" ]; then
+            echo "::error::could not find bootstrap API key in server log"
+            cat "$LOG"
+            exit 1
+          fi
+
+          CARD_ID="quickstart-ci-${{ github.run_id }}"
+
+          echo "creating card"
+          curl -fsS -X POST http://127.0.0.1:4000/api/v1/cards \
+            -H "Authorization: Bearer $KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"id\":\"$CARD_ID\",\"title\":\"Quickstart smoke card\",\"acceptance\":[\"the quickstart works\"]}" \
+            | tee /dev/stderr | grep -q '"status":"ready"'
+
+          echo "claiming card"
+          curl -fsS -X POST "http://127.0.0.1:4000/api/v1/cards/$CARD_ID/claim" \
+            -H "Authorization: Bearer $KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"agent":"quickstart-ci"}' \
+            | tee /dev/stderr | grep -q '"card_id":"'"$CARD_ID"'"'
+
+          echo "completing card"
+          curl -fsS -X POST "http://127.0.0.1:4000/api/v1/cards/$CARD_ID/complete" \
+            -H "Authorization: Bearer $KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"proof":"https://github.com/misty-step/powder/actions/runs/'"${{ github.run_id }}"'"}' \
+            | tee /dev/stderr | grep -q '"status":"done"'
+
+          echo "verifying card reads back done"
+          curl -fsS "http://127.0.0.1:4000/api/v1/cards/$CARD_ID" \
+            -H "Authorization: Bearer $KEY" \
+            | tee /dev/stderr | grep -q '"status":"done"'
+
+      - name: Stop powder-server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/quickstart/server.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/quickstart/server.pid")" 2>/dev/null || true
+          fi
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickstart-server-log
+          path: ${{ runner.temp }}/quickstart/server.log
+          if-no-files-found: ignore
