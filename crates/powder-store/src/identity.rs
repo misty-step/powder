@@ -82,6 +82,11 @@ pub struct VerifiedApiKey {
     pub actor: Actor,
     pub name: String,
     pub scope: ApiKeyScope,
+    /// The same non-secret lookup prefix `ApiKeySummary::key_prefix` exposes
+    /// -- lets a caller-facing error (e.g. a 403 lacking admin scope) name
+    /// *which* presented key was insufficient without ever handling the raw
+    /// secret (powder-918).
+    pub key_prefix: String,
 }
 
 /// Key metadata for listing: never the hash or the raw secret. `key_prefix`
@@ -157,7 +162,7 @@ impl Store {
              ORDER BY api_keys.created_at ASC, api_keys.id ASC",
         )?;
         let candidates = statement
-            .query_map([prefix], |row| {
+            .query_map([prefix.clone()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -213,6 +218,7 @@ impl Store {
                     },
                     name,
                     scope,
+                    key_prefix: prefix,
                 }));
             }
         }

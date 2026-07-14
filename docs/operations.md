@@ -357,6 +357,31 @@ that URL in the board's always-visible chrome -- for a deployment fronted by
 a portal/home surface Powder itself doesn't own (powder-942). Self-hosters
 with no such portal leave it unset and see no change.
 
+### API key lifecycle: minting, storage, and what's recoverable (powder-918)
+
+**Durable key-drop convention: hand-out-at-mint-only.** `powder key-create`
+and `powder init-db --show-secret` print a raw secret exactly once, at the
+moment of minting, and the store never persists it (see below) -- there is no
+"look it up later" recovery path. Capture it directly into the *consumer's*
+own secret store (macOS/Linux keychain, 1Password, a CI secret store) in the
+same breath as minting it. Do not park a raw key anywhere on the box itself as
+a hand-off mechanism -- not a dotfile, not `/tmp`, not `/var/run`. **Incident
+(2026-07-04):** a key was left in `/var/run` to hand off between processes;
+`/var/run` is `tmpfs` and is wiped on every reboot and every supervisor
+restart, so the key silently vanished on the next deploy and had to be
+re-minted. If a key needs to reach a second consumer, mint a fresh key for
+that consumer and hand it out at mint time again -- never try to relay an
+already-minted raw value you no longer hold.
+
+Because there is no durable drop location, `key-create` refuses to mint at
+all unless the caller passes exactly one of `--show-secret` (print the raw
+key once, with a store-it-now warning) or `--redacted` (explicit
+acknowledgment that the secret will be discarded). Minting with neither flag
+used to silently print `redacted` and throw the only copy away; refusing is
+the honest behavior; a default that prints secrets unasked is worse.
+
+See [docs/self-hosting.md](self-hosting.md#secrets-at-rest) for what is and isn't recoverable at rest.
+
 ### A scoped key for the board UI on a phone (powder-925)
 
 The board's write actions (quick-add a card, change a card's status, claim,

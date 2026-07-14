@@ -174,7 +174,18 @@ pub fn help() -> String {
         "  powder version   # confirm the installed binary's build against `git rev-parse --short=12 HEAD` before starting a lane\n",
     );
     help.push_str("  powder init-db --db ./data/powder.db --show-secret\n");
-    help.push_str("  powder key-create --db ./data/powder.db --name codex --scope agent\n");
+    help.push_str(
+        "  powder key-create --db ./data/powder.db --name codex --scope agent --show-secret  \
+         (prints the raw secret once — store it immediately, it cannot be recovered)\n",
+    );
+    help.push_str(
+        "  powder key-create --db ./data/powder.db --name codex --scope agent --redacted  \
+         (mints the key but discards the secret; only use this if you don't need the raw value)\n",
+    );
+    help.push_str(
+        "  key-create requires exactly one of --show-secret or --redacted; it refuses to mint \
+         without an explicit choice\n",
+    );
     help.push_str("  powder key-list --db ./data/powder.db\n");
     help.push_str("  powder key-revoke key-id --db ./data/powder.db\n");
     help.push_str(
@@ -283,6 +294,32 @@ fn init_db(args: &[String]) -> Result<String, ShellError> {
 
 fn key_create(args: &[String]) -> Result<String, ShellError> {
     let show_secret = has_flag(args, "--show-secret");
+    let redacted = has_flag(args, "--redacted");
+
+    // The raw secret exists only in the instant `create_api_key` returns; the
+    // store persists nothing but a sha256 hash, so a key minted without
+    // capturing that value is gone forever (the dogfood incident: minting
+    // without --show-secret printed "redacted" and the secret was
+    // unrecoverable). Require the caller to make an explicit choice before
+    // we mint, rather than defaulting to either a silent discard or an
+    // unsolicited secret print.
+    match (show_secret, redacted) {
+        (true, true) => {
+            return Err(ShellError::Invalid(
+                "key-create: pass exactly one of --show-secret or --redacted, not both".to_string(),
+            ))
+        }
+        (false, false) => {
+            return Err(ShellError::Invalid(
+                "key-create: refusing to mint a key without an explicit secret-handling choice; \
+                 pass --show-secret to print the raw key once (store it immediately, it cannot \
+                 be recovered) or --redacted to acknowledge the secret will be discarded"
+                    .to_string(),
+            ))
+        }
+        _ => {}
+    }
+
     let name = flag_value(args, "--name").unwrap_or("agent");
     let scope = flag_value(args, "--scope")
         .and_then(ApiKeyScope::parse)
@@ -293,7 +330,9 @@ fn key_create(args: &[String]) -> Result<String, ShellError> {
 
     if show_secret {
         Ok(format!(
-            "api-key\t{}\t{}\t{}\n",
+            "api-key\t{}\t{}\t{}\n\
+             WARNING: this is the only time this secret is shown. Store it now \
+             (consumer secret store: keychain, 1Password, etc.) — it cannot be recovered.\n",
             key.id,
             key.scope.as_str(),
             key.raw_key
@@ -1611,7 +1650,12 @@ fn positional(args: &[String]) -> Vec<&str> {
 fn flag_takes_value(flag: &str) -> bool {
     !matches!(
         flag,
-        "--dry-run" | "--show-secret" | "--admin" | "--include-hidden" | "--unchecked"
+        "--dry-run"
+            | "--show-secret"
+            | "--redacted"
+            | "--admin"
+            | "--include-hidden"
+            | "--unchecked"
     )
 }
 
@@ -2604,6 +2648,84 @@ mod tests {
 
         let missing = run(&args(["key-revoke", "key-does-not-exist", "--db", &db])).unwrap_err();
         assert!(matches!(missing, ShellError::NotFound(_)));
+    }
+
+    /// powder-918: minting a key without saying what to do with the secret
+    /// used to silently print "redacted" and throw the only copy away
+    /// forever (the store never persists the raw value). `key-create` must
+    /// refuse rather than guess, and the refusal must name both flags so an
+    /// agent hitting this cold learns what to pass without reading source.
+    #[test]
+    fn cli_key_create_refuses_without_an_explicit_secret_choice() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-key-create-refusal-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+
+        let err = run(&args(["key-create", "--db", &db, "--name", "codex"])).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("--show-secret") && message.contains("--redacted"),
+            "refusal must name both flags: {message}"
+        );
+
+        let err_both = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex",
+            "--show-secret",
+            "--redacted",
+        ]))
+        .unwrap_err();
+        assert!(
+            err_both.to_string().contains("--show-secret")
+                && err_both.to_string().contains("--redacted"),
+            "conflicting flags must also be refused: {err_both}"
+        );
+
+        // no "codex" key was minted by either refused call (init-db already
+        // seeds an unrelated bootstrap key, so the list is not itself empty).
+        let listed = run(&args(["key-list", "--db", &db])).unwrap();
+        assert!(
+            !listed.contains("codex"),
+            "a refused key-create must not persist a key: {listed}"
+        );
+
+        let redacted = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex",
+            "--redacted",
+        ]))
+        .unwrap();
+        assert!(redacted.contains("redacted"));
+        assert!(
+            !redacted.to_lowercase().contains("sk_"),
+            "redacted output must never carry the raw secret: {redacted}"
+        );
+
+        let shown = run(&args([
+            "key-create",
+            "--db",
+            &db,
+            "--name",
+            "codex2",
+            "--show-secret",
+        ]))
+        .unwrap();
+        assert!(
+            shown.contains("Store it now"),
+            "showing the secret must carry a store-it-now warning: {shown}"
+        );
     }
 
     #[test]
