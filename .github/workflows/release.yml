@@ -167,6 +167,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          # Only the binary tarball artifacts; the docker job also uploads a
+          # *.dockerbuild provenance artifact that this step must not try to
+          # extract (it broke the v0.1.0 publish job).
+          pattern: powder-*
           merge-multiple: true
 
       - name: List staged assets
