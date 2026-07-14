@@ -137,8 +137,6 @@ fn compact_serde_attrs_keep_store_json_blob_round_trips_lossless() -> Result<()>
         "blocks",
         "blocked_by",
         "repo",
-        "workspace_path",
-        "branch_name",
         "source",
         "claim",
     ] {
@@ -1207,6 +1205,149 @@ fn migration_13_to_14_adds_parent_to_existing_databases() -> Result<()> {
     Ok(())
 }
 
+/// powder-epic-one-card-model: a v14 database (with `workspace_path` and
+/// `branch_name` still populated, mirroring what a real deployed instance
+/// carries) migrates to v15 with both columns dropped and every other
+/// field -- including `assignee`, whose fate belongs to a different epic --
+/// intact.
+#[test]
+fn migration_14_to_15_drops_workspace_path_and_branch_name_from_existing_databases() -> Result<()> {
+    let path = temp_db("v14-workspace-branch");
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE cards (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL,
+              criteria_json TEXT NOT NULL DEFAULT '[]',
+              proof_plan_json TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL,
+              autonomy TEXT NOT NULL DEFAULT 'review',
+              priority TEXT NOT NULL,
+              estimate TEXT,
+              labels_json TEXT NOT NULL,
+              assignee TEXT,
+              related_json TEXT NOT NULL,
+              blocks_json TEXT NOT NULL,
+              blocked_by_json TEXT NOT NULL,
+              repo TEXT,
+              workspace_path TEXT,
+              branch_name TEXT,
+              source_path TEXT,
+              source_digest TEXT,
+              claim_agent TEXT,
+              claim_run_id TEXT,
+              claim_acquired_at INTEGER,
+              claim_expires_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              parent TEXT
+            );
+            CREATE TABLE repositories (
+              name TEXT PRIMARY KEY,
+              visibility TEXT NOT NULL DEFAULT 'visible',
+              tier TEXT NOT NULL DEFAULT 'backburner',
+              import_provenance TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE repository_aliases (
+              alias TEXT PRIMARY KEY,
+              repository_name TEXT NOT NULL REFERENCES repositories(name) ON DELETE CASCADE,
+              created_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 14;
+            "#,
+        )?;
+        connection.execute(
+            "INSERT INTO cards (
+                id, title, body, acceptance_json, status, priority, labels_json,
+                assignee, related_json, blocks_json, blocked_by_json, repo,
+                workspace_path, branch_name, created_at, updated_at
+             ) VALUES (
+                'legacy-001', 'Legacy card', 'body text', '[\"prove it\"]', 'ready', 'p1', '[]',
+                'agent-legacy', '[]', '[]', '[]', 'powder',
+                '/tmp/legacy-workspace', 'codex/legacy-branch', 10, 10
+             )",
+            [],
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    assert!(!store.cards_has_column("workspace_path")?);
+    assert!(!store.cards_has_column("branch_name")?);
+    // assignee's fate belongs to a different epic -- it must survive.
+    assert!(store.cards_has_column("assignee")?);
+
+    let card = store
+        .get_card(&CardId::new("legacy-001")?)?
+        .expect("legacy card survives the migration");
+    assert_eq!(card.title, "Legacy card");
+    assert_eq!(card.status, CardStatus::Ready);
+    assert_eq!(card.assignee.as_deref(), Some("agent-legacy"));
+    assert_eq!(card.repo.as_deref(), Some("powder"));
+    Ok(())
+}
+
+/// A prior crashed run may have already dropped `workspace_path` but not
+/// `branch_name` (the two `ALTER TABLE ... DROP COLUMN` statements in
+/// `MIGRATE_14_TO_15` don't commit atomically together). Migrating again
+/// must finish the job instead of getting stuck re-running a `DROP COLUMN`
+/// against a column that's already gone.
+#[test]
+fn migration_14_to_15_finishes_a_half_applied_branch_name_drop() -> Result<()> {
+    let path = temp_db("v14-half-applied");
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            CREATE TABLE cards (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              acceptance_json TEXT NOT NULL,
+              criteria_json TEXT NOT NULL DEFAULT '[]',
+              proof_plan_json TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL,
+              autonomy TEXT NOT NULL DEFAULT 'review',
+              priority TEXT NOT NULL,
+              estimate TEXT,
+              labels_json TEXT NOT NULL,
+              assignee TEXT,
+              related_json TEXT NOT NULL,
+              blocks_json TEXT NOT NULL,
+              blocked_by_json TEXT NOT NULL,
+              repo TEXT,
+              branch_name TEXT,
+              source_path TEXT,
+              source_digest TEXT,
+              claim_agent TEXT,
+              claim_run_id TEXT,
+              claim_acquired_at INTEGER,
+              claim_expires_at INTEGER,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              parent TEXT
+            );
+            PRAGMA user_version = 14;
+            "#,
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    assert!(!store.cards_has_column("branch_name")?);
+    Ok(())
+}
+
 #[test]
 fn card_relations_round_trip_through_store_and_detail() -> Result<()> {
     let mut store = Store::open_in_memory()?;
@@ -1673,9 +1814,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("patch-protected")?;
-    let mut card = sourced_card("patch-protected", 2, "sha256:v1");
-    card.branch_name = Some("codex/powder-901".to_string());
-    card.workspace_path = Some("/tmp/powder-workspace".to_string());
+    let card = sourced_card("patch-protected", 2, "sha256:v1");
     store.import_cards(vec![card])?;
     let claim = store.claim_card(
         &card_id,
@@ -1708,11 +1847,6 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
     assert_eq!(
         patched.source.as_ref().map(|source| source.digest.as_str()),
         Some("sha256:v1")
-    );
-    assert_eq!(patched.branch_name.as_deref(), Some("codex/powder-901"));
-    assert_eq!(
-        patched.workspace_path.as_deref(),
-        Some("/tmp/powder-workspace")
     );
     assert_eq!(
         patched.claim.as_ref().map(|claim| &claim.run_id),

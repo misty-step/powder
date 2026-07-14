@@ -880,20 +880,16 @@ async fn create_card(
     // the operator's mobile quick-add flow without holding admin.
     let actor = authorize(&state, &headers)?;
     let now = unix_now();
-    // Default status reflects whether a real oracle exists: empty
-    // acceptance can never default to `ready` ("ready is a query, not
-    // vibes", VISION.md), regardless of the omitted-status default. An
-    // explicit status is still honored either way -- status is a label,
-    // is_ready_at is the independent gate.
+    // Default status reflects whether a real oracle exists (VISION.md:
+    // "ready is a query, not vibes") -- see
+    // `CardStatus::default_for_acceptance`. An explicit status is still
+    // honored either way -- status is a label, is_ready_at is the
+    // independent gate.
     let status = request
         .status
         .as_deref()
         .and_then(CardStatus::parse)
-        .unwrap_or(if request.acceptance.is_empty() {
-            CardStatus::Backlog
-        } else {
-            CardStatus::Ready
-        });
+        .unwrap_or_else(|| CardStatus::default_for_acceptance(&request.acceptance));
     let priority = request
         .priority
         .as_deref()
