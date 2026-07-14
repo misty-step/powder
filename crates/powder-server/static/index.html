@@ -85,6 +85,10 @@
         <svg class="ae-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
         file card
       </button>
+      <button class="pw-filter-btn" id="cmdk-toggle" type="button" aria-haspopup="dialog" aria-controls="cmdk">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+        jump <kbd>&#8984;K</kbd>
+      </button>
       <button class="pw-filter-btn" id="filter-btn" type="button" aria-expanded="false" aria-controls="filters">
         <svg class="ae-icon" aria-hidden="true"><use href="#i-filter"></use></svg>
         filter<span class="pw-filter-n" id="filter-n"></span>
@@ -135,7 +139,10 @@
     <section class="pw-repo-settings" aria-label="repository settings">
       <div class="pw-settings-head">
         <p class="ae-h">REPOSITORIES</p>
-        <span id="repo-settings-count" class="ae-num">0</span>
+        <span class="pw-settings-head-meta">
+          <span id="repo-settings-count" class="ae-num">0</span>
+          <button id="repo-empty-toggle" class="pw-filter-clear" type="button" aria-pressed="false" hidden>show empty</button>
+        </span>
       </div>
       <form id="repo-create-form" class="pw-repo-create">
         <label>
@@ -240,10 +247,32 @@
   </div>
 
   <footer class="pw-foot">
-    <span class="pw-foot-hint"><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · open cards for full detail</span>
+    <span class="pw-foot-hint"><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>&#8984;K</kbd> jump · <kbd>Esc</kbd> back</span>
     <a id="footer-home-link" class="pw-board-link" href="" hidden>sanctum</a>
     <span>powder</span>
   </footer>
+
+  <div id="cmdk" class="pw-cmdk" hidden>
+    <div class="pw-cmdk-backdrop" data-cmdk-dismiss></div>
+    <div class="pw-cmdk-panel" role="dialog" aria-modal="true" aria-label="Jump to card">
+      <div class="pw-cmdk-combobox">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+        <input
+          id="cmdk-input"
+          class="pw-cmdk-input"
+          type="text"
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="cmdk-list"
+          aria-autocomplete="list"
+          autocomplete="off"
+          placeholder="Jump to a card by id or title&hellip;"
+        >
+      </div>
+      <ul id="cmdk-list" class="pw-cmdk-list" role="listbox" aria-label="Matching cards"></ul>
+      <p id="cmdk-empty" class="pw-empty pw-cmdk-empty" hidden>No matching cards.</p>
+    </div>
+  </div>
 </div>
 
 <div id="powder-card-app" class="pw-detail-app" aria-live="polite">

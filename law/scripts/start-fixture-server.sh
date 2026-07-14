@@ -22,6 +22,17 @@ cargo run -q -p powder-cli -- create-card --db "$DB" --id 001 --title "Lifecycle
 cargo run -q -p powder-cli -- create-card --db "$DB" --id blocked-card --title "Blocked card" --acceptance "dependency clears" --status blocked >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id done-card --title "Done card" --acceptance "proof exists" --status done >/dev/null
 
+# powder-915: init-db seeds ~24 "ratified tier" repository entities
+# (powder-916), every one of them at card_count 0 until something is filed
+# under it -- so with zero-card repos hidden by default (this card), a
+# fixture that never files a card under any registered repo would leave the
+# settings list showing nothing until "show empty" is toggled, and the "a
+# seeded repo shows its count" law spec would have nothing real to assert
+# against. One card filed under the already-registered "powder" repo gives
+# it a real, nonzero, visible-by-default row alongside the ~24 still-hidden
+# empty ones.
+cargo run -q -p powder-cli -- create-card --db "$DB" --id powder-repo-example --title "Repo-scoped example card" --acceptance "proof exists" --status ready --repo powder >/dev/null
+
 # powder-ui-awaiting-you: a claimed, in-flight run parked on an operator
 # question so the awaiting-you strip/badge/answer-form law-gate specs have a
 # real elicitation to render and answer against. Deliberately no trailing
