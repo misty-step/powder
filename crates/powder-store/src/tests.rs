@@ -3435,8 +3435,134 @@ fn created_agent_key_verifies_with_agent_scope() -> Result<()> {
 
     assert_eq!(verified.scope, ApiKeyScope::Agent);
     assert_eq!(verified.name, "agent");
-    assert_eq!(verified.actor.display_name, "agent");
-    assert_eq!(verified.actor.kind.as_str(), "agent");
+    assert_eq!(verified.principal, "agent");
+    Ok(())
+}
+
+#[test]
+fn migration_17_to_18_preserves_keys_claims_and_runs_while_deleting_actor_kind() -> Result<()> {
+    let path = temp_db("principal-worker-run-v18");
+    let card_id = CardId::new("principal-migration")?;
+    let (raw_key, key_id, revoked_raw_key, revoked_key_id, run_id) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        let key = store.create_api_key("roster", ApiKeyScope::Agent, 1)?;
+        store
+            .verify_api_key(&key.raw_key, 2)?
+            .expect("key verifies");
+        let revoked = store.create_api_key("retired-roster", ApiKeyScope::Agent, 1)?;
+        store
+            .verify_api_key(&revoked.raw_key, 2)?
+            .expect("key verifies before revocation");
+        store.revoke_api_key(&revoked.id, 3)?;
+        store.import_cards(vec![ready_card(card_id.as_str(), 3)])?;
+        let claim = store.claim_card(
+            &card_id,
+            "roster",
+            4,
+            600,
+            &Authority::actor("roster", false),
+        )?;
+        (
+            key.raw_key,
+            key.id,
+            revoked.raw_key,
+            revoked.id,
+            claim.run_id,
+        )
+    };
+
+    // Reconstruct the exact identity/lease columns schema 17 carried so the
+    // production migration, rather than fresh-schema creation, is exercised.
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE actors (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              created_at INTEGER NOT NULL
+            );
+            INSERT INTO actors (id, kind, display_name, created_at)
+              SELECT 'actor-' || id, 'agent', principal, created_at FROM api_keys;
+            CREATE TABLE api_keys_v17 (
+              id TEXT PRIMARY KEY,
+              actor_id TEXT NOT NULL REFERENCES actors(id),
+              name TEXT NOT NULL,
+              key_prefix TEXT NOT NULL,
+              key_hash TEXT NOT NULL,
+              hash_algorithm TEXT NOT NULL DEFAULT 'sha256',
+              scope TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              revoked_at INTEGER,
+              last_used_at INTEGER
+            );
+            INSERT INTO api_keys_v17
+              (id, actor_id, name, key_prefix, key_hash, hash_algorithm,
+               scope, created_at, revoked_at, last_used_at)
+              SELECT id, 'actor-' || id, name, key_prefix, key_hash,
+                     hash_algorithm, scope, created_at, revoked_at, last_used_at
+              FROM api_keys;
+            DROP TABLE api_keys;
+            ALTER TABLE api_keys_v17 RENAME TO api_keys;
+            CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix, revoked_at);
+            ALTER TABLE cards DROP COLUMN claim_principal;
+            ALTER TABLE runs DROP COLUMN principal;
+            PRAGMA user_version = 17;
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+
+    let summaries = store.list_api_keys()?;
+    let active_summary = summaries
+        .iter()
+        .find(|key| key.id == key_id)
+        .expect("active key summary");
+    assert_eq!(active_summary.last_used_at, Some(2));
+    assert_eq!(active_summary.revoked_at, None);
+    let revoked_summary = summaries
+        .iter()
+        .find(|key| key.id == revoked_key_id)
+        .expect("revoked key summary");
+    assert_eq!(revoked_summary.principal, "retired-roster");
+    assert_eq!(revoked_summary.last_used_at, Some(2));
+    assert_eq!(revoked_summary.revoked_at, Some(3));
+    assert!(store.verify_api_key(&revoked_raw_key, 5)?.is_none());
+
+    let verified = store
+        .verify_api_key(&raw_key, 5)?
+        .expect("legacy key remains valid");
+    assert_eq!(verified.id, key_id);
+    assert_eq!(verified.principal, "roster");
+    let summary = store
+        .list_api_keys()?
+        .into_iter()
+        .find(|key| key.id == key_id)
+        .expect("key summary");
+    assert_eq!(summary.last_used_at, Some(5));
+
+    let card = store.get_card(&card_id)?.expect("card survives");
+    let claim = card.claim.expect("claim survives");
+    assert_eq!(claim.principal, "roster");
+    assert_eq!(claim.agent, "roster");
+    assert_eq!(claim.run_id, run_id);
+    let run = store.get_run(&run_id)?.expect("run survives");
+    assert_eq!(run.principal, "roster");
+    assert_eq!(run.agent, "roster");
+
+    let actors_left: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'actors'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(actors_left, 0, "the one-actor-per-key table is deleted");
     Ok(())
 }
 
@@ -3457,7 +3583,7 @@ fn list_api_keys_reports_metadata_never_secrets() -> Result<()> {
     assert_eq!(keys[0].last_used_at, None);
     assert_eq!(keys[1].id, agent.id);
     assert_eq!(keys[1].name, "codex");
-    assert_eq!(keys[1].actor.display_name, "codex");
+    assert_eq!(keys[1].principal, "codex");
     assert_eq!(keys[1].revoked_at, None);
     assert_eq!(keys[1].key_prefix, agent.key_prefix);
     assert_eq!(keys[1].last_used_at, None);
@@ -3648,16 +3774,13 @@ fn v1_api_keys_migrate_to_actor_bound_keys() -> Result<()> {
     // pre-existing rows), proving the loop didn't skip a step.
     let verified = store.verify_api_key(raw_key, 21)?.expect("migrated key");
     assert_eq!(verified.name, "legacy-agent");
-    assert_eq!(verified.actor.id, "actor-key-legacy");
-    assert_eq!(verified.actor.display_name, "legacy-agent");
-    assert_eq!(verified.actor.kind.as_str(), "agent");
+    assert_eq!(verified.principal, "legacy-agent");
 
     let created = store.create_api_key("new-agent", ApiKeyScope::Agent, 20)?;
     let verified = store
         .verify_api_key(&created.raw_key, 22)?
         .expect("new key after migration");
-    assert_eq!(verified.actor.display_name, "new-agent");
-    assert_eq!(verified.actor.kind.as_str(), "agent");
+    assert_eq!(verified.principal, "new-agent");
     Ok(())
 }
 
@@ -3757,13 +3880,13 @@ fn migration_1_to_2_finishes_a_backfill_that_crashed_after_the_column_add() -> R
 
     // The interrupted backfill must have been finished: no key left NULL,
     // and an actor row minted for the legacy key.
-    let null_actor_ids: i64 = store.connection.query_row(
-        "SELECT COUNT(*) FROM api_keys WHERE actor_id IS NULL",
+    let null_principals: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM api_keys WHERE principal IS NULL OR principal = ''",
         [],
         |row| row.get(0),
     )?;
     assert_eq!(
-        null_actor_ids, 0,
+        null_principals, 0,
         "the completeness guard must finish the backfill the crash interrupted"
     );
 
@@ -3774,8 +3897,7 @@ fn migration_1_to_2_finishes_a_backfill_that_crashed_after_the_column_add() -> R
         .verify_api_key(raw_key, 21)?
         .expect("legacy key must still authenticate after the finished backfill");
     assert_eq!(verified.name, "legacy-agent");
-    assert_eq!(verified.actor.id, "actor-key-legacy");
-    assert_eq!(verified.actor.display_name, "legacy-agent");
+    assert_eq!(verified.principal, "legacy-agent");
     Ok(())
 }
 
@@ -3871,7 +3993,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
     // switching new keys to sha256 must never break a key that already
     // exists in the wild on a deployed instance.
     let verified = store.verify_api_key(raw_key, 21)?.expect("legacy v2 key");
-    assert_eq!(verified.actor.display_name, "v2-agent");
+    assert_eq!(verified.principal, "v2-agent");
 
     // a key created after the migration is hashed with sha256, not bcrypt.
     let created = store.create_api_key("post-migration-agent", ApiKeyScope::Agent, 30)?;
@@ -3884,7 +4006,7 @@ fn v2_bcrypt_keys_migrate_to_sha256_capable_schema_without_breaking() -> Result<
     let verified = store
         .verify_api_key(&created.raw_key, 31)?
         .expect("new sha256 key");
-    assert_eq!(verified.actor.display_name, "post-migration-agent");
+    assert_eq!(verified.principal, "post-migration-agent");
     Ok(())
 }
 
@@ -4144,7 +4266,7 @@ fn migration_3_to_4_finishes_a_half_applied_run_column_drop() -> Result<()> {
     Ok(())
 }
 
-/// Every migration step from 1->16 must tolerate being invoked twice in a
+/// Every migration step from 1->18 must tolerate being invoked twice in a
 /// row against a database that already has its target schema (the shape a
 /// crash-and-retry boot produces once a step has fully applied but before
 /// `migrate()`'s loop reaches `SCHEMA_VERSION`) without erroring. Steps 11+
@@ -4180,6 +4302,10 @@ fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
     store.migrate_14_to_15()?;
     store.migrate_15_to_16()?;
     store.migrate_15_to_16()?;
+    store.migrate_16_to_17()?;
+    store.migrate_16_to_17()?;
+    store.migrate_17_to_18()?;
+    store.migrate_17_to_18()?;
 
     // Re-running every step twice must not have perturbed the fully
     // migrated schema: still at SCHEMA_VERSION, still able to round-trip a
@@ -4286,27 +4412,76 @@ fn admin_authority_bypasses_claim_ownership() -> Result<()> {
 }
 
 #[test]
-fn claim_card_rejects_agent_impersonation() -> Result<()> {
+fn claim_card_records_principal_separately_from_worker() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("001")?;
     store.import_cards(vec![ready_card("001", 2)])?;
 
-    let err = store.claim_card(
+    let receipt = store.claim_card(
         &card_id,
         "agent-a",
         10,
         3600,
         &Authority::actor("agent-b", false),
+    )?;
+    assert_eq!(receipt.principal, "agent-b");
+    assert_eq!(receipt.agent, "agent-a");
+
+    let wrong_principal = store.release_claim(
+        &card_id,
+        &receipt.run_id,
+        11,
+        &Authority::actor("agent-a", false),
     );
     assert!(matches!(
-        err,
+        wrong_principal,
         Err(StoreError::Domain(DomainError::Forbidden(_)))
     ));
-    assert!(store
-        .list_ready(ReadyQuery::new(10, 10))?
-        .iter()
-        .any(|card| card.id == card_id));
+    store.release_claim(
+        &card_id,
+        &receipt.run_id,
+        12,
+        &Authority::actor("agent-b", false),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn request_input_rejects_a_released_run_after_same_principal_reclaims_as_another_worker(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("001")?;
+    store.import_cards(vec![ready_card("001", 2)])?;
+    let principal = Authority::principal("roster", false);
+
+    let first = store.claim_card(&card_id, "worker-a", 10, 3600, &principal)?;
+    store.release_claim(&card_id, &first.run_id, 11, &principal)?;
+    let second = store.claim_card(&card_id, "worker-b", 12, 3600, &principal)?;
+    store.update_status(&card_id, CardStatus::InProgress, 13, &principal)?;
+
+    let error = store
+        .request_input(&first.run_id, "Approve stale run?", 14, &principal)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not the current claim"),
+        "error was: {error}"
+    );
+    assert_eq!(
+        store.get_run(&first.run_id)?.expect("first run").state,
+        RunState::Released
+    );
+    assert_eq!(
+        store.get_run(&second.run_id)?.expect("second run").state,
+        RunState::Active
+    );
+    let card = store.get_card(&card_id)?.expect("card");
+    assert_eq!(card.status, CardStatus::InProgress);
+    assert_eq!(
+        card.claim.as_ref().map(|claim| &claim.run_id),
+        Some(&second.run_id)
+    );
     Ok(())
 }
 

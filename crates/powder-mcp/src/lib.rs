@@ -86,7 +86,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "manage_claim",
-        description: "Manage the claim lease for one card. action=claim requires agent and returns run_id; action=renew, heartbeat, release, or transfer requires run_id; action=transfer also requires to_agent. ttl_seconds applies to claim, renew, and transfer. actor/admin are optional local-store authority args. Heartbeat or renew before lease expiry.",
+        description: "Manage the claim lease for one card. action=claim requires the semantic worker label agent and returns authenticated principal, agent, and run_id; one remote integration principal may coordinate multiple workers. action=renew, heartbeat, release, or transfer requires run_id; action=transfer also requires to_agent. ttl_seconds applies to claim, renew, and transfer. actor/admin are optional local-store authority args. Heartbeat or renew before lease expiry.",
         input_schema: r#"{"type":"object","required":["card_id","action"],"properties":{"card_id":{"type":"string"},"action":{"type":"string","enum":["claim","renew","heartbeat","release","transfer"]},"agent":{"type":"string"},"to_agent":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
@@ -907,14 +907,13 @@ fn relation_ack_payload(card: &Card) -> Value {
 /// Wire shape for one key row, shared by store and remote dispatch so both
 /// faces render `list_keys` identically to `GET /api/v1/keys`. `ApiKeySummary`
 /// itself stays plain-Rust (no `Serialize`) rather than growing a derive for
-/// a shape only one face renders differently than its own fields (actor here
-/// is a display-name string, not the nested `Actor` record).
+/// a shape only one face renders differently than its own fields.
 fn key_summary_json(key: powder_store::ApiKeySummary) -> Value {
     json!({
         "id": key.id,
         "name": key.name,
         "scope": key.scope.as_str(),
-        "actor": key.actor.display_name,
+        "principal": key.principal,
         "key_prefix": key.key_prefix,
         "created_at": key.created_at,
         "revoked_at": key.revoked_at,
@@ -1649,7 +1648,7 @@ mod tests {
 
         assert_eq!(key["name"], "codex");
         assert_eq!(key["scope"], "agent");
-        assert_eq!(key["actor"], "codex");
+        assert_eq!(key["principal"], "codex");
         assert_eq!(key["key_prefix"], used.key_prefix);
         assert_eq!(key["last_used_at"], 5);
         assert!(key["revoked_at"].is_null());

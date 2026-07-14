@@ -64,16 +64,15 @@ impl fmt::Display for DomainError {
 
 impl std::error::Error for DomainError {}
 
-/// The caller performing a mutation, resolved by the adapter (HTTP bearer key,
-/// CLI `--actor` flag, or MCP tool argument) into a shape the domain can check
-/// claim ownership against without depending on any adapter's identity types.
+/// The authenticated integration performing a mutation. The principal owns
+/// leases; worker labels remain explicit claim/run metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
     /// No identity enforcement: single-operator surfaces (CLI/MCP without an
     /// explicit actor, or HTTP auth disabled) that predate real identity.
     Unchecked,
-    Actor {
-        display_name: String,
+    Principal {
+        name: String,
         is_admin: bool,
     },
 }
@@ -84,8 +83,12 @@ impl Authority {
     }
 
     pub fn actor(display_name: impl Into<String>, is_admin: bool) -> Self {
-        Self::Actor {
-            display_name: display_name.into(),
+        Self::principal(display_name, is_admin)
+    }
+
+    pub fn principal(name: impl Into<String>, is_admin: bool) -> Self {
+        Self::Principal {
+            name: name.into(),
             is_admin,
         }
     }
@@ -96,16 +99,16 @@ impl Authority {
     pub fn require_identity(&self, requested: &str) -> Result<(), DomainError> {
         match self {
             Self::Unchecked => Ok(()),
-            Self::Actor { is_admin: true, .. } => Ok(()),
-            Self::Actor {
-                display_name,
+            Self::Principal { is_admin: true, .. } => Ok(()),
+            Self::Principal {
+                name,
                 is_admin: false,
             } => {
-                if display_name == requested {
+                if name == requested {
                     Ok(())
                 } else {
                     Err(DomainError::forbidden(format!(
-                        "actor {display_name} cannot act as {requested}"
+                        "principal {name} cannot act as {requested}"
                     )))
                 }
             }
@@ -117,14 +120,14 @@ impl Authority {
     pub fn require_holder(&self, holder: Option<&str>) -> Result<(), DomainError> {
         match self {
             Self::Unchecked => Ok(()),
-            Self::Actor { is_admin: true, .. } => Ok(()),
-            Self::Actor {
-                display_name,
+            Self::Principal { is_admin: true, .. } => Ok(()),
+            Self::Principal {
+                name,
                 is_admin: false,
             } => match holder {
-                Some(current) if current == display_name => Ok(()),
+                Some(current) if current == name => Ok(()),
                 _ => Err(DomainError::forbidden(format!(
-                    "actor {display_name} does not hold the active claim"
+                    "principal {name} does not hold the active claim"
                 ))),
             },
         }
@@ -133,7 +136,7 @@ impl Authority {
     pub fn actor_label(&self) -> String {
         match self {
             Self::Unchecked => "unchecked".to_string(),
-            Self::Actor { display_name, .. } => display_name.clone(),
+            Self::Principal { name, .. } => name.clone(),
         }
     }
 }
@@ -449,6 +452,10 @@ impl AcceptanceCriterion {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
+    /// The authenticated integration that acquired and owns this lease.
+    pub principal: String,
+    /// The semantic worker executing the run. Multiple workers may share one
+    /// integration principal without sharing a run or a lease.
     pub agent: String,
     pub run_id: RunId,
     pub acquired_at: i64,
@@ -844,6 +851,13 @@ impl Card {
         self.claim.as_ref().map(|claim| claim.agent.as_str())
     }
 
+    /// The authenticated integration that owns the active lease. This is
+    /// deliberately distinct from `claim_holder`, which is the semantic
+    /// worker label displayed to operators.
+    pub fn claim_principal(&self) -> Option<&str> {
+        self.claim.as_ref().map(|claim| claim.principal.as_str())
+    }
+
     /// Whether this card's lifecycle (status + claim) must survive a
     /// source refresh: an active claim, an in-progress/awaiting-input
     /// status, or a terminal outcome. A backlog/ready card with no claim has
@@ -918,12 +932,14 @@ impl Card {
 
     pub fn apply_claim(
         &mut self,
+        principal: impl Into<String>,
         agent: impl Into<String>,
         run_id: RunId,
         now: i64,
         ttl_seconds: u64,
         blocker_is_terminal: impl Fn(&CardId) -> bool,
     ) -> Result<Claim, DomainError> {
+        let principal = non_empty("principal", principal.into())?;
         let agent = non_empty("agent", agent.into())?;
         validate_ttl(ttl_seconds)?;
 
@@ -939,6 +955,7 @@ impl Card {
         self.claim_readiness(now, blocker_is_terminal)?;
 
         let claim = Claim {
+            principal,
             agent,
             run_id,
             acquired_at: now,
@@ -1058,6 +1075,7 @@ pub struct Run {
     pub id: RunId,
     pub card_id: CardId,
     pub state: RunState,
+    pub principal: String,
     pub agent: String,
     pub claim_expires_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1639,6 +1657,7 @@ mod tests {
     fn claimed_card_keeps_status_and_claim_across_reimport() {
         let mut current = card("001", CardStatus::InProgress);
         current.claim = Some(Claim {
+            principal: "principal-a".to_string(),
             agent: "agent-a".to_string(),
             run_id: RunId::new("run-1").unwrap(),
             acquired_at: 5,
@@ -1933,6 +1952,7 @@ mod tests {
         let mut card =
             card("001", CardStatus::InProgress).with_acceptance(["prove it".to_string()]);
         card.claim = Some(Claim {
+            principal: "principal-a".to_string(),
             agent: "agent-a".to_string(),
             run_id: RunId::new("run-1").unwrap(),
             acquired_at: 0,

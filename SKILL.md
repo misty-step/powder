@@ -82,6 +82,10 @@ Default agent persona (20 tools):
   tier, import provenance, and status counts.
 - `manage_claim`: acquire, renew, heartbeat, release, or transfer a claim with
   `action` set to `claim`, `renew`, `heartbeat`, `release`, or `transfer`.
+  Remote API-key mode records the authenticated integration `principal`
+  separately from the required `agent` worker label and returned `run_id`; one
+  principal may coordinate multiple workers, and lease ownership follows that
+  principal.
   This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
   `heartbeat`, `release_claim`, and `transfer_claim` tools.
 - `get_card`: read one card with runs, activities, links, comments, and claim

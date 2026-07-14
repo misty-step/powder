@@ -1572,7 +1572,7 @@ mod tests {
     fn list_keys_sends_get_with_bearer_auth() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
-            json!({"keys": [{"id": "key-1", "name": "codex", "scope": "agent", "actor": "codex", "key_prefix": "sk_powder_abc", "created_at": 1, "revoked_at": null, "last_used_at": 5}]}),
+            json!({"keys": [{"id": "key-1", "name": "codex", "scope": "agent", "principal": "codex", "key_prefix": "sk_powder_abc", "created_at": 1, "revoked_at": null, "last_used_at": 5}]}),
         )]);
         let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
 
@@ -1595,7 +1595,7 @@ mod tests {
     fn admin_toolset_allows_remote_json_rpc_dispatch_of_hidden_tools() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
-            json!({"keys": [{"id": "key-1", "name": "codex", "scope": "agent", "actor": "codex", "key_prefix": "sk_powder_abc", "created_at": 1, "revoked_at": null, "last_used_at": 5}]}),
+            json!({"keys": [{"id": "key-1", "name": "codex", "scope": "agent", "principal": "codex", "key_prefix": "sk_powder_abc", "created_at": 1, "revoked_at": null, "last_used_at": 5}]}),
         )]);
         let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
 

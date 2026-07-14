@@ -30,7 +30,7 @@ plain string.
 | `card-created` | a card is created through API, CLI, MCP, or import helpers that opt into event emission | `source` |
 | `moved-to-ready` | a card's status becomes `ready`, including explicit release to ready | `previous_status`, `status`, or release metadata |
 | `awaiting-input` | a run asks for input and the card moves to `awaiting_input` | `run_id`, `question` |
-| `claim-expired` | Powder observes an expired active claim while reclaiming the card | `run_id`, `agent`, `expired_at` |
+| `claim-expired` | Powder observes an expired active claim while reclaiming the card | `principal`, `run_id`, `agent`, `expired_at` |
 | `completed` | a card reaches a terminal completion path | `previous_status`, `status`, optional `proof` |
 | `comment-added` | an actor adds a card comment | `author`, `body` |
 
