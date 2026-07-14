@@ -19,7 +19,6 @@ mod identity;
 mod repositories;
 mod schema;
 mod secrets;
-pub mod status_model_020;
 #[cfg(test)]
 mod tests;
 
@@ -215,13 +214,9 @@ pub struct BoardStatsCounts {
     #[serde(skip_serializing_if = "is_zero")]
     pub ready: usize,
     #[serde(skip_serializing_if = "is_zero")]
-    pub claimed: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub running: usize,
+    pub in_progress: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub awaiting_input: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub blocked: usize,
     #[serde(skip_serializing_if = "is_zero")]
     pub done: usize,
     #[serde(skip_serializing_if = "is_zero")]
@@ -239,10 +234,8 @@ impl BoardStatsCounts {
         match status {
             CardStatus::Backlog => self.backlog += cards,
             CardStatus::Ready => self.ready += cards,
-            CardStatus::Claimed => self.claimed += cards,
-            CardStatus::Running => self.running += cards,
+            CardStatus::InProgress => self.in_progress += cards,
             CardStatus::AwaitingInput => self.awaiting_input += cards,
-            CardStatus::Blocked => self.blocked += cards,
             CardStatus::Done => self.done += cards,
             CardStatus::Shipped => self.shipped += cards,
             CardStatus::Abandoned => self.abandoned += cards,
@@ -252,6 +245,18 @@ impl BoardStatsCounts {
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+/// Wall-clock seconds, for migration-generated timestamps only. Every
+/// domain-facing write threads `now` in from its caller (so tests stay
+/// deterministic); `migrate()` has no caller-supplied clock to thread
+/// through, and a one-time schema migration's own audit-event timestamp is
+/// infra bookkeeping, not a domain decision.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Explicit partial update for mutable card fields. Fields left as `None`
@@ -399,6 +404,10 @@ impl Store {
                 15 => {
                     self.migrate_15_to_16()?;
                     16
+                }
+                16 => {
+                    self.migrate_16_to_17()?;
+                    17
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -623,6 +632,109 @@ impl Store {
         if self.cards_has_column("autonomy")? {
             self.connection.execute_batch(MIGRATE_15_TO_16)?;
         }
+        Ok(())
+    }
+
+    /// powder-status-vocabulary: collapses the nine-status vocabulary to
+    /// seven. `claimed`/`running` both become `in_progress` -- the claim
+    /// struct already carries who/lease/liveness, so a status bit
+    /// distinguishing "claimed but not yet running" from "running" was a
+    /// second, driftable copy of claim presence. `blocked` is dropped
+    /// entirely: blocking eligibility is already derived from `blocked_by`
+    /// relations at claim time ([`powder_core::Card::claim_readiness`])
+    /// regardless of status, so an explicit `blocked` status was a second,
+    /// driftable copy of that derived fact.
+    ///
+    /// Where a former-`blocked` card lands depends on what it actually
+    /// carries:
+    /// - real `blocked_by` relations -> `ready`: `list_ready`/claiming keep
+    ///   excluding it until every blocker resolves, so nothing becomes
+    ///   claimable that was not already;
+    /// - non-empty acceptance but NO `blocked_by` relations -> `backlog`:
+    ///   on the live board most blocked cards record their blocker only as
+    ///   prose (operator timers, missing secrets, vendor bugs, pending
+    ///   decisions) with zero relations wired, and mapping those to `ready`
+    ///   would make them immediately claimable by the fleet with no
+    ///   compensating control. Backlog forces a human re-triage: wire the
+    ///   relations or promote deliberately (adversarial review of PR #134,
+    ///   ratified 2026-07-14);
+    /// - empty acceptance -> `backlog`, mirroring
+    ///   [`CardStatus::default_for_acceptance`], the same rule a freshly
+    ///   created card is defaulted by ("ready is a query, not vibes",
+    ///   VISION.md).
+    ///
+    /// Every other status (`backlog`, `ready`, `awaiting_input`, `done`,
+    /// `shipped`, `abandoned`) is untouched -- `awaiting_input` stays
+    /// first-class and queryable, and the three terminal outcomes stay
+    /// distinguishable (operator ruling, 2026-07-14). Claims/runs/
+    /// relations/events are never touched by this migration; only the
+    /// `status` column on affected cards changes, plus one audit
+    /// `card_events` row per changed card. Idempotent: guarded by the
+    /// surrounding `migrate()` loop, which only ever runs the 16->17 step
+    /// once (a database already at or past schema 17 never re-enters this
+    /// function), and the whole step commits atomically so a crash
+    /// mid-migration leaves the prior schema version to retry cleanly
+    /// rather than a half-applied status column.
+    fn migrate_16_to_17(&mut self) -> Result<()> {
+        // Every real database has carried `status NOT NULL` since schema
+        // creation (v0); this guard exists only so a synthetic test double
+        // that fabricates a bare `cards(id)` table to exercise one unrelated
+        // intermediate migration step (see e.g.
+        // `migration_11_to_12_tolerates_half_applied_autonomy_column`) can
+        // still walk `migrate()` all the way to current without growing a
+        // phantom `status` column it has no reason to carry.
+        if !self.cards_has_column("status")? {
+            return Ok(());
+        }
+        let now = unix_now();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT id, status, acceptance_json, blocked_by_json FROM cards
+                 WHERE status IN ('claimed', 'running', 'blocked')
+                 ORDER BY id",
+            )?;
+            let affected = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            for (card_id, old_status, acceptance_json, blocked_by_json) in affected {
+                let empty_acceptance = acceptance_json.trim() == "[]";
+                let relation_less = blocked_by_json.trim() == "[]";
+                let (new_status, detail) = match old_status.as_str() {
+                    "claimed" | "running" => ("in_progress", ""),
+                    "blocked" if empty_acceptance => ("backlog", " (empty acceptance)"),
+                    "blocked" if relation_less => (
+                        "backlog",
+                        " (no blocked_by relations; re-triage before claiming)",
+                    ),
+                    "blocked" => ("ready", ""),
+                    other => (other, ""),
+                };
+                transaction.execute(
+                    "UPDATE cards SET status = ?1 WHERE id = ?2",
+                    params![new_status, card_id],
+                )?;
+                append_card_event(
+                    &transaction,
+                    &CardId::new(card_id)?,
+                    "status",
+                    "system:status-vocabulary-migration",
+                    &format!("status-vocabulary migration: {old_status} -> {new_status}{detail}"),
+                    now,
+                )?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 

@@ -51,9 +51,14 @@ fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
         let mut store = Store::open(&path)?;
         store.migrate()?;
         let card = store.get_card(&card_id)?.expect("persisted card");
-        assert_eq!(card.status, CardStatus::Claimed);
+        assert_eq!(card.status, CardStatus::InProgress);
         assert!(card.claim.is_some());
-        store.update_status(&card_id, CardStatus::Running, 20, &Authority::unchecked())?;
+        store.update_status(
+            &card_id,
+            CardStatus::InProgress,
+            20,
+            &Authority::unchecked(),
+        )?;
         let link = store.add_link(&card_id, "proof", "https://example.test/proof", 21)?;
         assert_eq!(link.card_id, card_id);
         let awaiting = store.request_input(
@@ -178,10 +183,10 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
 
-    let mut blocked = ready_card("blocked-1", 10);
-    blocked.status = CardStatus::Blocked;
-    blocked.repo = Some("misty-step/example".to_string());
-    store.import_cards(vec![blocked])?;
+    let mut in_progress = ready_card("in-progress-1", 10);
+    in_progress.status = CardStatus::InProgress;
+    in_progress.repo = Some("misty-step/example".to_string());
+    store.import_cards(vec![in_progress])?;
 
     let mut done = ready_card("done-1", 20);
     done.status = CardStatus::Done;
@@ -200,17 +205,17 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     assert_eq!(all.len(), 3);
 
     // status filter alone.
-    let blocked_only = store.list_cards(
+    let in_progress_only = store.list_cards(
         &CardFilter {
-            status: Some(CardStatus::Blocked),
+            status: Some(CardStatus::InProgress),
             repo: None,
             estimate: None,
             ..CardFilter::default()
         },
         20,
     )?;
-    assert_eq!(blocked_only.len(), 1);
-    assert_eq!(blocked_only[0].id.as_str(), "blocked-1");
+    assert_eq!(in_progress_only.len(), 1);
+    assert_eq!(in_progress_only[0].id.as_str(), "in-progress-1");
 
     // repo filter alone. Operator-facing repo identity is canonicalized to the
     // short repo name, but old full-slug filters remain accepted aliases.
@@ -349,7 +354,12 @@ fn list_approvals_surfaces_packet_links_and_drains_after_answer() -> Result<()> 
     store.import_cards(vec![ready_card("001", 2), ready_card("002", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     let unlinked_claim = store.claim_card(
         &unlinked_card_id,
         "agent-b",
@@ -399,7 +409,12 @@ fn approval_queue_and_answer_input_reject_stale_awaiting_run_after_reclaim() -> 
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let first = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     store.add_link(
         &card_id,
         "approval/packet",
@@ -413,7 +428,7 @@ fn approval_queue_and_answer_input_reject_stale_awaiting_run_after_reclaim() -> 
         &Authority::unchecked(),
     )?;
     store.connection.execute(
-        "UPDATE cards SET status = 'running' WHERE id = ?1",
+        "UPDATE cards SET status = 'in_progress' WHERE id = ?1",
         [card_id.as_str()],
     )?;
 
@@ -473,9 +488,9 @@ fn board_stats_counts_statuses_claims_and_visibility_by_repo() -> Result<()> {
 
     let mut alpha_ready = ready_card("alpha-ready", 10);
     alpha_ready.repo = Some("alpha".to_string());
-    let mut alpha_blocked = ready_card("alpha-blocked", 11);
-    alpha_blocked.status = CardStatus::Blocked;
-    alpha_blocked.repo = Some("alpha".to_string());
+    let mut alpha_backlog = ready_card("alpha-backlog", 11);
+    alpha_backlog.status = CardStatus::Backlog;
+    alpha_backlog.repo = Some("alpha".to_string());
     let mut alpha_expired = ready_card("alpha-expired", 12);
     alpha_expired.repo = Some("alpha".to_string());
     let mut beta_running = ready_card("beta-running", 13);
@@ -490,7 +505,7 @@ fn board_stats_counts_statuses_claims_and_visibility_by_repo() -> Result<()> {
 
     store.import_cards(vec![
         alpha_ready,
-        alpha_blocked,
+        alpha_backlog,
         alpha_expired,
         beta_running,
         beta_input,
@@ -515,7 +530,7 @@ fn board_stats_counts_statuses_claims_and_visibility_by_repo() -> Result<()> {
     )?;
     store.update_status(
         &CardId::new("beta-running")?,
-        CardStatus::Running,
+        CardStatus::InProgress,
         81,
         &Authority::unchecked(),
     )?;
@@ -541,10 +556,9 @@ fn board_stats_counts_statuses_claims_and_visibility_by_repo() -> Result<()> {
     assert_eq!(stats.repos.len(), 2);
     assert_eq!(stats.totals.cards, 6);
     assert_eq!(stats.totals.ready, 1);
-    assert_eq!(stats.totals.claimed, 1);
-    assert_eq!(stats.totals.running, 1);
+    assert_eq!(stats.totals.backlog, 1);
+    assert_eq!(stats.totals.in_progress, 2);
     assert_eq!(stats.totals.awaiting_input, 1);
-    assert_eq!(stats.totals.blocked, 1);
     assert_eq!(stats.totals.done, 1);
     assert_eq!(stats.totals.active_claims, 2);
 
@@ -555,8 +569,8 @@ fn board_stats_counts_statuses_claims_and_visibility_by_repo() -> Result<()> {
         .expect("alpha stats");
     assert_eq!(alpha.counts.cards, 3);
     assert_eq!(alpha.counts.ready, 1);
-    assert_eq!(alpha.counts.claimed, 1);
-    assert_eq!(alpha.counts.blocked, 1);
+    assert_eq!(alpha.counts.backlog, 1);
+    assert_eq!(alpha.counts.in_progress, 1);
     assert_eq!(alpha.counts.active_claims, 0);
 
     let beta = stats
@@ -565,7 +579,7 @@ fn board_stats_counts_statuses_claims_and_visibility_by_repo() -> Result<()> {
         .find(|row| row.repo.as_deref() == Some("beta"))
         .expect("beta stats");
     assert_eq!(beta.counts.cards, 3);
-    assert_eq!(beta.counts.running, 1);
+    assert_eq!(beta.counts.in_progress, 1);
     assert_eq!(beta.counts.awaiting_input, 1);
     assert_eq!(beta.counts.done, 1);
     assert_eq!(beta.counts.active_claims, 2);
@@ -2444,7 +2458,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
         &card_id,
         CardPatch {
             title: Some("Patched title".to_string()),
-            status: Some(CardStatus::Blocked),
+            status: Some(CardStatus::Ready),
             labels: Some(vec![
                 "api".to_string(),
                 " ".to_string(),
@@ -2457,7 +2471,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
     )?;
 
     assert_eq!(patched.title, "Patched title");
-    assert_eq!(patched.status, CardStatus::Blocked);
+    assert_eq!(patched.status, CardStatus::Ready);
     assert_eq!(patched.labels, vec!["api", "safe-update"]);
     assert_eq!(patched.created_at, 2);
     assert_eq!(
@@ -2512,7 +2526,7 @@ fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call
     )?;
     store.update_status(
         &card_id,
-        CardStatus::Running,
+        CardStatus::InProgress,
         11,
         &Authority::actor("import-worker", false),
     )?;
@@ -2536,7 +2550,7 @@ fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call
     assert!(detail.events.iter().any(|event| {
         event.event_type == "status"
             && event.actor == "external-closer"
-            && event.payload.contains("running -> done")
+            && event.payload.contains("in_progress -> done")
     }));
     Ok(())
 }
@@ -2549,7 +2563,12 @@ fn expired_running_claim_can_be_reclaimed_from_sqlite_store() -> Result<()> {
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let first = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let ready = store.list_ready(ReadyQuery::new(15, 10))?;
     assert_eq!(
@@ -2562,7 +2581,7 @@ fn expired_running_claim_can_be_reclaimed_from_sqlite_store() -> Result<()> {
     assert_ne!(first.run_id, second.run_id);
     assert_eq!(second.agent, "agent-b");
     let card = store.get_card(&card_id)?.expect("card");
-    assert_eq!(card.status, CardStatus::Claimed);
+    assert_eq!(card.status, CardStatus::InProgress);
     assert_eq!(
         card.claim.as_ref().map(|claim| claim.agent.as_str()),
         Some("agent-b")
@@ -2586,7 +2605,12 @@ fn release_claim_on_an_already_expired_claim_succeeds_as_a_no_op() -> Result<()>
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let released = store.release_claim(&card_id, &claim.run_id, 30, &Authority::unchecked())?;
 
@@ -2609,7 +2633,12 @@ fn renew_claim_on_an_already_expired_claim_returns_a_distinct_recoverable_error(
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let renewed = store.renew_claim(&card_id, &claim.run_id, 30, 60, &Authority::unchecked());
 
@@ -2635,7 +2664,12 @@ fn heartbeat_claim_on_an_already_expired_claim_returns_a_distinct_recoverable_er
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let heartbeat = store.heartbeat_claim(&card_id, &claim.run_id, 30, &Authority::unchecked());
 
@@ -2723,7 +2757,12 @@ fn release_to_ready_clears_claim_immediately() -> Result<()> {
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     let released = store.update_status(&card_id, CardStatus::Ready, 12, &Authority::unchecked())?;
 
     assert_eq!(released.status, CardStatus::Ready);
@@ -2744,21 +2783,22 @@ fn release_to_ready_clears_claim_immediately() -> Result<()> {
 }
 
 #[test]
-fn blocking_claimed_card_clears_claim_immediately() -> Result<()> {
+fn abandoning_claimed_card_clears_claim_immediately() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("001")?;
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    let blocked =
-        store.update_status(&card_id, CardStatus::Blocked, 11, &Authority::unchecked())?;
+    let abandoned =
+        store.update_status(&card_id, CardStatus::Abandoned, 11, &Authority::unchecked())?;
 
-    assert_eq!(blocked.status, CardStatus::Blocked);
-    assert!(blocked.claim.is_none());
+    assert_eq!(abandoned.status, CardStatus::Abandoned);
+    assert!(abandoned.claim.is_none());
     assert_eq!(
-        store.get_run(&claim.run_id)?.expect("released run").state,
-        RunState::Released
+        store.get_run(&claim.run_id)?.expect("completed run").state,
+        RunState::Complete,
+        "a terminal status closes the run as Complete, not merely Released"
     );
     Ok(())
 }
@@ -2979,7 +3019,12 @@ fn answer_input_preserves_question_and_resumes_run() -> Result<()> {
     store.import_cards(vec![ready_card("001", 2)])?;
 
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     store.add_link(&card_id, "context", "https://example.test/context", 12)?;
     store.request_input(
         &claim.run_id,
@@ -3021,7 +3066,7 @@ fn answer_input_preserves_question_and_resumes_run() -> Result<()> {
     )?;
     assert_eq!(answered.state, RunState::Active);
     let card = store.get_card(&card_id)?.expect("card");
-    assert_eq!(card.status, CardStatus::Running);
+    assert_eq!(card.status, CardStatus::InProgress);
 
     let run_detail = store
         .get_run_detail(&claim.run_id, DetailLevel::Detailed)?
@@ -3064,7 +3109,12 @@ fn completion_after_same_second_release_reclaim_completes_current_run() -> Resul
     let first = store.claim_card(&card_id, "agent-a", 10, 60, &Authority::unchecked())?;
     store.release_claim(&card_id, &first.run_id, 10, &Authority::unchecked())?;
     let second = store.claim_card(&card_id, "agent-b", 10, 60, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 10, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        10,
+        &Authority::unchecked(),
+    )?;
     store.complete_card(
         &card_id,
         Some("https://example.test/proof"),
@@ -3905,7 +3955,7 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
 
     // audit-over-enforcement: any actor may set status/complete, but not
     // mutate another actor's lease heartbeat/renew/release path.
-    store.update_status(&card_id, CardStatus::Running, 20, &intruder)?;
+    store.update_status(&card_id, CardStatus::InProgress, 20, &intruder)?;
     let completed = store.complete_card(&card_id, None, Vec::new(), 21, &intruder)?;
     assert_eq!(completed.status, CardStatus::Done);
     let card = store.get_card(&card_id)?.expect("card");
@@ -3929,7 +3979,7 @@ fn admin_authority_bypasses_claim_ownership() -> Result<()> {
     )?;
     let admin = Authority::actor("operator", true);
 
-    store.update_status(&card_id, CardStatus::Running, 20, &admin)?;
+    store.update_status(&card_id, CardStatus::InProgress, 20, &admin)?;
     // An admin can transfer a claim it does not hold -- the same "acts as
     // anyone" authority that already covers status/completion here.
     let transferred = store.transfer_claim(&card_id, &claim.run_id, "agent-b", 21, 3600, &admin)?;
@@ -3988,7 +4038,7 @@ fn answer_input_rejects_actor_impersonation() -> Result<()> {
     )?;
     store.update_status(
         &card_id,
-        CardStatus::Running,
+        CardStatus::InProgress,
         11,
         &Authority::actor("agent-a", false),
     )?;
@@ -4047,7 +4097,7 @@ fn reimport_over_a_claimed_card_preserves_claim_and_status() -> Result<()> {
     )?;
     store.update_status(
         &card_id,
-        CardStatus::Running,
+        CardStatus::InProgress,
         11,
         &Authority::actor("agent-a", false),
     )?;
@@ -4057,7 +4107,7 @@ fn reimport_over_a_claimed_card_preserves_claim_and_status() -> Result<()> {
     let outcome = store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
 
     let card = store.get_card(&card_id)?.expect("card");
-    assert_eq!(card.status, CardStatus::Running);
+    assert_eq!(card.status, CardStatus::InProgress);
     assert_eq!(
         card.claim.as_ref().map(|claim| claim.agent.as_str()),
         Some("agent-a")
@@ -4080,7 +4130,12 @@ fn reimport_over_a_terminal_card_keeps_its_outcome() -> Result<()> {
     let card_id = CardId::new("001")?;
     store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
     let claim = store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
     store.complete_card(
         &card_id,
         Some("https://example.test/proof"),
@@ -4114,14 +4169,14 @@ fn reimport_over_a_quiescent_card_refreshes_content_and_status() -> Result<()> {
     store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
 
     let mut edited = sourced_card("001", 999, "sha256:v2-edited");
-    edited.status = CardStatus::Blocked;
+    edited.status = CardStatus::Backlog;
     edited.title = "Edited title".to_string();
     let outcome = store.import_cards(vec![edited])?;
 
     let card = store.get_card(&card_id)?.expect("card");
     assert_eq!(
         card.status,
-        CardStatus::Blocked,
+        CardStatus::Backlog,
         "no one owns it, safe to refresh"
     );
     assert_eq!(card.title, "Edited title");
@@ -4263,7 +4318,12 @@ fn preview_import_reports_without_mutating_the_store() -> Result<()> {
     let card_id = CardId::new("001")?;
     store.import_cards(vec![sourced_card("001", 2, "sha256:v1")])?;
     store.claim_card(&card_id, "agent-a", 10, 3600, &Authority::unchecked())?;
-    store.update_status(&card_id, CardStatus::Running, 11, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        11,
+        &Authority::unchecked(),
+    )?;
 
     let preview = store.preview_import(&[sourced_card("001", 2, "sha256:v2-edited")])?;
     assert_eq!(
@@ -4276,7 +4336,7 @@ fn preview_import_reports_without_mutating_the_store() -> Result<()> {
 
     // preview must not have written anything.
     let card = store.get_card(&card_id)?.expect("card");
-    assert_eq!(card.status, CardStatus::Running);
+    assert_eq!(card.status, CardStatus::InProgress);
     assert!(card.claim.is_some());
     Ok(())
 }
@@ -4286,7 +4346,7 @@ fn preview_import_reports_without_mutating_the_store() -> Result<()> {
 fn allowlisted_card(id: &str, repo: &str, created_at: i64) -> Card {
     let mut card = Card::new(CardId::new(id).unwrap(), format!("Card {id}"), "do it")
         .unwrap()
-        .with_status(CardStatus::Running)
+        .with_status(CardStatus::InProgress)
         .with_priority(Priority::P1)
         .with_acceptance(["proof exists".to_string()])
         .with_created_at(created_at);

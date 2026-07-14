@@ -219,7 +219,7 @@ self_test() {
     || failures=$((failures + 1))
 
   # Negative control: the field names without JSON-key colons (a Rust/SQL
-  # column list, like powder-store's status_model_020.rs) must not match.
+  # column list) must not match.
   printf 'let columns = ["%s", "%s", "%s"];\n' \
     "$key_card" "$key_agent" "$key_created" >"$tmp/column_list.rs"
   assert_clean "$tmp/column_list.rs" "column-list mention (false positive)" \

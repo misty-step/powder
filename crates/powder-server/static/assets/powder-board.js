@@ -1,12 +1,14 @@
 "use strict";
 
+// powder-status-vocabulary: the seven-status vocabulary. claimed/running
+// collapsed into in_progress (who holds the card lives on the claim
+// struct), and blocked is not a status -- blocking is derived from
+// unresolved blocked_by relations (see hasUnresolvedBlocker below).
 const RAW_STATUSES = [
   "backlog",
   "ready",
-  "claimed",
-  "running",
+  "in_progress",
   "awaiting_input",
-  "blocked",
   "done",
   "shipped",
   "abandoned",
@@ -554,14 +556,19 @@ function normalizeCard(card) {
   };
 }
 
+// powder-status-vocabulary: lane mapping over the seven statuses. READY is
+// `ready`; IN PROGRESS is `in_progress` plus `awaiting_input` (the
+// awaiting-you strip already differentiates the latter); DONE folds the
+// three distinct terminal outcomes into one lane. `in_progress` is no
+// longer derived from claimed/running -- it is a real status now.
 function displayStatus(status) {
-  if (["claimed", "running", "awaiting_input"].includes(status)) {
+  if (status === "in_progress" || status === "awaiting_input") {
     return "in_progress";
   }
   if (status === "done" || status === "shipped" || status === "abandoned") {
     return "done";
   }
-  if (status === "ready" || status === "blocked") return "ready";
+  if (status === "ready") return "ready";
   return "backlog";
 }
 
@@ -772,17 +779,7 @@ function repositoryRowHTML(summary) {
 }
 
 function statusCountsHTML(counts) {
-  const order = [
-    "backlog",
-    "ready",
-    "blocked",
-    "claimed",
-    "running",
-    "awaiting_input",
-    "done",
-    "shipped",
-    "abandoned",
-  ];
+  const order = RAW_STATUSES;
   const chips = order
     .filter((status) => counts[status])
     .map((status) => `<span class="ae-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`);
@@ -1106,12 +1103,33 @@ function priorityIndex(priority) {
   return { p0: 0, p1: 1, p2: 2, p3: 3 }[cleanPriority(priority)] ?? 4;
 }
 
+// powder-status-vocabulary: `blocked` is not a status; a card is blocked
+// while at least one `blocked_by` entry has not reached a terminal status.
+// This mirrors the server's claim-eligibility rule (`Card::claim_readiness`),
+// including its fail-closed stance: a blocker id that is not on the board at
+// all still blocks -- it cannot be proven resolved.
+function hasUnresolvedBlocker(card, cardsById) {
+  return (card.blocked_by || []).some((id) => {
+    const blocker = cardsById.get(id);
+    return !blocker || blocker.displayStatus !== "done";
+  });
+}
+
 function bucket() {
   const visible = state.cards.filter(passes);
+  const cardsById = new Map(state.cards.map((card) => [card.id, card]));
   return {
     backlog: sorted(visible.filter((card) => card.displayStatus === "backlog")),
-    ready: sorted(visible.filter((card) => card.displayStatus === "ready" && card.status !== "blocked")),
-    blocked: sorted(visible.filter((card) => card.status === "blocked")),
+    ready: sorted(
+      visible.filter(
+        (card) => card.displayStatus === "ready" && !hasUnresolvedBlocker(card, cardsById),
+      ),
+    ),
+    blocked: sorted(
+      visible.filter(
+        (card) => card.displayStatus === "ready" && hasUnresolvedBlocker(card, cardsById),
+      ),
+    ),
     inProgress: sorted(visible.filter((card) => card.displayStatus === "in_progress")),
     done: sorted(visible.filter((card) => card.displayStatus === "done")),
   };
@@ -1411,9 +1429,8 @@ function statusGlyph(status) {
     `<span class="pw-g"><svg class="ae-icon ${tone}" aria-hidden="true"><use href="#${id}"></use></svg></span>`;
   if (status === "done" || status === "shipped") return glyph("i-check", "ae-ok");
   if (status === "awaiting_input") return glyph("i-ask", "ae-warn");
-  if (status === "blocked" || status === "abandoned") return glyph("i-block", "ae-warn");
-  if (status === "running") return glyph("i-play");
-  if (status === "claimed") return glyph("i-hand");
+  if (status === "abandoned") return glyph("i-block", "ae-warn");
+  if (status === "in_progress") return glyph("i-play");
   return "";
 }
 
@@ -1546,7 +1563,7 @@ function relationsHTML(card) {
 // `get_card_detail` already returns it fully populated; this just renders
 // what was previously discarded.
 function epicStateHTML(epicState) {
-  const order = ["backlog", "ready", "claimed", "running", "awaiting_input", "blocked", "done", "shipped", "abandoned"];
+  const order = RAW_STATUSES;
   const counts = epicState.status_counts || {};
   const countChips = order
     .filter((status) => counts[status])

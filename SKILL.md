@@ -55,8 +55,9 @@ Default agent persona (20 tools):
   `transitive_blocked_by`/`blocked_by_cycle` fields explain a *blocked*
   card's chain past one hop.
 - `list_cards`: enumerate cards by optional status/repo/`estimate`
-  filter, including `blocked`, `review`, and `done` cards `list_ready` never
-  surfaces. With no `status` filter, `done`/`shipped`/`abandoned` cards are
+  filter, including cards `list_ready` never surfaces -- `backlog`, cards with
+  an unresolved `blocked_by` relation, and `done`/`shipped`/`abandoned`.
+  With no `status` filter, `done`/`shipped`/`abandoned` cards are
   hidden by default (in both local `POWDER_DB_PATH` and remote
   `POWDER_API_BASE_URL` modes) -- pass `include_terminal: true` to restore
   the full sweep; an explicit `status` filter (e.g. `status: done`) always
@@ -181,7 +182,7 @@ powder transfer-claim 001 --db ./data/powder.db --run run-id --to-agent codex --
 powder release-claim 001 --db ./data/powder.db --run run-id
 powder get-card 001 --db ./data/powder.db
 powder update-relations 001 --db ./data/powder.db --related 002 --blocks 003 --blocked-by 000
-powder update-status 001 --db ./data/powder.db --status running
+powder update-status 001 --db ./data/powder.db --status in_progress
 powder request-input run-id --db ./data/powder.db --question "Approve?"
 powder list-awaiting-input --db ./data/powder.db
 powder answer-input run-id --db ./data/powder.db --actor operator --answer approved

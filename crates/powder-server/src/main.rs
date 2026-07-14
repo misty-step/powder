@@ -403,13 +403,7 @@ struct PatchCardRequest {
 
 impl PatchCardRequest {
     fn into_patch(self) -> Result<CardPatch, ApiError> {
-        let status = self
-            .status
-            .as_deref()
-            .map(|raw| {
-                CardStatus::parse(raw).ok_or_else(|| ApiError::bad_request("invalid status"))
-            })
-            .transpose()?;
+        let status = self.status.as_deref().map(parse_status).transpose()?;
         let priority = self
             .priority
             .as_deref()
@@ -892,14 +886,7 @@ async fn list_cards(
     Query(params): Query<ListCardsParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
-    let status = params
-        .status
-        .as_deref()
-        .map(|raw| {
-            CardStatus::parse(raw)
-                .ok_or_else(|| ApiError::bad_request(format!("invalid status: {raw}")))
-        })
-        .transpose()?;
+    let status = params.status.as_deref().map(parse_status).transpose()?;
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
     let limit = params.limit.unwrap_or(20).max(1);
     let filter = CardFilter {
@@ -1081,11 +1068,14 @@ async fn create_card(
     // "ready is a query, not vibes") -- see
     // `CardStatus::default_for_acceptance`. An explicit status is still
     // honored either way -- status is a label, is_ready_at is the
-    // independent gate.
+    // independent gate. An explicit-but-invalid status (including the
+    // retired `claimed`/`running`/`blocked` names) is a 400 naming the
+    // current vocabulary, never silently swallowed into the default.
     let status = request
         .status
         .as_deref()
-        .and_then(CardStatus::parse)
+        .map(parse_status)
+        .transpose()?
         .unwrap_or_else(|| CardStatus::default_for_acceptance(&request.acceptance));
     let priority = request
         .priority
@@ -1245,8 +1235,7 @@ async fn update_status(
 ) -> Result<Json<Card>, ApiError> {
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let status = CardStatus::parse(&request.status)
-        .ok_or_else(|| ApiError::bad_request("invalid status"))?;
+    let status = parse_status(&request.status)?;
     let card =
         lock_store(&state)?.update_status(&card_id, status, unix_now(), &actor.authority())?;
     Ok(Json(card))
@@ -1770,6 +1759,25 @@ fn card_ids(raw: Option<Vec<String>>) -> Result<Vec<CardId>, ApiError> {
         .map(CardId::new)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(ApiError::from)
+}
+
+/// powder-status-vocabulary: every status string arriving over HTTP routes
+/// through here, so a retired status name (`claimed`, `running`, `blocked`)
+/// is rejected with a 400 that names the current seven-status vocabulary --
+/// never silently aliased onto a surviving status or swallowed into a
+/// default.
+fn parse_status(raw: &str) -> Result<CardStatus, ApiError> {
+    CardStatus::parse(raw).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "invalid status {raw:?}; valid: {}",
+            CardStatus::ALL
+                .iter()
+                .copied()
+                .map(CardStatus::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })
 }
 
 fn parse_estimate(raw: &str) -> Result<Estimate, ApiError> {

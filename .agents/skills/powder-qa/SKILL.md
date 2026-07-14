@@ -66,7 +66,7 @@ cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
 CLAIM=$(cargo run -q -p powder-cli -- claim 001 --db "$DB" --agent codex)
 RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)
 cargo run -q -p powder-cli -- heartbeat 001 --db "$DB" --run "$RUN_ID"
-cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status running
+cargo run -q -p powder-cli -- update-status 001 --db "$DB" --status in_progress
 cargo run -q -p powder-cli -- request-input "$RUN_ID" --db "$DB" --question "Approve completion?"
 cargo run -q -p powder-cli -- list-awaiting-input --db "$DB"
 cargo run -q -p powder-cli -- answer-input "$RUN_ID" --db "$DB" --actor operator --answer approved
