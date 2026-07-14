@@ -26,17 +26,53 @@ Seven statuses, down from the prior nine:
 Applied by `migrate_16_to_17` in `powder-store` on the next deploy, with one
 audit `card_events` row per changed card
 (`"status-vocabulary migration: <old> -> <new>"`, plus a parenthetical
-rationale on the two backlog branches, actor
+rationale when the destination needs explanation, actor
 `system:status-vocabulary-migration`). Claims, runs, relations, and all
-existing events are untouched; only the `status` column on affected cards
-changes.
+pre-existing events are untouched; only the `status` column on affected
+cards changes. At schema v17, the persisted claim tuple contained the worker
+and run identifiers plus both timestamps; schema v18 added the authenticated
+principal as a fifth field. A current valid claim requires all five values to
+be present and both identity fields and the run identifier to be non-blank.
+Partial claim columns and complete tuples with a blank identifier are treated
+as claimless by the same decoder used for normal card reads, but remain
+byte-for-byte untouched for later diagnosis or repair. Structured criteria
+are the effective acceptance oracle whenever they contain a non-blank item;
+the legacy acceptance list is the fallback. Migration and card reads share
+that decoder too, so divergent legacy columns cannot disagree about readiness.
+
+## Corrective Repair (schema v19)
+
+The first deployed schema-v17 migration used a less strict claim classifier
+than normal card reads and stranded seven claimless cards in `in_progress`.
+`migrate_18_to_19` repairs only cards that still satisfy all three facts:
+
+- current status is exactly `in_progress`;
+- the latest status-event timestamp contains only an exact, unambiguous
+  schema-v17 status event with actor
+  `system:status-vocabulary-migration` and payload
+  `status-vocabulary migration: claimed -> in_progress` or
+  `status-vocabulary migration: running -> in_progress`;
+- the shared principal/worker/run decoder reports no valid persisted claim.
+
+The destination is `ready` when the shared effective-oracle decoder finds a
+non-blank acceptance criterion and `backlog` otherwise. The migration does not
+hard-code card ids. It changes only status and appends one audit event per
+repair under actor `system:status-v17-repair`; claims, runs, relations,
+criteria, pre-existing events, and key metadata remain byte-for-byte intact.
+The whole step is atomic and retry-safe: after correction, a card no longer
+matches the required `in_progress` predicate.
+Before advancing the schema version, the step also fails closed unless the
+schema-v18 identity migration is intact: claims carry principals, runs retain
+their complete principal/worker/lifecycle persistence shape, API keys have the
+complete principalized metadata shape, and the legacy `actors` table is gone.
 
 | Legacy status | New status | Why |
 | --- | --- | --- |
 | `backlog` | `backlog` | Unchanged. |
 | `ready` | `ready` | Unchanged. |
-| `claimed` | `in_progress` | The claimed/running distinction duplicated claim presence -- the claim struct already carries who/lease/liveness. |
-| `running` | `in_progress` | Same collapse; a status bit distinguishing "claimed but not yet running" from "running" was a second, driftable copy of the claim. |
+| `claimed` or `running` (complete, valid claim) | `in_progress` | The claimed/running distinction duplicated claim presence -- the claim struct already carries who/lease/liveness. |
+| `claimed` or `running` (no valid claim, real acceptance oracle) | `ready` | Without a claim there is no active work to represent; leaving the card `in_progress` would strand it outside `list_ready`. |
+| `claimed` or `running` (no valid claim or acceptance oracle) | `backlog` | No resumable claim and no executable oracle; re-triage is required. |
 | `blocked` (has `blocked_by` relations) | `ready` | Blocking is derived from unresolved `blocked_by` relations (`Card::claim_readiness`), not stored as a status -- see below. `list_ready`/claiming keep excluding the card until every blocker resolves, so nothing becomes claimable that was not already. |
 | `blocked` (non-empty acceptance, NO `blocked_by` relations) | `backlog` | Live-board audit (adversarial review of PR #134, ratified 2026-07-14): most blocked cards record their blocker only as prose -- operator timers, missing secrets, vendor bugs, pending decisions -- with zero relations wired. Mapping those to `ready` would have made them immediately claimable by the fleet with no compensating control. Backlog forces a human re-triage: wire the relations or promote deliberately. |
 | `blocked` (empty acceptance) | `backlog` | Mirrors `CardStatus::default_for_acceptance`, the same rule a freshly created card is defaulted by ("ready is a query, not vibes"). |

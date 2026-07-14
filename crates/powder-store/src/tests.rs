@@ -172,9 +172,9 @@ fn migration_11_to_12_tolerates_half_applied_autonomy_column() -> Result<()> {
     }
 
     let mut store = Store::open(&path)?;
-    store.migrate()?;
+    store.migrate_11_to_12()?;
 
-    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    assert!(store.cards_has_column("autonomy")?);
     Ok(())
 }
 
@@ -1557,9 +1557,8 @@ fn migration_13_to_14_adds_parent_to_existing_databases() -> Result<()> {
     }
 
     let mut store = Store::open(&path)?;
-    store.migrate()?;
+    store.migrate_13_to_14()?;
 
-    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
     assert!(store.cards_has_column("parent")?);
     Ok(())
 }
@@ -1597,6 +1596,7 @@ fn migration_14_to_15_drops_workspace_path_and_branch_name_from_existing_databas
               branch_name TEXT,
               source_path TEXT,
               source_digest TEXT,
+              claim_principal TEXT,
               claim_agent TEXT,
               claim_run_id TEXT,
               claim_acquired_at INTEGER,
@@ -1636,9 +1636,8 @@ fn migration_14_to_15_drops_workspace_path_and_branch_name_from_existing_databas
     }
 
     let mut store = Store::open(&path)?;
-    store.migrate()?;
+    store.migrate_14_to_15()?;
 
-    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
     assert!(!store.cards_has_column("workspace_path")?);
     assert!(!store.cards_has_column("branch_name")?);
     // assignee's fate belongs to a different epic -- it must survive.
@@ -1686,6 +1685,7 @@ fn migration_14_to_15_finishes_a_half_applied_branch_name_drop() -> Result<()> {
               branch_name TEXT,
               source_path TEXT,
               source_digest TEXT,
+              claim_principal TEXT,
               claim_agent TEXT,
               claim_run_id TEXT,
               claim_acquired_at INTEGER,
@@ -1700,9 +1700,8 @@ fn migration_14_to_15_finishes_a_half_applied_branch_name_drop() -> Result<()> {
     }
 
     let mut store = Store::open(&path)?;
-    store.migrate()?;
+    store.migrate_14_to_15()?;
 
-    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
     assert!(!store.cards_has_column("branch_name")?);
     Ok(())
 }
@@ -1739,6 +1738,7 @@ fn migration_15_to_16_drops_autonomy_from_existing_databases() -> Result<()> {
               repo TEXT,
               source_path TEXT,
               source_digest TEXT,
+              claim_principal TEXT,
               claim_agent TEXT,
               claim_run_id TEXT,
               claim_acquired_at INTEGER,
@@ -1786,9 +1786,8 @@ fn migration_15_to_16_drops_autonomy_from_existing_databases() -> Result<()> {
     }
 
     let mut store = Store::open(&path)?;
-    store.migrate()?;
+    store.migrate_15_to_16()?;
 
-    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
     assert!(!store.cards_has_column("autonomy")?);
 
     let auto_card = store
@@ -4266,7 +4265,7 @@ fn migration_3_to_4_finishes_a_half_applied_run_column_drop() -> Result<()> {
     Ok(())
 }
 
-/// Every migration step from 1->18 must tolerate being invoked twice in a
+/// Every migration step from 1->19 must tolerate being invoked twice in a
 /// row against a database that already has its target schema (the shape a
 /// crash-and-retry boot produces once a step has fully applied but before
 /// `migrate()`'s loop reaches `SCHEMA_VERSION`) without erroring. Steps 11+
@@ -4306,6 +4305,8 @@ fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
     store.migrate_16_to_17()?;
     store.migrate_17_to_18()?;
     store.migrate_17_to_18()?;
+    store.migrate_18_to_19()?;
+    store.migrate_18_to_19()?;
 
     // Re-running every step twice must not have perturbed the fully
     // migrated schema: still at SCHEMA_VERSION, still able to round-trip a
@@ -4313,6 +4314,89 @@ fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
     assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
     let saved = store.upsert_card(ready_card("idempotent-migrations", 1))?;
     assert_eq!(store.get_card(&saved.id)?, Some(saved));
+    Ok(())
+}
+
+#[test]
+fn migration_18_to_19_rejects_schema_drift_without_advancing_version() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.connection.execute_batch(
+        "DROP TABLE card_events;
+         PRAGMA user_version = 18;",
+    )?;
+
+    let error = store.migrate().expect_err("malformed schema v18 must fail");
+    assert!(
+        matches!(
+            &error,
+            StoreError::InvalidStoredValue {
+                field: "schema v18",
+                ..
+            }
+        ),
+        "unexpected migration error: {error}"
+    );
+    assert_eq!(store.schema_version()?, 18);
+    Ok(())
+}
+
+#[test]
+fn migration_18_to_19_rejects_identity_drift_without_advancing_version() -> Result<()> {
+    for (case, damage) in [
+        (
+            "missing runs principal",
+            "ALTER TABLE runs DROP COLUMN principal;",
+        ),
+        ("missing runs worker", "ALTER TABLE runs DROP COLUMN agent;"),
+        ("missing runs state", "ALTER TABLE runs DROP COLUMN state;"),
+        (
+            "missing runs lease",
+            "ALTER TABLE runs DROP COLUMN claim_expires_at;",
+        ),
+        ("missing runs proof", "ALTER TABLE runs DROP COLUMN proof;"),
+        (
+            "missing runs updated timestamp",
+            "ALTER TABLE runs DROP COLUMN updated_at;",
+        ),
+        (
+            "missing runs created timestamp",
+            "DROP INDEX idx_runs_card_created;
+             ALTER TABLE runs DROP COLUMN created_at;",
+        ),
+        (
+            "missing api key principal",
+            "ALTER TABLE api_keys DROP COLUMN principal;",
+        ),
+        (
+            "incomplete api key shape",
+            "ALTER TABLE api_keys DROP COLUMN last_used_at;",
+        ),
+        (
+            "legacy actors table",
+            "CREATE TABLE actors (id TEXT PRIMARY KEY);",
+        ),
+    ] {
+        let mut store = Store::open_in_memory()?;
+        store.migrate()?;
+        store.connection.execute_batch(damage)?;
+        store
+            .connection
+            .execute_batch("PRAGMA user_version = 18;")?;
+
+        let error = store.migrate().expect_err(case);
+        assert!(
+            matches!(
+                &error,
+                StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    ..
+                }
+            ),
+            "{case}: unexpected migration error: {error}"
+        );
+        assert_eq!(store.schema_version()?, 18, "{case}");
+    }
     Ok(())
 }
 
