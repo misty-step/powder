@@ -51,6 +51,7 @@ pub const COMMANDS: &[&str] = &[
     "subscription-list",
     "subscription-disable",
     "dead-letter-list",
+    "dead-letter-replay",
     "event-tail",
 ];
 
@@ -140,6 +141,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "subscription-list" => subscription_list(rest),
         [command, rest @ ..] if command == "subscription-disable" => subscription_disable(rest),
         [command, rest @ ..] if command == "dead-letter-list" => dead_letter_list(rest),
+        [command, rest @ ..] if command == "dead-letter-replay" => dead_letter_replay(rest),
         [command, rest @ ..] if command == "event-tail" => event_tail(rest),
         [command, ..] => Err(ShellError::Invalid(format!("unknown command: {command}"))),
     }
@@ -253,6 +255,7 @@ pub fn help() -> String {
     help.push_str("  powder subscription-list --db ./data/powder.db\n");
     help.push_str("  powder subscription-disable sub-id --db ./data/powder.db\n");
     help.push_str("  powder dead-letter-list --db ./data/powder.db\n");
+    help.push_str("  powder dead-letter-replay --db ./data/powder.db [--subscription sub-id]\n");
     help.push_str("  powder event-tail --db ./data/powder.db --after 0 --limit 20\n");
     help.push_str(
         "  powder update-status 001 --db ./data/powder.db --status running --actor codex\n\n",
@@ -1378,6 +1381,21 @@ fn dead_letter_list(args: &[String]) -> Result<String, ShellError> {
     }))
 }
 
+/// Requeues dead-lettered webhook deliveries so the delivery loop retries
+/// them on its next tick -- see `Store::replay_dead_letters` for why this
+/// exists (the extended 1s/4s/16s/64s/256s backoff still gives up after
+/// ~5.7 minutes). `--db`-only, matching `dead-letter-list` and every other
+/// event-subscription/dead-letter command's transport support -- no remote
+/// mode yet.
+fn dead_letter_replay(args: &[String]) -> Result<String, ShellError> {
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let subscription_id = flag_value(args, "--subscription");
+    let replayed = store
+        .replay_dead_letters(subscription_id, unix_now())
+        .map_err(store_err)?;
+    to_pretty_json(&serde_json::json!({ "replayed": replayed }))
+}
+
 fn event_tail(args: &[String]) -> Result<String, ShellError> {
     let store = open_store(required_flag(args, "--db")?)?;
     let after = flag_value(args, "--after")
@@ -1694,6 +1712,7 @@ mod tests {
         assert!(COMMANDS.contains(&"subscription-list"));
         assert!(COMMANDS.contains(&"subscription-disable"));
         assert!(COMMANDS.contains(&"dead-letter-list"));
+        assert!(COMMANDS.contains(&"dead-letter-replay"));
         assert!(COMMANDS.contains(&"event-tail"));
     }
 
@@ -2411,6 +2430,86 @@ mod tests {
 
         let disabled = run(&args(["subscription-disable", parts[1], "--db", &db])).unwrap();
         assert!(disabled.contains(parts[1]));
+    }
+
+    /// `dead-letter-replay` requeues everything (or one subscription's
+    /// backlog) so the next delivery-loop tick retries it -- exercised here
+    /// by driving deliveries straight to `dead_letter` via the store
+    /// directly (the CLI has no delivery loop of its own to wait out the
+    /// real backoff schedule) and then proving the CLI command clears them.
+    #[test]
+    fn cli_dead_letter_replay_requeues_deliveries_and_reports_the_count() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-dead-letter-replay-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "subscription-create",
+            "--db",
+            &db,
+            "--url",
+            "http://127.0.0.1:9/unreachable",
+            "--event-filter",
+            "completed",
+        ]))
+        .unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "dlq-replay-cli",
+            "--title",
+            "DLQ replay via CLI",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        run(&args([
+            "complete-card",
+            "dlq-replay-cli",
+            "--db",
+            &db,
+            "--proof",
+            "cli dead-letter-replay coverage",
+        ]))
+        .unwrap();
+
+        {
+            let mut store = Store::open(&db).unwrap();
+            let mut now = unix_now();
+            for _ in 0..6 {
+                for due in store.due_webhook_deliveries(now, 10).unwrap() {
+                    store
+                        .record_webhook_delivery_failure(&due.id, Some(500), "unreachable", now)
+                        .unwrap();
+                }
+                now += 300;
+            }
+            assert_eq!(store.list_dead_letter_deliveries(10).unwrap().len(), 1);
+        }
+
+        let listed = run(&args(["dead-letter-list", "--db", &db])).unwrap();
+        assert!(listed.contains("\"event_type\": \"completed\""));
+
+        let replayed = run(&args(["dead-letter-replay", "--db", &db])).unwrap();
+        assert!(replayed.contains("\"replayed\": 1"));
+
+        let listed_after = run(&args(["dead-letter-list", "--db", &db])).unwrap();
+        assert!(listed_after.contains("\"dead_letters\": []"));
+
+        // A second replay with nothing left dead-lettered is a legitimate
+        // no-op, not an error.
+        let replayed_again = run(&args(["dead-letter-replay", "--db", &db])).unwrap();
+        assert!(replayed_again.contains("\"replayed\": 0"));
     }
 
     #[test]

@@ -119,6 +119,24 @@ fn config_rejects_invalid_auth_mode() {
 }
 
 #[test]
+fn config_defaults_dead_letter_ready_threshold_and_accepts_an_override() {
+    let default = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
+    assert_eq!(
+        default.dead_letter_ready_threshold,
+        DEFAULT_READYZ_DEAD_LETTER_THRESHOLD
+    );
+
+    let overridden = Config::from_pairs([("POWDER_READYZ_DEAD_LETTER_THRESHOLD", "5")]).unwrap();
+    assert_eq!(overridden.dead_letter_ready_threshold, 5);
+}
+
+#[test]
+fn config_rejects_a_non_numeric_dead_letter_ready_threshold() {
+    let err = Config::from_pairs([("POWDER_READYZ_DEAD_LETTER_THRESHOLD", "lots")]).unwrap_err();
+    assert_eq!(err.variable, "POWDER_READYZ_DEAD_LETTER_THRESHOLD");
+}
+
+#[test]
 fn config_accepts_explicit_bind_addr() {
     let config = Config::from_pairs([("POWDER_BIND_ADDR", "127.0.0.1:4100")]).unwrap();
     assert_eq!(
@@ -1574,7 +1592,9 @@ async fn sse_tail_replays_card_events_as_event_stream() {
 
 #[tokio::test]
 async fn forced_webhook_failures_retry_to_dead_letter_view() {
-    let (webhook_url, receiver) = spawn_webhook_capture(3, 500);
+    // 6 attempts total on the extended backoff schedule (1s, 4s, 16s, 64s,
+    // 256s between attempts; see `WEBHOOK_MAX_ATTEMPTS`).
+    let (webhook_url, receiver) = spawn_webhook_capture(6, 500);
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state.clone());
 
@@ -1615,21 +1635,22 @@ async fn forced_webhook_failures_retry_to_dead_letter_view() {
     assert_eq!(completed.status(), StatusCode::OK);
 
     let base = unix_now() + 10;
-    assert_eq!(deliver_due_webhooks_once(&state, base).await.unwrap(), 1);
-    assert_eq!(
-        deliver_due_webhooks_once(&state, base + 1).await.unwrap(),
-        1
-    );
-    assert_eq!(
-        deliver_due_webhooks_once(&state, base + 3).await.unwrap(),
-        1
-    );
-    for _ in 0..3 {
+    for offset in [0_i64, 1, 5, 21, 85, 341] {
+        assert_eq!(
+            deliver_due_webhooks_once(&state, base + offset)
+                .await
+                .unwrap(),
+            1,
+            "delivery should be due at offset {offset}s"
+        );
+    }
+    for _ in 0..6 {
         let received = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(received.json["event_type"], "completed");
     }
 
     let dead = app
+        .clone()
         .oneshot(json_request(
             Method::GET,
             "/api/v1/events/dead-letter",
@@ -1641,8 +1662,61 @@ async fn forced_webhook_failures_retry_to_dead_letter_view() {
     assert_eq!(dead.status(), StatusCode::OK);
     let dead = response_json(dead).await;
     assert_eq!(dead["dead_letters"][0]["event_type"], "completed");
-    assert_eq!(dead["dead_letters"][0]["attempt_count"], 3);
+    assert_eq!(dead["dead_letters"][0]["attempt_count"], 6);
     assert_eq!(dead["dead_letters"][0]["last_status"], 500);
+
+    // Non-admin callers cannot replay dead letters.
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let forbidden = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/events/dead-letter/replay",
+            Some(&agent_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // An admin replay requeues the dead letter; it shows up as due again
+    // and is gone from the dead-letter view.
+    let replayed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/events/dead-letter/replay",
+            Some(&raw_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), StatusCode::OK);
+    let replayed = response_json(replayed).await;
+    assert_eq!(replayed["replayed"], 1);
+
+    let dead_after = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/events/dead-letter",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let dead_after = response_json(dead_after).await;
+    assert_eq!(dead_after["dead_letters"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        deliver_due_webhooks_once(&state, base + 341).await.unwrap(),
+        1,
+        "replayed delivery should be immediately due again"
+    );
 }
 
 #[test]
@@ -3608,6 +3682,171 @@ async fn healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db
     }
 }
 
+/// powder-epic-truthful-ops: a healthy fresh instance reports every gate
+/// individually, not just a bare `ok`, so an operator (or an alert rule)
+/// staring at `/readyz` can see *why* it passed, not just that it did.
+#[tokio::test]
+async fn readyz_reports_every_gate_when_healthy() {
+    let (state, _) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["writable"], true);
+    assert_eq!(body["schema_version"], powder_store::SCHEMA_VERSION);
+    assert_eq!(
+        body["schema_version_expected"],
+        powder_store::SCHEMA_VERSION
+    );
+    assert_eq!(body["dead_letter_count"], 0);
+    assert_eq!(
+        body["dead_letter_threshold"],
+        DEFAULT_READYZ_DEAD_LETTER_THRESHOLD
+    );
+    assert_eq!(body["poison_count"], 0);
+}
+
+/// The dead-letter backlog gate trips `/readyz` to 503 once the count meets
+/// (not just exceeds) the configured threshold -- `POWDER_READYZ_DEAD_LETTER_
+/// THRESHOLD` set to 1 here so a single dead letter is enough to prove the
+/// comparison, rather than needing to drive 100 real deliveries to failure.
+#[tokio::test]
+async fn readyz_fails_when_dead_letter_backlog_meets_threshold() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let state = AppState {
+        config: Arc::new(Config {
+            dead_letter_ready_threshold: 1,
+            ..(*state.config).clone()
+        }),
+        store: state.store,
+        poison_count: state.poison_count,
+    };
+    let app = app(state.clone());
+
+    let (webhook_url, _receiver) = spawn_webhook_capture(1, 500);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/events/subscriptions",
+            Some(&raw_key),
+            &format!(r#"{{"url":"{webhook_url}","event_filter":["completed"]}}"#),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"readyz-dlq","title":"Readyz DLQ","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/readyz-dlq/complete",
+            Some(&raw_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+
+    // Drive the single delivery straight to dead-letter directly through
+    // the store, rather than replaying the full 6-attempt/341s HTTP
+    // backoff schedule already covered by
+    // `forced_webhook_failures_retry_to_dead_letter_view`.
+    {
+        let mut store = state.store.lock().unwrap();
+        let now = unix_now();
+        for due in store.due_webhook_deliveries(now, 10).unwrap() {
+            for attempt in 0..6 {
+                let _ = attempt;
+                store
+                    .record_webhook_delivery_failure(&due.id, Some(500), "forced", now)
+                    .unwrap();
+            }
+        }
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await;
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["dead_letter_count"], 1);
+    assert_eq!(body["dead_letter_threshold"], 1);
+}
+
+/// A poisoned store mutex is recovered (not fatal) -- ordinary routes keep
+/// serving 200s -- but `/readyz` reports it and fails until an operator
+/// investigates and restarts, per the `lock_store`/`Ready` doc comments.
+#[tokio::test]
+async fn poisoned_store_mutex_is_recovered_and_flagged_not_ready() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+
+    // Poison the mutex the same way a panicking request handler would: take
+    // the lock on another thread and panic while still holding it.
+    let store_for_poison = state.store.clone();
+    let poisoning = std::thread::spawn(move || {
+        let _guard = store_for_poison.lock().unwrap();
+        panic!("simulated handler panic while holding the store lock");
+    });
+    let _ = poisoning.join();
+    assert!(state.store.is_poisoned());
+
+    let app = app(state);
+
+    // An ordinary route still succeeds -- the poisoned lock is recovered,
+    // not fatal.
+    let healthy_route = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"post-poison","title":"Post poison","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(healthy_route.status(), StatusCode::OK);
+
+    // /readyz reports the poisoning and fails.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await;
+    assert_eq!(body["ok"], false);
+    assert!(body["poison_count"].as_u64().unwrap() >= 1);
+}
+
 /// powder-942: the board's home affordance is driven by onboarding's
 /// `home_url`, absent by default and present when `POWDER_HOME_URL` is set --
 /// the board's JS decides whether to render a link at all from this field.
@@ -3798,8 +4037,10 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
             field_note: FieldNoteConfig::default(),
             tailnet_proxy_secret: None,
             tailnet_admin: true,
+            dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
         }),
         store: Arc::new(Mutex::new(store)),
+        poison_count: Arc::new(AtomicU64::new(0)),
     };
     (state, key.raw_key)
 }
@@ -3823,6 +4064,7 @@ fn test_state_with_field_note(
             ..(*state.config).clone()
         }),
         store: Arc::new(Mutex::new(store)),
+        poison_count: state.poison_count,
     };
     (state, key)
 }
@@ -3838,6 +4080,7 @@ fn test_state_with_home_url(auth_mode: AuthMode, home_url: &str) -> (AppState, S
             ..(*state.config).clone()
         }),
         store: state.store,
+        poison_count: state.poison_count,
     };
     (state, key)
 }
@@ -3854,6 +4097,7 @@ fn test_state_with_tailnet_backstop(proxy_secret: Option<&str>, tailnet_admin: b
             ..(*state.config).clone()
         }),
         store: state.store,
+        poison_count: state.poison_count,
     }
 }
 

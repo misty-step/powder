@@ -222,30 +222,17 @@ ALTER TABLE api_keys ADD COLUMN hash_algorithm TEXT NOT NULL DEFAULT 'bcrypt';
 /// the store's own `ON CONFLICT ... = excluded.*` upsert. Dead columns since
 /// the day this schema was written; `proof` is untouched, since
 /// `complete_card` genuinely writes it.
-pub const MIGRATE_3_TO_4: &str = r#"
-ALTER TABLE runs DROP COLUMN model;
-ALTER TABLE runs DROP COLUMN turn_count;
-ALTER TABLE runs DROP COLUMN token_count;
-ALTER TABLE runs DROP COLUMN consecutive_failures;
-ALTER TABLE runs DROP COLUMN last_error;
-ALTER TABLE runs DROP COLUMN result;
-"#;
-
-pub const MIGRATE_4_TO_5: &str = r#"
-ALTER TABLE cards ADD COLUMN related_json TEXT NOT NULL DEFAULT '[]';
-ALTER TABLE cards ADD COLUMN blocks_json TEXT NOT NULL DEFAULT '[]';
-
-CREATE TABLE IF NOT EXISTS card_events (
-  id TEXT PRIMARY KEY,
-  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
-  event_type TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);
-"#;
-
+///
+/// powder-epic-truthful-ops: this step's SQL used to live here as
+/// `MIGRATE_3_TO_4`, run unconditionally. It now lives inline in
+/// `Store::migrate_3_to_4`, one `DROP COLUMN` per dead column, each guarded
+/// by `table_has_column` -- a crash partway through the six drops needs to
+/// finish only the columns still present on retry, which a single
+/// all-or-nothing batch constant can't express. See that function's doc
+/// comment.
+///
+/// The `MIGRATE_4_TO_5` step (the two `cards` `ADD COLUMN`s plus the
+/// `card_events` table) moved the same way, into `Store::migrate_4_to_5`.
 pub const MIGRATE_5_TO_6: &str = r#"
 CREATE TABLE IF NOT EXISTS event_subscriptions (
   id TEXT PRIMARY KEY,
@@ -318,10 +305,10 @@ ALTER TABLE repositories ADD COLUMN tier TEXT NOT NULL DEFAULT 'backburner';
 CREATE INDEX IF NOT EXISTS idx_repositories_tier ON repositories(tier, name);
 "#;
 
-pub const MIGRATE_8_TO_9: &str = r#"
-ALTER TABLE cards ADD COLUMN criteria_json TEXT NOT NULL DEFAULT '[]';
-ALTER TABLE cards ADD COLUMN proof_plan_json TEXT NOT NULL DEFAULT '[]';
-"#;
+// The `MIGRATE_8_TO_9` step (the two `cards` `ADD COLUMN`s for
+// `criteria_json`/`proof_plan_json`) moved into `Store::migrate_8_to_9` for
+// the same per-column-guard reason as `MIGRATE_3_TO_4`/`MIGRATE_4_TO_5`
+// above.
 
 /// powder-931: key hygiene is currently a manual, error-prone audit against
 /// a list with no signal for "is anything still using this". Recording the

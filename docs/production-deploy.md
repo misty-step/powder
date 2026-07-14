@@ -102,30 +102,142 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    cargo zigbuild --release --target x86_64-unknown-linux-gnu -p powder-server -p powder-cli
    ```
 
-2. **Swap binaries atomically and let the supervisor respawn** (do NOT
-   restart `sanctum.service` -- that bounces every app on the box):
+2. **Snapshot the live database before touching a binary.** The swap in
+   step 3 respawns the process against the *same* database file; a bad
+   migration or a schema-version regression in the new binary should never
+   also cost the last-known-good data. A WAL-safe live snapshot via
+   `sqlite3 .backup` (works against a database `powder-server` still has
+   open, unlike `cp`, which can copy a torn read mid-write):
+
+   ```sh
+   ssh root@<box> 'sqlite3 <path-under-/data> ".backup <path-under-/data>/powder.pre-deploy-$(date +%Y%m%d%H%M%S).db"'
+   ```
+
+   Litestream is already replicating continuously in the background
+   (sanctum-owned config on the box; see "Backup, restore drill, and
+   rollback" below) -- this local `.backup` snapshot is a *second*,
+   deploy-scoped safety net you control the exact timing of, not a
+   replacement for that replication.
+
+3. **Swap binaries atomically, keep the prior binary, and let the
+   supervisor respawn** (do NOT restart `sanctum.service` -- that bounces
+   every app on the box):
 
    ```sh
    scp target/x86_64-unknown-linux-gnu/release/powder-server root@<box>:/usr/local/bin/powder-server.new
    scp target/x86_64-unknown-linux-gnu/release/powder root@<box>:/usr/local/bin/powder.new
-   ssh root@<box> 'mv /usr/local/bin/powder-server.new /usr/local/bin/powder-server \
+   ssh root@<box> 'cp /usr/local/bin/powder-server /usr/local/bin/powder-server.prev \
+     && cp /usr/local/bin/powder /usr/local/bin/powder.prev \
+     && mv /usr/local/bin/powder-server.new /usr/local/bin/powder-server \
      && mv /usr/local/bin/powder.new /usr/local/bin/powder \
      && chmod +x /usr/local/bin/powder-server /usr/local/bin/powder \
      && pkill -x powder-server'   # supervisor respawns it on the new binary
    curl -s "$POWDER_API_BASE_URL/healthz"   # verify it came back
+   curl -s "$POWDER_API_BASE_URL/readyz"    # confirm schema/writable/dead-letter/poison gates are all green
    ```
 
-3. **Record the deploy**: note the deployed `master` SHA and date on the
+   `powder-server.prev`/`powder.prev` are the binaries this deploy just
+   replaced -- kept in place (overwritten by the *next* deploy's own
+   `.prev` copy, not retained indefinitely) specifically for the rollback
+   command below.
+
+4. **Rollback**, if `/readyz` or `/healthz` comes back unhealthy and the new
+   binary itself (not just data) is the suspect: swap the `.prev` binaries
+   back in and respawn, the same way step 3 swapped them forward.
+
+   ```sh
+   ssh root@<box> 'mv /usr/local/bin/powder-server /usr/local/bin/powder-server.rolled-back \
+     && mv /usr/local/bin/powder /usr/local/bin/powder.rolled-back \
+     && mv /usr/local/bin/powder-server.prev /usr/local/bin/powder-server \
+     && mv /usr/local/bin/powder.prev /usr/local/bin/powder \
+     && pkill -x powder-server'
+   curl -s "$POWDER_API_BASE_URL/healthz"
+   ```
+
+   Rollback restores the *binary*, not the database -- if the new binary
+   already wrote schema-incompatible data before you rolled back, restore
+   from the step-2 snapshot (or a Litestream generation) instead; see
+   "Backup, restore drill, and rollback" below.
+
+5. **Record the deploy**: note the deployed `master` SHA and date on the
    Powder card that drove the change (work log or completion proof). The
    Sanctum repo's `vendor/powder` pin was the durable record until
    sanctum#83 ("reduce Sanctum to host infrastructure") deleted `vendor/`
    entirely — do not try to bump it; there is currently no Sanctum-side
-   record of the deployed SHA (verified 2026-07-13).
+   record of the deployed SHA (verified 2026-07-13). The running instance's
+   own startup log line (`powder-server starting`, `journalctl -u
+   sanctum`) now carries `version`/`git_sha` for exactly this purpose
+   (powder-epic-truthful-ops) -- read it back over SSH as a second,
+   independent confirmation of what actually booted, rather than trusting
+   the deploy script alone.
+6. **Post-deploy checklist item (lead, not this task):** re-verify the
+   Canary heartbeat against the live box after the swap. This is a manual
+   step for whoever drove the deploy to do against the real instance --
+   nothing in this repo can exercise it.
 
 A merged PR on `misty-step/powder` alone changes nothing in production until
 the steps above happen. `powder version` on a locally installed CLI reports
 the commit *your local build* came from; it says nothing about what commit
 the deployed instance is running.
+
+## Backup, restore drill, and rollback (powder-epic-truthful-ops)
+
+The generic Litestream + S3 restore procedure -- what gets replicated, how
+`bin/entrypoint.sh` auto-restores on boot, how to run a non-destructive
+drill -- is documented once, provider-agnostically, in
+[`docs/self-hosting.md#backup-and-restore-litestream--s3`](self-hosting.md#backup-and-restore-litestream--s3).
+[`docs/litestream-restore-drill.md`](litestream-restore-drill.md) is a
+tombstone: it recorded a real drill run against the now-destroyed Fly app
+and is not current evidence for anything running today.
+
+**This section is the DO-box-specific version of that drill** -- the
+commands an operator actually runs over `ssh` against the Sanctum box, not
+against a local checkout. It requires the box; nothing here can be exercised
+from this repo alone, and it is not part of this PR's own gate.
+
+- **Litestream itself is Sanctum-owned**, not this repo's `litestream.yml`
+  (that file, like `fly.toml`, is the standalone self-hoster's reference
+  config -- see "The checked-in Fly config: disposition" below). The box
+  runs its own Litestream config, replicating the production SQLite path to
+  DigitalOcean Spaces continuously. Read that config on the box (its exact
+  path is Sanctum's own concern, not tracked in this repo per powder-951)
+  before running the drill below, so `-config` points at what's actually
+  running.
+
+- **Non-destructive restore drill**, run over `ssh root@<box>` (or via
+  `tailscale ssh root@<box>` from an operator machine, per "Verify before
+  trusting this document" above):
+
+  ```sh
+  # 1. Restore the latest replicated generation to a scratch path -- never
+  #    the live DB path -- so the drill cannot touch what's currently
+  #    serving traffic.
+  litestream restore -if-replica-exists \
+    -o /tmp/powder-restore-drill.db \
+    -config <the box's own litestream config path> \
+    <the box's live POWDER_DB_PATH>
+
+  # 2. Prove the restored file is a real, current Powder database with a
+  #    readback, not just "the file exists" -- pick any card id known to
+  #    exist on the live board.
+  powder get-card <a-known-card-id> --db /tmp/powder-restore-drill.db
+
+  # 3. Clean up -- this was a drill, not a real restore.
+  rm -f /tmp/powder-restore-drill.db
+  ```
+
+  A successful step 2 (the card's real title/status/acceptance come back,
+  not an error) is the drill's pass condition. If it fails, Litestream's
+  replication itself is broken and needs attention before the next real
+  incident needs it.
+
+- **Restoring for real** (not a drill) replaces the live `POWDER_DB_PATH`
+  file with a restored generation and requires stopping `powder-server`
+  first (`pkill -x powder-server`; the supervisor will respawn it against
+  whatever file is at that path when it comes back) -- run the same
+  `litestream restore` command from step 1 above but with `-o` pointed at
+  the real `POWDER_DB_PATH` instead of a scratch path, after moving the
+  current (corrupt/lost) file aside rather than deleting it outright.
 
 ## The checked-in Fly config: disposition
 

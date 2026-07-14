@@ -1,3 +1,27 @@
+//! powder-epic-truthful-ops: this file used to assert the shape of "the
+//! deploy" with no qualifier, when `fly.toml`/`litestream.yml`/
+//! `bin/entrypoint.sh` describe a Fly app (`powder`) that was destroyed
+//! 2026-07-07 and is not, and has never been since the 2026-07-09 cutover,
+//! this repo's operator's production path -- see
+//! `docs/production-deploy.md` for where production actually runs (a
+//! DigitalOcean droplet behind Tailscale, supervised by Sanctum, deployed by
+//! cross-compile + binary swap, no image build, no Fly step at all).
+//!
+//! These tests are re-scoped to what `fly.toml`/`litestream.yml`/
+//! `bin/entrypoint.sh` actually are: a **supported reference deployment**
+//! for a standalone self-hoster who wants to run Powder on Fly under their
+//! own org (the quickstart/Docker path in `docs/self-hosting.md` documents
+//! the other endorsed option). Keeping this contract green still matters --
+//! a self-hoster following the reference should not hit a silently rotted
+//! config -- it just no longer stands in for "production is healthy",
+//! because it never described the operator's actual production instance.
+//!
+//! `production_contract.rs`, alongside this file, asserts what the
+//! operator's *real* deploy path actually needs from this repo: an
+//! env-only-config binary, idempotent migrations, and a schema-gated
+//! `/readyz` -- properties that hold regardless of which reference
+//! deployment shape (Fly, Docker, bare host) a given instance uses.
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -10,7 +34,7 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn fly_config_keeps_the_instance_always_on_with_data_volume_and_route_checks() {
+fn self_hoster_fly_reference_keeps_the_instance_always_on_with_data_volume_and_route_checks() {
     let root = repo_root();
     let fly = std::fs::read_to_string(root.join("fly.toml")).expect("read fly.toml");
 
@@ -31,21 +55,22 @@ fn fly_config_keeps_the_instance_always_on_with_data_volume_and_route_checks() {
     ] {
         assert!(
             fly.contains(expected),
-            "fly.toml should contain {expected:?}"
+            "fly.toml (the standalone self-hoster reference deployment) should contain {expected:?}"
         );
     }
 }
 
 #[test]
-fn fly_config_is_flycast_only_and_can_never_re_expose_a_public_ip() {
+fn self_hoster_fly_reference_is_flycast_only_and_can_never_re_expose_a_public_ip() {
     let root = repo_root();
     let fly = std::fs::read_to_string(root.join("fly.toml")).expect("read fly.toml");
 
     // `[http_service]` is Fly's public-Anycast-on-80/443 shorthand: defining
     // it asks flyctl to provision a public IP for this app on next deploy if
-    // it doesn't have one. This app must only ever declare `[[services]]`,
-    // Fly's lower-level stanza that stays private as long as no public IP is
-    // allocated (verified live via `bin/check-private-ingress.sh`).
+    // it doesn't have one. This reference app must only ever declare
+    // `[[services]]`, Fly's lower-level stanza that stays private as long as
+    // no public IP is allocated (verified live, prior to the 2026-07-07
+    // teardown, via `bin/check-private-ingress.sh`).
     assert!(
         !fly.contains("[http_service]"),
         "fly.toml must not declare a public [http_service]; use [[services]] for flycast-only ingress"
@@ -62,13 +87,14 @@ fn fly_config_is_flycast_only_and_can_never_re_expose_a_public_ip() {
         fly.contains(r#"handlers = ["http"]"#) && !fly.contains(r#"handlers = ["tls""#),
         "fly.toml services.ports must use a plain http handler, never a public tls handler"
     );
-    // `[::]` is required, not `0.0.0.0`: this app's private-network path
-    // (Flycast/`.internal`) is IPv6-only, and a `0.0.0.0` bind cannot answer
-    // it (confirmed live: `fly proxy` reset every request against a
-    // `0.0.0.0`-bound deploy, and worked immediately once switched to `[::]`).
-    // `fly deploy` prints a "not listening on 0.0.0.0" warning for `[::]`
-    // regardless; that is a confirmed cosmetic false positive (health
-    // checks stay 2/2 passing) — see the comment in fly.toml.
+    // `[::]` is required, not `0.0.0.0`: this reference app's private-network
+    // path (Flycast/`.internal`) is IPv6-only, and a `0.0.0.0` bind cannot
+    // answer it (confirmed live, prior to the 2026-07-07 teardown: `fly
+    // proxy` reset every request against a `0.0.0.0`-bound deploy, and
+    // worked immediately once switched to `[::]`). `fly deploy` prints a
+    // "not listening on 0.0.0.0" warning for `[::]` regardless; that is a
+    // confirmed cosmetic false positive (health checks stayed 2/2 passing
+    // while this app was live) — see the comment in fly.toml.
     assert!(
         fly.contains(r#"POWDER_BIND_ADDR = "[::]:4000""#),
         "fly.toml must bind [::] so the private Flycast/.internal path stays reachable"
@@ -76,7 +102,7 @@ fn fly_config_is_flycast_only_and_can_never_re_expose_a_public_ip() {
 }
 
 #[test]
-fn litestream_config_targets_fly_tigris_with_path_style_s3() {
+fn self_hoster_litestream_reference_targets_fly_tigris_with_path_style_s3() {
     let root = repo_root();
     let config = std::fs::read_to_string(root.join("litestream.yml")).expect("read litestream.yml");
 
@@ -91,13 +117,13 @@ fn litestream_config_targets_fly_tigris_with_path_style_s3() {
     ] {
         assert!(
             config.contains(expected),
-            "litestream.yml should contain {expected:?}"
+            "litestream.yml (the standalone self-hoster reference config) should contain {expected:?}"
         );
     }
 }
 
 #[test]
-fn entrypoint_restore_and_replication_paths_are_locked() {
+fn self_hoster_entrypoint_restore_and_replication_paths_are_locked() {
     let root = repo_root();
     let script = root.join("test/bin/entrypoint_test.sh");
     let output = Command::new("bash")
