@@ -3697,3 +3697,115 @@ fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()
 
     Ok(())
 }
+
+// powder-scrub-write-boundary: every agent/human free-text write routes
+// through `secrets::scrub_secrets` at the store's own write boundary, not in
+// any adapter. These are the anti-regression tests the card demands: mint a
+// *real* credential through the store's own generators (not a hand-typed
+// fixture) and assert it never survives a write, end to end -- including the
+// outbound webhook payload a comment or work-log entry feeds.
+
+#[test]
+fn scrub_secrets_redacts_a_freshly_minted_api_key() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let created = store.create_api_key("ci-bot", ApiKeyScope::Agent, 10)?;
+    assert!(created.raw_key.starts_with("sk_powder_"));
+
+    let scrubbed = crate::secrets::scrub_secrets(&created.raw_key);
+    assert!(!scrubbed.contains(&created.raw_key));
+    assert!(scrubbed.contains("[REDACTED:powder-api-key]"));
+    Ok(())
+}
+
+#[test]
+fn scrub_secrets_redacts_a_freshly_minted_webhook_signing_secret() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let created =
+        store.create_event_subscription("http://127.0.0.1:9000/hooks/powder", Vec::new(), 10)?;
+    assert!(created.signing_secret.starts_with("whsec_powder_"));
+
+    let scrubbed = crate::secrets::scrub_secrets(&created.signing_secret);
+    assert!(!scrubbed.contains(&created.signing_secret));
+    assert!(scrubbed.contains("[REDACTED:powder-webhook-secret]"));
+    Ok(())
+}
+
+#[test]
+fn comment_carrying_a_fresh_api_key_reads_back_scrubbed_everywhere() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    // A subscription watching comment-added, so the outbound webhook payload
+    // for this exact write is inspectable too.
+    store.create_event_subscription(
+        "http://127.0.0.1:9000/hooks/powder",
+        vec!["comment-added".to_string()],
+        5,
+    )?;
+
+    let card_id = CardId::new("scrub-comment")?;
+    store.create_card_with_events(ready_card("scrub-comment", 10), "operator", 10)?;
+
+    // A real, freshly minted key -- not a hand-typed fixture -- accidentally
+    // pasted into a comment.
+    let leaked = store.create_api_key("leaked-in-comment", ApiKeyScope::Agent, 11)?;
+    let comment_body = format!("oops, wrong window: {}", leaked.raw_key);
+
+    let comment = store.add_comment(&card_id, "agent-a", &comment_body, 20)?;
+    assert!(!comment.body.contains(&leaked.raw_key));
+    assert!(comment.body.contains("[REDACTED:powder-api-key]"));
+
+    // Readback via get_card_detail must be scrubbed too -- it reads whatever
+    // was actually persisted, so this mostly confirms the write-time scrub
+    // is durable, not read-time.
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed, 30)?
+        .expect("card detail");
+    assert_eq!(detail.comments.len(), 1);
+    assert!(!detail.comments[0].body.contains(&leaked.raw_key));
+    assert!(detail.comments[0]
+        .body
+        .contains("[REDACTED:powder-api-key]"));
+
+    // The outbound webhook payload embeds the comment body in `change`
+    // (lib.rs's add_comment). Because scrubbing happens at write time before
+    // the event is enqueued, the payload is clean by construction -- assert
+    // it anyway per the card's instruction, since this is the regression a
+    // future refactor could silently reintroduce.
+    let due = store.due_webhook_deliveries(20, 10)?;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].event_type, "comment-added");
+    assert!(!due[0].payload_json.contains(&leaked.raw_key));
+    assert!(due[0].payload_json.contains("[REDACTED:powder-api-key]"));
+
+    Ok(())
+}
+
+#[test]
+fn scrub_write_boundary_leaves_short_prose_mentions_untouched_end_to_end() -> Result<()> {
+    // The anti-false-positive companion to the redaction tests above: a work
+    // log that merely *discusses* the key-shape prefix in prose (well under
+    // the 20-char floor after the prefix) must survive the write boundary
+    // byte for byte, not just in the unit-level secrets::scrub_secrets tests.
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("scrub-prose")?;
+    store.create_card_with_events(ready_card("scrub-prose", 10), "operator", 10)?;
+
+    let prose = "confirmed the sk_powder_ prefix is what identifies a Powder-issued key";
+    let entry = store.append_work_log(
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        prose,
+        20,
+    )?;
+    assert_eq!(entry.body, prose);
+
+    let comment = store.add_comment(&card_id, "agent-a", prose, 21)?;
+    assert_eq!(comment.body, prose);
+
+    Ok(())
+}

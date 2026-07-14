@@ -172,7 +172,9 @@ pub const ROUTES: &[ApiRoute] = &[
         method: "POST",
         path: "/api/v1/cards/{id}/comments",
         intent: "attach an actor-attributed comment to a card, visible immediately via get_card/get_run",
-        body_shape: None,
+        body_shape: Some(
+            r#"{"author":"...","body":"..."} -- both fields are required; body is scrubbed for known secret shapes server-side before storage"#,
+        ),
     },
     ApiRoute {
         method: "POST",
