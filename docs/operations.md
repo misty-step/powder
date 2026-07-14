@@ -46,15 +46,35 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
 | `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | `work-log\tcard_id\tagent\tbody` |
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
+| `answer-input` | SQLite run resume | `POST /api/v1/runs/{id}/answer` | `answered-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
-falling back to ephemeral state. `update-relations`, `get-run`,
-`list-awaiting-input`, `answer-input`, `repository-*`, `import-github-issues`, `key-*`, and
-`subscription-*` remain `--db`-only (bulk/admin operations or reads with no
-remote-mode demand yet); omitting `--db` on those still fails with a bare
-`missing --db`.
+falling back to ephemeral state. `update-relations`, `set-parent`, `get-run`,
+`list-awaiting-input`, `repository-*`, `import-github-issues`,
+`key-*`, `subscription-*`, `dead-letter-list`, and `event-tail` remain
+`--db`-only (bulk/admin operations, hierarchy/webhook management, or reads
+with no remote-mode demand yet); omitting `--db` on those still fails with a
+bare `missing --db`.
+
+Commands with no remote-mode transport, verified against `COMMANDS` in
+`crates/powder-cli/src/lib.rs`:
+
+| Command | Purpose | Example |
+| --- | --- | --- |
+| `set-parent` | Link or clear a card's explicit `parent` edge (epic decomposition) | `powder set-parent 002 --db ./data/powder.db --parent 001` / `powder set-parent 002 --db ./data/powder.db --clear` |
+| `repository-get` | Read one repository entity by canonical name or alias | `powder repository-get canary --db ./data/powder.db` |
+| `repository-delete` | Delete an unused repository entity and its aliases | `powder repository-delete canary --db ./data/powder.db` |
+| `subscription-create` | Register a signed webhook subscription (prints the signing secret once with `--show-secret`) | `powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret` |
+| `subscription-list` | List webhook subscriptions without disclosing signing secrets | `powder subscription-list --db ./data/powder.db` |
+| `subscription-disable` | Disable a subscription while preserving its delivery history | `powder subscription-disable sub-id --db ./data/powder.db` |
+| `dead-letter-list` | List webhook deliveries that exhausted retry attempts | `powder dead-letter-list --db ./data/powder.db` |
+| `event-tail` | Page through durable outbound card events (the same feed `GET /api/v1/events/tail` streams as SSE) after a given sequence number | `powder event-tail --db ./data/powder.db --after 0 --limit 20` |
+
+See [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks) for a full
+`subscription-create` -> trigger an event -> `event-tail`/`dead-letter-list`
+readback walkthrough against a real local server.
 
 MCP can also run against a local or deployed `powder-server` over HTTP instead
 of opening SQLite directly:
@@ -178,6 +198,11 @@ profiles:
 
 ## Self-Hosting
 
+For the copy-pasteable quickstart (Docker, release binary, bare-host +
+systemd, Fly), the full env-var reference, and the backup/restore story, see
+[`docs/self-hosting.md`](self-hosting.md). This section stays focused on the
+production posture and lore specific to this repo's own history.
+
 Powder follows the Canary-style deployment pattern:
 
 - one Rust service image
@@ -187,14 +212,17 @@ Powder follows the Canary-style deployment pattern:
 - optional Litestream replication to Fly Tigris
 - `/healthz`, `/readyz`, and `/api/v1/onboarding`
 - auth configured by env (`api-key`, `tailscale-header`, or `none`)
-- change webhooks configured by `POWDER_WEBHOOK_URLS` (comma- or newline-separated)
+- change webhooks configured at runtime via `POST /api/v1/events/subscriptions`
+  (`powder subscription-create`), not an env var -- see
+  [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks)
 - first-run bootstrap API key, printed once unless
   `POWDER_DISCLOSE_BOOTSTRAP_KEY=false`
 
-Local setup:
+Local setup (there is no dotenv loader -- `cp .env.example .env` alone does
+nothing until the file is loaded into the process environment):
 
 ```sh
-cp .env.example .env
+set -a; source .env; set +a
 POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 ```
 
@@ -262,8 +290,12 @@ matches that actor.
 Powder is audit-first, not lifecycle-enforcing: any authorized actor may set any
 card status in one call. Claims remain useful leases for coordination, but
 status correction and completion do not require the actor to hold the claim or
-provide proof. When configured, card create/update/status changes POST
-`{"event":"card.*","card":{...}}` to each URL in `POWDER_WEBHOOK_URLS`.
+provide proof. Card create/update/status/claim-expiry/completion changes are
+delivered to any URL registered via `POST /api/v1/events/subscriptions`
+(`powder subscription-create --url ... [--event-filter ...]`), each with its
+own HMAC signing secret and independent retry/dead-letter tracking -- see
+[`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks) for the full
+contract and a working local example.
 
 ### Field-note seed generator (powder-921)
 
