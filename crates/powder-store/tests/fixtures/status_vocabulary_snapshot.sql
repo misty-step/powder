@@ -66,13 +66,31 @@ SELECT
   1700000100 + n
 FROM expanded;
 
--- Adversarial legacy claim shapes. `claimed-008` has no claim at all;
--- `claimed-009` and `running-045` carry malformed partial claim tuples that
--- the current card loader already treats as claimless. The migration must
--- classify from a complete, valid tuple without repairing or erasing any of
--- these bytes. `running-044` proves that a claimless legacy active status with
--- no real oracle returns to backlog instead of being stranded in progress.
+-- Adversarial legacy claim/oracle shapes. `claimed-008` has no claim and
+-- deliberately divergent oracle columns: structured criteria are the loader's
+-- authoritative oracle even though the legacy acceptance list is empty.
+-- `claimed-009` and `running-045` carry partial claim tuples. `running-042`
+-- and `running-043` carry all four claim columns, but respectively have a
+-- blank agent and blank run id. All malformed forms must decode claimless
+-- without repairing or erasing their bytes. `running-044` proves that a
+-- claimless legacy active status with no real oracle returns to backlog.
+UPDATE cards SET
+  acceptance_json = '[]',
+  criteria_json = '[{"text":"structured oracle survives legacy acceptance drift"}]'
+WHERE id = 'claimed-008';
 UPDATE cards SET claim_agent = 'partial-claimed-agent' WHERE id = 'claimed-009';
+UPDATE cards SET
+  claim_agent = '   ',
+  claim_run_id = 'run-running-042-malformed',
+  claim_acquired_at = 1700000042,
+  claim_expires_at = 1700003642
+WHERE id = 'running-042';
+UPDATE cards SET
+  claim_agent = 'agent-running-043-malformed',
+  claim_run_id = '   ',
+  claim_acquired_at = 1700000043,
+  claim_expires_at = 1700003643
+WHERE id = 'running-043';
 UPDATE cards SET acceptance_json = '["   "]' WHERE id = 'running-044';
 UPDATE cards SET claim_agent = 'partial-running-agent' WHERE id = 'running-045';
 

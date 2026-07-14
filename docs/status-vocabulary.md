@@ -31,8 +31,12 @@ rationale when the destination needs explanation, actor
 pre-existing events are untouched; only the `status` column on affected
 cards changes. For this migration, a valid claim means a complete, non-empty
 four-column claim tuple: agent and run identifiers plus both timestamps.
-Partial claim columns are treated as claimless, but remain byte-for-byte
-untouched for later diagnosis or repair.
+Partial claim columns and complete tuples with a blank identifier are treated
+as claimless by the same decoder used for normal card reads, but remain
+byte-for-byte untouched for later diagnosis or repair. Structured criteria
+are the effective acceptance oracle whenever they contain a non-blank item;
+the legacy acceptance list is the fallback. Migration and card reads share
+that decoder too, so divergent legacy columns cannot disagree about readiness.
 
 | Legacy status | New status | Why |
 | --- | --- | --- |
