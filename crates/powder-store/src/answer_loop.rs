@@ -114,7 +114,7 @@ impl Store {
 
     pub fn list_awaiting_input(&self, limit: usize) -> Result<Vec<AwaitingInput>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, card_id, state, agent, claim_expires_at, proof,
+            "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,
              created_at, updated_at
              FROM runs
              WHERE state = 'awaiting_input'
@@ -141,7 +141,7 @@ impl Store {
 
     pub fn list_approvals(&self, limit: usize) -> Result<Vec<ApprovalQueueRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT DISTINCT runs.id, runs.card_id, runs.state, runs.agent,
+            "SELECT DISTINCT runs.id, runs.card_id, runs.state, runs.principal, runs.agent,
              runs.claim_expires_at, runs.proof, runs.created_at, runs.updated_at
              FROM runs
              JOIN cards ON cards.id = runs.card_id
@@ -382,7 +382,7 @@ fn load_child_evidence(connection: &Connection, card_id: &CardId) -> Result<Vec<
     Ok(evidence.into_iter().map(|entry| entry.4).collect())
 }
 
-fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run> {
+pub(super) fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run> {
     connection
         .query_row(RUN_SELECT_SQL, [run_id.as_str()], RunRecord::from_row)
         .optional()?
@@ -398,7 +398,7 @@ fn load_runs_for_card(
     let records = match detail {
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
-                "SELECT id, card_id, state, agent, claim_expires_at, proof,
+                "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,
                  created_at, updated_at
                  FROM runs
                  WHERE card_id = ?1
@@ -411,7 +411,7 @@ fn load_runs_for_card(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT id, card_id, state, agent, claim_expires_at, proof,
+                "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,
                  created_at, updated_at
                  FROM runs
                  WHERE card_id = ?1

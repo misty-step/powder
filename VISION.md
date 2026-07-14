@@ -123,6 +123,10 @@ yet trustworthy enough for a fleet to depend on:
 - `powder-store` persists the instance database in SQLite, enables WAL, owns
   migrations, stores hashed API keys, seeds the first bootstrap key once, and
   runs transactional card lifecycle operations.
+- API keys authenticate neutral integration principals. Claims and runs keep
+  that principal distinct from the declared worker label and unique run id, so
+  one orchestrator credential can coordinate many workers without lying in the
+  audit trail or minting a key per persona.
 - `powder-cli` can initialize an instance database, create cards, list ready
   work, claim, transition, and complete cards.
 - `powder-mcp` exposes the full agent toolset (20 default tools plus a
