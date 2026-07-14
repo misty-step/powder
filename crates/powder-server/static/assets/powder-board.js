@@ -15,8 +15,20 @@ const RAW_STATUSES = [
 const PAGE_LIMIT = 1000;
 const STORAGE_KEY = "powder-api-key";
 const BOARD_STATE_KEY = "powder-board-state";
+const ANSWER_ACTOR_KEY = "powder-answer-actor";
 const KEY_MINT_COMMAND =
   "powder key-create --db /data/powder.db --name operator --scope admin --show-secret";
+
+// powder-epic-answer-board: live board updates over SSE (GET
+// /api/v1/events/tail). Simplest honest design (see PR design notes) --
+// treat every non-keep-alive event block as "something changed" and
+// debounce a full board refetch, rather than surgically patching DOM per
+// event type.
+const LIVE_RETRY_BASE_MS = 1000;
+const LIVE_RETRY_MAX_MS = 30_000;
+const LIVE_REFRESH_DEBOUNCE_MS = 500;
+const LIVE_HIGHLIGHT_MS = 2_200;
+const LIVE_PRIME_LIMIT = 500;
 
 const KNOWN_REPO_META = {
   crucible: { icon: "i-flask", cat: 0 },
@@ -50,6 +62,12 @@ const els = {
   detailHomeLink: document.getElementById("detail-home-link"),
   footerHomeLink: document.getElementById("footer-home-link"),
   connection: document.getElementById("connection-status"),
+  liveIndicator: document.getElementById("live-indicator"),
+  awaitingBadge: document.getElementById("awaiting-badge"),
+  awaitingBadgeCount: document.getElementById("awaiting-badge-count"),
+  awaitingStrip: document.getElementById("awaiting-strip"),
+  awaitingCount: document.getElementById("awaiting-count"),
+  awaitingList: document.getElementById("awaiting-list"),
   authPanel: document.getElementById("auth-panel"),
   repoSettingsCount: document.getElementById("repo-settings-count"),
   repoSettingsList: document.getElementById("repo-settings-list"),
@@ -98,6 +116,7 @@ const state = {
   needsSetup: false,
   cards: [],
   repositories: [],
+  awaiting: [],
   detailCache: new Map(),
   selectedId: null,
   view: "both",
@@ -214,6 +233,40 @@ function renderHomeLink(homeUrl) {
   }
 }
 
+// Shared by the initial/full load and the silent live-refresh path so both
+// stay wired to the same set of list endpoints.
+async function fetchBoardData() {
+  const [groups, repositoryData, awaiting] = await Promise.all([
+    Promise.all(
+      RAW_STATUSES.map(async (status) => {
+        const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
+        return listPageCards(data, status);
+      }),
+    ),
+    apiJson("/api/v1/repositories?include_hidden=true"),
+    fetchAwaitingInput(),
+  ]);
+  return {
+    cards: dedupeCards(groups.flat()).map(normalizeCard),
+    repositories: normalizeRepositories(repositoryData.repositories || []),
+    awaiting,
+  };
+}
+
+// powder-ui-awaiting-you: GET /api/v1/runs/awaiting-input -- every run
+// currently parked on an operator question, newest-wait-first from the
+// store. Read-only, so it never needs a write key.
+async function fetchAwaitingInput() {
+  try {
+    const data = await apiJson("/api/v1/runs/awaiting-input?limit=50");
+    return Array.isArray(data.awaiting) ? data.awaiting : [];
+  } catch (_err) {
+    // The awaiting strip is a convenience surface, not the primary board --
+    // a failure here must not block the rest of the board from loading.
+    return [];
+  }
+}
+
 async function loadBoard() {
   state.loading = true;
   state.error = "";
@@ -222,23 +275,10 @@ async function loadBoard() {
   render();
   try {
     await loadOnboarding();
-    const [groups, repositoryData] = await Promise.all([
-      Promise.all(
-        RAW_STATUSES.map(async (status) => {
-          try {
-            const data = await apiJson(
-              `/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`,
-            );
-            return listPageCards(data, status);
-          } catch (err) {
-            throw err;
-          }
-        }),
-      ),
-      apiJson("/api/v1/repositories?include_hidden=true"),
-    ]);
-    state.cards = dedupeCards(groups.flat()).map(normalizeCard);
-    state.repositories = normalizeRepositories(repositoryData.repositories || []);
+    const data = await fetchBoardData();
+    state.cards = data.cards;
+    state.repositories = data.repositories;
+    state.awaiting = data.awaiting;
     state.loading = false;
     state.detailCache.clear();
     updateSuccessConnection();
@@ -255,6 +295,205 @@ async function loadBoard() {
     if (failure.kind === "auth") showAuth(failure.action);
     render();
   }
+}
+
+// Live-triggered refresh (powder-epic-answer-board): re-uses fetchBoardData
+// but never flips state.loading, so it never repaints the lanes with the
+// "Loading cards..." placeholder -- that would blow away scroll position
+// and any open filter/search focus for a background refresh the operator
+// did not ask for. Failures are silent; the live indicator's reconnect
+// state already communicates connectivity trouble.
+async function refreshLive() {
+  try {
+    const data = await fetchBoardData();
+    const changed = changedCardIds(state.cards, data.cards);
+    state.cards = data.cards;
+    state.repositories = data.repositories;
+    state.awaiting = data.awaiting;
+    state.detailCache.clear();
+    buildFilters();
+    renderRepositorySettings();
+    render();
+    highlightChangedCards(changed);
+  } catch (_err) {
+    // keep showing the last good board
+  }
+}
+
+function changedCardIds(previous, next) {
+  const before = new Map(previous.map((card) => [card.id, card.updated_at]));
+  const changed = [];
+  for (const card of next) {
+    if (before.get(card.id) !== card.updated_at) changed.push(card.id);
+  }
+  return changed;
+}
+
+// A plain, non-animated highlight: add the class, hold it for a fixed
+// duration, remove it. There is no CSS transition on `.pw-card-live-changed`
+// (see powder-board.css) so this is reduced-motion-safe by construction --
+// it never depends on a media-query opt-out to stay still.
+function highlightChangedCards(ids) {
+  if (!ids.length) return;
+  for (const id of ids) {
+    let selector;
+    try {
+      selector = `[data-id="${CSS.escape(id)}"]`;
+    } catch (_err) {
+      continue;
+    }
+    document.querySelectorAll(selector).forEach((node) => {
+      node.classList.add("pw-card-live-changed");
+      setTimeout(() => node.classList.remove("pw-card-live-changed"), LIVE_HIGHLIGHT_MS);
+    });
+  }
+}
+
+// --- SSE live updates (powder-epic-answer-board) -------------------------
+//
+// GET /api/v1/events/tail streams named SSE events (`event: card-created`,
+// etc) plus periodic unnamed keep-alive comments. `fetch` + a manual
+// line-delimited parser is used instead of `EventSource` because
+// `EventSource` only dispatches unnamed "message" events automatically --
+// consuming every named event type would mean enumerating and
+// `addEventListener`-ing each one (`EVENT_TYPES` in powder-store), which is
+// exactly the "one-to-one wrapper" shape this board avoids elsewhere. Since
+// the refresh strategy below treats every event as an equivalent "something
+// changed" signal (see `refreshLive`), a generic parse-any-data-block loop
+// is both simpler and forward-compatible with new event types.
+let liveRetryDelay = LIVE_RETRY_BASE_MS;
+let liveCursor = 0;
+let liveGeneration = 0;
+let liveRefreshTimer = null;
+let liveTickTimer = null;
+let lastLiveEventAt = 0;
+let liveState = "connecting";
+
+function startLiveUpdates() {
+  if (liveTickTimer) return;
+  liveTickTimer = setInterval(renderLiveIndicator, 1000);
+  primeLiveCursor().finally(() => connectLive());
+}
+
+// One-shot, non-live tail read so the persistent live connection below
+// starts from "now" instead of replaying every historical event (a fresh
+// deployment's whole card-creation backlog) as if it just happened.
+// LIVE_PRIME_LIMIT caps how far back this looks; on an instance with more
+// backlog than that, a handful of old events could be treated as new the
+// first time the board loads -- a display-freshness nuance, not a
+// correctness issue, since it only ever triggers an extra refetch.
+async function primeLiveCursor() {
+  try {
+    const response = await fetch(`/api/v1/events/tail?live=false&limit=${LIVE_PRIME_LIMIT}`, {
+      headers: apiHeaders({ Accept: "text/event-stream" }),
+    });
+    if (!response.ok || !response.body) return;
+    const text = await response.text();
+    for (const block of text.split("\n\n")) {
+      advanceLiveCursor(block);
+    }
+  } catch (_err) {
+    // start from 0 -- worst case the first connection replays some history
+  }
+}
+
+function advanceLiveCursor(block) {
+  for (const line of block.split("\n")) {
+    if (!line.startsWith("id:")) continue;
+    const id = Number(line.slice(3).trim());
+    if (Number.isFinite(id)) liveCursor = Math.max(liveCursor, id);
+  }
+}
+
+async function connectLive() {
+  const generation = ++liveGeneration;
+  updateLiveIndicator("connecting");
+  let response;
+  try {
+    response = await fetch(`/api/v1/events/tail?live=true&after=${liveCursor}`, {
+      headers: apiHeaders({ Accept: "text/event-stream" }),
+    });
+  } catch (_err) {
+    if (generation === liveGeneration) scheduleLiveReconnect(generation);
+    return;
+  }
+  if (generation !== liveGeneration) return;
+  if (!response.ok || !response.body) {
+    scheduleLiveReconnect(generation);
+    return;
+  }
+  liveRetryDelay = LIVE_RETRY_BASE_MS;
+  updateLiveIndicator("live");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (generation !== liveGeneration) return;
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        handleLiveBlock(buffer.slice(0, sep));
+        buffer = buffer.slice(sep + 2);
+      }
+    }
+  } catch (_err) {
+    // network drop mid-stream -- fall through to reconnect
+  }
+  if (generation !== liveGeneration) return;
+  scheduleLiveReconnect(generation);
+}
+
+function scheduleLiveReconnect(generation) {
+  updateLiveIndicator("reconnecting");
+  const delay = liveRetryDelay;
+  liveRetryDelay = Math.min(LIVE_RETRY_MAX_MS, liveRetryDelay * 2);
+  setTimeout(() => {
+    if (generation === liveGeneration) connectLive();
+  }, delay);
+}
+
+function handleLiveBlock(block) {
+  if (!block.trim()) return;
+  advanceLiveCursor(block);
+  const hasData = block.split("\n").some((line) => line.startsWith("data:"));
+  if (!hasData) return; // keep-alive comment, not a domain event
+  lastLiveEventAt = Date.now();
+  renderLiveIndicator();
+  scheduleLiveRefresh();
+}
+
+function scheduleLiveRefresh() {
+  clearTimeout(liveRefreshTimer);
+  liveRefreshTimer = setTimeout(() => {
+    refreshLive();
+  }, LIVE_REFRESH_DEBOUNCE_MS);
+}
+
+function updateLiveIndicator(nextState) {
+  liveState = nextState;
+  renderLiveIndicator();
+}
+
+function renderLiveIndicator() {
+  if (!els.liveIndicator) return;
+  els.liveIndicator.dataset.state = liveState;
+  if (liveState === "reconnecting") {
+    els.liveIndicator.textContent = "live · reconnecting…";
+    return;
+  }
+  if (liveState === "connecting" && !lastLiveEventAt) {
+    els.liveIndicator.textContent = "live · connecting…";
+    return;
+  }
+  if (!lastLiveEventAt) {
+    els.liveIndicator.textContent = "live";
+    return;
+  }
+  const seconds = Math.max(0, Math.round((Date.now() - lastLiveEventAt) / 1000));
+  els.liveIndicator.textContent = `live · last event ${seconds}s ago`;
 }
 
 function dedupeCards(cards) {
@@ -812,6 +1051,7 @@ function bucket() {
 }
 
 function render() {
+  renderAwaitingStrip();
   if (state.loading) {
     renderLoading();
     return;
@@ -893,6 +1133,73 @@ function renderCounts(buckets) {
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
 }
 
+// powder-ui-awaiting-you: "N agents are waiting on you" at a glance --
+// a pinned strip, default-visible whenever it is nonzero and hidden
+// entirely at zero (see PR design notes for the lane-vs-strip tradeoff),
+// plus a header badge so the count is discoverable even when the strip has
+// scrolled out of view.
+function renderAwaitingStrip() {
+  const items = state.awaiting || [];
+  const count = items.length;
+  if (els.awaitingStrip) els.awaitingStrip.hidden = count === 0;
+  if (els.awaitingCount) els.awaitingCount.textContent = count;
+  if (els.awaitingBadge) els.awaitingBadge.hidden = count === 0;
+  if (els.awaitingBadgeCount) els.awaitingBadgeCount.textContent = count;
+  if (els.awaitingList) {
+    els.awaitingList.innerHTML = items.map(awaitingItemHTML).join("");
+  }
+}
+
+function awaitingItemHTML(item) {
+  const card = item.card || {};
+  const run = item.run || {};
+  const question = item.question?.payload || "";
+  const savedActor = localStorage.getItem(ANSWER_ACTOR_KEY) || "";
+  return `
+    <li class="pw-awaiting-item" data-run-id="${escapeHtml(run.id)}">
+      <div class="pw-awaiting-head">
+        <a class="pw-rel-id" href="${escapeHtml(cardHref(card.id))}">${escapeHtml(card.id)}</a>
+        <span class="ae-item">${escapeHtml(card.title || "")}</span>
+      </div>
+      <p class="pw-awaiting-q">${escapeHtml(question)}</p>
+      <form class="pw-awaiting-form" data-run-id="${escapeHtml(run.id)}">
+        <label><span class="ae-chrome">Answered by</span><input class="ae-input" name="actor" type="text" autocomplete="off" required value="${escapeHtml(savedActor)}"></label>
+        <label><span class="ae-chrome">Answer</span><textarea class="ae-input" name="answer" rows="2" required></textarea></label>
+        <button class="ae-button ae-button-compact" type="submit">answer</button>
+        <p class="pw-awaiting-error" aria-live="polite"></p>
+      </form>
+    </li>
+  `;
+}
+
+async function submitAwaitingAnswer(form) {
+  const runId = form.dataset.runId;
+  const data = new FormData(form);
+  const actor = String(data.get("actor") || "").trim();
+  const answer = String(data.get("answer") || "").trim();
+  const errorNode = form.querySelector(".pw-awaiting-error");
+  if (errorNode) errorNode.textContent = "";
+  if (!actor || !answer) {
+    if (errorNode) errorNode.textContent = "Your name and an answer are both required.";
+    return;
+  }
+  const submitButton = form.querySelector("button[type=submit]");
+  if (submitButton) submitButton.disabled = true;
+  try {
+    await apiJson(`/api/v1/runs/${encodePath(runId)}/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ actor, answer }),
+    });
+    localStorage.setItem(ANSWER_ACTOR_KEY, actor);
+    await loadBoard();
+  } catch (err) {
+    if (errorNode) errorNode.textContent = `Failed: ${err.message || err}`;
+  } finally {
+    if (submitButton) submitButton.disabled = false;
+  }
+}
+
 function saveBoardState() {
   try {
     sessionStorage.setItem("powder-board-path", `${window.location.pathname}${window.location.search}`);
@@ -957,8 +1264,16 @@ function cardHTML(card) {
   `;
 }
 
+// powder-ui-hierarchy-render: the board's list endpoints return plain
+// `Card`s, which carry `parent` but not `children_total` -- there is no
+// cheap way to know a card *has* children from this data, only whether a
+// card *is* one (see PR design notes). So the board badges children with
+// "part of <epic>"; the epic's own roll-up chip (counts, progress,
+// evidence) only renders in the one-click-away detail view, where
+// `children_total`/`epic_state` are actually present.
 function relationBadges(card) {
   const badges = [];
+  if (card.parent) badges.push(`part of ${card.parent}`);
   if ((card.blocked_by || []).length) badges.push(`blocked by ${card.blocked_by.length}`);
   if ((card.blocks || []).length) badges.push(`blocks ${card.blocks.length}`);
   if ((card.related || []).length) badges.push(`related ${card.related.length}`);
@@ -1041,9 +1356,12 @@ function detailHTML(card, detail = {}) {
   const latestRun = latestRunFor(normalized, detail.runs || []);
   const timeline = timelineItems(detail);
   const parts = [];
+  const parentBadge = normalized.parent
+    ? `<li><a class="pw-rel-badge pw-parent-badge" href="${escapeHtml(cardHref(normalized.parent))}">part of ${escapeHtml(normalized.parent)}</a></li>`
+    : "";
   parts.push(`
     <section class="pw-detail-hero">
-      <nav class="ae-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `ae-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li></ol></nav>
+      <nav class="ae-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `ae-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li>${parentBadge}</ol></nav>
       <p class="pw-detail-title ae-strong">${escapeHtml(normalized.title)}</p>
       <p class="pw-detail-meta">
         <span class="pw-st">${statusGlyph(normalized.status)}${escapeHtml(statusText(normalized.status))}</span>
@@ -1065,6 +1383,8 @@ function detailHTML(card, detail = {}) {
     <div class="pw-detail-grid">
       <div class="pw-detail-primary">
         ${section("DESCRIPTION", markdownHTML(normalized.body))}
+        ${detail.epic_state ? section("EPIC PROGRESS", epicStateHTML(detail.epic_state)) : ""}
+        ${(detail.children || []).length ? section("CHILDREN", childrenHTML(detail.children, detail.children_total)) : ""}
         ${section("ACCEPTANCE", acceptanceHTML(normalized))}
         ${section("PROOF PLAN / EVIDENCE", proofEvidenceHTML(normalized, detail.links || [], detail.runs || []))}
         ${section("WORK LOG", workLogHTML(detail.work_log || []))}
@@ -1113,6 +1433,73 @@ function relationsHTML(card) {
   ];
   if (rows.every(([, ids]) => ids.length === 0)) return empty("No relations.");
   return `<dl>${rows.map(([term, ids]) => `<div class="pw-def-row"><dt>${escapeHtml(term)}</dt><dd>${ids.length ? ids.map((id) => `<a class="pw-rel-id" href="${escapeHtml(cardHref(id))}">${escapeHtml(id)}</a>`).join(" ") : "none"}</dd></div>`).join("")}</dl>`;
+}
+
+// powder-ui-hierarchy-render: the deterministic recomposition packet a
+// parent ("epic") card carries in its own detail response --
+// `get_card_detail` already returns it fully populated; this just renders
+// what was previously discarded.
+function epicStateHTML(epicState) {
+  const order = ["backlog", "ready", "claimed", "running", "awaiting_input", "blocked", "done", "shipped", "abandoned"];
+  const counts = epicState.status_counts || {};
+  const countChips = order
+    .filter((status) => counts[status])
+    .map((status) => `<span class="ae-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`)
+    .join("");
+  const mismatches = (epicState.mismatches || [])
+    .map(
+      (text) =>
+        `<p class="pw-epic-warn"><svg class="ae-icon" aria-hidden="true"><use href="#i-alert"></use></svg>${escapeHtml(text)}</p>`,
+    )
+    .join("");
+  const freshness = epicState.freshness
+    ? `<p class="ae-chrome">Freshness: ${escapeHtml(formatDate(epicState.freshness.oldest_update))} through ${escapeHtml(formatDate(epicState.freshness.newest_update))}</p>`
+    : "";
+  const evidence = Array.isArray(epicState.evidence) ? epicState.evidence : [];
+  const evidenceRows = evidence
+    .map((item) => {
+      const target = item.kind === "link" ? linkOrText(item.reference) : `<span>${escapeHtml(item.reference)}</span>`;
+      const label = item.label ? ` · ${escapeHtml(item.label)}` : "";
+      return `<p class="pw-link-row"><svg class="ae-icon" aria-hidden="true"><use href="#i-proof"></use></svg><span><span class="ae-item">${escapeHtml(item.child_id)}${label}</span><br>${target}</span></p>`;
+    })
+    .join("");
+  const evidenceRemaining = (epicState.evidence_total || evidence.length) - evidence.length;
+  const evidenceMore =
+    evidenceRemaining > 0
+      ? `<p class="ae-chrome">+${evidenceRemaining} more evidence item${evidenceRemaining === 1 ? "" : "s"} not shown.</p>`
+      : "";
+  return `
+    <p class="pw-epic-progress">${epicState.criteria_checked}/${epicState.criteria_total} criteria checked across ${epicState.children_total} ${epicState.children_total === 1 ? "child" : "children"} · ${epicState.active_claims} active claim${epicState.active_claims === 1 ? "" : "s"}</p>
+    ${countChips ? `<p class="pw-repo-counts">${countChips}</p>` : ""}
+    ${mismatches}
+    ${freshness}
+    ${evidenceRows || evidenceMore ? `<div class="pw-epic-evidence">${evidenceRows}${evidenceMore}</div>` : ""}
+  `;
+}
+
+// Children render as a plain acceptance-style list (status glyph + link +
+// per-child criteria progress) rather than a second board -- the epic
+// packet above already carries the rolled-up numbers; this is for jumping
+// to a specific child.
+function childrenHTML(children, childrenTotal) {
+  if (!children.length) return empty("No child cards.");
+  const rows = children
+    .map((child) => {
+      const glyph = statusGlyph(child.status);
+      return `
+        <li class="pw-acc-item${child.status === "done" || child.status === "shipped" ? " is-checked" : ""}">
+          ${glyph || `<span class="pw-g"></span>`}
+          <span>
+            <a class="pw-rel-id" href="${escapeHtml(cardHref(child.id))}">${escapeHtml(child.id)}</a> ${escapeHtml(child.title)}
+            <br><span class="ae-muted">${escapeHtml(statusText(child.status))} · ${child.criteria_checked}/${child.criteria_total} criteria${child.claim?.agent ? ` · ${escapeHtml(child.claim.agent)}` : ""}</span>
+          </span>
+        </li>
+      `;
+    })
+    .join("");
+  const truncated = typeof childrenTotal === "number" && childrenTotal > children.length;
+  const more = truncated ? `<p class="ae-chrome">+${childrenTotal - children.length} more not shown.</p>` : "";
+  return `<ul class="pw-acc-list">${rows}</ul>${more}`;
 }
 
 function trailHTML(items, fallback) {
@@ -1491,6 +1878,19 @@ els.clearApiKey.addEventListener("click", () => {
   renderAuthState("API key cleared. Paste a key when you need write actions.");
   loadBoard();
 });
+els.awaitingList?.addEventListener("submit", (event) => {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement)) return;
+  event.preventDefault();
+  submitAwaitingAnswer(form);
+});
+els.awaitingBadge?.addEventListener("click", () => {
+  els.awaitingStrip?.scrollIntoView({
+    behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    block: "start",
+  });
+  els.awaitingList?.querySelector("input, textarea")?.focus();
+});
 document.addEventListener("click", (event) => {
   const link = event.target.closest("[data-card-link]");
   if (link) saveBoardState();
@@ -1521,4 +1921,5 @@ if (cardRouteId()) {
   setView(state.view);
   placeIndicator();
   loadBoard();
+  startLiveUpdates();
 }

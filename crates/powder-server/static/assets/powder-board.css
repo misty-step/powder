@@ -1039,6 +1039,157 @@ html:not([data-pw-route='card']) .pw-detail-app {
   font-size: 11px;
 }
 
+/* powder-ui-awaiting-you: a status-line readout, not a control -- ticks
+   every second in JS, so it deliberately carries no aria-live (a per-second
+   announcement would spam screen readers). Connect/disconnect transitions
+   are conveyed by data-state, not motion. */
+.pw-live {
+  font-family: var(--ae-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ae-ink-faint);
+  white-space: nowrap;
+}
+
+.pw-live[data-state='live'] {
+  color: var(--ae-ok);
+}
+
+.pw-live[data-state='reconnecting'] {
+  color: var(--ae-warn);
+}
+
+/* header badge that jumps to #awaiting-strip; hidden at zero so it never
+   claims header real estate when nothing needs the operator. */
+.pw-awaiting-jump {
+  color: var(--ae-warn);
+}
+
+.pw-awaiting-jump[hidden] {
+  display: none;
+}
+
+/* pinned, always-discoverable strip (not a 4th kanban lane -- see PR design
+   notes) that only occupies layout when there is something to answer. */
+.pw-awaiting {
+  flex: none;
+  padding: 0.8em 2em;
+  border-bottom: 1px solid var(--ae-line);
+  background: var(--ae-wash);
+}
+
+.pw-awaiting[hidden] {
+  display: none;
+}
+
+.pw-awaiting-head-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1em;
+}
+
+.pw-awaiting-head-row .ae-h {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  margin: 0;
+}
+
+.pw-awaiting-head-row .ae-icon {
+  width: 1em;
+  height: 1em;
+}
+
+.pw-awaiting-list {
+  list-style: none;
+  margin: 0.7em 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+  gap: 0.8em;
+}
+
+.pw-awaiting-item {
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius);
+  padding: 0.7em 0.9em;
+  font-size: 13px;
+  background: var(--ae-surface);
+}
+
+.pw-awaiting-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6em;
+  flex-wrap: wrap;
+}
+
+.pw-awaiting-q {
+  margin-top: 0.45em;
+  overflow-wrap: anywhere;
+}
+
+.pw-awaiting-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+  margin-top: 0.6em;
+}
+
+.pw-awaiting-form label {
+  display: block;
+}
+
+.pw-awaiting-form .ae-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 13px;
+}
+
+.pw-awaiting-error {
+  color: var(--ae-err);
+  min-height: 1.2em;
+}
+
+/* epic hierarchy (powder-ui-hierarchy-render) */
+.pw-epic-progress {
+  font-size: 13px;
+  color: var(--ae-ink-muted);
+}
+
+.pw-epic-warn {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin-top: 0.6em;
+  color: var(--ae-warn);
+  font-size: 13px;
+}
+
+.pw-epic-warn .ae-icon {
+  width: 1em;
+  height: 1em;
+  flex: none;
+}
+
+.pw-epic-evidence {
+  margin-top: 0.6em;
+}
+
+.pw-parent-badge {
+  text-decoration: none;
+}
+
+/* live updates (powder-epic-answer-board): a plain, non-animated highlight
+   -- the class is added and later removed on a timer, never transitioned,
+   so it is reduced-motion-safe by construction rather than by a media-query
+   opt-out. */
+.pw-card-live-changed {
+  outline: 2px solid var(--ae-accent);
+  outline-offset: 2px;
+}
+
 .ae-cat-0 { color: var(--ae-cat-0); }
 .ae-cat-1 { color: var(--ae-cat-1); }
 .ae-cat-2 { color: var(--ae-cat-2); }
@@ -1051,8 +1202,13 @@ html:not([data-pw-route='card']) .pw-detail-app {
 @media (max-width: 760px) {
   .pw-top,
   .pw-foot,
-  .pw-filters {
+  .pw-filters,
+  .pw-awaiting {
     padding-inline: 1.2rem;
+  }
+
+  .pw-awaiting-list {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .pw-main,
