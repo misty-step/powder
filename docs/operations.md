@@ -46,12 +46,13 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
 | `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | `work-log\tcard_id\tagent\tbody` |
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
+| `answer-input` | SQLite run resume | `POST /api/v1/runs/{id}/answer` | `answered-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
 falling back to ephemeral state. `update-relations`, `set-parent`, `get-run`,
-`list-awaiting-input`, `answer-input`, `repository-*`, `import-github-issues`,
+`list-awaiting-input`, `repository-*`, `import-github-issues`,
 `key-*`, `subscription-*`, `dead-letter-list`, and `event-tail` remain
 `--db`-only (bulk/admin operations, hierarchy/webhook management, or reads
 with no remote-mode demand yet); omitting `--db` on those still fails with a

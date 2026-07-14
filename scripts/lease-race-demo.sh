@@ -9,13 +9,24 @@
 #     explicit constant (CLAIM_TTL_SECONDS); Actor B polls list_ready in a
 #     bounded loop and asserts the reclaim happens inside POLL_TIMEOUT_SECONDS
 #     (asserted to be well under the TTL's next order of magnitude), not on a
-#     fixed sleep that could race the server under load.
+#     fixed sleep that could race the server under load. The race is bounded
+#     from BOTH sides: while Actor A's lease is still live, list_ready must
+#     EXCLUDE the card (a regression that leaks claimed cards into the ready
+#     pool cannot PASS as a suspiciously instant "reclaim"), and the measured
+#     reclaim must take at least CLAIM_TTL_SECONDS - 1 (allowing whole-second
+#     clock granularity) -- expiry by TTL, not by accident.
 #   - Boots a real powder-server (release binary, same pattern as
 #     .github/workflows/quickstart.yml) against a fresh ephemeral SQLite DB
 #     and a random free TCP port -- no shared state with any other run.
-#   - "Mint nothing": auth is the first-run bootstrap key
-#     (POWDER_DISCLOSE_BOOTSTRAP_KEY=true), exactly like the README
-#     quickstart and the quickstart CI job. No key-create step.
+#   - Auth/attribution: the first-run bootstrap key
+#     (POWDER_DISCLOSE_BOOTSTRAP_KEY=true) plays the operator -- it creates
+#     the card and mints one agent-scope key per actor via `powder key-create
+#     --db` (the documented operational pattern from docs/operations.md).
+#     Each actor then authenticates as itself: in api-key mode every audited
+#     event is attributed to the authenticated key's actor (there is no
+#     request-body actor field on completion), so codex-agent's claim,
+#     work-log, and claim-expired -- and human-with-curl's claim and
+#     completion -- all carry the right name in the trail.
 #   - Actor A ("codex-agent") and Actor B ("human-with-curl") are both driven
 #     over plain curl against the HTTP API -- deliberately not powder-mcp --
 #     because the point of the demo is that *any* actor speaking the same
@@ -100,8 +111,13 @@ say "card: $CARD_ID"
 say "claim TTL: ${CLAIM_TTL_SECONDS}s | poll timeout: ${POLL_TIMEOUT_SECONDS}s"
 rule
 
-say "[boot] building powder-server (release)"
-( cd "$ROOT" && cargo build --release --locked -p powder-server >/dev/null )
+say "[boot] building powder-server + powder CLI (release)"
+if ! ( cd "$ROOT" && cargo build --release --locked -p powder-server -p powder-cli ) >"$WORKDIR/build.log" 2>&1; then
+  echo "cargo build failed; log follows" >&2
+  cat "$WORKDIR/build.log" >&2
+  exit 1
+fi
+POWDER_CLI="$ROOT/target/release/powder"
 
 say "[boot] starting powder-server on $BASE_URL against a fresh ephemeral DB"
 POWDER_DB_PATH="$DB" \
@@ -133,28 +149,45 @@ if [ -z "$KEY" ]; then
   cat "$SERVER_LOG" >&2
   exit 1
 fi
-say "[boot] minted nothing -- using the first-run bootstrap key"
+say "[boot] operator holds the first-run bootstrap key"
 rule
 
-say "[setup] creating card $CARD_ID"
+say "[setup] creating card $CARD_ID (as the operator)"
 curl -fsS -X POST "$BASE_URL/api/v1/cards" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d "{\"id\":\"$CARD_ID\",\"title\":\"Lease race demo card\",\"acceptance\":[\"the race resolves via lease expiry, not a human unsticking it\"]}" \
   | jq -c '{id: .id, status: .status}'
+
+say "[setup] minting one agent-scope key per actor (powder key-create --db, the documented operator pattern)"
+KEY_A="$("$POWDER_CLI" key-create --db "$DB" --name codex-agent --scope agent --show-secret | cut -f4 | tr -d '\n')"
+KEY_B="$("$POWDER_CLI" key-create --db "$DB" --name human-with-curl --scope agent --show-secret | cut -f4 | tr -d '\n')"
+if [ -z "$KEY_A" ] || [ -z "$KEY_B" ]; then
+  echo "key-create did not return a secret for one of the actors" >&2
+  exit 1
+fi
+say "[setup] actors hold their own keys; every audited event below is attributed to its actor"
 rule
 
 say "[actor A: codex-agent] claiming with ttl_seconds=$CLAIM_TTL_SECONDS"
 CLAIM_A="$(curl -fsS -X POST "$BASE_URL/api/v1/cards/$CARD_ID/claim" \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $KEY_A" -H "Content-Type: application/json" \
   -d "{\"agent\":\"codex-agent\",\"ttl_seconds\":$CLAIM_TTL_SECONDS}")"
 say "$CLAIM_A" | jq -c .
 RUN_A="$(printf '%s' "$CLAIM_A" | jq -r '.run_id')"
 EXPIRES_A="$(printf '%s' "$CLAIM_A" | jq -r '.expires_at')"
 say "[actor A] run_id=$RUN_A expires_at=$EXPIRES_A"
 
+say "[check] while the lease is live, list_ready must EXCLUDE the card (leases actually gate the pool)"
+LIVE_READY_IDS="$(curl -fsS "$BASE_URL/api/v1/cards/ready?limit=50" -H "Authorization: Bearer $KEY_B" | jq -r '.cards[].id')"
+if printf '%s\n' "$LIVE_READY_IDS" | grep -qx "$CARD_ID"; then
+  echo "ASSERTION FAILED: card appeared in list_ready while its lease was still active" >&2
+  exit 1
+fi
+say "[check] confirmed: card is NOT in list_ready while claimed"
+
 say "[actor A] appending a work-log entry, then going dark"
 curl -fsS -X POST "$BASE_URL/api/v1/cards/$CARD_ID/work-log" \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $KEY_A" -H "Content-Type: application/json" \
   -d "{\"agent\":\"codex-agent\",\"run_id\":\"$RUN_A\",\"body\":\"starting work, about to crash and never heartbeat\"}" \
   | jq -c '{card_id: .card_id, agent: .agent}'
 
@@ -165,7 +198,7 @@ say "[actor B: human-with-curl] polling list_ready until the card returns (TTL e
 POLL_START="$(date +%s)"
 reclaimed=0
 for _ in $(seq 1 "$POLL_TIMEOUT_SECONDS"); do
-  READY_IDS="$(curl -fsS "$BASE_URL/api/v1/cards/ready?limit=50" -H "Authorization: Bearer $KEY" | jq -r '.cards[].id')"
+  READY_IDS="$(curl -fsS "$BASE_URL/api/v1/cards/ready?limit=50" -H "Authorization: Bearer $KEY_B" | jq -r '.cards[].id')"
   if printf '%s\n' "$READY_IDS" | grep -qx "$CARD_ID"; then
     reclaimed=1
     break
@@ -183,21 +216,28 @@ if [ "$POLL_ELAPSED" -ge "$POLL_TIMEOUT_SECONDS" ]; then
   echo "reclaim took ${POLL_ELAPSED}s, which is not < ${POLL_TIMEOUT_SECONDS}s" >&2
   exit 1
 fi
-say "[actor B] card reclaimed via list_ready after ${POLL_ELAPSED}s (asserted < ${POLL_TIMEOUT_SECONDS}s)"
+# Lower bound: the reclaim must have been caused by TTL expiry, not by the
+# card never leaving (or instantly re-entering) the ready pool. Allow 1s of
+# slack for whole-second clock granularity and the pre-poll work-log call.
+if [ "$POLL_ELAPSED" -lt "$((CLAIM_TTL_SECONDS - 1))" ]; then
+  echo "reclaim took only ${POLL_ELAPSED}s -- faster than the ${CLAIM_TTL_SECONDS}s TTL could expire; leases are not gating the pool" >&2
+  exit 1
+fi
+say "[actor B] card reclaimed via list_ready after ${POLL_ELAPSED}s (asserted >= $((CLAIM_TTL_SECONDS - 1))s and < ${POLL_TIMEOUT_SECONDS}s)"
 rule
 
 say "[actor B] claiming the abandoned card"
 CLAIM_B="$(curl -fsS -X POST "$BASE_URL/api/v1/cards/$CARD_ID/claim" \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $KEY_B" -H "Content-Type: application/json" \
   -d '{"agent":"human-with-curl","ttl_seconds":3600}')"
 say "$CLAIM_B" | jq -c .
 RUN_B="$(printf '%s' "$CLAIM_B" | jq -r '.run_id')"
 say "[actor B] run_id=$RUN_B"
 
-say "[actor B] completing the card with proof"
+say "[actor B] completing the card with proof (attribution comes from actor B's own key)"
 PROOF="lease-race-demo local run, card=$CARD_ID, reclaimed after ${POLL_ELAPSED}s"
 curl -fsS -X POST "$BASE_URL/api/v1/cards/$CARD_ID/complete" \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $KEY_B" -H "Content-Type: application/json" \
   -d "$(jq -n --arg proof "$PROOF" '{proof: $proof}')" \
   | jq -c '{id: .id, status: .status}'
 rule
@@ -216,7 +256,7 @@ FINAL_STATUS="$(printf '%s' "$DETAIL" | jq -r '.card.status')"
 WORK_LOG_COUNT="$(printf '%s' "$DETAIL" | jq '[.work_log[] | select(.agent == "codex-agent")] | length')"
 CARD_CREATED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "card-created")] | length')"
 CLAIM_EXPIRED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "claim-expired" and .actor == "codex-agent")] | length')"
-COMPLETED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "completed")] | length')"
+COMPLETED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "completed" and .actor == "human-with-curl")] | length')"
 
 fail=0
 assert_eq() {
@@ -231,7 +271,7 @@ assert_eq "final card status is done" "done" "$FINAL_STATUS"
 assert_eq "Actor A's work-log entry survived the crash" 1 "$WORK_LOG_COUNT"
 assert_eq "one card-created event" 1 "$CARD_CREATED_COUNT"
 assert_eq "one claim-expired event attributed to codex-agent" 1 "$CLAIM_EXPIRED_COUNT"
-assert_eq "one completed event" 1 "$COMPLETED_COUNT"
+assert_eq "one completed event attributed to human-with-curl" 1 "$COMPLETED_COUNT"
 
 if [ "$fail" -ne 0 ]; then
   echo "--- card detail ---" >&2
@@ -255,4 +295,4 @@ say "=== Race transcript (from the audit trail, not narration) ==="
   printf '%s' "$EVENTS_JSON" | jq -r '.[] | select(.event_type == "completed") | [(.occurred_at|tostring), .actor, "completed"] | @tsv'
 } | awk -F'\t' 'BEGIN { printf "%-12s %-16s %s\n", "at", "actor", "event" } { printf "%-12s %-16s %s\n", $1, $2, $3 }'
 rule
-say "RESULT: PASS -- codex-agent crashed, its lease expired after ${CLAIM_TTL_SECONDS}s, human-with-curl reclaimed the card via list_ready in ${POLL_ELAPSED}s with no human editing any file, and the full claim A -> claim-expired -> claim B -> completed trail is recorded against the card (runs table for both claims, outbound event tail for claim-expired and completed)."
+say "RESULT: PASS -- codex-agent crashed, its lease expired after ${CLAIM_TTL_SECONDS}s, human-with-curl reclaimed the card via list_ready in ${POLL_ELAPSED}s with no human editing any file, and the full claim A -> claim-expired -> claim B -> completed trail is recorded against the card, each event attributed to the actor that caused it (runs table for both claims, outbound event tail for claim-expired and completed)."
