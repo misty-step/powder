@@ -6,6 +6,18 @@ use powder_store::Store;
 use serde_json::Value;
 
 fn main() {
+    // powder-workstation-cli-convergence: `powder-mcp` had no version
+    // signal at all -- unlike `powder version`/`powder-server version`,
+    // there was no way to tell a stale, long-lived MCP subprocess apart
+    // from a freshly built one short of reading its source. Handled before
+    // any env var is read so it works with no configuration at all.
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "version" || arg == "--version" || arg == "-v" {
+            print!("{}", version());
+            return;
+        }
+    }
+
     let retired_source_env = concat!("POWDER_", "BACKLOG_DIR");
     if std::env::var_os(retired_source_env).is_some() {
         eprintln!(
@@ -52,6 +64,19 @@ fn main() {
          fallback: claims and completions must not silently evaporate on process exit."
     );
     std::process::exit(1);
+}
+
+/// Mirrors `powder_cli::version()`'s format exactly (`crates/powder-cli/
+/// src/lib.rs`) so `scripts/install-workstation.sh` can print one consistent
+/// before/after shape across `powder`, `powder-mcp`, and `powder-server`.
+fn version() -> String {
+    let dirty = env!("POWDER_MCP_GIT_DIRTY") == "true";
+    format!(
+        "powder-mcp {} (git {}{})\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("POWDER_MCP_GIT_SHA"),
+        if dirty { ", dirty" } else { "" }
+    )
 }
 
 fn run_persistent(db_path: &str, toolset: Toolset) -> Result<(), Box<dyn std::error::Error>> {

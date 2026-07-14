@@ -313,6 +313,17 @@ struct Ready {
     /// See `AppState::poison_count`. Always present (unlike the DB-derived
     /// fields above) since it never requires a store lock to read.
     poison_count: u64,
+    /// powder-workstation-cli-convergence: `powder version` compares this
+    /// against the installed CLI's own build sha and prints a DRIFT warning
+    /// on mismatch -- the only prior way to answer "does my workstation
+    /// binary match the server it's talking to" was reading startup logs
+    /// (powder-epic-truthful-ops's `tracing::info!("powder-server
+    /// starting")` line) on a box the caller may not have shell access to.
+    /// Compile-time constants, so present in both the ok and error arms
+    /// below -- unlike the DB-derived fields, they never require a store
+    /// lock to read and are always safe to disclose unauthenticated.
+    version: &'static str,
+    git_sha: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -555,8 +566,37 @@ struct TailParams {
     live: Option<bool>,
 }
 
+/// Mirrors `powder_cli::version()`'s format exactly (`crates/powder-cli/
+/// src/lib.rs`) so `scripts/install-workstation.sh` can print one
+/// consistent before/after shape across `powder`, `powder-mcp`, and
+/// `powder-server`. `/readyz`'s `version`/`git_sha` fields are the same two
+/// compile-time constants, surfaced over HTTP for a caller with no shell on
+/// the box (powder-workstation-cli-convergence).
+fn version() -> String {
+    let dirty = env!("POWDER_SERVER_GIT_DIRTY") == "true";
+    format!(
+        "powder-server {} (git {}{})\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("POWDER_SERVER_GIT_SHA"),
+        if dirty { ", dirty" } else { "" }
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // powder-workstation-cli-convergence: a plain `--version`/`version`/
+    // `-v` argument prints and exits before touching config/env/the store,
+    // so `scripts/install-workstation.sh` can check a freshly `cargo
+    // install`ed `powder-server` binary the same inert way it already
+    // checks `powder version` and `powder-mcp version`, without starting a
+    // listener.
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "version" || arg == "--version" || arg == "-v" {
+            print!("{}", version());
+            return Ok(());
+        }
+    }
+
     // powder-epic-truthful-ops: `EnvFilter::from_default_env()` fell back to
     // *no logging at all* when `RUST_LOG` was unset -- the common case for
     // an operator who just followed the quickstart -- so a running instance
@@ -821,6 +861,8 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
                     dead_letter_count: Some(dead_letter_count),
                     dead_letter_threshold: state.config.dead_letter_ready_threshold,
                     poison_count,
+                    version: env!("CARGO_PKG_VERSION"),
+                    git_sha: env!("POWDER_SERVER_GIT_SHA"),
                 }),
             )
         }
@@ -835,6 +877,8 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
                 dead_letter_count: None,
                 dead_letter_threshold: state.config.dead_letter_ready_threshold,
                 poison_count,
+                version: env!("CARGO_PKG_VERSION"),
+                git_sha: env!("POWDER_SERVER_GIT_SHA"),
             }),
         ),
     }

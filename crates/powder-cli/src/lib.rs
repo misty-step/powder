@@ -101,7 +101,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [] => Ok(help()),
         [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
         [command] if command == "version" || command == "--version" || command == "-v" => {
-            Ok(version())
+            Ok(version_with_remote_env(remote_env))
         }
         [command, rest @ ..] if command == "init-db" => init_db(rest),
         [command, rest @ ..] if command == "key-create" => key_create(rest),
@@ -152,15 +152,70 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
 /// command's API-mode support) before it starts a claim, instead of hitting
 /// a bare `missing --db` on a command the checkout has long since covered.
 /// Compare against `git -C <checkout> rev-parse --short=12 HEAD`; a mismatch
-/// means `cargo install --path crates/powder-cli` is due.
+/// means `scripts/install-workstation.sh` (or `cargo install --path
+/// crates/powder-cli`) is due. Uses the process environment for any remote
+/// drift check below; `version_with_remote_env` is the version under test.
 pub fn version() -> String {
+    version_with_remote_env(&RemoteEnv::from_pairs(std::env::vars()))
+}
+
+/// powder-workstation-cli-convergence: a stale local binary was the whole
+/// incident (0.1.0 git 1d1ded8 vs. a checkout at 414ac7f, silently missing
+/// the repeated-`--acceptance` fix -- a live card lost four criteria) and
+/// the server side was never the problem. `powder version` alone can only
+/// ever prove what the *binary* was built from; it cannot prove that
+/// matches what the operator is actually talking to. When
+/// `POWDER_API_BASE_URL` is configured, also fetch the unauthenticated
+/// `/readyz` (added `version`/`git_sha` fields, additive) and compare the
+/// server's git sha against this binary's -- a mismatch prints a DRIFT line
+/// instead of staying silent. A server unreachable, or one predating these
+/// fields (older deploy), degrades to a plain note, never an error: `powder
+/// version` must never fail just because the network is down.
+fn version_with_remote_env(remote_env: &RemoteEnv) -> String {
     let dirty = env!("POWDER_CLI_GIT_DIRTY") == "true";
-    format!(
+    let local_sha = env!("POWDER_CLI_GIT_SHA");
+    let mut out = format!(
         "powder {} (git {}{})\n",
         env!("CARGO_PKG_VERSION"),
-        env!("POWDER_CLI_GIT_SHA"),
+        local_sha,
         if dirty { ", dirty" } else { "" }
-    )
+    );
+
+    if let Some(client) = remote_env.client() {
+        match client.get("/readyz") {
+            Ok(body) => {
+                let server_version = body.get("version").and_then(Value::as_str);
+                let server_sha = body.get("git_sha").and_then(Value::as_str);
+                match (server_version, server_sha) {
+                    (Some(server_version), Some(server_sha)) => {
+                        out.push_str(&format!(
+                            "server {server_version} (git {server_sha}) at {}\n",
+                            client.base_url()
+                        ));
+                        if server_sha != local_sha {
+                            out.push_str(&format!(
+                                "DRIFT: installed binary (git {local_sha}) != server (git \
+                                 {server_sha}) -- run scripts/install-workstation.sh to converge\n"
+                            ));
+                        }
+                    }
+                    _ => out.push_str(&format!(
+                        "server: reachable at {} but /readyz has no version/git_sha \
+                         (deploy predates powder-workstation-cli-convergence)\n",
+                        client.base_url()
+                    )),
+                }
+            }
+            Err(err) => {
+                out.push_str(&format!(
+                    "server: unreachable at {} ({err})\n",
+                    client.base_url()
+                ));
+            }
+        }
+    }
+
+    out
 }
 
 pub fn help() -> String {
@@ -1746,6 +1801,85 @@ mod tests {
 
         assert_eq!(run(&args(["--version"])).unwrap(), output);
         assert_eq!(run(&args(["-v"])).unwrap(), output);
+    }
+
+    /// powder-workstation-cli-convergence: no `POWDER_API_BASE_URL`
+    /// configured must reproduce the exact prior output byte-for-byte --
+    /// the drift check is additive, never a default-on behavior change.
+    #[test]
+    fn cli_version_adds_no_server_line_without_remote_env() {
+        let output = run_with_env(&args(["version"]), &remote_env(None, None)).unwrap();
+        assert!(output.starts_with("powder 0.1.0 (git "));
+        assert!(!output.contains("server"));
+        assert!(!output.contains("DRIFT"));
+    }
+
+    /// The whole point of the operator incident this card fixes: a stale
+    /// workstation binary and a fine server, with nothing surfacing the
+    /// drift. `version` must name both shas and steer toward the fix.
+    #[test]
+    fn cli_version_warns_on_drift_when_server_git_sha_differs() {
+        let local_sha = env!("POWDER_CLI_GIT_SHA");
+        let (base_url, _recorded) = spawn_test_server(vec![(
+            200,
+            json!({"ok": true, "version": "0.1.0", "git_sha": "deadbeefcafe"}),
+        )]);
+
+        let output = run_with_env(&args(["version"]), &remote_env(Some(&base_url), None)).unwrap();
+
+        assert!(output.contains("DRIFT"), "{output}");
+        assert!(output.contains(local_sha), "{output}");
+        assert!(output.contains("deadbeefcafe"), "{output}");
+        assert!(
+            output.contains("scripts/install-workstation.sh"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn cli_version_reports_no_drift_when_server_git_sha_matches() {
+        let local_sha = env!("POWDER_CLI_GIT_SHA");
+        let (base_url, _recorded) = spawn_test_server(vec![(
+            200,
+            json!({"ok": true, "version": "0.1.0", "git_sha": local_sha}),
+        )]);
+
+        let output = run_with_env(&args(["version"]), &remote_env(Some(&base_url), None)).unwrap();
+
+        assert!(
+            output.contains(&format!("server 0.1.0 (git {local_sha})")),
+            "{output}"
+        );
+        assert!(!output.contains("DRIFT"), "{output}");
+    }
+
+    /// A deploy that predates this card's `/readyz` fields must degrade to
+    /// a plain note, not a false DRIFT (there is nothing to compare).
+    #[test]
+    fn cli_version_degrades_gracefully_when_server_readyz_predates_version_fields() {
+        let (base_url, _recorded) = spawn_test_server(vec![(200, json!({"ok": true}))]);
+
+        let output = run_with_env(&args(["version"]), &remote_env(Some(&base_url), None)).unwrap();
+
+        assert!(
+            output.contains("predates powder-workstation-cli-convergence"),
+            "{output}"
+        );
+        assert!(!output.contains("DRIFT"), "{output}");
+    }
+
+    /// `powder version` must never fail just because the network is down --
+    /// it degrades to a plain note instead of an error.
+    #[test]
+    fn cli_version_reports_unreachable_server_without_failing() {
+        let output = run_with_env(
+            &args(["version"]),
+            &remote_env(Some("http://127.0.0.1:1"), None),
+        )
+        .unwrap();
+
+        assert!(output.starts_with("powder 0.1.0 (git "), "{output}");
+        assert!(output.contains("server: unreachable"), "{output}");
     }
 
     #[test]

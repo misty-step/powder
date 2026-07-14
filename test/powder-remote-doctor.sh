@@ -19,12 +19,20 @@ if [[ "$*" == *'/status'* ]]; then
   fi
   exit 0
 fi
+if [[ "$*" == *'/readyz'* && -n "${POWDER_TEST_SERVER_SHA:-}" ]]; then
+  printf '{"ok":true,"version":"0.1.0","git_sha":"%s"}\n' "$POWDER_TEST_SERVER_SHA"
+  exit 0
+fi
 printf '{"ok":true}\n'
 SH
 chmod +x "$TMP/curl"
 
 cat >"$TMP/powder" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "version" ]]; then
+  printf 'powder 0.1.0 (git %s)\n' "${POWDER_TEST_LOCAL_SHA:-abcdefabcdef}"
+  exit 0
+fi
 [[ -n "${POWDER_API_KEY:-}" ]] || exit 41
 printf '{"card":{"id":"powder-agent-reachability"}}\n'
 SH
@@ -87,5 +95,27 @@ if run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=b
   exit 1
 fi
 grep -q 'CREDENTIAL_BOOTSTRAP' "$TMP/auth.out"
+
+# powder-workstation-cli-convergence: a version mismatch between the
+# workstation binary and the deployed server is a WARN, never a FAIL --
+# still PASS powder_remote overall, exit 0, but a distinct stderr line an
+# operator (or an alert on stderr) can act on.
+drift_stderr="$(run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key \
+  POWDER_TEST_LOCAL_SHA=abcdefabcdef POWDER_TEST_SERVER_SHA=deadbeefcafe 2>&1 1>/dev/null)"
+grep -q 'WARN VERSION_DRIFT' <<<"$drift_stderr"
+grep -q 'abcdefabcdef' <<<"$drift_stderr"
+grep -q 'deadbeefcafe' <<<"$drift_stderr"
+grep -q 'install-workstation.sh' <<<"$drift_stderr"
+drift_exit_status_stdout="$(run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key \
+  POWDER_TEST_LOCAL_SHA=abcdefabcdef POWDER_TEST_SERVER_SHA=deadbeefcafe)"
+grep -q 'PASS powder_remote' <<<"$drift_exit_status_stdout"
+
+# No drift, no warning, when the workstation and server shas agree.
+no_drift_stderr="$(run_doctor POWDER_API_BASE_URL=https://sanctum.example:10001 POWDER_API_KEY=test-key \
+  POWDER_TEST_LOCAL_SHA=abcdefabcdef POWDER_TEST_SERVER_SHA=abcdefabcdef 2>&1 1>/dev/null)"
+if grep -q 'VERSION_DRIFT' <<<"$no_drift_stderr"; then
+  echo "expected no VERSION_DRIFT warning when local and server shas match" >&2
+  exit 1
+fi
 
 echo "PASS powder-remote-doctor tests"
