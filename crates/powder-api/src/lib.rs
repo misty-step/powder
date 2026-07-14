@@ -97,7 +97,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}",
         intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
         body_shape: Some(
-            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"estimate":null,"labels":null} -- every field is optional; only the fields present in the body are changed, admin scope required; estimate is one of S|M|L|XL"#,
+            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"autonomy":null,"priority":null,"estimate":null,"labels":null} -- every field is optional; only the fields present in the body are changed; any authenticated actor may patch and the change is audited with actor and field list; estimate is one of S|M|L|XL"#,
         ),
     },
     ApiRoute {
