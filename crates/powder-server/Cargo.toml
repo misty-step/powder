@@ -29,3 +29,10 @@ ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Test-only: the cross-face `list_ready` ordering parity test drives the
+# CLI's and MCP's own in-process entry points against an identical fixture
+# alongside this crate's own HTTP handlers, proving all three faces expose
+# the same `Store::list_ready_page` order rather than re-sorting it
+# independently. No production code in this crate depends on either face.
+powder-cli = { path = "../powder-cli" }
+powder-mcp = { path = "../powder-mcp" }

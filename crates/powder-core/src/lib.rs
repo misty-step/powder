@@ -2,6 +2,7 @@
 
 mod model;
 mod queries;
+mod ready_order;
 mod repository;
 
 pub use model::{
@@ -12,6 +13,9 @@ pub use model::{
     RunDetail, RunId, RunState, WorkLogEntry,
 };
 pub use queries::{ClaimReceipt, ReadyQuery};
+pub use ready_order::{
+    order_ready_cards, ready_sort_cmp, transitive_blocked_by, ReadyOrder, TransitiveBlockers,
+};
 pub use repository::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
 };
