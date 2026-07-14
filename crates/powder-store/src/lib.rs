@@ -165,6 +165,20 @@ pub struct CardListPage {
     /// limit does nothing for the latter, and a hint that conflates the two
     /// sends an agent in a loop.
     pub excluded_terminal_count: usize,
+    /// powder-epic-ready-plan: ids from `cards`' *full eligible set* (before
+    /// `limit` truncation, mirroring how `total_count` already describes
+    /// the untruncated set) that sit **on** a `blocks`/`blocked_by` cycle
+    /// among that eligible set -- the members of a strongly connected
+    /// component, the only cards whose relative order cannot be
+    /// topological (they order among themselves by the stable
+    /// priority/age/id sort instead). Cards merely *downstream* of a cycle
+    /// are never listed here: they keep a genuine topological position
+    /// after the cycle that blocks them. Always empty for
+    /// [`Store::list_cards_page`] (it never computes a topological order);
+    /// populated only by [`Store::list_ready_page`]. See
+    /// [`powder_core::order_ready_cards`] for why a cycle is reported here
+    /// rather than causing a hang or a panic.
+    pub cycle_card_ids: Vec<CardId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -841,15 +855,19 @@ impl Store {
         Ok(self.list_ready_page(query)?.cards)
     }
 
+    /// `cards` is ordered topologically over `blocks`/`blocked_by` edges
+    /// confined to the eligible set (see
+    /// [`powder_core::order_ready_cards`]'s doc comment for the full
+    /// eligibility-vs-ordering-vs-explanation design); an eligible set with
+    /// no such edges among its members orders exactly as it always has --
+    /// priority, then age, then id. `cycle_card_ids` names exactly the
+    /// eligible cards **on** a `blocks`/`blocked_by` cycle; those cards
+    /// still appear in `cards` (grouped, in the stable order, at the
+    /// cycle's own topological position) and every other card -- including
+    /// cards downstream of a cycle -- keeps a genuine topological position,
+    /// so nothing is dropped and no orderable edge is ignored.
     pub fn list_ready_page(&self, query: ReadyQuery) -> Result<CardListPage> {
-        let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
-        let records = statement
-            .query_map([], CardRecord::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let all_cards = records
-            .into_iter()
-            .map(|record| card_from_record(&self.connection, record))
-            .collect::<Result<Vec<_>>>()?;
+        let all_cards = load_all_cards(&self.connection)?;
         // reuses the same full scan already loaded above, rather than a
         // second query per blocker: a blocker missing from this map is
         // treated as still blocking (fail closed).
@@ -871,17 +889,14 @@ impl Store {
         }
         let total_count = cards.len();
 
-        cards.sort_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| left.created_at.cmp(&right.created_at))
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        let order = powder_core::order_ready_cards(cards);
+        let mut cards = order.cards;
         cards.truncate(query.limit);
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count: 0,
+            cycle_card_ids: order.cycle_card_ids,
         })
     }
 
@@ -947,17 +962,13 @@ impl Store {
         }
         let excluded_terminal_count = total_count - cards.len();
 
-        cards.sort_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| left.created_at.cmp(&right.created_at))
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        cards.sort_by(powder_core::ready_sort_cmp);
         cards.truncate(limit.max(1));
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count,
+            cycle_card_ids: Vec::new(),
         })
     }
 
@@ -2092,6 +2103,20 @@ fn card_from_record(connection: &Connection, record: CardRecord) -> Result<Card>
         card.repo = resolve_repository_name(connection, repo)?;
     }
     Ok(card)
+}
+
+/// Full unfiltered card scan, one query -- shared by [`Store::list_ready_page`]
+/// and the transitive-blocker walk in `answer_loop::get_card_detail`, so
+/// relation-graph traversals never need a second per-blocker query.
+pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
+    let mut statement = connection.prepare(CARD_SELECT_ALL_SQL)?;
+    let records = statement
+        .query_map([], CardRecord::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    records
+        .into_iter()
+        .map(|record| card_from_record(connection, record))
+        .collect()
 }
 
 /// A parent edge must point at an existing card and must not close a cycle:
