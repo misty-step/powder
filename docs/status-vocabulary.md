@@ -29,14 +29,42 @@ audit `card_events` row per changed card
 rationale when the destination needs explanation, actor
 `system:status-vocabulary-migration`). Claims, runs, relations, and all
 pre-existing events are untouched; only the `status` column on affected
-cards changes. For this migration, a valid claim means a complete, non-empty
-four-column claim tuple: agent and run identifiers plus both timestamps.
+cards changes. At schema v17, the persisted claim tuple contained the worker
+and run identifiers plus both timestamps; schema v18 added the authenticated
+principal as a fifth field. A current valid claim requires all five values to
+be present and both identity fields and the run identifier to be non-blank.
 Partial claim columns and complete tuples with a blank identifier are treated
 as claimless by the same decoder used for normal card reads, but remain
 byte-for-byte untouched for later diagnosis or repair. Structured criteria
 are the effective acceptance oracle whenever they contain a non-blank item;
 the legacy acceptance list is the fallback. Migration and card reads share
 that decoder too, so divergent legacy columns cannot disagree about readiness.
+
+## Corrective Repair (schema v19)
+
+The first deployed schema-v17 migration used a less strict claim classifier
+than normal card reads and stranded seven claimless cards in `in_progress`.
+`migrate_18_to_19` repairs only cards that still satisfy all three facts:
+
+- current status is exactly `in_progress`;
+- the latest status-event timestamp contains only an exact, unambiguous
+  schema-v17 status event with actor
+  `system:status-vocabulary-migration` and payload
+  `status-vocabulary migration: claimed -> in_progress` or
+  `status-vocabulary migration: running -> in_progress`;
+- the shared principal/worker/run decoder reports no valid persisted claim.
+
+The destination is `ready` when the shared effective-oracle decoder finds a
+non-blank acceptance criterion and `backlog` otherwise. The migration does not
+hard-code card ids. It changes only status and appends one audit event per
+repair under actor `system:status-v17-repair`; claims, runs, relations,
+criteria, pre-existing events, and key metadata remain byte-for-byte intact.
+The whole step is atomic and retry-safe: after correction, a card no longer
+matches the required `in_progress` predicate.
+Before advancing the schema version, the step also fails closed unless the
+schema-v18 identity migration is intact: claims carry principals, runs retain
+their complete principal/worker/lifecycle persistence shape, API keys have the
+complete principalized metadata shape, and the legacy `actors` table is gone.
 
 | Legacy status | New status | Why |
 | --- | --- | --- |

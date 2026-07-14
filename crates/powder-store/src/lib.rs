@@ -416,6 +416,10 @@ impl Store {
                     self.migrate_17_to_18()?;
                     18
                 }
+                18 => {
+                    self.migrate_18_to_19()?;
+                    19
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -852,8 +856,221 @@ impl Store {
         Ok(())
     }
 
+    /// Repairs the seven claimless production cards that schema v17 moved
+    /// from `claimed`/`running` to `in_progress` before claim decoding was
+    /// unified. Selection is provenance-based rather than id-based: a card
+    /// must still be `in_progress`, carry one of the exact v17 migration
+    /// events that created that status, and decode as claimless under the
+    /// same principal/worker/run decoder used by normal card reads. The
+    /// effective acceptance oracle likewise uses the shared card decoder.
+    ///
+    /// Apart from the corrected status and one explicit repair event, every
+    /// persisted byte is left untouched. The status predicate also makes the
+    /// step safe to retry if the transaction commits before `user_version`
+    /// is advanced: repaired rows no longer match on the second pass.
+    fn migrate_18_to_19(&mut self) -> Result<()> {
+        // A database claiming schema v18 must carry every field the repair
+        // reads. Fail closed on schema drift so the outer migration loop
+        // cannot advance `user_version` while silently skipping the repair.
+        for column in [
+            "status",
+            "acceptance_json",
+            "criteria_json",
+            "claim_principal",
+            "claim_agent",
+            "claim_run_id",
+            "claim_acquired_at",
+            "claim_expires_at",
+        ] {
+            if !self.cards_has_column(column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing cards.{column}"),
+                });
+            }
+        }
+        for column in [
+            "id",
+            "card_id",
+            "event_type",
+            "actor",
+            "payload",
+            "created_at",
+        ] {
+            if !self.table_has_column("card_events", column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing card_events.{column}"),
+                });
+            }
+        }
+        for column in [
+            "id",
+            "card_id",
+            "state",
+            "principal",
+            "agent",
+            "claim_expires_at",
+            "proof",
+            "created_at",
+            "updated_at",
+        ] {
+            if !self.table_has_column("runs", column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing runs.{column}"),
+                });
+            }
+        }
+        for column in [
+            "id",
+            "principal",
+            "name",
+            "key_prefix",
+            "key_hash",
+            "hash_algorithm",
+            "scope",
+            "created_at",
+            "revoked_at",
+            "last_used_at",
+        ] {
+            if !self.table_has_column("api_keys", column)? {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "schema v18",
+                    value: format!("missing api_keys.{column}"),
+                });
+            }
+        }
+        if self.table_exists("actors")? {
+            return Err(StoreError::InvalidStoredValue {
+                field: "schema v18",
+                value: "legacy actors table still present".to_string(),
+            });
+        }
+
+        let now = unix_now();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT c.id, c.acceptance_json, c.criteria_json,
+                        c.claim_principal, c.claim_agent, c.claim_run_id,
+                        c.claim_acquired_at, c.claim_expires_at
+                 FROM cards c
+                 WHERE c.status = 'in_progress'
+                   AND EXISTS (
+                     SELECT 1
+                     FROM card_events e
+                     WHERE e.card_id = c.id
+                       AND e.event_type = 'status'
+                       AND e.actor = 'system:status-vocabulary-migration'
+                       AND e.payload IN (
+                         'status-vocabulary migration: claimed -> in_progress',
+                         'status-vocabulary migration: running -> in_progress'
+                       )
+                       AND e.created_at = (
+                         SELECT MAX(latest.created_at)
+                         FROM card_events latest
+                         WHERE latest.card_id = c.id
+                           AND latest.event_type = 'status'
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM card_events ambiguous
+                         WHERE ambiguous.card_id = c.id
+                           AND ambiguous.event_type = 'status'
+                           AND ambiguous.created_at >= e.created_at
+                           AND ambiguous.id <> e.id
+                           AND (
+                             ambiguous.actor <> e.actor
+                             OR ambiguous.payload <> e.payload
+                           )
+                       )
+                   )
+                 ORDER BY c.id",
+            )?;
+            let candidates = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+
+            for (
+                card_id,
+                acceptance_json,
+                criteria_json,
+                claim_principal,
+                claim_agent,
+                claim_run_id,
+                claim_acquired_at,
+                claim_expires_at,
+            ) in candidates
+            {
+                if decode_stored_claim(
+                    claim_principal,
+                    claim_agent,
+                    claim_run_id,
+                    claim_acquired_at,
+                    claim_expires_at,
+                )?
+                .is_some()
+                {
+                    continue;
+                }
+
+                let oracle = decode_stored_oracle(acceptance_json, criteria_json)?;
+                let new_status = if oracle.acceptance.is_empty() {
+                    "backlog"
+                } else {
+                    "ready"
+                };
+                transaction.execute(
+                    "UPDATE cards
+                     SET status = ?1
+                     WHERE id = ?2 AND status = 'in_progress'",
+                    params![new_status, card_id],
+                )?;
+                append_card_event(
+                    &transaction,
+                    &CardId::new(card_id)?,
+                    "status",
+                    "system:status-v17-repair",
+                    &format!(
+                        "status-v17 repair: in_progress -> {new_status} \
+                         (claimless v17 migration)"
+                    ),
+                    now,
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn cards_has_column(&self, column: &str) -> Result<bool> {
         self.table_has_column("cards", column)
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = ?1
+             )",
+            [table],
+            |row| row.get(0),
+        )?)
     }
 
     /// `table` is always an internal, hardcoded literal from a call site in
