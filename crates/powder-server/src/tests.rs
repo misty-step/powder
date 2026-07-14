@@ -1884,8 +1884,12 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(script.contains("function renderRepositorySettings("));
     assert!(script.contains("function canonicalRepoLabel("));
     assert!(script.contains("function relationBadges("));
-    assert!(script.contains("function animateRailShare("));
-    assert!(script.contains("cancelAnimationFrame(viewAnimation);"));
+    // powder-903: the board <-> backlog <-> both view switch is a plain CSS
+    // transition (see powder-board.css) driven by one instant style write,
+    // not a per-frame JS animation loop.
+    assert!(script.contains("function setRailShare("));
+    assert!(script.contains("function setView("));
+    assert!(!script.contains("function animateRailShare("));
     assert!(script.contains("write key needed"));
     assert!(!script.contains("read-only"));
 

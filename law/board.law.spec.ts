@@ -18,6 +18,11 @@ import {
    the board renders real cards rather than an empty shell. */
 
 const MODES = ["light", "dark"] as const;
+// powder-ui-keyboard-firstrun: the second, genuinely-empty fixture server
+// (law/scripts/start-empty-fixture-server.sh, wired in playwright.config.ts's
+// `webServer` array) -- an absolute URL passed to page.goto() overrides the
+// config's default baseURL for just that navigation.
+const EMPTY_BASE_URL = "http://127.0.0.1:4101";
 const CARD_ROUTE_VIEWPORTS = [
   { name: "desktop", size: { width: 1280, height: 900 } },
   { name: "mobile-390", size: { width: 390, height: 900 } },
@@ -97,9 +102,21 @@ for (const mode of MODES) {
     await page.locator("#settings-toggle").click();
     await expect(page.locator("#auth-panel")).toBeVisible();
     await expect(page.locator("#repo-create-form")).toBeVisible();
-    await expect(page.locator("#repo-settings-list .pw-repo-row").first()).toBeVisible();
     await expect(page.locator("#repo-settings-list")).toContainText("Merge alias");
     await expect(page.locator("#repo-settings-list")).toContainText("Tier");
+    // powder-915: init-db seeds ~24 "ratified tier" repositories at
+    // card_count 0 -- all hidden by default now that zero-card repos are
+    // hidden behind the "show empty" toggle (see the standalone toggle law
+    // spec). "powder" is the one fixture repo with a real card filed under
+    // it (start-fixture-server.sh), so it's the one expected to be visible
+    // by default with a nonzero count and a tier badge -- see PR design
+    // notes for why there is no description field here (RepositorySummary
+    // carries none).
+    const powderRow = page.locator('.pw-repo-row[data-repo-name="powder"]');
+    await expect(powderRow).toBeVisible();
+    await expect(powderRow.locator(".pw-repo-tier-badge")).toBeVisible();
+    const seededCount = await powderRow.locator(".ae-num").innerText();
+    expect(Number(seededCount)).toBeGreaterThan(0);
     await assertLaw(page, { consoleErrors: errors });
   });
 
@@ -140,6 +157,171 @@ for (const mode of MODES) {
   });
 
 }
+
+// powder-ui-keyboard-firstrun: card-level keyboard nav -- j/k roving focus
+// across every visible card link, Enter opens the focused card's detail
+// route (the browser's own anchor activation, not reimplemented), Escape
+// returns to the board. Read-only against the shared fixture.
+for (const mode of MODES) {
+  test(`board · ${mode} · j moves focus onto a card, Enter opens it, Escape returns (powder-ui-keyboard-firstrun)`, async ({
+    page,
+  }) => {
+    const errors = await boot(page, mode);
+    await page.keyboard.press("j");
+    const focused = page.locator("[data-card-link]:focus");
+    await expect(focused).toBeVisible();
+    const href = await focused.getAttribute("href");
+    expect(href).toBeTruthy();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(new RegExp(`${href}$`));
+    await expect(page.locator("#powder-card-app")).toBeVisible();
+    await assertLaw(page, { consoleErrors: errors });
+    await page.keyboard.press("Escape");
+    await expect(page).toHaveURL(/\/board$/);
+    await expect(page.locator("#powder-board-app")).toBeVisible();
+  });
+}
+
+// powder-ui-keyboard-firstrun: the ⌘K/Ctrl-K command palette -- simplest
+// honest design is a modal listbox filtering the board's own already-loaded
+// card list. Opened here via the visible #cmdk-toggle button (a real click
+// target, not just a hidden shortcut) rather than simulating the
+// platform-specific meta/ctrl modifier.
+for (const mode of MODES) {
+  test(`board · ${mode} · the command palette jumps to a seeded card by id fragment (powder-ui-keyboard-firstrun)`, async ({
+    page,
+  }) => {
+    const errors = await boot(page, mode);
+    await page.locator("#cmdk-toggle").click();
+    await expect(page.locator("#cmdk")).toBeVisible();
+    await expect(page.locator("#cmdk-input")).toBeFocused();
+    await page.locator("#cmdk-input").fill("epic-hierarchy-child-a");
+    await expect(page.locator("#cmdk-list .pw-cmdk-item")).toHaveCount(1);
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/\/c\/epic-hierarchy-child-a$/);
+    await assertLaw(page, { consoleErrors: errors });
+  });
+}
+
+// Adversarial-review blocker: aria-modal="true" without focus containment
+// is a lie -- Tab used to walk straight out of the palette into the
+// visually-covered board. This proves the trap: Tab/Shift-Tab keep focus
+// inside the dialog, and closing hands focus back to the invoker.
+test("board · the command palette traps Tab focus and restores the invoker on close (powder-ui-keyboard-firstrun review)", async ({
+  page,
+}) => {
+  const errors = await boot(page, "light");
+  await page.locator("#cmdk-toggle").click();
+  await expect(page.locator("#cmdk")).toBeVisible();
+  await expect(page.locator("#cmdk-input")).toBeFocused();
+  for (const key of ["Tab", "Tab", "Shift+Tab", "Tab", "Shift+Tab"]) {
+    await page.keyboard.press(key);
+    const inside = await page.evaluate(() =>
+      document.getElementById("cmdk")!.contains(document.activeElement),
+    );
+    expect(inside, `focus must stay inside the dialog after ${key}`).toBe(true);
+  }
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#cmdk")).toBeHidden();
+  await expect(page.locator("#cmdk-toggle")).toBeFocused();
+  await assertLaw(page, { consoleErrors: errors });
+});
+
+// powder-ui-keyboard-firstrun: honest empty states -- a brand-new instance
+// (zero cards, zero filters) gets an onboarding welcome, distinct from a
+// filter that simply matches nothing. Uses the second, genuinely-empty
+// fixture server (see EMPTY_BASE_URL) so this proves against a board that
+// really has zero cards, not a populated one with every filter cleared.
+for (const mode of MODES) {
+  test(`board · ${mode} · a brand-new instance renders the welcome empty state (powder-ui-keyboard-firstrun)`, async ({
+    page,
+  }) => {
+    const errors = await boot(page, mode, `${EMPTY_BASE_URL}/board`);
+    await expect(page.locator("#lane-ready")).toContainText("Welcome");
+    await expect(page.locator("#lane-ready")).toContainText("powder key-create");
+    const nudge = page.locator("#lane-ready [data-firstrun-file-card]");
+    await expect(nudge).toBeVisible();
+    await assertLaw(page, { consoleErrors: errors });
+    await nudge.click();
+    await expect(page.locator("#quick-add-panel")).toBeVisible();
+  });
+}
+
+for (const mode of MODES) {
+  test(`board · ${mode} · a filter matching nothing names the active filters (powder-ui-keyboard-firstrun)`, async ({
+    page,
+  }) => {
+    const errors = await boot(page, mode);
+    await page.locator("#filter-btn").click();
+    await page.locator("#text-filter").fill("zzz-no-such-card-zzz");
+    await expect(page.locator("#lane-ready")).toContainText(
+      'No matches for "zzz-no-such-card-zzz"',
+    );
+    await expect(page.locator("#lane-ready")).toContainText("clear filters");
+    await assertLaw(page, { consoleErrors: errors });
+  });
+}
+
+// powder-903: the board <-> backlog <-> both view switch is a plain CSS
+// transition on `.pw-main`'s grid-template-columns (see PR design notes),
+// not a per-frame JS animation loop. Honest scope of this spec
+// (adversarial-review rewording): it does NOT measure jank or prove the
+// main thread never stalls -- it proves a click landing while the CSS
+// transition is verifiably mid-interpolation (the rail's resolved grid
+// track is strictly between its start and end widths at the moment of the
+// next click) is handled immediately rather than dropped or queued behind
+// the animation. The pre-PR rAF loop also kept clicks working; what this
+// pins down is that the *current* transition really is in flight when the
+// next command lands, which the earlier version of this spec never
+// sampled. `--pw-view-duration` is stretched via an injected style so the
+// mid-flight window is reliably sampleable under CI load -- same
+// declarative mechanism, longer beat.
+test("board · view switch controls stay responsive mid-transition (powder-903)", async ({
+  page,
+}) => {
+  const errors = await boot(page, "light");
+  await page.addStyleTag({ content: ":root { --pw-view-duration: 600ms; }" });
+  const railTrackWidth = () =>
+    page
+      .locator("#main")
+      .evaluate((el) => parseFloat(getComputedStyle(el).gridTemplateColumns));
+  const start = await railTrackWidth();
+  expect(start, "the rail track starts at its 'both' share").toBeGreaterThan(0);
+
+  await page.locator("#tab-board").click();
+  // Wait until the resolved track width has left its start value...
+  await expect
+    .poll(railTrackWidth, { intervals: [16, 16, 16, 16, 32, 32, 64] })
+    .toBeLessThan(start);
+  // ...and sample again: strictly between end (0) and start proves the CSS
+  // transition is interpolating right now, not already finished.
+  const during = await railTrackWidth();
+  expect(during, "sampled mid-interpolation, not after the transition ended").toBeGreaterThan(0);
+  expect(during).toBeLessThan(start);
+
+  // Fire the next switch while the transition is provably in flight: the
+  // click must register immediately (aria-selected and data-view flip),
+  // not be dropped or deferred until the animation ends.
+  await page.locator("#tab-backlog").click();
+  await expect(page.locator("#tab-backlog")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#main")).toHaveAttribute("data-view", "backlog");
+  await page.locator("#tab-both").click();
+  await expect(page.locator("#tab-both")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#main")).toHaveAttribute("data-view", "both");
+  await assertLaw(page, { consoleErrors: errors });
+});
+
+test("board · prefers-reduced-motion collapses the view-switch transition (powder-903)", async ({
+  page,
+}) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const errors = await boot(page, "light");
+  const duration = await page
+    .locator("#main")
+    .evaluate((el) => getComputedStyle(el).transitionDuration);
+  expect(parseFloat(duration)).toBeLessThan(0.001);
+  await assertLaw(page, { consoleErrors: errors });
+});
 
 // powder-ui-awaiting-you: the fixture DB seeds one run parked on an
 // operator question (law/scripts/start-fixture-server.sh, "awaiting-answer")
@@ -509,4 +691,54 @@ test("board · mobile-390 · header controls stay on-screen with the long live i
   }
 
   await assertLaw(page, { consoleErrors: errors });
+});
+
+// powder-915: zero-card repositories are hidden from the settings list by
+// default, behind an explicit "show empty" toggle -- registers a real
+// repository entity with no cards via the same API the settings form uses,
+// standalone (not mode-looped) and last in the file since it's a write
+// against the shared fixture DB, cleaned up afterward via DELETE so a
+// second local run against the reused dev DB starts from the same state.
+test("board · a zero-card repository is hidden until the show-empty toggle is used (powder-915)", async ({
+  page,
+}) => {
+  const repoName = `law-gate-zero-card-${Date.now()}`;
+  const created = await page.request.post("/api/v1/repositories", {
+    data: { name: repoName, aliases: [], visibility: "visible", tier: "active" },
+  });
+  expect(created.ok()).toBe(true);
+
+  const errors = await boot(page, "light");
+  await page.locator("#settings-toggle").click();
+  await expect(page.locator("#auth-panel")).toBeVisible();
+
+  const row = page.locator(`.pw-repo-row[data-repo-name="${repoName}"]`);
+  await expect(row).toBeHidden();
+  const toggle = page.locator("#repo-empty-toggle");
+  await expect(toggle).toBeVisible();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+  await expect(row).toBeVisible();
+  await expect(row.locator(".ae-num")).toHaveText("0");
+
+  await assertLaw(page, { consoleErrors: errors });
+
+  // Review fix: showEmptyRepos persists through the same
+  // saveBoardState()/restoreBoardState() session round-trip as its sibling
+  // showAllTiers -- navigate out to a card (which saves board state) and
+  // back to the board (which restores it), then confirm the toggle is
+  // still engaged instead of silently reset.
+  await page.locator("[data-card-link]").first().click();
+  await expect(page.locator("#powder-card-app")).toBeVisible();
+  await page.locator("#detail-board-link").click();
+  await expect(page.locator("#powder-board-app")).toBeVisible();
+  await waitForSettled(page);
+  await page.locator("#settings-toggle").click();
+  await expect(page.locator("#repo-empty-toggle")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(`.pw-repo-row[data-repo-name="${repoName}"]`)).toBeVisible();
+
+  const deleted = await page.request.delete(`/api/v1/repositories/${repoName}`);
+  expect(deleted.ok(), "clean up the zero-card fixture repository").toBe(true);
 });
