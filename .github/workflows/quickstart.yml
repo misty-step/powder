@@ -11,6 +11,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "README.md"
+      - "scripts/lease-race-demo.sh"
       - ".github/workflows/quickstart.yml"
   push:
     branches: [master]
@@ -19,6 +20,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "README.md"
+      - "scripts/lease-race-demo.sh"
       - ".github/workflows/quickstart.yml"
 
 permissions:
@@ -127,3 +129,22 @@ jobs:
           name: quickstart-server-log
           path: ${{ runner.temp }}/quickstart/server.log
           if-no-files-found: ignore
+
+  lease-race-demo:
+    name: lease-race demo (crash + reclaim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      # scripts/lease-race-demo.sh (powder-lease-proof-demo) is the
+      # executable proof behind the README's lease-race positioning: it
+      # boots a real powder-server, has one actor claim + crash, and asserts
+      # a second actor reclaims via lease expiry with a full audit trail. If
+      # this job goes red, the README's claim is lying.
+      - name: Run the lease-race demo
+        run: bash scripts/lease-race-demo.sh
