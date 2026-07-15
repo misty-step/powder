@@ -275,11 +275,12 @@ set -a; source .env; set +a
 POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 ```
 
-Board read routes are reachable without a key in `api-key` mode; the private
-Flycast/Tailscale network is the read perimeter. Mutations, card status and
-relation changes, claim lifecycle, card authoring, comments, links,
-answer-loop writes, and key management require `Authorization: Bearer <key>` in
-`api-key` mode. Use
+Board read routes require `Authorization: Bearer <key>` in `api-key` mode
+unless `POWDER_PUBLIC_READS=true` is explicitly set. Set that flag only when
+the deployment's listener is genuinely private (e.g. Flycast/Tailscale internal
+ingress with no public path). Mutations, card status and relation changes,
+claim lifecycle, card authoring, comments, links, answer-loop writes, and key
+management always require a bearer key in `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
 supported tailnet identity headers and strips spoofed client-supplied identity
 headers. Use `none` only for local development.
@@ -321,16 +322,28 @@ bulk import): tailnet-authenticated callers still authenticate and can use
 claim-scoped routes, but `require_admin`-gated routes reject them with
 `403`.
 
-**Ratified posture (powder-931, 2026-07-06):** the deployed instance runs
-`api-key` mode with unauthenticated reads, reachable only over its private
-tailnet hostname (see [`docs/production-deploy.md`](production-deploy.md))
-— never a public listener.
-This was reviewed as a deliberate tradeoff (it serves the operator's
-read-only phone use case) rather than an oversight, and the operator
-ratified keeping it as-is. If the deployment's network exposure ever
-changes (public listener, non-tailnet ingress), this posture must be
-re-reviewed before that change ships — read routes are not currently
-closed behind read-scope keys.
+**Fail-closed read posture (powder-public-read-posture, 2026-07-15):**
+`api-key` mode now requires a valid bearer key for every read route by
+default. The legacy private-perimeter behavior — where board reads were
+reachable without a key — is preserved only under the explicit escape hatch
+`POWDER_PUBLIC_READS=true`. Use that flag only when the listener is genuinely
+private (e.g. Flycast/Tailscale internal ingress with no public path). New
+deployments should leave it unset.
+
+**Rollout runbook for an existing private-perimeter instance:**
+
+1. Deploy the new binary with `POWDER_PUBLIC_READS=true` and confirm reads
+   still work for existing keyless readers.
+2. Inventory every keyless reader (board UI phone clients, Glass, dashboard
+   panels, automation cron jobs) and mint a scoped key for each over
+   `POST /api/v1/keys` (admin scope required). The raw secret prints once.
+3. Reconfigure each reader to send `Authorization: Bearer <key>`.
+4. Remove `POWDER_PUBLIC_READS=true` from the deployment env and restart.
+5. Verify with curl: a keyless `GET /api/v1/cards` must now return `401`, and
+   a request with a valid key returns `200`. A revoked key must return `401`
+   on reads as well as mutations.
+
+`tailscale-header` and `none` auth modes are unchanged.
 
 API keys authenticate a neutral principal. Claims and runs separately record
 that principal, the explicit request-body `agent` worker label, and the unique

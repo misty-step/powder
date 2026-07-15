@@ -32,25 +32,25 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
-        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more,cycle_card_ids?}",
+        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more,cycle_card_ids?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards",
-        intent: "list cards by optional status/repo/estimate filter; response is {cards,total_count,has_more}",
+        intent: "list cards by optional status/repo/estimate filter; response is {cards,total_count,has_more}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/approvals",
-        intent: "list awaiting-input runs with card title, latest question, run id, and any approval-prefixed packet links",
+        intent: "list awaiting-input runs with card title, latest question, run id, and any approval-prefixed packet links; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/stats",
-        intent: "return compact board status counts by repository plus totals; optional repo and include_hidden query params",
+        intent: "return compact board status counts by repository plus totals; optional repo and include_hidden query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
@@ -60,15 +60,15 @@ pub const ROUTES: &[ApiRoute] = &[
         body_shape: None,
     },
     ApiRoute {
-        method: "POST",
+        method: "GET",
         path: "/api/v1/repositories",
-        intent: "create or update a repository entity with aliases, visibility, tier, and import provenance",
+        intent: "list repository entities with aliases, visibility, tier, import provenance, and status counts; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/repositories/{name}",
-        intent: "read one repository entity resolved by canonical name or alias",
+        intent: "read one repository entity resolved by canonical name or alias; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
@@ -92,7 +92,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/{id}",
-        intent: "read one card with runs, activity, links, comments, and claim state; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
+        intent: "read one card with runs, activity, links, comments, and claim state; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
@@ -202,13 +202,13 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/{id}",
-        intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
+        intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/awaiting-input",
-        intent: "list runs waiting on human or agent input",
+        intent: "list runs waiting on human or agent input; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
@@ -252,7 +252,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/events/tail",
-        intent: "tail durable card events as Server-Sent Events",
+        intent: "tail durable card events as Server-Sent Events; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {
@@ -263,8 +263,14 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/keys",
+        intent: "mint a new API key and return the raw secret exactly once (admin scope only); body: {\"name\":\"...\",\"scope\":\"admin|agent\"}",
+        body_shape: Some(r#"{"name":"...","scope":"admin|agent"} -- name is required; scope must be "admin" or "agent"; the raw key is returned exactly once and never again"#),
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/keys/{id}/revoke",
-        intent: "revoke an api key so it immediately fails auth (admin scope only)",
+        intent: "revoke an api key so it immediately fails auth on every route, including reads (admin scope only)",
         body_shape: None,
     },
 ];
