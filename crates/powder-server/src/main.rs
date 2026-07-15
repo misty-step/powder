@@ -14,9 +14,10 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
+        request::Parts,
         HeaderMap, StatusCode,
     },
     response::{
@@ -106,6 +107,12 @@ struct Config {
     /// `/readyz`'s dead-letter backlog gate. See
     /// `DEFAULT_READYZ_DEAD_LETTER_THRESHOLD`.
     dead_letter_ready_threshold: i64,
+    /// Read posture override for `api-key` mode (powder-public-read-posture).
+    /// When `false` (default), read routes require a valid bearer token in
+    /// `api-key` mode. When `true`, read routes are reachable without a key,
+    /// preserving the historical Flycast/tailnet private-perimeter behavior.
+    /// `tailscale-header` and `none` modes are unaffected.
+    public_reads: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -196,6 +203,11 @@ impl Config {
                 })?,
                 None => DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
             };
+        let public_reads = parse_bool(
+            "POWDER_PUBLIC_READS",
+            env_value(&vars, "POWDER_PUBLIC_READS"),
+        )?
+        .unwrap_or(false);
 
         Ok(Self {
             db_path,
@@ -208,6 +220,7 @@ impl Config {
             tailnet_proxy_secret,
             tailnet_admin,
             dead_letter_ready_threshold,
+            public_reads,
         })
     }
 }
@@ -765,7 +778,7 @@ fn app(state: AppState) -> Router {
             post(replay_dead_letters),
         )
         .route("/api/v1/events/tail", get(tail_events))
-        .route("/api/v1/keys", get(list_keys))
+        .route("/api/v1/keys", get(list_keys).post(create_key))
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
         .with_state(state)
         // Method/path/status/latency per request via the tracing crate
@@ -1026,10 +1039,9 @@ async fn get_repository(
 
 async fn upsert_repository(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Json(request): Json<RepositoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let name = request
         .name
         .clone()
@@ -1041,11 +1053,10 @@ async fn upsert_repository(
 
 async fn update_repository(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Path(name): Path<String>,
     Json(request): Json<RepositoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let repository_name = request.name.clone().unwrap_or(name);
     let repository = lock_store(&state)?
         .upsert_repository(repository_upsert(repository_name, request)?, unix_now())?;
@@ -1054,21 +1065,19 @@ async fn update_repository(
 
 async fn delete_repository(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     lock_store(&state)?.delete_repository(&name)?;
     Ok(Json(json!({ "deleted": true, "repository": name })))
 }
 
 async fn merge_repository_alias(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(actor): AdminActor,
     Path(name): Path<String>,
     Json(request): Json<RepositoryMergeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = require_admin(&state, &headers)?;
     let merge_actor = request.actor.unwrap_or(actor.principal);
     let outcome = lock_store(&state)?.merge_repository_alias(
         &request.alias,
@@ -1095,13 +1104,12 @@ async fn get_card(
 
 async fn create_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Json(request): Json<CreateCardRequest>,
 ) -> Result<Json<Value>, ApiError> {
     // powder-925: single-card authoring is agent-accessible, same as
     // claim/status/comment/complete -- a scoped (non-admin) key can carry
     // the operator's mobile quick-add flow without holding admin.
-    let actor = authorize(&state, &headers)?;
     let now = unix_now();
     // Default status reflects whether a real oracle exists (VISION.md:
     // "ready is a query, not vibes") -- see
@@ -1158,7 +1166,7 @@ async fn create_card(
 
 async fn patch_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<PatchCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
@@ -1166,7 +1174,6 @@ async fn patch_card(
     // rule as single-card authoring (powder-925) -- an actor-scoped key can
     // record an operator ruling (title/body/acceptance/priority) without the
     // admin key; every patch is audited with actor and field list.
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let card = lock_store(&state)?.patch_card(
         &card_id,
@@ -1179,11 +1186,10 @@ async fn patch_card(
 
 async fn claim_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<ClaimRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let receipt = lock_store(&state)?.claim_card(
         &card_id,
@@ -1197,11 +1203,10 @@ async fn claim_card(
 
 async fn release_claim(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
     let receipt =
@@ -1211,11 +1216,10 @@ async fn release_claim(
 
 async fn renew_claim(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
     let receipt = lock_store(&state)?.renew_claim(
@@ -1230,11 +1234,10 @@ async fn renew_claim(
 
 async fn heartbeat_claim(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
     let receipt =
@@ -1248,11 +1251,10 @@ async fn heartbeat_claim(
 /// admin-invocable, same authority shape as renew/release/heartbeat.
 async fn transfer_claim(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<TransferRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
     let receipt = lock_store(&state)?.transfer_claim(
@@ -1268,11 +1270,10 @@ async fn transfer_claim(
 
 async fn update_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<StatusRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let status = parse_status(&request.status)?;
     let card =
@@ -1282,11 +1283,10 @@ async fn update_status(
 
 async fn update_relations(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<RelationsRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let card = lock_store(&state)?.update_relations(
         &card_id,
@@ -1301,11 +1301,10 @@ async fn update_relations(
 
 async fn set_parent(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<ParentRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let parent = request.parent.map(CardId::new).transpose()?;
     let card = lock_store(&state)?.set_parent(&card_id, parent, unix_now(), &actor.authority())?;
@@ -1314,11 +1313,10 @@ async fn set_parent(
 
 async fn check_criterion(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(authenticated): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<CriterionRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let card = lock_store(&state)?.check_criterion_as(
         &card_id,
@@ -1333,11 +1331,10 @@ async fn check_criterion(
 
 async fn add_link(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(authenticated): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<LinkRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let link = lock_store(&state)?.add_link_as(
         &card_id,
@@ -1351,11 +1348,10 @@ async fn add_link(
 
 async fn add_comment(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(authenticated): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<CommentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let comment = lock_store(&state)?.add_comment_as(
         &card_id,
@@ -1369,11 +1365,10 @@ async fn add_comment(
 
 async fn append_work_log(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(authenticated): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<WorkLogRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let attribution = powder_store::WorkLogAttribution {
         model: request.model.as_deref(),
@@ -1394,11 +1389,10 @@ async fn append_work_log(
 
 async fn request_input(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<InputRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let run_id = RunId::new(id)?;
     let run = lock_store(&state)?.request_input(
         &run_id,
@@ -1411,11 +1405,10 @@ async fn request_input(
 
 async fn answer_input(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<AnswerRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let run_id = RunId::new(id)?;
     let run = lock_store(&state)?.answer_input(
         &run_id,
@@ -1454,11 +1447,10 @@ async fn list_awaiting_input(
 
 async fn complete_card(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Path(id): Path<String>,
     Json(request): Json<CompleteRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let card = lock_store(&state)?.complete_card(
         &card_id,
@@ -1480,10 +1472,9 @@ async fn complete_card(
 
 async fn create_event_subscription(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Json(request): Json<EventSubscriptionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let created = lock_store(&state)?.create_event_subscription(
         &request.url,
         request.event_filter.unwrap_or_default(),
@@ -1494,29 +1485,26 @@ async fn create_event_subscription(
 
 async fn list_event_subscriptions(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let subscriptions = lock_store(&state)?.list_event_subscriptions()?;
     Ok(Json(json!({ "subscriptions": subscriptions })))
 }
 
 async fn disable_event_subscription(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let subscription = lock_store(&state)?.disable_event_subscription(&id, unix_now())?;
     Ok(Json(json!(subscription)))
 }
 
 async fn list_dead_letters(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Query(params): Query<ReadyParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let dead_letters =
         lock_store(&state)?.list_dead_letter_deliveries(params.limit.unwrap_or(20))?;
     Ok(Json(json!({ "dead_letters": dead_letters })))
@@ -1537,10 +1525,9 @@ struct DeadLetterReplayRequest {
 /// authored change.
 async fn replay_dead_letters(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Json(request): Json<DeadLetterReplayRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let replayed =
         lock_store(&state)?.replay_dead_letters(request.subscription_id.as_deref(), unix_now())?;
     Ok(Json(json!({ "replayed": replayed })))
@@ -1594,6 +1581,41 @@ async fn tail_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateKeyRequest {
+    name: String,
+    scope: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreatedKeyResponse {
+    id: String,
+    name: String,
+    scope: &'static str,
+    principal: String,
+    key_prefix: String,
+    created_at: i64,
+    /// Raw secret shown exactly once, at mint time. Mirrors the CLI's
+    /// `key-create --show-secret` semantics over HTTP so operators can rotate
+    /// keys without SSH + `--db` access (powder-public-read-posture, rider 2).
+    raw_key: String,
+}
+
+impl From<powder_store::ApiKeyCreated> for CreatedKeyResponse {
+    fn from(key: powder_store::ApiKeyCreated) -> Self {
+        Self {
+            id: key.id,
+            name: key.name,
+            scope: key.scope.as_str(),
+            principal: key.principal,
+            key_prefix: key.key_prefix,
+            created_at: key.created_at,
+            raw_key: key.raw_key,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct KeySummaryResponse {
     id: String,
@@ -1623,9 +1645,8 @@ impl From<powder_store::ApiKeySummary> for KeySummaryResponse {
 
 async fn list_keys(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     let keys = lock_store(&state)?
         .list_api_keys()?
         .into_iter()
@@ -1634,12 +1655,22 @@ async fn list_keys(
     Ok(Json(json!({ "keys": keys })))
 }
 
+async fn create_key(
+    State(state): State<AppState>,
+    AdminActor(_actor): AdminActor,
+    Json(request): Json<CreateKeyRequest>,
+) -> Result<Json<CreatedKeyResponse>, ApiError> {
+    let scope = ApiKeyScope::parse(&request.scope)
+        .ok_or_else(|| ApiError::bad_request(format!("invalid key scope {:?}", request.scope)))?;
+    let created = lock_store(&state)?.create_api_key(&request.name, scope, unix_now())?;
+    Ok(Json(CreatedKeyResponse::from(created)))
+}
+
 async fn revoke_key(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AdminActor(_actor): AdminActor,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers)?;
     lock_store(&state)?.revoke_api_key(&id, unix_now())?;
     Ok(Json(json!({ "id": id, "revoked": true })))
 }
@@ -1665,6 +1696,40 @@ impl AuthorizedActor {
         } else {
             Authority::unchecked()
         }
+    }
+}
+
+/// Runs `authorize()` as a `FromRequestParts` extractor so authentication is
+/// checked before body-consuming extractors like `Json` run. This closes the
+/// ordering gap where an unauthenticated POST with a malformed body received
+/// a 415/422 before a 401 (powder-public-read-posture, rider 1).
+#[derive(Debug, Clone)]
+struct AuthActor(AuthorizedActor);
+
+impl FromRequestParts<AppState> for AuthActor {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        authorize(state, &parts.headers).map(AuthActor)
+    }
+}
+
+/// Runs `require_admin()` as a `FromRequestParts` extractor so admin gating
+/// happens before body deserialization, matching `AuthActor`'s ordering fix.
+#[derive(Debug, Clone)]
+struct AdminActor(AuthorizedActor);
+
+impl FromRequestParts<AppState> for AdminActor {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require_admin(state, &parts.headers).map(AdminActor)
     }
 }
 
@@ -1728,13 +1793,18 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
     }
 }
 
-/// Allow keyless reads when the deployment perimeter is the private Flycast
-/// network, while preserving trusted-ingress identity checks for tailnet mode.
+/// Read-route auth posture (powder-public-read-posture).
+///
+/// - `none` mode: auth is explicitly disabled; reads are public.
+/// - `tailscale-header` mode: unchanged; trust the injected tailnet identity.
+/// - `api-key` mode: reads require a valid key unless `POWDER_PUBLIC_READS=true`
+///   is set, which preserves the historical private-perimeter behavior.
 fn authorize_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    if matches!(state.config.auth_mode, AuthMode::TailscaleHeader) {
-        authorize(state, headers).map(|_| ())
-    } else {
-        Ok(())
+    match state.config.auth_mode {
+        AuthMode::None => Ok(()),
+        AuthMode::TailscaleHeader => authorize(state, headers).map(|_| ()),
+        AuthMode::ApiKey if state.config.public_reads => Ok(()),
+        AuthMode::ApiKey => authorize(state, headers).map(|_| ()),
     }
 }
 
