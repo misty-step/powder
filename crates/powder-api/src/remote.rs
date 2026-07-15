@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+use powder_core::{AcceptanceCriterion, CardId, CardStatus, ClaimSummary, Estimate, Priority};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,9 +302,154 @@ pub fn parse_list_page(response: Value) -> Result<ListPage, String> {
     })
 }
 
+/// Client-side status, version-skew-safe across vocabulary additions.
+///
+/// `powder_core::CardStatus` intentionally rejects unknown values so the
+/// server/store never persists garbage. On a client read boundary, however,
+/// an unrecognized status must degrade only that card, never abort the
+/// whole listing. `ClientStatus` mirrors the canonical vocabulary but falls
+/// back to `Unknown(raw)` for anything else, preserving the raw string for
+/// display and passthrough serialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientStatus {
+    Known(CardStatus),
+    Unknown(String),
+}
+
+impl ClientStatus {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Known(status) => status.as_str(),
+            Self::Unknown(raw) => raw.as_str(),
+        }
+    }
+
+    pub fn known(&self) -> Option<CardStatus> {
+        match self {
+            Self::Known(status) => Some(*status),
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
+impl Serialize for ClientStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(CardStatus::parse(&raw)
+            .map(ClientStatus::Known)
+            .unwrap_or_else(|| ClientStatus::Unknown(raw)))
+    }
+}
+
+/// A card summary from the wire, tolerant of unknown status values so a
+/// single future/retired status cannot break a whole listing.
+///
+/// The wire shape matches both a full `Card` (the HTTP API's
+/// `card_list_page_json` serializes whole cards) and a `CardSummary`
+/// projection; extra fields such as `body` and `criteria` are accepted and
+/// ignored when serializing back out.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClientCardSummary {
+    pub id: CardId,
+    pub title: String,
+    pub status: ClientStatus,
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimSummary>,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub criteria_checked: usize,
+    #[serde(default)]
+    pub criteria_total: usize,
+    /// Carried only when the server emits full cards; used to compute the
+    /// summary counts above and then dropped from the output.
+    #[serde(default, skip_serializing)]
+    pub criteria: Vec<AcceptanceCriterion>,
+}
+
+impl ClientCardSummary {
+    /// Compute criteria counts from the embedded criteria list when the
+    /// server response is a full `Card` rather than a pre-computed summary.
+    pub fn compute_criteria_counts(&mut self) {
+        if !self.criteria.is_empty() {
+            self.criteria_total = self.criteria.len();
+            self.criteria_checked = self
+                .criteria
+                .iter()
+                .filter(|c| c.checked_at.is_some() || c.checked_by.is_some())
+                .count();
+        }
+    }
+}
+
+/// A decoded `list_ready` / `list_cards` response page.
+#[derive(Debug, Clone)]
+pub struct CardSummaryPage {
+    pub cards: Vec<ClientCardSummary>,
+    pub total_count: usize,
+    pub has_more: bool,
+    pub excluded_terminal_count: usize,
+}
+
+/// Decode a list response into client-card summaries, tolerating unknown
+/// status values on individual cards. This is the read boundary where
+/// version skew between an older client and a newer server (or vice versa)
+/// must degrade per-card, never fail the entire page.
+pub fn parse_card_summary_page(response: Value) -> Result<CardSummaryPage, String> {
+    let cards = match response.get("cards") {
+        Some(Value::Array(cards)) => cards.clone(),
+        _ => return Err("remote list response missing cards array".to_string()),
+    };
+    let total_count = response
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "remote list response missing total_count".to_string())?;
+    let total_count = usize::try_from(total_count)
+        .map_err(|_| "remote list response total_count is too large".to_string())?;
+    let has_more = response
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "remote list response missing has_more".to_string())?;
+    let excluded_terminal_count = response
+        .get("excluded_terminal_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let mut cards = serde_json::from_value::<Vec<ClientCardSummary>>(Value::Array(cards))
+        .map_err(|err| format!("remote list response card decode failed: {err}"))?;
+    for card in &mut cards {
+        card.compute_criteria_counts();
+    }
+    Ok(CardSummaryPage {
+        cards,
+        total_count,
+        has_more,
+        excluded_terminal_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn resolve_key_cmd_trims_trailing_newline() {
@@ -402,5 +549,70 @@ mod tests {
         let fourth = maybe_append_stale_base_url_steer("http 404: not found".to_string(), 4);
         assert!(fourth.contains("POWDER_API_BASE_URL may be stale"));
         assert!(fourth.contains("restart this MCP client"));
+    }
+
+    /// Unknown status values must degrade only that card, never abort the
+    /// whole page. This is the central response-evolution contract:
+    /// clients treat vocabulary additions as additive.
+    #[test]
+    fn parse_card_summary_page_tolerates_unknown_status_values() {
+        let response = json!({
+            "cards": [
+                {
+                    "id": "known-1",
+                    "title": "Known card",
+                    "status": "ready",
+                    "priority": "p1",
+                    "updated_at": 10,
+                    "criteria_checked": 0,
+                    "criteria_total": 1,
+                },
+                {
+                    "id": "unknown-status",
+                    "title": "Future status card",
+                    "status": "paused",
+                    "priority": "p2",
+                    "updated_at": 20,
+                    "criteria_checked": 1,
+                    "criteria_total": 2,
+                },
+                {
+                    "id": "known-2",
+                    "title": "Another known card",
+                    "status": "in_progress",
+                    "priority": "p0",
+                    "updated_at": 30,
+                    "criteria_checked": 0,
+                    "criteria_total": 0,
+                },
+            ],
+            "total_count": 3,
+            "has_more": false,
+            "excluded_terminal_count": 0,
+        });
+
+        let page = parse_card_summary_page(response).expect("page must decode");
+        assert_eq!(page.cards.len(), 3);
+        assert_eq!(page.total_count, 3);
+        assert!(!page.has_more);
+        assert_eq!(
+            page.cards[0].status.known(),
+            Some(CardStatus::Ready),
+            "known status parses normally"
+        );
+        assert_eq!(
+            page.cards[1].status,
+            ClientStatus::Unknown("paused".to_string()),
+            "unknown status is preserved"
+        );
+        assert_eq!(
+            page.cards[2].status.known(),
+            Some(CardStatus::InProgress),
+            "other known statuses still decode"
+        );
+
+        // Round-trip: the raw unknown value serializes back through.
+        let value = serde_json::to_value(&page.cards[1]).expect("serialize");
+        assert_eq!(value["status"].as_str(), Some("paused"));
     }
 }

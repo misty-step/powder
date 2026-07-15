@@ -2,7 +2,10 @@
 
 mod remote;
 
-pub use remote::{parse_list_page, urlencode, ListPage, RemoteClient};
+pub use remote::{
+    parse_card_summary_page, parse_list_page, urlencode, CardSummaryPage, ClientCardSummary,
+    ClientStatus, ListPage, RemoteClient,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiRoute {
