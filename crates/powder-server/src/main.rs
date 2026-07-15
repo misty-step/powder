@@ -438,6 +438,7 @@ impl PatchCardRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CriterionRequest {
     criterion: usize,
     actor: String,
@@ -500,18 +501,21 @@ struct ParentRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LinkRequest {
     label: String,
     url: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommentRequest {
     author: String,
     body: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkLogRequest {
     agent: String,
     model: Option<String>,
@@ -1314,14 +1318,15 @@ async fn check_criterion(
     Path(id): Path<String>,
     Json(request): Json<CriterionRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    authorize(&state, &headers)?;
+    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let card = lock_store(&state)?.check_criterion(
+    let card = lock_store(&state)?.check_criterion_as(
         &card_id,
         request.criterion,
         &request.actor,
         request.checked.unwrap_or(true),
         unix_now(),
+        &authenticated.authority(),
     )?;
     Ok(Json(card))
 }
@@ -1332,9 +1337,15 @@ async fn add_link(
     Path(id): Path<String>,
     Json(request): Json<LinkRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let link = lock_store(&state)?.add_link(&card_id, &request.label, &request.url, unix_now())?;
+    let link = lock_store(&state)?.add_link_as(
+        &card_id,
+        &request.label,
+        &request.url,
+        unix_now(),
+        &authenticated.authority(),
+    )?;
     Ok(Json(json!(link)))
 }
 
@@ -1344,10 +1355,15 @@ async fn add_comment(
     Path(id): Path<String>,
     Json(request): Json<CommentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let comment =
-        lock_store(&state)?.add_comment(&card_id, &request.author, &request.body, unix_now())?;
+    let comment = lock_store(&state)?.add_comment_as(
+        &card_id,
+        &request.author,
+        &request.body,
+        unix_now(),
+        &authenticated.authority(),
+    )?;
     Ok(Json(json!(comment)))
 }
 
@@ -1357,7 +1373,7 @@ async fn append_work_log(
     Path(id): Path<String>,
     Json(request): Json<WorkLogRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let authenticated = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let attribution = powder_store::WorkLogAttribution {
         model: request.model.as_deref(),
@@ -1365,12 +1381,13 @@ async fn append_work_log(
         harness: request.harness.as_deref(),
         run_id: request.run_id.as_deref(),
     };
-    let entry = lock_store(&state)?.append_work_log(
+    let entry = lock_store(&state)?.append_work_log_as(
         &card_id,
         &request.agent,
         attribution,
         &request.body,
         unix_now(),
+        &authenticated.authority(),
     )?;
     Ok(Json(json!(entry)))
 }

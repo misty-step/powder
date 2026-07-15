@@ -106,8 +106,10 @@ fn schema_v19_repairs_only_the_seven_production_derived_incidents() {
         let mut store = Store::open(&path).expect("open schema-v18 store");
         assert_eq!(store.schema_version().expect("schema before repair"), 18);
         store.migrate().expect("run schema-v19 repair");
-        assert_eq!(store.schema_version().expect("schema after repair"), 19);
-        assert_eq!(SCHEMA_VERSION, 19);
+        assert_eq!(
+            store.schema_version().expect("schema after repair"),
+            SCHEMA_VERSION
+        );
     }
 
     let connection = Connection::open(&path).expect("open after snapshot");
@@ -237,7 +239,10 @@ fn schema_v19_repairs_only_the_seven_production_derived_incidents() {
     {
         let mut store = Store::open(&path).expect("reopen repaired store");
         store.migrate().expect("repeat migration is a no-op");
-        assert_eq!(store.schema_version().expect("schema remains current"), 19);
+        assert_eq!(
+            store.schema_version().expect("schema remains current"),
+            SCHEMA_VERSION
+        );
     }
     let final_connection = Connection::open(&path).expect("open final snapshot");
     assert_eq!(

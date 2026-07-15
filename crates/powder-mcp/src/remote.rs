@@ -228,6 +228,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             remote_card_ack_payload(&response)?
         }
         "check_criterion" => {
+            reject_principal_arg(args)?;
             let id = card_id(args, "card_id")?;
             let criterion = args["criterion"]
                 .as_u64()
@@ -272,6 +273,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             remote_relation_ack_payload(&response)?
         }
         "add_link" => {
+            reject_principal_arg(args)?;
             let id = card_id(args, "card_id")?;
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
@@ -281,6 +283,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             )?
         }
         "add_comment" => {
+            reject_principal_arg(args)?;
             let id = card_id(args, "card_id")?;
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
@@ -290,6 +293,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             )?
         }
         "append_work_log" => {
+            reject_principal_arg(args)?;
             let id = card_id(args, "card_id")?;
             let agent = required_str(args, "agent")?;
             let body = required_str(args, "body")?;
@@ -490,6 +494,18 @@ fn steer_remote_not_found(err: String, steered: String) -> String {
         steered
     } else {
         err
+    }
+}
+
+fn reject_principal_arg(args: &Value) -> Result<(), String> {
+    if args
+        .as_object()
+        .is_some_and(|object| object.contains_key("principal"))
+    {
+        Err("principal is not accepted; authenticated principal comes from the transport credential"
+            .to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -896,6 +912,36 @@ mod tests {
                 "run_id": null,
             }))
         );
+    }
+
+    #[test]
+    fn remote_annotation_tools_reject_caller_supplied_principal() {
+        let client = RemoteClient::new(
+            "http://127.0.0.1:1".to_string(),
+            Some("sk_powder_test".to_string()),
+        );
+        for (name, args) in [
+            (
+                "check_criterion",
+                json!({"card_id":"card","criterion":0,"actor":"operator","principal":"forged"}),
+            ),
+            (
+                "add_link",
+                json!({"card_id":"card","label":"proof","url":"https://example.test/proof","principal":"forged"}),
+            ),
+            (
+                "add_comment",
+                json!({"card_id":"card","author":"operator","body":"note","principal":"forged"}),
+            ),
+            (
+                "append_work_log",
+                json!({"card_id":"card","agent":"worker-a","body":"log","principal":"forged"}),
+            ),
+        ] {
+            let error = call_tool_remote(&client, name, &args)
+                .expect_err("principal argument rejected before HTTP");
+            assert!(error.contains("principal is not accepted"));
+        }
     }
 
     #[test]

@@ -1220,6 +1220,7 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
 }
 
 fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "check-criterion")?;
     let criterion = criterion_flag(args)?;
@@ -1249,6 +1250,7 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
 }
 
 fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "add-link")?;
     let label = required_flag(args, "--label")?;
@@ -1274,6 +1276,7 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
 }
 
 fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "add-comment")?;
     let author = required_flag(args, "--author")?;
@@ -1302,6 +1305,7 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
 }
 
 fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "append-work-log")?;
     let agent = required_flag(args, "--agent")?;
@@ -1632,6 +1636,20 @@ fn authority(args: &[String]) -> Authority {
     match flag_value(args, "--actor") {
         Some(name) => Authority::actor(name, has_flag(args, "--admin")),
         None => Authority::unchecked(),
+    }
+}
+
+fn reject_principal_flag(args: &[String]) -> Result<(), ShellError> {
+    if args
+        .iter()
+        .any(|arg| arg == "--principal" || arg.starts_with("--principal="))
+    {
+        Err(ShellError::Invalid(
+            "--principal is not accepted; authenticated principal comes from the remote credential"
+                .to_string(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -2659,6 +2677,56 @@ mod tests {
         assert!(card.contains("\"agent\": \"codex\""));
         assert!(card.contains("\"model\": \"claude-sonnet-5\""));
         assert!(card.contains("\"body\": \"tracing the claim expiry bug\""));
+    }
+
+    #[test]
+    fn annotation_commands_reject_a_caller_supplied_principal_flag() {
+        let env = remote_env(None, None);
+        for command in [
+            args([
+                "check-criterion",
+                "card",
+                "--criterion",
+                "0",
+                "--actor",
+                "operator",
+                "--principal",
+                "forged",
+            ]),
+            args([
+                "add-link",
+                "card",
+                "--label",
+                "proof",
+                "--url",
+                "https://example.test/proof",
+                "--principal",
+                "forged",
+            ]),
+            args([
+                "add-comment",
+                "card",
+                "--author",
+                "operator",
+                "--body",
+                "note",
+                "--principal",
+                "forged",
+            ]),
+            args([
+                "append-work-log",
+                "card",
+                "--agent",
+                "worker-a",
+                "--body",
+                "log",
+                "--principal",
+                "forged",
+            ]),
+        ] {
+            let error = run_with_env(&command, &env).expect_err("principal flag rejected");
+            assert!(error.to_string().contains("--principal is not accepted"));
+        }
     }
 
     #[test]

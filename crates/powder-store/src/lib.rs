@@ -356,6 +356,15 @@ pub struct WorkLogAttribution<'a> {
     pub run_id: Option<&'a str>,
 }
 
+struct MutationAudit<'a> {
+    event_type: &'a str,
+    actor: &'a str,
+    payload: &'a str,
+    subject_kind: &'a str,
+    subject_id: &'a str,
+    authority: &'a Authority,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -479,6 +488,10 @@ impl Store {
                 18 => {
                     self.migrate_18_to_19()?;
                     19
+                }
+                19 => {
+                    self.migrate_19_to_20()?;
+                    20
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1119,6 +1132,46 @@ impl Store {
         Ok(())
     }
 
+    /// Adds authenticated provenance to the shared mutation-audit envelope.
+    /// Every legacy value remains untouched: the new columns are nullable,
+    /// so old card events and outbound payloads retain their exact bytes and
+    /// explicitly carry unknown provenance rather than a fabricated identity.
+    fn migrate_19_to_20(&mut self) -> Result<()> {
+        let needs_principal = !self.table_has_column("card_events", "principal")?;
+        let needs_subject_kind = !self.table_has_column("card_events", "subject_kind")?;
+        let needs_subject_id = !self.table_has_column("card_events", "subject_id")?;
+        let needs_audit_event_id = !self.table_has_column("outbound_events", "audit_event_id")?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if needs_principal {
+            transaction.execute_batch("ALTER TABLE card_events ADD COLUMN principal TEXT;")?;
+        }
+        if needs_subject_kind {
+            transaction.execute_batch("ALTER TABLE card_events ADD COLUMN subject_kind TEXT;")?;
+        }
+        if needs_subject_id {
+            transaction.execute_batch("ALTER TABLE card_events ADD COLUMN subject_id TEXT;")?;
+        }
+        if needs_audit_event_id {
+            transaction.execute_batch(
+                "ALTER TABLE outbound_events
+                   ADD COLUMN audit_event_id TEXT
+                   REFERENCES card_events(id) ON DELETE SET NULL;",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_card_events_subject
+               ON card_events(card_id, subject_kind, subject_id);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_events_audit
+               ON outbound_events(audit_event_id)
+               WHERE audit_event_id IS NOT NULL;",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn cards_has_column(&self, column: &str) -> Result<bool> {
         self.table_has_column("cards", column)
     }
@@ -1501,6 +1554,25 @@ impl Store {
         checked: bool,
         now: i64,
     ) -> Result<Card> {
+        self.check_criterion_as(
+            card_id,
+            criterion,
+            actor,
+            checked,
+            now,
+            &Authority::unchecked(),
+        )
+    }
+
+    pub fn check_criterion_as(
+        &mut self,
+        card_id: &CardId,
+        criterion: usize,
+        actor: &str,
+        checked: bool,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<Card> {
         let actor = non_empty("actor", actor)?;
         let transaction = self
             .connection
@@ -1516,16 +1588,22 @@ impl Store {
         }
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        append_card_event(
+        let subject_id = criterion.to_string();
+        append_attributed_card_event(
             &transaction,
             card_id,
-            "criterion",
-            &actor,
-            &format!(
-                "criterion {} {}",
-                criterion,
-                if checked { "checked" } else { "unchecked" }
-            ),
+            MutationAudit {
+                event_type: "criterion",
+                actor: &actor,
+                payload: &format!(
+                    "criterion {} {}",
+                    criterion,
+                    if checked { "checked" } else { "unchecked" }
+                ),
+                subject_kind: "criterion",
+                subject_id: &subject_id,
+                authority,
+            },
             now,
         )?;
         transaction.commit()?;
@@ -2221,10 +2299,37 @@ impl Store {
     }
 
     pub fn add_link(&mut self, card_id: &CardId, label: &str, url: &str, now: i64) -> Result<Link> {
-        if self.get_card(card_id)?.is_none() {
-            return Err(DomainError::not_found("card", card_id.to_string()).into());
-        }
-        insert_link(&self.connection, card_id, label, url, now)
+        self.add_link_as(card_id, label, url, now, &Authority::unchecked())
+    }
+
+    pub fn add_link_as(
+        &mut self,
+        card_id: &CardId,
+        label: &str,
+        url: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<Link> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_card(&transaction, card_id)?;
+        let link = insert_link(&transaction, card_id, label, url, now)?;
+        append_attributed_card_event(
+            &transaction,
+            card_id,
+            MutationAudit {
+                event_type: "link",
+                actor: authority.principal_name().unwrap_or("unchecked"),
+                payload: "added link",
+                subject_kind: "link",
+                subject_id: link.id.as_str(),
+                authority,
+            },
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(link)
     }
 
     /// Not claim-holder-gated, matching `add_link`: attaching a comment is
@@ -2237,17 +2342,29 @@ impl Store {
         body: &str,
         now: i64,
     ) -> Result<Comment> {
+        self.add_comment_as(card_id, author, body, now, &Authority::unchecked())
+    }
+
+    pub fn add_comment_as(
+        &mut self,
+        card_id: &CardId,
+        author: &str,
+        body: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<Comment> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let card = load_card(&transaction, card_id)?;
+        let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
         let comment = Comment {
+            id: id.clone(),
             card_id: card_id.clone(),
             author: non_empty_scrubbed("author", author)?,
             body: non_empty_scrubbed("body", body)?,
             created_at: now,
         };
-        let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
         transaction.execute(
             "INSERT INTO comments (id, card_id, author, body, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2259,13 +2376,27 @@ impl Store {
                 comment.created_at
             ],
         )?;
-        events::append_outbound_card_event(
+        let audit_event = append_attributed_card_event(
+            &transaction,
+            card_id,
+            MutationAudit {
+                event_type: "comment",
+                actor: &comment.author,
+                payload: "added comment",
+                subject_kind: "comment",
+                subject_id: &comment.id,
+                authority,
+            },
+            now,
+        )?;
+        events::append_outbound_card_event_for_audit(
             &transaction,
             &card,
             "comment-added",
             &comment.author,
             json!({"author": comment.author.as_str(), "body": comment.body.as_str()}),
             now,
+            &audit_event,
         )?;
         transaction.commit()?;
         Ok(comment)
@@ -2288,12 +2419,33 @@ impl Store {
         body: &str,
         now: i64,
     ) -> Result<WorkLogEntry> {
+        self.append_work_log_as(
+            card_id,
+            agent,
+            attribution,
+            body,
+            now,
+            &Authority::unchecked(),
+        )
+    }
+
+    pub fn append_work_log_as(
+        &mut self,
+        card_id: &CardId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<WorkLogEntry> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let card = load_card(&transaction, card_id)?;
         let run_id = attribution.run_id.map(RunId::new).transpose()?;
+        let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
         let entry = WorkLogEntry {
+            id: id.clone(),
             card_id: card_id.clone(),
             agent: non_empty("agent", agent)?,
             // Attribution fields are caller-supplied free text too --
@@ -2306,7 +2458,6 @@ impl Store {
             body: non_empty_scrubbed("body", body)?,
             created_at: now,
         };
-        let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
         transaction.execute(
             "INSERT INTO work_log_entries
              (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
@@ -2323,7 +2474,20 @@ impl Store {
                 entry.created_at,
             ],
         )?;
-        events::append_outbound_card_event(
+        let audit_event = append_attributed_card_event(
+            &transaction,
+            card_id,
+            MutationAudit {
+                event_type: "work-log",
+                actor: &entry.agent,
+                payload: "appended work log",
+                subject_kind: "work_log",
+                subject_id: &entry.id,
+                authority,
+            },
+            now,
+        )?;
+        events::append_outbound_card_event_for_audit(
             &transaction,
             &card,
             "work-log-appended",
@@ -2334,6 +2498,7 @@ impl Store {
                 "harness": entry.harness,
             }),
             now,
+            &audit_event,
         )?;
         transaction.commit()?;
         Ok(entry)
@@ -2791,6 +2956,9 @@ fn append_card_event(
         event_type: non_empty("event_type", event_type)?,
         actor: non_empty("actor", actor)?,
         payload: payload.to_owned(),
+        principal: None,
+        subject_kind: None,
+        subject_id: None,
         created_at: now,
     };
     connection.execute(
@@ -2803,6 +2971,43 @@ fn append_card_event(
             event.actor.as_str(),
             event.payload.as_str(),
             event.created_at
+        ],
+    )?;
+    Ok(event)
+}
+
+fn append_attributed_card_event(
+    connection: &Connection,
+    card_id: &CardId,
+    audit: MutationAudit<'_>,
+    now: i64,
+) -> Result<CardEvent> {
+    let event = CardEvent {
+        id: CardEventId::new(format!("event-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
+        card_id: card_id.clone(),
+        event_type: non_empty("event_type", audit.event_type)?,
+        actor: non_empty("actor", audit.actor)?,
+        payload: audit.payload.to_owned(),
+        principal: audit.authority.principal_name().map(str::to_string),
+        subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
+        subject_id: Some(non_empty("subject_id", audit.subject_id)?),
+        created_at: now,
+    };
+    connection.execute(
+        "INSERT INTO card_events (
+           id, card_id, event_type, actor, payload, principal,
+           subject_kind, subject_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            event.id.as_str(),
+            event.card_id.as_str(),
+            event.event_type.as_str(),
+            event.actor.as_str(),
+            event.payload.as_str(),
+            event.principal.as_deref(),
+            event.subject_kind.as_deref(),
+            event.subject_id.as_deref(),
+            event.created_at,
         ],
     )?;
     Ok(event)
