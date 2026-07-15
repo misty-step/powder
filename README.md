@@ -74,6 +74,12 @@ curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
   -d '{"agent":"me"}'
 ```
 
+In `api-key` mode, read routes require a valid bearer key by default. Set
+`POWDER_PUBLIC_READS=true` only when the listener is on a genuinely private
+perimeter (e.g. internal Flycast/Tailscale ingress). See
+[`docs/operations.md`](docs/operations.md) for the full read-auth posture and
+rollout runbook.
+
 That's the whole loop: a card exists, is claimable, and carries a
 `run_id`/`expires_at` lease the moment it's claimed. CI runs this sequence (and more)
 on every change (see `.github/workflows/quickstart.yml`), so it can't

@@ -710,6 +710,81 @@ fn estimate_round_trips_through_persist_and_load_and_filters_list_and_ready() ->
 }
 
 #[test]
+fn file_papercut_creates_backlog_card_with_papercut_label_and_service_fallback() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "canary".to_string(),
+            aliases: Some(vec!["misty-step/canary".to_string()]),
+            visibility: Some(RepositoryVisibility::Visible),
+            tier: Some(RepositoryTier::Active),
+            import_provenance: Some("manual".to_string()),
+        },
+        1,
+    )?;
+
+    let report = powder_core::PapercutReport {
+        agent: "codex".to_string(),
+        body: "too many tokens just to report a typo".to_string(),
+        service: Some("canary".to_string()),
+        model: None,
+        harness: None,
+    };
+    let card = store.file_papercut(&report, "codex", 10)?;
+    assert!(card.id.as_str().starts_with("papercut-"));
+    assert_eq!(card.status, CardStatus::Backlog);
+    assert!(card.labels.contains(&"papercut".to_string()));
+    assert_eq!(card.repo.as_deref(), Some("canary"));
+    assert!(card.body.contains("too many tokens"));
+    assert!(card.body.contains("codex"));
+
+    let unknown = powder_core::PapercutReport {
+        agent: "codex".to_string(),
+        body: "weird error in mint".to_string(),
+        service: Some("mint".to_string()),
+        model: None,
+        harness: None,
+    };
+    let card = store.file_papercut(&unknown, "codex", 20)?;
+    assert_eq!(card.repo, None);
+    assert!(card.labels.contains(&"service:mint".to_string()));
+
+    let papercuts = store.list_cards(
+        &CardFilter {
+            label: Some("papercut".to_string()),
+            ..CardFilter::default()
+        },
+        20,
+    )?;
+    assert_eq!(papercuts.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn list_cards_label_filter_is_case_insensitive_and_counts_before_limit() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut tagged = ready_card("tagged", 10);
+    tagged.labels = vec!["papercut".to_string()];
+    let mut other = ready_card("other", 11);
+    other.labels = vec!["bug".to_string()];
+    store.import_cards(vec![tagged, other])?;
+
+    let found = store.list_cards_page(
+        &CardFilter {
+            label: Some("Papercut".to_string()),
+            ..CardFilter::default()
+        },
+        1,
+    )?;
+    assert_eq!(found.cards.len(), 1);
+    assert_eq!(found.total_count, 1);
+    assert_eq!(found.cards[0].id.as_str(), "tagged");
+    Ok(())
+}
+
+#[test]
 fn upsert_card_returns_the_canonical_repo_label_it_persists() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

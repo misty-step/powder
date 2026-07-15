@@ -2,7 +2,8 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, Priority, ReadyQuery, RunId,
+    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, PapercutReport, Priority,
+    ReadyQuery, RunId,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
@@ -30,6 +31,7 @@ pub const COMMANDS: &[&str] = &[
     "set-parent",
     "list-ready",
     "list-cards",
+    "papercut",
     "repository-list",
     "repository-get",
     "repository-upsert",
@@ -122,6 +124,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "set-parent" => set_parent(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
+        [command, rest @ ..] if command == "papercut" => papercut(rest, remote_env),
         [command, rest @ ..] if command == "repository-list" => repository_list(rest),
         [command, rest @ ..] if command == "repository-get" => repository_get(rest),
         [command, rest @ ..] if command == "repository-upsert" => repository_upsert(rest),
@@ -276,6 +279,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder list-cards --db ./data/powder.db --status ready --repo misty-step/example\n",
+    );
+    help.push_str(
+        "  powder papercut 'too many tokens to file a simple bug' --agent codex [--service canary]\n",
     );
     help.push_str("  powder repository-list --db ./data/powder.db --include-hidden\n");
     help.push_str(
@@ -883,12 +889,14 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         .map(parse_estimate_flag)
         .transpose()?;
     let repo = flag_value(args, "--repo").map(str::to_string);
+    let label = flag_value(args, "--label").map(str::to_string);
     let cards = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         let filter = CardFilter {
             status,
             estimate,
             repo: repo.clone(),
+            label: label.clone(),
             // powder-mcp-unfiltered-enumeration: only the MCP `list_cards`
             // tool defaults to hiding terminal cards; the CLI keeps its
             // existing whole-board behavior unchanged.
@@ -905,6 +913,9 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         }
         if let Some(repo) = &repo {
             query.push_str(&format!("&repo={}", urlencode(repo)));
+        }
+        if let Some(label) = &label {
+            query.push_str(&format!("&label={}", urlencode(label)));
         }
         let page = client
             .get(&format!("/api/v1/cards?{query}"))
@@ -928,6 +939,55 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         out.push_str("no-cards\n");
     }
     Ok(out)
+}
+
+/// File a one-call papercut. The body is every positional argument joined
+/// by spaces (so quoted or unquoted one-liners both work); --agent is
+/// required, --service/--model/--harness are optional attribution.
+fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let now = unix_now();
+    let agent = required_flag(args, "--agent")?;
+    let body = body_from_positionals(args)?;
+    let service = flag_value(args, "--service").map(str::to_string);
+    let model = flag_value(args, "--model").map(str::to_string);
+    let harness = flag_value(args, "--harness").map(str::to_string);
+
+    let report = PapercutReport {
+        agent: agent.to_string(),
+        body,
+        service,
+        model,
+        harness,
+    };
+
+    let ack = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .file_papercut(&report, agent, now)
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                "/api/v1/cards/papercut",
+                json!({
+                    "agent": report.agent,
+                    "body": report.body,
+                    "service": report.service,
+                    "model": report.model,
+                    "harness": report.harness,
+                }),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("papercut"));
+    };
+
+    Ok(format!(
+        "papercut\t{}\t{}\t{}\n",
+        json_string(&ack, "id")?,
+        json_string(&ack, "status")?,
+        json_string(&ack, "title")?,
+    ))
 }
 
 fn repository_list(args: &[String]) -> Result<String, ShellError> {
@@ -1861,6 +1921,16 @@ fn flag_takes_value(flag: &str) -> bool {
     )
 }
 
+fn body_from_positionals(args: &[String]) -> Result<String, ShellError> {
+    let words = positional(args);
+    if words.is_empty() {
+        return Err(ShellError::Invalid(
+            "papercut requires a body; pass it as the first argument".to_string(),
+        ));
+    }
+    Ok(words.join(" "))
+}
+
 fn store_err(err: StoreError) -> ShellError {
     match err {
         StoreError::Domain(domain_err) => ShellError::from(domain_err),
@@ -2490,6 +2560,43 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, ShellError::Invalid(_)));
+    }
+
+    #[test]
+    fn cli_papercut_files_a_backlog_card_and_label_filter_sweeps_it() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-papercut-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        let ack = run(&args([
+            "papercut",
+            "too many tokens just to report a typo",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--service",
+            "canary",
+        ]))
+        .unwrap();
+        assert!(ack.starts_with("papercut\t"));
+        assert!(ack.contains("backlog"));
+
+        let all = run(&args(["list-cards", "--db", &db])).unwrap();
+        assert!(all.contains("papercut-"));
+
+        let filtered = run(&args(["list-cards", "--db", &db, "--label", "papercut"])).unwrap();
+        assert!(filtered.contains("too many tokens"));
+        assert!(filtered.contains("backlog"));
+
+        let none = run(&args(["list-cards", "--db", &db, "--label", "nonexistent"])).unwrap();
+        assert!(none.contains("no-cards"));
     }
 
     #[test]
@@ -3952,6 +4059,51 @@ mod tests {
         assert_eq!(
             requests[7].body,
             Some(json!({"author": "operator", "body": "looks good"}))
+        );
+    }
+
+    /// Client read paths must degrade per-card on an unknown status value;
+    /// the CLI remote path keeps responses as `serde_json::Value` and simply
+    /// prints the raw status string, so a future vocabulary addition never
+    /// aborts the whole listing.
+    #[test]
+    fn cli_remote_listings_tolerate_unknown_status_values() {
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({
+                    "cards": [
+                        {"id": "known-1", "priority": "p1", "title": "Known card"},
+                        {"id": "future-1", "priority": "p2", "title": "Future status card"},
+                    ],
+                    "total_count": 2,
+                    "has_more": false,
+                }),
+            ),
+            (
+                200,
+                json!({
+                    "cards": [
+                        {"id": "known-1", "priority": "p1", "status": "ready", "title": "Known card"},
+                        {"id": "future-1", "priority": "p2", "status": "paused", "title": "Future status card"},
+                    ],
+                    "total_count": 2,
+                    "has_more": false,
+                }),
+            ),
+        ]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let ready = run_with_env(&args(["list-ready", "--limit", "5"]), &env).unwrap();
+        assert_eq!(
+            ready,
+            "known-1\tP1\tKnown card\nfuture-1\tP2\tFuture status card\n"
+        );
+
+        let cards = run_with_env(&args(["list-cards", "--limit", "5"]), &env).unwrap();
+        assert_eq!(
+            cards,
+            "known-1\tP1\tready\tKnown card\nfuture-1\tP2\tpaused\tFuture status card\n"
         );
     }
 

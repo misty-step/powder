@@ -719,6 +719,7 @@ version = "0.1.0"
 dependencies = [
  "powder-core",
  "powder-shell",
+ "serde",
  "serde_json",
  "ureq",
 ]

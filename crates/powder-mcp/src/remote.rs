@@ -5,8 +5,8 @@
 //! instance exactly as they are for any other HTTP caller -- no
 //! `actor`/`admin` tool arguments needed.
 
-use powder_api::{parse_list_page, urlencode, RemoteClient};
-use powder_core::{Card, CardSummary, DetailLevel};
+use powder_api::{parse_card_summary_page, urlencode, RemoteClient};
+use powder_core::DetailLevel;
 use serde_json::{json, Value};
 
 use super::{
@@ -41,6 +41,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             if let Some(repo) = optional_str(args, "repo") {
                 query.push_str(&format!("&repo={}", urlencode(repo)));
+            }
+            if let Some(label) = optional_str(args, "label") {
+                query.push_str(&format!("&label={}", urlencode(label)));
             }
             // powder-mcp-unfiltered-enumeration: same default as the local
             // (store-backed) dispatch path -- an unfiltered call hides
@@ -104,6 +107,19 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             let response = client.post("/api/v1/cards", body)?;
             remote_card_ack_payload(&response)?
+        }
+        "report_papercut" => {
+            let response = client.post(
+                "/api/v1/cards/papercut",
+                json!({
+                    "agent": required_str(args, "agent")?,
+                    "body": required_str(args, "body")?,
+                    "service": optional_str(args, "service"),
+                    "model": optional_str(args, "model"),
+                    "harness": optional_str(args, "harness"),
+                }),
+            )?;
+            response
         }
         "update_card" => {
             let id = card_id(args, "card_id")?;
@@ -410,20 +426,14 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
 }
 
 fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
-    // The deployed server reports how many matches were held back by
-    // `include_terminal=false` (powder-mcp-unfiltered-enumeration); absent
-    // (older servers, `list_ready`, or include_terminal=true) it is 0 and
-    // the hint below degrades to the historical "raise limit" text.
-    let excluded_terminal_count = response
-        .get("excluded_terminal_count")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0);
-    let page = parse_list_page(response)?;
+    // This decoder intentionally uses `ClientCardSummary` instead of
+    // `Vec<Card>` so that one unknown/future status value cannot abort the
+    // whole listing. The raw string is preserved and passed through.
+    let page = parse_card_summary_page(response)?;
+    let excluded_terminal_count = page.excluded_terminal_count;
     let total_count = page.total_count;
     let has_more = page.has_more;
-    let cards = serde_json::from_value::<Vec<Card>>(Value::Array(page.cards)).map_err(to_string)?;
-    let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
+    let summaries = page.cards;
 
     let mut payload = json!({
         "cards": summaries,
@@ -618,6 +628,8 @@ mod tests {
             "priority": priority,
             "created_at": 1,
             "updated_at": updated_at,
+            "criteria_checked": 0,
+            "criteria_total": 0,
         })
     }
 
@@ -999,6 +1011,108 @@ mod tests {
             requests[0].path,
             "/api/v1/cards?limit=5&status=in_progress&repo=misty-step%2Fexample&include_terminal=true"
         );
+    }
+
+    #[test]
+    fn list_ready_tolerates_unknown_status_without_failing_the_page() {
+        let (base_url, _recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "cards": [
+                    api_card("known-1", "Known card", "ready", "p1", 10),
+                    api_card("future-1", "Future status card", "paused", "p2", 20),
+                    api_card("known-2", "Another known card", "in_progress", "p0", 30),
+                ],
+                "total_count": 3,
+                "has_more": false,
+            }),
+        )]);
+        let client = RemoteClient::new(base_url, None);
+
+        let result = call_tool_remote(&client, "list_ready", &json!({"limit": 5})).unwrap();
+        let payload = tool_payload(&result);
+        let cards = payload["cards"].as_array().expect("cards array");
+        assert_eq!(
+            cards.len(),
+            3,
+            "unknown status must not drop the whole page"
+        );
+        assert_eq!(cards[0]["id"], "known-1");
+        assert_eq!(cards[1]["id"], "future-1");
+        assert_eq!(cards[1]["status"], "paused", "raw unknown status preserved");
+        assert_eq!(cards[2]["id"], "known-2");
+    }
+
+    #[test]
+    fn list_cards_tolerates_unknown_status_without_failing_the_page() {
+        let (base_url, _recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "cards": [
+                    api_card("known-1", "Known card", "ready", "p1", 10),
+                    api_card("future-1", "Future status card", "paused", "p2", 20),
+                ],
+                "total_count": 2,
+                "has_more": false,
+                "excluded_terminal_count": 0,
+            }),
+        )]);
+        let client = RemoteClient::new(base_url, None);
+
+        let result = call_tool_remote(&client, "list_cards", &json!({"limit": 5})).unwrap();
+        let payload = tool_payload(&result);
+        let cards = payload["cards"].as_array().expect("cards array");
+        assert_eq!(
+            cards.len(),
+            2,
+            "unknown status must not drop the whole page"
+        );
+        assert_eq!(cards[1]["status"], "paused", "raw unknown status preserved");
+    }
+
+    #[test]
+    fn board_stats_and_get_card_passthrough_unknown_status_values() {
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({
+                    "by_status": {"ready": 1, "paused": 1, "in_progress": 2},
+                    "by_repo": {},
+                }),
+            ),
+            (
+                200,
+                json!({"card": api_card("future-1", "Future status card", "paused", "p1", 10)}),
+            ),
+            (
+                200,
+                json!({
+                    "run": {
+                        "id": "run-future",
+                        "card_id": "future-1",
+                        "state": "active",
+                        "agent": "codex",
+                        "claim_expires_at": 100,
+                        "created_at": 1,
+                        "updated_at": 2,
+                    },
+                    "card": api_card("future-1", "Future status card", "paused", "p1", 10),
+                }),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, None);
+
+        let stats = call_tool_remote(&client, "board_stats", &json!({})).unwrap();
+        let stats_payload = tool_payload(&stats);
+        assert_eq!(stats_payload["by_status"]["paused"], 1);
+
+        let card = call_tool_remote(&client, "get_card", &json!({"card_id": "future-1"})).unwrap();
+        let card_payload = tool_payload(&card);
+        assert_eq!(card_payload["card"]["status"], "paused");
+
+        let run = call_tool_remote(&client, "get_run", &json!({"run_id": "run-future"})).unwrap();
+        let run_payload = tool_payload(&run);
+        assert_eq!(run_payload["card"]["status"], "paused");
     }
 
     /// powder-mcp-unfiltered-enumeration (rev-125 fix): production runs MCP

@@ -165,6 +165,7 @@ variables.
 | `PORT` | `4000` | `powder-server` | Used only to build the default `POWDER_BIND_ADDR` (`[::]:$PORT`) when `POWDER_BIND_ADDR` itself is unset. |
 | `POWDER_BIND_ADDR` | `[::]:<PORT>` | `powder-server` | Explicit socket address to bind, e.g. `127.0.0.1:4000` or `[::]:4000`. Overrides `PORT`. |
 | `POWDER_AUTH_MODE` | `api-key` | `powder-server` | One of `api-key` (aliases: `agent-api-key`, `shared-secret`), `tailscale-header` (aliases: `tailnet`), or `none` (aliases: `disabled`). See [auth modes](#auth-modes) below. |
+| `POWDER_PUBLIC_READS` | `false` | `powder-server` | In `api-key` mode, set `true` to allow keyless reads. Only safe when the listener is on a genuinely private perimeter (e.g. Flycast/Tailscale internal ingress). Ignored in `tailscale-header` and `none` modes. |
 | `POWDER_DISCLOSE_BOOTSTRAP_KEY` | `true` | `powder-server` | Whether the first-run bootstrap API key is printed to stderr (it lands in journald/service logs). Set `false` once you've captured it and rotated to an operator-held key. |
 | `POWDER_PUBLIC_BASE_URL` | unset | `powder-server` | Advertised base URL, surfaced via `/api/v1/onboarding`; informational only, does not change binding. |
 | `POWDER_HOME_URL` | unset | `powder-server` | If set, the board UI renders a plain-text link back to this URL (for a deployment fronted by a portal Powder doesn't own). Leave unset for no change. |
@@ -197,10 +198,11 @@ cargo run -p powder-server
 
 ### Auth modes
 
-- **`api-key`** (default): board reads are unauthenticated; every mutation
-  (claim, status, comments, completion, key management, ...) requires
-  `Authorization: Bearer <key>`. Safe default for public or mixed ingress —
-  the read perimeter is your network, not the API.
+- **`api-key`** (default): reads require `Authorization: Bearer <key>` unless
+  `POWDER_PUBLIC_READS=true` is set; every mutation requires a bearer key.
+  Defaulting to authenticated reads is fail-closed. Set
+  `POWDER_PUBLIC_READS=true` only when the deployment's perimeter is genuinely
+  private (e.g. a Flycast/Tailcast internal listener with no public ingress).
 - **`tailscale-header`**: trusts an identity header injected by a Tailscale
   Serve-equivalent trusted proxy. Only use this behind ingress that actually
   strips client-supplied spoofed identity headers before they reach Powder.

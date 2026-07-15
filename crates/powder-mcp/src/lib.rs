@@ -2,8 +2,8 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel, Estimate, Priority,
-    ReadyQuery, RunId,
+    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel, Estimate,
+    PapercutReport, Priority, ReadyQuery, RunId,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -36,7 +36,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. File friction the moment you feel it using report_papercut: too many tokens, too many calls, confusing errors, anything awkward; one call; do not stop working; do not fix it yourself; dedup happens at groom time. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -46,8 +46,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_cards",
-        description: "Scan card summaries by optional status/repo/estimate filter, not just ready-eligible ones. With no status filter, done/shipped/abandoned cards are hidden by default (set include_terminal:true to see them too); total_count in the response always reports the full matching count, terminal cards included, so a hidden card is never mistaken for a nonexistent one. An explicit status filter (e.g. status:done) always returns matching cards regardless of include_terminal. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
+        description: "Scan card summaries by optional status/repo/estimate/label filter, not just ready-eligible ones. With no status filter, done/shipped/abandoned cards are hidden by default (set include_terminal:true to see them too); total_count in the response always reports the full matching count, terminal cards included, so a hidden card is never mistaken for a nonexistent one. An explicit status filter (e.g. status:done) always returns matching cards regardless of include_terminal. Use get_card for full card detail before implementation.",
+        input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"label":{"type":"string"},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -141,8 +141,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "append_work_log",
-        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution you can supply. body is scrubbed for known secret shapes server-side before storage.",
+        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution the calling surface can supply. body is scrubbed for known secret shapes server-side before storage.",
         input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "report_papercut",
+        description: "File friction the moment you feel it -- too many tokens, too many calls, confusing errors, missing capability, anything awkward; one call; do not stop working; do not fix it yourself; dedup happens at groom time. Returns a minimal ack; the papercut is stored as a backlog card labeled 'papercut'.",
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["agent","body"],"properties":{"agent":{"type":"string"},"body":{"type":"string"},"service":{"type":"string"},"model":{"type":"string"},"harness":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "request_input",
@@ -403,6 +408,7 @@ pub fn call_tool_store(
                 .map(parse_estimate)
                 .transpose()?;
             let repo = args["repo"].as_str().map(str::to_string);
+            let label = args["label"].as_str().map(str::to_string);
             // powder-mcp-unfiltered-enumeration: an unfiltered (no explicit
             // status) query hides done/shipped/abandoned cards by default --
             // include_terminal:true restores the full sweep. An explicit
@@ -414,6 +420,7 @@ pub fn call_tool_store(
                 status,
                 repo,
                 estimate,
+                label,
                 include_terminal,
             };
             let page = store.list_cards_page(&filter, limit).map_err(to_string)?;
@@ -659,6 +666,24 @@ pub fn call_tool_store(
             json!(store
                 .append_work_log(&card_id, agent, attribution, body, now)
                 .map_err(to_string)?)
+        }
+        "report_papercut" => {
+            let report = PapercutReport {
+                agent: required_str(args, "agent")?.to_string(),
+                body: required_str(args, "body")?.to_string(),
+                service: optional_str(args, "service").map(str::to_string),
+                model: optional_str(args, "model").map(str::to_string),
+                harness: optional_str(args, "harness").map(str::to_string),
+            };
+            let card = store
+                .file_papercut(&report, &report.agent, now)
+                .map_err(to_string)?;
+            json!({
+                "id": card.id.as_str(),
+                "title": card.title,
+                "status": card.status.as_str(),
+                "labels": card.labels,
+            })
         }
         "request_input" => {
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
@@ -1298,7 +1323,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 20);
+        assert_eq!(default_tools.len(), 21);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1489,11 +1514,12 @@ mod tests {
                 "add_link",
                 "add_comment",
                 "append_work_log",
+                "report_papercut",
                 "request_input",
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 20);
+        assert_eq!(default_names.len(), 21);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1505,7 +1531,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 29);
+        assert_eq!(admin_names.len(), 30);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -2120,6 +2146,84 @@ mod tests {
             payload["hint"], "0 matches for {status:done, repo:mint}; board has 1 cards",
             "hint was: {payload}"
         );
+    }
+
+    #[test]
+    fn mcp_list_cards_filters_by_label() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![
+                seeded_card("tagged", "Tagged", CardStatus::Ready, 1),
+                seeded_card("untagged", "Untagged", CardStatus::Ready, 2),
+            ])
+            .unwrap();
+        store
+            .patch_card(
+                &CardId::new("tagged").unwrap(),
+                CardPatch {
+                    labels: Some(vec!["papercut".to_string()]),
+                    ..Default::default()
+                },
+                "operator",
+                3,
+            )
+            .unwrap();
+
+        let found =
+            call_tool_store(&mut store, "list_cards", &json!({"label": "papercut"}), 10).unwrap();
+        let payload = tool_payload(&found);
+        assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
+        let ids: Vec<&str> = payload["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["tagged"]);
+    }
+
+    #[test]
+    fn mcp_report_papercut_files_a_backlog_card() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .upsert_repository(
+                RepositoryUpsert {
+                    name: "canary".to_string(),
+                    aliases: Some(vec!["misty-step/canary".to_string()]),
+                    visibility: Some(RepositoryVisibility::Visible),
+                    tier: Some(RepositoryTier::Active),
+                    import_provenance: Some("manual".to_string()),
+                },
+                1,
+            )
+            .unwrap();
+
+        let ack = call_tool_store(
+            &mut store,
+            "report_papercut",
+            &json!({
+                "agent": "codex",
+                "body": "too many tokens just to report a typo",
+                "service": "canary",
+            }),
+            10,
+        )
+        .unwrap();
+        let text = ack["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert!(payload["id"].as_str().unwrap().starts_with("papercut-"));
+        assert_eq!(payload["status"], "backlog");
+        assert!(payload["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("papercut")));
+
+        let listed =
+            call_tool_store(&mut store, "list_cards", &json!({"label": "papercut"}), 20).unwrap();
+        let listed_payload = tool_payload(&listed);
+        assert_eq!(listed_payload["total_count"], 1);
     }
 
     #[test]
