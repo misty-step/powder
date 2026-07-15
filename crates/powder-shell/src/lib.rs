@@ -5,11 +5,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use powder_core::DomainError;
+use powder_core::{canonical_repo_label, CardId, DomainError};
 
 mod github;
+mod markdown;
 
 pub use github::{github_issue_to_card, load_github_issues_file, GitHubIssue, GitHubLabel};
+pub use markdown::{
+    detect_truncated_criteria, load_markdown_dir, parse_markdown_card, MarkdownParseError,
+    ParseDiagnostic, ParseDiagnosticKind, ParsedCard, TruncationDiagnostic,
+};
 
 pub type ShellResult<T> = Result<T, ShellError>;
 
@@ -56,11 +61,29 @@ pub fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-pub(crate) fn validate_repo_slug(repo: &str) -> ShellResult<&str> {
+pub fn validate_repo_slug(repo: &str) -> ShellResult<&str> {
     repo.rsplit('/')
         .next()
         .filter(|part| !part.is_empty())
         .ok_or_else(|| ShellError::Invalid(format!("invalid repo slug: {repo}")))
+}
+
+/// Tag `cards` with the canonical repo label and namespace each id
+/// `{short-repo}-{original-id}`. Shared by callers that parse cards from a
+/// source other than a local directory but still need the same collision-free
+/// multi-repo id scheme.
+pub fn namespace_cards_for_repo(
+    mut cards: Vec<powder_core::Card>,
+    repo: &str,
+) -> ShellResult<Vec<powder_core::Card>> {
+    let id_prefix = validate_repo_slug(repo)?;
+    let repo_label = canonical_repo_label(repo.trim())
+        .ok_or_else(|| ShellError::Invalid(format!("invalid repo slug: {repo}")))?;
+    for card in &mut cards {
+        card.id = CardId::new(format!("{id_prefix}-{}", card.id)).map_err(ShellError::from)?;
+        card.repo = Some(repo_label.clone());
+    }
+    Ok(cards)
 }
 
 #[cfg(test)]
