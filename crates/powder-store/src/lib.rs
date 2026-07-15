@@ -1610,6 +1610,76 @@ impl Store {
         Ok(card)
     }
 
+    /// Repair a card's acceptance criteria by re-parsing the oracle source
+    /// and applying the result while preserving checked/proof state for any
+    /// criterion whose identity survives (same position and unchanged text,
+    /// or stored text is a truncation-prefix of the new text). Status,
+    /// claim, relations, comments, and source provenance are left untouched
+    /// -- only the criteria text and the structured criteria columns change.
+    pub fn repair_criteria(
+        &mut self,
+        card_id: &CardId,
+        acceptance: Vec<String>,
+        actor: &str,
+        now: i64,
+    ) -> Result<CriteriaRepair> {
+        let actor = non_empty("actor", actor)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let card = load_card(&transaction, card_id)?;
+        let previous: Vec<String> = card.acceptance.clone();
+        let previous_criteria = card.criteria.clone();
+        let repaired = card.repair_acceptance(acceptance).with_updated_at(now);
+
+        let changes: Vec<CriteriaChange> = repaired
+            .acceptance
+            .iter()
+            .enumerate()
+            .filter_map(|(index, current)| {
+                previous
+                    .get(index)
+                    .filter(|prev| *prev != current)
+                    .map(|prev| {
+                        let state_preserved = previous_criteria
+                            .get(index)
+                            .zip(repaired.criteria.get(index))
+                            .map(|(before, after)| {
+                                before.checked_at == after.checked_at
+                                    && before.checked_by == after.checked_by
+                                    && before.proof_links == after.proof_links
+                            })
+                            .unwrap_or(false);
+                        CriteriaChange {
+                            index,
+                            previous: prev.clone(),
+                            current: current.clone(),
+                            state_preserved,
+                        }
+                    })
+            })
+            .collect();
+
+        if !changes.is_empty() {
+            persist_card(&transaction, &repaired)?;
+            append_card_event(
+                &transaction,
+                card_id,
+                "repair",
+                &actor,
+                &format!("repaired {} acceptance criterion(s)", changes.len()),
+                now,
+            )?;
+        }
+
+        transaction.commit()?;
+        Ok(CriteriaRepair {
+            card_id: card_id.to_string(),
+            criteria_changed: changes.len(),
+            changes,
+        })
+    }
+
     pub fn record_card_event(
         &mut self,
         card_id: &CardId,
@@ -3203,6 +3273,23 @@ pub struct ImportOutcome {
     /// inflate this counter. `preview_import` exposes the repair count before
     /// a batch is written.
     pub content_repaired: usize,
+}
+
+/// Report from `Store::repair_criteria`: which criteria changed and whether
+/// checked/proof state was preserved at each position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CriteriaRepair {
+    pub card_id: String,
+    pub criteria_changed: usize,
+    pub changes: Vec<CriteriaChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CriteriaChange {
+    pub index: usize,
+    pub previous: String,
+    pub current: String,
+    pub state_preserved: bool,
 }
 
 impl ImportOutcome {

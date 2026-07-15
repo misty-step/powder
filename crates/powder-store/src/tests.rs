@@ -1,6 +1,6 @@
 use powder_core::{
-    AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, DetailLevel, DomainError,
-    Estimate, Priority, ReadyQuery, RunId, RunState,
+    AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
+    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
 };
 
 use crate::{
@@ -4885,6 +4885,93 @@ fn preview_import_reports_without_mutating_the_store() -> Result<()> {
     let card = store.get_card(&card_id)?.expect("card");
     assert_eq!(card.status, CardStatus::InProgress);
     assert!(card.claim.is_some());
+    Ok(())
+}
+
+#[test]
+fn repair_criteria_updates_truncated_text_and_preserves_lifecycle_state() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("sploot-026")?;
+
+    // Seed a card whose stored criterion is the old truncated prefix.
+    let mut card = Card::new(card_id.clone(), "Thumbnail routes", "do it")?
+        .with_status(CardStatus::Ready)
+        .with_acceptance(["The list/shuffle (`assets/route.ts`), and similar".to_string()])
+        .with_created_at(10);
+    card.criteria[0].checked_by = Some("agent-a".to_string());
+    card.criteria[0].checked_at = Some(100);
+    card.criteria[0].proof_links.push(CriterionProof {
+        url: "https://example.test/pr-1".to_string(),
+        actor: "agent-a".to_string(),
+        created_at: 100,
+    });
+    store.import_cards(vec![card])?;
+    store.claim_card(&card_id, "agent-a", 20, 3600, &Authority::unchecked())?;
+    store.update_status(
+        &card_id,
+        CardStatus::InProgress,
+        21,
+        &Authority::unchecked(),
+    )?;
+
+    let repair = store.repair_criteria(
+        &card_id,
+        vec!["The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) read paths return `thumbnailUrl`.".to_string()],
+        "operator",
+        50,
+    )?;
+
+    assert_eq!(repair.card_id, "sploot-026");
+    assert_eq!(repair.criteria_changed, 1);
+    assert!(repair.changes[0].state_preserved);
+
+    let repaired = store.get_card(&card_id)?.expect("repaired card");
+    assert_eq!(
+        repaired.criteria[0].text,
+        "The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) read paths return `thumbnailUrl`."
+    );
+    assert_eq!(repaired.criteria[0].checked_by.as_deref(), Some("agent-a"));
+    assert_eq!(repaired.criteria[0].checked_at, Some(100));
+    assert_eq!(repaired.criteria[0].proof_links.len(), 1);
+    assert_eq!(
+        repaired.status,
+        CardStatus::InProgress,
+        "status must be untouched"
+    );
+    assert!(repaired.claim.is_some(), "claim must be untouched");
+    assert_eq!(repaired.updated_at, 50);
+    Ok(())
+}
+
+#[test]
+fn repair_criteria_is_no_op_when_source_matches_stored() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("sploot-026")?;
+    store.import_cards(vec![Card::new(
+        card_id.clone(),
+        "Thumbnail routes",
+        "do it",
+    )?
+    .with_status(CardStatus::Ready)
+    .with_acceptance(["already full text".to_string()])
+    .with_created_at(10)])?;
+
+    let before = store.get_card(&card_id)?.unwrap();
+    let repair = store.repair_criteria(
+        &card_id,
+        vec!["already full text".to_string()],
+        "operator",
+        50,
+    )?;
+
+    assert_eq!(repair.criteria_changed, 0);
+    let after = store.get_card(&card_id)?.unwrap();
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "updated_at must not change on no-op"
+    );
     Ok(())
 }
 
