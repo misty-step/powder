@@ -54,6 +54,10 @@ pub struct CardEventEnvelope {
     pub event_type: String,
     pub occurred_at: i64,
     pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_event_id: Option<String>,
     pub card: Card,
     pub change: Value,
 }
@@ -470,6 +474,38 @@ pub(super) fn append_outbound_card_event(
     change: Value,
     now: i64,
 ) -> Result<CardEventEnvelope> {
+    append_outbound_card_event_inner(connection, card, event_type, actor, change, now, None)
+}
+
+pub(super) fn append_outbound_card_event_for_audit(
+    connection: &Connection,
+    card: &Card,
+    event_type: &str,
+    actor: &str,
+    change: Value,
+    now: i64,
+    audit_event: &powder_core::CardEvent,
+) -> Result<CardEventEnvelope> {
+    append_outbound_card_event_inner(
+        connection,
+        card,
+        event_type,
+        actor,
+        change,
+        now,
+        Some(audit_event),
+    )
+}
+
+fn append_outbound_card_event_inner(
+    connection: &Connection,
+    card: &Card,
+    event_type: &str,
+    actor: &str,
+    change: Value,
+    now: i64,
+    audit_event: Option<&powder_core::CardEvent>,
+) -> Result<CardEventEnvelope> {
     validate_event_type(event_type)?;
     let event_id = format!("evt-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
     let event = CardEventEnvelope {
@@ -478,14 +514,24 @@ pub(super) fn append_outbound_card_event(
         event_type: event_type.to_string(),
         occurred_at: now,
         actor: non_empty("actor", actor)?,
+        principal: audit_event.and_then(|event| event.principal.clone()),
+        audit_event_id: audit_event.map(|event| event.id.to_string()),
         card: card.clone(),
         change,
     };
     let payload_json = to_json(&event)?;
     connection.execute(
-        "INSERT INTO outbound_events (id, event_type, card_id, payload_json, occurred_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![event_id, event_type, card.id.as_str(), payload_json, now],
+        "INSERT INTO outbound_events (
+           id, event_type, card_id, audit_event_id, payload_json, occurred_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event_id,
+            event_type,
+            card.id.as_str(),
+            event.audit_event_id.as_deref(),
+            payload_json,
+            now
+        ],
     )?;
 
     let subscriptions = active_subscriptions(connection)?;

@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -96,9 +96,13 @@ CREATE TABLE IF NOT EXISTS card_events (
   event_type TEXT NOT NULL,
   actor TEXT NOT NULL,
   payload TEXT NOT NULL,
+  principal TEXT,
+  subject_kind TEXT,
+  subject_id TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_card_events_subject ON card_events(card_id, subject_kind, subject_id);
 
 CREATE TABLE IF NOT EXISTS links (
   id TEXT PRIMARY KEY,
@@ -145,10 +149,13 @@ CREATE TABLE IF NOT EXISTS outbound_events (
   id TEXT NOT NULL UNIQUE,
   event_type TEXT NOT NULL,
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  audit_event_id TEXT REFERENCES card_events(id) ON DELETE SET NULL,
   payload_json TEXT NOT NULL,
   occurred_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_events_card_created ON outbound_events(card_id, sequence);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_events_audit
+  ON outbound_events(audit_event_id) WHERE audit_event_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
   id TEXT PRIMARY KEY,

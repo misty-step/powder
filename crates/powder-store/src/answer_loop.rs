@@ -586,7 +586,8 @@ fn load_events_for_card(
     let records = match detail {
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
-                "SELECT id, card_id, event_type, actor, payload, created_at
+                "SELECT id, card_id, event_type, actor, payload,
+                        principal, subject_kind, subject_id, created_at
                  FROM card_events
                  WHERE card_id = ?1
                  ORDER BY created_at ASC, rowid ASC",
@@ -598,7 +599,8 @@ fn load_events_for_card(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT id, card_id, event_type, actor, payload, created_at
+                "SELECT id, card_id, event_type, actor, payload,
+                        principal, subject_kind, subject_id, created_at
                  FROM card_events
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, rowid DESC
@@ -726,7 +728,7 @@ fn load_comments_for_card(
     let records = match detail {
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
-                "SELECT card_id, author, body, created_at
+                "SELECT id, card_id, author, body, created_at
                  FROM comments
                  WHERE card_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -738,7 +740,7 @@ fn load_comments_for_card(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT card_id, author, body, created_at
+                "SELECT id, card_id, author, body, created_at
                  FROM comments
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -793,6 +795,9 @@ struct CardEventRecord {
     event_type: String,
     actor: String,
     payload: String,
+    principal: Option<String>,
+    subject_kind: Option<String>,
+    subject_id: Option<String>,
     created_at: i64,
 }
 
@@ -804,7 +809,10 @@ impl CardEventRecord {
             event_type: row.get(2)?,
             actor: row.get(3)?,
             payload: row.get(4)?,
-            created_at: row.get(5)?,
+            principal: row.get(5)?,
+            subject_kind: row.get(6)?,
+            subject_id: row.get(7)?,
+            created_at: row.get(8)?,
         })
     }
 
@@ -815,6 +823,9 @@ impl CardEventRecord {
             event_type: self.event_type,
             actor: self.actor,
             payload: self.payload,
+            principal: self.principal,
+            subject_kind: self.subject_kind,
+            subject_id: self.subject_id,
             created_at: self.created_at,
         })
     }
@@ -878,6 +889,7 @@ impl LinkRecord {
 }
 
 struct CommentRecord {
+    id: String,
     card_id: String,
     author: String,
     body: String,
@@ -887,15 +899,17 @@ struct CommentRecord {
 impl CommentRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            card_id: row.get(0)?,
-            author: row.get(1)?,
-            body: row.get(2)?,
-            created_at: row.get(3)?,
+            id: row.get(0)?,
+            card_id: row.get(1)?,
+            author: row.get(2)?,
+            body: row.get(3)?,
+            created_at: row.get(4)?,
         })
     }
 
     fn into_comment(self) -> Result<Comment> {
         Ok(Comment {
+            id: self.id,
             card_id: CardId::new(self.card_id)?,
             author: self.author,
             body: self.body,
@@ -912,7 +926,7 @@ fn load_work_log_for_card(
     let records = match detail {
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
-                "SELECT card_id, agent, model, reasoning, harness, run_id, body, created_at
+                "SELECT id, card_id, agent, model, reasoning, harness, run_id, body, created_at
                  FROM work_log_entries
                  WHERE card_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -924,7 +938,7 @@ fn load_work_log_for_card(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT card_id, agent, model, reasoning, harness, run_id, body, created_at
+                "SELECT id, card_id, agent, model, reasoning, harness, run_id, body, created_at
                  FROM work_log_entries
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -966,6 +980,7 @@ fn count_work_log_for_card(connection: &Connection, card_id: &CardId) -> Result<
 }
 
 struct WorkLogRecord {
+    id: String,
     card_id: String,
     agent: String,
     model: Option<String>,
@@ -979,19 +994,21 @@ struct WorkLogRecord {
 impl WorkLogRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            card_id: row.get(0)?,
-            agent: row.get(1)?,
-            model: row.get(2)?,
-            reasoning: row.get(3)?,
-            harness: row.get(4)?,
-            run_id: row.get(5)?,
-            body: row.get(6)?,
-            created_at: row.get(7)?,
+            id: row.get(0)?,
+            card_id: row.get(1)?,
+            agent: row.get(2)?,
+            model: row.get(3)?,
+            reasoning: row.get(4)?,
+            harness: row.get(5)?,
+            run_id: row.get(6)?,
+            body: row.get(7)?,
+            created_at: row.get(8)?,
         })
     }
 
     fn into_entry(self) -> Result<WorkLogEntry> {
         Ok(WorkLogEntry {
+            id: self.id,
             card_id: CardId::new(self.card_id)?,
             agent: self.agent,
             model: self.model,

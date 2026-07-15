@@ -139,6 +139,17 @@ impl Authority {
             Self::Principal { name, .. } => name.clone(),
         }
     }
+
+    /// The authenticated integration principal, when this mutation crossed
+    /// an identity-enforcing boundary. Unchecked local adapters deliberately
+    /// return `None`; callers must never promote a semantic actor/author/
+    /// worker label into authenticated identity.
+    pub fn principal_name(&self) -> Option<&str> {
+        match self {
+            Self::Unchecked => None,
+            Self::Principal { name, .. } => Some(name),
+        }
+    }
 }
 
 macro_rules! id_type {
@@ -1100,6 +1111,12 @@ pub struct CardEvent {
     pub event_type: String,
     pub actor: String,
     pub payload: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -1114,6 +1131,8 @@ pub struct Link {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub card_id: CardId,
     pub author: String,
     pub body: String,
@@ -1127,6 +1146,8 @@ pub struct Comment {
 /// whatever attribution the calling surface can supply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkLogEntry {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub card_id: CardId,
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

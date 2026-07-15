@@ -122,7 +122,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "check_criterion",
         description: "Mark one acceptance criterion checked or unchecked and audit actor/time; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id","criterion","actor"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","criterion","actor"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "update_relations",
@@ -132,17 +132,17 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "add_link",
         description: "Attach a proof, PR, CI, artifact, or reference URL to a card.",
-        input_schema: r#"{"type":"object","required":["card_id","label","url"],"properties":{"card_id":{"type":"string"},"label":{"type":"string"},"url":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","label","url"],"properties":{"card_id":{"type":"string"},"label":{"type":"string"},"url":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "add_comment",
         description: "Attach an actor-attributed comment to a card, visible immediately via get_card/get_run.",
-        input_schema: r#"{"type":"object","required":["card_id","author","body"],"properties":{"card_id":{"type":"string"},"author":{"type":"string"},"body":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","author","body"],"properties":{"card_id":{"type":"string"},"author":{"type":"string"},"body":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "append_work_log",
         description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution you can supply. body is scrubbed for known secret shapes server-side before storage.",
-        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "request_input",
@@ -578,6 +578,7 @@ pub fn call_tool_store(
             card_ack_payload(&card)
         }
         "check_criterion" => {
+            reject_principal_arg(args)?;
             let card_id = card_id(args, "card_id")?;
             let criterion = criterion_arg(args)?;
             let actor = required_str(args, "actor")?;
@@ -627,6 +628,7 @@ pub fn call_tool_store(
             relation_ack_payload(&card)
         }
         "add_link" => {
+            reject_principal_arg(args)?;
             let card_id = card_id(args, "card_id")?;
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
@@ -635,6 +637,7 @@ pub fn call_tool_store(
                 .map_err(to_string)?)
         }
         "add_comment" => {
+            reject_principal_arg(args)?;
             let card_id = card_id(args, "card_id")?;
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
@@ -643,6 +646,7 @@ pub fn call_tool_store(
                 .map_err(to_string)?)
         }
         "append_work_log" => {
+            reject_principal_arg(args)?;
             let card_id = card_id(args, "card_id")?;
             let agent = required_str(args, "agent")?;
             let body = required_str(args, "body")?;
@@ -1240,6 +1244,18 @@ fn authority_arg(args: &Value) -> Authority {
     {
         Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
         None => Authority::unchecked(),
+    }
+}
+
+fn reject_principal_arg(args: &Value) -> Result<(), String> {
+    if args
+        .as_object()
+        .is_some_and(|object| object.contains_key("principal"))
+    {
+        Err("principal is not accepted; authenticated principal comes from the transport credential"
+            .to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -2966,6 +2982,34 @@ mod tests {
         )
         .unwrap();
         assert!(tool_payload(&card)["work_log"][0]["agent"] == "codex");
+    }
+
+    #[test]
+    fn local_annotation_tools_reject_caller_supplied_principal() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        for (name, args) in [
+            (
+                "check_criterion",
+                json!({"card_id":"card","criterion":0,"actor":"operator","principal":"forged"}),
+            ),
+            (
+                "add_link",
+                json!({"card_id":"card","label":"proof","url":"https://example.test/proof","principal":"forged"}),
+            ),
+            (
+                "add_comment",
+                json!({"card_id":"card","author":"operator","body":"note","principal":"forged"}),
+            ),
+            (
+                "append_work_log",
+                json!({"card_id":"card","agent":"worker-a","body":"log","principal":"forged"}),
+            ),
+        ] {
+            let error = call_tool_store(&mut store, name, &args, 10)
+                .expect_err("principal argument rejected");
+            assert!(error.contains("principal is not accepted"));
+        }
     }
 
     #[test]

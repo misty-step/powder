@@ -2332,6 +2332,118 @@ async fn add_comment_appears_in_get_card_immediately() {
     assert_eq!(card["comments"][0]["body"], "looks good");
 }
 
+#[tokio::test]
+async fn annotation_audit_principal_comes_only_from_http_authentication() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let roster_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("roster", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"principal-http","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    for (path, body) in [
+        (
+            "/api/v1/cards/principal-http/criteria/check",
+            r#"{"criterion":0,"actor":"operator","principal":"forged"}"#,
+        ),
+        (
+            "/api/v1/cards/principal-http/links",
+            r#"{"label":"proof","url":"https://example.test/proof","principal":"forged"}"#,
+        ),
+        (
+            "/api/v1/cards/principal-http/comments",
+            r#"{"author":"operator","body":"note","principal":"forged"}"#,
+        ),
+        (
+            "/api/v1/cards/principal-http/work-log",
+            r#"{"agent":"worker-a","body":"log","principal":"forged"}"#,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, path, Some(&roster_key), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(response_text(response).await.contains("principal"));
+    }
+
+    for (path, body) in [
+        (
+            "/api/v1/cards/principal-http/criteria/check",
+            r#"{"criterion":0,"actor":"operator"}"#,
+        ),
+        (
+            "/api/v1/cards/principal-http/links",
+            r#"{"label":"proof","url":"https://example.test/proof"}"#,
+        ),
+        (
+            "/api/v1/cards/principal-http/comments",
+            r#"{"author":"operator","body":"note"}"#,
+        ),
+        (
+            "/api/v1/cards/principal-http/work-log",
+            r#"{"agent":"worker-a","body":"log"}"#,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, path, Some(&roster_key), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/principal-http?detail=detailed")
+                .header(AUTHORIZATION, format!("Bearer {roster_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail = response_json(response).await;
+    assert_eq!(detail["comments"][0]["author"], "operator");
+    assert_eq!(detail["work_log"][0]["agent"], "worker-a");
+    let comment_id = detail["comments"][0]["id"].as_str().unwrap();
+    let work_log_id = detail["work_log"][0]["id"].as_str().unwrap();
+    let events = detail["events"].as_array().unwrap();
+    let attributed = events
+        .iter()
+        .filter(|event| event["principal"] == "roster")
+        .collect::<Vec<_>>();
+    assert_eq!(attributed.len(), 4);
+    assert!(attributed.iter().any(|event| {
+        event["actor"] == "operator"
+            && event["subject_kind"] == "comment"
+            && event["subject_id"] == comment_id
+    }));
+    assert!(attributed.iter().any(|event| {
+        event["actor"] == "worker-a"
+            && event["subject_kind"] == "work_log"
+            && event["subject_id"] == work_log_id
+    }));
+}
+
 /// powder-927: pin the comments route's 422 contract against axum's own
 /// `Json` extractor rejection (the same mechanism `create_card_rejects_unknown_fields_by_name`
 /// and `append_work_log_appears_in_get_card_immediately`'s missing-`agent`
