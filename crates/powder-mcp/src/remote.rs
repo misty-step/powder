@@ -42,6 +42,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(repo) = optional_str(args, "repo") {
                 query.push_str(&format!("&repo={}", urlencode(repo)));
             }
+            if let Some(label) = optional_str(args, "label") {
+                query.push_str(&format!("&label={}", urlencode(label)));
+            }
             // powder-mcp-unfiltered-enumeration: same default as the local
             // (store-backed) dispatch path -- an unfiltered call hides
             // terminal cards unless the caller passes include_terminal:true;
@@ -104,6 +107,19 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             let response = client.post("/api/v1/cards", body)?;
             remote_card_ack_payload(&response)?
+        }
+        "report_papercut" => {
+            let response = client.post(
+                "/api/v1/cards/papercut",
+                json!({
+                    "agent": required_str(args, "agent")?,
+                    "body": required_str(args, "body")?,
+                    "service": optional_str(args, "service"),
+                    "model": optional_str(args, "model"),
+                    "harness": optional_str(args, "harness"),
+                }),
+            )?;
+            response
         }
         "update_card" => {
             let id = card_id(args, "card_id")?;
