@@ -5,12 +5,16 @@ use powder_core::{
     Authority, Card, CardId, CardStatus, DetailLevel, Estimate, PapercutReport, Priority,
     ReadyQuery, RunId,
 };
-use powder_shell::{load_github_issues_file, unix_now, ShellError};
+use powder_shell::{
+    detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
+    namespace_cards_for_repo, unix_now, ParsedCard, ShellError,
+};
 use powder_store::{
     ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
     Store, StoreError,
 };
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 pub const COMMANDS: &[&str] = &[
     "version",
@@ -19,6 +23,7 @@ pub const COMMANDS: &[&str] = &[
     "key-list",
     "key-revoke",
     "import-github-issues",
+    "repair-criteria",
     "create-card",
     "update-card",
     "update-relations",
@@ -111,6 +116,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "key-list" => key_list(rest),
         [command, rest @ ..] if command == "key-revoke" => key_revoke(rest),
         [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
+        [command, rest @ ..] if command == "repair-criteria" => repair_criteria(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
         [command, rest @ ..] if command == "update-card" => update_card(rest, remote_env),
         [command, rest @ ..] if command == "update-relations" => update_relations(rest),
@@ -254,6 +260,12 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder import-github-issues issues.json --repo misty-step/bitterblossom --db ./data/powder.db\n",
+    );
+    help.push_str(
+        "  powder repair-criteria ./backlog.d --db ./data/powder.db  (dry-run JSONL report)\n",
+    );
+    help.push_str(
+        "  powder repair-criteria ./backlog.d --db ./data/powder.db --repo misty-step/sploot --apply --actor operator\n",
     );
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str(
@@ -503,6 +515,89 @@ fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
             card.status.as_str(),
             card.title
         ));
+    }
+    Ok(out)
+}
+
+/// Repair acceptance criteria that were truncated by earlier line-naive
+/// Markdown parsers, comparing stored criteria against fresh source files.
+///
+/// Dry-run (default) emits a JSONL report of source-to-stored differences.
+/// `--apply` writes only the criteria text; status, check state, provenance,
+/// comments, relations, and claims are left untouched. `--apply` requires
+/// `--actor`.
+fn repair_criteria(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let source_path = positional(args).first().copied().ok_or_else(|| {
+        ShellError::Invalid("repair-criteria requires a source directory path".to_string())
+    })?;
+    let db = required_flag(args, "--db")?;
+    let apply = has_flag(args, "--apply");
+    let actor = flag_value(args, "--actor");
+    if apply && actor.is_none() {
+        return Err(ShellError::Invalid("--apply requires --actor".to_string()));
+    }
+
+    let mut parsed_by_id = load_markdown_dir(PathBuf::from(source_path), now)
+        .map_err(|err| ShellError::Invalid(err.to_string()))?;
+
+    if let Some(repo) = flag_value(args, "--repo") {
+        let cards: Vec<Card> = parsed_by_id
+            .into_values()
+            .map(|parsed| parsed.card)
+            .collect();
+        let namespaced = namespace_cards_for_repo(cards, repo)?;
+        parsed_by_id = namespaced
+            .into_iter()
+            .map(|card| {
+                (
+                    card.id.to_string(),
+                    ParsedCard {
+                        card,
+                        diagnostics: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+    }
+
+    let mut store = open_store(db)?;
+    let mut out = String::new();
+    for (id, parsed) in parsed_by_id {
+        let card_id = CardId::new(&id).map_err(ShellError::from)?;
+        let Some(stored) = store.get_card(&card_id).map_err(store_err)? else {
+            out.push_str(&format!("missing\t{id}\n"));
+            continue;
+        };
+
+        let truncated = detect_truncated_criteria(&id, &stored.acceptance, &parsed.card.acceptance);
+        if apply {
+            let repair = store
+                .repair_criteria(
+                    &card_id,
+                    parsed.card.acceptance.clone(),
+                    actor.unwrap(),
+                    now,
+                )
+                .map_err(store_err)?;
+            out.push_str(
+                &serde_json::to_string(&repair)
+                    .map_err(|err| ShellError::Invalid(err.to_string()))?,
+            );
+        } else {
+            let report = json!({
+                "card_id": id,
+                "dry_run": true,
+                "stored_acceptance": stored.acceptance,
+                "source_acceptance": parsed.card.acceptance,
+                "truncated": truncated,
+            });
+            out.push_str(
+                &serde_json::to_string(&report)
+                    .map_err(|err| ShellError::Invalid(err.to_string()))?,
+            );
+        }
+        out.push('\n');
     }
     Ok(out)
 }
@@ -1891,6 +1986,7 @@ mod tests {
         assert!(COMMANDS.contains(&"answer-input"));
         assert!(COMMANDS.contains(&"add-comment"));
         assert!(COMMANDS.contains(&"append-work-log"));
+        assert!(COMMANDS.contains(&"repair-criteria"));
         assert!(COMMANDS.contains(&"check-criterion"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
@@ -4273,6 +4369,131 @@ mod tests {
             recorded.lock().unwrap().is_empty(),
             "--db must use SQLite and must not contact POWDER_API_BASE_URL"
         );
+    }
+
+    #[test]
+    fn cli_repair_criteria_dry_run_reports_diffs_and_apply_preserves_lifecycle() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-repair-criteria-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        let fixtures = std::env::temp_dir().join(format!(
+            "powder-cli-repair-criteria-fixtures-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&fixtures).unwrap();
+        let fixture = fixtures.join("026.md");
+        std::fs::write(
+            &fixture,
+            "# sploot-026: wrapped thumbnail route criterion\n\n\
+Priority: P1 | Status: ready\n\n\
+## Goal\n\
+Serve grid thumbnails instead of full originals.\n\n\
+## Oracle\n\
+- [ ] The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar (`similar/route.ts`) read paths return\n    `thumbnailUrl`, so grid tiles source the 256px thumbnail (with the existing thumbnail→blob error fallback intact).\n",
+        )
+        .unwrap();
+        let fixtures = fixtures.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "sploot-026",
+            "--title",
+            "Thumbnail routes",
+            "--acceptance",
+            "The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar",
+            "--status",
+            "ready",
+            "--repo",
+            "misty-step/sploot",
+        ]))
+        .unwrap();
+        run(&args([
+            "add-comment",
+            "sploot-026",
+            "--db",
+            &db,
+            "--author",
+            "operator",
+            "--body",
+            "manual Sploot repair note",
+        ]))
+        .unwrap();
+        let claimed = run(&args([
+            "claim",
+            "sploot-026",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--ttl",
+            "3600",
+        ]))
+        .unwrap();
+        assert!(claimed.starts_with("claimed\tsploot-026"));
+
+        let dry_run = run(&args([
+            "repair-criteria",
+            &fixtures,
+            "--db",
+            &db,
+            "--repo",
+            "misty-step/sploot",
+        ]))
+        .unwrap();
+        let report: Value = serde_json::from_str(dry_run.lines().next().unwrap()).unwrap();
+        assert_eq!(report["card_id"], "sploot-026");
+        assert!(report["dry_run"].as_bool().unwrap());
+        assert!(
+            report["truncated"].as_array().unwrap().len() == 1,
+            "dry-run must report one truncated criterion: {dry_run}"
+        );
+
+        let repair = run(&args([
+            "repair-criteria",
+            &fixtures,
+            "--db",
+            &db,
+            "--repo",
+            "misty-step/sploot",
+            "--apply",
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        let repair: Value = serde_json::from_str(repair.lines().next().unwrap()).unwrap();
+        assert_eq!(repair["criteria_changed"], 1);
+        assert!(repair["changes"][0]["state_preserved"].as_bool().unwrap());
+
+        let card = run(&args(["get-card", "sploot-026", "--db", &db])).unwrap();
+        let detail: Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(
+            detail["card"]["status"], "in_progress",
+            "status must survive repair"
+        );
+        assert!(
+            detail["card"]["claim"].is_object(),
+            "claim must survive repair: {card}"
+        );
+        assert_eq!(
+            detail["card"]["criteria"][0]["text"],
+            "The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar (`similar/route.ts`) read paths return `thumbnailUrl`, so grid tiles source the 256px thumbnail (with the existing thumbnail→blob error fallback intact)."
+        );
+        let comments = detail["comments"].as_array().unwrap();
+        assert!(comments
+            .iter()
+            .any(|c| c["body"] == "manual Sploot repair note"));
     }
 
     #[test]
