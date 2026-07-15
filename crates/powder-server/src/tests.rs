@@ -1073,6 +1073,90 @@ async fn list_cards_include_terminal_param_hides_terminal_server_side_and_defaul
     assert!(explicit_done.get("excluded_terminal_count").is_none());
 }
 
+#[tokio::test]
+async fn list_cards_filters_by_label() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    for body in [
+        r#"{"id":"tagged","title":"Tagged","acceptance":["x"],"labels":["papercut"]}"#,
+        r#"{"id":"untagged","title":"Untagged","acceptance":["x"],"labels":["bug"]}"#,
+    ] {
+        let created = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&raw_key),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+    }
+
+    let ids_from = |value: &serde_json::Value| -> Vec<String> {
+        value["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let papercuts = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?label=papercut",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(papercuts.status(), StatusCode::OK);
+    let papercuts = response_json(papercuts).await;
+    assert_eq!(ids_from(&papercuts), vec!["tagged".to_string()]);
+    assert_eq!(papercuts["total_count"], 1);
+}
+
+#[tokio::test]
+async fn file_papercut_creates_a_backlog_card_with_label() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let filed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/papercut",
+            Some(&raw_key),
+            r#"{"agent":"codex","body":"too many tokens just to report a typo"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(filed.status(), StatusCode::OK);
+    let filed = response_json(filed).await;
+    assert!(filed["id"].as_str().unwrap().starts_with("papercut-"));
+    assert_eq!(filed["status"], "backlog");
+    assert!(filed["labels"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("papercut")));
+
+    let listed = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?label=papercut",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let listed = response_json(listed).await;
+    assert_eq!(listed["total_count"], 1);
+}
+
 /// powder-966: an agent judging chewability from a list response must see
 /// the same acceptance-criterion text `get_card` would show, not a clipped
 /// preview. `GET /api/v1/cards` and `GET /api/v1/cards/ready` both serialize

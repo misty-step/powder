@@ -38,9 +38,21 @@ When the workflow contract changes, update the server instructions first
 (including the claim gate: cards without acceptance criteria cannot be
 claimed).
 
+## Papercut intake
+
+Papercuts are agent-reported UX friction filed as backlog cards. Use
+`report_papercut` (MCP) or `powder papercut <body> --agent <label>
+[--service <repo>]` (CLI) in both `--db` and remote modes. The tool is
+intentionally tiny: one call, no claim, no dedup scan, no fix required. The
+reporting agent is the audit actor, the body is secret-scrubbed, and the
+card carries the `papercut` label. If `service` matches a repository entity
+the card is homed there; otherwise a `service:<name>` label is added. Grooms
+sweep with `list_cards label:papercut` (MCP) or
+`powder list-cards --label papercut` (CLI).
+
 ## Expected MCP Tools
 
-Default agent persona (20 tools):
+Default agent persona (21 tools):
 
 - `list_ready`: return claimable cards from active repositories, ordered so
   no card appears after another card in the response it transitively
@@ -54,7 +66,7 @@ Default agent persona (20 tools):
   cards downstream of a cycle stay dependency-ordered after it. `get_card`'s
   `transitive_blocked_by`/`blocked_by_cycle` fields explain a *blocked*
   card's chain past one hop.
-- `list_cards`: enumerate cards by optional status/repo/`estimate`
+- `list_cards`: enumerate cards by optional status/repo/`estimate`/`label`
   filter, including cards `list_ready` never surfaces -- `backlog`, cards with
   an unresolved `blocked_by` relation, and `done`/`shipped`/`abandoned`.
   With no `status` filter, `done`/`shipped`/`abandoned` cards are
@@ -130,6 +142,12 @@ Default agent persona (20 tools):
   (agent, model, reasoning, harness, run_id, body) while actively working a
   card -- call this often, not just at completion; `body` is scrubbed for
   known secret shapes server-side before storage.
+- `report_papercut`: file friction the moment you feel it -- too many tokens,
+  too many calls, confusing errors, missing capability, anything awkward.
+  Required: `agent`, `body`. Optional: `service`, `model`, `harness`. The
+  report lands as a backlog card labeled `papercut`. One call; do not stop
+  working; do not fix it yourself; dedup happens at groom time. Grooms can
+  sweep with `list_cards` filtered by `label: papercut`.
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
 - `update_card`: patch title, body, acceptance, proof_plan, status, priority,
@@ -155,7 +173,7 @@ Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all` (9 tools):
 
 `powder` is remote-capable for the full card and claim-lifecycle workflow:
 with `POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`,
-`list-cards`, `get-card`, `create-card`, `claim`, `heartbeat`, `renew-claim`,
+`list-cards`, `papercut`, `get-card`, `create-card`, `claim`, `heartbeat`, `renew-claim`,
 `transfer-claim`, `release-claim`, `update-status`, `check-criterion`, `add-link`,
 `add-comment`, `append-work-log`, `request-input`, and `complete-card` all operate against the
 deployed instance when `--db` is omitted -- there is no separate "remote

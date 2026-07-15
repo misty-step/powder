@@ -205,6 +205,7 @@ pub struct CardFilter {
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
     pub estimate: Option<Estimate>,
+    pub label: Option<String>,
     pub include_terminal: bool,
 }
 
@@ -214,6 +215,7 @@ impl Default for CardFilter {
             status: None,
             repo: None,
             estimate: None,
+            label: None,
             include_terminal: true,
         }
     }
@@ -1479,6 +1481,39 @@ impl Store {
         Ok(saved)
     }
 
+    /// File a one-call papercut. The report maps deterministically to a
+    /// backlog card labeled `papercut`; if `service` names a known repository
+    /// entity the card is homed there, otherwise it carries a `service:<name>`
+    /// label. The full report body and attribution are preserved, then run
+    /// through the same secret-scrubbing path as comments and work logs.
+    /// Emits a normal `create` audit event with the reporting agent as actor.
+    pub fn file_papercut(
+        &mut self,
+        report: &powder_core::papercut::PapercutReport,
+        actor: &str,
+        now: i64,
+    ) -> Result<Card> {
+        let actor = non_empty("actor", actor)?;
+        let resolved_repo = report
+            .service
+            .as_deref()
+            .map(|service| self.get_repository(service))
+            .transpose()?
+            .flatten()
+            .map(|summary| summary.repo);
+        let id = CardId::new(format!(
+            "papercut-{}",
+            nanoid::nanoid!(12, &API_KEY_ALPHABET)
+        ))?;
+        let card = powder_core::papercut::file_papercut(
+            report.clone(),
+            resolved_repo.as_deref(),
+            now,
+            id,
+        )?;
+        self.create_card_with_events(card, &actor, now)
+    }
+
     pub fn patch_card(
         &mut self,
         card_id: &CardId,
@@ -1735,9 +1770,17 @@ impl Store {
                 }
                 None => !repo_filter_requested,
             })
+            .filter(|card| {
+                filter.label.as_ref().is_none_or(|wanted| {
+                    let wanted = wanted.trim().to_ascii_lowercase();
+                    card.labels
+                        .iter()
+                        .any(|label| label.trim().eq_ignore_ascii_case(&wanted))
+                })
+            })
             .collect::<Vec<_>>();
         // `total_count` reports how many cards match the caller's *explicit*
-        // status/repo/estimate filters -- deliberately computed
+        // status/repo/estimate/label filters -- deliberately computed
         // before the `include_terminal` exclusion below, so a caller that
         // asks for the whole board (no explicit status) and gets terminal
         // cards silently held back still sees the true match count rather

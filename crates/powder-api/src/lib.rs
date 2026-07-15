@@ -38,8 +38,14 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards",
-        intent: "list cards by optional status/repo/estimate filter; response is {cards,total_count,has_more}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "list cards by optional status/repo/estimate/label filter; response is {cards,total_count,has_more}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/cards/papercut",
+        intent: "file a one-call papercut report; body fields agent (required) and service/model/harness (optional); response is a minimal ack",
+        body_shape: Some(r#"{"agent":"...","body":"...","service":null,"model":null,"harness":null}"#),
     },
     ApiRoute {
         method: "GET",

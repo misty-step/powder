@@ -29,7 +29,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, Priority, ReadyQuery, RunId,
+    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, PapercutReport, Priority,
+    ReadyQuery, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -366,6 +367,7 @@ struct ListCardsParams {
     status: Option<String>,
     repo: Option<String>,
     estimate: Option<String>,
+    label: Option<String>,
     limit: Option<usize>,
     /// powder-mcp-unfiltered-enumeration: `false` hides
     /// done/shipped/abandoned cards when no explicit `status` is requested
@@ -410,6 +412,16 @@ struct CreateCardRequest {
     blocks: Option<Vec<String>>,
     blocked_by: Option<Vec<String>>,
     parent: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePapercutRequest {
+    agent: String,
+    body: String,
+    service: Option<String>,
+    model: Option<String>,
+    harness: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -731,6 +743,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/stats", get(board_stats))
         .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
+        .route("/api/v1/cards/papercut", post(file_papercut))
         .route("/api/v1/cards/ready", get(list_ready))
         .route(
             "/api/v1/repositories",
@@ -945,6 +958,7 @@ async fn list_cards(
         status,
         estimate,
         repo: params.repo,
+        label: params.label,
         include_terminal: params.include_terminal.unwrap_or(true),
     };
     let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
@@ -1162,6 +1176,34 @@ async fn create_card(
             json!("no acceptance criteria; the card cannot be claimed until it carries an oracle");
     }
     Ok(Json(payload))
+}
+
+async fn file_papercut(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<FilePapercutRequest>,
+) -> Result<Json<Value>, ApiError> {
+    // Same authorization posture as create_card: an agent-scoped key may
+    // file friction without claiming it or holding admin.
+    authorize(&state, &headers)?;
+    let now = unix_now();
+    let report = PapercutReport {
+        agent: request.agent,
+        body: request.body,
+        service: request.service,
+        model: request.model,
+        harness: request.harness,
+    };
+    let card = {
+        let mut store = lock_store(&state)?;
+        store.file_papercut(&report, &report.agent, now)?
+    };
+    Ok(Json(json!({
+        "id": card.id.as_str(),
+        "title": card.title,
+        "status": card.status.as_str(),
+        "labels": card.labels,
+    })))
 }
 
 async fn patch_card(
