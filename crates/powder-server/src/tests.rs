@@ -23,6 +23,10 @@ fn config_defaults_to_api_key_auth_and_data_path() {
     assert_eq!(config.auth_mode, AuthMode::ApiKey);
     assert!(config.disclose_bootstrap_key);
     assert!(
+        !config.public_reads,
+        "api-key mode must default to authenticated reads"
+    );
+    assert!(
         config.field_note.repo_allowlist.is_empty(),
         "no POWDER_FIELD_NOTE_REPOS means the generator stays inert"
     );
@@ -116,6 +120,18 @@ fn config_rejects_invalid_auth_mode() {
     let err = Config::from_pairs([("POWDER_AUTH_MODE", "open")]).unwrap_err();
 
     assert_eq!(err.variable, "POWDER_AUTH_MODE");
+}
+
+#[test]
+fn config_defaults_public_reads_to_false_and_accepts_escape_hatch() {
+    let default = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
+    assert!(!default.public_reads);
+
+    let public = Config::from_pairs([("POWDER_PUBLIC_READS", "true")]).unwrap();
+    assert!(public.public_reads);
+
+    let err = Config::from_pairs([("POWDER_PUBLIC_READS", "yes")]).unwrap_err();
+    assert_eq!(err.variable, "POWDER_PUBLIC_READS");
 }
 
 #[test]
@@ -1303,6 +1319,7 @@ async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
                     tailnet_proxy_secret: None,
                     tailnet_admin: true,
                     dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
+                    public_reads: false,
                 }),
                 store: Arc::new(Mutex::new(store)),
                 poison_count: Arc::new(AtomicU64::new(0)),
@@ -1633,7 +1650,7 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
         .oneshot(json_request(
             Method::GET,
             "/api/v1/repositories/canary-app",
-            None,
+            Some(&admin_key),
             "",
         ))
         .await
@@ -1655,7 +1672,12 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
 
     let visible_list = app
         .clone()
-        .oneshot(json_request(Method::GET, "/api/v1/repositories", None, ""))
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/repositories",
+            Some(&admin_key),
+            "",
+        ))
         .await
         .unwrap();
     let visible_list = response_json(visible_list).await;
@@ -1670,7 +1692,7 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
         .oneshot(json_request(
             Method::GET,
             "/api/v1/repositories?include_hidden=true",
-            None,
+            Some(&admin_key),
             "",
         ))
         .await
@@ -1715,7 +1737,7 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
         .oneshot(json_request(
             Method::GET,
             "/api/v1/cards/legacy-canary",
-            None,
+            Some(&admin_key),
             "",
         ))
         .await
@@ -2100,7 +2122,9 @@ fn demo_style_receiver_rejects_bad_signature() {
 
 #[tokio::test]
 async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    // powder-public-read-posture: the historical private-ingress behavior is
+    // preserved only under the explicit POWDER_PUBLIC_READS=true escape hatch.
+    let (state, raw_key) = test_state_with_public_reads(AuthMode::ApiKey, true);
     let app = app(state);
 
     let created = app
@@ -2136,7 +2160,7 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "private-ingress board read route {route} should not need a bearer token"
+            "POWDER_PUBLIC_READS=true board read route {route} should not need a bearer token"
         );
         let body = response_text(response).await;
         if route == "/api/v1/approvals" {
@@ -4470,6 +4494,288 @@ async fn tailnet_and_none_modes_authorize_as_configured() {
     assert_eq!(none.status(), StatusCode::OK);
 }
 
+/// powder-public-read-posture: fail-closed default in api-key mode.
+#[tokio::test]
+async fn api_key_mode_rejects_keyless_reads_by_default() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let keyless = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(keyless.status(), StatusCode::UNAUTHORIZED);
+
+    let with_key = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_key.status(), StatusCode::OK);
+}
+
+/// powder-public-read-posture: the POWDER_PUBLIC_READS=true escape hatch.
+#[tokio::test]
+async fn api_key_mode_public_reads_escape_hatch_allows_keyless_reads() {
+    let (state, _raw_key) = test_state_with_public_reads(AuthMode::ApiKey, true);
+    // Create a card so the list is non-empty and the response shape is exercised.
+    state
+        .store
+        .lock()
+        .unwrap()
+        .create_card_with_events(
+            Card::new(
+                CardId::new("pub-read").unwrap(),
+                "Public read".to_string(),
+                "".to_string(),
+            )
+            .unwrap()
+            .with_acceptance(vec!["exists".to_string()])
+            .with_status(CardStatus::Ready),
+            "test",
+            1,
+        )
+        .unwrap();
+    let app = app(state.clone());
+
+    let keyless = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(keyless.status(), StatusCode::OK);
+    let body = response_json(keyless).await;
+    assert_eq!(body["cards"].as_array().unwrap().len(), 1);
+}
+
+/// powder-public-read-posture, rider 1: authentication must run before body
+/// deserialization. A POST with no auth and a malformed body must 401, not 415/422.
+#[tokio::test]
+async fn unauthenticated_post_with_malformed_body_is_rejected_before_deserialization() {
+    let (state, _raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let bad_body = r#"{this is not even json"#;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/cards")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(bad_body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "auth must fail before JSON deserialization: got {:?}",
+        response.status()
+    );
+}
+
+/// powder-public-read-posture: revocation must now be observable on read
+/// routes, not only on mutating routes.
+#[tokio::test]
+async fn revoked_api_key_is_rejected_on_read_routes() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+
+    // Create a card so a successful read would return 200.
+    state
+        .store
+        .lock()
+        .unwrap()
+        .create_card_with_events(
+            Card::new(
+                CardId::new("revoke-read").unwrap(),
+                "Revoke read".to_string(),
+                "".to_string(),
+            )
+            .unwrap()
+            .with_acceptance(vec!["exists".to_string()])
+            .with_status(CardStatus::Ready),
+            "test",
+            1,
+        )
+        .unwrap();
+    let app = app(state.clone());
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+
+    // Revoke the bootstrap key.
+    let key_id = state
+        .store
+        .lock()
+        .unwrap()
+        .list_api_keys()
+        .unwrap()
+        .into_iter()
+        .find(|key| key.name == "bootstrap")
+        .map(|key| key.id)
+        .expect("bootstrap key exists");
+    state
+        .store
+        .lock()
+        .unwrap()
+        .revoke_api_key(&key_id, 2)
+        .unwrap();
+
+    let after_revoke = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after_revoke.status(),
+        StatusCode::UNAUTHORIZED,
+        "revoked key must fail on read routes, not just mutations"
+    );
+}
+
+/// powder-public-read-posture, rider 2: admin-scoped POST /api/v1/keys mints a
+/// key and returns the raw secret exactly once.
+#[tokio::test]
+async fn admin_can_mint_api_key_over_http() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let before = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/keys",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(before.status(), StatusCode::OK);
+    let before = response_json(before).await;
+    let before_count = before["keys"].as_array().unwrap().len();
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/keys",
+            Some(&admin_key),
+            r#"{"name":"glass-dashboard","scope":"agent"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(created["name"], "glass-dashboard");
+    assert_eq!(created["scope"], "agent");
+    assert!(
+        created["raw_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("sk_powder_"),
+        "raw key must be disclosed exactly once at mint time: {created}"
+    );
+    let new_key = created["raw_key"].as_str().unwrap().to_string();
+
+    let after = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/keys",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let after = response_json(after).await;
+    assert_eq!(
+        after["keys"].as_array().unwrap().len(),
+        before_count + 1,
+        "minted key appears in listing without exposing the secret"
+    );
+    assert!(after["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|key| key.get("raw_key").is_none()));
+
+    // The new key can authenticate a read with enforcement on.
+    let read_with_new_key = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header(AUTHORIZATION, format!("Bearer {new_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_with_new_key.status(), StatusCode::OK);
+}
+
+/// powder-public-read-posture, rider 2: only admin keys can mint over HTTP.
+#[tokio::test]
+async fn agent_scoped_key_cannot_mint_new_keys_over_http() {
+    let (state, _admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/keys",
+            Some(&agent_key),
+            r#"{"name":"forbidden","scope":"agent"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn every_request_triggers_the_trace_layer_without_leaking_the_bearer_token() {
     // Proves the wiring pattern deterministically, without depending on
@@ -4522,6 +4828,10 @@ async fn every_request_triggers_the_trace_layer_without_leaking_the_bearer_token
 }
 
 fn test_state(auth_mode: AuthMode) -> (AppState, String) {
+    test_state_with_public_reads(auth_mode, false)
+}
+
+fn test_state_with_public_reads(auth_mode: AuthMode, public_reads: bool) -> (AppState, String) {
     let mut store = Store::open_in_memory().unwrap();
     store.migrate().unwrap();
     let key = store.apply_initial_seed(1).unwrap().unwrap();
@@ -4537,6 +4847,7 @@ fn test_state(auth_mode: AuthMode) -> (AppState, String) {
             tailnet_proxy_secret: None,
             tailnet_admin: true,
             dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
+            public_reads,
         }),
         store: Arc::new(Mutex::new(store)),
         poison_count: Arc::new(AtomicU64::new(0)),

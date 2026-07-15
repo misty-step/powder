@@ -288,6 +288,20 @@ client or configure `POWDER_API_KEY_CMD`. A run of three or more consecutive
 be pointed at a stale host (a deployment cutover, powder-965's class of
 incident) -- restart the MCP client after fixing the URL.
 
+## Response Evolution Contract
+
+Status vocabulary changes are additive from the client's perspective.
+`powder-core::CardStatus` rejects unknown values on writes, so the server
+and store never persist invalid statuses. On read surfaces, however,
+clients decode with `powder_api::ClientStatus`: an unrecognized value
+degrades only that card and is preserved as a raw string. A listing
+(`list_ready`, `list_cards`, `board_stats`) must never hard-fail just
+because one card carries a future or retired status value. `get_card`
+and `get_run` return the server's JSON verbatim, so they are also
+version-skew safe. Agents and adapters should keep this contract in mind
+when adding new status values: deploy the server change first, then
+update clients at their own pace; the old client must keep reading.
+
 ## Local Gate
 
 ```sh
