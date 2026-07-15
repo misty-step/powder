@@ -727,6 +727,22 @@ impl Card {
         self
     }
 
+    /// Update the acceptance oracle while preserving checked/proof state
+    /// for any criterion whose identity survives: same position and either
+    /// unchanged text, or the stored text is a truncation-prefix of the new
+    /// text. Any other text change at that position is treated as a new
+    /// oracle item with no prior state to inherit.
+    pub fn repair_acceptance(mut self, acceptance: impl IntoIterator<Item = String>) -> Self {
+        let cleaned = clean_list(acceptance);
+        let incoming: Vec<_> = cleaned
+            .into_iter()
+            .filter_map(|item| AcceptanceCriterion::new(item).ok())
+            .collect();
+        self.criteria = merge_criteria_state(&self.criteria, incoming);
+        self.acceptance = self.criteria.iter().map(|c| c.text.clone()).collect();
+        self
+    }
+
     pub fn with_proof_plan(mut self, proof_plan: impl IntoIterator<Item = String>) -> Self {
         self.proof_plan = clean_list(proof_plan);
         self
@@ -750,6 +766,11 @@ impl Card {
     pub fn with_created_at(mut self, created_at: i64) -> Self {
         self.created_at = created_at;
         self.updated_at = created_at;
+        self
+    }
+
+    pub fn with_updated_at(mut self, updated_at: i64) -> Self {
+        self.updated_at = updated_at;
         self
     }
 
