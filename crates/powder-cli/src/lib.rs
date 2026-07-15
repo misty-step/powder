@@ -3859,6 +3859,51 @@ mod tests {
         );
     }
 
+    /// Client read paths must degrade per-card on an unknown status value;
+    /// the CLI remote path keeps responses as `serde_json::Value` and simply
+    /// prints the raw status string, so a future vocabulary addition never
+    /// aborts the whole listing.
+    #[test]
+    fn cli_remote_listings_tolerate_unknown_status_values() {
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({
+                    "cards": [
+                        {"id": "known-1", "priority": "p1", "title": "Known card"},
+                        {"id": "future-1", "priority": "p2", "title": "Future status card"},
+                    ],
+                    "total_count": 2,
+                    "has_more": false,
+                }),
+            ),
+            (
+                200,
+                json!({
+                    "cards": [
+                        {"id": "known-1", "priority": "p1", "status": "ready", "title": "Known card"},
+                        {"id": "future-1", "priority": "p2", "status": "paused", "title": "Future status card"},
+                    ],
+                    "total_count": 2,
+                    "has_more": false,
+                }),
+            ),
+        ]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let ready = run_with_env(&args(["list-ready", "--limit", "5"]), &env).unwrap();
+        assert_eq!(
+            ready,
+            "known-1\tP1\tKnown card\nfuture-1\tP2\tFuture status card\n"
+        );
+
+        let cards = run_with_env(&args(["list-cards", "--limit", "5"]), &env).unwrap();
+        assert_eq!(
+            cards,
+            "known-1\tP1\tready\tKnown card\nfuture-1\tP2\tpaused\tFuture status card\n"
+        );
+    }
+
     /// A lane maintaining a claim lease against a deployed instance (no
     /// local SQLite file at all) must be able to heartbeat, renew, and
     /// release without ever passing `--db` -- the stale-binary friction this
