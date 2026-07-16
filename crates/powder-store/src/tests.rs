@@ -309,6 +309,81 @@ fn fresh_schema_run_detail_query_uses_run_leading_work_log_index() -> Result<()>
 }
 
 #[test]
+fn migration_15_to_16_adds_only_criterion_review_kind_and_preserves_operations() -> Result<()> {
+    let path = temp_db("v15-criterion-review-kind");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute(
+            "INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               expected_run_id, state, created_at, updated_at, expires_at
+             ) VALUES ('existing-op', 'sha256:existing', 'completion', 'card-1',
+                       'actor-1', NULL, 'succeeded', 10, 11, 12)",
+            [],
+        )?;
+        store.connection.execute_batch(
+            "PRAGMA user_version = 15;
+             ALTER TABLE mutation_operations RENAME TO mutation_operations_v15;
+             CREATE TABLE mutation_operations (
+               operation_id TEXT PRIMARY KEY,
+               request_digest TEXT NOT NULL,
+               kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion')),
+               target_card_id TEXT NOT NULL,
+               authority TEXT NOT NULL,
+               expected_run_id TEXT,
+               state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+               result_json TEXT,
+               failure_code TEXT,
+               failure_message TEXT,
+               audit_event_id TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL
+             );
+             INSERT INTO mutation_operations SELECT * FROM mutation_operations_v15;
+             DROP INDEX idx_mutation_operations_expiry;
+             DROP TABLE mutation_operations_v15;
+             CREATE INDEX idx_mutation_operations_expiry
+               ON mutation_operations(expires_at, operation_id);",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let existing: (String, String, i64) = store.connection.query_row(
+        "SELECT kind, state, expires_at FROM mutation_operations
+         WHERE operation_id = 'existing-op'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        existing,
+        ("completion".to_string(), "succeeded".to_string(), 12)
+    );
+    store.connection.execute(
+        "INSERT INTO mutation_operations (
+           operation_id, request_digest, kind, target_card_id, authority,
+           state, created_at, updated_at, expires_at
+         ) VALUES ('review-op', 'sha256:review', 'criterion_review', 'card-1',
+                   'actor-1', 'pending', 20, 20, 30)",
+        [],
+    )?;
+    let invalid = store.connection.execute(
+        "INSERT INTO mutation_operations (
+           operation_id, request_digest, kind, target_card_id, authority,
+           state, created_at, updated_at, expires_at
+         ) VALUES ('invalid-op', 'sha256:invalid', 'other', 'card-1',
+                   'actor-1', 'pending', 20, 20, 30)",
+        [],
+    );
+    assert!(invalid.is_err());
+    Ok(())
+}
+
+#[test]
 fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

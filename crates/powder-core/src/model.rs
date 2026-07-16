@@ -301,6 +301,7 @@ impl fmt::Display for OperationId {
 pub enum OperationKind {
     WorkLogAppend,
     Completion,
+    CriterionReview,
 }
 
 impl OperationKind {
@@ -308,6 +309,7 @@ impl OperationKind {
         match self {
             Self::WorkLogAppend => "work_log_append",
             Self::Completion => "completion",
+            Self::CriterionReview => "criterion_review",
         }
     }
 
@@ -315,6 +317,7 @@ impl OperationKind {
         match raw {
             "work_log_append" => Some(Self::WorkLogAppend),
             "completion" => Some(Self::Completion),
+            "criterion_review" => Some(Self::CriterionReview),
             _ => None,
         }
     }

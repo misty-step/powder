@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -141,7 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_work_log_entries_run_created ON work_log_entries(
 CREATE TABLE IF NOT EXISTS mutation_operations (
   operation_id TEXT PRIMARY KEY,
   request_digest TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion')),
+  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion', 'criterion_review')),
   target_card_id TEXT NOT NULL,
   authority TEXT NOT NULL,
   expected_run_id TEXT,
@@ -416,6 +416,43 @@ pub const MIGRATE_14_TO_15: &str = r#"
 UPDATE work_log_entries SET actor = agent WHERE actor IS NULL;
 UPDATE work_log_entries SET updated_at = created_at WHERE updated_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_work_log_entries_run_created ON work_log_entries(run_id, created_at, id);
+"#;
+
+/// Add the criterion-review operation kind without changing any operation
+/// column, lifecycle state, retention field, or existing row.
+pub const MIGRATE_15_TO_16: &str = r#"
+ALTER TABLE mutation_operations RENAME TO mutation_operations_v15;
+
+CREATE TABLE mutation_operations (
+  operation_id TEXT PRIMARY KEY,
+  request_digest TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion', 'criterion_review')),
+  target_card_id TEXT NOT NULL,
+  authority TEXT NOT NULL,
+  expected_run_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+  result_json TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  audit_event_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+
+INSERT INTO mutation_operations (
+  operation_id, request_digest, kind, target_card_id, authority,
+  expected_run_id, state, result_json, failure_code, failure_message,
+  audit_event_id, created_at, updated_at, expires_at
+)
+SELECT
+  operation_id, request_digest, kind, target_card_id, authority,
+  expected_run_id, state, result_json, failure_code, failure_message,
+  audit_event_id, created_at, updated_at, expires_at
+FROM mutation_operations_v15;
+
+DROP TABLE mutation_operations_v15;
+CREATE INDEX idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,
