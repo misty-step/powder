@@ -2377,7 +2377,7 @@ fn load_run_for_review(connection: &Connection, run_id: &RunId) -> Result<Run> {
         .and_then(RunRecord::into_run)
 }
 
-fn criterion_review_from_values(
+struct CriterionReviewRecord {
     id: String,
     operation_id: String,
     card_id: String,
@@ -2390,32 +2390,53 @@ fn criterion_review_from_values(
     proof: Option<String>,
     supersedes_review_id: Option<String>,
     created_at: i64,
-) -> Result<CriterionReview> {
-    let criterion_index =
-        usize::try_from(criterion_index).map_err(|_| StoreError::InvalidStoredValue {
-            field: "criterion_reviews.criterion_index",
-            value: criterion_index.to_string(),
+}
+
+impl CriterionReviewRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            operation_id: row.get(1)?,
+            card_id: row.get(2)?,
+            run_id: row.get(3)?,
+            criterion_index: row.get(4)?,
+            criterion_id: row.get(5)?,
+            criterion_text: row.get(6)?,
+            decision: row.get(7)?,
+            reviewer: row.get(8)?,
+            proof: row.get(9)?,
+            supersedes_review_id: row.get(10)?,
+            created_at: row.get(11)?,
+        })
+    }
+
+    fn into_review(self) -> Result<CriterionReview> {
+        let criterion_index =
+            usize::try_from(self.criterion_index).map_err(|_| StoreError::InvalidStoredValue {
+                field: "criterion_reviews.criterion_index",
+                value: self.criterion_index.to_string(),
+            })?;
+        let decision = CriterionReviewDecision::parse(&self.decision).ok_or_else(|| {
+            StoreError::InvalidStoredValue {
+                field: "criterion_reviews.decision",
+                value: self.decision,
+            }
         })?;
-    let decision = CriterionReviewDecision::parse(&decision).ok_or_else(|| {
-        StoreError::InvalidStoredValue {
-            field: "criterion_reviews.decision",
-            value: decision,
-        }
-    })?;
-    Ok(CriterionReview {
-        id,
-        operation_id: OperationId::new(operation_id)?,
-        card_id: CardId::new(card_id)?,
-        run_id: RunId::new(run_id)?,
-        criterion_index,
-        criterion_id,
-        criterion_text,
-        decision,
-        reviewer,
-        proof,
-        supersedes_review_id,
-        created_at,
-    })
+        Ok(CriterionReview {
+            id: self.id,
+            operation_id: OperationId::new(self.operation_id)?,
+            card_id: CardId::new(self.card_id)?,
+            run_id: RunId::new(self.run_id)?,
+            criterion_index,
+            criterion_id: self.criterion_id,
+            criterion_text: self.criterion_text,
+            decision,
+            reviewer: self.reviewer,
+            proof: self.proof,
+            supersedes_review_id: self.supersedes_review_id,
+            created_at: self.created_at,
+        })
+    }
 }
 
 fn query_criterion_reviews(
@@ -2425,55 +2446,10 @@ fn query_criterion_reviews(
 ) -> Result<Vec<CriterionReview>> {
     let mut statement = connection.prepare(sql)?;
     let rows = statement
-        .query_map(parameters, |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, i64>(11)?,
-            ))
-        })?
+        .query_map(parameters, CriterionReviewRecord::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(
-            |(
-                id,
-                operation_id,
-                card_id,
-                run_id,
-                criterion_index,
-                criterion_id,
-                criterion_text,
-                decision,
-                reviewer,
-                proof,
-                supersedes_review_id,
-                created_at,
-            )| {
-                criterion_review_from_values(
-                    id,
-                    operation_id,
-                    card_id,
-                    run_id,
-                    criterion_index,
-                    criterion_id,
-                    criterion_text,
-                    decision,
-                    reviewer,
-                    proof,
-                    supersedes_review_id,
-                    created_at,
-                )
-            },
-        )
+        .map(CriterionReviewRecord::into_review)
         .collect()
 }
 
