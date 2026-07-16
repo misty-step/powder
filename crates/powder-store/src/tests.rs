@@ -1,12 +1,14 @@
 use powder_core::{
     AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource, CardStatus,
-    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
+    DetailLevel, DomainError, Estimate, OperationId, OperationState, Priority, ReadyQuery, RunId,
+    RunState,
 };
 
 use crate::{
-    ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
-    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError,
-    WorkLogAttribution, API_KEY_ALPHABET,
+    ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig,
+    ImportOutcome, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
+    StoreError, WorkLogAttribution, API_KEY_ALPHABET, OPERATION_RETENTION_SECONDS,
+    WORK_LOG_BODY_MAX_BYTES,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -3420,5 +3422,387 @@ fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()
         "backlog-imported cards completed with no proof (crucible-010's real shape) must not qualify"
     );
 
+    Ok(())
+}
+
+#[test]
+fn idempotent_work_log_recovers_lost_response_and_replays_one_effect() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-work-log")?;
+    store.import_cards(vec![ready_card("operation-work-log", 1)])?;
+    let operation_id = OperationId::new("op-work-log-lost-response")?;
+    let authority = Authority::actor("agent-a", false);
+
+    let committed = store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "one durable effect",
+        10,
+        &authority,
+    )?;
+    assert_eq!(committed.state, OperationState::Succeeded);
+
+    // Simulate a response disappearing after commit by discarding `committed`
+    // and recovering only from the stable operation identity.
+    let recovered = store.operation_status(&operation_id, 11, &authority)?;
+    let replayed = store.append_work_log_idempotent(
+        operation_id,
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "one durable effect",
+        12,
+        &authority,
+    )?;
+    assert_eq!(recovered, replayed);
+    assert_eq!(
+        recovered.result.as_ref().unwrap()["body"],
+        "one durable effect"
+    );
+    assert!(recovered.audit_event_id.is_some());
+    assert_eq!(
+        store
+            .get_card_detail(&card_id, DetailLevel::Detailed)?
+            .unwrap()
+            .work_log
+            .len(),
+        1
+    );
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn conflicting_operation_reuse_fails_closed_without_mixed_state() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-conflict")?;
+    store.import_cards(vec![ready_card("operation-conflict", 1)])?;
+    let operation_id = OperationId::new("op-conflict")?;
+    let authority = Authority::actor("agent-a", false);
+    store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "winner",
+        10,
+        &authority,
+    )?;
+
+    let error = store
+        .append_work_log_idempotent(
+            operation_id,
+            &card_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            "different request",
+            11,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::Domain(DomainError::Conflict(_))
+    ));
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.work_log.len(), 1);
+    assert_eq!(detail.work_log[0].body, "winner");
+    Ok(())
+}
+
+#[test]
+fn idempotent_completion_replays_one_audited_permissive_outcome() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-completion")?;
+    store.import_cards(vec![ready_card("operation-completion", 1)])?;
+    let operation_id = OperationId::new("op-completion")?;
+    let authority = Authority::actor("operator", true);
+    let proofs = vec![CriterionProofInput {
+        criterion: 0,
+        url: "https://example.test/proof".to_string(),
+    }];
+
+    let first = store.complete_card_idempotent(
+        operation_id.clone(),
+        &card_id,
+        Some("credential-free proof"),
+        proofs.clone(),
+        10,
+        &authority,
+    )?;
+    let second = store.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("credential-free proof"),
+        proofs,
+        11,
+        &authority,
+    )?;
+    assert_eq!(first, second);
+    assert_eq!(first.result.as_ref().unwrap()["status"], "done");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(detail.events.len(), 1);
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn rejected_operation_is_durable_bounded_and_retryable_as_the_same_outcome() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let operation_id = OperationId::new("op-rejected")?;
+    let missing = CardId::new("missing-operation-card")?;
+    let authority = Authority::actor("agent-a", false);
+    let first = store.append_work_log_idempotent(
+        operation_id.clone(),
+        &missing,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "cannot append",
+        10,
+        &authority,
+    )?;
+    let second = store.append_work_log_idempotent(
+        operation_id,
+        &missing,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "cannot append",
+        11,
+        &authority,
+    )?;
+    assert_eq!(first, second);
+    assert_eq!(first.state, OperationState::Rejected);
+    assert_eq!(first.failure.as_ref().unwrap().code, "not_found");
+    assert!(first.failure.as_ref().unwrap().message.len() <= 512);
+    Ok(())
+}
+
+#[test]
+fn operation_transaction_rolls_back_effect_and_identity_when_persistence_fails() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-rollback")?;
+    store.import_cards(vec![ready_card("operation-rollback", 1)])?;
+    store.connection.execute_batch(
+        "CREATE TRIGGER inject_operation_finish_failure
+         BEFORE UPDATE OF state ON mutation_operations
+         BEGIN SELECT RAISE(ABORT, 'injected operation persistence failure'); END;",
+    )?;
+    let operation_id = OperationId::new("op-rollback")?;
+    let authority = Authority::actor("agent-a", false);
+
+    let error = store
+        .append_work_log_idempotent(
+            operation_id.clone(),
+            &card_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            "must roll back",
+            10,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    store
+        .connection
+        .execute_batch("DROP TRIGGER inject_operation_finish_failure")?;
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &authority)?.state,
+        OperationState::Unknown
+    );
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert!(detail.work_log.is_empty());
+    assert!(store.list_event_tail(0, 20)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-security")?;
+    store.import_cards(vec![ready_card("operation-security", 1)])?;
+    let operation_id = OperationId::new("op-security")?;
+    let owner = Authority::actor("agent-a", false);
+    store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "token sk-abcdefghijklmnopqrstuvwxyz123456",
+        10,
+        &owner,
+    )?;
+    let visible = store.operation_status(&operation_id, 11, &owner)?;
+    let serialized = serde_json::to_string(&visible)?;
+    assert!(serialized.contains("[REDACTED:openai-key]"));
+    assert!(!serialized.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    let forbidden = store.operation_status(&operation_id, 11, &Authority::actor("agent-b", false));
+    assert!(matches!(
+        forbidden,
+        Err(StoreError::Domain(DomainError::Forbidden(_)))
+    ));
+    assert_eq!(
+        store
+            .operation_status(&operation_id, 10 + OPERATION_RETENTION_SECONDS, &owner)?
+            .state,
+        OperationState::Unknown
+    );
+    assert_eq!(
+        store
+            .get_card_detail(&card_id, DetailLevel::Detailed)?
+            .unwrap()
+            .work_log
+            .len(),
+        1,
+        "retention removes recovery metadata, not the audited mutation effect"
+    );
+    Ok(())
+}
+
+#[test]
+fn oversized_operation_request_has_no_operation_or_mutation_effect() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-bounds")?;
+    store.import_cards(vec![ready_card("operation-bounds", 1)])?;
+    let operation_id = OperationId::new("op-bounds")?;
+    let authority = Authority::actor("agent-a", false);
+    assert!(store
+        .append_work_log_idempotent(
+            operation_id.clone(),
+            &card_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            &"x".repeat(WORK_LOG_BODY_MAX_BYTES + 1),
+            10,
+            &authority,
+        )
+        .is_err());
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &authority)?.state,
+        OperationState::Unknown
+    );
+    assert!(store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap()
+        .work_log
+        .is_empty());
+    Ok(())
+}
+
+#[test]
+fn identical_operation_race_converges_on_one_stored_outcome() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("operation-identical-race");
+    let card_id = CardId::new("operation-identical-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("operation-identical-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || -> Result<_> {
+                let mut store = Store::open(path)?;
+                store.migrate()?;
+                barrier.wait();
+                store.append_work_log_idempotent(
+                    OperationId::new("op-identical-race")?,
+                    &card_id,
+                    "agent-a",
+                    WorkLogAttribution::default(),
+                    "same",
+                    10,
+                    &Authority::actor("agent-a", false),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(results[0], results[1]);
+    let store = Store::open(path)?;
+    assert_eq!(
+        store
+            .get_card_detail(&card_id, DetailLevel::Detailed)?
+            .unwrap()
+            .work_log
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn conflicting_operation_race_has_one_winner_and_no_mixed_state() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("operation-conflicting-race");
+    let card_id = CardId::new("operation-conflicting-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("operation-conflicting-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = ["request-a", "request-b"]
+        .into_iter()
+        .map(|body| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(path).unwrap();
+                store.migrate().unwrap();
+                barrier.wait();
+                store.append_work_log_idempotent(
+                    OperationId::new("op-conflicting-race").unwrap(),
+                    &card_id,
+                    "agent-a",
+                    WorkLogAttribution::default(),
+                    body,
+                    10,
+                    &Authority::actor("agent-a", false),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.work_log.len(), 1);
+    assert!(matches!(
+        detail.work_log[0].body.as_str(),
+        "request-a" | "request-b"
+    ));
     Ok(())
 }

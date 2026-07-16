@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -134,6 +134,24 @@ CREATE TABLE IF NOT EXISTS work_log_entries (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
+
+CREATE TABLE IF NOT EXISTS mutation_operations (
+  operation_id TEXT PRIMARY KEY,
+  request_digest TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion')),
+  target_card_id TEXT NOT NULL,
+  authority TEXT NOT NULL,
+  expected_run_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+  result_json TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  audit_event_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
 
 CREATE TABLE IF NOT EXISTS event_subscriptions (
   id TEXT PRIMARY KEY,
@@ -362,6 +380,30 @@ ALTER TABLE cards ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'review';
 /// backfill it.
 pub const MIGRATE_12_TO_13: &str = r#"
 ALTER TABLE cards ADD COLUMN estimate TEXT;
+"#;
+
+/// powder-mutation-idempotency: a bounded operation ledger for ambiguous
+/// retry recovery. The mutation effect and terminal operation outcome are
+/// committed in one SQLite transaction. Expired rows are pruned by store
+/// operations, so this table is a recovery window rather than an audit log.
+pub const MIGRATE_13_TO_14: &str = r#"
+CREATE TABLE IF NOT EXISTS mutation_operations (
+  operation_id TEXT PRIMARY KEY,
+  request_digest TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion')),
+  target_card_id TEXT NOT NULL,
+  authority TEXT NOT NULL,
+  expected_run_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+  result_json TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  audit_event_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,

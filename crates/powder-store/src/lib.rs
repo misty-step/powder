@@ -6,12 +6,13 @@ use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId,
-    RunState, WorkLogEntry,
+    CriterionProof, DomainError, Estimate, Link, LinkId, OperationField, OperationId,
+    OperationKind, OperationRequest, OperationState, Priority, ReadyQuery, Run, RunId, RunState,
+    WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use serde::{de::DeserializeOwned, Serialize};
-use serde_json::json;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 
 mod answer_loop;
 mod events;
@@ -36,12 +37,22 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5,
-    MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10,
-    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4,
+    MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
+    MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+pub const OPERATION_STATUS_SCHEMA_VERSION: &str = "powder.operation_status.v1";
+pub const OPERATION_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const OPERATION_FAILURE_MESSAGE_MAX_BYTES: usize = 512;
+pub const WORK_LOG_AGENT_MAX_BYTES: usize = 256;
+pub const WORK_LOG_ATTRIBUTION_MAX_BYTES: usize = 256;
+pub const WORK_LOG_BODY_MAX_BYTES: usize = 16 * 1024;
+pub const COMPLETION_PROOF_MAX_BYTES: usize = 4 * 1024;
+pub const CRITERION_PROOF_MAX_COUNT: usize = 128;
+pub const CRITERION_PROOF_URL_MAX_BYTES: usize = 4 * 1024;
 
 const API_KEY_ALPHABET: [char; 64] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
@@ -217,7 +228,7 @@ pub struct CardPatch {
     pub labels: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CriterionProofInput {
     pub criterion: usize,
     pub url: String,
@@ -234,6 +245,65 @@ pub struct WorkLogAttribution<'a> {
     pub reasoning: Option<&'a str>,
     pub harness: Option<&'a str>,
     pub run_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationFailure {
+    pub code: String,
+    pub message: String,
+}
+
+/// Bounded, versioned recovery view for one mutation operation.
+///
+/// `unknown` intentionally contains no inferred mutation outcome. A missing
+/// row can mean the request never reached Powder, the transaction rolled
+/// back, or the retention window elapsed. Callers must not treat it as
+/// success or blindly retry after the retention deadline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperationStatus {
+    pub schema_version: String,
+    pub operation_id: OperationId,
+    pub state: OperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<OperationKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_card_id: Option<CardId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_run_id: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<OperationFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+impl OperationStatus {
+    fn unknown(operation_id: OperationId) -> Self {
+        Self {
+            schema_version: OPERATION_STATUS_SCHEMA_VERSION.to_string(),
+            operation_id,
+            state: OperationState::Unknown,
+            request_digest: None,
+            kind: None,
+            target_card_id: None,
+            expected_run_id: None,
+            result: None,
+            failure: None,
+            audit_event_id: None,
+            created_at: None,
+            updated_at: None,
+            expires_at: None,
+        }
+    }
 }
 
 impl Store {
@@ -335,6 +405,10 @@ impl Store {
                 12 => {
                     self.migrate_12_to_13()?;
                     13
+                }
+                13 => {
+                    self.connection.execute_batch(MIGRATE_13_TO_14)?;
+                    14
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1331,49 +1405,112 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let card = load_card(&transaction, card_id)?;
-        let run_id = attribution.run_id.map(RunId::new).transpose()?;
-        let entry = WorkLogEntry {
-            card_id: card_id.clone(),
-            agent: non_empty("agent", agent)?,
-            model: attribution.model.map(str::to_owned),
-            reasoning: attribution.reasoning.map(str::to_owned),
-            harness: attribution.harness.map(str::to_owned),
-            run_id,
-            body: secrets::scrub_secrets(&non_empty("body", body)?),
-            created_at: now,
-        };
-        let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
-        transaction.execute(
-            "INSERT INTO work_log_entries
-             (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                entry.card_id.as_str(),
-                entry.agent,
-                entry.model,
-                entry.reasoning,
-                entry.harness,
-                entry.run_id.as_ref().map(RunId::as_str),
-                entry.body,
-                entry.created_at,
-            ],
-        )?;
-        events::append_outbound_card_event(
-            &transaction,
-            &card,
-            "work-log-appended",
-            &entry.agent,
-            json!({
-                "agent": entry.agent.as_str(),
-                "model": entry.model,
-                "harness": entry.harness,
-            }),
-            now,
-        )?;
+        let (entry, _) =
+            append_work_log_in_transaction(&transaction, card_id, agent, attribution, body, now)?;
         transaction.commit()?;
         Ok(entry)
+    }
+
+    /// Retry-safe work-log append using one durable operation identity.
+    ///
+    /// This is the generic P2 substrate. It deliberately does not enforce
+    /// that `run_id` is the card's current run. P3 owns that stricter rule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_work_log_idempotent(
+        &mut self,
+        operation_id: OperationId,
+        card_id: &CardId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        validate_bounded_non_empty("agent", agent, WORK_LOG_AGENT_MAX_BYTES)?;
+        validate_optional_bound("model", attribution.model, WORK_LOG_ATTRIBUTION_MAX_BYTES)?;
+        validate_optional_bound(
+            "reasoning",
+            attribution.reasoning,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        validate_optional_bound(
+            "harness",
+            attribution.harness,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        validate_bounded_non_empty("body", body, WORK_LOG_BODY_MAX_BYTES)?;
+        let expected_run = attribution.run_id.map(RunId::new).transpose()?;
+        let request = OperationRequest::new(
+            operation_id,
+            OperationKind::WorkLogAppend,
+            card_id.clone(),
+            &authority.actor_label(),
+            expected_run,
+            &[
+                OperationField {
+                    name: "agent",
+                    value: Some(agent),
+                },
+                OperationField {
+                    name: "model",
+                    value: attribution.model,
+                },
+                OperationField {
+                    name: "reasoning",
+                    value: attribution.reasoning,
+                },
+                OperationField {
+                    name: "harness",
+                    value: attribution.harness,
+                },
+                OperationField {
+                    name: "body",
+                    value: Some(body),
+                },
+            ],
+        )?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
+        }
+        reserve_operation(&transaction, &request, now)?;
+        match append_work_log_in_transaction(&transaction, card_id, agent, attribution, body, now) {
+            Ok((entry, event_id)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Succeeded,
+                    Some(json!(entry)),
+                    None,
+                    Some(event_id),
+                    now,
+                )?;
+            }
+            Err(StoreError::Domain(error)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Rejected,
+                    None,
+                    Some(operation_failure(&error)),
+                    None,
+                    now,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
     }
 
     pub fn request_input(
@@ -1436,78 +1573,521 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
-        let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (card, _) = complete_card_in_transaction(
+            &transaction,
+            card_id,
+            proof,
+            criterion_proofs,
+            now,
+            authority,
+            self.field_note_config.as_ref(),
+        )?;
+        transaction.commit()?;
+        Ok(card)
+    }
+
+    /// Retry-safe permissive completion using the shared P2 operation
+    /// substrate. This preserves Powder's explicit operator correction path
+    /// and does not add P1's expected-current-run precondition.
+    pub fn complete_card_idempotent(
+        &mut self,
+        operation_id: OperationId,
+        card_id: &CardId,
+        proof: Option<&str>,
+        criterion_proofs: Vec<CriterionProofInput>,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        validate_optional_bound("proof", proof, COMPLETION_PROOF_MAX_BYTES)?;
+        if criterion_proofs.len() > CRITERION_PROOF_MAX_COUNT {
+            return Err(DomainError::validation(
+                "criterion_proofs",
+                format!("must contain at most {CRITERION_PROOF_MAX_COUNT} items"),
+            )
+            .into());
+        }
+        for criterion_proof in &criterion_proofs {
+            validate_bounded_non_empty(
+                "criterion proof url",
+                &criterion_proof.url,
+                CRITERION_PROOF_URL_MAX_BYTES,
+            )?;
+        }
         let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+        let criterion_payload = to_json(&criterion_proofs)?;
+        let request = OperationRequest::new(
+            operation_id,
+            OperationKind::Completion,
+            card_id.clone(),
+            &authority.actor_label(),
+            None,
+            &[
+                OperationField {
+                    name: "proof",
+                    value: proof,
+                },
+                OperationField {
+                    name: "criterion_proofs",
+                    value: Some(&criterion_payload),
+                },
+            ],
+        )?;
         let field_note_config = self.field_note_config.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-
-        let previous = card.status;
-        let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
-
-        card.status = CardStatus::Done;
-        card.claim = None;
-        for criterion_proof in criterion_proofs {
-            let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
-            criterion.proof_links.push(CriterionProof {
-                url: criterion_proof.url,
-                actor: authority.actor_label(),
-                created_at: now,
-            });
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
         }
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        if let Some(run_id) = run_id {
-            close_run_for_status(
-                &transaction,
-                &run_id,
-                CardStatus::Done,
-                now,
-                proof.as_deref(),
-            )?;
-            append_activity(
-                &transaction,
-                &run_id,
-                ActivityType::Response,
-                proof
-                    .as_deref()
-                    .map(|proof| format!("completed: {proof}"))
-                    .unwrap_or_else(|| "completed without proof".to_string())
-                    .as_str(),
-                now,
-            )?;
-        }
-        append_card_event(
+        reserve_operation(&transaction, &request, now)?;
+        match complete_card_in_transaction(
             &transaction,
             card_id,
-            "status",
-            &authority.actor_label(),
-            &format!("{} -> done", previous.as_str()),
+            proof,
+            criterion_proofs,
+            now,
+            authority,
+            field_note_config.as_ref(),
+        ) {
+            Ok((card, event_id)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Succeeded,
+                    Some(json!({
+                        "card_id": card.id,
+                        "status": card.status,
+                        "updated_at": card.updated_at,
+                    })),
+                    None,
+                    Some(event_id),
+                    now,
+                )?;
+            }
+            Err(StoreError::Domain(error)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Rejected,
+                    None,
+                    Some(operation_failure(&error)),
+                    None,
+                    now,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Read one bounded operation outcome after pruning expired recovery
+    /// records. Unknown is returned as data rather than a 404 so callers can
+    /// distinguish an absent operation from transport failure.
+    pub fn operation_status(
+        &mut self,
+        operation_id: &OperationId,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        prune_expired_operations(&self.connection, now)?;
+        let Some(operation) = load_operation(&self.connection, operation_id)? else {
+            return Ok(OperationStatus::unknown(operation_id.clone()));
+        };
+        authority.require_operation_authority(&operation.authority)?;
+        operation.into_status()
+    }
+
+    pub fn prune_operations(&mut self, now: i64) -> Result<usize> {
+        prune_expired_operations(&self.connection, now)
+    }
+}
+
+fn append_work_log_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    agent: &str,
+    attribution: WorkLogAttribution<'_>,
+    body: &str,
+    now: i64,
+) -> Result<(WorkLogEntry, String)> {
+    let card = load_card(transaction, card_id)?;
+    let run_id = attribution.run_id.map(RunId::new).transpose()?;
+    let entry = WorkLogEntry {
+        card_id: card_id.clone(),
+        agent: non_empty("agent", agent)?,
+        model: attribution.model.map(str::to_owned),
+        reasoning: attribution.reasoning.map(str::to_owned),
+        harness: attribution.harness.map(str::to_owned),
+        run_id,
+        body: secrets::scrub_secrets(&non_empty("body", body)?),
+        created_at: now,
+    };
+    let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+    transaction.execute(
+        "INSERT INTO work_log_entries
+         (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            entry.card_id.as_str(),
+            entry.agent,
+            entry.model,
+            entry.reasoning,
+            entry.harness,
+            entry.run_id.as_ref().map(RunId::as_str),
+            entry.body,
+            entry.created_at,
+        ],
+    )?;
+    let event = events::append_outbound_card_event(
+        transaction,
+        &card,
+        "work-log-appended",
+        &entry.agent,
+        json!({
+            "agent": entry.agent.as_str(),
+            "model": entry.model,
+            "harness": entry.harness,
+        }),
+        now,
+    )?;
+    Ok((entry, event.event_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_card_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    proof: Option<&str>,
+    criterion_proofs: Vec<CriterionProofInput>,
+    now: i64,
+    authority: &Authority,
+    field_note_config: Option<&FieldNoteConfig>,
+) -> Result<(Card, String)> {
+    let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
+    let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+    let mut card = load_card(transaction, card_id)?;
+    let previous = card.status;
+    let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
+
+    card.status = CardStatus::Done;
+    card.claim = None;
+    for criterion_proof in criterion_proofs {
+        let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
+        criterion.proof_links.push(CriterionProof {
+            url: criterion_proof.url,
+            actor: authority.actor_label(),
+            created_at: now,
+        });
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    if let Some(run_id) = run_id {
+        close_run_for_status(
+            transaction,
+            &run_id,
+            CardStatus::Done,
+            now,
+            proof.as_deref(),
+        )?;
+        append_activity(
+            transaction,
+            &run_id,
+            ActivityType::Response,
+            proof
+                .as_deref()
+                .map(|proof| format!("completed: {proof}"))
+                .unwrap_or_else(|| "completed without proof".to_string())
+                .as_str(),
             now,
         )?;
-        if !previous.is_terminal() {
-            events::append_outbound_card_event(
-                &transaction,
-                &card,
-                "completed",
-                &authority.actor_label(),
-                json!({
-                    "previous_status": previous.as_str(),
-                    "status": card.status.as_str(),
-                    "proof": proof,
-                    "criteria": card.criteria
-                }),
-                now,
-            )?;
-            if let Some(config) = &field_note_config {
-                maybe_spawn_field_note_draft(&transaction, &card, proof.as_deref(), config, now)?;
-            }
-        }
-        transaction.commit()?;
-        Ok(card)
     }
+    let audit_event = append_card_event(
+        transaction,
+        card_id,
+        "status",
+        &authority.actor_label(),
+        &format!("{} -> done", previous.as_str()),
+        now,
+    )?;
+    if !previous.is_terminal() {
+        events::append_outbound_card_event(
+            transaction,
+            &card,
+            "completed",
+            &authority.actor_label(),
+            json!({
+                "previous_status": previous.as_str(),
+                "status": card.status.as_str(),
+                "proof": proof,
+                "criteria": card.criteria
+            }),
+            now,
+        )?;
+        if let Some(config) = field_note_config {
+            maybe_spawn_field_note_draft(transaction, &card, proof.as_deref(), config, now)?;
+        }
+    }
+    Ok((card, audit_event.id.to_string()))
+}
+
+#[derive(Debug)]
+struct StoredOperation {
+    operation_id: OperationId,
+    request_digest: String,
+    kind: OperationKind,
+    target_card_id: CardId,
+    authority: String,
+    expected_run_id: Option<RunId>,
+    state: OperationState,
+    result_json: Option<String>,
+    failure_code: Option<String>,
+    failure_message: Option<String>,
+    audit_event_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    expires_at: i64,
+}
+
+impl StoredOperation {
+    fn into_status(self) -> Result<OperationStatus> {
+        let result = self
+            .result_json
+            .as_deref()
+            .map(|raw| from_json::<Value>("operation.result_json", raw.to_string()))
+            .transpose()?;
+        let failure = match (self.failure_code, self.failure_message) {
+            (Some(code), Some(message)) => Some(OperationFailure { code, message }),
+            (None, None) => None,
+            (code, message) => {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "operation_failure",
+                    value: format!("code={code:?}, message={message:?}"),
+                });
+            }
+        };
+        Ok(OperationStatus {
+            schema_version: OPERATION_STATUS_SCHEMA_VERSION.to_string(),
+            operation_id: self.operation_id,
+            state: self.state,
+            request_digest: Some(self.request_digest),
+            kind: Some(self.kind),
+            target_card_id: Some(self.target_card_id),
+            expected_run_id: self.expected_run_id,
+            result,
+            failure,
+            audit_event_id: self.audit_event_id,
+            created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
+            expires_at: Some(self.expires_at),
+        })
+    }
+}
+
+fn reserve_operation(connection: &Connection, request: &OperationRequest, now: i64) -> Result<()> {
+    connection.execute(
+        "INSERT INTO mutation_operations (
+           operation_id, request_digest, kind, target_card_id, authority,
+           expected_run_id, state, result_json, failure_code, failure_message,
+           audit_event_id, created_at, updated_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, NULL, NULL, ?7, ?7, ?8)",
+        params![
+            request.id.as_str(),
+            request.request_digest,
+            request.kind.as_str(),
+            request.target.as_str(),
+            request.authority,
+            request.expected_run.as_ref().map(RunId::as_str),
+            now,
+            now.saturating_add(OPERATION_RETENTION_SECONDS),
+        ],
+    )?;
+    Ok(())
+}
+
+fn finish_operation(
+    connection: &Connection,
+    operation_id: &OperationId,
+    state: OperationState,
+    result: Option<Value>,
+    failure: Option<OperationFailure>,
+    audit_event_id: Option<String>,
+    now: i64,
+) -> Result<()> {
+    debug_assert!(matches!(
+        state,
+        OperationState::Succeeded | OperationState::Rejected | OperationState::Failed
+    ));
+    let result_json = result.as_ref().map(to_json).transpose()?;
+    connection.execute(
+        "UPDATE mutation_operations
+         SET state = ?2, result_json = ?3, failure_code = ?4,
+             failure_message = ?5, audit_event_id = ?6, updated_at = ?7
+         WHERE operation_id = ?1 AND state = 'pending'",
+        params![
+            operation_id.as_str(),
+            state.as_str(),
+            result_json,
+            failure.as_ref().map(|failure| failure.code.as_str()),
+            failure.as_ref().map(|failure| failure.message.as_str()),
+            audit_event_id,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_operation(
+    connection: &Connection,
+    operation_id: &OperationId,
+) -> Result<Option<StoredOperation>> {
+    connection
+        .query_row(
+            "SELECT operation_id, request_digest, kind, target_card_id, authority,
+                    expected_run_id, state, result_json, failure_code, failure_message,
+                    audit_event_id, created_at, updated_at, expires_at
+             FROM mutation_operations WHERE operation_id = ?1",
+            [operation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                operation_id,
+                request_digest,
+                kind,
+                target_card_id,
+                authority,
+                expected_run_id,
+                state,
+                result_json,
+                failure_code,
+                failure_message,
+                audit_event_id,
+                created_at,
+                updated_at,
+                expires_at,
+            )| {
+                Ok(StoredOperation {
+                    operation_id: OperationId::new(operation_id)?,
+                    request_digest,
+                    kind: OperationKind::parse(&kind).ok_or_else(|| {
+                        StoreError::InvalidStoredValue {
+                            field: "operation.kind",
+                            value: kind,
+                        }
+                    })?,
+                    target_card_id: CardId::new(target_card_id)?,
+                    authority,
+                    expected_run_id: expected_run_id.map(RunId::new).transpose()?,
+                    state: OperationState::parse(&state).ok_or_else(|| {
+                        StoreError::InvalidStoredValue {
+                            field: "operation.state",
+                            value: state,
+                        }
+                    })?,
+                    result_json,
+                    failure_code,
+                    failure_message,
+                    audit_event_id,
+                    created_at,
+                    updated_at,
+                    expires_at,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn replay_operation(
+    existing: StoredOperation,
+    request: &OperationRequest,
+) -> Result<OperationStatus> {
+    if existing.request_digest != request.request_digest {
+        return Err(DomainError::conflict(format!(
+            "operation id {} was already used for a different request",
+            request.id
+        ))
+        .into());
+    }
+    existing.into_status()
+}
+
+fn prune_expired_operations(connection: &Connection, now: i64) -> Result<usize> {
+    Ok(connection.execute(
+        "DELETE FROM mutation_operations WHERE expires_at <= ?1",
+        [now],
+    )?)
+}
+
+fn operation_failure(error: &DomainError) -> OperationFailure {
+    let code = match error {
+        DomainError::Validation { .. } => "validation",
+        DomainError::NotFound { .. } => "not_found",
+        DomainError::Conflict(_) => "conflict",
+        DomainError::Forbidden(_) => "forbidden",
+        DomainError::ClaimExpired(_) => "claim_expired",
+    };
+    OperationFailure {
+        code: code.to_string(),
+        message: truncate_utf8(&error.to_string(), OPERATION_FAILURE_MESSAGE_MAX_BYTES),
+    }
+}
+
+fn truncate_utf8(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_string();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn validate_bounded_non_empty(field: &'static str, value: &str, maximum: usize) -> Result<()> {
+    non_empty(field, value)?;
+    if value.len() > maximum {
+        return Err(
+            DomainError::validation(field, format!("must be at most {maximum} bytes")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_optional_bound(field: &'static str, value: Option<&str>, maximum: usize) -> Result<()> {
+    if let Some(value) = value {
+        validate_bounded_non_empty(field, value, maximum)?;
+    }
+    Ok(())
 }
 
 /// The field-note seed generator's actual eligibility check and draft spawn

@@ -1,6 +1,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -136,6 +137,25 @@ impl Authority {
             Self::Actor { display_name, .. } => display_name.clone(),
         }
     }
+
+    /// Operation recovery is scoped to the authenticated authority that
+    /// created the operation. Admins and unchecked local operator surfaces
+    /// may inspect any operation, while an agent may inspect only its own.
+    pub fn require_operation_authority(&self, recorded: &str) -> Result<(), DomainError> {
+        match self {
+            Self::Unchecked | Self::Actor { is_admin: true, .. } => Ok(()),
+            Self::Actor {
+                display_name,
+                is_admin: false,
+            } if display_name == recorded => Ok(()),
+            Self::Actor {
+                display_name,
+                is_admin: false,
+            } => Err(DomainError::forbidden(format!(
+                "actor {display_name} cannot inspect this operation"
+            ))),
+        }
+    }
 }
 
 macro_rules! id_type {
@@ -178,6 +198,259 @@ id_type!(RunId, "run_id");
 id_type!(ActivityId, "activity_id");
 id_type!(CardEventId, "card_event_id");
 id_type!(LinkId, "link_id");
+
+pub const OPERATION_REQUEST_SCHEMA_VERSION: &str = "powder.operation_request.v1";
+pub const OPERATION_ID_MAX_BYTES: usize = 128;
+pub const OPERATION_AUTHORITY_MAX_BYTES: usize = 256;
+pub const OPERATION_TARGET_MAX_BYTES: usize = 256;
+pub const OPERATION_REQUEST_MAX_BYTES: usize = 64 * 1024;
+
+/// Stable caller-supplied identity for one retryable mutation.
+///
+/// The deliberately narrow ASCII alphabet keeps operation ids safe in URL
+/// path segments, logs, SQLite keys, CLI output, and MCP payloads without
+/// adapter-specific escaping rules.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OperationId(String);
+
+impl OperationId {
+    pub fn new(raw: impl Into<String>) -> Result<Self, DomainError> {
+        let raw = raw.into();
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(DomainError::validation(
+                "operation_id",
+                "id cannot be empty",
+            ));
+        }
+        if value.len() > OPERATION_ID_MAX_BYTES {
+            return Err(DomainError::validation(
+                "operation_id",
+                format!("must be at most {OPERATION_ID_MAX_BYTES} bytes"),
+            ));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err(DomainError::validation(
+                "operation_id",
+                "must use only ASCII letters, digits, '-', '_', '.', or ':'",
+            ));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    WorkLogAppend,
+    Completion,
+}
+
+impl OperationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkLogAppend => "work_log_append",
+            Self::Completion => "completion",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "work_log_append" => Some(Self::WorkLogAppend),
+            "completion" => Some(Self::Completion),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Unknown,
+    Pending,
+    Succeeded,
+    Rejected,
+    Failed,
+}
+
+impl OperationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Pending => "pending",
+            Self::Succeeded => "succeeded",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "succeeded" => Some(Self::Succeeded),
+            "rejected" => Some(Self::Rejected),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One ordered canonical payload component.
+///
+/// Callers must provide fields in the operation kind's documented order.
+/// Names and values are length-prefixed before hashing, so delimiter and
+/// absent-versus-empty ambiguities cannot collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationField<'a> {
+    pub name: &'a str,
+    pub value: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRequest {
+    pub id: OperationId,
+    pub kind: OperationKind,
+    pub target: CardId,
+    pub authority: String,
+    pub expected_run: Option<RunId>,
+    pub request_digest: String,
+}
+
+impl OperationRequest {
+    pub fn new(
+        id: OperationId,
+        kind: OperationKind,
+        target: CardId,
+        authority: &str,
+        expected_run: Option<RunId>,
+        payload: &[OperationField<'_>],
+    ) -> Result<Self, DomainError> {
+        validate_operation_component(
+            "operation target",
+            target.as_str(),
+            OPERATION_TARGET_MAX_BYTES,
+        )?;
+        validate_operation_component(
+            "operation authority",
+            authority,
+            OPERATION_AUTHORITY_MAX_BYTES,
+        )?;
+
+        let mut canonical_bytes = 0usize;
+        let mut hasher = Sha256::new();
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "schema",
+            Some(OPERATION_REQUEST_SCHEMA_VERSION),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "kind",
+            Some(kind.as_str()),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "target_type",
+            Some("card"),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "target",
+            Some(target.as_str()),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "authority",
+            Some(authority),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "expected_run",
+            expected_run.as_ref().map(RunId::as_str),
+        )?;
+        for field in payload {
+            hash_component(&mut hasher, &mut canonical_bytes, field.name, field.value)?;
+        }
+
+        Ok(Self {
+            id,
+            kind,
+            target,
+            authority: authority.to_owned(),
+            expected_run,
+            request_digest: format!("sha256:{:x}", hasher.finalize()),
+        })
+    }
+}
+
+fn validate_operation_component(
+    field: &'static str,
+    value: &str,
+    maximum: usize,
+) -> Result<(), DomainError> {
+    if value.is_empty() {
+        return Err(DomainError::validation(field, "cannot be empty"));
+    }
+    if value.len() > maximum {
+        return Err(DomainError::validation(
+            field,
+            format!("must be at most {maximum} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_component(
+    hasher: &mut Sha256,
+    canonical_bytes: &mut usize,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), DomainError> {
+    let value_len = value.map_or(0, str::len);
+    let added = 8usize
+        .checked_add(name.len())
+        .and_then(|count| count.checked_add(value_len))
+        .ok_or_else(|| DomainError::validation("operation request", "size overflow"))?;
+    *canonical_bytes = canonical_bytes
+        .checked_add(added)
+        .ok_or_else(|| DomainError::validation("operation request", "size overflow"))?;
+    if *canonical_bytes > OPERATION_REQUEST_MAX_BYTES {
+        return Err(DomainError::validation(
+            "operation request",
+            format!("must be at most {OPERATION_REQUEST_MAX_BYTES} canonical bytes"),
+        ));
+    }
+    hasher.update((name.len() as u32).to_be_bytes());
+    hasher.update(name.as_bytes());
+    match value {
+        Some(value) => {
+            hasher.update((value.len() as u32).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update(u32::MAX.to_be_bytes()),
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1651,5 +1924,58 @@ mod tests {
     fn claim_readiness_ok_when_criteria_present_and_unblocked() {
         let card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
         assert!(card.claim_readiness(10, |_| true).is_ok());
+    }
+
+    #[test]
+    fn operation_digest_is_stable_and_covers_every_authority_and_payload_dimension() {
+        let build = |authority: &str, body: &str, run: Option<&str>| {
+            OperationRequest::new(
+                OperationId::new("op:stable-1").unwrap(),
+                OperationKind::WorkLogAppend,
+                CardId::new("card-1").unwrap(),
+                authority,
+                run.map(|value| RunId::new(value).unwrap()),
+                &[
+                    OperationField {
+                        name: "agent",
+                        value: Some("agent-a"),
+                    },
+                    OperationField {
+                        name: "body",
+                        value: Some(body),
+                    },
+                ],
+            )
+            .unwrap()
+            .request_digest
+        };
+
+        let digest = build("agent-a", "same", Some("run-1"));
+        assert_eq!(digest, build("agent-a", "same", Some("run-1")));
+        assert_ne!(digest, build("agent-b", "same", Some("run-1")));
+        assert_ne!(digest, build("agent-a", "changed", Some("run-1")));
+        assert_ne!(digest, build("agent-a", "same", Some("run-2")));
+        assert_ne!(digest, build("agent-a", "same", None));
+    }
+
+    #[test]
+    fn operation_identity_and_canonical_request_are_bounded() {
+        assert!(OperationId::new("valid.id:1_test").is_ok());
+        assert!(OperationId::new("contains/slash").is_err());
+        assert!(OperationId::new("x".repeat(OPERATION_ID_MAX_BYTES + 1)).is_err());
+        let oversized = "x".repeat(OPERATION_REQUEST_MAX_BYTES);
+        let error = OperationRequest::new(
+            OperationId::new("op-bounded").unwrap(),
+            OperationKind::Completion,
+            CardId::new("card-1").unwrap(),
+            "operator",
+            None,
+            &[OperationField {
+                name: "proof",
+                value: Some(&oversized),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical bytes"));
     }
 }
