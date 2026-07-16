@@ -4046,7 +4046,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_reviews_run_scoped_criterion_and_prints_recovery_status() {
+    fn direct_database_cli_cannot_create_authoritative_review() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4079,7 +4079,7 @@ mod tests {
             (claim.run_id.to_string(), criterion_id)
         };
 
-        let output = run(&args([
+        let error = run(&args([
             "review-criterion",
             "cli-review",
             "--db",
@@ -4099,20 +4099,16 @@ mod tests {
             "--actor",
             "cli-reviewer",
         ]))
-        .unwrap();
-        let status: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(status["state"], "succeeded");
-        assert_eq!(status["kind"], "criterion_review");
-        assert_eq!(status["result"]["reviewer"], "cli-reviewer");
-        assert_eq!(status["result"]["run_id"], run_id);
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("run-scoped criterion review requires authenticated authority"));
 
         let detail: Value =
             serde_json::from_str(&run(&args(["get-card", "cli-review", "--db", &db])).unwrap())
                 .unwrap();
-        assert_eq!(
-            detail["current_run_criteria"][0]["review"],
-            status["result"]
-        );
+        assert!(detail.get("criterion_reviews").is_none());
+        assert!(detail["current_run_criteria"][0].get("review").is_none());
     }
 
     #[test]

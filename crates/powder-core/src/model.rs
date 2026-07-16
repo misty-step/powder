@@ -174,6 +174,23 @@ impl Authority {
         }
     }
 
+    /// Return the stable identity supplied by an authenticated adapter.
+    ///
+    /// Run-scoped review deliberately excludes unchecked and label-only local
+    /// authority. Those surfaces retain the separate legacy criterion
+    /// correction mutation, but cannot create authoritative review state.
+    pub fn require_authenticated_identity(&self) -> Result<&str, DomainError> {
+        match self {
+            Self::Actor {
+                operation_identity: Some(identity),
+                ..
+            } => Ok(identity),
+            Self::Unchecked | Self::Actor { .. } => Err(DomainError::forbidden(
+                "run-scoped criterion review requires authenticated authority",
+            )),
+        }
+    }
+
     /// Operation recovery is scoped to the authenticated authority that
     /// created the operation. Admins and unchecked local operator surfaces
     /// may inspect any operation, while an agent may inspect only its own.

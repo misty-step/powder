@@ -2305,7 +2305,7 @@ Expose tools against the DB.
     }
 
     #[test]
-    fn mcp_reviews_exact_current_run_criterion_and_exposes_history() {
+    fn direct_store_mcp_cannot_create_authoritative_review() {
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
         let now = std::time::SystemTime::now()
@@ -2363,11 +2363,8 @@ Expose tools against the DB.
             }),
             now + 3,
         )
-        .unwrap();
-        let reviewed = tool_payload(&reviewed);
-        assert_eq!(reviewed["state"], "succeeded");
-        assert_eq!(reviewed["kind"], "criterion_review");
-        assert_eq!(reviewed["result"]["reviewer"], "mcp-reviewer");
+        .unwrap_err();
+        assert!(reviewed.contains("run-scoped criterion review requires authenticated authority"));
 
         let card_detail = call_tool_store(
             &mut store,
@@ -2386,11 +2383,11 @@ Expose tools against the DB.
         let card_detail = tool_payload(&card_detail);
         let run_detail = tool_payload(&run_detail);
         assert_eq!(card_detail["current_run_criteria"], run_detail["criteria"]);
-        assert_eq!(
-            card_detail["criterion_reviews"],
-            run_detail["criterion_reviews"]
-        );
-        assert_eq!(card_detail["criterion_reviews"][0], reviewed["result"]);
+        assert!(card_detail.get("criterion_reviews").is_none());
+        assert!(run_detail.get("criterion_reviews").is_none());
+        assert!(card_detail["current_run_criteria"][0]
+            .get("review")
+            .is_none());
     }
 
     #[test]

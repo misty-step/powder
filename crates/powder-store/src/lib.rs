@@ -871,6 +871,7 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<OperationStatus> {
+        authority.require_authenticated_identity()?;
         let criterion_id = non_empty("criterion_id", &input.criterion_id)?;
         let proof = input
             .proof

@@ -11,7 +11,8 @@ The reviewer is always derived from authenticated authority.
 There is no reviewer or actor request field.
 An authenticated non-admin authority must hold the current claim.
 An authenticated administrator may review as an auditable operator correction, but the card must still have the specified live current run.
-Unchecked direct-database CLI and stdio MCP retain their local-operator trust model and are recorded as `unchecked` unless an explicit local actor is supplied.
+Unchecked and label-only local authority cannot create authoritative run-scoped review state.
+Direct-database CLI and stdio MCP retain the explicit legacy `check-criterion` correction path, whose `checked_by` and `checked_at` fields remain non-authoritative for run-scoped completion.
 
 The operation digest uses `powder.operation_request.v1` with kind `criterion_review`.
 Its target is the card, its expected-run component is the specified run, and ordered payload fields are `criterion_index`, `criterion_id`, `decision`, and `proof`.

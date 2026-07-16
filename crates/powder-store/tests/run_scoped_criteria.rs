@@ -43,13 +43,17 @@ fn review_input(
     }
 }
 
+fn authenticated_operator() -> Authority {
+    Authority::authenticated("operator", "actor-operator", true)
+}
+
 #[test]
 fn review_replay_rereview_clear_and_all_read_models_agree() -> powder_store::Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
     let card_id = CardId::new("review-history")?;
     store.import_cards(vec![card(card_id.as_str(), &["ship exact behavior"])])?;
-    let claim = store.claim_card(&card_id, "reviewer", 10, 100, &Authority::unchecked())?;
+    let claim = store.claim_card(&card_id, "reviewer", 10, 100, &authenticated_operator())?;
     let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
     let authority = Authority::authenticated("Reviewer Name", "actor-reviewer", true);
 
@@ -152,7 +156,7 @@ fn conflicting_replay_and_unauthorized_review_have_no_approval_side_effect(
     store.migrate()?;
     let card_id = CardId::new("review-auth")?;
     store.import_cards(vec![card(card_id.as_str(), &["secure review"])])?;
-    let claim = store.claim_card(&card_id, "claim-holder", 10, 100, &Authority::unchecked())?;
+    let claim = store.claim_card(&card_id, "claim-holder", 10, 100, &authenticated_operator())?;
     let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
 
     let unauthorized = store.review_criterion(
@@ -220,8 +224,14 @@ fn released_expired_reclaimed_and_mismatched_runs_cannot_review() -> powder_stor
         card(card_id.as_str(), &["current only"]),
         card(other_card_id.as_str(), &["other"]),
     ])?;
-    let first = store.claim_card(&card_id, "agent-a", 10, 5, &Authority::unchecked())?;
-    let other = store.claim_card(&other_card_id, "agent-a", 10, 100, &Authority::unchecked())?;
+    let first = store.claim_card(&card_id, "agent-a", 10, 5, &authenticated_operator())?;
+    let other = store.claim_card(
+        &other_card_id,
+        "agent-a",
+        10,
+        100,
+        &authenticated_operator(),
+    )?;
     let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
 
     let mismatched = store.review_criterion(
@@ -235,7 +245,7 @@ fn released_expired_reclaimed_and_mismatched_runs_cannot_review() -> powder_stor
             None,
         ),
         12,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     assert_eq!(mismatched.state, OperationState::Rejected);
 
@@ -250,7 +260,7 @@ fn released_expired_reclaimed_and_mismatched_runs_cannot_review() -> powder_stor
             None,
         ),
         15,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     assert_eq!(expired.state, OperationState::Rejected);
     assert_eq!(expired.failure.unwrap().code, "claim_expired");
@@ -260,7 +270,7 @@ fn released_expired_reclaimed_and_mismatched_runs_cannot_review() -> powder_stor
         .current_run_criteria
         .is_empty());
 
-    let reclaimed = store.claim_card(&card_id, "agent-b", 16, 100, &Authority::unchecked())?;
+    let reclaimed = store.claim_card(&card_id, "agent-b", 16, 100, &authenticated_operator())?;
     let stale = store.review_criterion(
         &card_id,
         review_input(
@@ -272,11 +282,11 @@ fn released_expired_reclaimed_and_mismatched_runs_cannot_review() -> powder_stor
             None,
         ),
         17,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     assert_eq!(stale.state, OperationState::Rejected);
 
-    store.release_claim(&card_id, &reclaimed.run_id, 18, &Authority::unchecked())?;
+    store.release_claim(&card_id, &reclaimed.run_id, 18, &authenticated_operator())?;
     let released = store.review_criterion(
         &card_id,
         review_input(
@@ -288,7 +298,7 @@ fn released_expired_reclaimed_and_mismatched_runs_cannot_review() -> powder_stor
             None,
         ),
         19,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     assert_eq!(released.state, OperationState::Rejected);
     assert!(store.list_criterion_reviews(&card_id)?.is_empty());
@@ -302,7 +312,7 @@ fn edits_reordering_and_later_runs_fail_closed_without_losing_history() -> powde
     store.migrate()?;
     let card_id = CardId::new("review-edit")?;
     store.import_cards(vec![card(card_id.as_str(), &["alpha", "beta"])])?;
-    let run_a = store.claim_card(&card_id, "agent-a", 10, 100, &Authority::unchecked())?;
+    let run_a = store.claim_card(&card_id, "agent-a", 10, 100, &authenticated_operator())?;
     let original = store.get_card(&card_id)?.unwrap();
     let alpha_id = criterion_identity(&original.criteria, 0).unwrap();
     let beta_id = criterion_identity(&original.criteria, 1).unwrap();
@@ -317,7 +327,7 @@ fn edits_reordering_and_later_runs_fail_closed_without_losing_history() -> powde
             Some("alpha proof"),
         ),
         20,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
 
     store.patch_card(
@@ -340,7 +350,7 @@ fn edits_reordering_and_later_runs_fail_closed_without_losing_history() -> powde
             None,
         ),
         22,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     assert_eq!(stale_index.state, OperationState::Rejected);
     let moved_alpha = store.criterion_state_for_run(&card_id, &run_a.run_id)?;
@@ -364,8 +374,8 @@ fn edits_reordering_and_later_runs_fail_closed_without_losing_history() -> powde
         .review
         .is_none());
 
-    store.release_claim(&card_id, &run_a.run_id, 24, &Authority::unchecked())?;
-    let run_b = store.claim_card(&card_id, "agent-b", 25, 100, &Authority::unchecked())?;
+    store.release_claim(&card_id, &run_a.run_id, 24, &authenticated_operator())?;
+    let run_b = store.claim_card(&card_id, "agent-b", 25, 100, &authenticated_operator())?;
     assert!(store
         .criterion_state_for_run(&card_id, &run_b.run_id)?
         .iter()
@@ -386,7 +396,7 @@ fn concurrent_conflicting_operation_replay_commits_exactly_one_review() -> powde
         let mut store = Store::open(&path)?;
         store.migrate()?;
         store.import_cards(vec![card(card_id.as_str(), &["race safely"])])?;
-        let claim = store.claim_card(&card_id, "operator", 10, 100, &Authority::unchecked())?;
+        let claim = store.claim_card(&card_id, "operator", 10, 100, &authenticated_operator())?;
         let criterion_id =
             criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
         (claim.run_id, criterion_id)
@@ -411,7 +421,7 @@ fn concurrent_conflicting_operation_replay_commits_exactly_one_review() -> powde
                 &card_id,
                 review_input("review-race-op", &run_id, 0, &criterion_id, decision, None),
                 20,
-                &Authority::actor("operator", true),
+                &authenticated_operator(),
             )
         })
     })
@@ -441,7 +451,7 @@ fn out_of_range_index_and_persistence_failure_roll_back_every_effect() -> powder
         let mut store = Store::open(&path)?;
         store.migrate()?;
         store.import_cards(vec![card(card_id.as_str(), &["rollback safely"])])?;
-        let claim = store.claim_card(&card_id, "operator", 10, 100, &Authority::unchecked())?;
+        let claim = store.claim_card(&card_id, "operator", 10, 100, &authenticated_operator())?;
         let criterion_id =
             criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
         let out_of_range = store.review_criterion(
@@ -455,7 +465,7 @@ fn out_of_range_index_and_persistence_failure_roll_back_every_effect() -> powder
                 None,
             ),
             20,
-            &Authority::unchecked(),
+            &authenticated_operator(),
         )?;
         assert_eq!(out_of_range.state, OperationState::Rejected);
         assert_eq!(out_of_range.failure.unwrap().code, "validation");
@@ -483,14 +493,14 @@ fn out_of_range_index_and_persistence_failure_roll_back_every_effect() -> powder
             Some("must roll back"),
         ),
         21,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     );
     assert!(matches!(failed, Err(StoreError::Sqlite(_))));
     assert!(store.list_criterion_reviews(&card_id)?.is_empty());
     let status = store.operation_status(
         &OperationId::new("review-persistence-failure")?,
         22,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     assert_eq!(status.state, OperationState::Unknown);
     let detail = store
@@ -515,7 +525,7 @@ fn expired_operation_identity_can_be_reused_without_erasing_review_audit(
         "operator",
         10,
         (OPERATION_RETENTION_SECONDS + 1_000) as u64,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
     store.review_criterion(
@@ -529,7 +539,7 @@ fn expired_operation_identity_can_be_reused_without_erasing_review_audit(
             None,
         ),
         20,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     let after_retention = 20 + OPERATION_RETENTION_SECONDS;
     assert_eq!(store.prune_operations(after_retention)?, 1);
@@ -544,7 +554,7 @@ fn expired_operation_identity_can_be_reused_without_erasing_review_audit(
             Some("new request after recovery window"),
         ),
         after_retention,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     )?;
     assert_eq!(reused.state, OperationState::Succeeded);
     let history = store.list_criterion_reviews(&card_id)?;
@@ -564,7 +574,7 @@ fn oversized_review_proof_is_rejected_without_reserving_or_mutating() -> powder_
     store.migrate()?;
     let card_id = CardId::new("review-proof-bound")?;
     store.import_cards(vec![card(card_id.as_str(), &["bound proof"])])?;
-    let claim = store.claim_card(&card_id, "operator", 10, 100, &Authority::unchecked())?;
+    let claim = store.claim_card(&card_id, "operator", 10, 100, &authenticated_operator())?;
     let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
     let operation_id = OperationId::new("review-proof-too-large")?;
     let result = store.review_criterion(
@@ -578,7 +588,7 @@ fn oversized_review_proof_is_rejected_without_reserving_or_mutating() -> powder_
             proof: Some("x".repeat(CRITERION_REVIEW_PROOF_MAX_BYTES + 1)),
         },
         20,
-        &Authority::unchecked(),
+        &authenticated_operator(),
     );
     assert!(matches!(
         result,
@@ -590,7 +600,7 @@ fn oversized_review_proof_is_rejected_without_reserving_or_mutating() -> powder_
     assert!(store.list_criterion_reviews(&card_id)?.is_empty());
     assert_eq!(
         store
-            .operation_status(&operation_id, 21, &Authority::unchecked())?
+            .operation_status(&operation_id, 21, &authenticated_operator())?
             .state,
         OperationState::Unknown
     );

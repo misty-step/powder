@@ -3933,6 +3933,98 @@ async fn authenticated_criterion_review_derives_reviewer_and_rejects_forged_iden
 }
 
 #[tokio::test]
+async fn auth_none_cannot_create_p1_consumable_run_scoped_approval() {
+    let (state, _) = test_state(AuthMode::None);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            None,
+            r#"{"id":"auth-none-review","title":"Review","acceptance":["authenticated only"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/auth-none-review/claim",
+            None,
+            r#"{"agent":"anonymous","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let run_id = response_json(claim).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-none-review?detail=detailed",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    let criterion_id = response_json(detail).await["current_run_criteria"][0]["criterion_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let review = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!(
+                "/api/v1/cards/auth-none-review/runs/{run_id}/criteria/review"
+            ),
+            None,
+            &format!(
+                r#"{{"operation_id":"auth-none-review","criterion":0,"criterion_id":"{criterion_id}","decision":"approved"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(review.status(), StatusCode::FORBIDDEN);
+    let review = response_json(review).await;
+    assert_eq!(
+        review["error"],
+        "run-scoped criterion review requires authenticated authority"
+    );
+
+    let correction = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/auth-none-review/criteria/check",
+            None,
+            r#"{"criterion":0,"actor":"local-operator"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(correction.status(), StatusCode::OK);
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-none-review?detail=detailed",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(
+        detail["card"]["criteria"][0]["checked_by"],
+        "local-operator"
+    );
+    assert!(detail.get("criterion_reviews").is_none());
+    assert!(detail["current_run_criteria"][0].get("review").is_none());
+}
+#[tokio::test]
 async fn healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db_path() {
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
     let db_path = state.config.db_path.display().to_string();
