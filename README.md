@@ -94,9 +94,12 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `check-criterion` | SQLite criterion write | `POST /api/v1/cards/{id}/criteria/check` | `criterion\tid\tindex\tchecked|unchecked` |
 | `add-link` | SQLite link write | `POST /api/v1/cards/{id}/links` | `link\tcard_id\tid` |
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
-| `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | `work-log\tcard_id\tagent\tbody` |
+| `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | Legacy TSV or versioned operation JSON |
+| `operation-status` | SQLite operation recovery read | `GET /api/v1/operations/{id}` | Versioned bounded JSON outcome |
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
-| `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
+| `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | Legacy TSV or versioned operation JSON |
+
+See [`docs/mutation-operations-v1.md`](docs/mutation-operations-v1.md) for canonical request identity, replay, failure, authorization, and retention semantics.
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
