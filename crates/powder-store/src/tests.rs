@@ -384,6 +384,43 @@ fn migration_15_to_16_adds_only_criterion_review_kind_and_preserves_operations()
 }
 
 #[test]
+fn migration_16_to_17_adds_immutable_criterion_review_history() -> Result<()> {
+    let path = temp_db("v15-criterion-review-history");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute_batch(
+            "DROP TABLE criterion_reviews;
+             PRAGMA user_version = 16;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let table_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'criterion_reviews'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(table_sql.contains("criterion_review"));
+    assert!(table_sql.contains("supersedes_review_id"));
+    assert!(table_sql.contains("approved"));
+    assert!(table_sql.contains("rejected"));
+    assert!(table_sql.contains("cleared"));
+    let indexes: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name LIKE 'idx_criterion_reviews_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(indexes, 2);
+    Ok(())
+}
+
+#[test]
 fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

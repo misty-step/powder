@@ -3,12 +3,12 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
-    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
-    CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, Estimate, Link, LinkId, OperationField, OperationId,
-    OperationKind, OperationRequest, OperationState, Priority, ReadyQuery, Run, RunId, RunState,
-    WorkLogEntry,
+    canonical_repo_label, canonical_repo_matches, criterion_identity,
+    repo_from_numeric_card_id_prefix, AcceptanceCriterion, Activity, ActivityId, ActivityType,
+    Authority, AutonomyClass, Card, CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim,
+    ClaimReceipt, Comment, CriterionProof, CriterionReview, CriterionReviewDecision, DomainError,
+    Estimate, Link, LinkId, OperationField, OperationId, OperationKind, OperationRequest,
+    OperationState, Priority, ReadyQuery, Run, RunCriterionState, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -37,9 +37,9 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_1_TO_2,
-    MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8,
-    MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_16_TO_17,
+    MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7,
+    MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -54,6 +54,7 @@ pub const WORK_LOG_ENTRY_SCHEMA_VERSION: &str = "powder.work_log_entry.v1";
 pub const COMPLETION_PROOF_MAX_BYTES: usize = 4 * 1024;
 pub const CRITERION_PROOF_MAX_COUNT: usize = 128;
 pub const CRITERION_PROOF_URL_MAX_BYTES: usize = 4 * 1024;
+pub const CRITERION_REVIEW_PROOF_MAX_BYTES: usize = 4 * 1024;
 
 const API_KEY_ALPHABET: [char; 64] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
@@ -244,6 +245,16 @@ pub struct CriterionProofInput {
     pub url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionReviewInput {
+    pub operation_id: OperationId,
+    pub expected_run_id: RunId,
+    pub criterion: usize,
+    pub criterion_id: String,
+    pub decision: CriterionReviewDecision,
+    pub proof: Option<String>,
+}
+
 /// The optional attribution fields `append_work_log` accepts alongside the
 /// required `agent`: whatever the calling surface (Claude Code, Codex,
 /// a harness) knows about itself. Bundled into one struct rather than four
@@ -429,6 +440,10 @@ impl Store {
                 15 => {
                     self.connection.execute_batch(MIGRATE_15_TO_16)?;
                     16
+                }
+                16 => {
+                    self.connection.execute_batch(MIGRATE_16_TO_17)?;
+                    17
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -845,6 +860,124 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(card)
+    }
+
+    /// Apply one authenticated, run-scoped criterion review using the shared
+    /// bounded operation ledger for replay and recovery.
+    pub fn review_criterion(
+        &mut self,
+        card_id: &CardId,
+        input: CriterionReviewInput,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        let criterion_id = non_empty("criterion_id", &input.criterion_id)?;
+        let proof = input
+            .proof
+            .as_deref()
+            .map(|value| non_empty("proof", value))
+            .transpose()?;
+        validate_optional_bound("proof", proof.as_deref(), CRITERION_REVIEW_PROOF_MAX_BYTES)?;
+        let criterion_index = input.criterion.to_string();
+        let request = OperationRequest::new(
+            input.operation_id,
+            OperationKind::CriterionReview,
+            card_id.clone(),
+            authority.operation_identity(),
+            Some(input.expected_run_id.clone()),
+            &[
+                OperationField {
+                    name: "criterion_index",
+                    value: Some(&criterion_index),
+                },
+                OperationField {
+                    name: "criterion_id",
+                    value: Some(&criterion_id),
+                },
+                OperationField {
+                    name: "decision",
+                    value: Some(input.decision.as_str()),
+                },
+                OperationField {
+                    name: "proof",
+                    value: proof.as_deref(),
+                },
+            ],
+        )?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
+        }
+        reserve_operation(&transaction, &request, now)?;
+        match review_criterion_in_transaction(
+            &transaction,
+            card_id,
+            &input.expected_run_id,
+            input.criterion,
+            &criterion_id,
+            input.decision,
+            proof,
+            &request.id,
+            now,
+            authority,
+        ) {
+            Ok((review, event_id)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Succeeded,
+                    Some(json!(review)),
+                    None,
+                    Some(event_id),
+                    now,
+                )?;
+            }
+            Err(StoreError::Domain(error)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Rejected,
+                    None,
+                    Some(operation_failure(&error)),
+                    None,
+                    now,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    pub fn list_criterion_reviews(&self, card_id: &CardId) -> Result<Vec<CriterionReview>> {
+        load_criterion_reviews_for_card(&self.connection, card_id)
+    }
+
+    pub fn criterion_state_for_run(
+        &self,
+        card_id: &CardId,
+        run_id: &RunId,
+    ) -> Result<Vec<RunCriterionState>> {
+        let card = load_card(&self.connection, card_id)?;
+        let run = load_run_for_review(&self.connection, run_id)?;
+        if run.card_id != *card_id {
+            return Err(DomainError::conflict(format!(
+                "run {run_id} belongs to card {}, not {card_id}",
+                run.card_id
+            ))
+            .into());
+        }
+        project_run_criterion_state(&self.connection, &card, run_id)
     }
 
     pub fn record_card_event(
@@ -2120,6 +2253,303 @@ fn complete_card_in_transaction(
         }
     }
     Ok((card, audit_event.id.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_criterion_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    expected_run_id: &RunId,
+    criterion_index: usize,
+    expected_criterion_id: &str,
+    decision: CriterionReviewDecision,
+    proof: Option<String>,
+    operation_id: &OperationId,
+    now: i64,
+    authority: &Authority,
+) -> Result<(CriterionReview, String)> {
+    let card = load_card(transaction, card_id)?;
+    let run = load_run_for_review(transaction, expected_run_id)?;
+    if run.card_id != *card_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} belongs to card {}, not {card_id}",
+            run.card_id
+        ))
+        .into());
+    }
+    let claim = card
+        .claim
+        .as_ref()
+        .ok_or_else(|| DomainError::conflict(format!("card {card_id} has no current run")))?;
+    if claim.run_id != *expected_run_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} is not current for card {card_id}"
+        ))
+        .into());
+    }
+    if claim.is_expired(now) {
+        return Err(DomainError::claim_expired(format!(
+            "run {expected_run_id} claim expired at {}",
+            claim.expires_at
+        ))
+        .into());
+    }
+    if !matches!(run.state, RunState::Active | RunState::AwaitingInput) {
+        return Err(DomainError::conflict(format!("run {expected_run_id} is not active")).into());
+    }
+    authority.require_holder(Some(&claim.agent))?;
+    if criterion_index > u32::MAX as usize {
+        return Err(DomainError::validation(
+            "criterion",
+            "criterion index must fit an unsigned 32-bit integer",
+        )
+        .into());
+    }
+    let criterion = card.criteria.get(criterion_index).ok_or_else(|| {
+        DomainError::validation(
+            "criterion",
+            format!("criterion index {criterion_index} not found"),
+        )
+    })?;
+    let current_criterion_id = criterion_identity(&card.criteria, criterion_index)
+        .expect("criterion index was checked above");
+    if current_criterion_id != expected_criterion_id {
+        return Err(DomainError::conflict(format!(
+            "criterion identity mismatch at index {criterion_index}"
+        ))
+        .into());
+    }
+
+    let supersedes_review_id =
+        latest_criterion_review(transaction, expected_run_id, &current_criterion_id)?
+            .map(|review| review.id);
+    let review = CriterionReview {
+        id: format!("review-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)),
+        operation_id: operation_id.clone(),
+        card_id: card_id.clone(),
+        run_id: expected_run_id.clone(),
+        criterion_index,
+        criterion_id: current_criterion_id,
+        criterion_text: criterion.text.clone(),
+        decision,
+        reviewer: authority.actor_label(),
+        proof,
+        supersedes_review_id,
+        created_at: now,
+    };
+    transaction.execute(
+        "INSERT INTO criterion_reviews (
+           id, operation_id, card_id, run_id, criterion_index, criterion_id,
+           criterion_text, decision, reviewer, proof, supersedes_review_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            review.id,
+            review.operation_id.as_str(),
+            review.card_id.as_str(),
+            review.run_id.as_str(),
+            review.criterion_index as i64,
+            review.criterion_id,
+            review.criterion_text,
+            review.decision.as_str(),
+            review.reviewer,
+            review.proof,
+            review.supersedes_review_id,
+            review.created_at,
+        ],
+    )?;
+    let event = append_card_event(
+        transaction,
+        card_id,
+        "criterion-review",
+        &review.reviewer,
+        &to_json(&review)?,
+        now,
+    )?;
+    Ok((review, event.id.to_string()))
+}
+
+fn load_run_for_review(connection: &Connection, run_id: &RunId) -> Result<Run> {
+    connection
+        .query_row(RUN_SELECT_SQL, [run_id.as_str()], RunRecord::from_row)
+        .optional()?
+        .ok_or_else(|| DomainError::not_found("run", run_id.to_string()).into())
+        .and_then(RunRecord::into_run)
+}
+
+fn criterion_review_from_values(
+    id: String,
+    operation_id: String,
+    card_id: String,
+    run_id: String,
+    criterion_index: i64,
+    criterion_id: String,
+    criterion_text: String,
+    decision: String,
+    reviewer: String,
+    proof: Option<String>,
+    supersedes_review_id: Option<String>,
+    created_at: i64,
+) -> Result<CriterionReview> {
+    let criterion_index =
+        usize::try_from(criterion_index).map_err(|_| StoreError::InvalidStoredValue {
+            field: "criterion_reviews.criterion_index",
+            value: criterion_index.to_string(),
+        })?;
+    let decision = CriterionReviewDecision::parse(&decision).ok_or_else(|| {
+        StoreError::InvalidStoredValue {
+            field: "criterion_reviews.decision",
+            value: decision,
+        }
+    })?;
+    Ok(CriterionReview {
+        id,
+        operation_id: OperationId::new(operation_id)?,
+        card_id: CardId::new(card_id)?,
+        run_id: RunId::new(run_id)?,
+        criterion_index,
+        criterion_id,
+        criterion_text,
+        decision,
+        reviewer,
+        proof,
+        supersedes_review_id,
+        created_at,
+    })
+}
+
+fn query_criterion_reviews(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<CriterionReview>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement
+        .query_map(parameters, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                operation_id,
+                card_id,
+                run_id,
+                criterion_index,
+                criterion_id,
+                criterion_text,
+                decision,
+                reviewer,
+                proof,
+                supersedes_review_id,
+                created_at,
+            )| {
+                criterion_review_from_values(
+                    id,
+                    operation_id,
+                    card_id,
+                    run_id,
+                    criterion_index,
+                    criterion_id,
+                    criterion_text,
+                    decision,
+                    reviewer,
+                    proof,
+                    supersedes_review_id,
+                    created_at,
+                )
+            },
+        )
+        .collect()
+}
+
+const CRITERION_REVIEW_COLUMNS: &str = "id, operation_id, card_id, run_id, criterion_index,
+criterion_id, criterion_text, decision, reviewer, proof, supersedes_review_id, created_at";
+
+fn load_criterion_reviews_for_card(
+    connection: &Connection,
+    card_id: &CardId,
+) -> Result<Vec<CriterionReview>> {
+    query_criterion_reviews(
+        connection,
+        &format!(
+            "SELECT {CRITERION_REVIEW_COLUMNS} FROM criterion_reviews
+             WHERE card_id = ?1 ORDER BY sequence ASC"
+        ),
+        &[&card_id.as_str()],
+    )
+}
+
+fn load_criterion_reviews_for_run(
+    connection: &Connection,
+    run_id: &RunId,
+) -> Result<Vec<CriterionReview>> {
+    query_criterion_reviews(
+        connection,
+        &format!(
+            "SELECT {CRITERION_REVIEW_COLUMNS} FROM criterion_reviews
+             WHERE run_id = ?1 ORDER BY sequence ASC"
+        ),
+        &[&run_id.as_str()],
+    )
+}
+
+fn latest_criterion_review(
+    connection: &Connection,
+    run_id: &RunId,
+    criterion_id: &str,
+) -> Result<Option<CriterionReview>> {
+    Ok(query_criterion_reviews(
+        connection,
+        &format!(
+            "SELECT {CRITERION_REVIEW_COLUMNS} FROM criterion_reviews
+             WHERE run_id = ?1 AND criterion_id = ?2
+             ORDER BY sequence DESC LIMIT 1"
+        ),
+        &[&run_id.as_str(), &criterion_id],
+    )?
+    .into_iter()
+    .next())
+}
+
+fn project_run_criterion_state(
+    connection: &Connection,
+    card: &Card,
+    run_id: &RunId,
+) -> Result<Vec<RunCriterionState>> {
+    let latest = load_criterion_reviews_for_run(connection, run_id)?
+        .into_iter()
+        .fold(HashMap::new(), |mut by_identity, review| {
+            by_identity.insert(review.criterion_id.clone(), review);
+            by_identity
+        });
+    card.criteria
+        .iter()
+        .enumerate()
+        .map(|(criterion_index, criterion)| {
+            let criterion_id = criterion_identity(&card.criteria, criterion_index)
+                .expect("enumerated criterion must have an identity");
+            Ok(RunCriterionState {
+                criterion_index,
+                review: latest.get(&criterion_id).cloned(),
+                criterion_id,
+                criterion_text: criterion.text.clone(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug)]

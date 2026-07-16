@@ -4,9 +4,11 @@ use powder_core::{
     Run, RunDetail, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    append_activity, load_card, non_empty, persist_card, persist_run, schema::RUN_SELECT_SQL,
+    append_activity, load_card, load_criterion_reviews_for_card, load_criterion_reviews_for_run,
+    non_empty, persist_card, persist_run, project_run_criterion_state, schema::RUN_SELECT_SQL,
     Result, RunRecord, Store, StoreError,
 };
 
@@ -24,6 +26,15 @@ impl Store {
         card_id: &CardId,
         detail: DetailLevel,
     ) -> Result<Option<CardDetail>> {
+        self.get_card_detail_at(card_id, detail, unix_now())
+    }
+
+    pub fn get_card_detail_at(
+        &self,
+        card_id: &CardId,
+        detail: DetailLevel,
+        now: i64,
+    ) -> Result<Option<CardDetail>> {
         let Some(card) = self.get_card(card_id)? else {
             return Ok(None);
         };
@@ -33,12 +44,22 @@ impl Store {
         let links = load_link_section_for_card(&self.connection, card_id, detail)?;
         let comments = load_comments_for_card(&self.connection, card_id, detail)?;
         let work_log = load_work_log_for_card(&self.connection, card_id, detail)?;
+        let criterion_reviews = review_detail_section(
+            load_criterion_reviews_for_card(&self.connection, card_id)?,
+            detail,
+        );
+        let current_run_criteria = match card.claim.as_ref().filter(|claim| !claim.is_expired(now))
+        {
+            Some(claim) => project_run_criterion_state(&self.connection, &card, &claim.run_id)?,
+            None => Vec::new(),
+        };
         let truncated = runs.truncated()
             || activities.truncated()
             || events.truncated()
             || links.truncated()
             || comments.truncated()
-            || work_log.truncated();
+            || work_log.truncated()
+            || criterion_reviews.truncated();
         Ok(Some(CardDetail {
             runs: runs.items,
             runs_total: runs.total,
@@ -52,6 +73,9 @@ impl Store {
             comments_total: comments.total,
             work_log: work_log.items,
             work_log_total: work_log.total,
+            current_run_criteria,
+            criterion_reviews: criterion_reviews.items,
+            criterion_reviews_total: criterion_reviews.total,
             hint: detail_hint(truncated),
             card,
         }))
@@ -71,10 +95,16 @@ impl Store {
         let links = load_link_section_for_card(&self.connection, &run.card_id, detail)?;
         let comments = load_comments_for_card(&self.connection, &run.card_id, detail)?;
         let work_log = load_work_log_for_run(&self.connection, run_id, detail)?;
+        let criterion_reviews = review_detail_section(
+            load_criterion_reviews_for_run(&self.connection, run_id)?,
+            detail,
+        );
+        let criteria = project_run_criterion_state(&self.connection, &card, run_id)?;
         let truncated = activities.truncated()
             || links.truncated()
             || comments.truncated()
-            || work_log.truncated();
+            || work_log.truncated()
+            || criterion_reviews.truncated();
         Ok(Some(RunDetail {
             activities: activities.items,
             activities_total: activities.total,
@@ -84,6 +114,9 @@ impl Store {
             comments_total: comments.total,
             work_log: work_log.items,
             work_log_total: work_log.total,
+            criteria,
+            criterion_reviews: criterion_reviews.items,
+            criterion_reviews_total: criterion_reviews.total,
             hint: detail_hint(truncated),
             run,
             card,
@@ -208,6 +241,28 @@ impl Store {
         transaction.commit()?;
         Ok(run)
     }
+}
+
+fn review_detail_section<T>(mut items: Vec<T>, detail: DetailLevel) -> DetailSection<T> {
+    let total = items.len();
+    match detail {
+        DetailLevel::Detailed => DetailSection { items, total: None },
+        DetailLevel::Concise => {
+            items.reverse();
+            items.truncate(CONCISE_DETAIL_LIMIT as usize);
+            DetailSection {
+                total: truncated_total(total, items.len()),
+                items,
+            }
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 struct DetailSection<T> {

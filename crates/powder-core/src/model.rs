@@ -807,6 +807,83 @@ pub struct AcceptanceCriterion {
     pub proof_links: Vec<CriterionProof>,
 }
 
+/// Stable identity for one criterion value at one duplicate occurrence.
+///
+/// Exact text is hashed so reordering distinct criteria preserves identity,
+/// while edits fail closed instead of inheriting an earlier review. The
+/// occurrence suffix distinguishes duplicate text without pretending the
+/// duplicates have an ordering-independent identity.
+pub fn criterion_identity(criteria: &[AcceptanceCriterion], index: usize) -> Option<String> {
+    let criterion = criteria.get(index)?;
+    let occurrence = criteria[..index]
+        .iter()
+        .filter(|candidate| candidate.text == criterion.text)
+        .count();
+    let digest = Sha256::digest(criterion.text.as_bytes());
+    Some(format!(
+        "powder.criterion.v1:sha256:{digest:x}:{occurrence}"
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionReviewDecision {
+    Approved,
+    Rejected,
+    Cleared,
+}
+
+impl CriterionReviewDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Cleared => "cleared",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "cleared" => Some(Self::Cleared),
+            _ => None,
+        }
+    }
+}
+
+/// Immutable audit row for one run-scoped criterion review action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CriterionReview {
+    pub id: String,
+    pub operation_id: OperationId,
+    pub card_id: CardId,
+    pub run_id: RunId,
+    pub criterion_index: usize,
+    pub criterion_id: String,
+    pub criterion_text: String,
+    pub decision: CriterionReviewDecision,
+    pub reviewer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_review_id: Option<String>,
+    pub created_at: i64,
+}
+
+/// Exact criterion state for a specified run.
+///
+/// Consumers approve only `review.decision == approved`. A missing review or
+/// a latest `cleared`/`rejected` review is not approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCriterionState {
+    pub criterion_index: usize,
+    pub criterion_id: String,
+    pub criterion_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<CriterionReview>,
+}
+
 impl AcceptanceCriterion {
     pub fn new(text: impl Into<String>) -> Result<Self, DomainError> {
         Ok(Self {
@@ -1569,6 +1646,12 @@ pub struct CardDetail {
     pub work_log: Vec<WorkLogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_log_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_run_criteria: Vec<RunCriterionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criterion_reviews: Vec<CriterionReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_reviews_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -1593,6 +1676,12 @@ pub struct RunDetail {
     pub work_log: Vec<WorkLogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_log_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<RunCriterionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criterion_reviews: Vec<CriterionReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_reviews_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -2131,5 +2220,82 @@ mod tests {
         )
         .unwrap();
         assert_ne!(different_original.request_digest, digest);
+    }
+
+    #[test]
+    fn criterion_identity_survives_distinct_reordering_and_fails_closed_on_edit() {
+        let original = vec![
+            AcceptanceCriterion::new("alpha").unwrap(),
+            AcceptanceCriterion::new("beta").unwrap(),
+        ];
+        let reordered = vec![
+            AcceptanceCriterion::new("beta").unwrap(),
+            AcceptanceCriterion::new("alpha").unwrap(),
+        ];
+        let edited = vec![AcceptanceCriterion::new("alpha edited").unwrap()];
+
+        assert_eq!(
+            criterion_identity(&original, 0),
+            criterion_identity(&reordered, 1)
+        );
+        assert_ne!(
+            criterion_identity(&original, 0),
+            criterion_identity(&edited, 0)
+        );
+    }
+
+    #[test]
+    fn criterion_identity_distinguishes_duplicate_occurrences() {
+        let criteria = vec![
+            AcceptanceCriterion::new("same").unwrap(),
+            AcceptanceCriterion::new("other").unwrap(),
+            AcceptanceCriterion::new("same").unwrap(),
+        ];
+
+        assert_ne!(
+            criterion_identity(&criteria, 0),
+            criterion_identity(&criteria, 2)
+        );
+        assert!(criterion_identity(&criteria, 3).is_none());
+    }
+
+    #[test]
+    fn criterion_review_operation_digest_binds_every_contract_field() {
+        let build = |criterion_id: &str, decision: &str, proof: Option<&str>| {
+            OperationRequest::new(
+                OperationId::new("review-op").unwrap(),
+                OperationKind::CriterionReview,
+                CardId::new("card-1").unwrap(),
+                "actor-1",
+                Some(RunId::new("run-1").unwrap()),
+                &[
+                    OperationField {
+                        name: "criterion_index",
+                        value: Some("0"),
+                    },
+                    OperationField {
+                        name: "criterion_id",
+                        value: Some(criterion_id),
+                    },
+                    OperationField {
+                        name: "decision",
+                        value: Some(decision),
+                    },
+                    OperationField {
+                        name: "proof",
+                        value: proof,
+                    },
+                ],
+            )
+            .unwrap()
+            .request_digest
+        };
+
+        let base = build("criterion-a", "approved", Some("proof-a"));
+        assert_eq!(base, build("criterion-a", "approved", Some("proof-a")));
+        assert_ne!(base, build("criterion-b", "approved", Some("proof-a")));
+        assert_ne!(base, build("criterion-a", "rejected", Some("proof-a")));
+        assert_ne!(base, build("criterion-a", "approved", Some("proof-b")));
+        assert_ne!(base, build("criterion-a", "approved", None));
     }
 }

@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -155,6 +155,26 @@ CREATE TABLE IF NOT EXISTS mutation_operations (
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
+
+CREATE TABLE IF NOT EXISTS criterion_reviews (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL UNIQUE,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  criterion_index INTEGER NOT NULL,
+  criterion_id TEXT NOT NULL,
+  criterion_text TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected', 'cleared')),
+  reviewer TEXT NOT NULL,
+  proof TEXT,
+  supersedes_review_id TEXT REFERENCES criterion_reviews(id),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_card_created
+  ON criterion_reviews(card_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_run_criterion_created
+  ON criterion_reviews(run_id, criterion_id, sequence DESC);
 
 CREATE TABLE IF NOT EXISTS event_subscriptions (
   id TEXT PRIMARY KEY,
@@ -453,6 +473,28 @@ FROM mutation_operations_v15;
 
 DROP TABLE mutation_operations_v15;
 CREATE INDEX idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
+"#;
+
+pub const MIGRATE_16_TO_17: &str = r#"
+CREATE TABLE IF NOT EXISTS criterion_reviews (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL UNIQUE,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  criterion_index INTEGER NOT NULL,
+  criterion_id TEXT NOT NULL,
+  criterion_text TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected', 'cleared')),
+  reviewer TEXT NOT NULL,
+  proof TEXT,
+  supersedes_review_id TEXT REFERENCES criterion_reviews(id),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_card_created
+  ON criterion_reviews(card_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_run_criterion_created
+  ON criterion_reviews(run_id, criterion_id, sequence DESC);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,
