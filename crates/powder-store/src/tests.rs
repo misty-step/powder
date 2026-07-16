@@ -191,6 +191,45 @@ fn migration_11_to_12_tolerates_half_applied_autonomy_column() -> Result<()> {
 }
 
 #[test]
+fn migration_13_to_14_adds_the_bounded_operation_ledger_without_data_loss() -> Result<()> {
+    let path = temp_db("v13-operation-ledger");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("pre-operation-migration", 10)])?;
+        store.connection.execute_batch(
+            "DROP TABLE mutation_operations;
+             PRAGMA user_version = 13;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    assert!(store
+        .get_card(&CardId::new("pre-operation-migration")?)?
+        .is_some());
+    let table_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mutation_operations'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(table_sql.contains("work_log_append"));
+    assert!(table_sql.contains("succeeded"));
+    assert!(table_sql.contains("rejected"));
+    assert!(table_sql.contains("failed"));
+    let expiry_index: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_mutation_operations_expiry'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(expiry_index, 1);
+    Ok(())
+}
+
+#[test]
 fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
