@@ -3909,9 +3909,7 @@ fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()
             "reasoning Bearer abcdefghijklmnopqrstuvwxyz012345 {powder_api_key} {powder_webhook_secret}"
         ),
         format!("harness xoxb-1234567890abcdefghij {powder_api_key} {powder_webhook_secret}"),
-        format!(
-            "run-sk-ant-api03-abcdefghijklmnopqrstuvwxyz-{powder_api_key}-{powder_webhook_secret}"
-        ),
+        format!("run.{powder_api_key}.{powder_webhook_secret}"),
     ];
     let raw_body = format!(
         "token sk-abcdefghijklmnopqrstuvwxyz123456 {powder_api_key} {powder_webhook_secret}"

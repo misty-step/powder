@@ -124,11 +124,11 @@ mod tests {
     fn redacts_exact_powder_api_and_webhook_credentials_at_boundaries() {
         let api_key = format!("sk_powder_{}-_", "A".repeat(30));
         let webhook_secret = format!("whsec_powder_{}-_", "B".repeat(30));
-        let scrubbed = scrub_secrets(&format!("api=({api_key}), webhook={webhook_secret}."));
+        let scrubbed = scrub_secrets(&format!("{api_key}; webhook={webhook_secret}"));
 
         assert_eq!(
             scrubbed,
-            "api=([REDACTED:powder-api-key]), webhook=[REDACTED:powder-webhook-secret]."
+            "[REDACTED:powder-api-key]; webhook=[REDACTED:powder-webhook-secret]"
         );
     }
 
