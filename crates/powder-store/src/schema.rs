@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS work_log_entries (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_log_entries_run_created ON work_log_entries(run_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS mutation_operations (
   operation_id TEXT PRIMARY KEY,
@@ -414,6 +415,7 @@ CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations
 pub const MIGRATE_14_TO_15: &str = r#"
 UPDATE work_log_entries SET actor = agent WHERE actor IS NULL;
 UPDATE work_log_entries SET updated_at = created_at WHERE updated_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_work_log_entries_run_created ON work_log_entries(run_id, created_at, id);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,

@@ -267,6 +267,44 @@ fn migration_14_to_15_backfills_authoritative_work_log_identity_without_data_los
     assert_eq!(detail.work_log[0].id, "work-log-old");
     assert_eq!(detail.work_log[0].actor, "agent-a");
     assert_eq!(detail.work_log[0].created_at, detail.work_log[0].updated_at);
+    let run_index: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_work_log_entries_run_created'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(run_index.contains("(run_id, created_at, id)"));
+    Ok(())
+}
+
+#[test]
+fn fresh_schema_run_detail_query_uses_run_leading_work_log_index() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let index_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_work_log_entries_run_created'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(index_sql.contains("(run_id, created_at, id)"));
+
+    let mut statement = store.connection.prepare(
+        "EXPLAIN QUERY PLAN
+         SELECT id, card_id, actor, agent, model, reasoning, harness, run_id, body,
+                created_at, updated_at
+         FROM work_log_entries
+         WHERE run_id = ?1
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let plan = statement
+        .query_map(["run-query-plan"], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_work_log_entries_run_created")),
+        "run detail query plan did not use its run-leading index: {plan:?}"
+    );
     Ok(())
 }
 
