@@ -94,12 +94,14 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `check-criterion` | SQLite criterion write | `POST /api/v1/cards/{id}/criteria/check` | `criterion\tid\tindex\tchecked|unchecked` |
 | `add-link` | SQLite link write | `POST /api/v1/cards/{id}/links` | `link\tcard_id\tid` |
 | `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
-| `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | Legacy TSV or versioned operation JSON |
+| `append-run-work-log` | Strict current-run SQLite work_log write | `POST /api/v1/cards/{id}/runs/{run_id}/work-log` | Versioned operation JSON with exact stored record |
+| `append-work-log` | Permissive unbound/operator work_log note | `POST /api/v1/cards/{id}/work-log` | Legacy TSV or versioned operation JSON |
 | `operation-status` | SQLite operation recovery read | `GET /api/v1/operations/{id}` | Versioned bounded JSON outcome |
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | Legacy TSV or versioned operation JSON |
 
 See [`docs/mutation-operations-v1.md`](docs/mutation-operations-v1.md) for canonical request identity, replay, failure, authorization, and retention semantics.
+See [`docs/run-bound-work-logs-v1.md`](docs/run-bound-work-logs-v1.md) for strict current-run validation, the authoritative stored record, and event behavior.
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently

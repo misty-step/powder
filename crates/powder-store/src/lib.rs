@@ -37,8 +37,8 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4,
-    MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_1_TO_2, MIGRATE_2_TO_3,
+    MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9,
     MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
@@ -50,6 +50,7 @@ pub const OPERATION_FAILURE_MESSAGE_MAX_BYTES: usize = 512;
 pub const WORK_LOG_AGENT_MAX_BYTES: usize = 256;
 pub const WORK_LOG_ATTRIBUTION_MAX_BYTES: usize = 256;
 pub const WORK_LOG_BODY_MAX_BYTES: usize = 16 * 1024;
+pub const WORK_LOG_ENTRY_SCHEMA_VERSION: &str = "powder.work_log_entry.v1";
 pub const COMPLETION_PROOF_MAX_BYTES: usize = 4 * 1024;
 pub const CRITERION_PROOF_MAX_COUNT: usize = 128;
 pub const CRITERION_PROOF_URL_MAX_BYTES: usize = 4 * 1024;
@@ -410,6 +411,10 @@ impl Store {
                     self.connection.execute_batch(MIGRATE_13_TO_14)?;
                     14
                 }
+                14 => {
+                    self.migrate_14_to_15()?;
+                    15
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -434,12 +439,46 @@ impl Store {
         Ok(())
     }
 
+    fn migrate_14_to_15(&mut self) -> Result<()> {
+        if !self.table_exists("work_log_entries")? {
+            return Ok(());
+        }
+        if !self.table_has_column("work_log_entries", "actor")? {
+            self.connection
+                .execute_batch("ALTER TABLE work_log_entries ADD COLUMN actor TEXT;")?;
+        }
+        if !self.table_has_column("work_log_entries", "updated_at")? {
+            self.connection
+                .execute_batch("ALTER TABLE work_log_entries ADD COLUMN updated_at INTEGER;")?;
+        }
+        self.connection.execute_batch(MIGRATE_14_TO_15)?;
+        Ok(())
+    }
+
     fn cards_has_column(&self, column: &str) -> Result<bool> {
-        let mut statement = self.connection.prepare("PRAGMA table_info(cards)")?;
+        self.table_has_column("cards", column)
+    }
+
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(columns.iter().any(|name| name.eq_ignore_ascii_case(column)))
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Opts this `Store` into the field-note seed generator (see
@@ -1406,8 +1445,15 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (entry, _) =
-            append_work_log_in_transaction(&transaction, card_id, agent, attribution, body, now)?;
+        let (entry, _) = append_work_log_in_transaction(
+            &transaction,
+            card_id,
+            agent,
+            agent,
+            attribution,
+            body,
+            now,
+        )?;
         transaction.commit()?;
         Ok(entry)
     }
@@ -1486,7 +1532,15 @@ impl Store {
             return replay_operation(existing, &request);
         }
         reserve_operation(&transaction, &request, now)?;
-        match append_work_log_in_transaction(&transaction, card_id, agent, attribution, body, now) {
+        match append_work_log_in_transaction(
+            &transaction,
+            card_id,
+            agent,
+            agent,
+            attribution,
+            body,
+            now,
+        ) {
             Ok((entry, event_id)) => {
                 finish_operation(
                     &transaction,
@@ -1509,6 +1563,127 @@ impl Store {
                     now,
                 )?;
             }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Append one retry-safe work-log record only when `expected_run_id` is
+    /// still the card's live claim at the transaction boundary.
+    ///
+    /// This is the strict agent path. The permissive `append_work_log` path
+    /// remains available for explicit operator corrections and unbound notes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_run_work_log_idempotent(
+        &mut self,
+        operation_id: OperationId,
+        card_id: &CardId,
+        expected_run_id: &RunId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        validate_bounded_non_empty("agent", agent, WORK_LOG_AGENT_MAX_BYTES)?;
+        validate_optional_bound("model", attribution.model, WORK_LOG_ATTRIBUTION_MAX_BYTES)?;
+        validate_optional_bound(
+            "reasoning",
+            attribution.reasoning,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        validate_optional_bound(
+            "harness",
+            attribution.harness,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        if attribution.run_id.is_some() {
+            return Err(DomainError::validation(
+                "run_id",
+                "strict append accepts expected_run_id as the only run attribution",
+            )
+            .into());
+        }
+        validate_bounded_non_empty("body", body, WORK_LOG_BODY_MAX_BYTES)?;
+        let actor = strict_actor_label(authority)?;
+        let request = OperationRequest::new(
+            operation_id,
+            OperationKind::WorkLogAppend,
+            card_id.clone(),
+            authority.operation_identity(),
+            Some(expected_run_id.clone()),
+            &[
+                OperationField {
+                    name: "agent",
+                    value: Some(agent),
+                },
+                OperationField {
+                    name: "model",
+                    value: attribution.model,
+                },
+                OperationField {
+                    name: "reasoning",
+                    value: attribution.reasoning,
+                },
+                OperationField {
+                    name: "harness",
+                    value: attribution.harness,
+                },
+                OperationField {
+                    name: "body",
+                    value: Some(body),
+                },
+            ],
+        )?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
+        }
+        reserve_operation(&transaction, &request, now)?;
+        let strict_attribution = WorkLogAttribution {
+            run_id: Some(expected_run_id.as_str()),
+            ..attribution
+        };
+        match append_current_run_work_log_in_transaction(
+            &transaction,
+            card_id,
+            expected_run_id,
+            &actor,
+            agent,
+            strict_attribution,
+            body,
+            now,
+            authority,
+        ) {
+            Ok((entry, event_id)) => finish_operation(
+                &transaction,
+                &request.id,
+                OperationState::Succeeded,
+                Some(json!(entry)),
+                None,
+                Some(event_id),
+                now,
+            )?,
+            Err(StoreError::Domain(error)) => finish_operation(
+                &transaction,
+                &request.id,
+                OperationState::Rejected,
+                None,
+                Some(operation_failure(&error)),
+                None,
+                now,
+            )?,
             Err(error) => return Err(error),
         }
         let status = load_operation(&transaction, &request.id)?
@@ -1724,6 +1899,7 @@ impl Store {
 fn append_work_log_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     card_id: &CardId,
+    actor: &str,
     agent: &str,
     attribution: WorkLogAttribution<'_>,
     body: &str,
@@ -1734,8 +1910,12 @@ fn append_work_log_in_transaction(
     let run_id = scrubbed_optional(attribution.run_id)
         .map(RunId::new)
         .transpose()?;
+    let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
     let entry = WorkLogEntry {
+        schema_version: WORK_LOG_ENTRY_SCHEMA_VERSION.to_string(),
+        id: id.clone(),
         card_id: card_id.clone(),
+        actor: secrets::scrub_secrets(&non_empty("actor", actor)?),
         agent: secrets::scrub_secrets(&non_empty("agent", agent)?),
         model: scrubbed_optional(attribution.model),
         reasoning: scrubbed_optional(attribution.reasoning),
@@ -1743,15 +1923,17 @@ fn append_work_log_in_transaction(
         run_id,
         body: secrets::scrub_secrets(&non_empty("body", body)?),
         created_at: now,
+        updated_at: now,
     };
-    let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
     transaction.execute(
         "INSERT INTO work_log_entries
-         (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (id, card_id, actor, agent, model, reasoning, harness, run_id, body, created_at,
+          updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
-            id,
+            entry.id,
             entry.card_id.as_str(),
+            entry.actor,
             entry.agent,
             entry.model,
             entry.reasoning,
@@ -1759,34 +1941,87 @@ fn append_work_log_in_transaction(
             entry.run_id.as_ref().map(RunId::as_str),
             entry.body,
             entry.created_at,
+            entry.updated_at,
         ],
     )?;
-    let audit_payload = to_json(&json!({
-        "run_id": entry.run_id,
-        "model": entry.model,
-        "harness": entry.harness,
-    }))?;
     let audit_event = append_card_event(
         transaction,
         card_id,
         "work_log",
-        &entry.agent,
-        &audit_payload,
+        &entry.actor,
+        &to_json(&json!({
+            "schema_version": WORK_LOG_ENTRY_SCHEMA_VERSION,
+            "entry_id": entry.id,
+            "run_id": entry.run_id,
+            "agent": entry.agent,
+            "model": entry.model,
+            "reasoning": entry.reasoning,
+            "harness": entry.harness,
+        }))?,
         now,
     )?;
     events::append_outbound_card_event(
         transaction,
         &card,
         "work-log-appended",
-        &entry.agent,
-        json!({
-            "agent": entry.agent.as_str(),
-            "model": entry.model,
-            "harness": entry.harness,
-        }),
+        &entry.actor,
+        json!({"work_log": entry}),
         now,
     )?;
     Ok((entry, audit_event.id.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_current_run_work_log_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    expected_run_id: &RunId,
+    actor: &str,
+    agent: &str,
+    attribution: WorkLogAttribution<'_>,
+    body: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<(WorkLogEntry, String)> {
+    let card = load_card(transaction, card_id)?;
+    let run = transaction
+        .query_row(
+            RUN_SELECT_SQL,
+            [expected_run_id.as_str()],
+            RunRecord::from_row,
+        )
+        .optional()?
+        .ok_or_else(|| DomainError::not_found("run", expected_run_id.to_string()))?
+        .into_run()?;
+    if run.card_id != *card_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} belongs to card {}, not {card_id}",
+            run.card_id
+        ))
+        .into());
+    }
+    card.current_claim_for_run_agent(expected_run_id, agent, now)?;
+    if run.claim_expires_at <= now {
+        return Err(
+            DomainError::claim_expired(format!("run {expected_run_id} claim expired")).into(),
+        );
+    }
+    if !matches!(run.state, RunState::Active | RunState::AwaitingInput) {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} is {}",
+            run.state.as_str()
+        ))
+        .into());
+    }
+    if run.agent != agent {
+        return Err(DomainError::forbidden(format!(
+            "agent {agent} does not own run {expected_run_id}"
+        ))
+        .into());
+    }
+    authority.require_identity(agent)?;
+    authority.require_holder(card.claim_holder())?;
+    append_work_log_in_transaction(transaction, card_id, actor, agent, attribution, body, now)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2128,6 +2363,16 @@ fn validate_optional_bound(field: &'static str, value: Option<&str>, maximum: us
         validate_bounded_non_empty(field, value, maximum)?;
     }
     Ok(())
+}
+
+fn strict_actor_label(authority: &Authority) -> Result<String> {
+    match authority {
+        Authority::Unchecked => Err(DomainError::forbidden(
+            "strict run-bound work-log append requires an authenticated or explicit actor",
+        )
+        .into()),
+        Authority::Actor { .. } => Ok(authority.actor_label()),
+    }
 }
 
 /// The field-note seed generator's actual eligibility check and draft spawn

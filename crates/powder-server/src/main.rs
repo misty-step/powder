@@ -469,6 +469,16 @@ struct WorkLogRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct RunBoundWorkLogRequest {
+    operation_id: String,
+    agent: String,
+    model: Option<String>,
+    reasoning: Option<String>,
+    harness: Option<String>,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct InputRequest {
     question: String,
 }
@@ -618,6 +628,10 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/work-log", post(append_work_log))
+        .route(
+            "/api/v1/cards/{id}/runs/{run_id}/work-log",
+            post(append_run_work_log),
+        )
         .route("/api/v1/cards/{id}/complete", post(complete_card))
         .route("/api/v1/operations/{id}", get(get_operation_status))
         .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
@@ -1287,6 +1301,34 @@ async fn append_work_log(
         )?;
         Ok(Json(json!(entry)))
     }
+}
+
+async fn append_run_work_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, run_id)): Path<(String, String)>,
+    Json(request): Json<RunBoundWorkLogRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let run_id = RunId::new(run_id)?;
+    let attribution = powder_store::WorkLogAttribution {
+        model: request.model.as_deref(),
+        reasoning: request.reasoning.as_deref(),
+        harness: request.harness.as_deref(),
+        run_id: None,
+    };
+    let status = lock_store(&state)?.append_run_work_log_idempotent(
+        OperationId::new(request.operation_id)?,
+        &card_id,
+        &run_id,
+        &request.agent,
+        attribution,
+        &request.body,
+        unix_now(),
+        &actor.authority(),
+    )?;
+    Ok(Json(json!(status)))
 }
 
 async fn request_input(

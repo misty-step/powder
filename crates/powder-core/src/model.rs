@@ -1209,6 +1209,24 @@ impl Card {
         self.claim.as_ref().map(|claim| claim.agent.as_str())
     }
 
+    /// Resolve the exact unexpired current claim for a run-bound agent
+    /// mutation. This is intentionally stricter than permissive operator
+    /// correction paths, which do not use claims as lifecycle law.
+    pub fn current_claim_for_run_agent(
+        &self,
+        run_id: &RunId,
+        agent: &str,
+        now: i64,
+    ) -> Result<&Claim, DomainError> {
+        let claim = self.matching_active_claim(run_id, now)?;
+        if claim.agent != agent {
+            return Err(DomainError::forbidden(format!(
+                "agent {agent} does not own run {run_id}"
+            )));
+        }
+        Ok(claim)
+    }
+
     /// Whether this card's lifecycle (status + claim) must survive a
     /// backlog.d reimport: an active claim, a claimed/running/awaiting-input
     /// status, or a terminal outcome. A backlog/ready/blocked card with no
@@ -1478,7 +1496,10 @@ pub struct Comment {
 /// whatever attribution the calling surface can supply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkLogEntry {
+    pub schema_version: String,
+    pub id: String,
     pub card_id: CardId,
+    pub actor: String,
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1490,6 +1511,7 @@ pub struct WorkLogEntry {
     pub run_id: Option<RunId>,
     pub body: String,
     pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1564,6 +1586,10 @@ pub struct RunDetail {
     pub comments: Vec<Comment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comments_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_log: Vec<WorkLogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_log_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -1989,6 +2015,35 @@ mod tests {
     fn claim_readiness_ok_when_criteria_present_and_unblocked() {
         let card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
         assert!(card.claim_readiness(10, |_| true).is_ok());
+    }
+
+    #[test]
+    fn current_claim_for_run_agent_rejects_stale_expired_and_foreign_attribution() {
+        let mut card = Card::new(CardId::new("strict-domain").unwrap(), "Strict", "body")
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["proof".to_string()]);
+        let run = RunId::new("run-current").unwrap();
+        card.apply_claim("agent-a", run.clone(), 10, 10, |_| false)
+            .unwrap();
+        assert_eq!(
+            card.current_claim_for_run_agent(&run, "agent-a", 19)
+                .unwrap()
+                .run_id,
+            run
+        );
+        assert!(matches!(
+            card.current_claim_for_run_agent(&run, "agent-b", 19),
+            Err(DomainError::Forbidden(_))
+        ));
+        assert!(matches!(
+            card.current_claim_for_run_agent(&RunId::new("run-stale").unwrap(), "agent-a", 19),
+            Err(DomainError::Conflict(_))
+        ));
+        assert!(matches!(
+            card.current_claim_for_run_agent(&run, "agent-a", 20),
+            Err(DomainError::ClaimExpired(_))
+        ));
     }
 
     #[test]

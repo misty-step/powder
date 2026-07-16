@@ -233,6 +233,44 @@ fn migration_13_to_14_adds_the_bounded_operation_ledger_without_data_loss() -> R
 }
 
 #[test]
+fn migration_14_to_15_backfills_authoritative_work_log_identity_without_data_loss() -> Result<()> {
+    let path = temp_db("v14-work-log-identity");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("pre-work-log-identity", 1)])?;
+        store.connection.execute(
+            "INSERT INTO work_log_entries
+             (id, card_id, actor, agent, run_id, body, created_at, updated_at)
+             VALUES ('work-log-old', 'pre-work-log-identity', 'agent-a', 'agent-a', NULL,
+                     'old body', 10, 10)",
+            [],
+        )?;
+        store.connection.execute_batch(
+            "CREATE TABLE work_log_entries_old AS
+             SELECT id, card_id, agent, model, reasoning, harness, run_id, body, created_at
+             FROM work_log_entries;
+             DROP TABLE work_log_entries;
+             ALTER TABLE work_log_entries_old RENAME TO work_log_entries;
+             PRAGMA user_version = 14;",
+        )?;
+    }
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    let detail = store
+        .get_card_detail(
+            &CardId::new("pre-work-log-identity")?,
+            DetailLevel::Detailed,
+        )?
+        .expect("card detail");
+    assert_eq!(detail.work_log.len(), 1);
+    assert_eq!(detail.work_log[0].id, "work-log-old");
+    assert_eq!(detail.work_log[0].actor, "agent-a");
+    assert_eq!(detail.work_log[0].created_at, detail.work_log[0].updated_at);
+    Ok(())
+}
+
+#[test]
 fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -3678,7 +3716,10 @@ fn operation_transaction_rolls_back_effect_and_identity_when_persistence_fails()
         .get_card_detail(&card_id, DetailLevel::Detailed)?
         .unwrap();
     assert!(detail.work_log.is_empty());
-    assert!(store.list_event_tail(0, 20)?.is_empty());
+    assert!(!store
+        .list_event_tail(0, 20)?
+        .iter()
+        .any(|item| item.event.event_type == "work-log-appended"));
     Ok(())
 }
 
@@ -4166,6 +4207,326 @@ fn identical_operation_race_converges_on_one_stored_outcome() -> Result<()> {
             .len(),
         1
     );
+    Ok(())
+}
+
+#[test]
+fn identical_run_bound_operation_race_converges_on_one_exact_entry() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("strict-operation-identical-race");
+    let card_id = CardId::new("strict-operation-identical-race")?;
+    let run_id = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("strict-operation-identical-race", 1)])?;
+        store
+            .claim_card(
+                &card_id,
+                "agent-a",
+                10,
+                100,
+                &Authority::actor("agent-a", false),
+            )?
+            .run_id
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            let run_id = run_id.clone();
+            std::thread::spawn(move || -> Result<_> {
+                let mut store = Store::open(path)?;
+                store.migrate()?;
+                barrier.wait();
+                store.append_run_work_log_idempotent(
+                    OperationId::new("strict:identical-race")?,
+                    &card_id,
+                    &run_id,
+                    "agent-a",
+                    WorkLogAttribution::default(),
+                    "same",
+                    20,
+                    &Authority::actor("agent-a", false),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(results[0], results[1]);
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert_eq!(detail.work_log.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&detail.work_log[0])?,
+        results[0].result.clone().unwrap()
+    );
+    Ok(())
+}
+
+#[test]
+fn run_bound_work_log_replays_exact_scrubbed_record_across_all_history_views() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("strict-work-log")?;
+    store.import_cards(vec![ready_card("strict-work-log", 1)])?;
+    let authority = Authority::actor("agent-a", false);
+    let claim = store.claim_card(&card_id, "agent-a", 10, 100, &authority)?;
+    let operation_id = OperationId::new("strict:exact-retry")?;
+    let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+    let first = store.append_run_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        &claim.run_id,
+        "agent-a",
+        WorkLogAttribution {
+            model: Some("model-a"),
+            reasoning: Some("high"),
+            harness: Some("codex"),
+            run_id: None,
+        },
+        &format!("fixed with {secret}"),
+        20,
+        &authority,
+    )?;
+    assert_eq!(first.state, OperationState::Succeeded);
+    let result = first.result.clone().expect("stored result");
+    assert_eq!(result["schema_version"], "powder.work_log_entry.v1");
+    assert_eq!(result["actor"], "agent-a");
+    assert_eq!(result["agent"], "agent-a");
+    assert_eq!(result["run_id"], claim.run_id.as_str());
+    assert!(result["id"].as_str().unwrap().starts_with("work-log-"));
+    assert_eq!(result["created_at"], result["updated_at"]);
+    assert!(!result.to_string().contains(secret));
+
+    let replay = store.append_run_work_log_idempotent(
+        operation_id,
+        &card_id,
+        &claim.run_id,
+        "agent-a",
+        WorkLogAttribution {
+            model: Some("model-a"),
+            reasoning: Some("high"),
+            harness: Some("codex"),
+            run_id: None,
+        },
+        &format!("fixed with {secret}"),
+        200,
+        &authority,
+    )?;
+    assert_eq!(
+        replay, first,
+        "retry must replay even after the claim expires"
+    );
+
+    let card = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert_eq!(card.work_log.len(), 1);
+    assert_eq!(serde_json::to_value(&card.work_log[0])?, result);
+    let run = store
+        .get_run_detail(&claim.run_id, DetailLevel::Detailed)?
+        .expect("run detail");
+    assert_eq!(run.work_log.len(), 1);
+    assert_eq!(serde_json::to_value(&run.work_log[0])?, result);
+    let audit_id = first.audit_event_id.as_deref().expect("audit id");
+    let audit = card
+        .events
+        .iter()
+        .find(|event| event.id.as_str() == audit_id)
+        .expect("linked audit event");
+    assert_eq!(audit.actor, "agent-a");
+    let audit_payload: serde_json::Value = serde_json::from_str(&audit.payload)?;
+    assert_eq!(audit_payload["entry_id"], result["id"]);
+    assert_eq!(audit_payload["run_id"], result["run_id"]);
+    let outbound = store.list_event_tail(0, 20)?;
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].event.change["work_log"], result);
+    Ok(())
+}
+
+#[test]
+fn run_bound_work_log_rejects_released_expired_and_reclaimed_runs_without_effect() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("strict-stale-runs")?;
+    store.import_cards(vec![ready_card("strict-stale-runs", 1)])?;
+    let authority_a = Authority::actor("agent-a", false);
+    let run_a = store.claim_card(&card_id, "agent-a", 10, 10, &authority_a)?;
+
+    let expired = store.append_run_work_log_idempotent(
+        OperationId::new("strict:expired")?,
+        &card_id,
+        &run_a.run_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "late",
+        20,
+        &authority_a,
+    )?;
+    assert_eq!(expired.state, OperationState::Rejected);
+    assert_eq!(expired.failure.unwrap().code, "claim_expired");
+
+    let authority_b = Authority::actor("agent-b", false);
+    let run_b = store.claim_card(&card_id, "agent-b", 21, 100, &authority_b)?;
+    let reclaimed = store.append_run_work_log_idempotent(
+        OperationId::new("strict:reclaimed")?,
+        &card_id,
+        &run_a.run_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "stale owner",
+        22,
+        &authority_a,
+    )?;
+    assert_eq!(reclaimed.state, OperationState::Rejected);
+
+    store.release_claim(&card_id, &run_b.run_id, 23, &authority_b)?;
+    let released = store.append_run_work_log_idempotent(
+        OperationId::new("strict:released")?,
+        &card_id,
+        &run_b.run_id,
+        "agent-b",
+        WorkLogAttribution::default(),
+        "after release",
+        24,
+        &authority_b,
+    )?;
+    assert_eq!(released.state, OperationState::Rejected);
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert!(detail.work_log.is_empty());
+    assert!(!detail
+        .events
+        .iter()
+        .any(|event| event.event_type == "work_log"));
+    assert!(!store
+        .list_event_tail(0, 20)?
+        .iter()
+        .any(|item| item.event.event_type == "work-log-appended"));
+    Ok(())
+}
+
+#[test]
+fn run_bound_work_log_rejects_mismatch_foreign_malformed_and_unauthorized_without_effect(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_a = CardId::new("strict-validation-a")?;
+    let card_b = CardId::new("strict-validation-b")?;
+    store.import_cards(vec![
+        ready_card("strict-validation-a", 1),
+        ready_card("strict-validation-b", 1),
+    ])?;
+    let owner = Authority::actor("agent-a", false);
+    let run_a = store.claim_card(&card_a, "agent-a", 10, 100, &owner)?;
+    let run_b = store.claim_card(
+        &card_b,
+        "agent-b",
+        10,
+        100,
+        &Authority::actor("agent-b", false),
+    )?;
+
+    for (operation, card, run, agent, authority) in [
+        (
+            "strict:unknown",
+            card_a.clone(),
+            RunId::new("run-unknown")?,
+            "agent-a",
+            owner.clone(),
+        ),
+        (
+            "strict:mismatch",
+            card_a.clone(),
+            run_b.run_id.clone(),
+            "agent-a",
+            owner.clone(),
+        ),
+        (
+            "strict:foreign",
+            card_a.clone(),
+            run_a.run_id.clone(),
+            "agent-b",
+            owner.clone(),
+        ),
+        (
+            "strict:unauthorized",
+            card_a.clone(),
+            run_a.run_id.clone(),
+            "agent-a",
+            Authority::actor("intruder", false),
+        ),
+    ] {
+        let status = store.append_run_work_log_idempotent(
+            OperationId::new(operation)?,
+            &card,
+            &run,
+            agent,
+            WorkLogAttribution::default(),
+            "must not persist",
+            20,
+            &authority,
+        )?;
+        assert_eq!(status.state, OperationState::Rejected);
+    }
+
+    for result in [
+        store.append_run_work_log_idempotent(
+            OperationId::new("strict:empty-model")?,
+            &card_a,
+            &run_a.run_id,
+            "agent-a",
+            WorkLogAttribution {
+                model: Some(""),
+                ..WorkLogAttribution::default()
+            },
+            "body",
+            20,
+            &owner,
+        ),
+        store.append_run_work_log_idempotent(
+            OperationId::new("strict:over-body")?,
+            &card_a,
+            &run_a.run_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            &"x".repeat(WORK_LOG_BODY_MAX_BYTES + 1),
+            20,
+            &owner,
+        ),
+        store.append_run_work_log_idempotent(
+            OperationId::new("strict:unchecked")?,
+            &card_a,
+            &run_a.run_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            "body",
+            20,
+            &Authority::unchecked(),
+        ),
+    ] {
+        assert!(result.is_err());
+    }
+    for card_id in [&card_a, &card_b] {
+        let detail = store
+            .get_card_detail(card_id, DetailLevel::Detailed)?
+            .expect("card detail");
+        assert!(detail.work_log.is_empty());
+        assert!(!detail
+            .events
+            .iter()
+            .any(|event| event.event_type == "work_log"));
+    }
+    assert!(store.list_event_tail(0, 20)?.is_empty());
     Ok(())
 }
 

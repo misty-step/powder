@@ -54,7 +54,7 @@ Default agent persona:
   This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
   `heartbeat`, `release_claim`, and `transfer_claim` tools.
 - `get_card`: read one card with runs, activities, links, comments, and claim state.
-- `get_run`: read one run with its card, activities, links, comments, and run state.
+- `get_run`: read one run with its card, activities, links, comments, bound work log, and run state.
 - `list_awaiting_input`: list runs paused for human or agent input.
 - `answer_input`: append an actor-attributed answer and resume the run.
 - `update_status`: set a card to any status in one call and record an audit event.
@@ -63,10 +63,10 @@ Default agent persona:
 - `add_link`: attach a PR, CI run, artifact, or reference URL to a card.
 - `add_comment`: attach an actor-attributed comment, visible immediately via
   `get_card`/`get_run`.
-- `append_work_log`: append a high-frequency, fully-attributed work_log entry
-  (agent, model, reasoning, harness, run_id, body) while actively working a
-  card -- call this often, not just at completion; `body` is scrubbed for
-  known secret shapes server-side before storage.
+- `append_run_work_log`: append a retry-safe, fully attributed work-log entry against the exact unexpired current run.
+  Supply one stable operation identity and call this often while actively working, not just at completion.
+  Powder returns the exact secret-scrubbed stored record through the operation result.
+- `append_work_log`: append an explicit permissive unbound/operator note without asserting current-run ownership.
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
 - `update_card`: patch title, body, acceptance, proof_plan, status, priority,
@@ -94,7 +94,7 @@ Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all`:
 with `POWDER_API_BASE_URL` and `POWDER_API_KEY` set, `list-ready`,
 `list-cards`, `get-card`, `create-card`, `claim`, `heartbeat`, `renew-claim`,
 `transfer-claim`, `release-claim`, `update-status`, `check-criterion`, `add-link`,
-`add-comment`, `append-work-log`, `request-input`, and `complete-card` all operate against the
+`add-comment`, `append-run-work-log`, `append-work-log`, `request-input`, and `complete-card` all operate against the
 deployed instance when `--db` is omitted -- there is no separate "remote
 closeout" wrapper to reach for; the same commands used against `--db` work
 unchanged against a deployed instance. `--db` always wins when supplied, so a
@@ -112,7 +112,7 @@ export POWDER_API_BASE_URL=https://powder.internal
 export POWDER_API_KEY=sk_powder_...
 powder get-card 001
 powder add-link 001 --label pr --url https://github.com/misty-step/example/pull/1
-powder append-work-log 001 --agent codex --body "narrowed the fix to one function" --model claude-sonnet-5
+powder append-run-work-log 001 --run "$RUN_ID" --operation-id lane:work-log:01 --agent codex --body "narrowed the fix to one function" --model claude-sonnet-5
 powder add-comment 001 --author codex --body "shipped, PR linked above"
 powder complete-card 001 --proof https://github.com/misty-step/example/pull/1
 ```

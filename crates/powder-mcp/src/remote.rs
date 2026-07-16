@@ -289,6 +289,25 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 }),
             )?
         }
+        "append_run_work_log" => {
+            let id = card_id(args, "card_id")?;
+            let run = run_id(args, "expected_run_id")?;
+            let agent = required_str(args, "agent")?;
+            let body = required_str(args, "body")?;
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            client.post(
+                &format!("/api/v1/cards/{id}/runs/{run}/work-log"),
+                json!({
+                    "operation_id": operation_id,
+                    "agent": agent,
+                    "body": body,
+                    "model": optional_str(args, "model"),
+                    "reasoning": optional_str(args, "reasoning"),
+                    "harness": optional_str(args, "harness"),
+                }),
+            )?
+        }
         "request_input" => {
             let run = run_id(args, "run_id")?;
             let question = required_str(args, "question")?;
@@ -896,6 +915,59 @@ mod tests {
                 "harness": null,
                 "run_id": null,
                 "operation_id": null,
+            }))
+        );
+    }
+
+    #[test]
+    fn append_run_work_log_posts_the_strict_expected_run_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "remote:strict:one",
+            "state": "succeeded",
+            "result": {
+                "schema_version": "powder.work_log_entry.v1",
+                "id": "work-log-one",
+                "card_id": "001",
+                "run_id": "run-current",
+                "actor": "codex",
+                "agent": "codex",
+                "body": "done",
+                "created_at": 10,
+                "updated_at": 10
+            }
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone())]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let response = call_tool_remote(
+            &client,
+            "append_run_work_log",
+            &json!({
+                "operation_id": "remote:strict:one",
+                "card_id": "001",
+                "expected_run_id": "run-current",
+                "agent": "codex",
+                "actor": "codex",
+                "body": "done",
+                "model": "gpt-test"
+            }),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&response), status);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards/001/runs/run-current/work-log"
+        );
+        assert_eq!(
+            requests[0].body,
+            Some(json!({
+                "operation_id": "remote:strict:one",
+                "agent": "codex",
+                "body": "done",
+                "model": "gpt-test",
+                "reasoning": null,
+                "harness": null
             }))
         );
     }
@@ -1816,6 +1888,7 @@ mod tests {
         ("update_status", &["actor", "admin"]),
         ("update_relations", &["actor", "admin"]),
         ("append_work_log", &["actor", "admin"]),
+        ("append_run_work_log", &["actor", "admin"]),
         ("request_input", &["actor", "admin"]),
         ("complete_card", &["actor", "admin"]),
         ("operation_status", &["actor", "admin"]),

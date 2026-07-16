@@ -48,6 +48,7 @@ pub const COMMANDS: &[&str] = &[
     "add-link",
     "add-comment",
     "append-work-log",
+    "append-run-work-log",
     "request-input",
     "complete-card",
     "operation-status",
@@ -138,6 +139,9 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "add-link" => add_link(rest, remote_env),
         [command, rest @ ..] if command == "add-comment" => add_comment(rest, remote_env),
         [command, rest @ ..] if command == "append-work-log" => append_work_log(rest, remote_env),
+        [command, rest @ ..] if command == "append-run-work-log" => {
+            append_run_work_log(rest, remote_env)
+        }
         [command, rest @ ..] if command == "request-input" => request_input(rest, remote_env),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest, remote_env),
         [command, rest @ ..] if command == "operation-status" => operation_status(rest, remote_env),
@@ -231,6 +235,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id] [--operation-id stable-id]\n",
+    );
+    help.push_str(
+        "  powder append-run-work-log 001 --db ./data/powder.db --run run-id --operation-id stable-id --agent codex --actor codex --body \"focused tests passed\" [--model model] [--reasoning level] [--harness harness]\n",
     );
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof] [--operation-id stable-id]\n",
@@ -1279,6 +1286,55 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
             json_string(&entry, "body")?
         ))
     }
+}
+
+fn append_run_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "append-run-work-log")?;
+    let run_id = RunId::new(required_flag(args, "--run")?)?;
+    let operation_id = OperationId::new(required_flag(args, "--operation-id")?)?;
+    let agent = required_flag(args, "--agent")?;
+    let body = required_flag(args, "--body")?;
+    let model = flag_value(args, "--model");
+    let reasoning = flag_value(args, "--reasoning");
+    let harness = flag_value(args, "--harness");
+    let status = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .append_run_work_log_idempotent(
+                operation_id,
+                &card_id,
+                &run_id,
+                agent,
+                powder_store::WorkLogAttribution {
+                    model,
+                    reasoning,
+                    harness,
+                    run_id: None,
+                },
+                body,
+                now,
+                &authority(args),
+            )
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/runs/{run_id}/work-log"),
+                json!({
+                    "operation_id": operation_id,
+                    "agent": agent,
+                    "body": body,
+                    "model": model,
+                    "reasoning": reasoning,
+                    "harness": harness,
+                }),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("append-run-work-log"));
+    };
+    to_pretty_json(&status)
 }
 
 fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -2476,6 +2532,130 @@ mod tests {
         assert!(card.contains("\"agent\": \"codex\""));
         assert!(card.contains("\"model\": \"claude-sonnet-5\""));
         assert!(card.contains("\"body\": \"tracing the claim expiry bug\""));
+    }
+
+    #[test]
+    fn cli_append_run_work_log_replays_the_exact_current_run_record() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-strict-work-log-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "strict-cli",
+            "--title",
+            "Strict CLI",
+            "--acceptance",
+            "proof",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let claim = run(&args([
+            "claim",
+            "strict-cli",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--actor",
+            "codex",
+        ]))
+        .unwrap();
+        let run_id = claim.split('\t').nth(2).unwrap();
+        let command = [
+            "append-run-work-log",
+            "strict-cli",
+            "--db",
+            &db,
+            "--run",
+            run_id,
+            "--operation-id",
+            "cli:strict:one",
+            "--agent",
+            "codex",
+            "--actor",
+            "codex",
+            "--body",
+            "focused tests passed",
+        ];
+        let first = run(&args(command)).unwrap();
+        let replay = run(&args(command)).unwrap();
+        assert_eq!(replay, first);
+        let status: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(status["state"], "succeeded");
+        assert_eq!(status["result"]["run_id"], run_id);
+        assert_eq!(status["result"]["actor"], "codex");
+        assert_eq!(
+            status["result"]["schema_version"],
+            "powder.work_log_entry.v1"
+        );
+        let run_detail = run(&args(["get-run", run_id, "--db", &db])).unwrap();
+        let run_detail: serde_json::Value = serde_json::from_str(&run_detail).unwrap();
+        assert_eq!(run_detail["work_log"][0], status["result"]);
+    }
+
+    #[test]
+    fn cli_append_run_work_log_requires_an_explicit_actor_for_direct_db_access() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-strict-auth-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "strict-cli-auth",
+            "--title",
+            "Strict CLI auth",
+            "--acceptance",
+            "proof",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let claim = run(&args([
+            "claim",
+            "strict-cli-auth",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+        ]))
+        .unwrap();
+        let run_id = claim.split('\t').nth(2).unwrap();
+        let error = run(&args([
+            "append-run-work-log",
+            "strict-cli-auth",
+            "--db",
+            &db,
+            "--run",
+            run_id,
+            "--operation-id",
+            "cli:strict:unchecked",
+            "--agent",
+            "codex",
+            "--body",
+            "no",
+        ]))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires an authenticated or explicit actor"));
     }
 
     #[test]

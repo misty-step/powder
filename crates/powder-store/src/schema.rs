@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -125,13 +125,15 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE TABLE IF NOT EXISTS work_log_entries (
   id TEXT PRIMARY KEY,
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  actor TEXT NOT NULL,
   agent TEXT NOT NULL,
   model TEXT,
   reasoning TEXT,
   harness TEXT,
   run_id TEXT,
   body TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
 
@@ -404,6 +406,14 @@ CREATE TABLE IF NOT EXISTS mutation_operations (
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
+"#;
+
+/// powder-run-bound-work-logs: expose stable entry and actor identity in the
+/// authoritative stored work-log record. Existing permissive entries retain
+/// their historical agent as actor and their creation time as update time.
+pub const MIGRATE_14_TO_15: &str = r#"
+UPDATE work_log_entries SET actor = agent WHERE actor IS NULL;
+UPDATE work_log_entries SET updated_at = created_at WHERE updated_at IS NULL;
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,

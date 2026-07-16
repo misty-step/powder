@@ -1995,6 +1995,214 @@ async fn http_operation_replay_status_conflict_and_authorization_are_consistent(
 }
 
 #[tokio::test]
+async fn http_run_bound_work_log_returns_the_exact_record_in_card_and_run_detail() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("agent-a", ApiKeyScope::Agent, 2)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"http-strict-log","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-strict-log/claim",
+            Some(&agent_key),
+            r#"{"agent":"agent-a","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim.status(), StatusCode::OK);
+    let run_id = response_json(claim).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let path = format!("/api/v1/cards/http-strict-log/runs/{run_id}/work-log");
+    let request = json!({
+        "operation_id": "http:strict:one",
+        "agent": "agent-a",
+        "model": "gpt-test",
+        "body": "done sk-abcdefghijklmnopqrstuvwxyz123456"
+    })
+    .to_string();
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&agent_key),
+            &request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await;
+    assert_eq!(first["state"], "succeeded");
+    let stored = first["result"].clone();
+    assert_eq!(stored["schema_version"], "powder.work_log_entry.v1");
+    assert_eq!(stored["run_id"], run_id);
+    assert!(!stored
+        .to_string()
+        .contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&agent_key),
+            &request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(replay).await, first);
+    let card = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-strict-log?detail=detailed",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let card = response_json(card).await;
+    assert_eq!(card["work_log"][0], stored);
+    assert_eq!(
+        card["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event_type"] == "work_log")
+            .count(),
+        1
+    );
+    let run = app
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/runs/{run_id}?detail=detailed"),
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(run).await["work_log"][0], stored);
+}
+
+#[tokio::test]
+async fn http_run_bound_work_log_rejects_foreign_identity_and_open_auth_without_effect() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let owner_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("owner", ApiKeyScope::Agent, 2)
+        .unwrap()
+        .raw_key;
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("intruder", ApiKeyScope::Agent, 3)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"http-strict-auth","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-strict-auth/claim",
+            Some(&owner_key),
+            r#"{"agent":"owner","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let run_id = response_json(claim).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rejected = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/cards/http-strict-auth/runs/{run_id}/work-log"),
+            Some(&intruder_key),
+            r#"{"operation_id":"http:strict:foreign","agent":"owner","body":"no"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::OK);
+    assert_eq!(response_json(rejected).await["state"], "rejected");
+    let card = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-strict-auth?detail=detailed",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert!(response_json(card).await.get("work_log").is_none());
+
+    let (open_state, _) = test_state(AuthMode::None);
+    let open_run = {
+        let mut open_store = open_state.store.lock().unwrap();
+        open_store
+            .import_cards(vec![Card::new(
+                CardId::new("open-strict").unwrap(),
+                "Open strict",
+                "body",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["proof".to_string()])])
+            .unwrap();
+        open_store
+            .claim_card(
+                &CardId::new("open-strict").unwrap(),
+                "agent-a",
+                unix_now(),
+                3600,
+                &Authority::unchecked(),
+            )
+            .unwrap()
+            .run_id
+            .to_string()
+    };
+    let response = super::app(open_state)
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/cards/open-strict/runs/{open_run}/work-log"),
+            None,
+            r#"{"operation_id":"http:strict:open","agent":"agent-a","body":"no"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn http_work_log_operation_scrubs_all_attribution_and_resolves_its_audit_link() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);

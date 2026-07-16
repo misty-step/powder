@@ -175,9 +175,17 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/work-log",
-        intent: "append a high-frequency, fully-attributed work_log entry while actively working a card (powder-943) -- context, current activity, issues, chain of thought, distinct from the low-frequency human-facing comments field",
+        intent: "append an explicit permissive unbound/operator work-log note; this compatibility path does not assert current-run ownership",
         body_shape: Some(
             r#"{"operation_id":null,"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; operation_id opts into powder.operation_status.v1 replay and recovery; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; every caller-controlled attribution field and body is scrubbed for known secret shapes server-side before storage"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/cards/{id}/runs/{run_id}/work-log",
+        intent: "atomically append one retry-safe work-log entry only when run_id is the card's unexpired current run and the authenticated actor is authorized for its agent attribution",
+        body_shape: Some(
+            r#"{"operation_id":"stable-id","agent":"...","body":"...","model":null,"reasoning":null,"harness":null} -- operation_id, agent, and body are required; returns powder.operation_status.v1 whose succeeded result is the exact powder.work_log_entry.v1 record stored in card/run detail and emitted in powder.card_event.v1 change.work_log"#,
         ),
     },
     ApiRoute {
@@ -195,7 +203,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/{id}",
-        intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
+        intent: "read one run with activity, card, links, comments, and work-log entries bound to that run; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
         body_shape: None,
     },
     ApiRoute {
