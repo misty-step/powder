@@ -439,8 +439,8 @@ impl Store {
                     15
                 }
                 15 => {
-                    self.connection.execute_batch(MIGRATE_15_TO_16)?;
-                    16
+                    self.migrate_15_to_16()?;
+                    continue;
                 }
                 16 => {
                     self.connection.execute_batch(MIGRATE_16_TO_17)?;
@@ -487,6 +487,51 @@ impl Store {
                 .execute_batch("ALTER TABLE work_log_entries ADD COLUMN updated_at INTEGER;")?;
         }
         self.connection.execute_batch(MIGRATE_14_TO_15)?;
+        Ok(())
+    }
+
+    fn migrate_15_to_16(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let table_sql = |name: &str| -> Result<Option<String>> {
+            Ok(transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        };
+
+        // Recover databases left between statements by the former
+        // non-transactional rebuild. Restore the v14 table first, then apply
+        // the same atomic rebuild below.
+        if table_sql("mutation_operations_v15")?.is_some() {
+            if table_sql("mutation_operations")?.is_some() {
+                transaction.execute("DROP TABLE mutation_operations", [])?;
+            }
+            transaction.execute(
+                "ALTER TABLE mutation_operations_v15 RENAME TO mutation_operations",
+                [],
+            )?;
+        }
+
+        let current_sql =
+            table_sql("mutation_operations")?.ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "schema.mutation_operations",
+                value: "missing during v15 to v16 migration".to_string(),
+            })?;
+        if !current_sql.contains("criterion_review") {
+            transaction.execute_batch(MIGRATE_15_TO_16)?;
+        } else {
+            transaction.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry
+                   ON mutation_operations(expires_at, operation_id);",
+            )?;
+        }
+        transaction.execute_batch("PRAGMA user_version = 16;")?;
+        transaction.commit()?;
         Ok(())
     }
 

@@ -20,6 +20,14 @@ Its target is the card, its expected-run component is the specified run, and ord
 The result and recovery record use `powder.operation_status.v1` unchanged.
 The operation retention window and replay rules are unchanged.
 
+## Migration composition
+
+Schema v14 to v15 is the frozen operation-ledger extension that adds only `criterion_review` to the operation-kind check.
+Its table rebuild and `user_version` advance commit in one immediate transaction, and retry restores a backup table left by the former non-transactional implementation before rebuilding.
+Schema v15 to v16 adds immutable criterion-review history without changing operation digesting, authority binding, replay, retention, lifecycle states, status response shape, or work-log behavior.
+Schema v16 to v17 adds stable reviewer identity and the criterion-specific run-authority binding.
+These steps remain ordered and independently retryable so the P3 and P4 migrations compose without merging or reimplementing P3-owned behavior.
+
 Proof is optional, trimmed, and limited to 4,096 UTF-8 bytes.
 An empty supplied proof is rejected.
 Known credential shapes are scrubbed before proof appears in history, events, operation results, or read projections, while the operation digest still distinguishes the original bounded request.

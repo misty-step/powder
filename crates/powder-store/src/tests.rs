@@ -390,8 +390,128 @@ fn migration_15_to_16_adds_only_criterion_review_kind_and_preserves_operations()
 }
 
 #[test]
+fn migration_15_to_16_failure_rolls_back_and_retries_deterministically() -> Result<()> {
+    let path = temp_db("v15-atomic-retry");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute_batch(
+            "INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               state, created_at, updated_at, expires_at
+             ) VALUES
+               ('valid-op', 'sha256:valid', 'completion', 'card-1', 'actor-1',
+                'succeeded', 10, 11, 12);
+             DROP INDEX idx_mutation_operations_expiry;
+             ALTER TABLE mutation_operations RENAME TO mutation_operations_v17;
+             CREATE TABLE mutation_operations (
+               operation_id TEXT PRIMARY KEY,
+               request_digest TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               target_card_id TEXT NOT NULL,
+               authority TEXT NOT NULL,
+               expected_run_id TEXT,
+               state TEXT NOT NULL,
+               result_json TEXT,
+               failure_code TEXT,
+               failure_message TEXT,
+               audit_event_id TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL
+             );
+             INSERT INTO mutation_operations SELECT * FROM mutation_operations_v17;
+             INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               state, created_at, updated_at, expires_at
+             ) VALUES
+               ('invalid-op', 'sha256:invalid', 'outside-contract', 'card-1', 'actor-1',
+                'succeeded', 10, 11, 12);
+             DROP TABLE mutation_operations_v17;
+             CREATE INDEX idx_mutation_operations_expiry
+               ON mutation_operations(expires_at, operation_id);
+             DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 15;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    let failed = store.migrate();
+    assert!(matches!(failed, Err(StoreError::Sqlite(_))));
+    assert_eq!(store.schema_version()?, 15);
+    let canonical_rows: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM mutation_operations", [], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(canonical_rows, 2);
+    let backup_tables: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'mutation_operations_v15'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(backup_tables, 0);
+
+    store.connection.execute(
+        "DELETE FROM mutation_operations WHERE operation_id = 'invalid-op'",
+        [],
+    )?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let preserved: String = store.connection.query_row(
+        "SELECT kind FROM mutation_operations WHERE operation_id = 'valid-op'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(preserved, "completion");
+    Ok(())
+}
+
+#[test]
+fn migration_15_to_16_recovers_a_legacy_partial_rebuild() -> Result<()> {
+    let path = temp_db("v15-partial-rebuild");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute_batch(
+            "INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               state, created_at, updated_at, expires_at
+             ) VALUES
+               ('preserved-op', 'sha256:preserved', 'completion', 'card-1', 'actor-1',
+                'succeeded', 10, 11, 12);
+             DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 15;
+             ALTER TABLE mutation_operations RENAME TO mutation_operations_v15;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let preserved: String = store.connection.query_row(
+        "SELECT kind FROM mutation_operations WHERE operation_id = 'preserved-op'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(preserved, "completion");
+    let backup_tables: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'mutation_operations_v15'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(backup_tables, 0);
+    Ok(())
+}
+
+#[test]
 fn migration_16_to_17_adds_immutable_criterion_review_history() -> Result<()> {
-    let path = temp_db("v15-criterion-review-history");
+    let path = temp_db("v16-criterion-review-history");
     {
         let mut store = Store::open(&path)?;
         store.migrate()?;
