@@ -75,6 +75,7 @@ pub enum Authority {
     Unchecked,
     Actor {
         display_name: String,
+        operation_identity: Option<String>,
         is_admin: bool,
     },
 }
@@ -87,6 +88,21 @@ impl Authority {
     pub fn actor(display_name: impl Into<String>, is_admin: bool) -> Self {
         Self::Actor {
             display_name: display_name.into(),
+            operation_identity: None,
+            is_admin,
+        }
+    }
+
+    /// Construct an adapter-authenticated authority whose stable identity is
+    /// distinct from its human-readable audit label.
+    pub fn authenticated(
+        display_name: impl Into<String>,
+        operation_identity: impl Into<String>,
+        is_admin: bool,
+    ) -> Self {
+        Self::Actor {
+            display_name: display_name.into(),
+            operation_identity: Some(operation_identity.into()),
             is_admin,
         }
     }
@@ -101,6 +117,7 @@ impl Authority {
             Self::Actor {
                 display_name,
                 is_admin: false,
+                ..
             } => {
                 if display_name == requested {
                     Ok(())
@@ -122,6 +139,7 @@ impl Authority {
             Self::Actor {
                 display_name,
                 is_admin: false,
+                ..
             } => match holder {
                 Some(current) if current == display_name => Ok(()),
                 _ => Err(DomainError::forbidden(format!(
@@ -138,6 +156,24 @@ impl Authority {
         }
     }
 
+    /// Stable identity used in operation digests and recovery authorization.
+    /// Legacy local actors fall back to their audit label.
+    pub fn operation_identity(&self) -> &str {
+        match self {
+            Self::Unchecked => "unchecked",
+            Self::Actor {
+                display_name,
+                operation_identity,
+                ..
+            } if operation_identity.is_none() => display_name,
+            Self::Actor {
+                operation_identity, ..
+            } => operation_identity
+                .as_deref()
+                .expect("matched Some operation identity"),
+        }
+    }
+
     /// Operation recovery is scoped to the authenticated authority that
     /// created the operation. Admins and unchecked local operator surfaces
     /// may inspect any operation, while an agent may inspect only its own.
@@ -147,10 +183,17 @@ impl Authority {
             Self::Actor {
                 display_name,
                 is_admin: false,
-            } if display_name == recorded => Ok(()),
+                operation_identity,
+                ..
+            } if operation_identity.as_deref() == Some(recorded)
+                || (operation_identity.is_none() && display_name == recorded) =>
+            {
+                Ok(())
+            }
             Self::Actor {
                 display_name,
                 is_admin: false,
+                ..
             } => Err(DomainError::forbidden(format!(
                 "actor {display_name} cannot inspect this operation"
             ))),

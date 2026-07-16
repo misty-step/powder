@@ -3675,6 +3675,36 @@ fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()
 }
 
 #[test]
+fn operation_status_uses_stable_authority_not_a_shared_display_name() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-stable-authority")?;
+    store.import_cards(vec![ready_card("operation-stable-authority", 1)])?;
+    let operation_id = OperationId::new("op-stable-authority")?;
+    let owner = Authority::authenticated("same-name", "actor-id-one", false);
+    store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        "same-name",
+        WorkLogAttribution::default(),
+        "owned outcome",
+        10,
+        &owner,
+    )?;
+
+    let lookalike = Authority::authenticated("same-name", "actor-id-two", false);
+    assert!(matches!(
+        store.operation_status(&operation_id, 11, &lookalike),
+        Err(StoreError::Domain(DomainError::Forbidden(_)))
+    ));
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &owner)?.state,
+        OperationState::Succeeded
+    );
+    Ok(())
+}
+
+#[test]
 fn oversized_operation_request_has_no_operation_or_mutation_effect() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

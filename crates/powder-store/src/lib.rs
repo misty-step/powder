@@ -1444,7 +1444,7 @@ impl Store {
             operation_id,
             OperationKind::WorkLogAppend,
             card_id.clone(),
-            &authority.actor_label(),
+            authority.operation_identity(),
             expected_run,
             &[
                 OperationField {
@@ -1622,7 +1622,7 @@ impl Store {
             operation_id,
             OperationKind::Completion,
             card_id.clone(),
-            &authority.actor_label(),
+            authority.operation_identity(),
             None,
             &[
                 OperationField {
