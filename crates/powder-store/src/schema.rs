@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 18;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_card_created ON runs(card_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS run_review_authorities (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  authority TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS activities (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -167,6 +172,7 @@ CREATE TABLE IF NOT EXISTS criterion_reviews (
   criterion_text TEXT NOT NULL,
   decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected', 'cleared')),
   reviewer TEXT NOT NULL,
+  reviewer_identity TEXT NOT NULL,
   proof TEXT,
   supersedes_review_id TEXT REFERENCES criterion_reviews(id),
   created_at INTEGER NOT NULL
@@ -495,6 +501,16 @@ CREATE INDEX IF NOT EXISTS idx_criterion_reviews_card_created
   ON criterion_reviews(card_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_criterion_reviews_run_criterion_created
   ON criterion_reviews(run_id, criterion_id, sequence DESC);
+"#;
+
+pub const MIGRATE_17_TO_18: &str = r#"
+ALTER TABLE criterion_reviews
+  ADD COLUMN reviewer_identity TEXT NOT NULL DEFAULT 'legacy:unverified';
+
+CREATE TABLE IF NOT EXISTS run_review_authorities (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  authority TEXT NOT NULL
+);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,

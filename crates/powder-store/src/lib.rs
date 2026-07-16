@@ -38,8 +38,9 @@ pub use repositories::{
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
     MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_16_TO_17,
-    MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5, MIGRATE_5_TO_6, MIGRATE_6_TO_7,
-    MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_17_TO_18, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5,
+    MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10,
+    RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -444,6 +445,10 @@ impl Store {
                 16 => {
                     self.connection.execute_batch(MIGRATE_16_TO_17)?;
                     17
+                }
+                17 => {
+                    self.connection.execute_batch(MIGRATE_17_TO_18)?;
+                    18
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1276,6 +1281,12 @@ impl Store {
             updated_at: now,
         };
         persist_run(&transaction, &run)?;
+        if let Some(identity) = authority.authenticated_identity() {
+            transaction.execute(
+                "INSERT INTO run_review_authorities (run_id, authority) VALUES (?1, ?2)",
+                params![run_id.as_str(), identity],
+            )?;
+        }
         append_activity(
             &transaction,
             &run_id,
@@ -2300,6 +2311,22 @@ fn review_criterion_in_transaction(
         return Err(DomainError::conflict(format!("run {expected_run_id} is not active")).into());
     }
     authority.require_holder(Some(&claim.agent))?;
+    let reviewer_identity = authority.require_authenticated_identity()?;
+    if !authority.is_admin() {
+        let claim_authority = transaction
+            .query_row(
+                "SELECT authority FROM run_review_authorities WHERE run_id = ?1",
+                [expected_run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if claim_authority.as_deref() != Some(reviewer_identity) {
+            return Err(DomainError::forbidden(
+                "authenticated reviewer does not own the current run",
+            )
+            .into());
+        }
+    }
     if criterion_index > u32::MAX as usize {
         return Err(DomainError::validation(
             "criterion",
@@ -2335,6 +2362,7 @@ fn review_criterion_in_transaction(
         criterion_text: criterion.text.clone(),
         decision,
         reviewer: authority.actor_label(),
+        reviewer_identity: reviewer_identity.to_string(),
         proof,
         supersedes_review_id,
         created_at: now,
@@ -2342,8 +2370,9 @@ fn review_criterion_in_transaction(
     transaction.execute(
         "INSERT INTO criterion_reviews (
            id, operation_id, card_id, run_id, criterion_index, criterion_id,
-           criterion_text, decision, reviewer, proof, supersedes_review_id, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+           criterion_text, decision, reviewer, reviewer_identity, proof,
+           supersedes_review_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             review.id,
             review.operation_id.as_str(),
@@ -2354,6 +2383,7 @@ fn review_criterion_in_transaction(
             review.criterion_text,
             review.decision.as_str(),
             review.reviewer,
+            review.reviewer_identity,
             review.proof,
             review.supersedes_review_id,
             review.created_at,
@@ -2388,6 +2418,7 @@ struct CriterionReviewRecord {
     criterion_text: String,
     decision: String,
     reviewer: String,
+    reviewer_identity: String,
     proof: Option<String>,
     supersedes_review_id: Option<String>,
     created_at: i64,
@@ -2405,9 +2436,10 @@ impl CriterionReviewRecord {
             criterion_text: row.get(6)?,
             decision: row.get(7)?,
             reviewer: row.get(8)?,
-            proof: row.get(9)?,
-            supersedes_review_id: row.get(10)?,
-            created_at: row.get(11)?,
+            reviewer_identity: row.get(9)?,
+            proof: row.get(10)?,
+            supersedes_review_id: row.get(11)?,
+            created_at: row.get(12)?,
         })
     }
 
@@ -2433,6 +2465,7 @@ impl CriterionReviewRecord {
             criterion_text: self.criterion_text,
             decision,
             reviewer: self.reviewer,
+            reviewer_identity: self.reviewer_identity,
             proof: self.proof,
             supersedes_review_id: self.supersedes_review_id,
             created_at: self.created_at,
@@ -2455,7 +2488,8 @@ fn query_criterion_reviews(
 }
 
 const CRITERION_REVIEW_COLUMNS: &str = "id, operation_id, card_id, run_id, criterion_index,
-criterion_id, criterion_text, decision, reviewer, proof, supersedes_review_id, created_at";
+criterion_id, criterion_text, decision, reviewer, reviewer_identity, proof,
+supersedes_review_id, created_at";
 
 fn load_criterion_reviews_for_card(
     connection: &Connection,
@@ -2510,6 +2544,7 @@ fn project_run_criterion_state(
 ) -> Result<Vec<RunCriterionState>> {
     let latest = load_criterion_reviews_for_run(connection, run_id)?
         .into_iter()
+        .filter(|review| review.reviewer_identity != "legacy:unverified")
         .fold(HashMap::new(), |mut by_identity, review| {
             by_identity.insert(review.criterion_id.clone(), review);
             by_identity

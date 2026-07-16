@@ -1,13 +1,13 @@
 use powder_core::{
-    AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource, CardStatus,
-    DetailLevel, DomainError, Estimate, OperationId, OperationState, Priority, ReadyQuery, RunId,
-    RunState,
+    criterion_identity, AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource,
+    CardStatus, CriterionReviewDecision, DetailLevel, DomainError, Estimate, OperationId,
+    OperationState, Priority, ReadyQuery, RunId, RunState,
 };
 
 use crate::{
-    ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig,
-    ImportOutcome, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
-    StoreError, WorkLogAttribution, API_KEY_ALPHABET, OPERATION_RETENTION_SECONDS,
+    ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, CriterionReviewInput,
+    FieldNoteConfig, ImportOutcome, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result,
+    Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET, OPERATION_RETENTION_SECONDS,
     TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE, TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV,
     WORK_LOG_ATTRIBUTION_MAX_BYTES, WORK_LOG_BODY_MAX_BYTES,
 };
@@ -201,7 +201,9 @@ fn migration_13_to_14_adds_the_bounded_operation_ledger_without_data_loss() -> R
         store.migrate()?;
         store.import_cards(vec![ready_card("pre-operation-migration", 10)])?;
         store.connection.execute_batch(
-            "DROP TABLE mutation_operations;
+            "DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             DROP TABLE mutation_operations;
              PRAGMA user_version = 13;",
         )?;
     }
@@ -252,6 +254,8 @@ fn migration_14_to_15_backfills_authoritative_work_log_identity_without_data_los
              FROM work_log_entries;
              DROP TABLE work_log_entries;
              ALTER TABLE work_log_entries_old RENAME TO work_log_entries;
+             DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
              PRAGMA user_version = 14;",
         )?;
     }
@@ -323,7 +327,9 @@ fn migration_15_to_16_adds_only_criterion_review_kind_and_preserves_operations()
             [],
         )?;
         store.connection.execute_batch(
-            "PRAGMA user_version = 15;
+            "DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 15;
              ALTER TABLE mutation_operations RENAME TO mutation_operations_v15;
              CREATE TABLE mutation_operations (
                operation_id TEXT PRIMARY KEY,
@@ -417,6 +423,103 @@ fn migration_16_to_17_adds_immutable_criterion_review_history() -> Result<()> {
         |row| row.get(0),
     )?;
     assert_eq!(indexes, 2);
+    Ok(())
+}
+
+#[test]
+fn migration_17_to_18_preserves_unverified_history_without_current_approval() -> Result<()> {
+    let path = temp_db("v17-reviewer-identity");
+    let card_id = CardId::new("pre-identity-review")?;
+    let authority = Authority::authenticated("operator", "actor-operator", true);
+    let (run_id, criterion_id) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card(card_id.as_str(), 1)])?;
+        let claim = store.claim_card(&card_id, "operator", 10, 100, &authority)?;
+        let criterion_id =
+            criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
+        store.review_criterion(
+            &card_id,
+            CriterionReviewInput {
+                operation_id: OperationId::new("pre-identity-operation")?,
+                expected_run_id: claim.run_id.clone(),
+                criterion: 0,
+                criterion_id: criterion_id.clone(),
+                decision: CriterionReviewDecision::Approved,
+                proof: Some("historical proof".to_string()),
+            },
+            20,
+            &authority,
+        )?;
+        store.connection.execute_batch(
+            "ALTER TABLE criterion_reviews RENAME TO criterion_reviews_v17;
+             CREATE TABLE criterion_reviews (
+               sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+               id TEXT NOT NULL UNIQUE,
+               operation_id TEXT NOT NULL,
+               card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+               run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+               criterion_index INTEGER NOT NULL,
+               criterion_id TEXT NOT NULL,
+               criterion_text TEXT NOT NULL,
+               decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected', 'cleared')),
+               reviewer TEXT NOT NULL,
+               proof TEXT,
+               supersedes_review_id TEXT REFERENCES criterion_reviews(id),
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO criterion_reviews (
+               sequence, id, operation_id, card_id, run_id, criterion_index,
+               criterion_id, criterion_text, decision, reviewer, proof,
+               supersedes_review_id, created_at
+             )
+             SELECT sequence, id, operation_id, card_id, run_id, criterion_index,
+                    criterion_id, criterion_text, decision, reviewer, proof,
+                    supersedes_review_id, created_at
+             FROM criterion_reviews_v17;
+             DROP TABLE criterion_reviews_v17;
+             CREATE INDEX idx_criterion_reviews_card_created
+               ON criterion_reviews(card_id, sequence);
+             CREATE INDEX idx_criterion_reviews_run_criterion_created
+               ON criterion_reviews(run_id, criterion_id, sequence DESC);
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 17;",
+        )?;
+        (claim.run_id, criterion_id)
+    };
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    let history = store.list_criterion_reviews(&card_id)?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].reviewer_identity, "legacy:unverified");
+    assert!(store.criterion_state_for_run(&card_id, &run_id)?[0]
+        .review
+        .is_none());
+
+    let reviewed = store.review_criterion(
+        &card_id,
+        CriterionReviewInput {
+            operation_id: OperationId::new("authenticated-rereview")?,
+            expected_run_id: run_id.clone(),
+            criterion: 0,
+            criterion_id,
+            decision: CriterionReviewDecision::Approved,
+            proof: Some("authenticated correction".to_string()),
+        },
+        21,
+        &authority,
+    )?;
+    assert_eq!(reviewed.state, OperationState::Succeeded);
+    let current = store.criterion_state_for_run(&card_id, &run_id)?[0]
+        .review
+        .clone()
+        .unwrap();
+    assert_eq!(current.reviewer_identity, "actor-operator");
+    assert_eq!(
+        current.supersedes_review_id.as_deref(),
+        Some(history[0].id.as_str())
+    );
     Ok(())
 }
 

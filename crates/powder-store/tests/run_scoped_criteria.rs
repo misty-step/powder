@@ -127,6 +127,7 @@ fn review_replay_rereview_clear_and_all_read_models_agree() -> powder_store::Res
     let current = card_detail.current_run_criteria[0].review.as_ref().unwrap();
     assert_eq!(current.decision, CriterionReviewDecision::Cleared);
     assert_eq!(current.reviewer, "Reviewer Name");
+    assert_eq!(current.reviewer_identity, "actor-reviewer");
     assert_eq!(current.proof.as_deref(), Some("operator correction"));
     assert_eq!(current.run_id, claim.run_id);
     assert_eq!(current.criterion_id, criterion_id);
@@ -143,6 +144,10 @@ fn review_replay_rereview_clear_and_all_read_models_agree() -> powder_store::Res
     let event_payload: serde_json::Value = serde_json::from_str(&review_events[2].payload)?;
     assert_eq!(event_payload["id"], current.id);
     assert_eq!(event_payload["reviewer"], current.reviewer);
+    assert_eq!(
+        event_payload["reviewer_identity"],
+        current.reviewer_identity
+    );
     assert_eq!(event_payload["decision"], "cleared");
     assert_eq!(event_payload["proof"], "operator correction");
     assert_eq!(event_payload["run_id"], claim.run_id.as_str());
@@ -156,7 +161,8 @@ fn conflicting_replay_and_unauthorized_review_have_no_approval_side_effect(
     store.migrate()?;
     let card_id = CardId::new("review-auth")?;
     store.import_cards(vec![card(card_id.as_str(), &["secure review"])])?;
-    let claim = store.claim_card(&card_id, "claim-holder", 10, 100, &authenticated_operator())?;
+    let holder = Authority::authenticated("claim-holder", "actor-holder", false);
+    let claim = store.claim_card(&card_id, "claim-holder", 10, 100, &holder)?;
     let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
 
     let unauthorized = store.review_criterion(
@@ -176,7 +182,6 @@ fn conflicting_replay_and_unauthorized_review_have_no_approval_side_effect(
     assert_eq!(unauthorized.failure.unwrap().code, "forbidden");
     assert!(store.list_criterion_reviews(&card_id)?.is_empty());
 
-    let holder = Authority::authenticated("claim-holder", "actor-holder", false);
     let first = store.review_criterion(
         &card_id,
         review_input(

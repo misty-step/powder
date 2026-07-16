@@ -10,6 +10,7 @@ The contract is generic Powder behavior and does not encode an orchestrator or c
 The reviewer is always derived from authenticated authority.
 There is no reviewer or actor request field.
 An authenticated non-admin authority must hold the current claim.
+Powder binds that run to the authority's stable authenticated identity at claim creation, so a different key or principal with the same display label cannot review it.
 An authenticated administrator may review as an auditable operator correction, but the card must still have the specified live current run.
 Unchecked and label-only local authority cannot create authoritative run-scoped review state.
 Direct-database CLI and stdio MCP retain the explicit legacy `check-criterion` correction path, whose `checked_by` and `checked_at` fields remain non-authoritative for run-scoped completion.
@@ -47,7 +48,7 @@ Rejected domain outcomes are retained as rejected operations when request constr
 ## History and current state
 
 Every successful action inserts an immutable `CriterionReview` history row and a matching card event.
-The row snapshots card, run, criterion index, criterion identity, exact criterion text, decision, reviewer, proof, operation identity, time, and the prior review it supersedes.
+The row snapshots card, run, criterion index, criterion identity, exact criterion text, reviewer display label, stable reviewer identity, decision, proof, operation identity, time, and the prior review it supersedes.
 An identical operation replay returns the original result and inserts nothing.
 A conflicting replay returns conflict and inserts nothing.
 
@@ -66,3 +67,4 @@ Legacy `AcceptanceCriterion.checked_by` and `checked_at` are not authoritative f
 A later claim creates a different run and begins with no current review state, even when an earlier run approved identical criterion text.
 Earlier reviews remain visible in history but never appear as the later run's current review.
 After release or expiry, card detail has no `current_run_criteria`; run detail still shows that run's historical projection.
+Reviews migrated from the pre-identity schema remain auditable with `reviewer_identity: "legacy:unverified"` but are excluded from authoritative current state until an authenticated re-review supersedes them.

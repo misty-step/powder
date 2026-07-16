@@ -191,6 +191,20 @@ impl Authority {
         }
     }
 
+    pub fn authenticated_identity(&self) -> Option<&str> {
+        match self {
+            Self::Actor {
+                operation_identity: Some(identity),
+                ..
+            } => Some(identity),
+            Self::Unchecked | Self::Actor { .. } => None,
+        }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Self::Actor { is_admin: true, .. })
+    }
+
     /// Operation recovery is scoped to the authenticated authority that
     /// created the operation. Admins and unchecked local operator surfaces
     /// may inspect any operation, while an agent may inspect only its own.
@@ -881,6 +895,7 @@ pub struct CriterionReview {
     pub criterion_text: String,
     pub decision: CriterionReviewDecision,
     pub reviewer: String,
+    pub reviewer_identity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
