@@ -177,7 +177,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/work-log",
         intent: "append a high-frequency, fully-attributed work_log entry while actively working a card (powder-943) -- context, current activity, issues, chain of thought, distinct from the low-frequency human-facing comments field",
         body_shape: Some(
-            r#"{"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; body is scrubbed for known secret shapes server-side before storage"#,
+            r#"{"operation_id":null,"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; operation_id opts into powder.operation_status.v1 replay and recovery; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; body is scrubbed for known secret shapes server-side before storage"#,
         ),
     },
     ApiRoute {
@@ -207,7 +207,15 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/complete",
-        intent: "mark a card done, optionally recording proof and criterion proof links",
+        intent: "mark a card done through the existing permissive operator-correction contract, optionally recording proof and criterion proof links; operation_id opts into replay and recovery but does not add an expected-run precondition",
+        body_shape: Some(
+            r#"{"operation_id":null,"proof":null,"criterion_proofs":null} -- operation_id opts into powder.operation_status.v1; proof and criterion_proofs remain optional; expected-current-run completion is a separate contract"#,
+        ),
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/operations/{id}",
+        intent: "read one bounded powder.operation_status.v1 recovery record as unknown, pending, succeeded, rejected, or failed; the creating authority or an admin is required",
         body_shape: None,
     },
     ApiRoute {

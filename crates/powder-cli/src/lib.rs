@@ -2,8 +2,8 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
-    ReadyQuery, RunId,
+    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Estimate, OperationId,
+    Priority, ReadyQuery, RunId,
 };
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
@@ -50,6 +50,7 @@ pub const COMMANDS: &[&str] = &[
     "append-work-log",
     "request-input",
     "complete-card",
+    "operation-status",
     "subscription-create",
     "subscription-list",
     "subscription-disable",
@@ -139,6 +140,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "append-work-log" => append_work_log(rest, remote_env),
         [command, rest @ ..] if command == "request-input" => request_input(rest, remote_env),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest, remote_env),
+        [command, rest @ ..] if command == "operation-status" => operation_status(rest, remote_env),
         [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
         [command, rest @ ..] if command == "subscription-list" => subscription_list(rest),
         [command, rest @ ..] if command == "subscription-disable" => subscription_disable(rest),
@@ -228,11 +230,12 @@ pub fn help() -> String {
         "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
     );
     help.push_str(
-        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id]\n",
+        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id] [--operation-id stable-id]\n",
     );
     help.push_str(
-        "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof]\n",
+        "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof] [--operation-id stable-id]\n",
     );
+    help.push_str("  powder operation-status stable-id --db ./data/powder.db [--actor codex]\n");
     help.push_str(
         "  powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret\n",
     );
@@ -1222,6 +1225,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let reasoning = flag_value(args, "--reasoning");
     let harness = flag_value(args, "--harness");
     let run_id = flag_value(args, "--run-id");
+    let operation_id = flag_value(args, "--operation-id");
     let attribution = powder_store::WorkLogAttribution {
         model,
         reasoning,
@@ -1230,9 +1234,23 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .append_work_log(&card_id, agent, attribution, body, now)
-            .map_err(store_err)?)
+        if let Some(operation_id) = operation_id {
+            json!(store
+                .append_work_log_idempotent(
+                    OperationId::new(operation_id)?,
+                    &card_id,
+                    agent,
+                    attribution,
+                    body,
+                    now,
+                    &authority(args),
+                )
+                .map_err(store_err)?)
+        } else {
+            json!(store
+                .append_work_log(&card_id, agent, attribution, body, now)
+                .map_err(store_err)?)
+        }
     } else if let Some(client) = remote_env.client() {
         client
             .post(
@@ -1244,18 +1262,23 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                     "reasoning": reasoning,
                     "harness": harness,
                     "run_id": run_id,
+                    "operation_id": operation_id,
                 }),
             )
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("append-work-log"));
     };
-    Ok(format!(
-        "work-log\t{}\t{}\t{}\n",
-        json_string(&entry, "card_id")?,
-        json_string(&entry, "agent")?,
-        json_string(&entry, "body")?
-    ))
+    if operation_id.is_some() {
+        to_pretty_json(&entry)
+    } else {
+        Ok(format!(
+            "work-log\t{}\t{}\t{}\n",
+            json_string(&entry, "card_id")?,
+            json_string(&entry, "agent")?,
+            json_string(&entry, "body")?
+        ))
+    }
 }
 
 fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1293,11 +1316,25 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let card_id = positional_card_id(args, "complete-card")?;
     let proof = flag_value(args, "--proof");
     let criterion_proofs = criterion_proofs_flag(args)?;
+    let operation_id = flag_value(args, "--operation-id");
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
-            .map_err(store_err)?)
+        if let Some(operation_id) = operation_id {
+            json!(store
+                .complete_card_idempotent(
+                    OperationId::new(operation_id)?,
+                    &card_id,
+                    proof,
+                    criterion_proofs,
+                    now,
+                    &authority(args),
+                )
+                .map_err(store_err)?)
+        } else {
+            json!(store
+                .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
+                .map_err(store_err)?)
+        }
     } else if let Some(client) = remote_env.client() {
         let mut body = json!({});
         if let Some(proof) = proof {
@@ -1309,17 +1346,45 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
                 .map(|proof| json!({"criterion": proof.criterion, "url": proof.url}))
                 .collect::<Vec<_>>());
         }
+        if let Some(operation_id) = operation_id {
+            body["operation_id"] = json!(operation_id);
+        }
         client
             .post(&format!("/api/v1/cards/{card_id}/complete"), body)
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("complete-card"));
     };
-    Ok(format!(
-        "completed\t{}\t{}\n",
-        json_string(&card, "id")?,
-        json_string(&card, "status")?
-    ))
+    if operation_id.is_some() {
+        to_pretty_json(&card)
+    } else {
+        Ok(format!(
+            "completed\t{}\t{}\n",
+            json_string(&card, "id")?,
+            json_string(&card, "status")?
+        ))
+    }
+}
+
+fn operation_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let raw = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("operation-status requires an operation id".into()))?;
+    let operation_id = OperationId::new(raw)?;
+    let status = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .operation_status(&operation_id, unix_now(), &authority(args))
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .get(&format!("/api/v1/operations/{operation_id}"))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("operation-status"));
+    };
+    to_pretty_json(&status)
 }
 
 fn subscription_create(args: &[String]) -> Result<String, ShellError> {
@@ -2414,6 +2479,62 @@ mod tests {
     }
 
     #[test]
+    fn cli_operation_identity_replays_and_recovers_one_work_log_effect() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-operation-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "operation-cli",
+            "--title",
+            "Operation CLI",
+        ]))
+        .unwrap();
+        let command = [
+            "append-work-log",
+            "operation-cli",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--body",
+            "one effect",
+            "--operation-id",
+            "op-cli-work-log",
+            "--actor",
+            "codex",
+        ];
+        let first = run(&args(command)).unwrap();
+        let second = run(&args(command)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first).unwrap()["state"],
+            "succeeded"
+        );
+        let status = run(&args([
+            "operation-status",
+            "op-cli-work-log",
+            "--db",
+            &db,
+            "--actor",
+            "codex",
+        ]))
+        .unwrap();
+        assert_eq!(status, first);
+        let card = run(&args(["get-card", "operation-cli", "--db", &db])).unwrap();
+        assert_eq!(card.matches("one effect").count(), 1);
+    }
+
+    #[test]
     fn cli_manages_event_subscriptions_and_tails_events() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-events-{}.db",
@@ -3210,6 +3331,56 @@ mod tests {
             requests[7].body,
             Some(json!({"author": "operator", "body": "looks good"}))
         );
+    }
+
+    #[test]
+    fn cli_remote_operation_identity_and_status_use_the_http_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-cli-remote",
+            "state": "succeeded",
+            "request_digest": "sha256:abc",
+            "kind": "work_log_append",
+            "target_card_id": "remote-card",
+            "result": {
+                "card_id": "remote-card",
+                "agent": "codex",
+                "body": "one remote effect",
+                "created_at": 10
+            }
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let mutation = run_with_env(
+            &args([
+                "append-work-log",
+                "remote-card",
+                "--agent",
+                "codex",
+                "--body",
+                "one remote effect",
+                "--operation-id",
+                "op-cli-remote",
+            ]),
+            &env,
+        )
+        .unwrap();
+        let recovered = run_with_env(&args(["operation-status", "op-cli-remote"]), &env).unwrap();
+        assert_eq!(mutation, recovered);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/remote-card/work-log");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-cli-remote"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/v1/operations/op-cli-remote");
+        assert!(requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some("Bearer sk_powder_test")));
     }
 
     /// A lane maintaining a claim lease against a deployed instance (no

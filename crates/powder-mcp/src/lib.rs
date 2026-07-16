@@ -3,7 +3,7 @@
 pub use powder_api::RemoteClient;
 use powder_core::{
     Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel,
-    Estimate, Priority, ReadyQuery, RunId,
+    Estimate, OperationId, Priority, ReadyQuery, RunId,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -28,7 +28,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Supply one stable operation_id before retryable work-log or completion mutations; after timeout or reconnect, call operation_status and retry only the identical request. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -133,8 +133,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "append_work_log",
-        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution you can supply. body is scrubbed for known secret shapes server-side before storage.",
-        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
+        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card. Supply operation_id for durable replay and status recovery. This P2 contract does not enforce current-run attribution; that remains a separate strict operation. body is scrubbed for known secret shapes server-side before storage.",
+        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string","maxLength":16384},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "request_input",
@@ -143,8 +143,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "complete_card",
-        description: "Set a card done, optionally recording a proof artifact or URL and proof links attached to criteria; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Set a card done through Powder's permissive operator-correction path. Supply operation_id for durable replay and status recovery. This P2 contract does not add an expected-current-run precondition.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"proof":{"type":"string","maxLength":4096},"criterion_proofs":{"type":"array","maxItems":128,"items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string","maxLength":4096}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "operation_status",
+        description: "Recover one bounded mutation outcome by stable operation identity. Returns powder.operation_status.v1 with unknown, pending, succeeded, rejected, or failed state.",
+        input_schema: r#"{"type":"object","required":["operation_id"],"properties":{"operation_id":{"type":"string","maxLength":128},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "create_event_subscription",
@@ -618,9 +623,23 @@ pub fn call_tool_store(
                 harness: optional_str(args, "harness"),
                 run_id: optional_str(args, "run_id"),
             };
-            json!(store
-                .append_work_log(&card_id, agent, attribution, body, now)
-                .map_err(to_string)?)
+            if let Some(operation_id) = optional_str(args, "operation_id") {
+                json!(store
+                    .append_work_log_idempotent(
+                        OperationId::new(operation_id).map_err(to_string)?,
+                        &card_id,
+                        agent,
+                        attribution,
+                        body,
+                        now,
+                        &authority_arg(args),
+                    )
+                    .map_err(to_string)?)
+            } else {
+                json!(store
+                    .append_work_log(&card_id, agent, attribution, body, now)
+                    .map_err(to_string)?)
+            }
         }
         "request_input" => {
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
@@ -631,16 +650,37 @@ pub fn call_tool_store(
         }
         "complete_card" => {
             let card_id = card_id(args, "card_id")?;
-            let card = store
-                .complete_card(
-                    &card_id,
-                    optional_str(args, "proof"),
-                    criterion_proofs_arg(args)?,
-                    now,
-                    &authority_arg(args),
-                )
-                .map_err(to_string)?;
-            card_ack_payload(&card)
+            let criterion_proofs = criterion_proofs_arg(args)?;
+            if let Some(operation_id) = optional_str(args, "operation_id") {
+                json!(store
+                    .complete_card_idempotent(
+                        OperationId::new(operation_id).map_err(to_string)?,
+                        &card_id,
+                        optional_str(args, "proof"),
+                        criterion_proofs,
+                        now,
+                        &authority_arg(args),
+                    )
+                    .map_err(to_string)?)
+            } else {
+                let card = store
+                    .complete_card(
+                        &card_id,
+                        optional_str(args, "proof"),
+                        criterion_proofs,
+                        now,
+                        &authority_arg(args),
+                    )
+                    .map_err(to_string)?;
+                card_ack_payload(&card)
+            }
+        }
+        "operation_status" => {
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            json!(store
+                .operation_status(&operation_id, now, &authority_arg(args))
+                .map_err(to_string)?)
         }
         "create_event_subscription" => {
             let url = required_str(args, "url")?;
@@ -1148,7 +1188,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 20);
+        assert_eq!(default_tools.len(), 21);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1279,9 +1319,10 @@ mod tests {
                 "append_work_log",
                 "request_input",
                 "complete_card",
+                "operation_status",
             ]
         );
-        assert_eq!(default_names.len(), 20);
+        assert_eq!(default_names.len(), 21);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1293,7 +1334,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 29);
+        assert_eq!(admin_names.len(), 30);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -2573,6 +2614,47 @@ Expose tools against the DB.
         )
         .unwrap();
         assert!(tool_payload(&card)["work_log"][0]["agent"] == "codex");
+    }
+
+    #[test]
+    fn mcp_operation_status_matches_idempotent_mutation_outcome() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![Card::new(
+                CardId::new("operation-mcp").unwrap(),
+                "Operation MCP",
+                "G.",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["g".to_string()])
+            .with_created_at(1)])
+            .unwrap();
+        let arguments = json!({
+            "operation_id": "op-mcp-work-log",
+            "card_id": "operation-mcp",
+            "agent": "codex",
+            "actor": "codex",
+            "body": "one effect"
+        });
+        let first = call_tool_store(&mut store, "append_work_log", &arguments, 10).unwrap();
+        assert_eq!(
+            tool_payload(&first)["state"],
+            "succeeded",
+            "unexpected operation response: {}",
+            tool_payload(&first)
+        );
+        let replay = call_tool_store(&mut store, "append_work_log", &arguments, 11).unwrap();
+        assert_eq!(tool_payload(&first), tool_payload(&replay));
+        let status = call_tool_store(
+            &mut store,
+            "operation_status",
+            &json!({"operation_id": "op-mcp-work-log", "actor": "codex"}),
+            12,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&status), tool_payload(&first));
     }
 
     #[test]

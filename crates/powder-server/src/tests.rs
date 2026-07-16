@@ -1882,6 +1882,169 @@ async fn append_work_log_appears_in_get_card_immediately() {
 }
 
 #[tokio::test]
+async fn http_operation_replay_status_conflict_and_authorization_are_consistent() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let owner_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("operation-actor", ApiKeyScope::Agent, 2)
+        .unwrap()
+        .raw_key;
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("operation-actor", ApiKeyScope::Agent, 3)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"http-operation","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let request =
+        r#"{"operation_id":"op-http-work-log","agent":"operation-actor","body":"one effect"}"#;
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation/work-log",
+            Some(&owner_key),
+            request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await;
+    assert_eq!(first["schema_version"], "powder.operation_status.v1");
+    assert_eq!(first["state"], "succeeded");
+
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation/work-log",
+            Some(&owner_key),
+            request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(replay).await, first);
+
+    let status = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-work-log",
+            Some(&owner_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(status).await, first);
+
+    let forbidden = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-work-log",
+            Some(&intruder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let conflict = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation/work-log",
+            Some(&owner_key),
+            r#"{"operation_id":"op-http-work-log","agent":"operation-actor","body":"changed"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let card = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-operation?detail=detailed",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(card).await["work_log"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn http_completion_response_loss_recovers_by_operation_identity() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"http-completion-operation","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let complete = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-completion-operation/complete",
+            Some(&raw_key),
+            r#"{"operation_id":"op-http-completion","proof":"credential-free proof"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete.status(), StatusCode::OK);
+    // The response body is deliberately discarded to model transport loss.
+    let status = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-completion",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let status = response_json(status).await;
+    assert_eq!(status["state"], "succeeded");
+    assert_eq!(status["result"]["status"], "done");
+    let replay = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-completion-operation/complete",
+            Some(&raw_key),
+            r#"{"operation_id":"op-http-completion","proof":"credential-free proof"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(replay).await, status);
+}
+
+#[tokio::test]
 async fn api_get_card_defaults_to_concise_and_accepts_detailed_detail() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     {

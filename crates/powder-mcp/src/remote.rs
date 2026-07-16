@@ -6,7 +6,7 @@
 //! `actor`/`admin` tool arguments needed.
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
-use powder_core::{Card, CardSummary, DetailLevel};
+use powder_core::{Card, CardSummary, DetailLevel, OperationId};
 use serde_json::{json, Value};
 
 use super::{
@@ -272,6 +272,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let id = card_id(args, "card_id")?;
             let agent = required_str(args, "agent")?;
             let body = required_str(args, "body")?;
+            let operation_id = optional_str(args, "operation_id")
+                .map(OperationId::new)
+                .transpose()
+                .map_err(to_string)?;
             client.post(
                 &format!("/api/v1/cards/{id}/work-log"),
                 json!({
@@ -281,6 +285,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                     "reasoning": optional_str(args, "reasoning"),
                     "harness": optional_str(args, "harness"),
                     "run_id": optional_str(args, "run_id"),
+                    "operation_id": operation_id,
                 }),
             )?
         }
@@ -294,6 +299,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "complete_card" => {
             let id = card_id(args, "card_id")?;
+            let operation_id = optional_str(args, "operation_id")
+                .map(OperationId::new)
+                .transpose()
+                .map_err(to_string)?;
             let mut body = json!({});
             if let Some(proof) = args["proof"].as_str() {
                 body["proof"] = json!(proof);
@@ -301,8 +310,18 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(criterion_proofs) = args["criterion_proofs"].as_array() {
                 body["criterion_proofs"] = json!(criterion_proofs);
             }
-            let response = client.post(&format!("/api/v1/cards/{id}/complete"), body)?;
-            remote_card_ack_payload(&response)?
+            if let Some(operation_id) = operation_id {
+                body["operation_id"] = json!(operation_id);
+                client.post(&format!("/api/v1/cards/{id}/complete"), body)?
+            } else {
+                let response = client.post(&format!("/api/v1/cards/{id}/complete"), body)?;
+                remote_card_ack_payload(&response)?
+            }
+        }
+        "operation_status" => {
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            client.get(&format!("/api/v1/operations/{operation_id}"))?
         }
         "create_event_subscription" => {
             let url = required_str(args, "url")?;
@@ -876,8 +895,50 @@ mod tests {
                 "reasoning": null,
                 "harness": null,
                 "run_id": null,
+                "operation_id": null,
             }))
         );
+    }
+
+    #[test]
+    fn idempotent_work_log_and_operation_status_preserve_the_same_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-remote-work-log",
+            "state": "succeeded",
+            "request_digest": "sha256:abc",
+            "kind": "work_log_append",
+            "target_card_id": "001",
+            "result": {"card_id": "001", "agent": "codex", "body": "one effect", "created_at": 10}
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let mutation = call_tool_remote(
+            &client,
+            "append_work_log",
+            &json!({
+                "operation_id": "op-remote-work-log",
+                "card_id": "001",
+                "agent": "codex",
+                "body": "one effect"
+            }),
+        )
+        .unwrap();
+        let lookup = call_tool_remote(
+            &client,
+            "operation_status",
+            &json!({"operation_id": "op-remote-work-log"}),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&mutation), tool_payload(&lookup));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].path, "/api/v1/cards/001/work-log");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-remote-work-log"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/v1/operations/op-remote-work-log");
     }
 
     #[test]
@@ -1703,8 +1764,10 @@ mod tests {
         ("manage_claim", &["actor", "admin"]),
         ("update_status", &["actor", "admin"]),
         ("update_relations", &["actor", "admin"]),
+        ("append_work_log", &["actor", "admin"]),
         ("request_input", &["actor", "admin"]),
         ("complete_card", &["actor", "admin"]),
+        ("operation_status", &["actor", "admin"]),
     ];
 
     /// Params that genuinely reach the remote server but not as a literal

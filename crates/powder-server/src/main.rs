@@ -26,7 +26,7 @@ use axum::{
 use hmac::{Hmac, Mac};
 use powder_core::{
     parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate,
-    Priority, ReadyQuery, RunId,
+    OperationId, Priority, ReadyQuery, RunId,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
@@ -459,6 +459,7 @@ struct CommentRequest {
 
 #[derive(Debug, Deserialize)]
 struct WorkLogRequest {
+    operation_id: Option<String>,
     agent: String,
     model: Option<String>,
     reasoning: Option<String>,
@@ -480,6 +481,7 @@ struct AnswerRequest {
 
 #[derive(Debug, Deserialize)]
 struct CompleteRequest {
+    operation_id: Option<String>,
     proof: Option<String>,
     criterion_proofs: Option<Vec<CriterionProofRequest>>,
 }
@@ -617,6 +619,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/work-log", post(append_work_log))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
+        .route("/api/v1/operations/{id}", get(get_operation_status))
         .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/input", post(request_input))
@@ -1254,7 +1257,7 @@ async fn append_work_log(
     Path(id): Path<String>,
     Json(request): Json<WorkLogRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize(&state, &headers)?;
+    let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let attribution = powder_store::WorkLogAttribution {
         model: request.model.as_deref(),
@@ -1262,14 +1265,28 @@ async fn append_work_log(
         harness: request.harness.as_deref(),
         run_id: request.run_id.as_deref(),
     };
-    let entry = lock_store(&state)?.append_work_log(
-        &card_id,
-        &request.agent,
-        attribution,
-        &request.body,
-        unix_now(),
-    )?;
-    Ok(Json(json!(entry)))
+    let mut store = lock_store(&state)?;
+    if let Some(operation_id) = request.operation_id {
+        let status = store.append_work_log_idempotent(
+            OperationId::new(operation_id)?,
+            &card_id,
+            &request.agent,
+            attribution,
+            &request.body,
+            unix_now(),
+            &actor.authority(),
+        )?;
+        Ok(Json(json!(status)))
+    } else {
+        let entry = store.append_work_log(
+            &card_id,
+            &request.agent,
+            attribution,
+            &request.body,
+            unix_now(),
+        )?;
+        Ok(Json(json!(entry)))
+    }
 }
 
 async fn request_input(
@@ -1337,25 +1354,53 @@ async fn complete_card(
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<CompleteRequest>,
-) -> Result<Json<Card>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
-    let card = lock_store(&state)?.complete_card(
-        &card_id,
-        request.proof.as_deref(),
-        request
-            .criterion_proofs
-            .unwrap_or_default()
-            .into_iter()
-            .map(|proof| CriterionProofInput {
-                criterion: proof.criterion,
-                url: proof.url,
-            })
-            .collect(),
+    let criterion_proofs = request
+        .criterion_proofs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|proof| CriterionProofInput {
+            criterion: proof.criterion,
+            url: proof.url,
+        })
+        .collect();
+    let mut store = lock_store(&state)?;
+    if let Some(operation_id) = request.operation_id {
+        let status = store.complete_card_idempotent(
+            OperationId::new(operation_id)?,
+            &card_id,
+            request.proof.as_deref(),
+            criterion_proofs,
+            unix_now(),
+            &actor.authority(),
+        )?;
+        Ok(Json(json!(status)))
+    } else {
+        let card = store.complete_card(
+            &card_id,
+            request.proof.as_deref(),
+            criterion_proofs,
+            unix_now(),
+            &actor.authority(),
+        )?;
+        Ok(Json(json!(card)))
+    }
+}
+
+async fn get_operation_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = authorize(&state, &headers)?;
+    let status = lock_store(&state)?.operation_status(
+        &OperationId::new(id)?,
         unix_now(),
         &actor.authority(),
     )?;
-    Ok(Json(card))
+    Ok(Json(json!(status)))
 }
 
 async fn create_event_subscription(
@@ -1503,6 +1548,7 @@ async fn revoke_key(
 #[derive(Debug, Clone)]
 struct AuthorizedActor {
     display_name: String,
+    operation_identity: String,
     enforces_identity: bool,
     is_admin: bool,
 }
@@ -1512,7 +1558,11 @@ impl AuthorizedActor {
     /// that `Store` mutation methods check claim ownership against.
     fn authority(&self) -> Authority {
         if self.enforces_identity {
-            Authority::actor(self.display_name.clone(), self.is_admin)
+            Authority::authenticated(
+                self.display_name.clone(),
+                self.operation_identity.clone(),
+                self.is_admin,
+            )
         } else {
             Authority::unchecked()
         }
@@ -1523,6 +1573,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
     match state.config.auth_mode {
         AuthMode::None => Ok(AuthorizedActor {
             display_name: "anonymous".to_string(),
+            operation_identity: "anonymous".to_string(),
             enforces_identity: false,
             is_admin: false,
         }),
@@ -1530,6 +1581,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             if let Some(identity) = trusted_tailnet_identity(headers) {
                 Ok(AuthorizedActor {
                     display_name: identity.to_string(),
+                    operation_identity: identity.to_string(),
                     enforces_identity: true,
                     is_admin: true,
                 })
@@ -1549,6 +1601,7 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             if key.scope.allows_agent() {
                 Ok(AuthorizedActor {
                     display_name: key.actor.display_name,
+                    operation_identity: key.actor.id,
                     enforces_identity: true,
                     is_admin: key.scope == ApiKeyScope::Admin,
                 })
