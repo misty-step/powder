@@ -4272,6 +4272,97 @@ fn identical_run_bound_operation_race_converges_on_one_exact_entry() -> Result<(
 }
 
 #[test]
+fn delayed_run_a_append_revalidates_after_release_and_reclaim_to_run_b() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("strict-release-reclaim-barrier");
+    let card_id = CardId::new("strict-release-reclaim-barrier")?;
+    let authority_a = Authority::actor("agent-a", false);
+    let run_a = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("strict-release-reclaim-barrier", 1)])?;
+        store.claim_card(&card_id, "agent-a", 10, 100, &authority_a)?
+    };
+
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let delayed = {
+        let path = path.clone();
+        let card_id = card_id.clone();
+        let run_id = run_a.run_id.clone();
+        let reached = Arc::clone(&reached);
+        let resume = Arc::clone(&resume);
+        std::thread::spawn(move || -> Result<_> {
+            let mut store = Store::open(path)?;
+            store.migrate()?;
+            store.run_work_log_validation_hook =
+                Some(super::RunWorkLogValidationHook { reached, resume });
+            store.append_run_work_log_idempotent(
+                OperationId::new("strict:release-reclaim-barrier")?,
+                &card_id,
+                &run_id,
+                "agent-a",
+                WorkLogAttribution::default(),
+                "delayed run A write",
+                30,
+                &Authority::actor("agent-a", false),
+            )
+        })
+    };
+
+    reached.wait();
+    let (run_b, card_b_before, run_b_before) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.release_claim(&card_id, &run_a.run_id, 20, &authority_a)?;
+        let run_b = store.claim_card(
+            &card_id,
+            "agent-b",
+            21,
+            100,
+            &Authority::actor("agent-b", false),
+        )?;
+        let card_b = store.get_card(&card_id)?.expect("card after reclaim");
+        let run_b_record = store.get_run(&run_b.run_id)?.expect("run B after reclaim");
+        (run_b, card_b, run_b_record)
+    };
+    resume.wait();
+
+    let rejected = delayed.join().expect("delayed append thread panicked")?;
+    assert_eq!(rejected.state, OperationState::Rejected);
+    assert_eq!(rejected.failure.expect("rejection detail").code, "conflict");
+
+    let store = Store::open(&path)?;
+    let card_b_after = store.get_card(&card_id)?.expect("card after rejection");
+    let run_b_after = store
+        .get_run(&run_b.run_id)?
+        .expect("run B after rejection");
+    assert_eq!(
+        card_b_after, card_b_before,
+        "run A must not mutate run B's card claim"
+    );
+    assert_eq!(run_b_after, run_b_before, "run A must not mutate run B");
+    assert_eq!(
+        card_b_after.claim.as_ref().map(|claim| &claim.run_id),
+        Some(&run_b.run_id)
+    );
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert!(detail.work_log.is_empty());
+    assert!(!detail
+        .events
+        .iter()
+        .any(|event| event.event_type == "work_log"));
+    assert!(!store
+        .list_event_tail(0, 100)?
+        .iter()
+        .any(|item| item.event.event_type == "work-log-appended"));
+    Ok(())
+}
+
+#[test]
 fn run_bound_work_log_replays_exact_scrubbed_record_across_all_history_views() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

@@ -83,6 +83,15 @@ pub enum StoreError {
 pub struct Store {
     connection: Connection,
     field_note_config: Option<FieldNoteConfig>,
+    #[cfg(test)]
+    run_work_log_validation_hook: Option<RunWorkLogValidationHook>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct RunWorkLogValidationHook {
+    reached: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
 }
 
 /// Config for the field-note seed generator (powder-921, content-harness
@@ -326,6 +335,8 @@ impl Store {
         let store = Self {
             connection,
             field_note_config: None,
+            #[cfg(test)]
+            run_work_log_validation_hook: None,
         };
         store.connection.pragma_update(None, "foreign_keys", "ON")?;
         store.connection.pragma_update(None, "busy_timeout", 5000)?;
@@ -1642,6 +1653,12 @@ impl Store {
                 },
             ],
         )?;
+
+        #[cfg(test)]
+        if let Some(hook) = &self.run_work_log_validation_hook {
+            hook.reached.wait();
+            hook.resume.wait();
+        }
 
         let transaction = self
             .connection
