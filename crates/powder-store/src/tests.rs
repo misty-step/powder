@@ -3680,6 +3680,105 @@ fn operation_transaction_rolls_back_effect_and_identity_when_persistence_fails()
 }
 
 #[test]
+fn completion_operation_rolls_back_card_proof_audit_and_identity_on_injected_failure() -> Result<()>
+{
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("completion-operation-rollback")?;
+    store.import_cards(vec![ready_card("completion-operation-rollback", 1)])?;
+    store.connection.execute_batch(
+        "CREATE TRIGGER inject_completion_operation_finish_failure
+         BEFORE UPDATE OF state ON mutation_operations
+         BEGIN SELECT RAISE(ABORT, 'injected completion persistence failure'); END;",
+    )?;
+    let operation_id = OperationId::new("op-completion-rollback")?;
+    let authority = Authority::actor("operator", true);
+
+    let error = store
+        .complete_card_idempotent(
+            operation_id.clone(),
+            &card_id,
+            Some("must roll back"),
+            vec![CriterionProofInput {
+                criterion: 0,
+                url: "https://example.test/must-roll-back".to_string(),
+            }],
+            10,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    store
+        .connection
+        .execute_batch("DROP TRIGGER inject_completion_operation_finish_failure")?;
+
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &authority)?.state,
+        OperationState::Unknown
+    );
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Ready);
+    assert!(detail.card.criteria[0].proof_links.is_empty());
+    assert!(detail.events.is_empty());
+    assert!(store.list_event_tail(0, 20)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn committed_completion_recovers_and_replays_after_process_restart() -> Result<()> {
+    let path = temp_db("completion-operation-restart");
+    let card_id = CardId::new("completion-operation-restart")?;
+    let operation_id = OperationId::new("op-completion-restart")?;
+    let authority = Authority::actor("operator", true);
+    let committed = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("completion-operation-restart", 1)])?;
+        store.complete_card_idempotent(
+            operation_id.clone(),
+            &card_id,
+            Some("restart-safe"),
+            vec![CriterionProofInput {
+                criterion: 0,
+                url: "https://example.test/restart-safe".to_string(),
+            }],
+            10,
+            &authority,
+        )?
+    };
+
+    let mut restarted = Store::open(&path)?;
+    restarted.migrate()?;
+    let recovered = restarted.operation_status(&operation_id, 11, &authority)?;
+    let replayed = restarted.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("restart-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/restart-safe".to_string(),
+        }],
+        12,
+        &authority,
+    )?;
+    assert_eq!(recovered, committed);
+    assert_eq!(replayed, committed);
+    let detail = restarted
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(detail.events.len(), 1);
+    assert_eq!(
+        committed.audit_event_id.as_deref(),
+        Some(detail.events[0].id.as_str())
+    );
+    Ok(())
+}
+
+#[test]
 fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -3981,5 +4080,115 @@ fn conflicting_operation_race_has_one_winner_and_no_mixed_state() -> Result<()> 
         detail.work_log[0].body.as_str(),
         "request-a" | "request-b"
     ));
+    Ok(())
+}
+
+#[test]
+fn identical_completion_operation_race_converges_on_one_outcome() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("completion-operation-identical-race");
+    let card_id = CardId::new("completion-operation-identical-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("completion-operation-identical-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || -> Result<_> {
+                let mut store = Store::open(path)?;
+                store.migrate()?;
+                barrier.wait();
+                store.complete_card_idempotent(
+                    OperationId::new("op-completion-identical-race")?,
+                    &card_id,
+                    Some("same completion"),
+                    vec![CriterionProofInput {
+                        criterion: 0,
+                        url: "https://example.test/same".to_string(),
+                    }],
+                    10,
+                    &Authority::actor("operator", true),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(results[0], results[1]);
+
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(detail.events.len(), 1);
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn conflicting_completion_operation_race_has_one_winner_without_mixed_state() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("completion-operation-conflicting-race");
+    let card_id = CardId::new("completion-operation-conflicting-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("completion-operation-conflicting-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = ["request-a", "request-b"]
+        .into_iter()
+        .map(|winner| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(path).unwrap();
+                store.migrate().unwrap();
+                barrier.wait();
+                store.complete_card_idempotent(
+                    OperationId::new("op-completion-conflicting-race").unwrap(),
+                    &card_id,
+                    Some(winner),
+                    vec![CriterionProofInput {
+                        criterion: 0,
+                        url: format!("https://example.test/{winner}"),
+                    }],
+                    10,
+                    &Authority::actor("operator", true),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert!(matches!(
+        detail.card.criteria[0].proof_links[0].url.as_str(),
+        "https://example.test/request-a" | "https://example.test/request-b"
+    ));
+    assert_eq!(detail.events.len(), 1);
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
     Ok(())
 }
