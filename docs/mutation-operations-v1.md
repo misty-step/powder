@@ -45,6 +45,9 @@ The `failed` state is reserved for a terminal failure that Powder can durably an
 The creating authenticated authority may read the record, and an administrator may read any record.
 Unchecked direct-database operator surfaces retain their existing local trust behavior.
 The response contains only bounded digests, identifiers, safe failure metadata, timestamps, the authoritative result, and an audit event identity.
+`audit_event_id` always names a durable card-audit event in the `event-*` namespace.
+It never names an outbound delivery event in the separate `evt-*` namespace.
+Resolve the link by reading `GET /api/v1/cards/{target_card_id}?detail=detailed` and locating the matching `events[].id` value.
 It never stores or returns bearer credentials, credential commands, request headers, or unsanitized work-log secrets.
 
 An unknown response is not proof of failure.
@@ -73,7 +76,8 @@ Safe failure messages are limited to 512 bytes.
 
 Operation recovery records expire seven days after creation and are pruned by operation mutations, status reads, or an explicit store prune.
 Retention deletes only recovery metadata and never deletes the card mutation, work log, proof, card event, outbound event, or other audit history.
-After retention expires, operation status is unknown and the old audit event identity remains the durable historical linkage.
+After retention expires, operation status is unknown and the `event-*` card-audit record remains in detailed card history.
+Clients that need the audit identity after expiry must retain it from the successful status response because an unknown response intentionally contains no target or audit metadata.
 Clients must not assume an operation identity remains deduplicating after its retention deadline.
 Clients needing a longer retry horizon must reconcile the card, run, event, or audit history before issuing a new operation.
 

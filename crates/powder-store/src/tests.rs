@@ -3501,15 +3501,16 @@ fn idempotent_work_log_recovers_lost_response_and_replays_one_effect() -> Result
         recovered.result.as_ref().unwrap()["body"],
         "one durable effect"
     );
-    assert!(recovered.audit_event_id.is_some());
-    assert_eq!(
-        store
-            .get_card_detail(&card_id, DetailLevel::Detailed)?
-            .unwrap()
-            .work_log
-            .len(),
-        1
-    );
+    let audit_event_id = recovered.audit_event_id.as_deref().unwrap();
+    assert!(audit_event_id.starts_with("event-"));
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.work_log.len(), 1);
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.id.as_str() == audit_event_id));
     assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
     Ok(())
 }
@@ -3592,6 +3593,15 @@ fn idempotent_completion_replays_one_audited_permissive_outcome() -> Result<()> 
     assert_eq!(detail.card.status, CardStatus::Done);
     assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
     assert_eq!(detail.events.len(), 1);
+    assert!(first
+        .audit_event_id
+        .as_deref()
+        .unwrap()
+        .starts_with("event-"));
+    assert_eq!(
+        first.audit_event_id.as_deref(),
+        Some(detail.events[0].id.as_str())
+    );
     assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
     Ok(())
 }
@@ -3731,20 +3741,28 @@ fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()
         forbidden,
         Err(StoreError::Domain(DomainError::Forbidden(_)))
     ));
+    let audit_event_id = visible.audit_event_id.as_deref().unwrap().to_string();
+    assert!(audit_event_id.starts_with("event-"));
     assert_eq!(
         store
             .operation_status(&operation_id, 10 + OPERATION_RETENTION_SECONDS, &owner)?
             .state,
         OperationState::Unknown
     );
+    let retained_detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
     assert_eq!(
-        store
-            .get_card_detail(&card_id, DetailLevel::Detailed)?
-            .unwrap()
-            .work_log
-            .len(),
+        retained_detail.work_log.len(),
         1,
         "retention removes recovery metadata, not the audited mutation effect"
+    );
+    assert!(
+        retained_detail
+            .events
+            .iter()
+            .any(|event| event.id.as_str() == audit_event_id),
+        "the event-* audit link must resolve after recovery metadata expires"
     );
     Ok(())
 }

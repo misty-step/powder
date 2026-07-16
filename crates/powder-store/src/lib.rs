@@ -1761,7 +1761,20 @@ fn append_work_log_in_transaction(
             entry.created_at,
         ],
     )?;
-    let event = events::append_outbound_card_event(
+    let audit_payload = to_json(&json!({
+        "run_id": entry.run_id,
+        "model": entry.model,
+        "harness": entry.harness,
+    }))?;
+    let audit_event = append_card_event(
+        transaction,
+        card_id,
+        "work_log",
+        &entry.agent,
+        &audit_payload,
+        now,
+    )?;
+    events::append_outbound_card_event(
         transaction,
         &card,
         "work-log-appended",
@@ -1773,7 +1786,7 @@ fn append_work_log_in_transaction(
         }),
         now,
     )?;
-    Ok((entry, event.event_id))
+    Ok((entry, audit_event.id.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
