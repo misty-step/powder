@@ -3788,6 +3788,151 @@ async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
 }
 
 #[tokio::test]
+async fn authenticated_criterion_review_derives_reviewer_and_rejects_forged_identity() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let holder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("review-holder", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("review-intruder", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"auth-review","title":"Review","acceptance":["prove auth"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/auth-review/claim",
+            Some(&holder_key),
+            r#"{"agent":"review-holder","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let run_id = response_json(claimed).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-review?detail=detailed",
+            Some(&holder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let criterion_id = response_json(detail).await["current_run_criteria"][0]["criterion_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let path = format!("/api/v1/cards/auth-review/runs/{run_id}/criteria/review");
+
+    let forged = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&holder_key),
+            &format!(
+                r#"{{"operation_id":"http-forged","criterion":0,"criterion_id":"{criterion_id}","decision":"approved","reviewer":"admin"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let unauthorized = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&intruder_key),
+            &format!(
+                r#"{{"operation_id":"http-intruder","criterion":0,"criterion_id":"{criterion_id}","decision":"approved"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::OK);
+    let unauthorized = response_json(unauthorized).await;
+    assert_eq!(unauthorized["state"], "rejected");
+    assert_eq!(unauthorized["failure"]["code"], "forbidden");
+
+    let reviewed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&holder_key),
+            &format!(
+                r#"{{"operation_id":"http-review","criterion":0,"criterion_id":"{criterion_id}","decision":"approved","proof":"https://example.test/http-proof"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reviewed.status(), StatusCode::OK);
+    let reviewed = response_json(reviewed).await;
+    assert_eq!(reviewed["state"], "succeeded");
+    assert_eq!(reviewed["kind"], "criterion_review");
+    assert_eq!(reviewed["expected_run_id"], run_id);
+    assert_eq!(reviewed["result"]["reviewer"], "review-holder");
+    assert_eq!(
+        reviewed["result"]["proof"],
+        "https://example.test/http-proof"
+    );
+
+    let card_detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-review?detail=detailed",
+            Some(&holder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let card_detail = response_json(card_detail).await;
+    let run_detail = app
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/runs/{run_id}?detail=detailed"),
+            Some(&holder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let run_detail = response_json(run_detail).await;
+    assert_eq!(card_detail["current_run_criteria"], run_detail["criteria"]);
+    assert_eq!(
+        card_detail["criterion_reviews"],
+        run_detail["criterion_reviews"]
+    );
+    assert_eq!(card_detail["criterion_reviews"][0], reviewed["result"]);
+    assert_eq!(card_detail["criterion_reviews"][0]["run_id"], run_id);
+}
+
+#[tokio::test]
 async fn healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db_path() {
     let (state, _admin_key) = test_state(AuthMode::ApiKey);
     let db_path = state.config.db_path.display().to_string();

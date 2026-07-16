@@ -160,6 +160,14 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+        intent: "atomically record one authenticated run-scoped criterion decision with stable operation replay, exact criterion identity, bounded proof, immutable history, and current-run enforcement",
+        body_shape: Some(
+            r#"{"operation_id":"...","criterion":0,"criterion_id":"powder.criterion.v1:sha256:...:0","decision":"approved|rejected|cleared","proof":null} -- reviewer identity is derived from authenticated authority; reviewer and actor fields are rejected"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/cards/{id}/links",
         intent: "attach proof, PRs, CI, or reference links to a card",
         body_shape: Some(

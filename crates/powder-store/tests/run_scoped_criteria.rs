@@ -4,7 +4,10 @@ use powder_core::{
     criterion_identity, Authority, Card, CardId, CardStatus, CriterionReviewDecision, DetailLevel,
     DomainError, OperationId, OperationState, Priority, RunId,
 };
-use powder_store::{CardPatch, CriterionReviewInput, Store, StoreError};
+use powder_store::{
+    CardPatch, CriterionReviewInput, Store, StoreError, CRITERION_REVIEW_PROOF_MAX_BYTES,
+    OPERATION_RETENTION_SECONDS,
+};
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -497,5 +500,99 @@ fn out_of_range_index_and_persistence_failure_roll_back_every_effect() -> powder
         .events
         .iter()
         .all(|event| event.event_type != "criterion-review"));
+    Ok(())
+}
+
+#[test]
+fn expired_operation_identity_can_be_reused_without_erasing_review_audit(
+) -> powder_store::Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("review-retention")?;
+    store.import_cards(vec![card(card_id.as_str(), &["retain audit"])])?;
+    let claim = store.claim_card(
+        &card_id,
+        "operator",
+        10,
+        (OPERATION_RETENTION_SECONDS + 1_000) as u64,
+        &Authority::unchecked(),
+    )?;
+    let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
+    store.review_criterion(
+        &card_id,
+        review_input(
+            "review-reused-after-retention",
+            &claim.run_id,
+            0,
+            &criterion_id,
+            CriterionReviewDecision::Approved,
+            None,
+        ),
+        20,
+        &Authority::unchecked(),
+    )?;
+    let after_retention = 20 + OPERATION_RETENTION_SECONDS;
+    assert_eq!(store.prune_operations(after_retention)?, 1);
+    let reused = store.review_criterion(
+        &card_id,
+        review_input(
+            "review-reused-after-retention",
+            &claim.run_id,
+            0,
+            &criterion_id,
+            CriterionReviewDecision::Rejected,
+            Some("new request after recovery window"),
+        ),
+        after_retention,
+        &Authority::unchecked(),
+    )?;
+    assert_eq!(reused.state, OperationState::Succeeded);
+    let history = store.list_criterion_reviews(&card_id)?;
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].decision, CriterionReviewDecision::Approved);
+    assert_eq!(history[1].decision, CriterionReviewDecision::Rejected);
+    assert_eq!(
+        history[1].supersedes_review_id.as_deref(),
+        Some(history[0].id.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn oversized_review_proof_is_rejected_without_reserving_or_mutating() -> powder_store::Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("review-proof-bound")?;
+    store.import_cards(vec![card(card_id.as_str(), &["bound proof"])])?;
+    let claim = store.claim_card(&card_id, "operator", 10, 100, &Authority::unchecked())?;
+    let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
+    let operation_id = OperationId::new("review-proof-too-large")?;
+    let result = store.review_criterion(
+        &card_id,
+        CriterionReviewInput {
+            operation_id: operation_id.clone(),
+            expected_run_id: claim.run_id,
+            criterion: 0,
+            criterion_id,
+            decision: CriterionReviewDecision::Approved,
+            proof: Some("x".repeat(CRITERION_REVIEW_PROOF_MAX_BYTES + 1)),
+        },
+        20,
+        &Authority::unchecked(),
+    );
+    assert!(matches!(
+        result,
+        Err(StoreError::Domain(DomainError::Validation {
+            field: "proof",
+            ..
+        }))
+    ));
+    assert!(store.list_criterion_reviews(&card_id)?.is_empty());
+    assert_eq!(
+        store
+            .operation_status(&operation_id, 21, &Authority::unchecked())?
+            .state,
+        OperationState::Unknown
+    );
     Ok(())
 }

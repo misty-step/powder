@@ -2,12 +2,12 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel,
-    Estimate, OperationId, Priority, ReadyQuery, RunId,
+    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary,
+    CriterionReviewDecision, DetailLevel, Estimate, OperationId, Priority, ReadyQuery, RunId,
 };
 use powder_store::{
-    BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, Store,
+    BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, CriterionReviewInput,
+    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store,
 };
 use serde_json::{json, Value};
 
@@ -28,7 +28,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_run_work_log frequently with the exact current run, one stable operation_id, your agent identity, progress, blockers, evidence, and attribution. After timeout or reconnect, call operation_status and retry only the identical request. append_work_log is the permissive unbound/operator-note compatibility path, not the agent current-run path. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_run_work_log frequently with the exact current run, one stable operation_id, your agent identity, progress, blockers, evidence, and attribution. append_work_log is the permissive unbound/operator-note compatibility path, not the agent current-run path. Allocate one stable operation_id before retryable work-log, criterion-review, or completion mutations. After timeout or reconnect, call operation_status and retry only the identical request. Call review_criterion only with the exact current run and criterion_id from get_card/get_run; authenticated authority supplies the reviewer. Use add_comment only for low-frequency human-facing updates. Heartbeat or renew long claims before expiry. Release a claim when stopping voluntarily. If an operator decision is needed, request_input and pause; never invent approval. Call complete_card only when criteria are satisfied, with reviewable proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools are hidden unless POWDER_MCP_TOOLSETS=admin.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -115,6 +115,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "check_criterion",
         description: "Mark one acceptance criterion checked or unchecked and audit actor/time; returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["card_id","criterion","actor"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "review_criterion",
+        description: "Record one authenticated decision for an exact criterion on the exact current run. Requires a stable operation_id and criterion_id read from get_card/get_run. Reviewer identity comes from authenticated authority; actor/admin are only local-store authority controls.",
+        input_schema: r#"{"type":"object","required":["operation_id","card_id","run_id","criterion","criterion_id","decision"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"run_id":{"type":"string"},"criterion":{"type":"integer","minimum":0,"maximum":4294967295},"criterion_id":{"type":"string"},"decision":{"type":"string","enum":["approved","rejected","cleared"]},"proof":{"type":"string","maxLength":4096},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "update_relations",
@@ -588,6 +593,36 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             criterion_ack_payload(&card, criterion, checked)
         }
+        "review_criterion" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            let criterion = criterion_arg(args)?;
+            let criterion_id = required_str(args, "criterion_id")?;
+            let decision_raw = required_str(args, "decision")?;
+            let decision = CriterionReviewDecision::parse(decision_raw).ok_or_else(|| {
+                invalid_enum_value(
+                    "decision",
+                    decision_raw,
+                    "approved|rejected|cleared".to_string(),
+                )
+            })?;
+            json!(store
+                .review_criterion(
+                    &card_id,
+                    CriterionReviewInput {
+                        operation_id: OperationId::new(required_str(args, "operation_id")?)
+                            .map_err(to_string)?,
+                        expected_run_id: run_id,
+                        criterion,
+                        criterion_id: criterion_id.to_string(),
+                        decision,
+                        proof: optional_str(args, "proof").map(str::to_string),
+                    },
+                    now,
+                    &authority_arg(args),
+                )
+                .map_err(to_string)?)
+        }
         "update_relations" => {
             let card_id = card_id(args, "card_id")?;
             let card = store
@@ -1020,8 +1055,9 @@ fn criterion_proofs_arg(args: &Value) -> Result<Vec<CriterionProofInput>, String
 fn criterion_arg(args: &Value) -> Result<usize, String> {
     args["criterion"]
         .as_u64()
+        .filter(|value| *value <= u32::MAX as u64)
         .map(|value| value as usize)
-        .ok_or_else(|| missing_required("criterion"))
+        .ok_or_else(|| "criterion must be an unsigned 32-bit integer".to_string())
 }
 
 fn parse_status(raw: &str) -> Result<CardStatus, String> {
@@ -1341,6 +1377,7 @@ mod tests {
                 "answer_input",
                 "update_status",
                 "check_criterion",
+                "review_criterion",
                 "update_relations",
                 "add_link",
                 "add_comment",
@@ -2265,6 +2302,95 @@ Expose tools against the DB.
             .unwrap()
             .iter()
             .any(|event| { event["event_type"] == "criterion" && event["actor"] == "operator" }));
+    }
+
+    #[test]
+    fn mcp_reviews_exact_current_run_criterion_and_exposes_history() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "mcp-review",
+                "title": "MCP review",
+                "acceptance": ["review through mcp"],
+                "status": "ready"
+            }),
+            now,
+        )
+        .unwrap();
+        let claim = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({
+                "card_id": "mcp-review",
+                "action": "claim",
+                "agent": "mcp-reviewer",
+                "actor": "mcp-reviewer"
+            }),
+            now + 1,
+        )
+        .unwrap();
+        let run_id = tool_payload(&claim)["run_id"].as_str().unwrap().to_string();
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "mcp-review", "detail": "detailed"}),
+            now + 2,
+        )
+        .unwrap();
+        let criterion_id = tool_payload(&detail)["current_run_criteria"][0]["criterion_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reviewed = call_tool_store(
+            &mut store,
+            "review_criterion",
+            &json!({
+                "operation_id": "mcp-review-op",
+                "card_id": "mcp-review",
+                "run_id": run_id,
+                "criterion": 0,
+                "criterion_id": criterion_id,
+                "decision": "approved",
+                "proof": "https://example.test/mcp-proof",
+                "actor": "mcp-reviewer"
+            }),
+            now + 3,
+        )
+        .unwrap();
+        let reviewed = tool_payload(&reviewed);
+        assert_eq!(reviewed["state"], "succeeded");
+        assert_eq!(reviewed["kind"], "criterion_review");
+        assert_eq!(reviewed["result"]["reviewer"], "mcp-reviewer");
+
+        let card_detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "mcp-review", "detail": "detailed"}),
+            now + 4,
+        )
+        .unwrap();
+        let run_detail = call_tool_store(
+            &mut store,
+            "get_run",
+            &json!({"run_id": run_id, "detail": "detailed"}),
+            now + 4,
+        )
+        .unwrap();
+        let card_detail = tool_payload(&card_detail);
+        let run_detail = tool_payload(&run_detail);
+        assert_eq!(card_detail["current_run_criteria"], run_detail["criteria"]);
+        assert_eq!(
+            card_detail["criterion_reviews"],
+            run_detail["criterion_reviews"]
+        );
+        assert_eq!(card_detail["criterion_reviews"][0], reviewed["result"]);
     }
 
     #[test]

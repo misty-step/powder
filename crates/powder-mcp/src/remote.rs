@@ -238,6 +238,31 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             )?;
             remote_criterion_ack_payload(&response, criterion, checked, actor)?
         }
+        "review_criterion" => {
+            let id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            let criterion = args["criterion"]
+                .as_u64()
+                .filter(|value| *value <= u32::MAX as u64)
+                .ok_or_else(|| missing_required("criterion"))?;
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            let criterion_id = required_str(args, "criterion_id")?;
+            let decision = required_str(args, "decision")?;
+            let mut body = json!({
+                "operation_id": operation_id,
+                "criterion": criterion,
+                "criterion_id": criterion_id,
+                "decision": decision,
+            });
+            if let Some(proof) = optional_str(args, "proof") {
+                body["proof"] = json!(proof);
+            }
+            client.post(
+                &format!("/api/v1/cards/{id}/runs/{run_id}/criteria/review"),
+                body,
+            )?
+        }
         "update_relations" => {
             let id = card_id(args, "card_id")?;
             let response = client.post(
@@ -1475,6 +1500,56 @@ mod tests {
     }
 
     #[test]
+    fn run_scoped_review_sends_no_forgeable_reviewer_identity() {
+        let response = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "mcp-remote-review",
+            "state": "succeeded",
+            "kind": "criterion_review",
+            "target_card_id": "remote-review",
+            "expected_run_id": "run-remote-review",
+            "result": {"reviewer": "authenticated-agent"}
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, response)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "review_criterion",
+            &json!({
+                "operation_id": "mcp-remote-review",
+                "card_id": "remote-review",
+                "run_id": "run-remote-review",
+                "criterion": 0,
+                "criterion_id": "powder.criterion.v1:sha256:abc:0",
+                "decision": "approved",
+                "proof": "https://example.test/mcp-remote",
+                "actor": "forged-local-name",
+                "admin": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&result)["result"]["reviewer"],
+            "authenticated-agent"
+        );
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards/remote-review/runs/run-remote-review/criteria/review"
+        );
+        let body = requests[0].body.as_ref().unwrap();
+        assert_eq!(body["operation_id"], "mcp-remote-review");
+        assert_eq!(body["criterion"], 0);
+        assert_eq!(body["decision"], "approved");
+        assert!(body.get("actor").is_none());
+        assert!(body.get("reviewer").is_none());
+        assert!(body.get("admin").is_none());
+    }
+
+    #[test]
     fn status_and_relations_project_remote_card_payloads_to_acks() {
         let (base_url, recorded) = spawn_test_server(vec![
             (
@@ -1886,6 +1961,7 @@ mod tests {
         ("update_card", &["actor"]),
         ("manage_claim", &["actor", "admin"]),
         ("update_status", &["actor", "admin"]),
+        ("review_criterion", &["actor", "admin"]),
         ("update_relations", &["actor", "admin"]),
         ("append_work_log", &["actor", "admin"]),
         ("append_run_work_log", &["actor", "admin"]),

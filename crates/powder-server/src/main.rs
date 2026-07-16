@@ -25,13 +25,13 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus, DetailLevel, Estimate,
-    OperationId, Priority, ReadyQuery, RunId,
+    parse_backlog_card, Authority, AutonomyClass, Card, CardId, CardStatus,
+    CriterionReviewDecision, DetailLevel, Estimate, OperationId, Priority, ReadyQuery, RunId,
 };
 use powder_shell::{load_backlog_dir, namespace_cards_for_repo, unix_now};
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, CriterionReviewInput, FieldNoteConfig,
+    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -388,6 +388,16 @@ struct CriterionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CriterionReviewRequest {
+    operation_id: String,
+    criterion: u32,
+    criterion_id: String,
+    decision: String,
+    proof: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RepositoryRequest {
     name: Option<String>,
     aliases: Option<Vec<String>>,
@@ -625,6 +635,10 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/relations", post(update_relations))
         .route("/api/v1/cards/{id}/criteria/check", post(check_criterion))
+        .route(
+            "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+            post(review_criterion),
+        )
         .route("/api/v1/cards/{id}/links", post(add_link))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/work-log", post(append_work_log))
@@ -1238,6 +1252,32 @@ async fn check_criterion(
         unix_now(),
     )?;
     Ok(Json(card))
+}
+
+async fn review_criterion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, run_id)): Path<(String, String)>,
+    Json(request): Json<CriterionReviewRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let decision = CriterionReviewDecision::parse(&request.decision)
+        .ok_or_else(|| ApiError::bad_request("invalid criterion review decision"))?;
+    let status = lock_store(&state)?.review_criterion(
+        &card_id,
+        CriterionReviewInput {
+            operation_id: OperationId::new(request.operation_id)?,
+            expected_run_id: RunId::new(run_id)?,
+            criterion: request.criterion as usize,
+            criterion_id: request.criterion_id,
+            decision,
+            proof: request.proof,
+        },
+        unix_now(),
+        &actor.authority(),
+    )?;
+    Ok(Json(json!(status)))
 }
 
 async fn add_link(

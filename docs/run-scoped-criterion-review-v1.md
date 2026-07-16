@@ -20,6 +20,7 @@ The operation retention window and replay rules are unchanged.
 
 Proof is optional, trimmed, and limited to 4,096 UTF-8 bytes.
 An empty supplied proof is rejected.
+Known credential shapes are scrubbed before proof appears in history, events, operation results, or read projections, while the operation digest still distinguishes the original bounded request.
 The criterion index must fit the platform-independent unsigned 32-bit range before store access.
 
 ## Criterion identity

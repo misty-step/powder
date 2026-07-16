@@ -159,7 +159,7 @@ CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations
 CREATE TABLE IF NOT EXISTS criterion_reviews (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
-  operation_id TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL,
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   criterion_index INTEGER NOT NULL,
@@ -479,7 +479,7 @@ pub const MIGRATE_16_TO_17: &str = r#"
 CREATE TABLE IF NOT EXISTS criterion_reviews (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   id TEXT NOT NULL UNIQUE,
-  operation_id TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL,
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   criterion_index INTEGER NOT NULL,

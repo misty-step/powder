@@ -904,6 +904,7 @@ impl Store {
                 },
             ],
         )?;
+        let stored_proof = proof.as_deref().map(secrets::scrub_secrets);
 
         let transaction = self
             .connection
@@ -920,7 +921,7 @@ impl Store {
             input.criterion,
             &criterion_id,
             input.decision,
-            proof,
+            stored_proof,
             &request.id,
             now,
             authority,
