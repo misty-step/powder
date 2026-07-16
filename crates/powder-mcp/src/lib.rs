@@ -2658,6 +2658,57 @@ Expose tools against the DB.
     }
 
     #[test]
+    fn mcp_completion_operation_replays_and_recovers_one_proof_effect() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let card_id = CardId::new("completion-operation-mcp").unwrap();
+        store
+            .import_cards(vec![Card::new(
+                card_id.clone(),
+                "Completion operation MCP",
+                "G.",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["proof is linked".to_string()])
+            .with_created_at(1)])
+            .unwrap();
+        let arguments = json!({
+            "operation_id": "op-mcp-completion",
+            "card_id": "completion-operation-mcp",
+            "proof": "credential-free",
+            "criterion_proofs": [{
+                "criterion": 0,
+                "url": "https://example.test/mcp-completion"
+            }],
+            "actor": "operator",
+            "admin": true
+        });
+        let first = call_tool_store(&mut store, "complete_card", &arguments, 10).unwrap();
+        let replay = call_tool_store(&mut store, "complete_card", &arguments, 11).unwrap();
+        assert_eq!(tool_payload(&first)["state"], "succeeded");
+        assert_eq!(tool_payload(&replay), tool_payload(&first));
+        let status = call_tool_store(
+            &mut store,
+            "operation_status",
+            &json!({
+                "operation_id": "op-mcp-completion",
+                "actor": "operator",
+                "admin": true
+            }),
+            12,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&status), tool_payload(&first));
+        let detail = store
+            .get_card_detail(&card_id, DetailLevel::Detailed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.card.status, CardStatus::Done);
+        assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    }
+
+    #[test]
     fn mcp_get_card_defaults_to_concise_work_log_and_detail_returns_full_history() {
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();

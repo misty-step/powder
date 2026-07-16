@@ -2535,6 +2535,67 @@ mod tests {
     }
 
     #[test]
+    fn cli_completion_operation_replays_and_recovers_one_proof_effect() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-completion-operation-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "completion-operation-cli",
+            "--title",
+            "Completion operation CLI",
+            "--acceptance",
+            "proof is linked",
+        ]))
+        .unwrap();
+        let command = [
+            "complete-card",
+            "completion-operation-cli",
+            "--db",
+            &db,
+            "--proof",
+            "credential-free",
+            "--criterion-proof",
+            "0=https://example.test/cli-completion",
+            "--operation-id",
+            "op-cli-completion",
+            "--actor",
+            "operator",
+        ];
+        let first = run(&args(command)).unwrap();
+        let replay = run(&args(command)).unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first).unwrap()["state"],
+            "succeeded"
+        );
+        let recovered = run(&args([
+            "operation-status",
+            "op-cli-completion",
+            "--db",
+            &db,
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert_eq!(recovered, first);
+        let card = run(&args(["get-card", "completion-operation-cli", "--db", &db])).unwrap();
+        assert_eq!(
+            card.matches("https://example.test/cli-completion").count(),
+            1
+        );
+    }
+
+    #[test]
     fn cli_manages_event_subscriptions_and_tails_events() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-events-{}.db",
@@ -3381,6 +3442,60 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.authorization.as_deref() == Some("Bearer sk_powder_test")));
+    }
+
+    #[test]
+    fn cli_remote_completion_operation_and_status_use_the_http_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-cli-remote-completion",
+            "state": "succeeded",
+            "request_digest": "sha256:def",
+            "kind": "completion",
+            "target_card_id": "remote-card",
+            "result": {"card_id": "remote-card", "status": "done", "updated_at": 10},
+            "audit_event_id": "event-cli-remote"
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let mutation = run_with_env(
+            &args([
+                "complete-card",
+                "remote-card",
+                "--proof",
+                "credential-free",
+                "--criterion-proof",
+                "0=https://example.test/cli-remote-completion",
+                "--operation-id",
+                "op-cli-remote-completion",
+            ]),
+            &env,
+        )
+        .unwrap();
+        let recovered = run_with_env(
+            &args(["operation-status", "op-cli-remote-completion"]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(mutation, recovered);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/remote-card/complete");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-cli-remote-completion"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["criterion_proofs"][0]["url"],
+            "https://example.test/cli-remote-completion"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(
+            requests[1].path,
+            "/api/v1/operations/op-cli-remote-completion"
+        );
     }
 
     /// A lane maintaining a claim lease against a deployed instance (no

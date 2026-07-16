@@ -942,6 +942,57 @@ mod tests {
     }
 
     #[test]
+    fn idempotent_completion_and_operation_status_preserve_the_same_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-remote-completion",
+            "state": "succeeded",
+            "request_digest": "sha256:def",
+            "kind": "completion",
+            "target_card_id": "001",
+            "result": {"card_id": "001", "status": "done", "updated_at": 10},
+            "audit_event_id": "event-remote-completion"
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let mutation = call_tool_remote(
+            &client,
+            "complete_card",
+            &json!({
+                "operation_id": "op-remote-completion",
+                "card_id": "001",
+                "proof": "credential-free",
+                "criterion_proofs": [{
+                    "criterion": 0,
+                    "url": "https://example.test/mcp-remote-completion"
+                }]
+            }),
+        )
+        .unwrap();
+        let lookup = call_tool_remote(
+            &client,
+            "operation_status",
+            &json!({"operation_id": "op-remote-completion"}),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&mutation), tool_payload(&lookup));
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/001/complete");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-remote-completion"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["criterion_proofs"][0]["url"],
+            "https://example.test/mcp-remote-completion"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/v1/operations/op-remote-completion");
+    }
+
+    #[test]
     fn list_ready_sends_get_with_limit_query() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
