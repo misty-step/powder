@@ -3786,55 +3786,83 @@ fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()
     store.import_cards(vec![ready_card("operation-security", 1)])?;
     let operation_id = OperationId::new("op-security")?;
     let owner = Authority::actor("agent-a", false);
+    let powder_api_key = format!("sk_powder_{}-_", "A".repeat(30));
+    let powder_webhook_secret = format!("whsec_powder_{}-_", "B".repeat(30));
     let raw_attribution = [
-        "agent sk-abcdefghijklmnopqrstuvwxyz123456",
-        "model ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-        "reasoning Bearer abcdefghijklmnopqrstuvwxyz012345",
-        "harness xoxb-1234567890abcdefghij",
-        "run-sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+        format!("agent sk-abcdefghijklmnopqrstuvwxyz123456 {powder_api_key} {powder_webhook_secret}"),
+        format!(
+            "model ghp_abcdefghijklmnopqrstuvwxyz0123456789 {powder_api_key} {powder_webhook_secret}"
+        ),
+        format!(
+            "reasoning Bearer abcdefghijklmnopqrstuvwxyz012345 {powder_api_key} {powder_webhook_secret}"
+        ),
+        format!("harness xoxb-1234567890abcdefghij {powder_api_key} {powder_webhook_secret}"),
+        format!(
+            "run-sk-ant-api03-abcdefghijklmnopqrstuvwxyz-{powder_api_key}-{powder_webhook_secret}"
+        ),
     ];
+    let raw_body = format!(
+        "token sk-abcdefghijklmnopqrstuvwxyz123456 {powder_api_key} {powder_webhook_secret}"
+    );
     store.append_work_log_idempotent(
         operation_id.clone(),
         &card_id,
-        raw_attribution[0],
+        &raw_attribution[0],
         WorkLogAttribution {
-            model: Some(raw_attribution[1]),
-            reasoning: Some(raw_attribution[2]),
-            harness: Some(raw_attribution[3]),
-            run_id: Some(raw_attribution[4]),
+            model: Some(&raw_attribution[1]),
+            reasoning: Some(&raw_attribution[2]),
+            harness: Some(&raw_attribution[3]),
+            run_id: Some(&raw_attribution[4]),
         },
-        "token sk-abcdefghijklmnopqrstuvwxyz123456",
+        &raw_body,
         10,
         &owner,
     )?;
     let visible = store.operation_status(&operation_id, 11, &owner)?;
     let serialized = serde_json::to_string(&visible)?;
     assert!(serialized.contains("[REDACTED:openai-key]"));
+    assert!(serialized.contains("[REDACTED:powder-api-key]"));
+    assert!(serialized.contains("[REDACTED:powder-webhook-secret]"));
     assert!(!serialized.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
-    for secret in raw_attribution {
+    for secret in &raw_attribution {
         assert!(
             !serialized.contains(secret),
             "operation status leaked attribution secret: {secret}"
         );
     }
+    assert!(!serialized.contains(&powder_api_key));
+    assert!(!serialized.contains(&powder_webhook_secret));
     let detail = store
         .get_card_detail(&card_id, DetailLevel::Detailed)?
         .unwrap();
     let persisted = serde_json::to_string(&detail.work_log)?;
-    for secret in raw_attribution {
+    for secret in &raw_attribution {
         assert!(
             !persisted.contains(secret),
             "durable work log leaked attribution secret: {secret}"
         );
     }
+    assert!(!persisted.contains(&powder_api_key));
+    assert!(!persisted.contains(&powder_webhook_secret));
+    assert!(persisted.contains("[REDACTED:powder-api-key]"));
+    assert!(persisted.contains("[REDACTED:powder-webhook-secret]"));
     assert!(persisted.contains("agent [REDACTED:openai-key]"));
+    let card_audit = serde_json::to_string(&detail.events)?;
+    assert!(!card_audit.contains(&powder_api_key));
+    assert!(!card_audit.contains(&powder_webhook_secret));
+    assert!(card_audit.contains("[REDACTED:powder-api-key]"));
+    assert!(card_audit.contains("[REDACTED:powder-webhook-secret]"));
     let outbound = serde_json::to_string(&store.list_event_tail(0, 20)?)?;
-    for secret in raw_attribution {
+    for secret in &raw_attribution {
         assert!(
             !outbound.contains(secret),
             "outbound audit history leaked attribution secret: {secret}"
         );
     }
+    assert!(!outbound.contains(&powder_api_key));
+    assert!(!outbound.contains(&powder_webhook_secret));
+    assert!(outbound.contains("[REDACTED:powder-api-key]"));
+    assert!(outbound.contains("[REDACTED:powder-webhook-secret]"));
     let forbidden = store.operation_status(&operation_id, 11, &Authority::actor("agent-b", false));
     assert!(matches!(
         forbidden,
