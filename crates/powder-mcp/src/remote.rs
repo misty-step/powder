@@ -354,7 +354,16 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(criterion_proofs) = args["criterion_proofs"].as_array() {
                 body["criterion_proofs"] = json!(criterion_proofs);
             }
-            if let Some(operation_id) = operation_id {
+            if let Some(expected_run_id) = optional_str(args, "expected_run_id") {
+                let operation_id = operation_id.ok_or_else(|| {
+                    "complete_card expected_run_id requires operation_id".to_string()
+                })?;
+                body["operation_id"] = json!(operation_id);
+                client.post(
+                    &format!("/api/v1/cards/{id}/runs/{expected_run_id}/complete"),
+                    body,
+                )?
+            } else if let Some(operation_id) = operation_id {
                 body["operation_id"] = json!(operation_id);
                 client.post(&format!("/api/v1/cards/{id}/complete"), body)?
             } else {

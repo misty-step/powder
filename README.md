@@ -99,11 +99,12 @@ as a bare `missing --db` on a command the checkout has long since covered.
 | `append-work-log` | Permissive unbound/operator work_log note | `POST /api/v1/cards/{id}/work-log` | Legacy TSV or versioned operation JSON |
 | `operation-status` | SQLite operation recovery read | `GET /api/v1/operations/{id}` | Versioned bounded JSON outcome |
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
-| `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | Legacy TSV or versioned operation JSON |
+| `complete-card` | SQLite permissive or strict run-bound completion | `POST /api/v1/cards/{id}/complete` or `POST /api/v1/cards/{id}/runs/{run_id}/complete` | Legacy TSV or versioned operation JSON |
 
 See [`docs/mutation-operations-v1.md`](docs/mutation-operations-v1.md) for canonical request identity, replay, failure, authorization, and retention semantics.
 See [`docs/run-bound-work-logs-v1.md`](docs/run-bound-work-logs-v1.md) for strict current-run validation, the authoritative stored record, and event behavior.
 See [`docs/run-scoped-criterion-review-v1.md`](docs/run-scoped-criterion-review-v1.md) for authoritative current-run criterion state, stable identity, re-review, clear, edit, reorder, and later-run semantics.
+See [`docs/run-bound-completion-v1.md`](docs/run-bound-completion-v1.md) for atomic expected-run completion, approval consumption, replay, recovery, and permissive operator compatibility.
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently

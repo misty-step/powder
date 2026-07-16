@@ -99,6 +99,117 @@ fn transferred_claim_rebinds_strict_review_identity() -> powder_store::Result<()
 }
 
 #[test]
+fn run_bound_completion_requires_current_approved_run_and_replays_once() -> powder_store::Result<()>
+{
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("strict-completion")?;
+    store.import_cards(vec![card(card_id.as_str(), &["approved criterion"])])?;
+    let holder = Authority::authenticated("agent-a", "actor-a", false);
+    let claim = store.claim_card(&card_id, "agent-a", 10, 100, &holder)?;
+    let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
+
+    let premature = store.complete_card_for_run_idempotent(
+        OperationId::new("strict-completion-premature")?,
+        &card_id,
+        &claim.run_id,
+        Some("proof"),
+        vec![],
+        20,
+        &holder,
+    )?;
+    assert_eq!(premature.state, OperationState::Rejected);
+
+    store.review_criterion(
+        &card_id,
+        review_input(
+            "strict-completion-review",
+            &claim.run_id,
+            0,
+            &criterion_id,
+            CriterionReviewDecision::Approved,
+            Some("review proof"),
+        ),
+        21,
+        &holder,
+    )?;
+    let operation_id = OperationId::new("strict-completion-success")?;
+    let completed = store.complete_card_for_run_idempotent(
+        operation_id.clone(),
+        &card_id,
+        &claim.run_id,
+        Some("completion proof"),
+        vec![],
+        22,
+        &holder,
+    )?;
+    assert_eq!(completed.state, OperationState::Succeeded);
+    assert_eq!(completed.expected_run_id.as_ref(), Some(&claim.run_id));
+    assert_eq!(
+        completed.result.as_ref().unwrap()["run_id"],
+        claim.run_id.as_str()
+    );
+    assert_eq!(
+        completed.audit_event_id.as_deref(),
+        completed.result.as_ref().unwrap()["audit_event_id"].as_str()
+    );
+
+    let replay = store.complete_card_for_run_idempotent(
+        operation_id,
+        &card_id,
+        &claim.run_id,
+        Some("completion proof"),
+        vec![],
+        23,
+        &holder,
+    )?;
+    assert_eq!(replay, completed);
+    let changed = store.complete_card_for_run_idempotent(
+        OperationId::new("strict-completion-success")?,
+        &card_id,
+        &claim.run_id,
+        Some("changed proof"),
+        vec![],
+        24,
+        &holder,
+    );
+    assert!(matches!(
+        changed,
+        Err(StoreError::Domain(DomainError::Conflict(_)))
+    ));
+    assert_eq!(store.get_card(&card_id)?.unwrap().status, CardStatus::Done);
+    Ok(())
+}
+
+#[test]
+fn expired_run_bound_completion_is_rejected_without_completion_effect() -> powder_store::Result<()>
+{
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("expired-completion")?;
+    store.import_cards(vec![card(card_id.as_str(), &["approval required"])])?;
+    let holder = Authority::authenticated("agent-a", "actor-a", false);
+    let claim = store.claim_card(&card_id, "agent-a", 10, 10, &holder)?;
+    let rejected = store.complete_card_for_run_idempotent(
+        OperationId::new("expired-completion")?,
+        &card_id,
+        &claim.run_id,
+        Some("too late"),
+        vec![],
+        20,
+        &holder,
+    )?;
+    assert_eq!(rejected.state, OperationState::Rejected);
+    assert_eq!(rejected.failure.as_ref().unwrap().code, "claim_expired");
+    assert_ne!(store.get_card(&card_id)?.unwrap().status, CardStatus::Done);
+    assert_eq!(
+        store.get_run(&claim.run_id)?.unwrap().state,
+        powder_core::RunState::Active
+    );
+    Ok(())
+}
+
+#[test]
 fn review_replay_rereview_clear_and_all_read_models_agree() -> powder_store::Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

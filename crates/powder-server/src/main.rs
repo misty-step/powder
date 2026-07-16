@@ -649,6 +649,10 @@ fn app(state: AppState) -> Router {
             post(append_run_work_log),
         )
         .route("/api/v1/cards/{id}/complete", post(complete_card))
+        .route(
+            "/api/v1/cards/{id}/runs/{run_id}/complete",
+            post(complete_card_for_run),
+        )
         .route("/api/v1/operations/{id}", get(get_operation_status))
         .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
         .route("/api/v1/runs/{id}", get(get_run))
@@ -1472,6 +1476,42 @@ async fn complete_card(
         )?;
         Ok(Json(json!(card)))
     }
+}
+
+async fn complete_card_for_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, run_id)): Path<(String, String)>,
+    Json(request): Json<CompleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor = authorize(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let run_id = RunId::new(run_id)?;
+    let operation_id = request.operation_id.ok_or_else(|| {
+        powder_core::DomainError::validation(
+            "operation_id",
+            "run-bound completion requires an operation identity",
+        )
+    })?;
+    let criterion_proofs = request
+        .criterion_proofs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|proof| CriterionProofInput {
+            criterion: proof.criterion,
+            url: proof.url,
+        })
+        .collect();
+    let status = lock_store(&state)?.complete_card_for_run_idempotent(
+        OperationId::new(operation_id)?,
+        &card_id,
+        &run_id,
+        request.proof.as_deref(),
+        criterion_proofs,
+        unix_now(),
+        &actor.authority(),
+    )?;
+    Ok(Json(json!(status)))
 }
 
 async fn get_operation_status(

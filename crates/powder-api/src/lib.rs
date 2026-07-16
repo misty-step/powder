@@ -229,6 +229,14 @@ pub const ROUTES: &[ApiRoute] = &[
         ),
     },
     ApiRoute {
+        method: "POST",
+        path: "/api/v1/cards/{id}/runs/{run_id}/complete",
+        intent: "atomically complete only when run_id is the card's unexpired current run, the actor is authorized for that claim, and every current run criterion is approved",
+        body_shape: Some(
+            r#"{"operation_id":"stable-id","proof":null,"criterion_proofs":null} -- operation_id is required; returns powder.operation_status.v1 with a powder.run_bound_completion.v1 authoritative receipt and supports identical replay after response loss"#,
+        ),
+    },
+    ApiRoute {
         method: "GET",
         path: "/api/v1/operations/{id}",
         intent: "read one bounded powder.operation_status.v1 recovery record as unknown, pending, succeeded, rejected, or failed; the creating authority or an admin is required",

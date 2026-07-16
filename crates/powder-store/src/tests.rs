@@ -3938,6 +3938,92 @@ fn idempotent_work_log_recovers_lost_response_and_replays_one_effect() -> Result
 }
 
 #[test]
+fn delayed_run_a_completion_revalidates_after_release_and_reclaim_to_run_b() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("strict-completion-release-reclaim-barrier");
+    let card_id = CardId::new("strict-completion-release-reclaim-barrier")?;
+    let authority_a = Authority::authenticated("agent-a", "actor-a", false);
+    let run_a = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card(card_id.as_str(), 1)])?;
+        let claim = store.claim_card(&card_id, "agent-a", 10, 100, &authority_a)?;
+        let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0)
+            .expect("criterion identity");
+        store.review_criterion(
+            &card_id,
+            CriterionReviewInput {
+                operation_id: OperationId::new("strict-completion-barrier-review")?,
+                expected_run_id: claim.run_id.clone(),
+                criterion: 0,
+                criterion_id,
+                decision: CriterionReviewDecision::Approved,
+                proof: Some("review proof".to_string()),
+            },
+            11,
+            &authority_a,
+        )?;
+        claim
+    };
+
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let delayed = {
+        let path = path.clone();
+        let card_id = card_id.clone();
+        let run_id = run_a.run_id.clone();
+        let reached = Arc::clone(&reached);
+        let resume = Arc::clone(&resume);
+        std::thread::spawn(move || -> Result<_> {
+            let mut store = Store::open(path)?;
+            store.migrate()?;
+            store.run_completion_validation_hook =
+                Some(super::RunCompletionValidationHook { reached, resume });
+            store.complete_card_for_run_idempotent(
+                OperationId::new("strict-completion-barrier")?,
+                &card_id,
+                &run_id,
+                Some("delayed run A proof"),
+                vec![],
+                30,
+                &Authority::authenticated("agent-a", "actor-a", false),
+            )
+        })
+    };
+
+    reached.wait();
+    let (run_b, card_b_before, run_b_before, event_count_before) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.release_claim(&card_id, &run_a.run_id, 20, &authority_a)?;
+        let run_b = store.claim_card(
+            &card_id,
+            "agent-b",
+            21,
+            100,
+            &Authority::authenticated("agent-b", "actor-b", false),
+        )?;
+        let card_b = store.get_card(&card_id)?.expect("card after reclaim");
+        let run_b_record = store.get_run(&run_b.run_id)?.expect("run B after reclaim");
+        let event_count = store.list_event_tail(0, 20)?.len();
+        (run_b, card_b, run_b_record, event_count)
+    };
+    resume.wait();
+
+    let rejected = delayed
+        .join()
+        .expect("delayed completion thread panicked")?;
+    assert_eq!(rejected.state, OperationState::Rejected);
+    assert_eq!(rejected.failure.expect("rejection detail").code, "conflict");
+    let store = Store::open(&path)?;
+    assert_eq!(store.get_card(&card_id)?.unwrap(), card_b_before);
+    assert_eq!(store.get_run(&run_b.run_id)?.unwrap(), run_b_before);
+    assert_eq!(store.list_event_tail(0, 20)?.len(), event_count_before);
+    Ok(())
+}
+
+#[test]
 fn conflicting_operation_reuse_fails_closed_without_mixed_state() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -4148,6 +4234,75 @@ fn completion_operation_rolls_back_card_proof_audit_and_identity_on_injected_fai
     assert!(detail.card.criteria[0].proof_links.is_empty());
     assert!(detail.events.is_empty());
     assert!(store.list_event_tail(0, 20)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn run_bound_completion_rolls_back_card_run_proof_events_audit_and_identity() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("strict-completion-rollback")?;
+    let authority = Authority::authenticated("agent-a", "actor-a", false);
+    store.import_cards(vec![ready_card(card_id.as_str(), 1)])?;
+    let claim = store.claim_card(&card_id, "agent-a", 10, 100, &authority)?;
+    let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0)
+        .expect("criterion identity");
+    store.review_criterion(
+        &card_id,
+        CriterionReviewInput {
+            operation_id: OperationId::new("strict-completion-rollback-review")?,
+            expected_run_id: claim.run_id.clone(),
+            criterion: 0,
+            criterion_id,
+            decision: CriterionReviewDecision::Approved,
+            proof: Some("review proof".to_string()),
+        },
+        11,
+        &authority,
+    )?;
+    let card_before = store.get_card(&card_id)?.unwrap();
+    let run_before = store.get_run(&claim.run_id)?.unwrap();
+    let detail_before = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    let outbound_before = store.list_event_tail(0, 20)?;
+    store.connection.execute_batch(
+        "CREATE TRIGGER inject_strict_completion_finish_failure
+         BEFORE UPDATE OF state ON mutation_operations
+         BEGIN SELECT RAISE(ABORT, 'injected strict completion persistence failure'); END;",
+    )?;
+    let operation_id = OperationId::new("strict-completion-rollback")?;
+    let error = store
+        .complete_card_for_run_idempotent(
+            operation_id.clone(),
+            &card_id,
+            &claim.run_id,
+            Some("must roll back"),
+            vec![CriterionProofInput {
+                criterion: 0,
+                url: "https://example.test/must-roll-back".to_string(),
+            }],
+            12,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    store
+        .connection
+        .execute_batch("DROP TRIGGER inject_strict_completion_finish_failure")?;
+
+    assert_eq!(
+        store.operation_status(&operation_id, 13, &authority)?.state,
+        OperationState::Unknown
+    );
+    assert_eq!(store.get_card(&card_id)?.unwrap(), card_before);
+    assert_eq!(store.get_run(&claim.run_id)?.unwrap(), run_before);
+    let detail_after = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail_after.events, detail_before.events);
+    assert_eq!(detail_after.activities, detail_before.activities);
+    assert_eq!(store.list_event_tail(0, 20)?, outbound_before);
     Ok(())
 }
 

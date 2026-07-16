@@ -916,6 +916,26 @@ pub struct RunCriterionState {
     pub review: Option<CriterionReview>,
 }
 
+impl RunCriterionState {
+    pub fn is_approved(&self) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| review.decision == CriterionReviewDecision::Approved)
+    }
+}
+
+pub fn require_all_run_criteria_approved(
+    criteria: &[RunCriterionState],
+) -> Result<(), DomainError> {
+    if let Some(criterion) = criteria.iter().find(|criterion| !criterion.is_approved()) {
+        return Err(DomainError::conflict(format!(
+            "criterion {} is not approved for the expected run",
+            criterion.criterion_index
+        )));
+    }
+    Ok(())
+}
+
 impl AcceptanceCriterion {
     pub fn new(text: impl Into<String>) -> Result<Self, DomainError> {
         Ok(Self {

@@ -245,7 +245,7 @@ pub fn help() -> String {
         "  powder append-run-work-log 001 --db ./data/powder.db --run run-id --operation-id stable-id --agent codex --actor codex --body \"focused tests passed\" [--model model] [--reasoning level] [--harness harness]\n",
     );
     help.push_str(
-        "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof] [--operation-id stable-id]\n",
+        "  powder complete-card 001 --db ./data/powder.db [--run RUN_ID --operation-id stable-id] [--proof https://example.test/proof]\n",
     );
     help.push_str("  powder operation-status stable-id --db ./data/powder.db [--actor codex]\n");
     help.push_str(
@@ -1434,9 +1434,27 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let proof = flag_value(args, "--proof");
     let criterion_proofs = criterion_proofs_flag(args)?;
     let operation_id = flag_value(args, "--operation-id");
+    let expected_run_id = flag_value(args, "--run").map(RunId::new).transpose()?;
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        if let Some(operation_id) = operation_id {
+        if let Some(run_id) = expected_run_id.as_ref() {
+            let operation_id = operation_id.ok_or_else(|| {
+                ShellError::Invalid(
+                    "complete-card --run requires --operation-id for recovery".to_string(),
+                )
+            })?;
+            json!(store
+                .complete_card_for_run_idempotent(
+                    OperationId::new(operation_id)?,
+                    &card_id,
+                    run_id,
+                    proof,
+                    criterion_proofs,
+                    now,
+                    &authority(args),
+                )
+                .map_err(store_err)?)
+        } else if let Some(operation_id) = operation_id {
             json!(store
                 .complete_card_idempotent(
                     OperationId::new(operation_id)?,
@@ -1466,9 +1484,17 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
         if let Some(operation_id) = operation_id {
             body["operation_id"] = json!(operation_id);
         }
-        client
-            .post(&format!("/api/v1/cards/{card_id}/complete"), body)
-            .map_err(remote_err)?
+        let path = if let Some(run_id) = expected_run_id.as_ref() {
+            if operation_id.is_none() {
+                return Err(ShellError::Invalid(
+                    "complete-card --run requires --operation-id for recovery".to_string(),
+                ));
+            }
+            format!("/api/v1/cards/{card_id}/runs/{run_id}/complete")
+        } else {
+            format!("/api/v1/cards/{card_id}/complete")
+        };
+        client.post(&path, body).map_err(remote_err)?
     } else {
         return Err(missing_transport("complete-card"));
     };

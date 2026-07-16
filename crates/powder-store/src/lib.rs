@@ -4,11 +4,12 @@ use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, criterion_identity,
-    repo_from_numeric_card_id_prefix, AcceptanceCriterion, Activity, ActivityId, ActivityType,
-    Authority, AutonomyClass, Card, CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim,
-    ClaimReceipt, Comment, CriterionProof, CriterionReview, CriterionReviewDecision, DomainError,
-    Estimate, Link, LinkId, OperationField, OperationId, OperationKind, OperationRequest,
-    OperationState, Priority, ReadyQuery, Run, RunCriterionState, RunId, RunState, WorkLogEntry,
+    repo_from_numeric_card_id_prefix, require_all_run_criteria_approved, AcceptanceCriterion,
+    Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card, CardEvent, CardEventId,
+    CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, CriterionProof, CriterionReview,
+    CriterionReviewDecision, DomainError, Estimate, Link, LinkId, OperationField, OperationId,
+    OperationKind, OperationRequest, OperationState, Priority, ReadyQuery, Run, RunCriterionState,
+    RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -87,11 +88,20 @@ pub struct Store {
     field_note_config: Option<FieldNoteConfig>,
     #[cfg(test)]
     run_work_log_validation_hook: Option<RunWorkLogValidationHook>,
+    #[cfg(test)]
+    run_completion_validation_hook: Option<RunCompletionValidationHook>,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
 struct RunWorkLogValidationHook {
+    reached: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct RunCompletionValidationHook {
     reached: std::sync::Arc<std::sync::Barrier>,
     resume: std::sync::Arc<std::sync::Barrier>,
 }
@@ -349,6 +359,8 @@ impl Store {
             field_note_config: None,
             #[cfg(test)]
             run_work_log_validation_hook: None,
+            #[cfg(test)]
+            run_completion_validation_hook: None,
         };
         store.connection.pragma_update(None, "foreign_keys", "ON")?;
         store.connection.pragma_update(None, "busy_timeout", 5000)?;
@@ -2113,6 +2125,122 @@ impl Store {
         Ok(status)
     }
 
+    /// Retry-safe completion bound atomically to one expected current run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_card_for_run_idempotent(
+        &mut self,
+        operation_id: OperationId,
+        card_id: &CardId,
+        expected_run_id: &RunId,
+        proof: Option<&str>,
+        criterion_proofs: Vec<CriterionProofInput>,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        validate_optional_bound("proof", proof, COMPLETION_PROOF_MAX_BYTES)?;
+        if criterion_proofs.len() > CRITERION_PROOF_MAX_COUNT {
+            return Err(DomainError::validation(
+                "criterion_proofs",
+                format!("must contain at most {CRITERION_PROOF_MAX_COUNT} items"),
+            )
+            .into());
+        }
+        for criterion_proof in &criterion_proofs {
+            validate_bounded_non_empty(
+                "criterion proof url",
+                &criterion_proof.url,
+                CRITERION_PROOF_URL_MAX_BYTES,
+            )?;
+        }
+        let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+        let criterion_payload = to_json(&criterion_proofs)?;
+        let request = OperationRequest::new(
+            operation_id,
+            OperationKind::Completion,
+            card_id.clone(),
+            authority.operation_identity(),
+            Some(expected_run_id.clone()),
+            &[
+                OperationField {
+                    name: "proof",
+                    value: proof,
+                },
+                OperationField {
+                    name: "criterion_proofs",
+                    value: Some(&criterion_payload),
+                },
+            ],
+        )?;
+
+        #[cfg(test)]
+        if let Some(hook) = &self.run_completion_validation_hook {
+            hook.reached.wait();
+            hook.resume.wait();
+        }
+
+        let field_note_config = self.field_note_config.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
+        }
+        reserve_operation(&transaction, &request, now)?;
+        match complete_card_for_run_in_transaction(
+            &transaction,
+            card_id,
+            expected_run_id,
+            proof,
+            criterion_proofs.clone(),
+            now,
+            authority,
+            field_note_config.as_ref(),
+        ) {
+            Ok((card, event_id)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Succeeded,
+                    Some(json!({
+                        "schema_version": "powder.run_bound_completion.v1",
+                        "card_id": card.id,
+                        "run_id": expected_run_id,
+                        "operation_id": request.id,
+                        "status": card.status,
+                        "proof": proof.map(secrets::scrub_secrets),
+                        "criterion_proofs": criterion_proofs,
+                        "updated_at": card.updated_at,
+                        "audit_event_id": event_id,
+                    })),
+                    None,
+                    Some(event_id),
+                    now,
+                )?;
+            }
+            Err(StoreError::Domain(error)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Rejected,
+                    None,
+                    Some(operation_failure(&error)),
+                    None,
+                    now,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
     /// Read one bounded operation outcome after pruning expired recovery
     /// records. Unknown is returned as data rather than a 404 so callers can
     /// distinguish an absent operation from transport failure.
@@ -2261,6 +2389,77 @@ fn append_current_run_work_log_in_transaction(
     authority.require_identity(agent)?;
     authority.require_holder(card.claim_holder())?;
     append_work_log_in_transaction(transaction, card_id, actor, agent, attribution, body, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_card_for_run_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    expected_run_id: &RunId,
+    proof: Option<&str>,
+    criterion_proofs: Vec<CriterionProofInput>,
+    now: i64,
+    authority: &Authority,
+    field_note_config: Option<&FieldNoteConfig>,
+) -> Result<(Card, String)> {
+    let card = load_card(transaction, card_id)?;
+    let claim = card
+        .claim
+        .as_ref()
+        .ok_or_else(|| DomainError::conflict(format!("card {card_id} has no current run")))?;
+    if claim.run_id != *expected_run_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} is not current for card {card_id}"
+        ))
+        .into());
+    }
+    if claim.is_expired(now) {
+        return Err(DomainError::claim_expired(format!(
+            "run {expected_run_id} claim expired at {}",
+            claim.expires_at
+        ))
+        .into());
+    }
+    let run = transaction
+        .query_row(
+            RUN_SELECT_SQL,
+            [expected_run_id.as_str()],
+            RunRecord::from_row,
+        )
+        .optional()?
+        .ok_or_else(|| DomainError::not_found("run", expected_run_id.to_string()))?
+        .into_run()?;
+    if run.card_id != *card_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} belongs to card {}, not {card_id}",
+            run.card_id
+        ))
+        .into());
+    }
+    if run.claim_expires_at <= now {
+        return Err(
+            DomainError::claim_expired(format!("run {expected_run_id} claim expired")).into(),
+        );
+    }
+    if !matches!(run.state, RunState::Active | RunState::AwaitingInput) {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} is {}",
+            run.state.as_str()
+        ))
+        .into());
+    }
+    authority.require_holder(Some(&claim.agent))?;
+    let criteria = project_run_criterion_state(transaction, &card, expected_run_id)?;
+    require_all_run_criteria_approved(&criteria)?;
+    complete_card_in_transaction(
+        transaction,
+        card_id,
+        proof,
+        criterion_proofs,
+        now,
+        authority,
+        field_note_config,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

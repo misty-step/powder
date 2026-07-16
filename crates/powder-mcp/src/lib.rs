@@ -153,8 +153,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "complete_card",
-        description: "Set a card done through Powder's permissive operator-correction path. Supply operation_id for durable replay and status recovery. This P2 contract does not add an expected-current-run precondition.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"proof":{"type":"string","maxLength":4096},"criterion_proofs":{"type":"array","maxItems":128,"items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string","maxLength":4096}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Complete a card. Supply expected_run_id and operation_id for strict current-run completion with durable recovery; omit expected_run_id only for the explicit permissive operator-correction path.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"operation_id":{"type":"string","maxLength":128},"expected_run_id":{"type":"string"},"card_id":{"type":"string"},"proof":{"type":"string","maxLength":4096},"criterion_proofs":{"type":"array","maxItems":128,"items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string","maxLength":4096}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "operation_status",
@@ -714,7 +714,20 @@ pub fn call_tool_store(
         "complete_card" => {
             let card_id = card_id(args, "card_id")?;
             let criterion_proofs = criterion_proofs_arg(args)?;
-            if let Some(operation_id) = optional_str(args, "operation_id") {
+            if let Some(expected_run_id) = optional_str(args, "expected_run_id") {
+                let operation_id = required_str(args, "operation_id")?;
+                json!(store
+                    .complete_card_for_run_idempotent(
+                        OperationId::new(operation_id).map_err(to_string)?,
+                        &card_id,
+                        &RunId::new(expected_run_id).map_err(to_string)?,
+                        optional_str(args, "proof"),
+                        criterion_proofs,
+                        now,
+                        &authority_arg(args),
+                    )
+                    .map_err(to_string)?)
+            } else if let Some(operation_id) = optional_str(args, "operation_id") {
                 json!(store
                     .complete_card_idempotent(
                         OperationId::new(operation_id).map_err(to_string)?,
