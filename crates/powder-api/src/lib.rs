@@ -177,7 +177,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/work-log",
         intent: "append a high-frequency, fully-attributed work_log entry while actively working a card (powder-943) -- context, current activity, issues, chain of thought, distinct from the low-frequency human-facing comments field",
         body_shape: Some(
-            r#"{"operation_id":null,"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; operation_id opts into powder.operation_status.v1 replay and recovery; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; body is scrubbed for known secret shapes server-side before storage"#,
+            r#"{"operation_id":null,"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; operation_id opts into powder.operation_status.v1 replay and recovery; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; every caller-controlled attribution field and body is scrubbed for known secret shapes server-side before storage"#,
         ),
     },
     ApiRoute {

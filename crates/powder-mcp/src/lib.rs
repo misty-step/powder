@@ -133,8 +133,8 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "append_work_log",
-        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card. Supply operation_id for durable replay and status recovery. This P2 contract does not enforce current-run attribution; that remains a separate strict operation. body is scrubbed for known secret shapes server-side before storage.",
-        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string","maxLength":16384},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card. Supply operation_id for durable replay and status recovery. This P2 contract does not enforce current-run attribution; that remains a separate strict operation. Every caller-controlled attribution field and body is scrubbed for known secret shapes server-side before storage.",
+        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"agent":{"type":"string","maxLength":256},"body":{"type":"string","maxLength":16384},"model":{"type":"string","maxLength":256},"reasoning":{"type":"string","maxLength":256},"harness":{"type":"string","maxLength":256},"run_id":{"type":"string","maxLength":256},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "request_input",

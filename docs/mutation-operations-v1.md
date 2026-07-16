@@ -23,6 +23,8 @@ The canonical request is limited to 65,536 bytes before hashing.
 
 Work-log operation payloads are ordered as `agent`, `model`, `reasoning`, `harness`, and `body`.
 The optional work-log `run_id` is represented as the request's expected-run digest component, but P2 does not validate that it is the card's current run.
+The digest covers the caller's original bounded fields before redaction, so distinct raw requests remain conflicting even when their safe projections use the same redaction marker.
+Powder scrubs known credential shapes from `agent`, `model`, `reasoning`, `harness`, `run_id`, and `body` before storing the work log, authoritative result, recovery projection, card audit, or outbound event.
 Completion operation payloads are ordered as `proof` and the deterministic JSON representation of `criterion_proofs`.
 
 ## Lifecycle and replay
@@ -69,7 +71,8 @@ Conflicting deliveries with one identity serialize at the immediate transaction 
 
 Work-log agent identity is limited to 256 bytes.
 Each optional work-log attribution field is limited to 256 bytes.
-Work-log body is limited to 16,384 bytes for the operation contract and is scrubbed before result storage.
+Work-log body is limited to 16,384 bytes for the operation contract.
+Every work-log attribution field and body is scrubbed before any mutation or recovery value is stored.
 Completion proof is limited to 4,096 bytes.
 Completion accepts at most 128 criterion proof items, and each proof URL is limited to 4,096 bytes.
 Safe failure messages are limited to 512 bytes.
