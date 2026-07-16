@@ -1995,6 +1995,90 @@ async fn http_operation_replay_status_conflict_and_authorization_are_consistent(
 }
 
 #[tokio::test]
+async fn http_work_log_operation_scrubs_all_attribution_and_resolves_its_audit_link() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"http-operation-secrets","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let raw_attribution = [
+        "agent sk-abcdefghijklmnopqrstuvwxyz123456",
+        "model ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "reasoning Bearer abcdefghijklmnopqrstuvwxyz012345",
+        "harness xoxb-1234567890abcdefghij",
+        "run-sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+    ];
+    let mutation = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation-secrets/work-log",
+            Some(&raw_key),
+            &json!({
+                "operation_id": "op-http-secrets",
+                "agent": raw_attribution[0],
+                "model": raw_attribution[1],
+                "reasoning": raw_attribution[2],
+                "harness": raw_attribution[3],
+                "run_id": raw_attribution[4],
+                "body": "body sk-abcdefghijklmnopqrstuvwxyz123456"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mutation.status(), StatusCode::OK);
+    let mutation = response_json(mutation).await;
+    let serialized = serde_json::to_string(&mutation).unwrap();
+    for secret in raw_attribution {
+        assert!(!serialized.contains(secret), "HTTP status leaked {secret}");
+    }
+    assert!(!serialized.contains("body sk-abcdefghijklmnopqrstuvwxyz123456"));
+    let audit_event_id = mutation["audit_event_id"].as_str().unwrap();
+    assert!(audit_event_id.starts_with("event-"));
+
+    let recovered = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-secrets",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(recovered).await, mutation);
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-operation-secrets?detail=detailed",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    let detail_serialized = serde_json::to_string(&detail).unwrap();
+    for secret in raw_attribution {
+        assert!(
+            !detail_serialized.contains(secret),
+            "HTTP card history leaked {secret}"
+        );
+    }
+    assert!(detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["id"] == audit_event_id));
+}
+
+#[tokio::test]
 async fn http_completion_response_loss_recovers_by_operation_identity() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -2032,6 +2116,23 @@ async fn http_completion_response_loss_recovers_by_operation_identity() {
     let status = response_json(status).await;
     assert_eq!(status["state"], "succeeded");
     assert_eq!(status["result"]["status"], "done");
+    let audit_event_id = status["audit_event_id"].as_str().unwrap();
+    assert!(audit_event_id.starts_with("event-"));
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-completion-operation?detail=detailed",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert!(response_json(detail).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["id"] == audit_event_id));
     let replay = app
         .oneshot(json_request(
             Method::POST,
