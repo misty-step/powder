@@ -95,35 +95,14 @@ This strict operation does not change permissive status correction, permissive c
 It does not implement run-scoped criterion review or expected-run conditional completion.
 It reuses the approved operation substrate without changing operation status vocabulary, recovery authorization, digest framing, or retention.
 
-## Known P3 and P4 landing blocker
+## P3 and P4 migration composition
 
-P3 and P4 cannot be landed independently at their current migration numbers.
-P3 owns the work-log record and run-leading index migration from schema 14 to 15.
-P4 independently owns an operation-kind constraint migration currently numbered 14 to 15 and a review-history migration currently numbered 15 to 16.
-No branch should be merged, cherry-picked, rebased, or renumbered until General authorizes integration.
-
-The future authorized linear composition must be exactly:
+The authorized integration composes the migrations in this order:
 
 1. P3 work-log actor, update timestamp, and `(run_id, created_at, id)` index migrate schema 14 to 15.
 2. P4 `criterion_review` operation kind and its additive `mutation_operations` constraint migrate schema 15 to 16.
 3. P4 review history migrates schema 16 to 17.
+4. P4 stable reviewer identity and run-authority binding migrate schema 17 to 18.
 
-The integration owner must make the following exact renumbering edits after authorization:
-
-- In `crates/powder-store/src/schema.rs`, retain P3's `SCHEMA_VERSION` 15 hunk as the first landing, then raise the composed fresh-schema version to 17.
-- In `crates/powder-store/src/schema.rs`, retain P3's `MIGRATE_14_TO_15` work-log backfill and index hunk unchanged.
-- In `crates/powder-store/src/schema.rs`, rename P4's operation-kind `MIGRATE_14_TO_15` constant and comment to `MIGRATE_15_TO_16` without changing its approved SQL.
-- In `crates/powder-store/src/schema.rs`, rename P4's review-history `MIGRATE_15_TO_16` constant and comment to `MIGRATE_16_TO_17` without changing its approved SQL.
-- In the fresh `SCHEMA` hunk in `crates/powder-store/src/schema.rs`, compose P3's authoritative work-log columns and run-leading index with P4's approved `criterion_review` kind constraint and review-history objects.
-- In the schema import list in `crates/powder-store/src/lib.rs`, retain `MIGRATE_14_TO_15` for P3 and import the renumbered P4 `MIGRATE_15_TO_16` and `MIGRATE_16_TO_17` constants.
-- In the `Store::migrate` match in `crates/powder-store/src/lib.rs`, retain P3's `14 => 15` arm, add P4 operation-kind `15 => 16`, and add P4 review-history `16 => 17`.
-- In `crates/powder-store/src/tests.rs`, retain `migration_14_to_15_backfills_authoritative_work_log_identity_without_data_loss`, including its index assertion.
-- In P4's focused migration tests in `crates/powder-store/src/tests.rs`, rename operation-kind coverage to 15-to-16 and review-history coverage to 16-to-17, and update their seeded `PRAGMA user_version` values accordingly.
-
-The composed migration suite must prove fresh schema creation at version 17 and each supported upgrade boundary.
-It must prove schema 14 runs P3, P4 operation-kind, and P4 review-history in order.
-It must prove schema 15 runs only the two P4 steps.
-It must prove schema 16 runs only P4 review history.
-Every path must preserve existing work-log rows, operation recovery rows, and review history.
-
-This ordering is a known landing blocker, not authorization for P3 to copy or edit P4's operation kind, constraint, review schema, or tests.
+Fresh schema creation and every supported upgrade boundary end at schema 18.
+The composed migration suite preserves existing work-log rows, operation recovery rows, and review history.

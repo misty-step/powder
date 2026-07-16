@@ -278,6 +278,14 @@ fn migration_14_to_15_backfills_authoritative_work_log_identity_without_data_los
         |row| row.get(0),
     )?;
     assert!(run_index.contains("(run_id, created_at, id)"));
+    let operation_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mutation_operations'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(operation_sql.contains("criterion_review"));
+    assert!(store.table_has_column("criterion_reviews", "reviewer_identity")?);
+    assert_eq!(store.schema_version()?, 18);
     Ok(())
 }
 

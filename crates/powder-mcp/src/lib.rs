@@ -28,7 +28,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_run_work_log frequently with the exact current run, one stable operation_id, your agent identity, progress, blockers, evidence, and attribution. append_work_log is the permissive unbound/operator-note compatibility path, not the agent current-run path. Allocate one stable operation_id before retryable work-log, criterion-review, or completion mutations. After timeout or reconnect, call operation_status and retry only the identical request. Call review_criterion only with the exact current run and criterion_id from get_card/get_run; authenticated authority supplies the reviewer. Use add_comment only for low-frequency human-facing updates. Heartbeat or renew long claims before expiry. Release a claim when stopping voluntarily. If an operator decision is needed, request_input and pause; never invent approval. Call complete_card only when criteria are satisfied, with reviewable proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools are hidden unless POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready; claim exactly one card with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_run_work_log frequently with the exact current run, one stable operation_id, your agent identity, progress, blockers, evidence, and attribution. append_work_log is the permissive unbound/operator-note compatibility path, not the agent current-run path. Allocate one stable operation_id before retryable work-log, criterion-review, or completion mutations. After timeout or reconnect, call operation_status and retry only the identical request. Call review_criterion only with the exact current run and criterion_id from get_card/get_run; authenticated authority supplies the reviewer. Use add_comment only for low-frequency updates. Heartbeat or renew long claims before expiry. Release a claim when stopping voluntarily. If an operator decision is needed, request_input and pause; never invent approval. Call complete_card only when criteria are satisfied, with reviewable proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools are hidden unless POWDER_MCP_TOOLSETS=admin.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -1261,7 +1261,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 22);
+        assert_eq!(default_tools.len(), 23);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1397,7 +1397,7 @@ mod tests {
                 "operation_status",
             ]
         );
-        assert_eq!(default_names.len(), 22);
+        assert_eq!(default_names.len(), 23);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1409,7 +1409,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 31);
+        assert_eq!(admin_names.len(), 32);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
