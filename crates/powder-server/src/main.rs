@@ -440,6 +440,8 @@ struct LeaseRequest {
 struct TransferRequest {
     run_id: String,
     to_agent: String,
+    #[serde(default)]
+    to_identity: Option<String>,
     ttl_seconds: Option<u64>,
 }
 
@@ -1191,10 +1193,11 @@ async fn transfer_claim(
     let actor = authorize(&state, &headers)?;
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
-    let receipt = lock_store(&state)?.transfer_claim(
+    let receipt = lock_store(&state)?.transfer_claim_with_identity(
         &card_id,
         &run_id,
         &request.to_agent,
+        request.to_identity.as_deref(),
         unix_now(),
         request.ttl_seconds.unwrap_or(3600),
         &actor.authority(),

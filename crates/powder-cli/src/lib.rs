@@ -954,16 +954,18 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
     let card_id = positional_card_id(args, "transfer-claim")?;
     let run_id = required_run_flag(args)?;
     let to_agent = required_flag(args, "--to-agent")?;
+    let to_identity = flag_value(args, "--to-identity");
     let ttl_seconds = optional_ttl(args)?;
     let (transferred_card_id, transferred_run_id, transferred_agent, expires_at) = if let Some(db) =
         flag_value(args, "--db")
     {
         let mut store = open_store(db)?;
         let claim = store
-            .transfer_claim(
+            .transfer_claim_with_identity(
                 &card_id,
                 &run_id,
                 to_agent,
+                to_identity,
                 now,
                 ttl_seconds,
                 &authority(args),
@@ -976,12 +978,14 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
             claim.expires_at,
         )
     } else if let Some(client) = remote_env.client() {
+        let mut request =
+            json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds});
+        if let Some(identity) = to_identity {
+            request["to_identity"] = json!(identity);
+        }
         let transferred = client
-                .post(
-                    &format!("/api/v1/cards/{card_id}/transfer"),
-                    json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
-                )
-                .map_err(remote_err)?;
+            .post(&format!("/api/v1/cards/{card_id}/transfer"), request)
+            .map_err(remote_err)?;
         (
             json_string(&transferred, "card_id")?,
             json_string(&transferred, "run_id")?,

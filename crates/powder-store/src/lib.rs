@@ -1551,6 +1551,28 @@ impl Store {
         ttl_seconds: u64,
         authority: &Authority,
     ) -> Result<ClaimReceipt> {
+        self.transfer_claim_with_identity(
+            card_id,
+            run_id,
+            to_agent,
+            None,
+            now,
+            ttl_seconds,
+            authority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_claim_with_identity(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        to_agent: &str,
+        recipient_identity: Option<&str>,
+        now: i64,
+        ttl_seconds: u64,
+        authority: &Authority,
+    ) -> Result<ClaimReceipt> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1568,6 +1590,11 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
+        transaction.execute(
+            "INSERT INTO run_review_authorities(run_id, authority) VALUES (?1, ?2)
+             ON CONFLICT(run_id) DO UPDATE SET authority = excluded.authority",
+            params![run_id.as_str(), recipient_identity.unwrap_or(to_agent)],
+        )?;
         append_activity(
             &transaction,
             run_id,

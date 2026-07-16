@@ -48,6 +48,57 @@ fn authenticated_operator() -> Authority {
 }
 
 #[test]
+fn transferred_claim_rebinds_strict_review_identity() -> powder_store::Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("transfer-review")?;
+    store.import_cards(vec![card(card_id.as_str(), &["review after handoff"])])?;
+    let from = Authority::authenticated("agent-a", "actor-a", false);
+    let to = Authority::authenticated("agent-b", "actor-b", false);
+    let claim = store.claim_card(&card_id, "agent-a", 10, 100, &from)?;
+    store.transfer_claim_with_identity(
+        &card_id,
+        &claim.run_id,
+        "agent-b",
+        Some("actor-b"),
+        20,
+        100,
+        &from,
+    )?;
+    let criterion_id = criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
+    let approved = store.review_criterion(
+        &card_id,
+        review_input(
+            "transfer-review",
+            &claim.run_id,
+            0,
+            &criterion_id,
+            CriterionReviewDecision::Approved,
+            None,
+        ),
+        30,
+        &to,
+    )?;
+    assert_eq!(approved.state, OperationState::Succeeded);
+    let same_label = Authority::authenticated("agent-b", "actor-c", false);
+    let rejected = store.review_criterion(
+        &card_id,
+        review_input(
+            "transfer-review-forged",
+            &claim.run_id,
+            0,
+            &criterion_id,
+            CriterionReviewDecision::Cleared,
+            None,
+        ),
+        31,
+        &same_label,
+    );
+    assert_eq!(rejected?.state, OperationState::Rejected);
+    Ok(())
+}
+
+#[test]
 fn review_replay_rereview_clear_and_all_read_models_agree() -> powder_store::Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

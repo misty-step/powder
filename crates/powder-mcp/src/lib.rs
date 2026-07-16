@@ -952,8 +952,17 @@ fn manage_claim_store(store: &mut Store, args: &Value, now: i64) -> Result<Value
         ClaimAction::Transfer => {
             let run_id = run_id_for_claim(args, action)?;
             let to_agent = required_claim_arg(args, action, "to_agent")?;
+            let to_identity = args.get("to_identity").and_then(Value::as_str);
             json!(store
-                .transfer_claim(&card_id, &run_id, to_agent, now, ttl_seconds, &authority)
+                .transfer_claim_with_identity(
+                    &card_id,
+                    &run_id,
+                    to_agent,
+                    to_identity,
+                    now,
+                    ttl_seconds,
+                    &authority,
+                )
                 .map_err(to_string)?)
         }
     })
