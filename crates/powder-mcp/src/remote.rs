@@ -1099,6 +1099,48 @@ mod tests {
     }
 
     #[test]
+    fn run_bound_completion_posts_expected_run_path_and_recovery_identity() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-strict-completion",
+            "state": "succeeded",
+            "kind": "completion",
+            "target_card_id": "001",
+            "expected_run_id": "run-current",
+            "result": {
+                "schema_version": "powder.run_bound_completion.v1",
+                "card_id": "001",
+                "run_id": "run-current",
+                "operation_id": "op-strict-completion",
+                "status": "done"
+            }
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let completed = call_tool_remote(
+            &client,
+            "complete_card",
+            &json!({
+                "operation_id": "op-strict-completion",
+                "expected_run_id": "run-current",
+                "card_id": "001",
+                "proof": "strict proof"
+            }),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&completed)["expected_run_id"], "run-current");
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards/001/runs/run-current/complete"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-strict-completion"
+        );
+    }
+
+    #[test]
     fn list_ready_sends_get_with_limit_query() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
