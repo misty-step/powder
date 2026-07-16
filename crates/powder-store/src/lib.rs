@@ -1953,6 +1953,8 @@ fn finish_operation(
         state,
         OperationState::Succeeded | OperationState::Rejected | OperationState::Failed
     ));
+    #[cfg(test)]
+    exit_before_operation_commit_if_requested(operation_id);
     let result_json = result.as_ref().map(to_json).transpose()?;
     connection.execute(
         "UPDATE mutation_operations
@@ -1970,6 +1972,20 @@ fn finish_operation(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+const TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV: &str = "POWDER_TEST_EXIT_BEFORE_OPERATION_COMMIT";
+
+#[cfg(test)]
+const TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE: i32 = 86;
+
+#[cfg(test)]
+fn exit_before_operation_commit_if_requested(operation_id: &OperationId) {
+    if std::env::var(TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV).as_deref() == Ok(operation_id.as_str())
+    {
+        std::process::exit(TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE);
+    }
 }
 
 fn load_operation(

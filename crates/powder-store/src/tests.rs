@@ -8,8 +8,11 @@ use crate::{
     ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig,
     ImportOutcome, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
     StoreError, WorkLogAttribution, API_KEY_ALPHABET, OPERATION_RETENTION_SECONDS,
+    TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE, TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV,
     WORK_LOG_ATTRIBUTION_MAX_BYTES, WORK_LOG_BODY_MAX_BYTES,
 };
+
+const UNCOMMITTED_CRASH_DB_ENV: &str = "POWDER_TEST_UNCOMMITTED_CRASH_DB";
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -3774,6 +3777,115 @@ fn committed_completion_recovers_and_replays_after_process_restart() -> Result<(
     assert_eq!(
         committed.audit_event_id.as_deref(),
         Some(detail.events[0].id.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn uncommitted_completion_crash_child() -> Result<()> {
+    let Some(path) = std::env::var_os(UNCOMMITTED_CRASH_DB_ENV) else {
+        return Ok(());
+    };
+    let mut store = Store::open(path)?;
+    store.migrate()?;
+    let card_id = CardId::new("completion-operation-uncommitted-crash")?;
+    let operation_id = OperationId::new("op-completion-uncommitted-crash")?;
+    let authority = Authority::actor("operator", true);
+
+    let result = store.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("crash-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/crash-safe".to_string(),
+        }],
+        20,
+        &authority,
+    );
+    panic!("test-only process-exit hook did not fire: {result:?}");
+}
+
+#[test]
+fn process_exit_with_open_completion_transaction_rolls_back_and_retries_once() -> Result<()> {
+    let path = temp_db("completion-operation-uncommitted-crash");
+    let card_id = CardId::new("completion-operation-uncommitted-crash")?;
+    let operation_id = OperationId::new("op-completion-uncommitted-crash")?;
+    let authority = Authority::actor("operator", true);
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card(
+            "completion-operation-uncommitted-crash",
+            1,
+        )])?;
+    }
+
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("tests::uncommitted_completion_crash_child")
+        .arg("--nocapture")
+        .env(UNCOMMITTED_CRASH_DB_ENV, &path)
+        .env(TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV, operation_id.as_str())
+        .output()?;
+    assert_eq!(
+        child.status.code(),
+        Some(TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE),
+        "child did not exit at the uncommitted transaction barrier; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    let mut restarted = Store::open(&path)?;
+    restarted.migrate()?;
+    assert_eq!(
+        restarted
+            .operation_status(&operation_id, 21, &authority)?
+            .state,
+        OperationState::Unknown
+    );
+    let rolled_back = restarted
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(rolled_back.card.status, CardStatus::Ready);
+    assert!(rolled_back.card.criteria[0].proof_links.is_empty());
+    assert!(rolled_back.events.is_empty());
+    assert!(restarted.list_event_tail(0, 20)?.is_empty());
+
+    let committed = restarted.complete_card_idempotent(
+        operation_id.clone(),
+        &card_id,
+        Some("crash-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/crash-safe".to_string(),
+        }],
+        22,
+        &authority,
+    )?;
+    let replayed = restarted.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("crash-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/crash-safe".to_string(),
+        }],
+        23,
+        &authority,
+    )?;
+    assert_eq!(committed.state, OperationState::Succeeded);
+    assert_eq!(replayed, committed);
+    let final_detail = restarted
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(final_detail.card.status, CardStatus::Done);
+    assert_eq!(final_detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(final_detail.events.len(), 1);
+    assert_eq!(restarted.list_event_tail(0, 20)?.len(), 1);
+    assert_eq!(
+        committed.audit_event_id.as_deref(),
+        Some(final_detail.events[0].id.as_str())
     );
     Ok(())
 }
