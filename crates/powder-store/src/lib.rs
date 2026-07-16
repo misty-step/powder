@@ -3,15 +3,16 @@
 use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
-    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, AutonomyClass, Card,
-    CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId,
-    RunState, WorkLogEntry,
+    canonical_repo_label, canonical_repo_matches, criterion_identity,
+    repo_from_numeric_card_id_prefix, AcceptanceCriterion, Activity, ActivityId, ActivityType,
+    Authority, AutonomyClass, Card, CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim,
+    ClaimReceipt, Comment, CriterionProof, CriterionReview, CriterionReviewDecision, DomainError,
+    Estimate, Link, LinkId, OperationField, OperationId, OperationKind, OperationRequest,
+    OperationState, Priority, ReadyQuery, Run, RunCriterionState, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use serde::{de::DeserializeOwned, Serialize};
-use serde_json::json;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 
 mod answer_loop;
 mod events;
@@ -36,12 +37,25 @@ pub use repositories::{
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
-    MIGRATE_12_TO_13, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5,
+    MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_16_TO_17,
+    MIGRATE_17_TO_18, MIGRATE_1_TO_2, MIGRATE_2_TO_3, MIGRATE_3_TO_4, MIGRATE_4_TO_5,
     MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_8_TO_9, MIGRATE_9_TO_10,
     RUN_SELECT_SQL, SCHEMA, SCHEMA_VERSION,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+pub const OPERATION_STATUS_SCHEMA_VERSION: &str = "powder.operation_status.v1";
+pub const OPERATION_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const OPERATION_FAILURE_MESSAGE_MAX_BYTES: usize = 512;
+pub const WORK_LOG_AGENT_MAX_BYTES: usize = 256;
+pub const WORK_LOG_ATTRIBUTION_MAX_BYTES: usize = 256;
+pub const WORK_LOG_BODY_MAX_BYTES: usize = 16 * 1024;
+pub const WORK_LOG_ENTRY_SCHEMA_VERSION: &str = "powder.work_log_entry.v1";
+pub const COMPLETION_PROOF_MAX_BYTES: usize = 4 * 1024;
+pub const CRITERION_PROOF_MAX_COUNT: usize = 128;
+pub const CRITERION_PROOF_URL_MAX_BYTES: usize = 4 * 1024;
+pub const CRITERION_REVIEW_PROOF_MAX_BYTES: usize = 4 * 1024;
 
 const API_KEY_ALPHABET: [char; 64] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
@@ -71,6 +85,15 @@ pub enum StoreError {
 pub struct Store {
     connection: Connection,
     field_note_config: Option<FieldNoteConfig>,
+    #[cfg(test)]
+    run_work_log_validation_hook: Option<RunWorkLogValidationHook>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct RunWorkLogValidationHook {
+    reached: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
 }
 
 /// Config for the field-note seed generator (powder-921, content-harness
@@ -217,10 +240,20 @@ pub struct CardPatch {
     pub labels: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CriterionProofInput {
     pub criterion: usize,
     pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionReviewInput {
+    pub operation_id: OperationId,
+    pub expected_run_id: RunId,
+    pub criterion: usize,
+    pub criterion_id: String,
+    pub decision: CriterionReviewDecision,
+    pub proof: Option<String>,
 }
 
 /// The optional attribution fields `append_work_log` accepts alongside the
@@ -234,6 +267,65 @@ pub struct WorkLogAttribution<'a> {
     pub reasoning: Option<&'a str>,
     pub harness: Option<&'a str>,
     pub run_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationFailure {
+    pub code: String,
+    pub message: String,
+}
+
+/// Bounded, versioned recovery view for one mutation operation.
+///
+/// `unknown` intentionally contains no inferred mutation outcome. A missing
+/// row can mean the request never reached Powder, the transaction rolled
+/// back, or the retention window elapsed. Callers must not treat it as
+/// success or blindly retry after the retention deadline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperationStatus {
+    pub schema_version: String,
+    pub operation_id: OperationId,
+    pub state: OperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<OperationKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_card_id: Option<CardId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_run_id: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<OperationFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+impl OperationStatus {
+    fn unknown(operation_id: OperationId) -> Self {
+        Self {
+            schema_version: OPERATION_STATUS_SCHEMA_VERSION.to_string(),
+            operation_id,
+            state: OperationState::Unknown,
+            request_digest: None,
+            kind: None,
+            target_card_id: None,
+            expected_run_id: None,
+            result: None,
+            failure: None,
+            audit_event_id: None,
+            created_at: None,
+            updated_at: None,
+            expires_at: None,
+        }
+    }
 }
 
 impl Store {
@@ -255,6 +347,8 @@ impl Store {
         let store = Self {
             connection,
             field_note_config: None,
+            #[cfg(test)]
+            run_work_log_validation_hook: None,
         };
         store.connection.pragma_update(None, "foreign_keys", "ON")?;
         store.connection.pragma_update(None, "busy_timeout", 5000)?;
@@ -336,6 +430,26 @@ impl Store {
                     self.migrate_12_to_13()?;
                     13
                 }
+                13 => {
+                    self.connection.execute_batch(MIGRATE_13_TO_14)?;
+                    14
+                }
+                14 => {
+                    self.migrate_14_to_15()?;
+                    15
+                }
+                15 => {
+                    self.migrate_15_to_16()?;
+                    continue;
+                }
+                16 => {
+                    self.connection.execute_batch(MIGRATE_16_TO_17)?;
+                    17
+                }
+                17 => {
+                    self.connection.execute_batch(MIGRATE_17_TO_18)?;
+                    18
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -360,12 +474,91 @@ impl Store {
         Ok(())
     }
 
+    fn migrate_14_to_15(&mut self) -> Result<()> {
+        if !self.table_exists("work_log_entries")? {
+            return Ok(());
+        }
+        if !self.table_has_column("work_log_entries", "actor")? {
+            self.connection
+                .execute_batch("ALTER TABLE work_log_entries ADD COLUMN actor TEXT;")?;
+        }
+        if !self.table_has_column("work_log_entries", "updated_at")? {
+            self.connection
+                .execute_batch("ALTER TABLE work_log_entries ADD COLUMN updated_at INTEGER;")?;
+        }
+        self.connection.execute_batch(MIGRATE_14_TO_15)?;
+        Ok(())
+    }
+
+    fn migrate_15_to_16(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let table_sql = |name: &str| -> Result<Option<String>> {
+            Ok(transaction
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        };
+
+        // Recover databases left between statements by the former
+        // non-transactional rebuild. Restore the v14 table first, then apply
+        // the same atomic rebuild below.
+        if table_sql("mutation_operations_v15")?.is_some() {
+            if table_sql("mutation_operations")?.is_some() {
+                transaction.execute("DROP TABLE mutation_operations", [])?;
+            }
+            transaction.execute(
+                "ALTER TABLE mutation_operations_v15 RENAME TO mutation_operations",
+                [],
+            )?;
+        }
+
+        let current_sql =
+            table_sql("mutation_operations")?.ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "schema.mutation_operations",
+                value: "missing during v15 to v16 migration".to_string(),
+            })?;
+        if !current_sql.contains("criterion_review") {
+            transaction.execute_batch(MIGRATE_15_TO_16)?;
+        } else {
+            transaction.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry
+                   ON mutation_operations(expires_at, operation_id);",
+            )?;
+        }
+        transaction.execute_batch("PRAGMA user_version = 16;")?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn cards_has_column(&self, column: &str) -> Result<bool> {
-        let mut statement = self.connection.prepare("PRAGMA table_info(cards)")?;
+        self.table_has_column("cards", column)
+    }
+
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(columns.iter().any(|name| name.eq_ignore_ascii_case(column)))
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Opts this `Store` into the field-note seed generator (see
@@ -719,6 +912,126 @@ impl Store {
         Ok(card)
     }
 
+    /// Apply one authenticated, run-scoped criterion review using the shared
+    /// bounded operation ledger for replay and recovery.
+    pub fn review_criterion(
+        &mut self,
+        card_id: &CardId,
+        input: CriterionReviewInput,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        authority.require_authenticated_identity()?;
+        let criterion_id = non_empty("criterion_id", &input.criterion_id)?;
+        let proof = input
+            .proof
+            .as_deref()
+            .map(|value| non_empty("proof", value))
+            .transpose()?;
+        validate_optional_bound("proof", proof.as_deref(), CRITERION_REVIEW_PROOF_MAX_BYTES)?;
+        let criterion_index = input.criterion.to_string();
+        let request = OperationRequest::new(
+            input.operation_id,
+            OperationKind::CriterionReview,
+            card_id.clone(),
+            authority.operation_identity(),
+            Some(input.expected_run_id.clone()),
+            &[
+                OperationField {
+                    name: "criterion_index",
+                    value: Some(&criterion_index),
+                },
+                OperationField {
+                    name: "criterion_id",
+                    value: Some(&criterion_id),
+                },
+                OperationField {
+                    name: "decision",
+                    value: Some(input.decision.as_str()),
+                },
+                OperationField {
+                    name: "proof",
+                    value: proof.as_deref(),
+                },
+            ],
+        )?;
+        let stored_proof = proof.as_deref().map(secrets::scrub_secrets);
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
+        }
+        reserve_operation(&transaction, &request, now)?;
+        match review_criterion_in_transaction(
+            &transaction,
+            card_id,
+            &input.expected_run_id,
+            input.criterion,
+            &criterion_id,
+            input.decision,
+            stored_proof,
+            &request.id,
+            now,
+            authority,
+        ) {
+            Ok((review, event_id)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Succeeded,
+                    Some(json!(review)),
+                    None,
+                    Some(event_id),
+                    now,
+                )?;
+            }
+            Err(StoreError::Domain(error)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Rejected,
+                    None,
+                    Some(operation_failure(&error)),
+                    None,
+                    now,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    pub fn list_criterion_reviews(&self, card_id: &CardId) -> Result<Vec<CriterionReview>> {
+        load_criterion_reviews_for_card(&self.connection, card_id)
+    }
+
+    pub fn criterion_state_for_run(
+        &self,
+        card_id: &CardId,
+        run_id: &RunId,
+    ) -> Result<Vec<RunCriterionState>> {
+        let card = load_card(&self.connection, card_id)?;
+        let run = load_run_for_review(&self.connection, run_id)?;
+        if run.card_id != *card_id {
+            return Err(DomainError::conflict(format!(
+                "run {run_id} belongs to card {}, not {card_id}",
+                run.card_id
+            ))
+            .into());
+        }
+        project_run_criterion_state(&self.connection, &card, run_id)
+    }
+
     pub fn record_card_event(
         &mut self,
         card_id: &CardId,
@@ -1013,6 +1326,12 @@ impl Store {
             updated_at: now,
         };
         persist_run(&transaction, &run)?;
+        if let Some(identity) = authority.authenticated_identity() {
+            transaction.execute(
+                "INSERT INTO run_review_authorities (run_id, authority) VALUES (?1, ?2)",
+                params![run_id.as_str(), identity],
+            )?;
+        }
         append_activity(
             &transaction,
             &run_id,
@@ -1232,6 +1551,28 @@ impl Store {
         ttl_seconds: u64,
         authority: &Authority,
     ) -> Result<ClaimReceipt> {
+        self.transfer_claim_with_identity(
+            card_id,
+            run_id,
+            to_agent,
+            None,
+            now,
+            ttl_seconds,
+            authority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn transfer_claim_with_identity(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        to_agent: &str,
+        recipient_identity: Option<&str>,
+        now: i64,
+        ttl_seconds: u64,
+        authority: &Authority,
+    ) -> Result<ClaimReceipt> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1249,6 +1590,11 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
+        transaction.execute(
+            "INSERT INTO run_review_authorities(run_id, authority) VALUES (?1, ?2)
+             ON CONFLICT(run_id) DO UPDATE SET authority = excluded.authority",
+            params![run_id.as_str(), recipient_identity.unwrap_or(to_agent)],
+        )?;
         append_activity(
             &transaction,
             run_id,
@@ -1316,10 +1662,11 @@ impl Store {
     /// card's own state -- any authenticated caller may narrate their own
     /// work. Only `agent` is required attribution; every field on
     /// `attribution` is whatever the calling surface can supply.
-    /// `body` is scrubbed for known secret shapes before it is ever
-    /// persisted (powder-943 governance ruling: this becomes fleet-retro
-    /// synthesis input, so it gets the same scrub discipline as any other
-    /// agent-output surface, at write time rather than read time).
+    /// Every caller-controlled attribution field and `body` is scrubbed for
+    /// known secret shapes before it is ever persisted (powder-943 governance
+    /// ruling: this becomes fleet-retro synthesis input, so it gets the same
+    /// scrub discipline as any other agent-output surface, at write time
+    /// rather than read time).
     pub fn append_work_log(
         &mut self,
         card_id: &CardId,
@@ -1331,49 +1678,261 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let card = load_card(&transaction, card_id)?;
-        let run_id = attribution.run_id.map(RunId::new).transpose()?;
-        let entry = WorkLogEntry {
-            card_id: card_id.clone(),
-            agent: non_empty("agent", agent)?,
-            model: attribution.model.map(str::to_owned),
-            reasoning: attribution.reasoning.map(str::to_owned),
-            harness: attribution.harness.map(str::to_owned),
-            run_id,
-            body: secrets::scrub_secrets(&non_empty("body", body)?),
-            created_at: now,
-        };
-        let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
-        transaction.execute(
-            "INSERT INTO work_log_entries
-             (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                entry.card_id.as_str(),
-                entry.agent,
-                entry.model,
-                entry.reasoning,
-                entry.harness,
-                entry.run_id.as_ref().map(RunId::as_str),
-                entry.body,
-                entry.created_at,
-            ],
-        )?;
-        events::append_outbound_card_event(
+        let (entry, _) = append_work_log_in_transaction(
             &transaction,
-            &card,
-            "work-log-appended",
-            &entry.agent,
-            json!({
-                "agent": entry.agent.as_str(),
-                "model": entry.model,
-                "harness": entry.harness,
-            }),
+            card_id,
+            agent,
+            agent,
+            attribution,
+            body,
             now,
         )?;
         transaction.commit()?;
         Ok(entry)
+    }
+
+    /// Retry-safe work-log append using one durable operation identity.
+    ///
+    /// This is the generic P2 substrate. It deliberately does not enforce
+    /// that `run_id` is the card's current run. P3 owns that stricter rule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_work_log_idempotent(
+        &mut self,
+        operation_id: OperationId,
+        card_id: &CardId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        validate_bounded_non_empty("agent", agent, WORK_LOG_AGENT_MAX_BYTES)?;
+        validate_optional_bound("model", attribution.model, WORK_LOG_ATTRIBUTION_MAX_BYTES)?;
+        validate_optional_bound(
+            "reasoning",
+            attribution.reasoning,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        validate_optional_bound(
+            "harness",
+            attribution.harness,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        validate_optional_bound("run_id", attribution.run_id, WORK_LOG_ATTRIBUTION_MAX_BYTES)?;
+        validate_bounded_non_empty("body", body, WORK_LOG_BODY_MAX_BYTES)?;
+        let expected_run = attribution.run_id.map(RunId::new).transpose()?;
+        let recorded_expected_run = attribution
+            .run_id
+            .map(secrets::scrub_secrets)
+            .map(RunId::new)
+            .transpose()?;
+        let request = OperationRequest::new_with_recorded_expected_run(
+            operation_id,
+            OperationKind::WorkLogAppend,
+            card_id.clone(),
+            authority.operation_identity(),
+            expected_run,
+            recorded_expected_run,
+            &[
+                OperationField {
+                    name: "agent",
+                    value: Some(agent),
+                },
+                OperationField {
+                    name: "model",
+                    value: attribution.model,
+                },
+                OperationField {
+                    name: "reasoning",
+                    value: attribution.reasoning,
+                },
+                OperationField {
+                    name: "harness",
+                    value: attribution.harness,
+                },
+                OperationField {
+                    name: "body",
+                    value: Some(body),
+                },
+            ],
+        )?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
+        }
+        reserve_operation(&transaction, &request, now)?;
+        match append_work_log_in_transaction(
+            &transaction,
+            card_id,
+            agent,
+            agent,
+            attribution,
+            body,
+            now,
+        ) {
+            Ok((entry, event_id)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Succeeded,
+                    Some(json!(entry)),
+                    None,
+                    Some(event_id),
+                    now,
+                )?;
+            }
+            Err(StoreError::Domain(error)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Rejected,
+                    None,
+                    Some(operation_failure(&error)),
+                    None,
+                    now,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Append one retry-safe work-log record only when `expected_run_id` is
+    /// still the card's live claim at the transaction boundary.
+    ///
+    /// This is the strict agent path. The permissive `append_work_log` path
+    /// remains available for explicit operator corrections and unbound notes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_run_work_log_idempotent(
+        &mut self,
+        operation_id: OperationId,
+        card_id: &CardId,
+        expected_run_id: &RunId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        validate_bounded_non_empty("agent", agent, WORK_LOG_AGENT_MAX_BYTES)?;
+        validate_optional_bound("model", attribution.model, WORK_LOG_ATTRIBUTION_MAX_BYTES)?;
+        validate_optional_bound(
+            "reasoning",
+            attribution.reasoning,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        validate_optional_bound(
+            "harness",
+            attribution.harness,
+            WORK_LOG_ATTRIBUTION_MAX_BYTES,
+        )?;
+        if attribution.run_id.is_some() {
+            return Err(DomainError::validation(
+                "run_id",
+                "strict append accepts expected_run_id as the only run attribution",
+            )
+            .into());
+        }
+        validate_bounded_non_empty("body", body, WORK_LOG_BODY_MAX_BYTES)?;
+        let actor = strict_actor_label(authority)?;
+        let request = OperationRequest::new(
+            operation_id,
+            OperationKind::WorkLogAppend,
+            card_id.clone(),
+            authority.operation_identity(),
+            Some(expected_run_id.clone()),
+            &[
+                OperationField {
+                    name: "agent",
+                    value: Some(agent),
+                },
+                OperationField {
+                    name: "model",
+                    value: attribution.model,
+                },
+                OperationField {
+                    name: "reasoning",
+                    value: attribution.reasoning,
+                },
+                OperationField {
+                    name: "harness",
+                    value: attribution.harness,
+                },
+                OperationField {
+                    name: "body",
+                    value: Some(body),
+                },
+            ],
+        )?;
+
+        #[cfg(test)]
+        if let Some(hook) = &self.run_work_log_validation_hook {
+            hook.reached.wait();
+            hook.resume.wait();
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
+        }
+        reserve_operation(&transaction, &request, now)?;
+        let strict_attribution = WorkLogAttribution {
+            run_id: Some(expected_run_id.as_str()),
+            ..attribution
+        };
+        match append_current_run_work_log_in_transaction(
+            &transaction,
+            card_id,
+            expected_run_id,
+            &actor,
+            agent,
+            strict_attribution,
+            body,
+            now,
+            authority,
+        ) {
+            Ok((entry, event_id)) => finish_operation(
+                &transaction,
+                &request.id,
+                OperationState::Succeeded,
+                Some(json!(entry)),
+                None,
+                Some(event_id),
+                now,
+            )?,
+            Err(StoreError::Domain(error)) => finish_operation(
+                &transaction,
+                &request.id,
+                OperationState::Rejected,
+                None,
+                Some(operation_failure(&error)),
+                None,
+                now,
+            )?,
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
     }
 
     pub fn request_input(
@@ -1436,77 +1995,919 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
-        let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (card, _) = complete_card_in_transaction(
+            &transaction,
+            card_id,
+            proof,
+            criterion_proofs,
+            now,
+            authority,
+            self.field_note_config.as_ref(),
+        )?;
+        transaction.commit()?;
+        Ok(card)
+    }
+
+    /// Retry-safe permissive completion using the shared P2 operation
+    /// substrate. This preserves Powder's explicit operator correction path
+    /// and does not add P1's expected-current-run precondition.
+    pub fn complete_card_idempotent(
+        &mut self,
+        operation_id: OperationId,
+        card_id: &CardId,
+        proof: Option<&str>,
+        criterion_proofs: Vec<CriterionProofInput>,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        validate_optional_bound("proof", proof, COMPLETION_PROOF_MAX_BYTES)?;
+        if criterion_proofs.len() > CRITERION_PROOF_MAX_COUNT {
+            return Err(DomainError::validation(
+                "criterion_proofs",
+                format!("must contain at most {CRITERION_PROOF_MAX_COUNT} items"),
+            )
+            .into());
+        }
+        for criterion_proof in &criterion_proofs {
+            validate_bounded_non_empty(
+                "criterion proof url",
+                &criterion_proof.url,
+                CRITERION_PROOF_URL_MAX_BYTES,
+            )?;
+        }
         let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+        let criterion_payload = to_json(&criterion_proofs)?;
+        let request = OperationRequest::new(
+            operation_id,
+            OperationKind::Completion,
+            card_id.clone(),
+            authority.operation_identity(),
+            None,
+            &[
+                OperationField {
+                    name: "proof",
+                    value: proof,
+                },
+                OperationField {
+                    name: "criterion_proofs",
+                    value: Some(&criterion_payload),
+                },
+            ],
+        )?;
         let field_note_config = self.field_note_config.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-
-        let previous = card.status;
-        let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
-
-        card.status = CardStatus::Done;
-        card.claim = None;
-        for criterion_proof in criterion_proofs {
-            let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
-            criterion.proof_links.push(CriterionProof {
-                url: criterion_proof.url,
-                actor: authority.actor_label(),
-                created_at: now,
-            });
+        prune_expired_operations(&transaction, now)?;
+        if let Some(existing) = load_operation(&transaction, &request.id)? {
+            return replay_operation(existing, &request);
         }
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        if let Some(run_id) = run_id {
-            close_run_for_status(
-                &transaction,
-                &run_id,
-                CardStatus::Done,
-                now,
-                proof.as_deref(),
-            )?;
-            append_activity(
-                &transaction,
-                &run_id,
-                ActivityType::Response,
-                proof
-                    .as_deref()
-                    .map(|proof| format!("completed: {proof}"))
-                    .unwrap_or_else(|| "completed without proof".to_string())
-                    .as_str(),
-                now,
-            )?;
-        }
-        append_card_event(
+        reserve_operation(&transaction, &request, now)?;
+        match complete_card_in_transaction(
             &transaction,
             card_id,
-            "status",
-            &authority.actor_label(),
-            &format!("{} -> done", previous.as_str()),
+            proof,
+            criterion_proofs,
+            now,
+            authority,
+            field_note_config.as_ref(),
+        ) {
+            Ok((card, event_id)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Succeeded,
+                    Some(json!({
+                        "card_id": card.id,
+                        "status": card.status,
+                        "updated_at": card.updated_at,
+                    })),
+                    None,
+                    Some(event_id),
+                    now,
+                )?;
+            }
+            Err(StoreError::Domain(error)) => {
+                finish_operation(
+                    &transaction,
+                    &request.id,
+                    OperationState::Rejected,
+                    None,
+                    Some(operation_failure(&error)),
+                    None,
+                    now,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        let status = load_operation(&transaction, &request.id)?
+            .ok_or_else(|| StoreError::InvalidStoredValue {
+                field: "operation_id",
+                value: request.id.to_string(),
+            })?
+            .into_status()?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Read one bounded operation outcome after pruning expired recovery
+    /// records. Unknown is returned as data rather than a 404 so callers can
+    /// distinguish an absent operation from transport failure.
+    pub fn operation_status(
+        &mut self,
+        operation_id: &OperationId,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<OperationStatus> {
+        prune_expired_operations(&self.connection, now)?;
+        let Some(operation) = load_operation(&self.connection, operation_id)? else {
+            return Ok(OperationStatus::unknown(operation_id.clone()));
+        };
+        authority.require_operation_authority(&operation.authority)?;
+        operation.into_status()
+    }
+
+    pub fn prune_operations(&mut self, now: i64) -> Result<usize> {
+        prune_expired_operations(&self.connection, now)
+    }
+}
+
+fn append_work_log_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    actor: &str,
+    agent: &str,
+    attribution: WorkLogAttribution<'_>,
+    body: &str,
+    now: i64,
+) -> Result<(WorkLogEntry, String)> {
+    let card = load_card(transaction, card_id)?;
+    let scrubbed_optional = |value: Option<&str>| value.map(secrets::scrub_secrets);
+    let run_id = scrubbed_optional(attribution.run_id)
+        .map(RunId::new)
+        .transpose()?;
+    let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+    let entry = WorkLogEntry {
+        schema_version: WORK_LOG_ENTRY_SCHEMA_VERSION.to_string(),
+        id: id.clone(),
+        card_id: card_id.clone(),
+        actor: secrets::scrub_secrets(&non_empty("actor", actor)?),
+        agent: secrets::scrub_secrets(&non_empty("agent", agent)?),
+        model: scrubbed_optional(attribution.model),
+        reasoning: scrubbed_optional(attribution.reasoning),
+        harness: scrubbed_optional(attribution.harness),
+        run_id,
+        body: secrets::scrub_secrets(&non_empty("body", body)?),
+        created_at: now,
+        updated_at: now,
+    };
+    transaction.execute(
+        "INSERT INTO work_log_entries
+         (id, card_id, actor, agent, model, reasoning, harness, run_id, body, created_at,
+          updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            entry.id,
+            entry.card_id.as_str(),
+            entry.actor,
+            entry.agent,
+            entry.model,
+            entry.reasoning,
+            entry.harness,
+            entry.run_id.as_ref().map(RunId::as_str),
+            entry.body,
+            entry.created_at,
+            entry.updated_at,
+        ],
+    )?;
+    let audit_event = append_card_event(
+        transaction,
+        card_id,
+        "work_log",
+        &entry.actor,
+        &to_json(&json!({
+            "schema_version": WORK_LOG_ENTRY_SCHEMA_VERSION,
+            "entry_id": entry.id,
+            "run_id": entry.run_id,
+            "agent": entry.agent,
+            "model": entry.model,
+            "reasoning": entry.reasoning,
+            "harness": entry.harness,
+        }))?,
+        now,
+    )?;
+    events::append_outbound_card_event(
+        transaction,
+        &card,
+        "work-log-appended",
+        &entry.actor,
+        json!({"work_log": entry}),
+        now,
+    )?;
+    Ok((entry, audit_event.id.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_current_run_work_log_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    expected_run_id: &RunId,
+    actor: &str,
+    agent: &str,
+    attribution: WorkLogAttribution<'_>,
+    body: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<(WorkLogEntry, String)> {
+    let card = load_card(transaction, card_id)?;
+    let run = transaction
+        .query_row(
+            RUN_SELECT_SQL,
+            [expected_run_id.as_str()],
+            RunRecord::from_row,
+        )
+        .optional()?
+        .ok_or_else(|| DomainError::not_found("run", expected_run_id.to_string()))?
+        .into_run()?;
+    if run.card_id != *card_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} belongs to card {}, not {card_id}",
+            run.card_id
+        ))
+        .into());
+    }
+    card.current_claim_for_run_agent(expected_run_id, agent, now)?;
+    if run.claim_expires_at <= now {
+        return Err(
+            DomainError::claim_expired(format!("run {expected_run_id} claim expired")).into(),
+        );
+    }
+    if !matches!(run.state, RunState::Active | RunState::AwaitingInput) {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} is {}",
+            run.state.as_str()
+        ))
+        .into());
+    }
+    if run.agent != agent {
+        return Err(DomainError::forbidden(format!(
+            "agent {agent} does not own run {expected_run_id}"
+        ))
+        .into());
+    }
+    authority.require_identity(agent)?;
+    authority.require_holder(card.claim_holder())?;
+    append_work_log_in_transaction(transaction, card_id, actor, agent, attribution, body, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_card_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    proof: Option<&str>,
+    criterion_proofs: Vec<CriterionProofInput>,
+    now: i64,
+    authority: &Authority,
+    field_note_config: Option<&FieldNoteConfig>,
+) -> Result<(Card, String)> {
+    let proof = proof.map(|value| non_empty("proof", value)).transpose()?;
+    let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+    let mut card = load_card(transaction, card_id)?;
+    let previous = card.status;
+    let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
+
+    card.status = CardStatus::Done;
+    card.claim = None;
+    for criterion_proof in criterion_proofs {
+        let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
+        criterion.proof_links.push(CriterionProof {
+            url: criterion_proof.url,
+            actor: authority.actor_label(),
+            created_at: now,
+        });
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    if let Some(run_id) = run_id {
+        close_run_for_status(
+            transaction,
+            &run_id,
+            CardStatus::Done,
+            now,
+            proof.as_deref(),
+        )?;
+        append_activity(
+            transaction,
+            &run_id,
+            ActivityType::Response,
+            proof
+                .as_deref()
+                .map(|proof| format!("completed: {proof}"))
+                .unwrap_or_else(|| "completed without proof".to_string())
+                .as_str(),
             now,
         )?;
-        if !previous.is_terminal() {
-            events::append_outbound_card_event(
-                &transaction,
-                &card,
-                "completed",
-                &authority.actor_label(),
-                json!({
-                    "previous_status": previous.as_str(),
-                    "status": card.status.as_str(),
-                    "proof": proof,
-                    "criteria": card.criteria
-                }),
-                now,
-            )?;
-            if let Some(config) = &field_note_config {
-                maybe_spawn_field_note_draft(&transaction, &card, proof.as_deref(), config, now)?;
-            }
+    }
+    let audit_event = append_card_event(
+        transaction,
+        card_id,
+        "status",
+        &authority.actor_label(),
+        &format!("{} -> done", previous.as_str()),
+        now,
+    )?;
+    if !previous.is_terminal() {
+        events::append_outbound_card_event(
+            transaction,
+            &card,
+            "completed",
+            &authority.actor_label(),
+            json!({
+                "previous_status": previous.as_str(),
+                "status": card.status.as_str(),
+                "proof": proof,
+                "criteria": card.criteria
+            }),
+            now,
+        )?;
+        if let Some(config) = field_note_config {
+            maybe_spawn_field_note_draft(transaction, &card, proof.as_deref(), config, now)?;
         }
-        transaction.commit()?;
-        Ok(card)
+    }
+    Ok((card, audit_event.id.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_criterion_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    card_id: &CardId,
+    expected_run_id: &RunId,
+    criterion_index: usize,
+    expected_criterion_id: &str,
+    decision: CriterionReviewDecision,
+    proof: Option<String>,
+    operation_id: &OperationId,
+    now: i64,
+    authority: &Authority,
+) -> Result<(CriterionReview, String)> {
+    let card = load_card(transaction, card_id)?;
+    let run = load_run_for_review(transaction, expected_run_id)?;
+    if run.card_id != *card_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} belongs to card {}, not {card_id}",
+            run.card_id
+        ))
+        .into());
+    }
+    let claim = card
+        .claim
+        .as_ref()
+        .ok_or_else(|| DomainError::conflict(format!("card {card_id} has no current run")))?;
+    if claim.run_id != *expected_run_id {
+        return Err(DomainError::conflict(format!(
+            "run {expected_run_id} is not current for card {card_id}"
+        ))
+        .into());
+    }
+    if claim.is_expired(now) {
+        return Err(DomainError::claim_expired(format!(
+            "run {expected_run_id} claim expired at {}",
+            claim.expires_at
+        ))
+        .into());
+    }
+    if !matches!(run.state, RunState::Active | RunState::AwaitingInput) {
+        return Err(DomainError::conflict(format!("run {expected_run_id} is not active")).into());
+    }
+    authority.require_holder(Some(&claim.agent))?;
+    let reviewer_identity = authority.require_authenticated_identity()?;
+    if !authority.is_admin() {
+        let claim_authority = transaction
+            .query_row(
+                "SELECT authority FROM run_review_authorities WHERE run_id = ?1",
+                [expected_run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if claim_authority.as_deref() != Some(reviewer_identity) {
+            return Err(DomainError::forbidden(
+                "authenticated reviewer does not own the current run",
+            )
+            .into());
+        }
+    }
+    if criterion_index > u32::MAX as usize {
+        return Err(DomainError::validation(
+            "criterion",
+            "criterion index must fit an unsigned 32-bit integer",
+        )
+        .into());
+    }
+    let criterion = card.criteria.get(criterion_index).ok_or_else(|| {
+        DomainError::validation(
+            "criterion",
+            format!("criterion index {criterion_index} not found"),
+        )
+    })?;
+    let current_criterion_id = criterion_identity(&card.criteria, criterion_index)
+        .expect("criterion index was checked above");
+    if current_criterion_id != expected_criterion_id {
+        return Err(DomainError::conflict(format!(
+            "criterion identity mismatch at index {criterion_index}"
+        ))
+        .into());
+    }
+
+    let supersedes_review_id =
+        latest_criterion_review(transaction, expected_run_id, &current_criterion_id)?
+            .map(|review| review.id);
+    let review = CriterionReview {
+        id: format!("review-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)),
+        operation_id: operation_id.clone(),
+        card_id: card_id.clone(),
+        run_id: expected_run_id.clone(),
+        criterion_index,
+        criterion_id: current_criterion_id,
+        criterion_text: criterion.text.clone(),
+        decision,
+        reviewer: authority.actor_label(),
+        reviewer_identity: reviewer_identity.to_string(),
+        proof,
+        supersedes_review_id,
+        created_at: now,
+    };
+    transaction.execute(
+        "INSERT INTO criterion_reviews (
+           id, operation_id, card_id, run_id, criterion_index, criterion_id,
+           criterion_text, decision, reviewer, reviewer_identity, proof,
+           supersedes_review_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            review.id,
+            review.operation_id.as_str(),
+            review.card_id.as_str(),
+            review.run_id.as_str(),
+            review.criterion_index as i64,
+            review.criterion_id,
+            review.criterion_text,
+            review.decision.as_str(),
+            review.reviewer,
+            review.reviewer_identity,
+            review.proof,
+            review.supersedes_review_id,
+            review.created_at,
+        ],
+    )?;
+    let event = append_card_event(
+        transaction,
+        card_id,
+        "criterion-review",
+        &review.reviewer,
+        &to_json(&review)?,
+        now,
+    )?;
+    Ok((review, event.id.to_string()))
+}
+
+fn load_run_for_review(connection: &Connection, run_id: &RunId) -> Result<Run> {
+    connection
+        .query_row(RUN_SELECT_SQL, [run_id.as_str()], RunRecord::from_row)
+        .optional()?
+        .ok_or_else(|| DomainError::not_found("run", run_id.to_string()).into())
+        .and_then(RunRecord::into_run)
+}
+
+struct CriterionReviewRecord {
+    id: String,
+    operation_id: String,
+    card_id: String,
+    run_id: String,
+    criterion_index: i64,
+    criterion_id: String,
+    criterion_text: String,
+    decision: String,
+    reviewer: String,
+    reviewer_identity: String,
+    proof: Option<String>,
+    supersedes_review_id: Option<String>,
+    created_at: i64,
+}
+
+impl CriterionReviewRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            operation_id: row.get(1)?,
+            card_id: row.get(2)?,
+            run_id: row.get(3)?,
+            criterion_index: row.get(4)?,
+            criterion_id: row.get(5)?,
+            criterion_text: row.get(6)?,
+            decision: row.get(7)?,
+            reviewer: row.get(8)?,
+            reviewer_identity: row.get(9)?,
+            proof: row.get(10)?,
+            supersedes_review_id: row.get(11)?,
+            created_at: row.get(12)?,
+        })
+    }
+
+    fn into_review(self) -> Result<CriterionReview> {
+        let criterion_index =
+            usize::try_from(self.criterion_index).map_err(|_| StoreError::InvalidStoredValue {
+                field: "criterion_reviews.criterion_index",
+                value: self.criterion_index.to_string(),
+            })?;
+        let decision = CriterionReviewDecision::parse(&self.decision).ok_or_else(|| {
+            StoreError::InvalidStoredValue {
+                field: "criterion_reviews.decision",
+                value: self.decision,
+            }
+        })?;
+        Ok(CriterionReview {
+            id: self.id,
+            operation_id: OperationId::new(self.operation_id)?,
+            card_id: CardId::new(self.card_id)?,
+            run_id: RunId::new(self.run_id)?,
+            criterion_index,
+            criterion_id: self.criterion_id,
+            criterion_text: self.criterion_text,
+            decision,
+            reviewer: self.reviewer,
+            reviewer_identity: self.reviewer_identity,
+            proof: self.proof,
+            supersedes_review_id: self.supersedes_review_id,
+            created_at: self.created_at,
+        })
+    }
+}
+
+fn query_criterion_reviews(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<CriterionReview>> {
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement
+        .query_map(parameters, CriterionReviewRecord::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(CriterionReviewRecord::into_review)
+        .collect()
+}
+
+const CRITERION_REVIEW_COLUMNS: &str = "id, operation_id, card_id, run_id, criterion_index,
+criterion_id, criterion_text, decision, reviewer, reviewer_identity, proof,
+supersedes_review_id, created_at";
+
+fn load_criterion_reviews_for_card(
+    connection: &Connection,
+    card_id: &CardId,
+) -> Result<Vec<CriterionReview>> {
+    query_criterion_reviews(
+        connection,
+        &format!(
+            "SELECT {CRITERION_REVIEW_COLUMNS} FROM criterion_reviews
+             WHERE card_id = ?1 ORDER BY sequence ASC"
+        ),
+        &[&card_id.as_str()],
+    )
+}
+
+fn load_criterion_reviews_for_run(
+    connection: &Connection,
+    run_id: &RunId,
+) -> Result<Vec<CriterionReview>> {
+    query_criterion_reviews(
+        connection,
+        &format!(
+            "SELECT {CRITERION_REVIEW_COLUMNS} FROM criterion_reviews
+             WHERE run_id = ?1 ORDER BY sequence ASC"
+        ),
+        &[&run_id.as_str()],
+    )
+}
+
+fn latest_criterion_review(
+    connection: &Connection,
+    run_id: &RunId,
+    criterion_id: &str,
+) -> Result<Option<CriterionReview>> {
+    Ok(query_criterion_reviews(
+        connection,
+        &format!(
+            "SELECT {CRITERION_REVIEW_COLUMNS} FROM criterion_reviews
+             WHERE run_id = ?1 AND criterion_id = ?2
+             ORDER BY sequence DESC LIMIT 1"
+        ),
+        &[&run_id.as_str(), &criterion_id],
+    )?
+    .into_iter()
+    .next())
+}
+
+fn project_run_criterion_state(
+    connection: &Connection,
+    card: &Card,
+    run_id: &RunId,
+) -> Result<Vec<RunCriterionState>> {
+    let latest = load_criterion_reviews_for_run(connection, run_id)?
+        .into_iter()
+        .filter(|review| review.reviewer_identity != "legacy:unverified")
+        .fold(HashMap::new(), |mut by_identity, review| {
+            by_identity.insert(review.criterion_id.clone(), review);
+            by_identity
+        });
+    card.criteria
+        .iter()
+        .enumerate()
+        .map(|(criterion_index, criterion)| {
+            let criterion_id = criterion_identity(&card.criteria, criterion_index)
+                .expect("enumerated criterion must have an identity");
+            Ok(RunCriterionState {
+                criterion_index,
+                review: latest.get(&criterion_id).cloned(),
+                criterion_id,
+                criterion_text: criterion.text.clone(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct StoredOperation {
+    operation_id: OperationId,
+    request_digest: String,
+    kind: OperationKind,
+    target_card_id: CardId,
+    authority: String,
+    expected_run_id: Option<RunId>,
+    state: OperationState,
+    result_json: Option<String>,
+    failure_code: Option<String>,
+    failure_message: Option<String>,
+    audit_event_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    expires_at: i64,
+}
+
+impl StoredOperation {
+    fn into_status(self) -> Result<OperationStatus> {
+        let result = self
+            .result_json
+            .as_deref()
+            .map(|raw| from_json::<Value>("operation.result_json", raw.to_string()))
+            .transpose()?;
+        let failure = match (self.failure_code, self.failure_message) {
+            (Some(code), Some(message)) => Some(OperationFailure { code, message }),
+            (None, None) => None,
+            (code, message) => {
+                return Err(StoreError::InvalidStoredValue {
+                    field: "operation_failure",
+                    value: format!("code={code:?}, message={message:?}"),
+                });
+            }
+        };
+        Ok(OperationStatus {
+            schema_version: OPERATION_STATUS_SCHEMA_VERSION.to_string(),
+            operation_id: self.operation_id,
+            state: self.state,
+            request_digest: Some(self.request_digest),
+            kind: Some(self.kind),
+            target_card_id: Some(self.target_card_id),
+            expected_run_id: self.expected_run_id,
+            result,
+            failure,
+            audit_event_id: self.audit_event_id,
+            created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
+            expires_at: Some(self.expires_at),
+        })
+    }
+}
+
+fn reserve_operation(connection: &Connection, request: &OperationRequest, now: i64) -> Result<()> {
+    connection.execute(
+        "INSERT INTO mutation_operations (
+           operation_id, request_digest, kind, target_card_id, authority,
+           expected_run_id, state, result_json, failure_code, failure_message,
+           audit_event_id, created_at, updated_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, NULL, NULL, NULL, ?7, ?7, ?8)",
+        params![
+            request.id.as_str(),
+            request.request_digest,
+            request.kind.as_str(),
+            request.target.as_str(),
+            request.authority,
+            request.expected_run.as_ref().map(RunId::as_str),
+            now,
+            now.saturating_add(OPERATION_RETENTION_SECONDS),
+        ],
+    )?;
+    Ok(())
+}
+
+fn finish_operation(
+    connection: &Connection,
+    operation_id: &OperationId,
+    state: OperationState,
+    result: Option<Value>,
+    failure: Option<OperationFailure>,
+    audit_event_id: Option<String>,
+    now: i64,
+) -> Result<()> {
+    debug_assert!(matches!(
+        state,
+        OperationState::Succeeded | OperationState::Rejected | OperationState::Failed
+    ));
+    #[cfg(test)]
+    exit_before_operation_commit_if_requested(operation_id);
+    let result_json = result.as_ref().map(to_json).transpose()?;
+    connection.execute(
+        "UPDATE mutation_operations
+         SET state = ?2, result_json = ?3, failure_code = ?4,
+             failure_message = ?5, audit_event_id = ?6, updated_at = ?7
+         WHERE operation_id = ?1 AND state = 'pending'",
+        params![
+            operation_id.as_str(),
+            state.as_str(),
+            result_json,
+            failure.as_ref().map(|failure| failure.code.as_str()),
+            failure.as_ref().map(|failure| failure.message.as_str()),
+            audit_event_id,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+const TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV: &str = "POWDER_TEST_EXIT_BEFORE_OPERATION_COMMIT";
+
+#[cfg(test)]
+const TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE: i32 = 86;
+
+#[cfg(test)]
+fn exit_before_operation_commit_if_requested(operation_id: &OperationId) {
+    if std::env::var(TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV).as_deref() == Ok(operation_id.as_str())
+    {
+        std::process::exit(TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE);
+    }
+}
+
+fn load_operation(
+    connection: &Connection,
+    operation_id: &OperationId,
+) -> Result<Option<StoredOperation>> {
+    connection
+        .query_row(
+            "SELECT operation_id, request_digest, kind, target_card_id, authority,
+                    expected_run_id, state, result_json, failure_code, failure_message,
+                    audit_event_id, created_at, updated_at, expires_at
+             FROM mutation_operations WHERE operation_id = ?1",
+            [operation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                operation_id,
+                request_digest,
+                kind,
+                target_card_id,
+                authority,
+                expected_run_id,
+                state,
+                result_json,
+                failure_code,
+                failure_message,
+                audit_event_id,
+                created_at,
+                updated_at,
+                expires_at,
+            )| {
+                Ok(StoredOperation {
+                    operation_id: OperationId::new(operation_id)?,
+                    request_digest,
+                    kind: OperationKind::parse(&kind).ok_or_else(|| {
+                        StoreError::InvalidStoredValue {
+                            field: "operation.kind",
+                            value: kind,
+                        }
+                    })?,
+                    target_card_id: CardId::new(target_card_id)?,
+                    authority,
+                    expected_run_id: expected_run_id.map(RunId::new).transpose()?,
+                    state: OperationState::parse(&state).ok_or_else(|| {
+                        StoreError::InvalidStoredValue {
+                            field: "operation.state",
+                            value: state,
+                        }
+                    })?,
+                    result_json,
+                    failure_code,
+                    failure_message,
+                    audit_event_id,
+                    created_at,
+                    updated_at,
+                    expires_at,
+                })
+            },
+        )
+        .transpose()
+}
+
+fn replay_operation(
+    existing: StoredOperation,
+    request: &OperationRequest,
+) -> Result<OperationStatus> {
+    if existing.request_digest != request.request_digest {
+        return Err(DomainError::conflict(format!(
+            "operation id {} was already used for a different request",
+            request.id
+        ))
+        .into());
+    }
+    existing.into_status()
+}
+
+fn prune_expired_operations(connection: &Connection, now: i64) -> Result<usize> {
+    Ok(connection.execute(
+        "DELETE FROM mutation_operations WHERE expires_at <= ?1",
+        [now],
+    )?)
+}
+
+fn operation_failure(error: &DomainError) -> OperationFailure {
+    let code = match error {
+        DomainError::Validation { .. } => "validation",
+        DomainError::NotFound { .. } => "not_found",
+        DomainError::Conflict(_) => "conflict",
+        DomainError::Forbidden(_) => "forbidden",
+        DomainError::ClaimExpired(_) => "claim_expired",
+    };
+    OperationFailure {
+        code: code.to_string(),
+        message: truncate_utf8(&error.to_string(), OPERATION_FAILURE_MESSAGE_MAX_BYTES),
+    }
+}
+
+fn truncate_utf8(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_string();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn validate_bounded_non_empty(field: &'static str, value: &str, maximum: usize) -> Result<()> {
+    non_empty(field, value)?;
+    if value.len() > maximum {
+        return Err(
+            DomainError::validation(field, format!("must be at most {maximum} bytes")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_optional_bound(field: &'static str, value: Option<&str>, maximum: usize) -> Result<()> {
+    if let Some(value) = value {
+        validate_bounded_non_empty(field, value, maximum)?;
+    }
+    Ok(())
+}
+
+fn strict_actor_label(authority: &Authority) -> Result<String> {
+    match authority {
+        Authority::Unchecked => Err(DomainError::forbidden(
+            "strict run-bound work-log append requires an authenticated or explicit actor",
+        )
+        .into()),
+        Authority::Actor { .. } => Ok(authority.actor_label()),
     }
 }
 

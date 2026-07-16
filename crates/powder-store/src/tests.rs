@@ -1,13 +1,18 @@
 use powder_core::{
-    AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource, CardStatus,
-    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
+    criterion_identity, AcceptanceCriterion, Authority, AutonomyClass, Card, CardId, CardSource,
+    CardStatus, CriterionReviewDecision, DetailLevel, DomainError, Estimate, OperationId,
+    OperationState, Priority, ReadyQuery, RunId, RunState,
 };
 
 use crate::{
-    ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
-    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError,
-    WorkLogAttribution, API_KEY_ALPHABET,
+    ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, CriterionReviewInput,
+    FieldNoteConfig, ImportOutcome, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result,
+    Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET, OPERATION_RETENTION_SECONDS,
+    TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE, TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV,
+    WORK_LOG_ATTRIBUTION_MAX_BYTES, WORK_LOG_BODY_MAX_BYTES,
 };
+
+const UNCOMMITTED_CRASH_DB_ENV: &str = "POWDER_TEST_UNCOMMITTED_CRASH_DB";
 
 fn temp_db(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -185,6 +190,464 @@ fn migration_11_to_12_tolerates_half_applied_autonomy_column() -> Result<()> {
     store.migrate()?;
 
     assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    Ok(())
+}
+
+#[test]
+fn migration_13_to_14_adds_the_bounded_operation_ledger_without_data_loss() -> Result<()> {
+    let path = temp_db("v13-operation-ledger");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("pre-operation-migration", 10)])?;
+        store.connection.execute_batch(
+            "DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             DROP TABLE mutation_operations;
+             PRAGMA user_version = 13;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    assert!(store
+        .get_card(&CardId::new("pre-operation-migration")?)?
+        .is_some());
+    let table_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mutation_operations'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(table_sql.contains("work_log_append"));
+    assert!(table_sql.contains("succeeded"));
+    assert!(table_sql.contains("rejected"));
+    assert!(table_sql.contains("failed"));
+    let expiry_index: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_mutation_operations_expiry'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(expiry_index, 1);
+    Ok(())
+}
+
+#[test]
+fn migration_14_to_15_backfills_authoritative_work_log_identity_without_data_loss() -> Result<()> {
+    let path = temp_db("v14-work-log-identity");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("pre-work-log-identity", 1)])?;
+        store.connection.execute(
+            "INSERT INTO work_log_entries
+             (id, card_id, actor, agent, run_id, body, created_at, updated_at)
+             VALUES ('work-log-old', 'pre-work-log-identity', 'agent-a', 'agent-a', NULL,
+                     'old body', 10, 10)",
+            [],
+        )?;
+        store.connection.execute_batch(
+            "CREATE TABLE work_log_entries_old AS
+             SELECT id, card_id, agent, model, reasoning, harness, run_id, body, created_at
+             FROM work_log_entries;
+             DROP TABLE work_log_entries;
+             ALTER TABLE work_log_entries_old RENAME TO work_log_entries;
+             DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 14;",
+        )?;
+    }
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    let detail = store
+        .get_card_detail(
+            &CardId::new("pre-work-log-identity")?,
+            DetailLevel::Detailed,
+        )?
+        .expect("card detail");
+    assert_eq!(detail.work_log.len(), 1);
+    assert_eq!(detail.work_log[0].id, "work-log-old");
+    assert_eq!(detail.work_log[0].actor, "agent-a");
+    assert_eq!(detail.work_log[0].created_at, detail.work_log[0].updated_at);
+    let run_index: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_work_log_entries_run_created'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(run_index.contains("(run_id, created_at, id)"));
+    let operation_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mutation_operations'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(operation_sql.contains("criterion_review"));
+    assert!(store.table_has_column("criterion_reviews", "reviewer_identity")?);
+    assert_eq!(store.schema_version()?, 18);
+    Ok(())
+}
+
+#[test]
+fn fresh_schema_run_detail_query_uses_run_leading_work_log_index() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let index_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_work_log_entries_run_created'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(index_sql.contains("(run_id, created_at, id)"));
+
+    let mut statement = store.connection.prepare(
+        "EXPLAIN QUERY PLAN
+         SELECT id, card_id, actor, agent, model, reasoning, harness, run_id, body,
+                created_at, updated_at
+         FROM work_log_entries
+         WHERE run_id = ?1
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let plan = statement
+        .query_map(["run-query-plan"], |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_work_log_entries_run_created")),
+        "run detail query plan did not use its run-leading index: {plan:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_15_to_16_adds_only_criterion_review_kind_and_preserves_operations() -> Result<()> {
+    let path = temp_db("v15-criterion-review-kind");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute(
+            "INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               expected_run_id, state, created_at, updated_at, expires_at
+             ) VALUES ('existing-op', 'sha256:existing', 'completion', 'card-1',
+                       'actor-1', NULL, 'succeeded', 10, 11, 12)",
+            [],
+        )?;
+        store.connection.execute_batch(
+            "DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 15;
+             ALTER TABLE mutation_operations RENAME TO mutation_operations_v15;
+             CREATE TABLE mutation_operations (
+               operation_id TEXT PRIMARY KEY,
+               request_digest TEXT NOT NULL,
+               kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion')),
+               target_card_id TEXT NOT NULL,
+               authority TEXT NOT NULL,
+               expected_run_id TEXT,
+               state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+               result_json TEXT,
+               failure_code TEXT,
+               failure_message TEXT,
+               audit_event_id TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL
+             );
+             INSERT INTO mutation_operations SELECT * FROM mutation_operations_v15;
+             DROP INDEX idx_mutation_operations_expiry;
+             DROP TABLE mutation_operations_v15;
+             CREATE INDEX idx_mutation_operations_expiry
+               ON mutation_operations(expires_at, operation_id);",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let existing: (String, String, i64) = store.connection.query_row(
+        "SELECT kind, state, expires_at FROM mutation_operations
+         WHERE operation_id = 'existing-op'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        existing,
+        ("completion".to_string(), "succeeded".to_string(), 12)
+    );
+    store.connection.execute(
+        "INSERT INTO mutation_operations (
+           operation_id, request_digest, kind, target_card_id, authority,
+           state, created_at, updated_at, expires_at
+         ) VALUES ('review-op', 'sha256:review', 'criterion_review', 'card-1',
+                   'actor-1', 'pending', 20, 20, 30)",
+        [],
+    )?;
+    let invalid = store.connection.execute(
+        "INSERT INTO mutation_operations (
+           operation_id, request_digest, kind, target_card_id, authority,
+           state, created_at, updated_at, expires_at
+         ) VALUES ('invalid-op', 'sha256:invalid', 'other', 'card-1',
+                   'actor-1', 'pending', 20, 20, 30)",
+        [],
+    );
+    assert!(invalid.is_err());
+    Ok(())
+}
+
+#[test]
+fn migration_15_to_16_failure_rolls_back_and_retries_deterministically() -> Result<()> {
+    let path = temp_db("v15-atomic-retry");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute_batch(
+            "INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               state, created_at, updated_at, expires_at
+             ) VALUES
+               ('valid-op', 'sha256:valid', 'completion', 'card-1', 'actor-1',
+                'succeeded', 10, 11, 12);
+             DROP INDEX idx_mutation_operations_expiry;
+             ALTER TABLE mutation_operations RENAME TO mutation_operations_v17;
+             CREATE TABLE mutation_operations (
+               operation_id TEXT PRIMARY KEY,
+               request_digest TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               target_card_id TEXT NOT NULL,
+               authority TEXT NOT NULL,
+               expected_run_id TEXT,
+               state TEXT NOT NULL,
+               result_json TEXT,
+               failure_code TEXT,
+               failure_message TEXT,
+               audit_event_id TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL
+             );
+             INSERT INTO mutation_operations SELECT * FROM mutation_operations_v17;
+             INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               state, created_at, updated_at, expires_at
+             ) VALUES
+               ('invalid-op', 'sha256:invalid', 'outside-contract', 'card-1', 'actor-1',
+                'succeeded', 10, 11, 12);
+             DROP TABLE mutation_operations_v17;
+             CREATE INDEX idx_mutation_operations_expiry
+               ON mutation_operations(expires_at, operation_id);
+             DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 15;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    let failed = store.migrate();
+    assert!(matches!(failed, Err(StoreError::Sqlite(_))));
+    assert_eq!(store.schema_version()?, 15);
+    let canonical_rows: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM mutation_operations", [], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(canonical_rows, 2);
+    let backup_tables: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'mutation_operations_v15'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(backup_tables, 0);
+
+    store.connection.execute(
+        "DELETE FROM mutation_operations WHERE operation_id = 'invalid-op'",
+        [],
+    )?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let preserved: String = store.connection.query_row(
+        "SELECT kind FROM mutation_operations WHERE operation_id = 'valid-op'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(preserved, "completion");
+    Ok(())
+}
+
+#[test]
+fn migration_15_to_16_recovers_a_legacy_partial_rebuild() -> Result<()> {
+    let path = temp_db("v15-partial-rebuild");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute_batch(
+            "INSERT INTO mutation_operations (
+               operation_id, request_digest, kind, target_card_id, authority,
+               state, created_at, updated_at, expires_at
+             ) VALUES
+               ('preserved-op', 'sha256:preserved', 'completion', 'card-1', 'actor-1',
+                'succeeded', 10, 11, 12);
+             DROP TABLE criterion_reviews;
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 15;
+             ALTER TABLE mutation_operations RENAME TO mutation_operations_v15;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let preserved: String = store.connection.query_row(
+        "SELECT kind FROM mutation_operations WHERE operation_id = 'preserved-op'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(preserved, "completion");
+    let backup_tables: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'mutation_operations_v15'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(backup_tables, 0);
+    Ok(())
+}
+
+#[test]
+fn migration_16_to_17_adds_immutable_criterion_review_history() -> Result<()> {
+    let path = temp_db("v16-criterion-review-history");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.connection.execute_batch(
+            "DROP TABLE criterion_reviews;
+             PRAGMA user_version = 16;",
+        )?;
+    }
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+
+    assert_eq!(store.schema_version()?, crate::schema::SCHEMA_VERSION);
+    let table_sql: String = store.connection.query_row(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'criterion_reviews'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(table_sql.contains("criterion_review"));
+    assert!(table_sql.contains("supersedes_review_id"));
+    assert!(table_sql.contains("approved"));
+    assert!(table_sql.contains("rejected"));
+    assert!(table_sql.contains("cleared"));
+    let indexes: i64 = store.connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name LIKE 'idx_criterion_reviews_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(indexes, 2);
+    Ok(())
+}
+
+#[test]
+fn migration_17_to_18_preserves_unverified_history_without_current_approval() -> Result<()> {
+    let path = temp_db("v17-reviewer-identity");
+    let card_id = CardId::new("pre-identity-review")?;
+    let authority = Authority::authenticated("operator", "actor-operator", true);
+    let (run_id, criterion_id) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card(card_id.as_str(), 1)])?;
+        let claim = store.claim_card(&card_id, "operator", 10, 100, &authority)?;
+        let criterion_id =
+            criterion_identity(&store.get_card(&card_id)?.unwrap().criteria, 0).unwrap();
+        store.review_criterion(
+            &card_id,
+            CriterionReviewInput {
+                operation_id: OperationId::new("pre-identity-operation")?,
+                expected_run_id: claim.run_id.clone(),
+                criterion: 0,
+                criterion_id: criterion_id.clone(),
+                decision: CriterionReviewDecision::Approved,
+                proof: Some("historical proof".to_string()),
+            },
+            20,
+            &authority,
+        )?;
+        store.connection.execute_batch(
+            "ALTER TABLE criterion_reviews RENAME TO criterion_reviews_v17;
+             CREATE TABLE criterion_reviews (
+               sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+               id TEXT NOT NULL UNIQUE,
+               operation_id TEXT NOT NULL,
+               card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+               run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+               criterion_index INTEGER NOT NULL,
+               criterion_id TEXT NOT NULL,
+               criterion_text TEXT NOT NULL,
+               decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected', 'cleared')),
+               reviewer TEXT NOT NULL,
+               proof TEXT,
+               supersedes_review_id TEXT REFERENCES criterion_reviews(id),
+               created_at INTEGER NOT NULL
+             );
+             INSERT INTO criterion_reviews (
+               sequence, id, operation_id, card_id, run_id, criterion_index,
+               criterion_id, criterion_text, decision, reviewer, proof,
+               supersedes_review_id, created_at
+             )
+             SELECT sequence, id, operation_id, card_id, run_id, criterion_index,
+                    criterion_id, criterion_text, decision, reviewer, proof,
+                    supersedes_review_id, created_at
+             FROM criterion_reviews_v17;
+             DROP TABLE criterion_reviews_v17;
+             CREATE INDEX idx_criterion_reviews_card_created
+               ON criterion_reviews(card_id, sequence);
+             CREATE INDEX idx_criterion_reviews_run_criterion_created
+               ON criterion_reviews(run_id, criterion_id, sequence DESC);
+             DROP TABLE run_review_authorities;
+             PRAGMA user_version = 17;",
+        )?;
+        (claim.run_id, criterion_id)
+    };
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    let history = store.list_criterion_reviews(&card_id)?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].reviewer_identity, "legacy:unverified");
+    assert!(store.criterion_state_for_run(&card_id, &run_id)?[0]
+        .review
+        .is_none());
+
+    let reviewed = store.review_criterion(
+        &card_id,
+        CriterionReviewInput {
+            operation_id: OperationId::new("authenticated-rereview")?,
+            expected_run_id: run_id.clone(),
+            criterion: 0,
+            criterion_id,
+            decision: CriterionReviewDecision::Approved,
+            proof: Some("authenticated correction".to_string()),
+        },
+        21,
+        &authority,
+    )?;
+    assert_eq!(reviewed.state, OperationState::Succeeded);
+    let current = store.criterion_state_for_run(&card_id, &run_id)?[0]
+        .review
+        .clone()
+        .unwrap();
+    assert_eq!(current.reviewer_identity, "actor-operator");
+    assert_eq!(
+        current.supersedes_review_id.as_deref(),
+        Some(history[0].id.as_str())
+    );
     Ok(())
 }
 
@@ -3420,5 +3883,1283 @@ fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()
         "backlog-imported cards completed with no proof (crucible-010's real shape) must not qualify"
     );
 
+    Ok(())
+}
+
+#[test]
+fn idempotent_work_log_recovers_lost_response_and_replays_one_effect() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-work-log")?;
+    store.import_cards(vec![ready_card("operation-work-log", 1)])?;
+    let operation_id = OperationId::new("op-work-log-lost-response")?;
+    let authority = Authority::actor("agent-a", false);
+
+    let committed = store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "one durable effect",
+        10,
+        &authority,
+    )?;
+    assert_eq!(committed.state, OperationState::Succeeded);
+
+    // Simulate a response disappearing after commit by discarding `committed`
+    // and recovering only from the stable operation identity.
+    let recovered = store.operation_status(&operation_id, 11, &authority)?;
+    let replayed = store.append_work_log_idempotent(
+        operation_id,
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "one durable effect",
+        12,
+        &authority,
+    )?;
+    assert_eq!(recovered, replayed);
+    assert_eq!(
+        recovered.result.as_ref().unwrap()["body"],
+        "one durable effect"
+    );
+    let audit_event_id = recovered.audit_event_id.as_deref().unwrap();
+    assert!(audit_event_id.starts_with("event-"));
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.work_log.len(), 1);
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.id.as_str() == audit_event_id));
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn conflicting_operation_reuse_fails_closed_without_mixed_state() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-conflict")?;
+    store.import_cards(vec![ready_card("operation-conflict", 1)])?;
+    let operation_id = OperationId::new("op-conflict")?;
+    let authority = Authority::actor("agent-a", false);
+    store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "winner",
+        10,
+        &authority,
+    )?;
+
+    let error = store
+        .append_work_log_idempotent(
+            operation_id,
+            &card_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            "different request",
+            11,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::Domain(DomainError::Conflict(_))
+    ));
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.work_log.len(), 1);
+    assert_eq!(detail.work_log[0].body, "winner");
+    Ok(())
+}
+
+#[test]
+fn idempotent_completion_replays_one_audited_permissive_outcome() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-completion")?;
+    store.import_cards(vec![ready_card("operation-completion", 1)])?;
+    let operation_id = OperationId::new("op-completion")?;
+    let authority = Authority::actor("operator", true);
+    let proofs = vec![CriterionProofInput {
+        criterion: 0,
+        url: "https://example.test/proof".to_string(),
+    }];
+
+    let first = store.complete_card_idempotent(
+        operation_id.clone(),
+        &card_id,
+        Some("credential-free proof"),
+        proofs.clone(),
+        10,
+        &authority,
+    )?;
+    let second = store.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("credential-free proof"),
+        proofs,
+        11,
+        &authority,
+    )?;
+    assert_eq!(first, second);
+    assert_eq!(first.result.as_ref().unwrap()["status"], "done");
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(detail.events.len(), 1);
+    assert!(first
+        .audit_event_id
+        .as_deref()
+        .unwrap()
+        .starts_with("event-"));
+    assert_eq!(
+        first.audit_event_id.as_deref(),
+        Some(detail.events[0].id.as_str())
+    );
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn rejected_operation_is_durable_bounded_and_retryable_as_the_same_outcome() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let operation_id = OperationId::new("op-rejected")?;
+    let missing = CardId::new("missing-operation-card")?;
+    let authority = Authority::actor("agent-a", false);
+    let first = store.append_work_log_idempotent(
+        operation_id.clone(),
+        &missing,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "cannot append",
+        10,
+        &authority,
+    )?;
+    let second = store.append_work_log_idempotent(
+        operation_id,
+        &missing,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "cannot append",
+        11,
+        &authority,
+    )?;
+    assert_eq!(first, second);
+    assert_eq!(first.state, OperationState::Rejected);
+    assert_eq!(first.failure.as_ref().unwrap().code, "not_found");
+    assert!(first.failure.as_ref().unwrap().message.len() <= 512);
+    Ok(())
+}
+
+#[test]
+fn operation_transaction_rolls_back_effect_and_identity_when_persistence_fails() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-rollback")?;
+    store.import_cards(vec![ready_card("operation-rollback", 1)])?;
+    store.connection.execute_batch(
+        "CREATE TRIGGER inject_operation_finish_failure
+         BEFORE UPDATE OF state ON mutation_operations
+         BEGIN SELECT RAISE(ABORT, 'injected operation persistence failure'); END;",
+    )?;
+    let operation_id = OperationId::new("op-rollback")?;
+    let authority = Authority::actor("agent-a", false);
+
+    let error = store
+        .append_work_log_idempotent(
+            operation_id.clone(),
+            &card_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            "must roll back",
+            10,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    store
+        .connection
+        .execute_batch("DROP TRIGGER inject_operation_finish_failure")?;
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &authority)?.state,
+        OperationState::Unknown
+    );
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert!(detail.work_log.is_empty());
+    assert!(!store
+        .list_event_tail(0, 20)?
+        .iter()
+        .any(|item| item.event.event_type == "work-log-appended"));
+    Ok(())
+}
+
+#[test]
+fn completion_operation_rolls_back_card_proof_audit_and_identity_on_injected_failure() -> Result<()>
+{
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("completion-operation-rollback")?;
+    store.import_cards(vec![ready_card("completion-operation-rollback", 1)])?;
+    store.connection.execute_batch(
+        "CREATE TRIGGER inject_completion_operation_finish_failure
+         BEFORE UPDATE OF state ON mutation_operations
+         BEGIN SELECT RAISE(ABORT, 'injected completion persistence failure'); END;",
+    )?;
+    let operation_id = OperationId::new("op-completion-rollback")?;
+    let authority = Authority::actor("operator", true);
+
+    let error = store
+        .complete_card_idempotent(
+            operation_id.clone(),
+            &card_id,
+            Some("must roll back"),
+            vec![CriterionProofInput {
+                criterion: 0,
+                url: "https://example.test/must-roll-back".to_string(),
+            }],
+            10,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    store
+        .connection
+        .execute_batch("DROP TRIGGER inject_completion_operation_finish_failure")?;
+
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &authority)?.state,
+        OperationState::Unknown
+    );
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Ready);
+    assert!(detail.card.criteria[0].proof_links.is_empty());
+    assert!(detail.events.is_empty());
+    assert!(store.list_event_tail(0, 20)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn committed_completion_recovers_and_replays_after_process_restart() -> Result<()> {
+    let path = temp_db("completion-operation-restart");
+    let card_id = CardId::new("completion-operation-restart")?;
+    let operation_id = OperationId::new("op-completion-restart")?;
+    let authority = Authority::actor("operator", true);
+    let committed = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("completion-operation-restart", 1)])?;
+        store.complete_card_idempotent(
+            operation_id.clone(),
+            &card_id,
+            Some("restart-safe"),
+            vec![CriterionProofInput {
+                criterion: 0,
+                url: "https://example.test/restart-safe".to_string(),
+            }],
+            10,
+            &authority,
+        )?
+    };
+
+    let mut restarted = Store::open(&path)?;
+    restarted.migrate()?;
+    let recovered = restarted.operation_status(&operation_id, 11, &authority)?;
+    let replayed = restarted.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("restart-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/restart-safe".to_string(),
+        }],
+        12,
+        &authority,
+    )?;
+    assert_eq!(recovered, committed);
+    assert_eq!(replayed, committed);
+    let detail = restarted
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(detail.events.len(), 1);
+    assert_eq!(
+        committed.audit_event_id.as_deref(),
+        Some(detail.events[0].id.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn uncommitted_completion_crash_child() -> Result<()> {
+    let Some(path) = std::env::var_os(UNCOMMITTED_CRASH_DB_ENV) else {
+        return Ok(());
+    };
+    let mut store = Store::open(path)?;
+    store.migrate()?;
+    let card_id = CardId::new("completion-operation-uncommitted-crash")?;
+    let operation_id = OperationId::new("op-completion-uncommitted-crash")?;
+    let authority = Authority::actor("operator", true);
+
+    let result = store.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("crash-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/crash-safe".to_string(),
+        }],
+        20,
+        &authority,
+    );
+    panic!("test-only process-exit hook did not fire: {result:?}");
+}
+
+#[test]
+fn process_exit_with_open_completion_transaction_rolls_back_and_retries_once() -> Result<()> {
+    let path = temp_db("completion-operation-uncommitted-crash");
+    let card_id = CardId::new("completion-operation-uncommitted-crash")?;
+    let operation_id = OperationId::new("op-completion-uncommitted-crash")?;
+    let authority = Authority::actor("operator", true);
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card(
+            "completion-operation-uncommitted-crash",
+            1,
+        )])?;
+    }
+
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("tests::uncommitted_completion_crash_child")
+        .arg("--nocapture")
+        .env(UNCOMMITTED_CRASH_DB_ENV, &path)
+        .env(TEST_EXIT_BEFORE_OPERATION_COMMIT_ENV, operation_id.as_str())
+        .output()?;
+    assert_eq!(
+        child.status.code(),
+        Some(TEST_EXIT_BEFORE_OPERATION_COMMIT_CODE),
+        "child did not exit at the uncommitted transaction barrier; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+
+    let mut restarted = Store::open(&path)?;
+    restarted.migrate()?;
+    assert_eq!(
+        restarted
+            .operation_status(&operation_id, 21, &authority)?
+            .state,
+        OperationState::Unknown
+    );
+    let rolled_back = restarted
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(rolled_back.card.status, CardStatus::Ready);
+    assert!(rolled_back.card.criteria[0].proof_links.is_empty());
+    assert!(rolled_back.events.is_empty());
+    assert!(restarted.list_event_tail(0, 20)?.is_empty());
+
+    let committed = restarted.complete_card_idempotent(
+        operation_id.clone(),
+        &card_id,
+        Some("crash-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/crash-safe".to_string(),
+        }],
+        22,
+        &authority,
+    )?;
+    let replayed = restarted.complete_card_idempotent(
+        operation_id,
+        &card_id,
+        Some("crash-safe"),
+        vec![CriterionProofInput {
+            criterion: 0,
+            url: "https://example.test/crash-safe".to_string(),
+        }],
+        23,
+        &authority,
+    )?;
+    assert_eq!(committed.state, OperationState::Succeeded);
+    assert_eq!(replayed, committed);
+    let final_detail = restarted
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(final_detail.card.status, CardStatus::Done);
+    assert_eq!(final_detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(final_detail.events.len(), 1);
+    assert_eq!(restarted.list_event_tail(0, 20)?.len(), 1);
+    assert_eq!(
+        committed.audit_event_id.as_deref(),
+        Some(final_detail.events[0].id.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-security")?;
+    store.import_cards(vec![ready_card("operation-security", 1)])?;
+    let operation_id = OperationId::new("op-security")?;
+    let owner = Authority::actor("agent-a", false);
+    let powder_api_key = format!("sk_powder_{}-_", "A".repeat(30));
+    let powder_webhook_secret = format!("whsec_powder_{}-_", "B".repeat(30));
+    let raw_attribution = [
+        format!("agent sk-abcdefghijklmnopqrstuvwxyz123456 {powder_api_key} {powder_webhook_secret}"),
+        format!(
+            "model ghp_abcdefghijklmnopqrstuvwxyz0123456789 {powder_api_key} {powder_webhook_secret}"
+        ),
+        format!(
+            "reasoning Bearer abcdefghijklmnopqrstuvwxyz012345 {powder_api_key} {powder_webhook_secret}"
+        ),
+        format!("harness xoxb-1234567890abcdefghij {powder_api_key} {powder_webhook_secret}"),
+        format!("run.{powder_api_key}.{powder_webhook_secret}"),
+    ];
+    let raw_body = format!(
+        "token sk-abcdefghijklmnopqrstuvwxyz123456 {powder_api_key} {powder_webhook_secret}"
+    );
+    store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        &raw_attribution[0],
+        WorkLogAttribution {
+            model: Some(&raw_attribution[1]),
+            reasoning: Some(&raw_attribution[2]),
+            harness: Some(&raw_attribution[3]),
+            run_id: Some(&raw_attribution[4]),
+        },
+        &raw_body,
+        10,
+        &owner,
+    )?;
+    let visible = store.operation_status(&operation_id, 11, &owner)?;
+    let serialized = serde_json::to_string(&visible)?;
+    assert!(serialized.contains("[REDACTED:openai-key]"));
+    assert!(serialized.contains("[REDACTED:powder-api-key]"));
+    assert!(serialized.contains("[REDACTED:powder-webhook-secret]"));
+    assert!(!serialized.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    for secret in &raw_attribution {
+        assert!(
+            !serialized.contains(secret),
+            "operation status leaked attribution secret: {secret}"
+        );
+    }
+    assert!(!serialized.contains(&powder_api_key));
+    assert!(!serialized.contains(&powder_webhook_secret));
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    let persisted = serde_json::to_string(&detail.work_log)?;
+    for secret in &raw_attribution {
+        assert!(
+            !persisted.contains(secret),
+            "durable work log leaked attribution secret: {secret}"
+        );
+    }
+    assert!(!persisted.contains(&powder_api_key));
+    assert!(!persisted.contains(&powder_webhook_secret));
+    assert!(persisted.contains("[REDACTED:powder-api-key]"));
+    assert!(persisted.contains("[REDACTED:powder-webhook-secret]"));
+    assert!(persisted.contains("agent [REDACTED:openai-key]"));
+    let card_audit = serde_json::to_string(&detail.events)?;
+    assert!(!card_audit.contains(&powder_api_key));
+    assert!(!card_audit.contains(&powder_webhook_secret));
+    assert!(card_audit.contains("[REDACTED:powder-api-key]"));
+    assert!(card_audit.contains("[REDACTED:powder-webhook-secret]"));
+    let outbound = serde_json::to_string(&store.list_event_tail(0, 20)?)?;
+    for secret in &raw_attribution {
+        assert!(
+            !outbound.contains(secret),
+            "outbound audit history leaked attribution secret: {secret}"
+        );
+    }
+    assert!(!outbound.contains(&powder_api_key));
+    assert!(!outbound.contains(&powder_webhook_secret));
+    assert!(outbound.contains("[REDACTED:powder-api-key]"));
+    assert!(outbound.contains("[REDACTED:powder-webhook-secret]"));
+    let forbidden = store.operation_status(&operation_id, 11, &Authority::actor("agent-b", false));
+    assert!(matches!(
+        forbidden,
+        Err(StoreError::Domain(DomainError::Forbidden(_)))
+    ));
+    let audit_event_id = visible.audit_event_id.as_deref().unwrap().to_string();
+    assert!(audit_event_id.starts_with("event-"));
+    assert_eq!(
+        store
+            .operation_status(&operation_id, 10 + OPERATION_RETENTION_SECONDS, &owner)?
+            .state,
+        OperationState::Unknown
+    );
+    let retained_detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(
+        retained_detail.work_log.len(),
+        1,
+        "retention removes recovery metadata, not the audited mutation effect"
+    );
+    assert!(
+        retained_detail
+            .events
+            .iter()
+            .any(|event| event.id.as_str() == audit_event_id),
+        "the event-* audit link must resolve after recovery metadata expires"
+    );
+    Ok(())
+}
+
+#[test]
+fn idempotent_work_log_run_id_honors_the_attribution_boundary() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-run-id-bound")?;
+    store.import_cards(vec![ready_card("operation-run-id-bound", 1)])?;
+    let authority = Authority::actor("agent-a", false);
+    let maximum = "r".repeat(WORK_LOG_ATTRIBUTION_MAX_BYTES);
+    let accepted = store.append_work_log_idempotent(
+        OperationId::new("op-run-id-at-limit")?,
+        &card_id,
+        "agent-a",
+        WorkLogAttribution {
+            run_id: Some(&maximum),
+            ..WorkLogAttribution::default()
+        },
+        "bounded",
+        10,
+        &authority,
+    )?;
+    assert_eq!(accepted.state, OperationState::Succeeded);
+
+    let oversized = "r".repeat(WORK_LOG_ATTRIBUTION_MAX_BYTES + 1);
+    let rejected_id = OperationId::new("op-run-id-over-limit")?;
+    let error = store
+        .append_work_log_idempotent(
+            rejected_id.clone(),
+            &card_id,
+            "agent-a",
+            WorkLogAttribution {
+                run_id: Some(&oversized),
+                ..WorkLogAttribution::default()
+            },
+            "must not persist",
+            11,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("run_id"));
+    assert_eq!(
+        store.operation_status(&rejected_id, 12, &authority)?.state,
+        OperationState::Unknown
+    );
+    assert_eq!(
+        store
+            .get_card_detail(&card_id, DetailLevel::Detailed)?
+            .unwrap()
+            .work_log
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn operation_status_uses_stable_authority_not_a_shared_display_name() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-stable-authority")?;
+    store.import_cards(vec![ready_card("operation-stable-authority", 1)])?;
+    let operation_id = OperationId::new("op-stable-authority")?;
+    let owner = Authority::authenticated("same-name", "actor-id-one", false);
+    store.append_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        "same-name",
+        WorkLogAttribution::default(),
+        "owned outcome",
+        10,
+        &owner,
+    )?;
+
+    let lookalike = Authority::authenticated("same-name", "actor-id-two", false);
+    assert!(matches!(
+        store.operation_status(&operation_id, 11, &lookalike),
+        Err(StoreError::Domain(DomainError::Forbidden(_)))
+    ));
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &owner)?.state,
+        OperationState::Succeeded
+    );
+    Ok(())
+}
+
+#[test]
+fn oversized_operation_request_has_no_operation_or_mutation_effect() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-bounds")?;
+    store.import_cards(vec![ready_card("operation-bounds", 1)])?;
+    let operation_id = OperationId::new("op-bounds")?;
+    let authority = Authority::actor("agent-a", false);
+    assert!(store
+        .append_work_log_idempotent(
+            operation_id.clone(),
+            &card_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            &"x".repeat(WORK_LOG_BODY_MAX_BYTES + 1),
+            10,
+            &authority,
+        )
+        .is_err());
+    assert_eq!(
+        store.operation_status(&operation_id, 11, &authority)?.state,
+        OperationState::Unknown
+    );
+    assert!(store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap()
+        .work_log
+        .is_empty());
+    Ok(())
+}
+
+#[test]
+fn identical_operation_race_converges_on_one_stored_outcome() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("operation-identical-race");
+    let card_id = CardId::new("operation-identical-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("operation-identical-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || -> Result<_> {
+                let mut store = Store::open(path)?;
+                store.migrate()?;
+                barrier.wait();
+                store.append_work_log_idempotent(
+                    OperationId::new("op-identical-race")?,
+                    &card_id,
+                    "agent-a",
+                    WorkLogAttribution::default(),
+                    "same",
+                    10,
+                    &Authority::actor("agent-a", false),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(results[0], results[1]);
+    let store = Store::open(path)?;
+    assert_eq!(
+        store
+            .get_card_detail(&card_id, DetailLevel::Detailed)?
+            .unwrap()
+            .work_log
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn identical_run_bound_operation_race_converges_on_one_exact_entry() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("strict-operation-identical-race");
+    let card_id = CardId::new("strict-operation-identical-race")?;
+    let run_id = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("strict-operation-identical-race", 1)])?;
+        store
+            .claim_card(
+                &card_id,
+                "agent-a",
+                10,
+                100,
+                &Authority::actor("agent-a", false),
+            )?
+            .run_id
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            let run_id = run_id.clone();
+            std::thread::spawn(move || -> Result<_> {
+                let mut store = Store::open(path)?;
+                store.migrate()?;
+                barrier.wait();
+                store.append_run_work_log_idempotent(
+                    OperationId::new("strict:identical-race")?,
+                    &card_id,
+                    &run_id,
+                    "agent-a",
+                    WorkLogAttribution::default(),
+                    "same",
+                    20,
+                    &Authority::actor("agent-a", false),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(results[0], results[1]);
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert_eq!(detail.work_log.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&detail.work_log[0])?,
+        results[0].result.clone().unwrap()
+    );
+    Ok(())
+}
+
+#[test]
+fn delayed_run_a_append_revalidates_after_release_and_reclaim_to_run_b() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("strict-release-reclaim-barrier");
+    let card_id = CardId::new("strict-release-reclaim-barrier")?;
+    let authority_a = Authority::actor("agent-a", false);
+    let run_a = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("strict-release-reclaim-barrier", 1)])?;
+        store.claim_card(&card_id, "agent-a", 10, 100, &authority_a)?
+    };
+
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let delayed = {
+        let path = path.clone();
+        let card_id = card_id.clone();
+        let run_id = run_a.run_id.clone();
+        let reached = Arc::clone(&reached);
+        let resume = Arc::clone(&resume);
+        std::thread::spawn(move || -> Result<_> {
+            let mut store = Store::open(path)?;
+            store.migrate()?;
+            store.run_work_log_validation_hook =
+                Some(super::RunWorkLogValidationHook { reached, resume });
+            store.append_run_work_log_idempotent(
+                OperationId::new("strict:release-reclaim-barrier")?,
+                &card_id,
+                &run_id,
+                "agent-a",
+                WorkLogAttribution::default(),
+                "delayed run A write",
+                30,
+                &Authority::actor("agent-a", false),
+            )
+        })
+    };
+
+    reached.wait();
+    let (run_b, card_b_before, run_b_before) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.release_claim(&card_id, &run_a.run_id, 20, &authority_a)?;
+        let run_b = store.claim_card(
+            &card_id,
+            "agent-b",
+            21,
+            100,
+            &Authority::actor("agent-b", false),
+        )?;
+        let card_b = store.get_card(&card_id)?.expect("card after reclaim");
+        let run_b_record = store.get_run(&run_b.run_id)?.expect("run B after reclaim");
+        (run_b, card_b, run_b_record)
+    };
+    resume.wait();
+
+    let rejected = delayed.join().expect("delayed append thread panicked")?;
+    assert_eq!(rejected.state, OperationState::Rejected);
+    assert_eq!(rejected.failure.expect("rejection detail").code, "conflict");
+
+    let store = Store::open(&path)?;
+    let card_b_after = store.get_card(&card_id)?.expect("card after rejection");
+    let run_b_after = store
+        .get_run(&run_b.run_id)?
+        .expect("run B after rejection");
+    assert_eq!(
+        card_b_after, card_b_before,
+        "run A must not mutate run B's card claim"
+    );
+    assert_eq!(run_b_after, run_b_before, "run A must not mutate run B");
+    assert_eq!(
+        card_b_after.claim.as_ref().map(|claim| &claim.run_id),
+        Some(&run_b.run_id)
+    );
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert!(detail.work_log.is_empty());
+    assert!(!detail
+        .events
+        .iter()
+        .any(|event| event.event_type == "work_log"));
+    assert!(!store
+        .list_event_tail(0, 100)?
+        .iter()
+        .any(|item| item.event.event_type == "work-log-appended"));
+    Ok(())
+}
+
+#[test]
+fn run_bound_work_log_replays_exact_scrubbed_record_across_all_history_views() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("strict-work-log")?;
+    store.import_cards(vec![ready_card("strict-work-log", 1)])?;
+    let authority = Authority::actor("agent-a", false);
+    let claim = store.claim_card(&card_id, "agent-a", 10, 100, &authority)?;
+    let operation_id = OperationId::new("strict:exact-retry")?;
+    let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+    let first = store.append_run_work_log_idempotent(
+        operation_id.clone(),
+        &card_id,
+        &claim.run_id,
+        "agent-a",
+        WorkLogAttribution {
+            model: Some("model-a"),
+            reasoning: Some("high"),
+            harness: Some("codex"),
+            run_id: None,
+        },
+        &format!("fixed with {secret}"),
+        20,
+        &authority,
+    )?;
+    assert_eq!(first.state, OperationState::Succeeded);
+    let result = first.result.clone().expect("stored result");
+    assert_eq!(result["schema_version"], "powder.work_log_entry.v1");
+    assert_eq!(result["actor"], "agent-a");
+    assert_eq!(result["agent"], "agent-a");
+    assert_eq!(result["run_id"], claim.run_id.as_str());
+    assert!(result["id"].as_str().unwrap().starts_with("work-log-"));
+    assert_eq!(result["created_at"], result["updated_at"]);
+    assert!(!result.to_string().contains(secret));
+
+    let replay = store.append_run_work_log_idempotent(
+        operation_id,
+        &card_id,
+        &claim.run_id,
+        "agent-a",
+        WorkLogAttribution {
+            model: Some("model-a"),
+            reasoning: Some("high"),
+            harness: Some("codex"),
+            run_id: None,
+        },
+        &format!("fixed with {secret}"),
+        200,
+        &authority,
+    )?;
+    assert_eq!(
+        replay, first,
+        "retry must replay even after the claim expires"
+    );
+
+    let card = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert_eq!(card.work_log.len(), 1);
+    assert_eq!(serde_json::to_value(&card.work_log[0])?, result);
+    let run = store
+        .get_run_detail(&claim.run_id, DetailLevel::Detailed)?
+        .expect("run detail");
+    assert_eq!(run.work_log.len(), 1);
+    assert_eq!(serde_json::to_value(&run.work_log[0])?, result);
+    let audit_id = first.audit_event_id.as_deref().expect("audit id");
+    let audit = card
+        .events
+        .iter()
+        .find(|event| event.id.as_str() == audit_id)
+        .expect("linked audit event");
+    assert_eq!(audit.actor, "agent-a");
+    let audit_payload: serde_json::Value = serde_json::from_str(&audit.payload)?;
+    assert_eq!(audit_payload["entry_id"], result["id"]);
+    assert_eq!(audit_payload["run_id"], result["run_id"]);
+    let outbound = store.list_event_tail(0, 20)?;
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].event.change["work_log"], result);
+    Ok(())
+}
+
+#[test]
+fn run_bound_work_log_rejects_released_expired_and_reclaimed_runs_without_effect() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("strict-stale-runs")?;
+    store.import_cards(vec![ready_card("strict-stale-runs", 1)])?;
+    let authority_a = Authority::actor("agent-a", false);
+    let run_a = store.claim_card(&card_id, "agent-a", 10, 10, &authority_a)?;
+
+    let expired = store.append_run_work_log_idempotent(
+        OperationId::new("strict:expired")?,
+        &card_id,
+        &run_a.run_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "late",
+        20,
+        &authority_a,
+    )?;
+    assert_eq!(expired.state, OperationState::Rejected);
+    assert_eq!(expired.failure.unwrap().code, "claim_expired");
+
+    let authority_b = Authority::actor("agent-b", false);
+    let run_b = store.claim_card(&card_id, "agent-b", 21, 100, &authority_b)?;
+    let reclaimed = store.append_run_work_log_idempotent(
+        OperationId::new("strict:reclaimed")?,
+        &card_id,
+        &run_a.run_id,
+        "agent-a",
+        WorkLogAttribution::default(),
+        "stale owner",
+        22,
+        &authority_a,
+    )?;
+    assert_eq!(reclaimed.state, OperationState::Rejected);
+
+    store.release_claim(&card_id, &run_b.run_id, 23, &authority_b)?;
+    let released = store.append_run_work_log_idempotent(
+        OperationId::new("strict:released")?,
+        &card_id,
+        &run_b.run_id,
+        "agent-b",
+        WorkLogAttribution::default(),
+        "after release",
+        24,
+        &authority_b,
+    )?;
+    assert_eq!(released.state, OperationState::Rejected);
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .expect("card detail");
+    assert!(detail.work_log.is_empty());
+    assert!(!detail
+        .events
+        .iter()
+        .any(|event| event.event_type == "work_log"));
+    assert!(!store
+        .list_event_tail(0, 20)?
+        .iter()
+        .any(|item| item.event.event_type == "work-log-appended"));
+    Ok(())
+}
+
+#[test]
+fn run_bound_work_log_rejects_mismatch_foreign_malformed_and_unauthorized_without_effect(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_a = CardId::new("strict-validation-a")?;
+    let card_b = CardId::new("strict-validation-b")?;
+    store.import_cards(vec![
+        ready_card("strict-validation-a", 1),
+        ready_card("strict-validation-b", 1),
+    ])?;
+    let owner = Authority::actor("agent-a", false);
+    let run_a = store.claim_card(&card_a, "agent-a", 10, 100, &owner)?;
+    let run_b = store.claim_card(
+        &card_b,
+        "agent-b",
+        10,
+        100,
+        &Authority::actor("agent-b", false),
+    )?;
+
+    for (operation, card, run, agent, authority) in [
+        (
+            "strict:unknown",
+            card_a.clone(),
+            RunId::new("run-unknown")?,
+            "agent-a",
+            owner.clone(),
+        ),
+        (
+            "strict:mismatch",
+            card_a.clone(),
+            run_b.run_id.clone(),
+            "agent-a",
+            owner.clone(),
+        ),
+        (
+            "strict:foreign",
+            card_a.clone(),
+            run_a.run_id.clone(),
+            "agent-b",
+            owner.clone(),
+        ),
+        (
+            "strict:unauthorized",
+            card_a.clone(),
+            run_a.run_id.clone(),
+            "agent-a",
+            Authority::actor("intruder", false),
+        ),
+    ] {
+        let status = store.append_run_work_log_idempotent(
+            OperationId::new(operation)?,
+            &card,
+            &run,
+            agent,
+            WorkLogAttribution::default(),
+            "must not persist",
+            20,
+            &authority,
+        )?;
+        assert_eq!(status.state, OperationState::Rejected);
+    }
+
+    for result in [
+        store.append_run_work_log_idempotent(
+            OperationId::new("strict:empty-model")?,
+            &card_a,
+            &run_a.run_id,
+            "agent-a",
+            WorkLogAttribution {
+                model: Some(""),
+                ..WorkLogAttribution::default()
+            },
+            "body",
+            20,
+            &owner,
+        ),
+        store.append_run_work_log_idempotent(
+            OperationId::new("strict:over-body")?,
+            &card_a,
+            &run_a.run_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            &"x".repeat(WORK_LOG_BODY_MAX_BYTES + 1),
+            20,
+            &owner,
+        ),
+        store.append_run_work_log_idempotent(
+            OperationId::new("strict:unchecked")?,
+            &card_a,
+            &run_a.run_id,
+            "agent-a",
+            WorkLogAttribution::default(),
+            "body",
+            20,
+            &Authority::unchecked(),
+        ),
+    ] {
+        assert!(result.is_err());
+    }
+    for card_id in [&card_a, &card_b] {
+        let detail = store
+            .get_card_detail(card_id, DetailLevel::Detailed)?
+            .expect("card detail");
+        assert!(detail.work_log.is_empty());
+        assert!(!detail
+            .events
+            .iter()
+            .any(|event| event.event_type == "work_log"));
+    }
+    assert!(store.list_event_tail(0, 20)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn conflicting_operation_race_has_one_winner_and_no_mixed_state() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("operation-conflicting-race");
+    let card_id = CardId::new("operation-conflicting-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("operation-conflicting-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = ["request-a", "request-b"]
+        .into_iter()
+        .map(|body| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(path).unwrap();
+                store.migrate().unwrap();
+                barrier.wait();
+                store.append_work_log_idempotent(
+                    OperationId::new("op-conflicting-race").unwrap(),
+                    &card_id,
+                    "agent-a",
+                    WorkLogAttribution::default(),
+                    body,
+                    10,
+                    &Authority::actor("agent-a", false),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.work_log.len(), 1);
+    assert!(matches!(
+        detail.work_log[0].body.as_str(),
+        "request-a" | "request-b"
+    ));
+    Ok(())
+}
+
+#[test]
+fn identical_completion_operation_race_converges_on_one_outcome() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("completion-operation-identical-race");
+    let card_id = CardId::new("completion-operation-identical-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("completion-operation-identical-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || -> Result<_> {
+                let mut store = Store::open(path)?;
+                store.migrate()?;
+                barrier.wait();
+                store.complete_card_idempotent(
+                    OperationId::new("op-completion-identical-race")?,
+                    &card_id,
+                    Some("same completion"),
+                    vec![CriterionProofInput {
+                        criterion: 0,
+                        url: "https://example.test/same".to_string(),
+                    }],
+                    10,
+                    &Authority::actor("operator", true),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(results[0], results[1]);
+
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert_eq!(detail.events.len(), 1);
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn conflicting_completion_operation_race_has_one_winner_without_mixed_state() -> Result<()> {
+    use std::sync::{Arc, Barrier};
+
+    let path = temp_db("completion-operation-conflicting-race");
+    let card_id = CardId::new("completion-operation-conflicting-race")?;
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("completion-operation-conflicting-race", 1)])?;
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = ["request-a", "request-b"]
+        .into_iter()
+        .map(|winner| {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let card_id = card_id.clone();
+            std::thread::spawn(move || {
+                let mut store = Store::open(path).unwrap();
+                store.migrate().unwrap();
+                barrier.wait();
+                store.complete_card_idempotent(
+                    OperationId::new("op-completion-conflicting-race").unwrap(),
+                    &card_id,
+                    Some(winner),
+                    vec![CriterionProofInput {
+                        criterion: 0,
+                        url: format!("https://example.test/{winner}"),
+                    }],
+                    10,
+                    &Authority::actor("operator", true),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread did not panic"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+    let store = Store::open(path)?;
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    assert_eq!(detail.card.status, CardStatus::Done);
+    assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
+    assert!(matches!(
+        detail.card.criteria[0].proof_links[0].url.as_str(),
+        "https://example.test/request-a" | "https://example.test/request-b"
+    ));
+    assert_eq!(detail.events.len(), 1);
+    assert_eq!(store.list_event_tail(0, 20)?.len(), 1);
     Ok(())
 }

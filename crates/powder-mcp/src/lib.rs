@@ -2,12 +2,12 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel,
-    Estimate, Priority, ReadyQuery, RunId,
+    Authority, AutonomyClass, Card, CardDetail, CardId, CardStatus, CardSummary,
+    CriterionReviewDecision, DetailLevel, Estimate, OperationId, Priority, ReadyQuery, RunId,
 };
 use powder_store::{
-    BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, Store,
+    BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, CriterionReviewInput,
+    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Store,
 };
 use serde_json::{json, Value};
 
@@ -28,7 +28,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready; claim exactly one card with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_run_work_log frequently with the exact current run, one stable operation_id, your agent identity, progress, blockers, evidence, and attribution. append_work_log is the permissive unbound/operator-note compatibility path, not the agent current-run path. Allocate one stable operation_id before retryable work-log, criterion-review, or completion mutations. After timeout or reconnect, call operation_status and retry only the identical request. Call review_criterion only with the exact current run and criterion_id from get_card/get_run; authenticated authority supplies the reviewer. Use add_comment only for low-frequency updates. Heartbeat or renew long claims before expiry. Release a claim when stopping voluntarily. If an operator decision is needed, request_input and pause; never invent approval. Call complete_card only when criteria are satisfied, with reviewable proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools are hidden unless POWDER_MCP_TOOLSETS=admin.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -117,6 +117,11 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","required":["card_id","criterion","actor"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"}}}"#,
     },
     ToolDef {
+        name: "review_criterion",
+        description: "Record one authenticated decision for an exact criterion on the exact current run. Requires a stable operation_id and criterion_id read from get_card/get_run. Reviewer identity comes from authenticated authority; actor/admin are only local-store authority controls.",
+        input_schema: r#"{"type":"object","required":["operation_id","card_id","run_id","criterion","criterion_id","decision"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"run_id":{"type":"string"},"criterion":{"type":"integer","minimum":0,"maximum":4294967295},"criterion_id":{"type":"string"},"decision":{"type":"string","enum":["approved","rejected","cleared"]},"proof":{"type":"string","maxLength":4096},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
         name: "update_relations",
         description: "Replace a card's related, blocks, and blocked_by relation lists; returns a minimal ack; get_card for full state.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
@@ -133,8 +138,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "append_work_log",
-        description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution you can supply. body is scrubbed for known secret shapes server-side before storage.",
-        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
+        description: "Append an explicit permissive unbound/operator work-log note. This compatibility path does not assert current-run ownership. Every caller-controlled attribution field and body is scrubbed before storage.",
+        input_schema: r#"{"type":"object","required":["card_id","agent","body"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"agent":{"type":"string","maxLength":256},"body":{"type":"string","maxLength":16384},"model":{"type":"string","maxLength":256},"reasoning":{"type":"string","maxLength":256},"harness":{"type":"string","maxLength":256},"run_id":{"type":"string","maxLength":256},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "append_run_work_log",
+        description: "Append one retry-safe powder.work_log_entry.v1 only if expected_run_id is still the card's unexpired current run and actor/agent attribution is authorized. The succeeded powder.operation_status.v1 result exactly matches card detail, run detail, audit identity, and the emitted event record.",
+        input_schema: r#"{"type":"object","required":["operation_id","card_id","expected_run_id","agent","body","actor"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"expected_run_id":{"type":"string"},"agent":{"type":"string","maxLength":256},"body":{"type":"string","maxLength":16384},"model":{"type":"string","maxLength":256},"reasoning":{"type":"string","maxLength":256},"harness":{"type":"string","maxLength":256},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "request_input",
@@ -143,8 +153,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "complete_card",
-        description: "Set a card done, optionally recording a proof artifact or URL and proof links attached to criteria; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        description: "Set a card done through Powder's permissive operator-correction path. Supply operation_id for durable replay and status recovery. This P2 contract does not add an expected-current-run precondition.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"operation_id":{"type":"string","maxLength":128},"card_id":{"type":"string"},"proof":{"type":"string","maxLength":4096},"criterion_proofs":{"type":"array","maxItems":128,"items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string","maxLength":4096}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "operation_status",
+        description: "Recover one bounded mutation outcome by stable operation identity. Returns powder.operation_status.v1 with unknown, pending, succeeded, rejected, or failed state.",
+        input_schema: r#"{"type":"object","required":["operation_id"],"properties":{"operation_id":{"type":"string","maxLength":128},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "create_event_subscription",
@@ -578,6 +593,36 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             criterion_ack_payload(&card, criterion, checked)
         }
+        "review_criterion" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            let criterion = criterion_arg(args)?;
+            let criterion_id = required_str(args, "criterion_id")?;
+            let decision_raw = required_str(args, "decision")?;
+            let decision = CriterionReviewDecision::parse(decision_raw).ok_or_else(|| {
+                invalid_enum_value(
+                    "decision",
+                    decision_raw,
+                    "approved|rejected|cleared".to_string(),
+                )
+            })?;
+            json!(store
+                .review_criterion(
+                    &card_id,
+                    CriterionReviewInput {
+                        operation_id: OperationId::new(required_str(args, "operation_id")?)
+                            .map_err(to_string)?,
+                        expected_run_id: run_id,
+                        criterion,
+                        criterion_id: criterion_id.to_string(),
+                        decision,
+                        proof: optional_str(args, "proof").map(str::to_string),
+                    },
+                    now,
+                    &authority_arg(args),
+                )
+                .map_err(to_string)?)
+        }
         "update_relations" => {
             let card_id = card_id(args, "card_id")?;
             let card = store
@@ -618,8 +663,45 @@ pub fn call_tool_store(
                 harness: optional_str(args, "harness"),
                 run_id: optional_str(args, "run_id"),
             };
+            if let Some(operation_id) = optional_str(args, "operation_id") {
+                json!(store
+                    .append_work_log_idempotent(
+                        OperationId::new(operation_id).map_err(to_string)?,
+                        &card_id,
+                        agent,
+                        attribution,
+                        body,
+                        now,
+                        &authority_arg(args),
+                    )
+                    .map_err(to_string)?)
+            } else {
+                json!(store
+                    .append_work_log(&card_id, agent, attribution, body, now)
+                    .map_err(to_string)?)
+            }
+        }
+        "append_run_work_log" => {
+            let card_id = card_id(args, "card_id")?;
+            let run_id = RunId::new(required_str(args, "expected_run_id")?).map_err(to_string)?;
+            let agent = required_str(args, "agent")?;
+            let body = required_str(args, "body")?;
             json!(store
-                .append_work_log(&card_id, agent, attribution, body, now)
+                .append_run_work_log_idempotent(
+                    OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?,
+                    &card_id,
+                    &run_id,
+                    agent,
+                    powder_store::WorkLogAttribution {
+                        model: optional_str(args, "model"),
+                        reasoning: optional_str(args, "reasoning"),
+                        harness: optional_str(args, "harness"),
+                        run_id: None,
+                    },
+                    body,
+                    now,
+                    &authority_arg(args),
+                )
                 .map_err(to_string)?)
         }
         "request_input" => {
@@ -631,16 +713,37 @@ pub fn call_tool_store(
         }
         "complete_card" => {
             let card_id = card_id(args, "card_id")?;
-            let card = store
-                .complete_card(
-                    &card_id,
-                    optional_str(args, "proof"),
-                    criterion_proofs_arg(args)?,
-                    now,
-                    &authority_arg(args),
-                )
-                .map_err(to_string)?;
-            card_ack_payload(&card)
+            let criterion_proofs = criterion_proofs_arg(args)?;
+            if let Some(operation_id) = optional_str(args, "operation_id") {
+                json!(store
+                    .complete_card_idempotent(
+                        OperationId::new(operation_id).map_err(to_string)?,
+                        &card_id,
+                        optional_str(args, "proof"),
+                        criterion_proofs,
+                        now,
+                        &authority_arg(args),
+                    )
+                    .map_err(to_string)?)
+            } else {
+                let card = store
+                    .complete_card(
+                        &card_id,
+                        optional_str(args, "proof"),
+                        criterion_proofs,
+                        now,
+                        &authority_arg(args),
+                    )
+                    .map_err(to_string)?;
+                card_ack_payload(&card)
+            }
+        }
+        "operation_status" => {
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            json!(store
+                .operation_status(&operation_id, now, &authority_arg(args))
+                .map_err(to_string)?)
         }
         "create_event_subscription" => {
             let url = required_str(args, "url")?;
@@ -849,8 +952,17 @@ fn manage_claim_store(store: &mut Store, args: &Value, now: i64) -> Result<Value
         ClaimAction::Transfer => {
             let run_id = run_id_for_claim(args, action)?;
             let to_agent = required_claim_arg(args, action, "to_agent")?;
+            let to_identity = args.get("to_identity").and_then(Value::as_str);
             json!(store
-                .transfer_claim(&card_id, &run_id, to_agent, now, ttl_seconds, &authority)
+                .transfer_claim_with_identity(
+                    &card_id,
+                    &run_id,
+                    to_agent,
+                    to_identity,
+                    now,
+                    ttl_seconds,
+                    &authority,
+                )
                 .map_err(to_string)?)
         }
     })
@@ -952,8 +1064,9 @@ fn criterion_proofs_arg(args: &Value) -> Result<Vec<CriterionProofInput>, String
 fn criterion_arg(args: &Value) -> Result<usize, String> {
     args["criterion"]
         .as_u64()
+        .filter(|value| *value <= u32::MAX as u64)
         .map(|value| value as usize)
-        .ok_or_else(|| missing_required("criterion"))
+        .ok_or_else(|| "criterion must be an unsigned 32-bit integer".to_string())
 }
 
 fn parse_status(raw: &str) -> Result<CardStatus, String> {
@@ -1148,7 +1261,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 20);
+        assert_eq!(default_tools.len(), 23);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1273,15 +1386,18 @@ mod tests {
                 "answer_input",
                 "update_status",
                 "check_criterion",
+                "review_criterion",
                 "update_relations",
                 "add_link",
                 "add_comment",
                 "append_work_log",
+                "append_run_work_log",
                 "request_input",
                 "complete_card",
+                "operation_status",
             ]
         );
-        assert_eq!(default_names.len(), 20);
+        assert_eq!(default_names.len(), 23);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1293,7 +1409,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 29);
+        assert_eq!(admin_names.len(), 32);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -2198,6 +2314,92 @@ Expose tools against the DB.
     }
 
     #[test]
+    fn direct_store_mcp_cannot_create_authoritative_review() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({
+                "id": "mcp-review",
+                "title": "MCP review",
+                "acceptance": ["review through mcp"],
+                "status": "ready"
+            }),
+            now,
+        )
+        .unwrap();
+        let claim = call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({
+                "card_id": "mcp-review",
+                "action": "claim",
+                "agent": "mcp-reviewer",
+                "actor": "mcp-reviewer"
+            }),
+            now + 1,
+        )
+        .unwrap();
+        let run_id = tool_payload(&claim)["run_id"].as_str().unwrap().to_string();
+        let detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "mcp-review", "detail": "detailed"}),
+            now + 2,
+        )
+        .unwrap();
+        let criterion_id = tool_payload(&detail)["current_run_criteria"][0]["criterion_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reviewed = call_tool_store(
+            &mut store,
+            "review_criterion",
+            &json!({
+                "operation_id": "mcp-review-op",
+                "card_id": "mcp-review",
+                "run_id": run_id,
+                "criterion": 0,
+                "criterion_id": criterion_id,
+                "decision": "approved",
+                "proof": "https://example.test/mcp-proof",
+                "actor": "mcp-reviewer"
+            }),
+            now + 3,
+        )
+        .unwrap_err();
+        assert!(reviewed.contains("run-scoped criterion review requires authenticated authority"));
+
+        let card_detail = call_tool_store(
+            &mut store,
+            "get_card",
+            &json!({"card_id": "mcp-review", "detail": "detailed"}),
+            now + 4,
+        )
+        .unwrap();
+        let run_detail = call_tool_store(
+            &mut store,
+            "get_run",
+            &json!({"run_id": run_id, "detail": "detailed"}),
+            now + 4,
+        )
+        .unwrap();
+        let card_detail = tool_payload(&card_detail);
+        let run_detail = tool_payload(&run_detail);
+        assert_eq!(card_detail["current_run_criteria"], run_detail["criteria"]);
+        assert!(card_detail.get("criterion_reviews").is_none());
+        assert!(run_detail.get("criterion_reviews").is_none());
+        assert!(card_detail["current_run_criteria"][0]
+            .get("review")
+            .is_none());
+    }
+
+    #[test]
     fn mcp_get_card_emits_criteria_but_lists_emit_only_summaries() {
         // powder-966: a >200-char criterion is the falsifier for server-side
         // truncation. get_card must return it byte-for-byte; list_cards and
@@ -2573,6 +2775,143 @@ Expose tools against the DB.
         )
         .unwrap();
         assert!(tool_payload(&card)["work_log"][0]["agent"] == "codex");
+    }
+
+    #[test]
+    fn mcp_append_run_work_log_returns_one_exact_run_bound_record() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let card_id = CardId::new("strict-mcp").unwrap();
+        store
+            .import_cards(vec![Card::new(card_id.clone(), "Strict MCP", "G.")
+                .unwrap()
+                .with_status(CardStatus::Ready)
+                .with_acceptance(["g".to_string()])
+                .with_created_at(1)])
+            .unwrap();
+        let claim = store
+            .claim_card(
+                &card_id,
+                "codex",
+                10,
+                100,
+                &Authority::actor("codex", false),
+            )
+            .unwrap();
+        let arguments = json!({
+            "operation_id": "mcp:strict:one",
+            "card_id": "strict-mcp",
+            "expected_run_id": claim.run_id,
+            "agent": "codex",
+            "actor": "codex",
+            "body": "focused tests passed"
+        });
+        let first = call_tool_store(&mut store, "append_run_work_log", &arguments, 20).unwrap();
+        let replay = call_tool_store(&mut store, "append_run_work_log", &arguments, 21).unwrap();
+        assert_eq!(tool_payload(&replay), tool_payload(&first));
+        let result = tool_payload(&first)["result"].clone();
+        assert_eq!(result["schema_version"], "powder.work_log_entry.v1");
+        assert_eq!(result["run_id"], claim.run_id.as_str());
+        let run = call_tool_store(
+            &mut store,
+            "get_run",
+            &json!({"run_id": claim.run_id, "detail": "detailed"}),
+            22,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&run)["work_log"][0], result);
+    }
+
+    #[test]
+    fn mcp_operation_status_matches_idempotent_mutation_outcome() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        store
+            .import_cards(vec![Card::new(
+                CardId::new("operation-mcp").unwrap(),
+                "Operation MCP",
+                "G.",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["g".to_string()])
+            .with_created_at(1)])
+            .unwrap();
+        let arguments = json!({
+            "operation_id": "op-mcp-work-log",
+            "card_id": "operation-mcp",
+            "agent": "codex",
+            "actor": "codex",
+            "body": "one effect"
+        });
+        let first = call_tool_store(&mut store, "append_work_log", &arguments, 10).unwrap();
+        assert_eq!(
+            tool_payload(&first)["state"],
+            "succeeded",
+            "unexpected operation response: {}",
+            tool_payload(&first)
+        );
+        let replay = call_tool_store(&mut store, "append_work_log", &arguments, 11).unwrap();
+        assert_eq!(tool_payload(&first), tool_payload(&replay));
+        let status = call_tool_store(
+            &mut store,
+            "operation_status",
+            &json!({"operation_id": "op-mcp-work-log", "actor": "codex"}),
+            12,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&status), tool_payload(&first));
+    }
+
+    #[test]
+    fn mcp_completion_operation_replays_and_recovers_one_proof_effect() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let card_id = CardId::new("completion-operation-mcp").unwrap();
+        store
+            .import_cards(vec![Card::new(
+                card_id.clone(),
+                "Completion operation MCP",
+                "G.",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["proof is linked".to_string()])
+            .with_created_at(1)])
+            .unwrap();
+        let arguments = json!({
+            "operation_id": "op-mcp-completion",
+            "card_id": "completion-operation-mcp",
+            "proof": "credential-free",
+            "criterion_proofs": [{
+                "criterion": 0,
+                "url": "https://example.test/mcp-completion"
+            }],
+            "actor": "operator",
+            "admin": true
+        });
+        let first = call_tool_store(&mut store, "complete_card", &arguments, 10).unwrap();
+        let replay = call_tool_store(&mut store, "complete_card", &arguments, 11).unwrap();
+        assert_eq!(tool_payload(&first)["state"], "succeeded");
+        assert_eq!(tool_payload(&replay), tool_payload(&first));
+        let status = call_tool_store(
+            &mut store,
+            "operation_status",
+            &json!({
+                "operation_id": "op-mcp-completion",
+                "actor": "operator",
+                "admin": true
+            }),
+            12,
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&status), tool_payload(&first));
+        let detail = store
+            .get_card_detail(&card_id, DetailLevel::Detailed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.card.status, CardStatus::Done);
+        assert_eq!(detail.card.criteria[0].proof_links.len(), 1);
     }
 
     #[test]

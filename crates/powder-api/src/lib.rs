@@ -160,6 +160,14 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+        intent: "atomically record one authenticated run-scoped criterion decision with stable operation replay, exact criterion identity, bounded proof, immutable history, and current-run enforcement",
+        body_shape: Some(
+            r#"{"operation_id":"...","criterion":0,"criterion_id":"powder.criterion.v1:sha256:...:0","decision":"approved|rejected|cleared","proof":null} -- reviewer identity is derived from authenticated authority; reviewer and actor fields are rejected"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/cards/{id}/links",
         intent: "attach proof, PRs, CI, or reference links to a card",
         body_shape: Some(
@@ -175,9 +183,17 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/work-log",
-        intent: "append a high-frequency, fully-attributed work_log entry while actively working a card (powder-943) -- context, current activity, issues, chain of thought, distinct from the low-frequency human-facing comments field",
+        intent: "append an explicit permissive unbound/operator work-log note; this compatibility path does not assert current-run ownership",
         body_shape: Some(
-            r#"{"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; body is scrubbed for known secret shapes server-side before storage"#,
+            r#"{"operation_id":null,"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; operation_id opts into powder.operation_status.v1 replay and recovery; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; every caller-controlled attribution field and body is scrubbed for known secret shapes server-side before storage"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/cards/{id}/runs/{run_id}/work-log",
+        intent: "atomically append one retry-safe work-log entry only when run_id is the card's unexpired current run and the authenticated actor is authorized for its agent attribution",
+        body_shape: Some(
+            r#"{"operation_id":"stable-id","agent":"...","body":"...","model":null,"reasoning":null,"harness":null} -- operation_id, agent, and body are required; returns powder.operation_status.v1 whose succeeded result is the exact powder.work_log_entry.v1 record stored in card/run detail and emitted in powder.card_event.v1 change.work_log"#,
         ),
     },
     ApiRoute {
@@ -195,7 +211,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/{id}",
-        intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
+        intent: "read one run with activity, card, links, comments, and work-log entries bound to that run; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated",
         body_shape: None,
     },
     ApiRoute {
@@ -207,7 +223,15 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/complete",
-        intent: "mark a card done, optionally recording proof and criterion proof links",
+        intent: "mark a card done through the existing permissive operator-correction contract, optionally recording proof and criterion proof links; operation_id opts into replay and recovery but does not add an expected-run precondition",
+        body_shape: Some(
+            r#"{"operation_id":null,"proof":null,"criterion_proofs":null} -- operation_id opts into powder.operation_status.v1; proof and criterion_proofs remain optional; expected-current-run completion is a separate contract"#,
+        ),
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/operations/{id}",
+        intent: "read one bounded powder.operation_status.v1 recovery record as unknown, pending, succeeded, rejected, or failed; the creating authority or an admin is required",
         body_shape: None,
     },
     ApiRoute {

@@ -1,6 +1,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -74,6 +75,7 @@ pub enum Authority {
     Unchecked,
     Actor {
         display_name: String,
+        operation_identity: Option<String>,
         is_admin: bool,
     },
 }
@@ -86,6 +88,21 @@ impl Authority {
     pub fn actor(display_name: impl Into<String>, is_admin: bool) -> Self {
         Self::Actor {
             display_name: display_name.into(),
+            operation_identity: None,
+            is_admin,
+        }
+    }
+
+    /// Construct an adapter-authenticated authority whose stable identity is
+    /// distinct from its human-readable audit label.
+    pub fn authenticated(
+        display_name: impl Into<String>,
+        operation_identity: impl Into<String>,
+        is_admin: bool,
+    ) -> Self {
+        Self::Actor {
+            display_name: display_name.into(),
+            operation_identity: Some(operation_identity.into()),
             is_admin,
         }
     }
@@ -100,6 +117,7 @@ impl Authority {
             Self::Actor {
                 display_name,
                 is_admin: false,
+                ..
             } => {
                 if display_name == requested {
                     Ok(())
@@ -121,6 +139,7 @@ impl Authority {
             Self::Actor {
                 display_name,
                 is_admin: false,
+                ..
             } => match holder {
                 Some(current) if current == display_name => Ok(()),
                 _ => Err(DomainError::forbidden(format!(
@@ -134,6 +153,81 @@ impl Authority {
         match self {
             Self::Unchecked => "unchecked".to_string(),
             Self::Actor { display_name, .. } => display_name.clone(),
+        }
+    }
+
+    /// Stable identity used in operation digests and recovery authorization.
+    /// Legacy local actors fall back to their audit label.
+    pub fn operation_identity(&self) -> &str {
+        match self {
+            Self::Unchecked => "unchecked",
+            Self::Actor {
+                display_name,
+                operation_identity,
+                ..
+            } if operation_identity.is_none() => display_name,
+            Self::Actor {
+                operation_identity, ..
+            } => operation_identity
+                .as_deref()
+                .expect("matched Some operation identity"),
+        }
+    }
+
+    /// Return the stable identity supplied by an authenticated adapter.
+    ///
+    /// Run-scoped review deliberately excludes unchecked and label-only local
+    /// authority. Those surfaces retain the separate legacy criterion
+    /// correction mutation, but cannot create authoritative review state.
+    pub fn require_authenticated_identity(&self) -> Result<&str, DomainError> {
+        match self {
+            Self::Actor {
+                operation_identity: Some(identity),
+                ..
+            } => Ok(identity),
+            Self::Unchecked | Self::Actor { .. } => Err(DomainError::forbidden(
+                "run-scoped criterion review requires authenticated authority",
+            )),
+        }
+    }
+
+    pub fn authenticated_identity(&self) -> Option<&str> {
+        match self {
+            Self::Actor {
+                operation_identity: Some(identity),
+                ..
+            } => Some(identity),
+            Self::Unchecked | Self::Actor { .. } => None,
+        }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Self::Actor { is_admin: true, .. })
+    }
+
+    /// Operation recovery is scoped to the authenticated authority that
+    /// created the operation. Admins and unchecked local operator surfaces
+    /// may inspect any operation, while an agent may inspect only its own.
+    pub fn require_operation_authority(&self, recorded: &str) -> Result<(), DomainError> {
+        match self {
+            Self::Unchecked | Self::Actor { is_admin: true, .. } => Ok(()),
+            Self::Actor {
+                display_name,
+                is_admin: false,
+                operation_identity,
+                ..
+            } if operation_identity.as_deref() == Some(recorded)
+                || (operation_identity.is_none() && display_name == recorded) =>
+            {
+                Ok(())
+            }
+            Self::Actor {
+                display_name,
+                is_admin: false,
+                ..
+            } => Err(DomainError::forbidden(format!(
+                "actor {display_name} cannot inspect this operation"
+            ))),
         }
     }
 }
@@ -178,6 +272,284 @@ id_type!(RunId, "run_id");
 id_type!(ActivityId, "activity_id");
 id_type!(CardEventId, "card_event_id");
 id_type!(LinkId, "link_id");
+
+pub const OPERATION_REQUEST_SCHEMA_VERSION: &str = "powder.operation_request.v1";
+pub const OPERATION_ID_MAX_BYTES: usize = 128;
+pub const OPERATION_AUTHORITY_MAX_BYTES: usize = 256;
+pub const OPERATION_TARGET_MAX_BYTES: usize = 256;
+pub const OPERATION_REQUEST_MAX_BYTES: usize = 64 * 1024;
+
+/// Stable caller-supplied identity for one retryable mutation.
+///
+/// The deliberately narrow ASCII alphabet keeps operation ids safe in URL
+/// path segments, logs, SQLite keys, CLI output, and MCP payloads without
+/// adapter-specific escaping rules.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OperationId(String);
+
+impl OperationId {
+    pub fn new(raw: impl Into<String>) -> Result<Self, DomainError> {
+        let raw = raw.into();
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(DomainError::validation(
+                "operation_id",
+                "id cannot be empty",
+            ));
+        }
+        if value.len() > OPERATION_ID_MAX_BYTES {
+            return Err(DomainError::validation(
+                "operation_id",
+                format!("must be at most {OPERATION_ID_MAX_BYTES} bytes"),
+            ));
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err(DomainError::validation(
+                "operation_id",
+                "must use only ASCII letters, digits, '-', '_', '.', or ':'",
+            ));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    WorkLogAppend,
+    Completion,
+    CriterionReview,
+}
+
+impl OperationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkLogAppend => "work_log_append",
+            Self::Completion => "completion",
+            Self::CriterionReview => "criterion_review",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "work_log_append" => Some(Self::WorkLogAppend),
+            "completion" => Some(Self::Completion),
+            "criterion_review" => Some(Self::CriterionReview),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Unknown,
+    Pending,
+    Succeeded,
+    Rejected,
+    Failed,
+}
+
+impl OperationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Pending => "pending",
+            Self::Succeeded => "succeeded",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "succeeded" => Some(Self::Succeeded),
+            "rejected" => Some(Self::Rejected),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One ordered canonical payload component.
+///
+/// Callers must provide fields in the operation kind's documented order.
+/// Names and values are length-prefixed before hashing, so delimiter and
+/// absent-versus-empty ambiguities cannot collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationField<'a> {
+    pub name: &'a str,
+    pub value: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRequest {
+    pub id: OperationId,
+    pub kind: OperationKind,
+    pub target: CardId,
+    pub authority: String,
+    pub expected_run: Option<RunId>,
+    pub request_digest: String,
+}
+
+impl OperationRequest {
+    pub fn new(
+        id: OperationId,
+        kind: OperationKind,
+        target: CardId,
+        authority: &str,
+        expected_run: Option<RunId>,
+        payload: &[OperationField<'_>],
+    ) -> Result<Self, DomainError> {
+        Self::new_with_recorded_expected_run(
+            id,
+            kind,
+            target,
+            authority,
+            expected_run.clone(),
+            expected_run,
+            payload,
+        )
+    }
+
+    /// Build a digest over the caller's original expected run while storing
+    /// a separate credential-safe projection for recovery responses.
+    pub fn new_with_recorded_expected_run(
+        id: OperationId,
+        kind: OperationKind,
+        target: CardId,
+        authority: &str,
+        digest_expected_run: Option<RunId>,
+        recorded_expected_run: Option<RunId>,
+        payload: &[OperationField<'_>],
+    ) -> Result<Self, DomainError> {
+        validate_operation_component(
+            "operation target",
+            target.as_str(),
+            OPERATION_TARGET_MAX_BYTES,
+        )?;
+        validate_operation_component(
+            "operation authority",
+            authority,
+            OPERATION_AUTHORITY_MAX_BYTES,
+        )?;
+
+        let mut canonical_bytes = 0usize;
+        let mut hasher = Sha256::new();
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "schema",
+            Some(OPERATION_REQUEST_SCHEMA_VERSION),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "kind",
+            Some(kind.as_str()),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "target_type",
+            Some("card"),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "target",
+            Some(target.as_str()),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "authority",
+            Some(authority),
+        )?;
+        hash_component(
+            &mut hasher,
+            &mut canonical_bytes,
+            "expected_run",
+            digest_expected_run.as_ref().map(RunId::as_str),
+        )?;
+        for field in payload {
+            hash_component(&mut hasher, &mut canonical_bytes, field.name, field.value)?;
+        }
+
+        Ok(Self {
+            id,
+            kind,
+            target,
+            authority: authority.to_owned(),
+            expected_run: recorded_expected_run,
+            request_digest: format!("sha256:{:x}", hasher.finalize()),
+        })
+    }
+}
+
+fn validate_operation_component(
+    field: &'static str,
+    value: &str,
+    maximum: usize,
+) -> Result<(), DomainError> {
+    if value.is_empty() {
+        return Err(DomainError::validation(field, "cannot be empty"));
+    }
+    if value.len() > maximum {
+        return Err(DomainError::validation(
+            field,
+            format!("must be at most {maximum} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_component(
+    hasher: &mut Sha256,
+    canonical_bytes: &mut usize,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), DomainError> {
+    let value_len = value.map_or(0, str::len);
+    let added = 8usize
+        .checked_add(name.len())
+        .and_then(|count| count.checked_add(value_len))
+        .ok_or_else(|| DomainError::validation("operation request", "size overflow"))?;
+    *canonical_bytes = canonical_bytes
+        .checked_add(added)
+        .ok_or_else(|| DomainError::validation("operation request", "size overflow"))?;
+    if *canonical_bytes > OPERATION_REQUEST_MAX_BYTES {
+        return Err(DomainError::validation(
+            "operation request",
+            format!("must be at most {OPERATION_REQUEST_MAX_BYTES} canonical bytes"),
+        ));
+    }
+    hasher.update((name.len() as u32).to_be_bytes());
+    hasher.update(name.as_bytes());
+    match value {
+        Some(value) => {
+            hasher.update((value.len() as u32).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update(u32::MAX.to_be_bytes()),
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -464,6 +836,84 @@ pub struct AcceptanceCriterion {
     pub checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proof_links: Vec<CriterionProof>,
+}
+
+/// Stable identity for one criterion value at one duplicate occurrence.
+///
+/// Exact text is hashed so reordering distinct criteria preserves identity,
+/// while edits fail closed instead of inheriting an earlier review. The
+/// occurrence suffix distinguishes duplicate text without pretending the
+/// duplicates have an ordering-independent identity.
+pub fn criterion_identity(criteria: &[AcceptanceCriterion], index: usize) -> Option<String> {
+    let criterion = criteria.get(index)?;
+    let occurrence = criteria[..index]
+        .iter()
+        .filter(|candidate| candidate.text == criterion.text)
+        .count();
+    let digest = Sha256::digest(criterion.text.as_bytes());
+    Some(format!(
+        "powder.criterion.v1:sha256:{digest:x}:{occurrence}"
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionReviewDecision {
+    Approved,
+    Rejected,
+    Cleared,
+}
+
+impl CriterionReviewDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Cleared => "cleared",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            "cleared" => Some(Self::Cleared),
+            _ => None,
+        }
+    }
+}
+
+/// Immutable audit row for one run-scoped criterion review action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CriterionReview {
+    pub id: String,
+    pub operation_id: OperationId,
+    pub card_id: CardId,
+    pub run_id: RunId,
+    pub criterion_index: usize,
+    pub criterion_id: String,
+    pub criterion_text: String,
+    pub decision: CriterionReviewDecision,
+    pub reviewer: String,
+    pub reviewer_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_review_id: Option<String>,
+    pub created_at: i64,
+}
+
+/// Exact criterion state for a specified run.
+///
+/// Consumers approve only `review.decision == approved`. A missing review or
+/// a latest `cleared`/`rejected` review is not approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCriterionState {
+    pub criterion_index: usize,
+    pub criterion_id: String,
+    pub criterion_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<CriterionReview>,
 }
 
 impl AcceptanceCriterion {
@@ -871,6 +1321,24 @@ impl Card {
         self.claim.as_ref().map(|claim| claim.agent.as_str())
     }
 
+    /// Resolve the exact unexpired current claim for a run-bound agent
+    /// mutation. This is intentionally stricter than permissive operator
+    /// correction paths, which do not use claims as lifecycle law.
+    pub fn current_claim_for_run_agent(
+        &self,
+        run_id: &RunId,
+        agent: &str,
+        now: i64,
+    ) -> Result<&Claim, DomainError> {
+        let claim = self.matching_active_claim(run_id, now)?;
+        if claim.agent != agent {
+            return Err(DomainError::forbidden(format!(
+                "agent {agent} does not own run {run_id}"
+            )));
+        }
+        Ok(claim)
+    }
+
     /// Whether this card's lifecycle (status + claim) must survive a
     /// backlog.d reimport: an active claim, a claimed/running/awaiting-input
     /// status, or a terminal outcome. A backlog/ready/blocked card with no
@@ -1140,7 +1608,10 @@ pub struct Comment {
 /// whatever attribution the calling surface can supply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkLogEntry {
+    pub schema_version: String,
+    pub id: String,
     pub card_id: CardId,
+    pub actor: String,
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1152,6 +1623,7 @@ pub struct WorkLogEntry {
     pub run_id: Option<RunId>,
     pub body: String,
     pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1206,6 +1678,12 @@ pub struct CardDetail {
     pub work_log: Vec<WorkLogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_log_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_run_criteria: Vec<RunCriterionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criterion_reviews: Vec<CriterionReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_reviews_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -1226,6 +1704,16 @@ pub struct RunDetail {
     pub comments: Vec<Comment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comments_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_log: Vec<WorkLogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_log_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<RunCriterionState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criterion_reviews: Vec<CriterionReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_reviews_total: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -1651,5 +2139,195 @@ mod tests {
     fn claim_readiness_ok_when_criteria_present_and_unblocked() {
         let card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
         assert!(card.claim_readiness(10, |_| true).is_ok());
+    }
+
+    #[test]
+    fn current_claim_for_run_agent_rejects_stale_expired_and_foreign_attribution() {
+        let mut card = Card::new(CardId::new("strict-domain").unwrap(), "Strict", "body")
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["proof".to_string()]);
+        let run = RunId::new("run-current").unwrap();
+        card.apply_claim("agent-a", run.clone(), 10, 10, |_| false)
+            .unwrap();
+        assert_eq!(
+            card.current_claim_for_run_agent(&run, "agent-a", 19)
+                .unwrap()
+                .run_id,
+            run
+        );
+        assert!(matches!(
+            card.current_claim_for_run_agent(&run, "agent-b", 19),
+            Err(DomainError::Forbidden(_))
+        ));
+        assert!(matches!(
+            card.current_claim_for_run_agent(&RunId::new("run-stale").unwrap(), "agent-a", 19),
+            Err(DomainError::Conflict(_))
+        ));
+        assert!(matches!(
+            card.current_claim_for_run_agent(&run, "agent-a", 20),
+            Err(DomainError::ClaimExpired(_))
+        ));
+    }
+
+    #[test]
+    fn operation_digest_is_stable_and_covers_every_authority_and_payload_dimension() {
+        let build = |authority: &str, body: &str, run: Option<&str>| {
+            OperationRequest::new(
+                OperationId::new("op:stable-1").unwrap(),
+                OperationKind::WorkLogAppend,
+                CardId::new("card-1").unwrap(),
+                authority,
+                run.map(|value| RunId::new(value).unwrap()),
+                &[
+                    OperationField {
+                        name: "agent",
+                        value: Some("agent-a"),
+                    },
+                    OperationField {
+                        name: "body",
+                        value: Some(body),
+                    },
+                ],
+            )
+            .unwrap()
+            .request_digest
+        };
+
+        let digest = build("agent-a", "same", Some("run-1"));
+        assert_eq!(digest, build("agent-a", "same", Some("run-1")));
+        assert_ne!(digest, build("agent-b", "same", Some("run-1")));
+        assert_ne!(digest, build("agent-a", "changed", Some("run-1")));
+        assert_ne!(digest, build("agent-a", "same", Some("run-2")));
+        assert_ne!(digest, build("agent-a", "same", None));
+    }
+
+    #[test]
+    fn operation_identity_and_canonical_request_are_bounded() {
+        assert!(OperationId::new("valid.id:1_test").is_ok());
+        assert!(OperationId::new("contains/slash").is_err());
+        assert!(OperationId::new("x".repeat(OPERATION_ID_MAX_BYTES + 1)).is_err());
+        let oversized = "x".repeat(OPERATION_REQUEST_MAX_BYTES);
+        let error = OperationRequest::new(
+            OperationId::new("op-bounded").unwrap(),
+            OperationKind::Completion,
+            CardId::new("card-1").unwrap(),
+            "operator",
+            None,
+            &[OperationField {
+                name: "proof",
+                value: Some(&oversized),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("canonical bytes"));
+    }
+
+    #[test]
+    fn scrubbed_expected_run_projection_does_not_weaken_the_original_digest() {
+        let original = OperationRequest::new_with_recorded_expected_run(
+            OperationId::new("op-safe-run-projection").unwrap(),
+            OperationKind::WorkLogAppend,
+            CardId::new("card-1").unwrap(),
+            "actor-1",
+            Some(RunId::new("run-sensitive-original").unwrap()),
+            Some(RunId::new("run-[REDACTED:openai-key]").unwrap()),
+            &[],
+        )
+        .unwrap();
+        let digest = original.request_digest.clone();
+
+        assert_eq!(original.request_digest, digest);
+        assert_eq!(
+            original.expected_run.unwrap().as_str(),
+            "run-[REDACTED:openai-key]"
+        );
+        let different_original = OperationRequest::new(
+            OperationId::new("op-safe-run-projection").unwrap(),
+            OperationKind::WorkLogAppend,
+            CardId::new("card-1").unwrap(),
+            "actor-1",
+            Some(RunId::new("run-sensitive-different").unwrap()),
+            &[],
+        )
+        .unwrap();
+        assert_ne!(different_original.request_digest, digest);
+    }
+
+    #[test]
+    fn criterion_identity_survives_distinct_reordering_and_fails_closed_on_edit() {
+        let original = vec![
+            AcceptanceCriterion::new("alpha").unwrap(),
+            AcceptanceCriterion::new("beta").unwrap(),
+        ];
+        let reordered = vec![
+            AcceptanceCriterion::new("beta").unwrap(),
+            AcceptanceCriterion::new("alpha").unwrap(),
+        ];
+        let edited = vec![AcceptanceCriterion::new("alpha edited").unwrap()];
+
+        assert_eq!(
+            criterion_identity(&original, 0),
+            criterion_identity(&reordered, 1)
+        );
+        assert_ne!(
+            criterion_identity(&original, 0),
+            criterion_identity(&edited, 0)
+        );
+    }
+
+    #[test]
+    fn criterion_identity_distinguishes_duplicate_occurrences() {
+        let criteria = vec![
+            AcceptanceCriterion::new("same").unwrap(),
+            AcceptanceCriterion::new("other").unwrap(),
+            AcceptanceCriterion::new("same").unwrap(),
+        ];
+
+        assert_ne!(
+            criterion_identity(&criteria, 0),
+            criterion_identity(&criteria, 2)
+        );
+        assert!(criterion_identity(&criteria, 3).is_none());
+    }
+
+    #[test]
+    fn criterion_review_operation_digest_binds_every_contract_field() {
+        let build = |criterion_id: &str, decision: &str, proof: Option<&str>| {
+            OperationRequest::new(
+                OperationId::new("review-op").unwrap(),
+                OperationKind::CriterionReview,
+                CardId::new("card-1").unwrap(),
+                "actor-1",
+                Some(RunId::new("run-1").unwrap()),
+                &[
+                    OperationField {
+                        name: "criterion_index",
+                        value: Some("0"),
+                    },
+                    OperationField {
+                        name: "criterion_id",
+                        value: Some(criterion_id),
+                    },
+                    OperationField {
+                        name: "decision",
+                        value: Some(decision),
+                    },
+                    OperationField {
+                        name: "proof",
+                        value: proof,
+                    },
+                ],
+            )
+            .unwrap()
+            .request_digest
+        };
+
+        let base = build("criterion-a", "approved", Some("proof-a"));
+        assert_eq!(base, build("criterion-a", "approved", Some("proof-a")));
+        assert_ne!(base, build("criterion-b", "approved", Some("proof-a")));
+        assert_ne!(base, build("criterion-a", "rejected", Some("proof-a")));
+        assert_ne!(base, build("criterion-a", "approved", Some("proof-b")));
+        assert_ne!(base, build("criterion-a", "approved", None));
     }
 }

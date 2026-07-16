@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 18;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_card_created ON runs(card_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS run_review_authorities (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  authority TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS activities (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -125,15 +130,57 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE TABLE IF NOT EXISTS work_log_entries (
   id TEXT PRIMARY KEY,
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  actor TEXT NOT NULL,
   agent TEXT NOT NULL,
   model TEXT,
   reasoning TEXT,
   harness TEXT,
   run_id TEXT,
   body TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_log_entries_run_created ON work_log_entries(run_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS mutation_operations (
+  operation_id TEXT PRIMARY KEY,
+  request_digest TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion', 'criterion_review')),
+  target_card_id TEXT NOT NULL,
+  authority TEXT NOT NULL,
+  expected_run_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+  result_json TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  audit_event_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
+
+CREATE TABLE IF NOT EXISTS criterion_reviews (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  criterion_index INTEGER NOT NULL,
+  criterion_id TEXT NOT NULL,
+  criterion_text TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected', 'cleared')),
+  reviewer TEXT NOT NULL,
+  reviewer_identity TEXT NOT NULL,
+  proof TEXT,
+  supersedes_review_id TEXT REFERENCES criterion_reviews(id),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_card_created
+  ON criterion_reviews(card_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_run_criterion_created
+  ON criterion_reviews(run_id, criterion_id, sequence DESC);
 
 CREATE TABLE IF NOT EXISTS event_subscriptions (
   id TEXT PRIMARY KEY,
@@ -362,6 +409,108 @@ ALTER TABLE cards ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'review';
 /// backfill it.
 pub const MIGRATE_12_TO_13: &str = r#"
 ALTER TABLE cards ADD COLUMN estimate TEXT;
+"#;
+
+/// powder-mutation-idempotency: a bounded operation ledger for ambiguous
+/// retry recovery. The mutation effect and terminal operation outcome are
+/// committed in one SQLite transaction. Expired rows are pruned by store
+/// operations, so this table is a recovery window rather than an audit log.
+pub const MIGRATE_13_TO_14: &str = r#"
+CREATE TABLE IF NOT EXISTS mutation_operations (
+  operation_id TEXT PRIMARY KEY,
+  request_digest TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion')),
+  target_card_id TEXT NOT NULL,
+  authority TEXT NOT NULL,
+  expected_run_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+  result_json TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  audit_event_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
+"#;
+
+/// powder-run-bound-work-logs: expose stable entry and actor identity in the
+/// authoritative stored work-log record. Existing permissive entries retain
+/// their historical agent as actor and their creation time as update time.
+pub const MIGRATE_14_TO_15: &str = r#"
+UPDATE work_log_entries SET actor = agent WHERE actor IS NULL;
+UPDATE work_log_entries SET updated_at = created_at WHERE updated_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_work_log_entries_run_created ON work_log_entries(run_id, created_at, id);
+"#;
+
+/// Add the criterion-review operation kind without changing any operation
+/// column, lifecycle state, retention field, or existing row.
+pub const MIGRATE_15_TO_16: &str = r#"
+ALTER TABLE mutation_operations RENAME TO mutation_operations_v15;
+
+CREATE TABLE mutation_operations (
+  operation_id TEXT PRIMARY KEY,
+  request_digest TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('work_log_append', 'completion', 'criterion_review')),
+  target_card_id TEXT NOT NULL,
+  authority TEXT NOT NULL,
+  expected_run_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'rejected', 'failed')),
+  result_json TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  audit_event_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+
+INSERT INTO mutation_operations (
+  operation_id, request_digest, kind, target_card_id, authority,
+  expected_run_id, state, result_json, failure_code, failure_message,
+  audit_event_id, created_at, updated_at, expires_at
+)
+SELECT
+  operation_id, request_digest, kind, target_card_id, authority,
+  expected_run_id, state, result_json, failure_code, failure_message,
+  audit_event_id, created_at, updated_at, expires_at
+FROM mutation_operations_v15;
+
+DROP TABLE mutation_operations_v15;
+CREATE INDEX idx_mutation_operations_expiry ON mutation_operations(expires_at, operation_id);
+"#;
+
+pub const MIGRATE_16_TO_17: &str = r#"
+CREATE TABLE IF NOT EXISTS criterion_reviews (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  criterion_index INTEGER NOT NULL,
+  criterion_id TEXT NOT NULL,
+  criterion_text TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected', 'cleared')),
+  reviewer TEXT NOT NULL,
+  proof TEXT,
+  supersedes_review_id TEXT REFERENCES criterion_reviews(id),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_card_created
+  ON criterion_reviews(card_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_criterion_reviews_run_criterion_created
+  ON criterion_reviews(run_id, criterion_id, sequence DESC);
+"#;
+
+pub const MIGRATE_17_TO_18: &str = r#"
+ALTER TABLE criterion_reviews
+  ADD COLUMN reviewer_identity TEXT NOT NULL DEFAULT 'legacy:unverified';
+
+CREATE TABLE IF NOT EXISTS run_review_authorities (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  authority TEXT NOT NULL
+);
 "#;
 
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, autonomy, priority, estimate, labels_json,

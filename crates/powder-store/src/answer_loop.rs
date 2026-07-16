@@ -4,9 +4,11 @@ use powder_core::{
     Run, RunDetail, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    append_activity, load_card, non_empty, persist_card, persist_run, schema::RUN_SELECT_SQL,
+    append_activity, load_card, load_criterion_reviews_for_card, load_criterion_reviews_for_run,
+    non_empty, persist_card, persist_run, project_run_criterion_state, schema::RUN_SELECT_SQL,
     Result, RunRecord, Store, StoreError,
 };
 
@@ -24,6 +26,15 @@ impl Store {
         card_id: &CardId,
         detail: DetailLevel,
     ) -> Result<Option<CardDetail>> {
+        self.get_card_detail_at(card_id, detail, unix_now())
+    }
+
+    pub fn get_card_detail_at(
+        &self,
+        card_id: &CardId,
+        detail: DetailLevel,
+        now: i64,
+    ) -> Result<Option<CardDetail>> {
         let Some(card) = self.get_card(card_id)? else {
             return Ok(None);
         };
@@ -33,12 +44,22 @@ impl Store {
         let links = load_link_section_for_card(&self.connection, card_id, detail)?;
         let comments = load_comments_for_card(&self.connection, card_id, detail)?;
         let work_log = load_work_log_for_card(&self.connection, card_id, detail)?;
+        let criterion_reviews = review_detail_section(
+            load_criterion_reviews_for_card(&self.connection, card_id)?,
+            detail,
+        );
+        let current_run_criteria = match card.claim.as_ref().filter(|claim| !claim.is_expired(now))
+        {
+            Some(claim) => project_run_criterion_state(&self.connection, &card, &claim.run_id)?,
+            None => Vec::new(),
+        };
         let truncated = runs.truncated()
             || activities.truncated()
             || events.truncated()
             || links.truncated()
             || comments.truncated()
-            || work_log.truncated();
+            || work_log.truncated()
+            || criterion_reviews.truncated();
         Ok(Some(CardDetail {
             runs: runs.items,
             runs_total: runs.total,
@@ -52,6 +73,9 @@ impl Store {
             comments_total: comments.total,
             work_log: work_log.items,
             work_log_total: work_log.total,
+            current_run_criteria,
+            criterion_reviews: criterion_reviews.items,
+            criterion_reviews_total: criterion_reviews.total,
             hint: detail_hint(truncated),
             card,
         }))
@@ -70,7 +94,17 @@ impl Store {
         let activities = load_activities_for_run(&self.connection, run_id, detail)?;
         let links = load_link_section_for_card(&self.connection, &run.card_id, detail)?;
         let comments = load_comments_for_card(&self.connection, &run.card_id, detail)?;
-        let truncated = activities.truncated() || links.truncated() || comments.truncated();
+        let work_log = load_work_log_for_run(&self.connection, run_id, detail)?;
+        let criterion_reviews = review_detail_section(
+            load_criterion_reviews_for_run(&self.connection, run_id)?,
+            detail,
+        );
+        let criteria = project_run_criterion_state(&self.connection, &card, run_id)?;
+        let truncated = activities.truncated()
+            || links.truncated()
+            || comments.truncated()
+            || work_log.truncated()
+            || criterion_reviews.truncated();
         Ok(Some(RunDetail {
             activities: activities.items,
             activities_total: activities.total,
@@ -78,6 +112,11 @@ impl Store {
             links_total: links.total,
             comments: comments.items,
             comments_total: comments.total,
+            work_log: work_log.items,
+            work_log_total: work_log.total,
+            criteria,
+            criterion_reviews: criterion_reviews.items,
+            criterion_reviews_total: criterion_reviews.total,
             hint: detail_hint(truncated),
             run,
             card,
@@ -202,6 +241,28 @@ impl Store {
         transaction.commit()?;
         Ok(run)
     }
+}
+
+fn review_detail_section<T>(mut items: Vec<T>, detail: DetailLevel) -> DetailSection<T> {
+    let total = items.len();
+    match detail {
+        DetailLevel::Detailed => DetailSection { items, total: None },
+        DetailLevel::Concise => {
+            items.reverse();
+            items.truncate(CONCISE_DETAIL_LIMIT as usize);
+            DetailSection {
+                total: truncated_total(total, items.len()),
+                items,
+            }
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 struct DetailSection<T> {
@@ -753,7 +814,8 @@ fn load_work_log_for_card(
     let records = match detail {
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
-                "SELECT card_id, agent, model, reasoning, harness, run_id, body, created_at
+                "SELECT id, card_id, actor, agent, model, reasoning, harness, run_id, body,
+                        created_at, updated_at
                  FROM work_log_entries
                  WHERE card_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -765,7 +827,8 @@ fn load_work_log_for_card(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT card_id, agent, model, reasoning, harness, run_id, body, created_at
+                "SELECT id, card_id, actor, agent, model, reasoning, harness, run_id, body,
+                        created_at, updated_at
                  FROM work_log_entries
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -797,6 +860,48 @@ fn load_work_log_for_card(
     })
 }
 
+fn load_work_log_for_run(
+    connection: &Connection,
+    run_id: &RunId,
+    detail: DetailLevel,
+) -> Result<DetailSection<WorkLogEntry>> {
+    let (order, limit) = match detail {
+        DetailLevel::Detailed => ("ASC", None),
+        DetailLevel::Concise => ("DESC", Some(CONCISE_DETAIL_LIMIT)),
+    };
+    let sql = format!(
+        "SELECT id, card_id, actor, agent, model, reasoning, harness, run_id, body,
+                created_at, updated_at
+         FROM work_log_entries
+         WHERE run_id = ?1
+         ORDER BY created_at {order}, id {order}{}",
+        limit.map_or(String::new(), |value| format!(" LIMIT {value}"))
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let records = statement
+        .query_map([run_id.as_str()], WorkLogRecord::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let work_log = records
+        .into_iter()
+        .map(WorkLogRecord::into_entry)
+        .collect::<Result<Vec<_>>>()?;
+    let total = match detail {
+        DetailLevel::Detailed => None,
+        DetailLevel::Concise => {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM work_log_entries WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )?;
+            truncated_total(count as usize, work_log.len())
+        }
+    };
+    Ok(DetailSection {
+        items: work_log,
+        total,
+    })
+}
+
 fn count_work_log_for_card(connection: &Connection, card_id: &CardId) -> Result<usize> {
     let total: i64 = connection.query_row(
         "SELECT COUNT(*) FROM work_log_entries WHERE card_id = ?1",
@@ -807,7 +912,9 @@ fn count_work_log_for_card(connection: &Connection, card_id: &CardId) -> Result<
 }
 
 struct WorkLogRecord {
+    id: String,
     card_id: String,
+    actor: String,
     agent: String,
     model: Option<String>,
     reasoning: Option<String>,
@@ -815,25 +922,32 @@ struct WorkLogRecord {
     run_id: Option<String>,
     body: String,
     created_at: i64,
+    updated_at: i64,
 }
 
 impl WorkLogRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            card_id: row.get(0)?,
-            agent: row.get(1)?,
-            model: row.get(2)?,
-            reasoning: row.get(3)?,
-            harness: row.get(4)?,
-            run_id: row.get(5)?,
-            body: row.get(6)?,
-            created_at: row.get(7)?,
+            id: row.get(0)?,
+            card_id: row.get(1)?,
+            actor: row.get(2)?,
+            agent: row.get(3)?,
+            model: row.get(4)?,
+            reasoning: row.get(5)?,
+            harness: row.get(6)?,
+            run_id: row.get(7)?,
+            body: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     }
 
     fn into_entry(self) -> Result<WorkLogEntry> {
         Ok(WorkLogEntry {
+            schema_version: super::WORK_LOG_ENTRY_SCHEMA_VERSION.to_string(),
+            id: self.id,
             card_id: CardId::new(self.card_id)?,
+            actor: self.actor,
             agent: self.agent,
             model: self.model,
             reasoning: self.reasoning,
@@ -841,6 +955,7 @@ impl WorkLogRecord {
             run_id: self.run_id.map(RunId::new).transpose()?,
             body: self.body,
             created_at: self.created_at,
+            updated_at: self.updated_at,
         })
     }
 }

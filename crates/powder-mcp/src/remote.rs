@@ -6,7 +6,7 @@
 //! `actor`/`admin` tool arguments needed.
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
-use powder_core::{Card, CardSummary, DetailLevel};
+use powder_core::{Card, CardSummary, DetailLevel, OperationId};
 use serde_json::{json, Value};
 
 use super::{
@@ -238,6 +238,31 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             )?;
             remote_criterion_ack_payload(&response, criterion, checked, actor)?
         }
+        "review_criterion" => {
+            let id = card_id(args, "card_id")?;
+            let run_id = run_id(args, "run_id")?;
+            let criterion = args["criterion"]
+                .as_u64()
+                .filter(|value| *value <= u32::MAX as u64)
+                .ok_or_else(|| missing_required("criterion"))?;
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            let criterion_id = required_str(args, "criterion_id")?;
+            let decision = required_str(args, "decision")?;
+            let mut body = json!({
+                "operation_id": operation_id,
+                "criterion": criterion,
+                "criterion_id": criterion_id,
+                "decision": decision,
+            });
+            if let Some(proof) = optional_str(args, "proof") {
+                body["proof"] = json!(proof);
+            }
+            client.post(
+                &format!("/api/v1/cards/{id}/runs/{run_id}/criteria/review"),
+                body,
+            )?
+        }
         "update_relations" => {
             let id = card_id(args, "card_id")?;
             let response = client.post(
@@ -272,6 +297,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let id = card_id(args, "card_id")?;
             let agent = required_str(args, "agent")?;
             let body = required_str(args, "body")?;
+            let operation_id = optional_str(args, "operation_id")
+                .map(OperationId::new)
+                .transpose()
+                .map_err(to_string)?;
             client.post(
                 &format!("/api/v1/cards/{id}/work-log"),
                 json!({
@@ -281,6 +310,26 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                     "reasoning": optional_str(args, "reasoning"),
                     "harness": optional_str(args, "harness"),
                     "run_id": optional_str(args, "run_id"),
+                    "operation_id": operation_id,
+                }),
+            )?
+        }
+        "append_run_work_log" => {
+            let id = card_id(args, "card_id")?;
+            let run = run_id(args, "expected_run_id")?;
+            let agent = required_str(args, "agent")?;
+            let body = required_str(args, "body")?;
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            client.post(
+                &format!("/api/v1/cards/{id}/runs/{run}/work-log"),
+                json!({
+                    "operation_id": operation_id,
+                    "agent": agent,
+                    "body": body,
+                    "model": optional_str(args, "model"),
+                    "reasoning": optional_str(args, "reasoning"),
+                    "harness": optional_str(args, "harness"),
                 }),
             )?
         }
@@ -294,6 +343,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "complete_card" => {
             let id = card_id(args, "card_id")?;
+            let operation_id = optional_str(args, "operation_id")
+                .map(OperationId::new)
+                .transpose()
+                .map_err(to_string)?;
             let mut body = json!({});
             if let Some(proof) = args["proof"].as_str() {
                 body["proof"] = json!(proof);
@@ -301,8 +354,18 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(criterion_proofs) = args["criterion_proofs"].as_array() {
                 body["criterion_proofs"] = json!(criterion_proofs);
             }
-            let response = client.post(&format!("/api/v1/cards/{id}/complete"), body)?;
-            remote_card_ack_payload(&response)?
+            if let Some(operation_id) = operation_id {
+                body["operation_id"] = json!(operation_id);
+                client.post(&format!("/api/v1/cards/{id}/complete"), body)?
+            } else {
+                let response = client.post(&format!("/api/v1/cards/{id}/complete"), body)?;
+                remote_card_ack_payload(&response)?
+            }
+        }
+        "operation_status" => {
+            let operation_id =
+                OperationId::new(required_str(args, "operation_id")?).map_err(to_string)?;
+            client.get(&format!("/api/v1/operations/{operation_id}"))?
         }
         "create_event_subscription" => {
             let url = required_str(args, "url")?;
@@ -876,8 +939,154 @@ mod tests {
                 "reasoning": null,
                 "harness": null,
                 "run_id": null,
+                "operation_id": null,
             }))
         );
+    }
+
+    #[test]
+    fn append_run_work_log_posts_the_strict_expected_run_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "remote:strict:one",
+            "state": "succeeded",
+            "result": {
+                "schema_version": "powder.work_log_entry.v1",
+                "id": "work-log-one",
+                "card_id": "001",
+                "run_id": "run-current",
+                "actor": "codex",
+                "agent": "codex",
+                "body": "done",
+                "created_at": 10,
+                "updated_at": 10
+            }
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone())]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let response = call_tool_remote(
+            &client,
+            "append_run_work_log",
+            &json!({
+                "operation_id": "remote:strict:one",
+                "card_id": "001",
+                "expected_run_id": "run-current",
+                "agent": "codex",
+                "actor": "codex",
+                "body": "done",
+                "model": "gpt-test"
+            }),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&response), status);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards/001/runs/run-current/work-log"
+        );
+        assert_eq!(
+            requests[0].body,
+            Some(json!({
+                "operation_id": "remote:strict:one",
+                "agent": "codex",
+                "body": "done",
+                "model": "gpt-test",
+                "reasoning": null,
+                "harness": null
+            }))
+        );
+    }
+
+    #[test]
+    fn idempotent_work_log_and_operation_status_preserve_the_same_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-remote-work-log",
+            "state": "succeeded",
+            "request_digest": "sha256:abc",
+            "kind": "work_log_append",
+            "target_card_id": "001",
+            "result": {"card_id": "001", "agent": "codex", "body": "one effect", "created_at": 10}
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let mutation = call_tool_remote(
+            &client,
+            "append_work_log",
+            &json!({
+                "operation_id": "op-remote-work-log",
+                "card_id": "001",
+                "agent": "codex",
+                "body": "one effect"
+            }),
+        )
+        .unwrap();
+        let lookup = call_tool_remote(
+            &client,
+            "operation_status",
+            &json!({"operation_id": "op-remote-work-log"}),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&mutation), tool_payload(&lookup));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].path, "/api/v1/cards/001/work-log");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-remote-work-log"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/v1/operations/op-remote-work-log");
+    }
+
+    #[test]
+    fn idempotent_completion_and_operation_status_preserve_the_same_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-remote-completion",
+            "state": "succeeded",
+            "request_digest": "sha256:def",
+            "kind": "completion",
+            "target_card_id": "001",
+            "result": {"card_id": "001", "status": "done", "updated_at": 10},
+            "audit_event_id": "event-remote-completion"
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let mutation = call_tool_remote(
+            &client,
+            "complete_card",
+            &json!({
+                "operation_id": "op-remote-completion",
+                "card_id": "001",
+                "proof": "credential-free",
+                "criterion_proofs": [{
+                    "criterion": 0,
+                    "url": "https://example.test/mcp-remote-completion"
+                }]
+            }),
+        )
+        .unwrap();
+        let lookup = call_tool_remote(
+            &client,
+            "operation_status",
+            &json!({"operation_id": "op-remote-completion"}),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&mutation), tool_payload(&lookup));
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/001/complete");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-remote-completion"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["criterion_proofs"][0]["url"],
+            "https://example.test/mcp-remote-completion"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/v1/operations/op-remote-completion");
     }
 
     #[test]
@@ -1288,6 +1497,56 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.authorization.as_deref() == Some("Bearer sk_powder_test")));
+    }
+
+    #[test]
+    fn run_scoped_review_sends_no_forgeable_reviewer_identity() {
+        let response = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "mcp-remote-review",
+            "state": "succeeded",
+            "kind": "criterion_review",
+            "target_card_id": "remote-review",
+            "expected_run_id": "run-remote-review",
+            "result": {"reviewer": "authenticated-agent"}
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, response)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+
+        let result = call_tool_remote(
+            &client,
+            "review_criterion",
+            &json!({
+                "operation_id": "mcp-remote-review",
+                "card_id": "remote-review",
+                "run_id": "run-remote-review",
+                "criterion": 0,
+                "criterion_id": "powder.criterion.v1:sha256:abc:0",
+                "decision": "approved",
+                "proof": "https://example.test/mcp-remote",
+                "actor": "forged-local-name",
+                "admin": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            tool_payload(&result)["result"]["reviewer"],
+            "authenticated-agent"
+        );
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards/remote-review/runs/run-remote-review/criteria/review"
+        );
+        let body = requests[0].body.as_ref().unwrap();
+        assert_eq!(body["operation_id"], "mcp-remote-review");
+        assert_eq!(body["criterion"], 0);
+        assert_eq!(body["decision"], "approved");
+        assert!(body.get("actor").is_none());
+        assert!(body.get("reviewer").is_none());
+        assert!(body.get("admin").is_none());
     }
 
     #[test]
@@ -1702,9 +1961,13 @@ mod tests {
         ("update_card", &["actor"]),
         ("manage_claim", &["actor", "admin"]),
         ("update_status", &["actor", "admin"]),
+        ("review_criterion", &["actor", "admin"]),
         ("update_relations", &["actor", "admin"]),
+        ("append_work_log", &["actor", "admin"]),
+        ("append_run_work_log", &["actor", "admin"]),
         ("request_input", &["actor", "admin"]),
         ("complete_card", &["actor", "admin"]),
+        ("operation_status", &["actor", "admin"]),
     ];
 
     /// Params that genuinely reach the remote server but not as a literal

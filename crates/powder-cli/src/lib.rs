@@ -2,15 +2,15 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, AutonomyClass, Board, Card, CardId, CardStatus, DetailLevel, Estimate, Priority,
-    ReadyQuery, RunId,
+    Authority, AutonomyClass, Board, Card, CardId, CardStatus, CriterionReviewDecision,
+    DetailLevel, Estimate, OperationId, Priority, ReadyQuery, RunId,
 };
 use powder_shell::{
     load_backlog_dir, load_backlog_dir_for_repo, load_github_issues_file, unix_now, ShellError,
 };
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
-    Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, CriterionReviewInput, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility, Store, StoreError,
 };
 use serde_json::{json, Value};
 
@@ -45,11 +45,14 @@ pub const COMMANDS: &[&str] = &[
     "answer-input",
     "update-status",
     "check-criterion",
+    "review-criterion",
     "add-link",
     "add-comment",
     "append-work-log",
+    "append-run-work-log",
     "request-input",
     "complete-card",
+    "operation-status",
     "subscription-create",
     "subscription-list",
     "subscription-disable",
@@ -134,11 +137,16 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "answer-input" => answer_input(rest, remote_env),
         [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
         [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
+        [command, rest @ ..] if command == "review-criterion" => review_criterion(rest, remote_env),
         [command, rest @ ..] if command == "add-link" => add_link(rest, remote_env),
         [command, rest @ ..] if command == "add-comment" => add_comment(rest, remote_env),
         [command, rest @ ..] if command == "append-work-log" => append_work_log(rest, remote_env),
+        [command, rest @ ..] if command == "append-run-work-log" => {
+            append_run_work_log(rest, remote_env)
+        }
         [command, rest @ ..] if command == "request-input" => request_input(rest, remote_env),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest, remote_env),
+        [command, rest @ ..] if command == "operation-status" => operation_status(rest, remote_env),
         [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
         [command, rest @ ..] if command == "subscription-list" => subscription_list(rest),
         [command, rest @ ..] if command == "subscription-disable" => subscription_disable(rest),
@@ -225,14 +233,21 @@ pub fn help() -> String {
         "  powder check-criterion 001 --db ./data/powder.db --criterion 0 --actor operator [--unchecked]\n",
     );
     help.push_str(
+        "  powder review-criterion 001 --db ./data/powder.db --run run-id --criterion 0 --criterion-id powder.criterion.v1:sha256:...:0 --decision approved --operation-id stable-id [--proof URL] [--actor reviewer]\n",
+    );
+    help.push_str(
         "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
     );
     help.push_str(
-        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id]\n",
+        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id] [--operation-id stable-id]\n",
     );
     help.push_str(
-        "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof]\n",
+        "  powder append-run-work-log 001 --db ./data/powder.db --run run-id --operation-id stable-id --agent codex --actor codex --body \"focused tests passed\" [--model model] [--reasoning level] [--harness harness]\n",
     );
+    help.push_str(
+        "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof] [--operation-id stable-id]\n",
+    );
+    help.push_str("  powder operation-status stable-id --db ./data/powder.db [--actor codex]\n");
     help.push_str(
         "  powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret\n",
     );
@@ -939,16 +954,18 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
     let card_id = positional_card_id(args, "transfer-claim")?;
     let run_id = required_run_flag(args)?;
     let to_agent = required_flag(args, "--to-agent")?;
+    let to_identity = flag_value(args, "--to-identity");
     let ttl_seconds = optional_ttl(args)?;
     let (transferred_card_id, transferred_run_id, transferred_agent, expires_at) = if let Some(db) =
         flag_value(args, "--db")
     {
         let mut store = open_store(db)?;
         let claim = store
-            .transfer_claim(
+            .transfer_claim_with_identity(
                 &card_id,
                 &run_id,
                 to_agent,
+                to_identity,
                 now,
                 ttl_seconds,
                 &authority(args),
@@ -961,12 +978,14 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
             claim.expires_at,
         )
     } else if let Some(client) = remote_env.client() {
+        let mut request =
+            json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds});
+        if let Some(identity) = to_identity {
+            request["to_identity"] = json!(identity);
+        }
         let transferred = client
-                .post(
-                    &format!("/api/v1/cards/{card_id}/transfer"),
-                    json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
-                )
-                .map_err(remote_err)?;
+            .post(&format!("/api/v1/cards/{card_id}/transfer"), request)
+            .map_err(remote_err)?;
         (
             json_string(&transferred, "card_id")?,
             json_string(&transferred, "run_id")?,
@@ -1160,6 +1179,58 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     ))
 }
 
+fn review_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let card_id = positional_card_id(args, "review-criterion")?;
+    let run_id = RunId::new(required_flag(args, "--run")?)?;
+    let criterion = criterion_flag(args)?;
+    if criterion > u32::MAX as usize {
+        return Err(ShellError::Invalid(
+            "--criterion must fit an unsigned 32-bit integer".to_string(),
+        ));
+    }
+    let criterion_id = required_flag(args, "--criterion-id")?;
+    let decision_raw = required_flag(args, "--decision")?;
+    let decision = CriterionReviewDecision::parse(decision_raw).ok_or_else(|| {
+        ShellError::Invalid("--decision must be approved, rejected, or cleared".to_string())
+    })?;
+    let operation_id = OperationId::new(required_flag(args, "--operation-id")?)?;
+    let proof = flag_value(args, "--proof").map(str::to_string);
+    let status = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .review_criterion(
+                &card_id,
+                CriterionReviewInput {
+                    operation_id,
+                    expected_run_id: run_id,
+                    criterion,
+                    criterion_id: criterion_id.to_string(),
+                    decision,
+                    proof,
+                },
+                unix_now(),
+                &authority(args),
+            )
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/runs/{run_id}/criteria/review"),
+                json!({
+                    "operation_id": operation_id,
+                    "criterion": criterion,
+                    "criterion_id": criterion_id,
+                    "decision": decision,
+                    "proof": proof,
+                }),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("review-criterion"));
+    };
+    to_pretty_json(&status)
+}
+
 fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "add-link")?;
@@ -1222,6 +1293,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let reasoning = flag_value(args, "--reasoning");
     let harness = flag_value(args, "--harness");
     let run_id = flag_value(args, "--run-id");
+    let operation_id = flag_value(args, "--operation-id");
     let attribution = powder_store::WorkLogAttribution {
         model,
         reasoning,
@@ -1230,9 +1302,23 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .append_work_log(&card_id, agent, attribution, body, now)
-            .map_err(store_err)?)
+        if let Some(operation_id) = operation_id {
+            json!(store
+                .append_work_log_idempotent(
+                    OperationId::new(operation_id)?,
+                    &card_id,
+                    agent,
+                    attribution,
+                    body,
+                    now,
+                    &authority(args),
+                )
+                .map_err(store_err)?)
+        } else {
+            json!(store
+                .append_work_log(&card_id, agent, attribution, body, now)
+                .map_err(store_err)?)
+        }
     } else if let Some(client) = remote_env.client() {
         client
             .post(
@@ -1244,18 +1330,72 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                     "reasoning": reasoning,
                     "harness": harness,
                     "run_id": run_id,
+                    "operation_id": operation_id,
                 }),
             )
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("append-work-log"));
     };
-    Ok(format!(
-        "work-log\t{}\t{}\t{}\n",
-        json_string(&entry, "card_id")?,
-        json_string(&entry, "agent")?,
-        json_string(&entry, "body")?
-    ))
+    if operation_id.is_some() {
+        to_pretty_json(&entry)
+    } else {
+        Ok(format!(
+            "work-log\t{}\t{}\t{}\n",
+            json_string(&entry, "card_id")?,
+            json_string(&entry, "agent")?,
+            json_string(&entry, "body")?
+        ))
+    }
+}
+
+fn append_run_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "append-run-work-log")?;
+    let run_id = RunId::new(required_flag(args, "--run")?)?;
+    let operation_id = OperationId::new(required_flag(args, "--operation-id")?)?;
+    let agent = required_flag(args, "--agent")?;
+    let body = required_flag(args, "--body")?;
+    let model = flag_value(args, "--model");
+    let reasoning = flag_value(args, "--reasoning");
+    let harness = flag_value(args, "--harness");
+    let status = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .append_run_work_log_idempotent(
+                operation_id,
+                &card_id,
+                &run_id,
+                agent,
+                powder_store::WorkLogAttribution {
+                    model,
+                    reasoning,
+                    harness,
+                    run_id: None,
+                },
+                body,
+                now,
+                &authority(args),
+            )
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post(
+                &format!("/api/v1/cards/{card_id}/runs/{run_id}/work-log"),
+                json!({
+                    "operation_id": operation_id,
+                    "agent": agent,
+                    "body": body,
+                    "model": model,
+                    "reasoning": reasoning,
+                    "harness": harness,
+                }),
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("append-run-work-log"));
+    };
+    to_pretty_json(&status)
 }
 
 fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1293,11 +1433,25 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let card_id = positional_card_id(args, "complete-card")?;
     let proof = flag_value(args, "--proof");
     let criterion_proofs = criterion_proofs_flag(args)?;
+    let operation_id = flag_value(args, "--operation-id");
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
-            .map_err(store_err)?)
+        if let Some(operation_id) = operation_id {
+            json!(store
+                .complete_card_idempotent(
+                    OperationId::new(operation_id)?,
+                    &card_id,
+                    proof,
+                    criterion_proofs,
+                    now,
+                    &authority(args),
+                )
+                .map_err(store_err)?)
+        } else {
+            json!(store
+                .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
+                .map_err(store_err)?)
+        }
     } else if let Some(client) = remote_env.client() {
         let mut body = json!({});
         if let Some(proof) = proof {
@@ -1309,17 +1463,45 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
                 .map(|proof| json!({"criterion": proof.criterion, "url": proof.url}))
                 .collect::<Vec<_>>());
         }
+        if let Some(operation_id) = operation_id {
+            body["operation_id"] = json!(operation_id);
+        }
         client
             .post(&format!("/api/v1/cards/{card_id}/complete"), body)
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("complete-card"));
     };
-    Ok(format!(
-        "completed\t{}\t{}\n",
-        json_string(&card, "id")?,
-        json_string(&card, "status")?
-    ))
+    if operation_id.is_some() {
+        to_pretty_json(&card)
+    } else {
+        Ok(format!(
+            "completed\t{}\t{}\n",
+            json_string(&card, "id")?,
+            json_string(&card, "status")?
+        ))
+    }
+}
+
+fn operation_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let raw = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("operation-status requires an operation id".into()))?;
+    let operation_id = OperationId::new(raw)?;
+    let status = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        json!(store
+            .operation_status(&operation_id, unix_now(), &authority(args))
+            .map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        client
+            .get(&format!("/api/v1/operations/{operation_id}"))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("operation-status"));
+    };
+    to_pretty_json(&status)
 }
 
 fn subscription_create(args: &[String]) -> Result<String, ShellError> {
@@ -2414,6 +2596,247 @@ mod tests {
     }
 
     #[test]
+    fn cli_append_run_work_log_replays_the_exact_current_run_record() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-strict-work-log-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "strict-cli",
+            "--title",
+            "Strict CLI",
+            "--acceptance",
+            "proof",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let claim = run(&args([
+            "claim",
+            "strict-cli",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--actor",
+            "codex",
+        ]))
+        .unwrap();
+        let run_id = claim.split('\t').nth(2).unwrap();
+        let command = [
+            "append-run-work-log",
+            "strict-cli",
+            "--db",
+            &db,
+            "--run",
+            run_id,
+            "--operation-id",
+            "cli:strict:one",
+            "--agent",
+            "codex",
+            "--actor",
+            "codex",
+            "--body",
+            "focused tests passed",
+        ];
+        let first = run(&args(command)).unwrap();
+        let replay = run(&args(command)).unwrap();
+        assert_eq!(replay, first);
+        let status: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(status["state"], "succeeded");
+        assert_eq!(status["result"]["run_id"], run_id);
+        assert_eq!(status["result"]["actor"], "codex");
+        assert_eq!(
+            status["result"]["schema_version"],
+            "powder.work_log_entry.v1"
+        );
+        let run_detail = run(&args(["get-run", run_id, "--db", &db])).unwrap();
+        let run_detail: serde_json::Value = serde_json::from_str(&run_detail).unwrap();
+        assert_eq!(run_detail["work_log"][0], status["result"]);
+    }
+
+    #[test]
+    fn cli_append_run_work_log_requires_an_explicit_actor_for_direct_db_access() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-strict-auth-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "strict-cli-auth",
+            "--title",
+            "Strict CLI auth",
+            "--acceptance",
+            "proof",
+            "--status",
+            "ready",
+        ]))
+        .unwrap();
+        let claim = run(&args([
+            "claim",
+            "strict-cli-auth",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+        ]))
+        .unwrap();
+        let run_id = claim.split('\t').nth(2).unwrap();
+        let error = run(&args([
+            "append-run-work-log",
+            "strict-cli-auth",
+            "--db",
+            &db,
+            "--run",
+            run_id,
+            "--operation-id",
+            "cli:strict:unchecked",
+            "--agent",
+            "codex",
+            "--body",
+            "no",
+        ]))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires an authenticated or explicit actor"));
+    }
+
+    #[test]
+    fn cli_operation_identity_replays_and_recovers_one_work_log_effect() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-operation-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "operation-cli",
+            "--title",
+            "Operation CLI",
+        ]))
+        .unwrap();
+        let command = [
+            "append-work-log",
+            "operation-cli",
+            "--db",
+            &db,
+            "--agent",
+            "codex",
+            "--body",
+            "one effect",
+            "--operation-id",
+            "op-cli-work-log",
+            "--actor",
+            "codex",
+        ];
+        let first = run(&args(command)).unwrap();
+        let second = run(&args(command)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first).unwrap()["state"],
+            "succeeded"
+        );
+        let status = run(&args([
+            "operation-status",
+            "op-cli-work-log",
+            "--db",
+            &db,
+            "--actor",
+            "codex",
+        ]))
+        .unwrap();
+        assert_eq!(status, first);
+        let card = run(&args(["get-card", "operation-cli", "--db", &db])).unwrap();
+        assert_eq!(card.matches("one effect").count(), 1);
+    }
+
+    #[test]
+    fn cli_completion_operation_replays_and_recovers_one_proof_effect() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-completion-operation-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "completion-operation-cli",
+            "--title",
+            "Completion operation CLI",
+            "--acceptance",
+            "proof is linked",
+        ]))
+        .unwrap();
+        let command = [
+            "complete-card",
+            "completion-operation-cli",
+            "--db",
+            &db,
+            "--proof",
+            "credential-free",
+            "--criterion-proof",
+            "0=https://example.test/cli-completion",
+            "--operation-id",
+            "op-cli-completion",
+            "--actor",
+            "operator",
+        ];
+        let first = run(&args(command)).unwrap();
+        let replay = run(&args(command)).unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first).unwrap()["state"],
+            "succeeded"
+        );
+        let recovered = run(&args([
+            "operation-status",
+            "op-cli-completion",
+            "--db",
+            &db,
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert_eq!(recovered, first);
+        let card = run(&args(["get-card", "completion-operation-cli", "--db", &db])).unwrap();
+        assert_eq!(
+            card.matches("https://example.test/cli-completion").count(),
+            1
+        );
+    }
+
+    #[test]
     fn cli_manages_event_subscriptions_and_tails_events() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-events-{}.db",
@@ -3212,6 +3635,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_remote_operation_identity_and_status_use_the_http_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-cli-remote",
+            "state": "succeeded",
+            "request_digest": "sha256:abc",
+            "kind": "work_log_append",
+            "target_card_id": "remote-card",
+            "result": {
+                "card_id": "remote-card",
+                "agent": "codex",
+                "body": "one remote effect",
+                "created_at": 10
+            }
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let mutation = run_with_env(
+            &args([
+                "append-work-log",
+                "remote-card",
+                "--agent",
+                "codex",
+                "--body",
+                "one remote effect",
+                "--operation-id",
+                "op-cli-remote",
+            ]),
+            &env,
+        )
+        .unwrap();
+        let recovered = run_with_env(&args(["operation-status", "op-cli-remote"]), &env).unwrap();
+        assert_eq!(mutation, recovered);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/remote-card/work-log");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-cli-remote"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/v1/operations/op-cli-remote");
+        assert!(requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some("Bearer sk_powder_test")));
+    }
+
+    #[test]
+    fn cli_remote_completion_operation_and_status_use_the_http_contract() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-cli-remote-completion",
+            "state": "succeeded",
+            "request_digest": "sha256:def",
+            "kind": "completion",
+            "target_card_id": "remote-card",
+            "result": {"card_id": "remote-card", "status": "done", "updated_at": 10},
+            "audit_event_id": "event-cli-remote"
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status.clone()), (200, status)]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let mutation = run_with_env(
+            &args([
+                "complete-card",
+                "remote-card",
+                "--proof",
+                "credential-free",
+                "--criterion-proof",
+                "0=https://example.test/cli-remote-completion",
+                "--operation-id",
+                "op-cli-remote-completion",
+            ]),
+            &env,
+        )
+        .unwrap();
+        let recovered = run_with_env(
+            &args(["operation-status", "op-cli-remote-completion"]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(mutation, recovered);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/v1/cards/remote-card/complete");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-cli-remote-completion"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["criterion_proofs"][0]["url"],
+            "https://example.test/cli-remote-completion"
+        );
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(
+            requests[1].path,
+            "/api/v1/operations/op-cli-remote-completion"
+        );
+    }
+
     /// A lane maintaining a claim lease against a deployed instance (no
     /// local SQLite file at all) must be able to heartbeat, renew, and
     /// release without ever passing `--db` -- the stale-binary friction this
@@ -3520,6 +4047,121 @@ mod tests {
             ShellError::Invalid(message)
                 if message == "list-cards requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments"
         ));
+    }
+
+    #[test]
+    fn direct_database_cli_cannot_create_authoritative_review() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("powder-cli-review-{nonce}.db"));
+        let db = path.to_string_lossy().to_string();
+        let card_id = CardId::new("cli-review").unwrap();
+        let (run_id, criterion_id) = {
+            let mut store = Store::open(&path).unwrap();
+            store.migrate().unwrap();
+            let card = Card::new(card_id.clone(), "CLI review", "body")
+                .unwrap()
+                .with_acceptance(["review through cli".to_string()])
+                .with_status(CardStatus::Ready);
+            store.import_cards(vec![card]).unwrap();
+            let claim = store
+                .claim_card(
+                    &card_id,
+                    "cli-reviewer",
+                    unix_now(),
+                    3600,
+                    &Authority::unchecked(),
+                )
+                .unwrap();
+            let criterion_id = powder_core::criterion_identity(
+                &store.get_card(&card_id).unwrap().unwrap().criteria,
+                0,
+            )
+            .unwrap();
+            (claim.run_id.to_string(), criterion_id)
+        };
+
+        let error = run(&args([
+            "review-criterion",
+            "cli-review",
+            "--db",
+            &db,
+            "--run",
+            &run_id,
+            "--criterion",
+            "0",
+            "--criterion-id",
+            &criterion_id,
+            "--decision",
+            "approved",
+            "--proof",
+            "https://example.test/cli-proof",
+            "--operation-id",
+            "cli-review-op",
+            "--actor",
+            "cli-reviewer",
+        ]))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("run-scoped criterion review requires authenticated authority"));
+
+        let detail: Value =
+            serde_json::from_str(&run(&args(["get-card", "cli-review", "--db", &db])).unwrap())
+                .unwrap();
+        assert!(detail.get("criterion_reviews").is_none());
+        assert!(detail["current_run_criteria"][0].get("review").is_none());
+    }
+
+    #[test]
+    fn cli_remote_review_uses_authenticated_http_contract_without_actor_field() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "cli-remote-review",
+            "state": "succeeded",
+            "kind": "criterion_review",
+            "target_card_id": "remote-review",
+            "expected_run_id": "run-remote-review",
+            "result": {"reviewer": "authenticated-reviewer"}
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status)]);
+        let output = run_with_env(
+            &args([
+                "review-criterion",
+                "remote-review",
+                "--run",
+                "run-remote-review",
+                "--criterion",
+                "0",
+                "--criterion-id",
+                "powder.criterion.v1:sha256:abc:0",
+                "--decision",
+                "rejected",
+                "--proof",
+                "remote proof",
+                "--operation-id",
+                "cli-remote-review",
+            ]),
+            &remote_env(Some(&base_url), Some("sk_powder_test")),
+        )
+        .unwrap();
+        assert!(output.contains("authenticated-reviewer"));
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards/remote-review/runs/run-remote-review/criteria/review"
+        );
+        let body = requests[0].body.as_ref().unwrap();
+        assert_eq!(body["operation_id"], "cli-remote-review");
+        assert_eq!(body["criterion"], 0);
+        assert_eq!(body["decision"], "rejected");
+        assert_eq!(body["proof"], "remote proof");
+        assert!(body.get("actor").is_none());
+        assert!(body.get("reviewer").is_none());
     }
 
     fn args<const N: usize>(items: [&str; N]) -> Vec<String> {

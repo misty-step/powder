@@ -91,6 +91,9 @@ impl Board {
             comments_total: None,
             work_log: self.work_log_for_card(card_id),
             work_log_total: None,
+            current_run_criteria: Vec::new(),
+            criterion_reviews: Vec::new(),
+            criterion_reviews_total: None,
             hint: None,
         })
     }
@@ -103,8 +106,17 @@ impl Board {
             links_total: None,
             comments: self.comments_for_card(&run.card_id),
             comments_total: None,
+            work_log: self
+                .work_log_for_card(&run.card_id)
+                .into_iter()
+                .filter(|entry| entry.run_id.as_ref() == Some(run_id))
+                .collect(),
+            work_log_total: None,
             activities: self.activities_for_run(run_id),
             activities_total: None,
+            criteria: Vec::new(),
+            criterion_reviews: Vec::new(),
+            criterion_reviews_total: None,
             run,
             card,
             hint: None,

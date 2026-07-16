@@ -1882,6 +1882,478 @@ async fn append_work_log_appears_in_get_card_immediately() {
 }
 
 #[tokio::test]
+async fn http_operation_replay_status_conflict_and_authorization_are_consistent() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let owner_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("operation-actor", ApiKeyScope::Agent, 2)
+        .unwrap()
+        .raw_key;
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("operation-actor", ApiKeyScope::Agent, 3)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"http-operation","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let request =
+        r#"{"operation_id":"op-http-work-log","agent":"operation-actor","body":"one effect"}"#;
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation/work-log",
+            Some(&owner_key),
+            request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await;
+    assert_eq!(first["schema_version"], "powder.operation_status.v1");
+    assert_eq!(first["state"], "succeeded");
+
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation/work-log",
+            Some(&owner_key),
+            request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(replay).await, first);
+
+    let status = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-work-log",
+            Some(&owner_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(status).await, first);
+
+    let forbidden = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-work-log",
+            Some(&intruder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let conflict = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation/work-log",
+            Some(&owner_key),
+            r#"{"operation_id":"op-http-work-log","agent":"operation-actor","body":"changed"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let card = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-operation?detail=detailed",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(card).await["work_log"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn http_run_bound_work_log_returns_the_exact_record_in_card_and_run_detail() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("agent-a", ApiKeyScope::Agent, 2)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"http-strict-log","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-strict-log/claim",
+            Some(&agent_key),
+            r#"{"agent":"agent-a","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim.status(), StatusCode::OK);
+    let run_id = response_json(claim).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let path = format!("/api/v1/cards/http-strict-log/runs/{run_id}/work-log");
+    let request = json!({
+        "operation_id": "http:strict:one",
+        "agent": "agent-a",
+        "model": "gpt-test",
+        "body": "done sk-abcdefghijklmnopqrstuvwxyz123456"
+    })
+    .to_string();
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&agent_key),
+            &request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await;
+    assert_eq!(first["state"], "succeeded");
+    let stored = first["result"].clone();
+    assert_eq!(stored["schema_version"], "powder.work_log_entry.v1");
+    assert_eq!(stored["run_id"], run_id);
+    assert!(!stored
+        .to_string()
+        .contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&agent_key),
+            &request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(replay).await, first);
+    let card = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-strict-log?detail=detailed",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let card = response_json(card).await;
+    assert_eq!(card["work_log"][0], stored);
+    assert_eq!(
+        card["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event_type"] == "work_log")
+            .count(),
+        1
+    );
+    let run = app
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/runs/{run_id}?detail=detailed"),
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(run).await["work_log"][0], stored);
+}
+
+#[tokio::test]
+async fn http_run_bound_work_log_rejects_foreign_identity_and_open_auth_without_effect() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let owner_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("owner", ApiKeyScope::Agent, 2)
+        .unwrap()
+        .raw_key;
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("intruder", ApiKeyScope::Agent, 3)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"http-strict-auth","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-strict-auth/claim",
+            Some(&owner_key),
+            r#"{"agent":"owner","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let run_id = response_json(claim).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rejected = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/cards/http-strict-auth/runs/{run_id}/work-log"),
+            Some(&intruder_key),
+            r#"{"operation_id":"http:strict:foreign","agent":"owner","body":"no"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::OK);
+    assert_eq!(response_json(rejected).await["state"], "rejected");
+    let card = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-strict-auth?detail=detailed",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert!(response_json(card).await.get("work_log").is_none());
+
+    let (open_state, _) = test_state(AuthMode::None);
+    let open_run = {
+        let mut open_store = open_state.store.lock().unwrap();
+        open_store
+            .import_cards(vec![Card::new(
+                CardId::new("open-strict").unwrap(),
+                "Open strict",
+                "body",
+            )
+            .unwrap()
+            .with_status(CardStatus::Ready)
+            .with_acceptance(["proof".to_string()])])
+            .unwrap();
+        open_store
+            .claim_card(
+                &CardId::new("open-strict").unwrap(),
+                "agent-a",
+                unix_now(),
+                3600,
+                &Authority::unchecked(),
+            )
+            .unwrap()
+            .run_id
+            .to_string()
+    };
+    let response = super::app(open_state)
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/cards/open-strict/runs/{open_run}/work-log"),
+            None,
+            r#"{"operation_id":"http:strict:open","agent":"agent-a","body":"no"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn http_work_log_operation_scrubs_all_attribution_and_resolves_its_audit_link() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"http-operation-secrets","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let raw_attribution = [
+        "agent sk-abcdefghijklmnopqrstuvwxyz123456",
+        "model ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "reasoning Bearer abcdefghijklmnopqrstuvwxyz012345",
+        "harness xoxb-1234567890abcdefghij",
+        "run-sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+    ];
+    let mutation = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-operation-secrets/work-log",
+            Some(&raw_key),
+            &json!({
+                "operation_id": "op-http-secrets",
+                "agent": raw_attribution[0],
+                "model": raw_attribution[1],
+                "reasoning": raw_attribution[2],
+                "harness": raw_attribution[3],
+                "run_id": raw_attribution[4],
+                "body": "body sk-abcdefghijklmnopqrstuvwxyz123456"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mutation.status(), StatusCode::OK);
+    let mutation = response_json(mutation).await;
+    let serialized = serde_json::to_string(&mutation).unwrap();
+    for secret in raw_attribution {
+        assert!(!serialized.contains(secret), "HTTP status leaked {secret}");
+    }
+    assert!(!serialized.contains("body sk-abcdefghijklmnopqrstuvwxyz123456"));
+    let audit_event_id = mutation["audit_event_id"].as_str().unwrap();
+    assert!(audit_event_id.starts_with("event-"));
+
+    let recovered = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-secrets",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(recovered).await, mutation);
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-operation-secrets?detail=detailed",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    let detail_serialized = serde_json::to_string(&detail).unwrap();
+    for secret in raw_attribution {
+        assert!(
+            !detail_serialized.contains(secret),
+            "HTTP card history leaked {secret}"
+        );
+    }
+    assert!(detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["id"] == audit_event_id));
+}
+
+#[tokio::test]
+async fn http_completion_response_loss_recovers_by_operation_identity() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"http-completion-operation","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let complete = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-completion-operation/complete",
+            Some(&raw_key),
+            r#"{"operation_id":"op-http-completion","proof":"credential-free proof"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(complete.status(), StatusCode::OK);
+    // The response body is deliberately discarded to model transport loss.
+    let status = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/operations/op-http-completion",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let status = response_json(status).await;
+    assert_eq!(status["state"], "succeeded");
+    assert_eq!(status["result"]["status"], "done");
+    let audit_event_id = status["audit_event_id"].as_str().unwrap();
+    assert!(audit_event_id.starts_with("event-"));
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/http-completion-operation?detail=detailed",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert!(response_json(detail).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["id"] == audit_event_id));
+    let replay = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/http-completion-operation/complete",
+            Some(&raw_key),
+            r#"{"operation_id":"op-http-completion","proof":"credential-free proof"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(replay).await, status);
+}
+
+#[tokio::test]
 async fn api_get_card_defaults_to_concise_and_accepts_detailed_detail() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     {
@@ -3313,6 +3785,360 @@ async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["actor"] == "intruder" && event["payload"].to_string().contains("done")
     }));
+}
+
+#[tokio::test]
+async fn authenticated_criterion_review_derives_reviewer_and_rejects_forged_identity() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let holder = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("review-holder", ApiKeyScope::Agent, 1)
+        .unwrap();
+    let holder_key = holder.raw_key.clone();
+    let intruder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("review-intruder", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"auth-review","title":"Review","acceptance":["prove auth"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/auth-review/claim",
+            Some(&holder_key),
+            r#"{"agent":"review-holder","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let run_id = response_json(claimed).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-review?detail=detailed",
+            Some(&holder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let criterion_id = response_json(detail).await["current_run_criteria"][0]["criterion_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let path = format!("/api/v1/cards/auth-review/runs/{run_id}/criteria/review");
+
+    let forged = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&holder_key),
+            &format!(
+                r#"{{"operation_id":"http-forged","criterion":0,"criterion_id":"{criterion_id}","decision":"approved","reviewer":"admin"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let unauthorized = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&intruder_key),
+            &format!(
+                r#"{{"operation_id":"http-intruder","criterion":0,"criterion_id":"{criterion_id}","decision":"approved"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::OK);
+    let unauthorized = response_json(unauthorized).await;
+    assert_eq!(unauthorized["state"], "rejected");
+    assert_eq!(unauthorized["failure"]["code"], "forbidden");
+
+    let reviewed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&holder_key),
+            &format!(
+                r#"{{"operation_id":"http-review","criterion":0,"criterion_id":"{criterion_id}","decision":"approved","proof":"https://example.test/http-proof"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reviewed.status(), StatusCode::OK);
+    let reviewed = response_json(reviewed).await;
+    assert_eq!(reviewed["state"], "succeeded");
+    assert_eq!(reviewed["kind"], "criterion_review");
+    assert_eq!(reviewed["expected_run_id"], run_id);
+    assert_eq!(reviewed["result"]["reviewer"], "review-holder");
+    assert_eq!(reviewed["result"]["reviewer_identity"], holder.actor.id);
+    assert_eq!(
+        reviewed["result"]["proof"],
+        "https://example.test/http-proof"
+    );
+
+    let card_detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-review?detail=detailed",
+            Some(&holder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let card_detail = response_json(card_detail).await;
+    let run_detail = app
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/runs/{run_id}?detail=detailed"),
+            Some(&holder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let run_detail = response_json(run_detail).await;
+    assert_eq!(card_detail["current_run_criteria"], run_detail["criteria"]);
+    assert_eq!(
+        card_detail["criterion_reviews"],
+        run_detail["criterion_reviews"]
+    );
+    assert_eq!(card_detail["criterion_reviews"][0], reviewed["result"]);
+    assert_eq!(card_detail["criterion_reviews"][0]["run_id"], run_id);
+    let review_event = card_detail["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["event_type"] == "criterion-review")
+        .unwrap();
+    let event_payload: Value =
+        serde_json::from_str(review_event["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(event_payload["reviewer_identity"], holder.actor.id);
+}
+
+#[tokio::test]
+async fn auth_none_cannot_create_p1_consumable_run_scoped_approval() {
+    let (state, _) = test_state(AuthMode::None);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            None,
+            r#"{"id":"auth-none-review","title":"Review","acceptance":["authenticated only"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/auth-none-review/claim",
+            None,
+            r#"{"agent":"anonymous","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let run_id = response_json(claim).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-none-review?detail=detailed",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    let criterion_id = response_json(detail).await["current_run_criteria"][0]["criterion_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let review = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!(
+                "/api/v1/cards/auth-none-review/runs/{run_id}/criteria/review"
+            ),
+            None,
+            &format!(
+                r#"{{"operation_id":"auth-none-review","criterion":0,"criterion_id":"{criterion_id}","decision":"approved"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(review.status(), StatusCode::FORBIDDEN);
+    let review = response_json(review).await;
+    assert_eq!(
+        review["error"],
+        "run-scoped criterion review requires authenticated authority"
+    );
+
+    let correction = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/auth-none-review/criteria/check",
+            None,
+            r#"{"criterion":0,"actor":"local-operator"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(correction.status(), StatusCode::OK);
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/auth-none-review?detail=detailed",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(
+        detail["card"]["criteria"][0]["checked_by"],
+        "local-operator"
+    );
+    assert!(detail.get("criterion_reviews").is_none());
+    assert!(detail["current_run_criteria"][0].get("review").is_none());
+}
+#[tokio::test]
+async fn same_display_name_keys_cannot_cross_authorize_criterion_review() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let first = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("same-reviewer", ApiKeyScope::Agent, 1)
+        .unwrap();
+    let second = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("same-reviewer", ApiKeyScope::Agent, 2)
+        .unwrap();
+    assert_ne!(first.actor.id, second.actor.id);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"same-label-review","title":"Review","acceptance":["unique authority"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/same-label-review/claim",
+            Some(&first.raw_key),
+            r#"{"agent":"same-reviewer","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let run_id = response_json(claim).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/same-label-review?detail=detailed",
+            Some(&first.raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let criterion_id = response_json(detail).await["current_run_criteria"][0]["criterion_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let path = format!("/api/v1/cards/same-label-review/runs/{run_id}/criteria/review");
+
+    let crossed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&second.raw_key),
+            &format!(
+                r#"{{"operation_id":"same-label-cross","criterion":0,"criterion_id":"{criterion_id}","decision":"approved"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(crossed.status(), StatusCode::OK);
+    let crossed = response_json(crossed).await;
+    assert_eq!(crossed["state"], "rejected");
+    assert_eq!(crossed["failure"]["code"], "forbidden");
+
+    let owned = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &path,
+            Some(&first.raw_key),
+            &format!(
+                r#"{{"operation_id":"same-label-owned","criterion":0,"criterion_id":"{criterion_id}","decision":"approved"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owned.status(), StatusCode::OK);
+    let owned = response_json(owned).await;
+    assert_eq!(owned["state"], "succeeded");
+    assert_eq!(owned["result"]["reviewer"], "same-reviewer");
+    assert_eq!(owned["result"]["reviewer_identity"], first.actor.id);
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/same-label-review?detail=detailed",
+            Some(&first.raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert_eq!(
+        detail["current_run_criteria"][0]["review"]["reviewer_identity"],
+        first.actor.id
+    );
 }
 
 #[tokio::test]

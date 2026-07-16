@@ -34,10 +34,17 @@ static PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     ]
 });
 
+static POWDER_API_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"sk_powder_[A-Za-z0-9_-]{32}").expect("valid regex"));
+static POWDER_WEBHOOK_SECRET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"whsec_powder_[A-Za-z0-9_-]{32}").expect("valid regex"));
+
 /// Replace every known secret shape in `body` with `[REDACTED:<pattern>]`,
 /// leaving everything else untouched.
 pub fn scrub_secrets(body: &str) -> String {
-    let mut scrubbed = body.to_string();
+    let mut scrubbed = scrub_exact_powder_secret(body, &POWDER_API_KEY, "powder-api-key");
+    scrubbed =
+        scrub_exact_powder_secret(&scrubbed, &POWDER_WEBHOOK_SECRET, "powder-webhook-secret");
     for (name, regex) in PATTERNS.iter() {
         if regex.is_match(&scrubbed) {
             let replacement = format!("[REDACTED:{name}]");
@@ -47,6 +54,30 @@ pub fn scrub_secrets(body: &str) -> String {
         }
     }
     scrubbed
+}
+
+fn scrub_exact_powder_secret(input: &str, regex: &Regex, name: &str) -> String {
+    regex
+        .replace_all(input, |captures: &regex::Captures<'_>| {
+            let matched = captures.get(0).expect("whole regex match");
+            let previous = matched
+                .start()
+                .checked_sub(1)
+                .and_then(|index| input.as_bytes().get(index));
+            let next = input.as_bytes().get(matched.end());
+            let bounded = previous.is_none_or(|byte| !is_powder_secret_byte(*byte))
+                && next.is_none_or(|byte| !is_powder_secret_byte(*byte));
+            if bounded {
+                format!("[REDACTED:{name}]")
+            } else {
+                matched.as_str().to_string()
+            }
+        })
+        .into_owned()
+}
+
+fn is_powder_secret_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
 #[cfg(test)]
@@ -87,5 +118,35 @@ mod tests {
     fn leaves_ordinary_prose_about_keys_untouched() {
         let body = "spent the last hour debugging why the API key wasn't loading from the env";
         assert_eq!(scrub_secrets(body), body);
+    }
+
+    #[test]
+    fn redacts_exact_powder_api_and_webhook_credentials_at_boundaries() {
+        let api_key = format!("sk_powder_{}-_", "A".repeat(30));
+        let webhook_secret = format!("whsec_powder_{}-_", "B".repeat(30));
+        let scrubbed = scrub_secrets(&format!("{api_key}; webhook={webhook_secret}"));
+
+        assert_eq!(
+            scrubbed,
+            "[REDACTED:powder-api-key]; webhook=[REDACTED:powder-webhook-secret]"
+        );
+    }
+
+    #[test]
+    fn powder_credential_near_misses_and_ordinary_text_are_not_over_redacted() {
+        let values = [
+            format!("sk_powder_{}", "A".repeat(31)),
+            format!("sk_powder_{}", "A".repeat(33)),
+            format!("prefixsk_powder_{}", "A".repeat(32)),
+            format!("sk_powder_{}.{}", "A".repeat(16), "A".repeat(16)),
+            format!("whsec_powder_{}", "B".repeat(31)),
+            format!("whsec_powder_{}", "B".repeat(33)),
+            format!("prefixwhsec_powder_{}", "B".repeat(32)),
+            "sk_powder_<32> and whsec_powder_<32> are documented formats".to_string(),
+        ];
+
+        for value in values {
+            assert_eq!(scrub_secrets(&value), value);
+        }
     }
 }
