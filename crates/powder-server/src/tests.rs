@@ -3943,6 +3943,110 @@ async fn authenticated_criterion_review_derives_reviewer_and_rejects_forged_iden
 }
 
 #[tokio::test]
+async fn authenticated_run_bound_completion_returns_replayable_authoritative_receipt() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let holder_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("completion-holder", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"strict-http-completion","title":"Complete","acceptance":["approved"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let claimed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/strict-http-completion/claim",
+            Some(&holder_key),
+            r#"{"agent":"completion-holder","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let run_id = response_json(claimed).await["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detail = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/strict-http-completion?detail=detailed",
+            Some(&holder_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let criterion_id = response_json(detail).await["current_run_criteria"][0]["criterion_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let review_path = format!("/api/v1/cards/strict-http-completion/runs/{run_id}/criteria/review");
+    let reviewed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &review_path,
+            Some(&holder_key),
+            &format!(
+                r#"{{"operation_id":"strict-http-review","criterion":0,"criterion_id":"{criterion_id}","decision":"approved"}}"#
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reviewed.status(), StatusCode::OK);
+
+    let completion_path = format!("/api/v1/cards/strict-http-completion/runs/{run_id}/complete");
+    let body =
+        r#"{"operation_id":"strict-http-completion-op","proof":"https://example.test/completion"}"#;
+    let completed = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &completion_path,
+            Some(&holder_key),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let completed = response_json(completed).await;
+    assert_eq!(completed["state"], "succeeded");
+    assert_eq!(completed["expected_run_id"], run_id);
+    assert_eq!(
+        completed["result"]["schema_version"],
+        "powder.run_bound_completion.v1"
+    );
+    assert_eq!(completed["result"]["run_id"], run_id);
+    assert_eq!(
+        completed["audit_event_id"],
+        completed["result"]["audit_event_id"]
+    );
+
+    let replay = app
+        .oneshot(json_request(
+            Method::POST,
+            &completion_path,
+            Some(&holder_key),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(replay).await, completed);
+}
+
+#[tokio::test]
 async fn auth_none_cannot_create_p1_consumable_run_scoped_approval() {
     let (state, _) = test_state(AuthMode::None);
     let app = app(state);

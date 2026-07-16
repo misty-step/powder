@@ -354,7 +354,16 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(criterion_proofs) = args["criterion_proofs"].as_array() {
                 body["criterion_proofs"] = json!(criterion_proofs);
             }
-            if let Some(operation_id) = operation_id {
+            if let Some(expected_run_id) = optional_str(args, "expected_run_id") {
+                let operation_id = operation_id.ok_or_else(|| {
+                    "complete_card expected_run_id requires operation_id".to_string()
+                })?;
+                body["operation_id"] = json!(operation_id);
+                client.post(
+                    &format!("/api/v1/cards/{id}/runs/{expected_run_id}/complete"),
+                    body,
+                )?
+            } else if let Some(operation_id) = operation_id {
                 body["operation_id"] = json!(operation_id);
                 client.post(&format!("/api/v1/cards/{id}/complete"), body)?
             } else {
@@ -1087,6 +1096,48 @@ mod tests {
         );
         assert_eq!(requests[1].method, "GET");
         assert_eq!(requests[1].path, "/api/v1/operations/op-remote-completion");
+    }
+
+    #[test]
+    fn run_bound_completion_posts_expected_run_path_and_recovery_identity() {
+        let status = json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": "op-strict-completion",
+            "state": "succeeded",
+            "kind": "completion",
+            "target_card_id": "001",
+            "expected_run_id": "run-current",
+            "result": {
+                "schema_version": "powder.run_bound_completion.v1",
+                "card_id": "001",
+                "run_id": "run-current",
+                "operation_id": "op-strict-completion",
+                "status": "done"
+            }
+        });
+        let (base_url, recorded) = spawn_test_server(vec![(200, status)]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let completed = call_tool_remote(
+            &client,
+            "complete_card",
+            &json!({
+                "operation_id": "op-strict-completion",
+                "expected_run_id": "run-current",
+                "card_id": "001",
+                "proof": "strict proof"
+            }),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&completed)["expected_run_id"], "run-current");
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/cards/001/runs/run-current/complete"
+        );
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["operation_id"],
+            "op-strict-completion"
+        );
     }
 
     #[test]

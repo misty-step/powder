@@ -114,8 +114,12 @@ powder get-card 001
 powder add-link 001 --label pr --url https://github.com/misty-step/example/pull/1
 powder append-run-work-log 001 --run "$RUN_ID" --operation-id lane:work-log:01 --agent codex --body "narrowed the fix to one function" --model claude-sonnet-5
 powder add-comment 001 --author codex --body "shipped, PR linked above"
-powder complete-card 001 --proof https://github.com/misty-step/example/pull/1
+powder complete-card 001 --run "$RUN_ID" --operation-id lane:completion:01 --proof https://github.com/misty-step/example/pull/1
 ```
+
+Run-bound completion is the normal agent closeout path.
+It requires the exact current run, a stable operation identity, and approved run-scoped criteria.
+Omitting `--run` selects Powder's separate permissive operator-correction path and must not be used to approximate agent completion.
 
 `update-relations`, `get-run`, `list-awaiting-input`, `answer-input`,
 `repository-*`, `import*`, `key-*`, and `subscription-*` remain `--db`-only:
@@ -142,7 +146,7 @@ powder request-input run-id --db ./data/powder.db --question "Approve?"
 powder list-awaiting-input --db ./data/powder.db
 powder answer-input run-id --db ./data/powder.db --actor operator --answer approved
 powder get-run run-id --db ./data/powder.db
-powder complete-card 001 --db ./data/powder.db
+powder complete-card 001 --db ./data/powder.db --run run-id --operation-id lane:completion:01 --actor codex
 ```
 
 ## MCP Over HTTP
