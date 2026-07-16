@@ -2449,6 +2449,30 @@ fn complete_card_for_run_in_transaction(
         .into());
     }
     authority.require_holder(Some(&claim.agent))?;
+    if matches!(authority, Authority::Unchecked) {
+        return Err(DomainError::forbidden(
+            "strict run-bound completion requires an authenticated or explicit actor",
+        )
+        .into());
+    }
+    if !authority.is_admin() && authority.authenticated_identity().is_some() {
+        let completion_identity = authority
+            .authenticated_identity()
+            .expect("authenticated identity was checked above");
+        let claim_authority = transaction
+            .query_row(
+                "SELECT authority FROM run_review_authorities WHERE run_id = ?1",
+                [expected_run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if claim_authority.as_deref() != Some(completion_identity) {
+            return Err(DomainError::forbidden(
+                "authenticated completion authority does not own the current run",
+            )
+            .into());
+        }
+    }
     let criteria = project_run_criterion_state(transaction, &card, expected_run_id)?;
     require_all_run_criteria_approved(&criteria)?;
     complete_card_in_transaction(

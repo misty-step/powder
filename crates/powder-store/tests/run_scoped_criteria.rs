@@ -133,6 +133,17 @@ fn run_bound_completion_requires_current_approved_run_and_replays_once() -> powd
         21,
         &holder,
     )?;
+    let same_label = store.complete_card_for_run_idempotent(
+        OperationId::new("strict-completion-same-label")?,
+        &card_id,
+        &claim.run_id,
+        Some("forged identity"),
+        vec![],
+        21,
+        &Authority::authenticated("agent-a", "actor-b", false),
+    )?;
+    assert_eq!(same_label.state, OperationState::Rejected);
+    assert_eq!(same_label.failure.as_ref().unwrap().code, "forbidden");
     let operation_id = OperationId::new("strict-completion-success")?;
     let completed = store.complete_card_for_run_idempotent(
         operation_id.clone(),

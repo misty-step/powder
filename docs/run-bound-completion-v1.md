@@ -7,7 +7,8 @@ It returns `powder.operation_status.v1` whose successful result is a `powder.run
 ## Atomic preconditions
 
 Powder validates and completes inside one immediate SQLite transaction.
-The card must have the supplied run as its current claim, the claim must be unexpired, the stored run must belong to the card and remain active or awaiting input, and the authority must hold the claim or be an administrator.
+The card must have the supplied run as its current claim, the claim must be unexpired, the stored run must belong to the card and remain active or awaiting input, and the authenticated authority must own that run's stable identity or be an administrator.
+An explicit local actor retains the direct-database trust model, while unchecked authority is rejected.
 Every current criterion must have a latest matching run-scoped review whose decision is `approved`.
 Legacy `checked_by` and `checked_at` fields do not satisfy this rule.
 

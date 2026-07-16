@@ -146,7 +146,7 @@ powder request-input run-id --db ./data/powder.db --question "Approve?"
 powder list-awaiting-input --db ./data/powder.db
 powder answer-input run-id --db ./data/powder.db --actor operator --answer approved
 powder get-run run-id --db ./data/powder.db
-powder complete-card 001 --db ./data/powder.db --run run-id --operation-id lane:completion:01
+powder complete-card 001 --db ./data/powder.db --run run-id --operation-id lane:completion:01 --actor codex
 ```
 
 ## MCP Over HTTP
