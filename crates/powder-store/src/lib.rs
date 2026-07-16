@@ -1390,10 +1390,11 @@ impl Store {
     /// card's own state -- any authenticated caller may narrate their own
     /// work. Only `agent` is required attribution; every field on
     /// `attribution` is whatever the calling surface can supply.
-    /// `body` is scrubbed for known secret shapes before it is ever
-    /// persisted (powder-943 governance ruling: this becomes fleet-retro
-    /// synthesis input, so it gets the same scrub discipline as any other
-    /// agent-output surface, at write time rather than read time).
+    /// Every caller-controlled attribution field and `body` is scrubbed for
+    /// known secret shapes before it is ever persisted (powder-943 governance
+    /// ruling: this becomes fleet-retro synthesis input, so it gets the same
+    /// scrub discipline as any other agent-output surface, at write time
+    /// rather than read time).
     pub fn append_work_log(
         &mut self,
         card_id: &CardId,
@@ -1438,14 +1439,21 @@ impl Store {
             attribution.harness,
             WORK_LOG_ATTRIBUTION_MAX_BYTES,
         )?;
+        validate_optional_bound("run_id", attribution.run_id, WORK_LOG_ATTRIBUTION_MAX_BYTES)?;
         validate_bounded_non_empty("body", body, WORK_LOG_BODY_MAX_BYTES)?;
         let expected_run = attribution.run_id.map(RunId::new).transpose()?;
-        let request = OperationRequest::new(
+        let recorded_expected_run = attribution
+            .run_id
+            .map(secrets::scrub_secrets)
+            .map(RunId::new)
+            .transpose()?;
+        let request = OperationRequest::new_with_recorded_expected_run(
             operation_id,
             OperationKind::WorkLogAppend,
             card_id.clone(),
             authority.operation_identity(),
             expected_run,
+            recorded_expected_run,
             &[
                 OperationField {
                     name: "agent",
@@ -1722,13 +1730,16 @@ fn append_work_log_in_transaction(
     now: i64,
 ) -> Result<(WorkLogEntry, String)> {
     let card = load_card(transaction, card_id)?;
-    let run_id = attribution.run_id.map(RunId::new).transpose()?;
+    let scrubbed_optional = |value: Option<&str>| value.map(secrets::scrub_secrets);
+    let run_id = scrubbed_optional(attribution.run_id)
+        .map(RunId::new)
+        .transpose()?;
     let entry = WorkLogEntry {
         card_id: card_id.clone(),
-        agent: non_empty("agent", agent)?,
-        model: attribution.model.map(str::to_owned),
-        reasoning: attribution.reasoning.map(str::to_owned),
-        harness: attribution.harness.map(str::to_owned),
+        agent: secrets::scrub_secrets(&non_empty("agent", agent)?),
+        model: scrubbed_optional(attribution.model),
+        reasoning: scrubbed_optional(attribution.reasoning),
+        harness: scrubbed_optional(attribution.harness),
         run_id,
         body: secrets::scrub_secrets(&non_empty("body", body)?),
         created_at: now,

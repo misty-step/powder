@@ -8,7 +8,7 @@ use crate::{
     ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig,
     ImportOutcome, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
     StoreError, WorkLogAttribution, API_KEY_ALPHABET, OPERATION_RETENTION_SECONDS,
-    WORK_LOG_BODY_MAX_BYTES,
+    WORK_LOG_ATTRIBUTION_MAX_BYTES, WORK_LOG_BODY_MAX_BYTES,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -3677,11 +3677,23 @@ fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()
     store.import_cards(vec![ready_card("operation-security", 1)])?;
     let operation_id = OperationId::new("op-security")?;
     let owner = Authority::actor("agent-a", false);
+    let raw_attribution = [
+        "agent sk-abcdefghijklmnopqrstuvwxyz123456",
+        "model ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "reasoning Bearer abcdefghijklmnopqrstuvwxyz012345",
+        "harness xoxb-1234567890abcdefghij",
+        "run-sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+    ];
     store.append_work_log_idempotent(
         operation_id.clone(),
         &card_id,
-        "agent-a",
-        WorkLogAttribution::default(),
+        raw_attribution[0],
+        WorkLogAttribution {
+            model: Some(raw_attribution[1]),
+            reasoning: Some(raw_attribution[2]),
+            harness: Some(raw_attribution[3]),
+            run_id: Some(raw_attribution[4]),
+        },
         "token sk-abcdefghijklmnopqrstuvwxyz123456",
         10,
         &owner,
@@ -3690,6 +3702,30 @@ fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()
     let serialized = serde_json::to_string(&visible)?;
     assert!(serialized.contains("[REDACTED:openai-key]"));
     assert!(!serialized.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    for secret in raw_attribution {
+        assert!(
+            !serialized.contains(secret),
+            "operation status leaked attribution secret: {secret}"
+        );
+    }
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed)?
+        .unwrap();
+    let persisted = serde_json::to_string(&detail.work_log)?;
+    for secret in raw_attribution {
+        assert!(
+            !persisted.contains(secret),
+            "durable work log leaked attribution secret: {secret}"
+        );
+    }
+    assert!(persisted.contains("agent [REDACTED:openai-key]"));
+    let outbound = serde_json::to_string(&store.list_event_tail(0, 20)?)?;
+    for secret in raw_attribution {
+        assert!(
+            !outbound.contains(secret),
+            "outbound audit history leaked attribution secret: {secret}"
+        );
+    }
     let forbidden = store.operation_status(&operation_id, 11, &Authority::actor("agent-b", false));
     assert!(matches!(
         forbidden,
@@ -3709,6 +3745,60 @@ fn operation_status_enforces_authority_scrubs_results_and_expires() -> Result<()
             .len(),
         1,
         "retention removes recovery metadata, not the audited mutation effect"
+    );
+    Ok(())
+}
+
+#[test]
+fn idempotent_work_log_run_id_honors_the_attribution_boundary() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("operation-run-id-bound")?;
+    store.import_cards(vec![ready_card("operation-run-id-bound", 1)])?;
+    let authority = Authority::actor("agent-a", false);
+    let maximum = "r".repeat(WORK_LOG_ATTRIBUTION_MAX_BYTES);
+    let accepted = store.append_work_log_idempotent(
+        OperationId::new("op-run-id-at-limit")?,
+        &card_id,
+        "agent-a",
+        WorkLogAttribution {
+            run_id: Some(&maximum),
+            ..WorkLogAttribution::default()
+        },
+        "bounded",
+        10,
+        &authority,
+    )?;
+    assert_eq!(accepted.state, OperationState::Succeeded);
+
+    let oversized = "r".repeat(WORK_LOG_ATTRIBUTION_MAX_BYTES + 1);
+    let rejected_id = OperationId::new("op-run-id-over-limit")?;
+    let error = store
+        .append_work_log_idempotent(
+            rejected_id.clone(),
+            &card_id,
+            "agent-a",
+            WorkLogAttribution {
+                run_id: Some(&oversized),
+                ..WorkLogAttribution::default()
+            },
+            "must not persist",
+            11,
+            &authority,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("run_id"));
+    assert_eq!(
+        store.operation_status(&rejected_id, 12, &authority)?.state,
+        OperationState::Unknown
+    );
+    assert_eq!(
+        store
+            .get_card_detail(&card_id, DetailLevel::Detailed)?
+            .unwrap()
+            .work_log
+            .len(),
+        1
     );
     Ok(())
 }

@@ -382,6 +382,28 @@ impl OperationRequest {
         expected_run: Option<RunId>,
         payload: &[OperationField<'_>],
     ) -> Result<Self, DomainError> {
+        Self::new_with_recorded_expected_run(
+            id,
+            kind,
+            target,
+            authority,
+            expected_run.clone(),
+            expected_run,
+            payload,
+        )
+    }
+
+    /// Build a digest over the caller's original expected run while storing
+    /// a separate credential-safe projection for recovery responses.
+    pub fn new_with_recorded_expected_run(
+        id: OperationId,
+        kind: OperationKind,
+        target: CardId,
+        authority: &str,
+        digest_expected_run: Option<RunId>,
+        recorded_expected_run: Option<RunId>,
+        payload: &[OperationField<'_>],
+    ) -> Result<Self, DomainError> {
         validate_operation_component(
             "operation target",
             target.as_str(),
@@ -429,7 +451,7 @@ impl OperationRequest {
             &mut hasher,
             &mut canonical_bytes,
             "expected_run",
-            expected_run.as_ref().map(RunId::as_str),
+            digest_expected_run.as_ref().map(RunId::as_str),
         )?;
         for field in payload {
             hash_component(&mut hasher, &mut canonical_bytes, field.name, field.value)?;
@@ -440,7 +462,7 @@ impl OperationRequest {
             kind,
             target,
             authority: authority.to_owned(),
-            expected_run,
+            expected_run: recorded_expected_run,
             request_digest: format!("sha256:{:x}", hasher.finalize()),
         })
     }
@@ -2020,5 +2042,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("canonical bytes"));
+    }
+
+    #[test]
+    fn scrubbed_expected_run_projection_does_not_weaken_the_original_digest() {
+        let original = OperationRequest::new_with_recorded_expected_run(
+            OperationId::new("op-safe-run-projection").unwrap(),
+            OperationKind::WorkLogAppend,
+            CardId::new("card-1").unwrap(),
+            "actor-1",
+            Some(RunId::new("run-sensitive-original").unwrap()),
+            Some(RunId::new("run-[REDACTED:openai-key]").unwrap()),
+            &[],
+        )
+        .unwrap();
+        let digest = original.request_digest.clone();
+
+        assert_eq!(original.request_digest, digest);
+        assert_eq!(
+            original.expected_run.unwrap().as_str(),
+            "run-[REDACTED:openai-key]"
+        );
+        let different_original = OperationRequest::new(
+            OperationId::new("op-safe-run-projection").unwrap(),
+            OperationKind::WorkLogAppend,
+            CardId::new("card-1").unwrap(),
+            "actor-1",
+            Some(RunId::new("run-sensitive-different").unwrap()),
+            &[],
+        )
+        .unwrap();
+        assert_ne!(different_original.request_digest, digest);
     }
 }
