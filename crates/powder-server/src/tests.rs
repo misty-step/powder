@@ -2201,7 +2201,7 @@ async fn board_shell_serves_from_root_board_and_card_routes_without_auth() {
     let root = response_text(root).await;
     assert!(root.contains(r#"id="powder-board-app""#));
     assert!(root.contains("/assets/powder-board.js"));
-    assert!(root.contains("This instance only accepts writes from inside its private network."));
+    assert!(root.contains(r#"id="auth-intro""#));
     assert!(root.contains("powder key-create --db /data/powder.db --name operator"));
     assert!(root.contains(r#"id="settings-toggle""#));
     assert!(root.contains(r#"id="repo-settings-list""#));
@@ -4404,6 +4404,45 @@ async fn onboarding_surfaces_configured_home_url_and_omits_it_by_default() {
         .unwrap();
     let body = response_json(response).await;
     assert_eq!(body["home_url"], "https://sanctum.example.test");
+}
+
+/// The board UI's `#auth-intro` banner (2026-07-16 dogfood: a stale static
+/// "writes only" banner sat next to a live "auth needed for this read"
+/// failure, because the sanctum deployment's read-auth-posture rollout
+/// flipped reads to enforced but the shell HTML never learned) reads its
+/// posture from onboarding's `public_reads` rather than assuming reads are
+/// always keyless. This pins the field to `Config.public_reads` both ways.
+#[tokio::test]
+async fn onboarding_surfaces_public_reads_matching_config() {
+    let (state, _) = test_state_with_public_reads(AuthMode::ApiKey, false);
+    let enforced = app(state);
+    let response = enforced
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/onboarding")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json(response).await;
+    assert_eq!(body["public_reads"], false);
+
+    let (state, _) = test_state_with_public_reads(AuthMode::ApiKey, true);
+    let escape_hatch = app(state);
+    let response = escape_hatch
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/onboarding")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json(response).await;
+    assert_eq!(body["public_reads"], true);
 }
 
 #[tokio::test]

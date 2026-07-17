@@ -90,7 +90,11 @@ const els = {
   apiKeyForm: document.getElementById("api-key-form"),
   apiKeyInput: document.getElementById("api-key-input"),
   clearApiKey: document.getElementById("clear-api-key"),
+  pasteApiKey: document.getElementById("paste-api-key"),
+  authIntro: document.getElementById("auth-intro"),
   authMessage: document.getElementById("auth-message"),
+  mintCommand: document.getElementById("mint-command"),
+  copyMintCommand: document.getElementById("copy-mint-command"),
   filters: document.getElementById("filters"),
   filterButton: document.getElementById("filter-btn"),
   filterN: document.getElementById("filter-n"),
@@ -127,6 +131,7 @@ const els = {
 const state = {
   apiKey: localStorage.getItem(STORAGE_KEY) || "",
   authMode: "unknown",
+  publicReads: null,
   needsSetup: false,
   cards: [],
   repositories: [],
@@ -216,7 +221,9 @@ async function loadOnboarding() {
     });
     const data = await response.json();
     state.authMode = data.auth_mode || "unknown";
+    state.publicReads = Boolean(data.public_reads);
     state.needsSetup = Boolean(data.needs_setup);
+    renderAuthIntro();
     renderAuthState();
     renderHomeLink(data.home_url);
     if (state.authMode === "api_key" && state.needsSetup && !state.apiKey) {
@@ -224,7 +231,9 @@ async function loadOnboarding() {
     }
   } catch (_err) {
     state.authMode = "unknown";
+    state.publicReads = null;
     state.needsSetup = false;
+    renderAuthIntro();
     renderAuthState();
   }
 }
@@ -635,16 +644,40 @@ function renderAuthState(message = "") {
   if (message) {
     els.authMessage.textContent = message;
   } else if (state.apiKey) {
-    els.authMessage.textContent =
-      "Key saved. Write actions will use it from this browser.";
+    els.authMessage.textContent = "Key saved. Requests from this browser will use it.";
   } else if (state.needsSetup) {
     els.authMessage.textContent = `No write keys exist yet. Mint one with: ${KEY_MINT_COMMAND}`;
+  } else if (state.authMode === "api_key" && state.publicReads === false) {
+    els.authMessage.textContent =
+      "No key saved. This instance requires a key to read or write.";
   } else if (state.authMode === "api_key") {
     els.authMessage.textContent =
       "No key saved. Paste a key here when you need write actions.";
   } else {
     els.authMessage.textContent =
       "This deployment does not require a stored API key.";
+  }
+}
+
+// `#auth-intro` and `#auth-message` sit in adjacent panels and must never
+// contradict each other -- the bug this fixes: a static "writes only"
+// banner next to a live "auth needed for this read" failure once a
+// deployment flips reads to enforced. Sourced from `/api/v1/onboarding`'s
+// `public_reads`, which mirrors the server's real `authorize_read` posture
+// instead of an assumption baked into markup.
+function renderAuthIntro() {
+  if (!els.authIntro) return;
+  if (state.authMode === "unknown") {
+    els.authIntro.textContent = "Checking this instance's access requirements...";
+  } else if (state.authMode !== "api_key") {
+    els.authIntro.textContent =
+      "This instance trusts its network perimeter and does not require an API key.";
+  } else if (state.publicReads) {
+    els.authIntro.textContent =
+      "This instance allows unauthenticated reads from its private network. Paste an API key to enable write actions.";
+  } else {
+    els.authIntro.textContent =
+      "This instance requires an API key for all access, including reads. Paste one below to connect.";
   }
 }
 
@@ -1219,8 +1252,8 @@ function renderFailure() {
   `;
   els.railList.innerHTML = message;
   els.laneReady.innerHTML = message;
-  els.laneInProgress.innerHTML = empty("Board unavailable.");
-  els.laneDone.innerHTML = empty("Board unavailable.");
+  els.laneInProgress.innerHTML = message;
+  els.laneDone.innerHTML = message;
   renderCounts({ backlog: [], ready: [], blocked: [], inProgress: [], done: [] });
 }
 
@@ -2151,16 +2184,46 @@ els.apiKeyForm.addEventListener("submit", (event) => {
   state.apiKey = els.apiKeyInput.value.trim();
   if (state.apiKey) localStorage.setItem(STORAGE_KEY, state.apiKey);
   else localStorage.removeItem(STORAGE_KEY);
-  renderAuthState("Key saved. Reloading the board with the stored key available for writes.");
+  renderAuthState();
   loadBoard();
 });
 els.clearApiKey.addEventListener("click", () => {
   state.apiKey = "";
   els.apiKeyInput.value = "";
   localStorage.removeItem(STORAGE_KEY);
-  renderAuthState("API key cleared. Paste a key when you need write actions.");
+  renderAuthState();
   loadBoard();
 });
+els.copyMintCommand?.addEventListener("click", async () => {
+  const text = els.mintCommand?.textContent || "";
+  try {
+    await navigator.clipboard.writeText(text);
+    els.copyMintCommand.textContent = "copied";
+  } catch (_err) {
+    els.copyMintCommand.textContent = "copy failed";
+  }
+  setTimeout(() => {
+    els.copyMintCommand.textContent = "copy";
+  }, 1500);
+});
+// Feature-detected: `clipboard.readText` needs a secure context and a
+// permission grant, so browsers/origins without it never see a dead
+// button -- the manual paste-into-field-then-save flow still works there.
+if (els.pasteApiKey && navigator.clipboard?.readText) {
+  els.pasteApiKey.hidden = false;
+  els.pasteApiKey.addEventListener("click", async () => {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (!text) return;
+      els.apiKeyInput.value = text;
+      els.apiKeyForm.requestSubmit();
+    } catch (_err) {
+      renderAuthState(
+        "Could not read the clipboard -- paste the key into the field instead.",
+      );
+    }
+  });
+}
 els.awaitingList?.addEventListener("submit", (event) => {
   const form = event.target;
   if (!(form instanceof HTMLFormElement)) return;
