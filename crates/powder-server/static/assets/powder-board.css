@@ -183,15 +183,26 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: none;
 }
 
+.pw-mint-cmd {
+  display: flex;
+  align-items: start;
+  gap: 0.5em;
+  margin-top: 0.45em;
+}
+
 .pw-auth code {
   display: inline-block;
-  max-width: 100%;
-  margin-top: 0.45em;
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 0.35em 0.5em;
-  overflow-x: auto;
   border: 1px solid var(--ae-line);
   background: var(--ae-surface);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+#copy-mint-command {
+  flex: none;
 }
 
 .pw-auth-form {

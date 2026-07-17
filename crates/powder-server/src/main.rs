@@ -345,6 +345,13 @@ struct Onboarding {
     needs_setup: bool,
     bootstrap_key_configured: bool,
     auth_mode: AuthMode,
+    /// Mirrors `Config.public_reads` (see `authorize_read`): true only when
+    /// `api-key` mode additionally exempts reads via `POWDER_PUBLIC_READS`.
+    /// The board UI reads this to state the deployment's actual read/write
+    /// posture instead of assuming reads are always free of a key --
+    /// wrong once a deployment flips reads to enforced (powder-public-read-posture;
+    /// the flag defaults to `false`, i.e. enforced).
+    public_reads: bool,
     public_base_url: Option<String>,
     /// A URL the board renders as a plain text link back to a deployment's
     /// own portal/home surface (powder-942: 6 of 9 Sanctum destinations had
@@ -911,6 +918,7 @@ async fn onboarding(State(state): State<AppState>) -> Result<Json<Onboarding>, A
         needs_setup: matches!(state.config.auth_mode, AuthMode::ApiKey) && active_keys == 0,
         bootstrap_key_configured: active_keys > 0,
         auth_mode: state.config.auth_mode,
+        public_reads: state.config.public_reads,
         public_base_url: state.config.public_base_url.clone(),
         home_url: state.config.home_url.clone(),
     }))

@@ -131,10 +131,13 @@
 
   <section id="auth-panel" class="pw-auth" hidden>
     <div>
-      <p class="ae-item">This instance only accepts writes from inside its private network. Paste an API key to enable write actions.</p>
+      <p id="auth-intro" class="ae-item">Checking this instance's access requirements&hellip;</p>
       <p class="ae-chrome">Connection: <span id="connection-status" class="pw-connection" data-kind="loading">loading</span></p>
       <p class="ae-chrome">Need a key? Mint one on the instance with:</p>
-      <code>powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
+      <span class="pw-mint-cmd">
+        <code id="mint-command">powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
+        <button id="copy-mint-command" class="ae-button ae-button-quiet ae-button-compact" type="button">copy</button>
+      </span>
     </div>
     <section class="pw-repo-settings" aria-label="repository settings">
       <div class="pw-settings-head">
@@ -181,6 +184,7 @@
         <span class="ae-chrome">API key</span>
         <input id="api-key-input" class="ae-input" type="password" autocomplete="off" placeholder="paste key">
       </label>
+      <button id="paste-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button" hidden>paste &amp; connect</button>
       <button class="ae-button ae-button-compact" type="submit">save</button>
       <button id="clear-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button">clear</button>
       <p id="auth-message" class="ae-chrome"></p>
