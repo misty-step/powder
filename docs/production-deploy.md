@@ -34,15 +34,41 @@ never a public URL:
 - **Data:** a SQLite path under the box's `/data` volume (WAL mode), streamed
   to DigitalOcean Spaces via Litestream
 - **Runtime env** (set in Sanctum's own supervisor config, in that `[[app]]`
-  block's env section):
+  block's env section) -- **`tailscale-header`, not `api-key`, since
+  2026-07-17.** The box is reachable only over Tailscale (see above); an
+  operator-facing self-hosted instance like this one should trust that
+  perimeter instead of asking every browser tab and service integration to
+  hold a pasted key:
 
   ```
   POWDER_DB_PATH=<path under Sanctum's /data volume>
   POWDER_BIND_ADDR=127.0.0.1:<port>
-  POWDER_AUTH_MODE=api-key
+  POWDER_AUTH_MODE=tailscale-header
   POWDER_PUBLIC_BASE_URL=<the box's tailnet origin, see above>
   POWDER_DISCLOSE_BOOTSTRAP_KEY=false
   ```
+
+  `tailscale-header` mode trusts the `Tailscale-User-Login` (or equivalent)
+  identity header `tailscale serve` injects on proxied HTTPS requests, so
+  any tailnet peer -- a browser, the CLI, an MCP client -- reaches the
+  board with no key at all and still gets a real, attributed principal (an
+  actual tailnet login, not a static agent string). `POWDER_TAILNET_ADMIN`
+  (default `true`, unset) controls whether that identity is admin-scoped;
+  `POWDER_TAILNET_PROXY_SECRET` is an optional in-code backstop requiring a
+  matching `X-Powder-Proxy-Secret` header from a *further* trusted proxy in
+  front of `tailscale serve`, not something `tailscale serve` itself sends
+  -- leave it unset unless such a proxy exists.
+
+  **Same-box and off-mesh service callers never get that header.** A
+  request self-originated from the box to its own tailnet hostname (a
+  co-hosted app calling back through `tailscale serve`, e.g. Glass calling
+  Powder with its Mint-brokered `GLASS_POWDER_API_KEY`) does not traverse
+  the peer-identity handshake that populates it -- verified live
+  2026-07-17. `tailscale-header` mode's `authorize()` therefore falls back
+  to verifying a bearer token (the same check `api-key` mode uses) whenever
+  a request carries `Authorization: Bearer <key>` but no identity header,
+  so a minted API key still works for exactly that case. Reads and writes
+  share one `authorize()` call, so this fallback covers both.
 
   `POWDER_DISCLOSE_BOOTSTRAP_KEY=false` means the very first admin key
   `powder-server` seeds on an empty database is created **redacted** --

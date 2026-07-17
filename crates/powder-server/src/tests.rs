@@ -4533,6 +4533,28 @@ async fn tailnet_and_none_modes_authorize_as_configured() {
     assert_eq!(none.status(), StatusCode::OK);
 }
 
+/// powder-tailnet-backstop residual: same-box or off-mesh service callers
+/// (Glass -> Powder via a Mint-brokered key) never get a `tailscale serve`
+/// identity header, so `tailscale-header` mode must still accept a valid
+/// bearer token through the real HTTP routing stack, not just direct
+/// `authorize()` calls.
+#[tokio::test]
+async fn tailnet_mode_accepts_a_bearer_token_over_http_with_no_identity_header() {
+    let (state, raw_key) = test_state(AuthMode::TailscaleHeader);
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 /// powder-public-read-posture: fail-closed default in api-key mode.
 #[tokio::test]
 async fn api_key_mode_rejects_keyless_reads_by_default() {
@@ -5158,4 +5180,54 @@ fn tailnet_admin_false_authorizes_but_require_admin_rejects() {
 
     let err = require_admin(&state, &identity_headers("operator")).unwrap_err();
     assert_eq!(err.status, StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn tailnet_mode_falls_back_to_a_valid_bearer_token_without_an_identity_header() {
+    let (state, raw_key) = test_state(AuthMode::TailscaleHeader);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
+    );
+    let actor = authorize(&state, &headers).unwrap();
+    assert!(actor.is_admin, "the seeded bootstrap key is admin-scoped");
+    assert!(
+        actor.key_prefix.is_some(),
+        "bearer-token fallback must record the key prefix like api-key mode does"
+    );
+}
+
+#[test]
+fn tailnet_mode_rejects_an_invalid_bearer_token_with_the_api_key_error_not_the_header_error() {
+    let (state, _raw_key) = test_state(AuthMode::TailscaleHeader);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer sk_powder_totally-bogus"),
+    );
+    let err = authorize(&state, &headers).unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(
+        err.message.contains("invalid bearer token"),
+        "a presented-but-wrong token must surface the api-key error, not \
+         \"missing trusted tailnet identity header\": {}",
+        err.message
+    );
+}
+
+#[test]
+fn tailnet_mode_prefers_the_identity_header_over_a_bearer_token_when_both_are_present() {
+    let (state, raw_key) = test_state(AuthMode::TailscaleHeader);
+    let mut headers = identity_headers("operator");
+    headers.insert(
+        AUTHORIZATION,
+        axum::http::HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
+    );
+    let actor = authorize(&state, &headers).unwrap();
+    assert_eq!(actor.principal, "operator");
+    assert!(
+        actor.key_prefix.is_none(),
+        "the identity header path must win, not the bearer-token fallback"
+    );
 }
