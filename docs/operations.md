@@ -312,6 +312,21 @@ header on every request it forwards, from a value only it and
 (any request with a trusted identity header is authorized) -- exactly as
 before this backstop existed.
 
+**Bearer-token fallback for callers that never reach the identity header
+(powder-tailnet-bearer-fallback).** A request self-originated from the box
+to its own tailnet hostname -- a co-hosted service calling `powder-server`
+back through `tailscale serve`, e.g. Glass calling Powder with a
+Mint-brokered key -- does not traverse the peer-identity handshake that
+populates the four headers above; it never gets one. `authorize()` falls
+back to verifying a bearer token (the same check `api-key` mode uses)
+whenever a `tailscale-header`-mode request carries `Authorization: Bearer
+<key>` and no identity header, so a minted API key still authenticates that
+caller instead of being silently locked out. Identity headers still win
+when both are present; the fallback only activates when no identity header
+is on the request at all. `authorize_read` shares the same `authorize()`
+call for both modes' checks, so this fallback covers reads and writes
+identically.
+
 `POWDER_TAILNET_ADMIN` controls the scope granted to a `tailscale-header`
 identity. Default (unset, or explicit `true`): every authenticated tailnet
 identity gets `admin` scope, matching the mode's original all-admin

@@ -1730,9 +1730,11 @@ struct AuthorizedActor {
     principal: String,
     enforces_identity: bool,
     is_admin: bool,
-    /// The presented API key's non-secret lookup prefix, when auth mode is
-    /// `ApiKey` -- `None` for tailnet-header or disabled auth, which never
-    /// see a key. Threaded through so a 403 can name which key came up
+    /// The presented API key's non-secret lookup prefix, set whenever
+    /// authorization actually verified a bearer token -- in `ApiKey` mode
+    /// always, in `TailscaleHeader` mode only for its bearer-token
+    /// fallback (see `authorize`). `None` for identity-header-based or
+    /// disabled auth. Threaded through so a 403 can name which key came up
     /// short instead of a bare "admin scope required" (powder-918).
     key_prefix: Option<String>,
 }
@@ -1804,42 +1806,59 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                 }
             }
             if let Some(identity) = trusted_tailnet_identity(headers) {
-                Ok(AuthorizedActor {
+                return Ok(AuthorizedActor {
                     principal: identity.to_string(),
                     enforces_identity: true,
                     is_admin: state.config.tailnet_admin,
                     key_prefix: None,
-                })
+                });
+            }
+            // Self-originated calls to the box's own tailnet hostname (a
+            // co-hosted service calling back through `tailscale serve`,
+            // e.g. Glass -> Powder) never traverse the peer-identity
+            // handshake that populates the header above -- verified live
+            // 2026-07-17: a same-box curl to the tailnet HTTPS origin came
+            // back 401 with no header, even though a distinct tailnet peer
+            // gets one. Rather than lock every off-mesh or same-box service
+            // integration out of this mode, fall back to a bearer token
+            // (the same verification `api-key` mode uses) when one is
+            // present, so a minted API key keeps working here. Only report
+            // the identity-header error when no credential was offered at
+            // all.
+            if bearer_token(headers).is_some() {
+                authorize_api_key(state, headers)
             } else {
                 Err(ApiError::unauthorized(
                     "missing trusted tailnet identity header",
                 ))
             }
         }
-        AuthMode::ApiKey => {
-            let token = bearer_token(headers)
-                .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
-            let verified = lock_store(state)?.verify_api_key(token, unix_now())?;
-            let Some(key) = verified else {
-                return Err(ApiError::unauthorized("invalid bearer token"));
-            };
-            if key.scope.allows_agent() {
-                Ok(AuthorizedActor {
-                    principal: key.principal,
-                    enforces_identity: true,
-                    is_admin: key.scope == ApiKeyScope::Admin,
-                    key_prefix: Some(key.key_prefix),
-                })
-            } else {
-                Err(ApiError::forbidden(format!(
-                    "{} (key {}, prefix {}) has scope {} which cannot access agent routes",
-                    key.principal,
-                    key.name,
-                    key.key_prefix,
-                    key.scope.as_str()
-                )))
-            }
-        }
+        AuthMode::ApiKey => authorize_api_key(state, headers),
+    }
+}
+
+fn authorize_api_key(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
+    let token =
+        bearer_token(headers).ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    let verified = lock_store(state)?.verify_api_key(token, unix_now())?;
+    let Some(key) = verified else {
+        return Err(ApiError::unauthorized("invalid bearer token"));
+    };
+    if key.scope.allows_agent() {
+        Ok(AuthorizedActor {
+            principal: key.principal,
+            enforces_identity: true,
+            is_admin: key.scope == ApiKeyScope::Admin,
+            key_prefix: Some(key.key_prefix),
+        })
+    } else {
+        Err(ApiError::forbidden(format!(
+            "{} (key {}, prefix {}) has scope {} which cannot access agent routes",
+            key.principal,
+            key.name,
+            key.key_prefix,
+            key.scope.as_str()
+        )))
     }
 }
 
