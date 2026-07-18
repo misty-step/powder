@@ -366,6 +366,12 @@ struct Onboarding {
 struct ReadyParams {
     limit: Option<usize>,
     estimate: Option<String>,
+    /// powder-cards-api-paged-continuation: resume past a prior response's
+    /// `next_after` instead of only ever seeing the first `limit` cards of
+    /// the same order. See `ListCardsParams::after` for the full
+    /// interim-vs-scale-proof-pagination distinction, which applies
+    /// identically here.
+    after: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +390,22 @@ struct ListCardsParams {
     /// dispatch path sends `false` for an unfiltered `list_cards` so remote
     /// mode matches local (store-backed) MCP mode.
     include_terminal: Option<bool>,
+    /// powder-cards-api-paged-continuation: the `next_after` id from a
+    /// prior response on this same (filter-identical) query, letting a
+    /// caller reach cards beyond `limit` instead of only ever seeing the
+    /// first page. Omitting it reproduces the historical first-page
+    /// response exactly -- this is purely additive.
+    ///
+    /// This is an *interim* continuation over an already fully-computed,
+    /// already-ordered in-memory list: `Store::list_cards_page_after`
+    /// still does a full unfiltered table scan and rebuilds that whole
+    /// list from scratch on every call, `after` or not. It bounds
+    /// response *payload size*, letting a caller reach cards beyond
+    /// `limit` -- it does **not** bound per-request DB/CPU cost. The
+    /// separate, deliberately-deferred
+    /// `powder-store-sql-pushed-list-filtering` card is what pushes the
+    /// filtering/ordering into SQL to fix that.
+    after: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,13 +962,15 @@ async fn list_ready(
     authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
+    let after = params.after.as_deref().map(CardId::new).transpose()?;
     let query = ReadyQuery::new(unix_now(), limit).with_estimate(estimate);
-    let page = lock_store(&state)?.list_ready_page(query)?;
+    let page = lock_store(&state)?.list_ready_page_after(query, after.as_ref())?;
     Ok(Json(card_list_page_json(
         page.cards,
         page.total_count,
         page.excluded_terminal_count,
         &page.cycle_card_ids,
+        page.next_after,
     )))
 }
 
@@ -962,6 +986,7 @@ async fn list_cards(
     let status = params.status.as_deref().map(parse_status).transpose()?;
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
     let limit = params.limit.unwrap_or(20).max(1);
+    let after = params.after.as_deref().map(CardId::new).transpose()?;
     let filter = CardFilter {
         status,
         estimate,
@@ -969,12 +994,13 @@ async fn list_cards(
         label: params.label,
         include_terminal: params.include_terminal.unwrap_or(true),
     };
-    let page = lock_store(&state)?.list_cards_page(&filter, limit)?;
+    let page = lock_store(&state)?.list_cards_page_after(&filter, limit, after.as_ref())?;
     Ok(Json(card_list_page_json(
         page.cards,
         page.total_count,
         page.excluded_terminal_count,
         &page.cycle_card_ids,
+        page.next_after,
     )))
 }
 
@@ -983,6 +1009,7 @@ fn card_list_page_json(
     total_count: usize,
     excluded_terminal_count: usize,
     cycle_card_ids: &[CardId],
+    next_after: Option<CardId>,
 ) -> serde_json::Value {
     let has_more = total_count > cards.len();
     let mut payload = json!({
@@ -1004,6 +1031,19 @@ fn card_list_page_json(
     // response shape is unchanged.
     if !cycle_card_ids.is_empty() {
         payload["cycle_card_ids"] = json!(cycle_card_ids);
+    }
+    // powder-cards-api-paged-continuation: present only when the
+    // already-computed, already-ordered list this call built has more
+    // cards beyond this page -- pass it back as `after` on the next
+    // request to fetch the next slice of that SAME order. `has_more`
+    // above keeps its historical meaning (it compares `total_count`
+    // against *this* page's length and was never position-aware across
+    // pages, by construction -- it only ever gave a correct "more exists"
+    // answer for a request with no `after`); `next_after`'s
+    // presence/absence is the authoritative "is there another page"
+    // answer once a caller is walking pages with `after`.
+    if let Some(next_after) = next_after {
+        payload["next_after"] = json!(next_after);
     }
     payload
 }

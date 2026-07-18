@@ -136,6 +136,13 @@ const state = {
   cards: [],
   repositories: [],
   awaiting: [],
+  // powder-board-lane-fetch-cascade: statsTotals backs the lane header
+  // counts unconditionally (board_stats is a plain SQL GROUP BY/COUNT(*),
+  // immune to the PAGE_LIMIT cap); cardFetchErrors tracks which raw
+  // statuses' card-list fetch failed so only that display lane renders an
+  // inline notice instead of its cards -- see fetchBoardData/render.
+  statsTotals: {},
+  cardFetchErrors: {},
   detailCache: new Map(),
   selectedId: null,
   view: "both",
@@ -258,9 +265,20 @@ function renderHomeLink(homeUrl) {
 
 // Shared by the initial/full load and the silent live-refresh path so both
 // stay wired to the same set of list endpoints.
+//
+// powder-board-lane-fetch-cascade: the seven per-status card-list fetches
+// are settled independently (Promise.allSettled, not Promise.all) so a
+// single status blowing past the client-side PAGE_LIMIT safety cap (see
+// listPageCards -- the server itself enforces no such cap) never rejects
+// the whole board fetch and blanks every lane. A failed status's cards are
+// simply omitted; render() surfaces the failure on just that status's
+// display lane (see failedDisplayLanes/laneFailureHTML) while the other
+// lanes render normally. board_stats is fetched in parallel and backs every
+// lane header count unconditionally, decoupled from whether that lane's
+// card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
-  const [groups, repositoryData, awaiting] = await Promise.all([
-    Promise.all(
+  const [results, repositoryData, awaiting, statsTotals] = await Promise.all([
+    Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
         const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
         return listPageCards(data, status);
@@ -268,12 +286,43 @@ async function fetchBoardData() {
     ),
     apiJson("/api/v1/repositories?include_hidden=true"),
     fetchAwaitingInput(),
+    fetchBoardStats(),
   ]);
+
+  const cardGroups = [];
+  const cardFetchErrors = {};
+  results.forEach((result, index) => {
+    if (result.status === "fulfilled") {
+      cardGroups.push(result.value);
+    } else {
+      const status = RAW_STATUSES[index];
+      cardFetchErrors[status] = result.reason?.message || String(result.reason);
+    }
+  });
+
   return {
-    cards: dedupeCards(groups.flat()).map(normalizeCard),
+    cards: dedupeCards(cardGroups.flat()).map(normalizeCard),
     repositories: normalizeRepositories(repositoryData.repositories || []),
     awaiting,
+    statsTotals,
+    cardFetchErrors,
   };
+}
+
+// GET /api/v1/stats is a pure SQL GROUP BY/COUNT(*) aggregate (no page
+// cap), so it stays correct even when a status has far more cards than
+// PAGE_LIMIT. include_hidden=true and no repo filter to match the
+// fleet-wide, all-repos scope of the per-status card fetches above. A
+// failure here must not block the rest of the board from loading -- lane
+// counts simply fall back to 0 (see laneStatTotal), same posture as
+// fetchAwaitingInput.
+async function fetchBoardStats() {
+  try {
+    const data = await apiJson("/api/v1/stats?include_hidden=true");
+    return (data && data.totals) || {};
+  } catch (_err) {
+    return {};
+  }
 }
 
 // powder-ui-awaiting-you: GET /api/v1/runs/awaiting-input -- every run
@@ -302,6 +351,8 @@ async function loadBoard() {
     state.cards = data.cards;
     state.repositories = data.repositories;
     state.awaiting = data.awaiting;
+    state.statsTotals = data.statsTotals;
+    state.cardFetchErrors = data.cardFetchErrors;
     state.loading = false;
     state.detailCache.clear();
     updateSuccessConnection();
@@ -333,6 +384,8 @@ async function refreshLive() {
     state.cards = data.cards;
     state.repositories = data.repositories;
     state.awaiting = data.awaiting;
+    state.statsTotals = data.statsTotals;
+    state.cardFetchErrors = data.cardFetchErrors;
     state.detailCache.clear();
     buildFilters();
     renderRepositorySettings();
@@ -1208,6 +1261,53 @@ function boardEmptyCopy(kindLabel, rich = false) {
   return empty(`Nothing ${kindLabel} yet.`);
 }
 
+// powder-board-lane-fetch-cascade: failedDisplayLanes/laneErrorsFor/
+// laneFailureHTML isolate a status-list fetch failure to its own display
+// lane; statTotal/laneStatTotal source lane header counts from board_stats
+// totals unconditionally, independent of whether the lane's card-list
+// fetch succeeded.
+function failedDisplayLanes() {
+  const lanes = new Set();
+  for (const status of Object.keys(state.cardFetchErrors || {})) {
+    lanes.add(displayStatus(status));
+  }
+  return lanes;
+}
+
+function laneErrorsFor(displayLaneName) {
+  const errors = state.cardFetchErrors || {};
+  return RAW_STATUSES.filter(
+    (status) => displayStatus(status) === displayLaneName && errors[status],
+  ).map((status) => errors[status]);
+}
+
+function laneFailureHTML(displayLaneName) {
+  const messages = laneErrorsFor(displayLaneName);
+  return `
+    <div class="pw-empty">
+      <p><svg class="ae-icon ae-err" aria-hidden="true"><use href="#i-alert"></use></svg> lane unavailable</p>
+      ${messages.map((message) => `<p>${escapeHtml(message)}</p>`).join("")}
+    </div>
+  `;
+}
+
+function statTotal(field) {
+  const totals = state.statsTotals || {};
+  return typeof totals[field] === "number" ? totals[field] : 0;
+}
+
+function laneStatTotal(displayLaneName) {
+  if (displayLaneName === "backlog") return statTotal("backlog");
+  if (displayLaneName === "ready") return statTotal("ready");
+  if (displayLaneName === "in_progress") {
+    return statTotal("in_progress") + statTotal("awaiting_input");
+  }
+  if (displayLaneName === "done") {
+    return statTotal("done") + statTotal("shipped") + statTotal("abandoned");
+  }
+  return 0;
+}
+
 function render() {
   renderAwaitingStrip();
   if (state.loading) {
@@ -1220,16 +1320,24 @@ function render() {
   }
 
   const buckets = bucket();
-  els.laneReady.innerHTML =
-    (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true)) +
-    (buckets.blocked.length
-      ? `<p class="ae-plate-cap pw-blocked-cap">BLOCKED · ${buckets.blocked.length}</p>${buckets.blocked.map(cardHTML).join("")}`
-      : "");
-  els.laneInProgress.innerHTML =
-    buckets.inProgress.map(cardHTML).join("") || boardEmptyCopy("in flight");
-  els.laneDone.innerHTML =
-    buckets.done.map(doneRowHTML).join("") || boardEmptyCopy("shipped");
-  renderRail(buckets.backlog);
+  const failedLanes = failedDisplayLanes();
+  els.laneReady.innerHTML = failedLanes.has("ready")
+    ? laneFailureHTML("ready")
+    : (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true)) +
+      (buckets.blocked.length
+        ? `<p class="ae-plate-cap pw-blocked-cap">BLOCKED · ${buckets.blocked.length}</p>${buckets.blocked.map(cardHTML).join("")}`
+        : "");
+  els.laneInProgress.innerHTML = failedLanes.has("in_progress")
+    ? laneFailureHTML("in_progress")
+    : buckets.inProgress.map(cardHTML).join("") || boardEmptyCopy("in flight");
+  els.laneDone.innerHTML = failedLanes.has("done")
+    ? laneFailureHTML("done")
+    : buckets.done.map(doneRowHTML).join("") || boardEmptyCopy("shipped");
+  if (failedLanes.has("backlog")) {
+    els.railList.innerHTML = laneFailureHTML("backlog");
+  } else {
+    renderRail(buckets.backlog);
+  }
   renderCounts(buckets);
   placeIndicator();
 }
@@ -1279,10 +1387,17 @@ function renderRail(cards) {
 }
 
 function renderCounts(buckets) {
-  els.backlogCount.textContent = buckets.backlog.length;
-  els.readyCount.textContent = buckets.ready.length + (buckets.blocked.length ? ` + ${buckets.blocked.length}` : "");
-  els.inProgressCount.textContent = buckets.inProgress.length;
-  els.doneCount.textContent = buckets.done.length;
+  // powder-board-lane-fetch-cascade: primary counts come from board_stats
+  // (state.statsTotals), not the fetched-cards array length, so they stay
+  // correct even when a lane's card-list fetch is capped/failing or the
+  // board is still loading. The "blocked" breakdown remains client-derived
+  // (it isn't a real status) and naturally reads 0 when the ready fetch
+  // itself failed, since no ready-status cards would be present.
+  els.backlogCount.textContent = laneStatTotal("backlog");
+  els.readyCount.textContent =
+    laneStatTotal("ready") + (buckets.blocked.length ? ` + ${buckets.blocked.length}` : "");
+  els.inProgressCount.textContent = laneStatTotal("in_progress");
+  els.doneCount.textContent = laneStatTotal("done");
   const activeFilterCount =
     state.filters.repos.size +
     state.filters.prios.size +

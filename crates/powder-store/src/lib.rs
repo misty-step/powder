@@ -248,6 +248,20 @@ pub struct CardListPage {
     /// [`powder_core::order_ready_cards`] for why a cycle is reported here
     /// rather than causing a hang or a panic.
     pub cycle_card_ids: Vec<CardId>,
+    /// powder-cards-api-paged-continuation: the id of the last card in
+    /// `cards`, present only when the *same* already-computed,
+    /// already-ordered list this call built (full scan, then filter, then
+    /// sort/topological-order -- see [`Store::list_cards_page_after`]/
+    /// [`Store::list_ready_page_after`]) has more cards beyond this page.
+    /// Pass it back as `after` on the next call to resume immediately past
+    /// it. This is an *interim* continuation over an in-memory list a call
+    /// fully recomputes every time, not SQL-pushed keyset pagination -- it
+    /// bounds response payload size, not per-request DB/CPU cost (that is
+    /// the separate, deliberately-deferred
+    /// `powder-store-sql-pushed-list-filtering` follow-up). `None` on the
+    /// last page, or whenever the eligible set already fits within
+    /// `limit`.
+    pub next_after: Option<CardId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1763,6 +1777,33 @@ impl Store {
     /// cards downstream of a cycle -- keeps a genuine topological position,
     /// so nothing is dropped and no orderable edge is ignored.
     pub fn list_ready_page(&self, query: ReadyQuery) -> Result<CardListPage> {
+        self.list_ready_page_after(query, None)
+    }
+
+    /// Continuation-aware variant of [`Store::list_ready_page`] --
+    /// unchanged when `after` is `None` (delegated to by `list_ready_page`
+    /// itself), used directly by the HTTP `/api/v1/cards/ready` route to
+    /// resume past a prior page (powder-cards-api-paged-continuation).
+    ///
+    /// `after`, when set, must be the id of a card present in the *same*
+    /// eligibility-filtered, topologically-ordered list this call
+    /// recomputes from scratch (typically the `next_after`/last card id a
+    /// prior call on this store returned); an id absent from that list --
+    /// never existed, no longer ready-eligible, or filtered by different
+    /// `query` parameters than the prior call used -- is rejected with a
+    /// validation error rather than silently resuming from the start or
+    /// skipping cards. This is an *interim* continuation over an
+    /// already-materialized in-memory list this call still fully
+    /// recomputes (full table scan, then eligibility filter, then
+    /// topological order) every time -- it bounds response payload size,
+    /// not per-request DB/CPU cost; see [`CardListPage::next_after`] and
+    /// the separate `powder-store-sql-pushed-list-filtering` follow-up for
+    /// what actually fixes that cost.
+    pub fn list_ready_page_after(
+        &self,
+        query: ReadyQuery,
+        after: Option<&CardId>,
+    ) -> Result<CardListPage> {
         let all_cards = load_all_cards(&self.connection)?;
         // reuses the same full scan already loaded above, rather than a
         // second query per blocker: a blocker missing from this map is
@@ -1786,13 +1827,14 @@ impl Store {
         let total_count = cards.len();
 
         let order = powder_core::order_ready_cards(cards);
-        let mut cards = order.cards;
-        cards.truncate(query.limit);
+        let cycle_card_ids = order.cycle_card_ids;
+        let (cards, next_after) = paginate_ordered_cards(order.cards, query.limit, after)?;
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count: 0,
-            cycle_card_ids: order.cycle_card_ids,
+            cycle_card_ids,
+            next_after,
         })
     }
 
@@ -1806,6 +1848,25 @@ impl Store {
     }
 
     pub fn list_cards_page(&self, filter: &CardFilter, limit: usize) -> Result<CardListPage> {
+        self.list_cards_page_after(filter, limit, None)
+    }
+
+    /// Continuation-aware variant of [`Store::list_cards_page`] --
+    /// unchanged when `after` is `None` (delegated to by `list_cards_page`
+    /// itself), used directly by the HTTP `/api/v1/cards` route to resume
+    /// past a prior page (powder-cards-api-paged-continuation). See
+    /// [`Store::list_ready_page_after`]'s doc comment for what `after` does
+    /// and does not buy: it lets a caller reach cards beyond `limit` from
+    /// this same already-computed, already-sorted list; it does not push
+    /// filtering or sorting into SQL, so it does not bound per-request
+    /// DB/CPU cost (`powder-store-sql-pushed-list-filtering` is the
+    /// separate follow-up for that).
+    pub fn list_cards_page_after(
+        &self,
+        filter: &CardFilter,
+        limit: usize,
+        after: Option<&CardId>,
+    ) -> Result<CardListPage> {
         let repo_filter_requested = filter.repo.is_some();
         let requested_repo_label = filter.repo.as_deref().and_then(canonical_repo_label);
         let repo_filter = filter
@@ -1867,12 +1928,13 @@ impl Store {
         let excluded_terminal_count = total_count - cards.len();
 
         cards.sort_by(powder_core::ready_sort_cmp);
-        cards.truncate(limit.max(1));
+        let (cards, next_after) = paginate_ordered_cards(cards, limit.max(1), after)?;
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count,
             cycle_card_ids: Vec::new(),
+            next_after,
         })
     }
 
@@ -3212,6 +3274,54 @@ pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
         .into_iter()
         .map(|record| card_from_record(connection, record))
         .collect()
+}
+
+/// Shared continuation-slicing step for [`Store::list_cards_page_after`]
+/// and [`Store::list_ready_page_after`] (powder-cards-api-paged-continuation):
+/// `cards` is the caller's already fully-computed, already-ordered eligible
+/// list (post filter, post sort/topological-order, pre-truncate) -- this
+/// helper never touches the database or recomputes anything, it only walks
+/// that in-memory `Vec` to find where a prior page left off.
+///
+/// `after`, when set, must name a card present in `cards`; an id that
+/// doesn't appear there (never existed in this order, filtered out by
+/// different query parameters than the prior call used, or gone ineligible
+/// since) is rejected outright rather than silently resuming from the
+/// start or skipping over cards -- a wrong resume point would look like no
+/// bug at all while quietly dropping or duplicating cards for the caller.
+///
+/// Returns the `limit`-sized (or shorter, on the last page) slice starting
+/// just after `after`'s position, plus `next_after`: the id to pass on the
+/// following call, present only when this slice didn't reach the end of
+/// `cards`.
+fn paginate_ordered_cards(
+    mut cards: Vec<Card>,
+    limit: usize,
+    after: Option<&CardId>,
+) -> Result<(Vec<Card>, Option<CardId>)> {
+    let limit = limit.max(1);
+    let start = match after {
+        None => 0,
+        Some(after_id) => {
+            let position = cards
+                .iter()
+                .position(|card| card.id == *after_id)
+                .ok_or_else(|| {
+                    DomainError::validation(
+                        "after",
+                        format!(
+                            "card {after_id} is not in the current result set (stale or \
+                             filtered-out continuation token)"
+                        ),
+                    )
+                })?;
+            position + 1
+        }
+    };
+    let end = (start + limit).min(cards.len());
+    let next_after = (end < cards.len()).then(|| cards[end - 1].id.clone());
+    let page = cards.drain(start..end).collect();
+    Ok((page, next_after))
 }
 
 /// A parent edge must point at an existing card and must not close a cycle:

@@ -75,10 +75,19 @@ or other dispatchers may claim work from Powder and execute elsewhere, but the
 dispatch loop and every model call are outside the core.
 
 **A human face on the same state.** The API/MCP/CLI contract comes first, but
-the product should still feel excellent to operate. The human UI is a thin,
-gorgeous Kanban board over the same cards, claims, timelines, relations,
-blockers, awaiting-input states, and proof links that agents consume. It is not a
-separate human-only project-management system.
+the product should still feel excellent to operate. The human UI is a thin
+layer over the same cards, claims, timelines, relations, blockers,
+awaiting-input states, and proof links that agents consume -- never a
+separate human-only data model or a feature-parity project-management clone.
+At small scale that thin layer is a gorgeous raw Kanban board. At fleet
+scale -- thousands of cards, dozens of repos, agents generating work
+continuously and without it being an event -- a raw ticket-by-ticket board
+stops being legible to a human, so the default human view becomes live
+rollups (epics, themes, velocity) computed from the same card graph, with
+raw per-ticket browsing one click away, not the landing page. Agents keep
+raw, full-fidelity access through the API/CLI/MCP contract regardless of
+what the human default renders (operator ruling, 2026-07-17: see
+`powder-epic-first-human-board`).
 
 **Instance data stays in instances.** The public repo may contain Powder's own
 product-development epics, synthetic fixtures, and sample config. Imported or

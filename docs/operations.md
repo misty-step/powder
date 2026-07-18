@@ -245,6 +245,54 @@ profiles:
       - cd /path/to/powder && exec cargo run --locked -q -p powder-mcp
 ```
 
+## Paging `/api/v1/cards` and `/api/v1/cards/ready` beyond `limit` (powder-cards-api-paged-continuation)
+
+Both list routes cap a single response to `limit` cards (default 20).
+Historically that was a hard wall: a caller could only ever see the first
+`limit` cards of the response's own order, with no way to reach the rest
+short of raising `limit` arbitrarily high. An optional `after` query param
+now lets a caller resume past a prior response instead:
+
+```
+GET /api/v1/cards?limit=20
+GET /api/v1/cards?limit=20&after=<next_after-from-the-previous-response>
+GET /api/v1/cards/ready?limit=20&after=<next_after-from-the-previous-response>
+```
+
+Each response includes `next_after` -- the card id to pass as `after` on
+the following request -- whenever more cards remain beyond the page just
+returned; it is omitted once a caller has reached the end. Omitting `after`
+entirely reproduces the historical first-page response byte-for-byte (same
+cards, same order, same `has_more`) -- `after`/`next_after` are purely
+additive, so every existing caller (the CLI's `list-cards`/`list-ready`,
+`powder-mcp`'s `list_cards`/`list_ready` tools, and any script that never
+sends `after`) is unaffected.
+
+**Read this as an interim continuation, not scale-proof pagination.** Both
+routes still do a full, unfiltered table scan and rebuild the entire
+filtered/sorted (or, for `/ready`, topologically-ordered) list in memory on
+*every* call, `after` or not -- `after` only tells that freshly-recomputed
+list where to resume slicing, so it bounds response *payload size*, not
+per-request DB/CPU cost. `after` also has no special resilience to
+concurrent writes between page fetches: it names a specific card id and
+resumes strictly after that id's position in whatever the list looks like
+*at the moment of the follow-up call*. If that id is no longer part of the
+eligible set -- deleted, filtered out by different query params than the
+prior call used, or (for `/ready`) gone ineligible since -- the request
+fails with `400 Bad Request` naming the stale token, rather than silently
+resuming from the start or skipping cards. The separate,
+deliberately-deferred `powder-store-sql-pushed-list-filtering` card is what
+pushes the filtering and ordering into SQL and actually bounds the
+per-request cost on a large board; until that lands, `after` only helps you
+reach cards beyond `limit`, it does not make a large board cheaper to page
+through.
+
+`has_more` keeps its historical meaning (it compares `total_count` against
+*this* page's size) and was never position-aware across pages -- it only
+ever gives a correct "more exists" answer on a request with no `after`.
+Once you're walking pages with `after`, use `next_after`'s presence or
+absence to decide whether to keep going.
+
 ## Self-Hosting
 
 For the copy-pasteable quickstart (Docker, release binary, bare-host +

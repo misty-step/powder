@@ -968,6 +968,255 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
     );
 }
 
+/// powder-cards-api-paged-continuation: (a) omitting `after` must reproduce
+/// today's exact first-page response -- same cards, same order, same
+/// `total_count`/`has_more` as the pre-continuation formula (see
+/// `list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards`'s
+/// own `limit=1` assertions for that historical shape); (b) supplying the
+/// returned `next_after` token fetches the next slice of the *same*
+/// already-computed order with no gaps and no duplicate cards across pages,
+/// against a seeded set larger than one page; and an unknown/stale `after`
+/// is rejected rather than silently resumed from the start.
+#[tokio::test]
+async fn list_cards_after_param_omitted_matches_first_page_and_continues_with_no_gaps_or_duplicates(
+) {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    {
+        let mut store = state.store.lock().unwrap();
+        for (id, created_at) in [
+            ("cont-1", 10),
+            ("cont-2", 20),
+            ("cont-3", 30),
+            ("cont-4", 40),
+            ("cont-5", 50),
+        ] {
+            let card = Card::new(CardId::new(id).unwrap(), format!("Card {id}"), "do it")
+                .unwrap()
+                .with_status(CardStatus::Backlog)
+                .with_priority(Priority::P2)
+                .with_created_at(created_at);
+            store.import_cards(vec![card]).unwrap();
+        }
+    }
+    let app = app(state);
+    let ids = |value: &serde_json::Value| -> Vec<String> {
+        value["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // (a) no `after`: today's exact first-page response.
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?limit=2",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await;
+    assert_eq!(ids(&first), vec!["cont-1", "cont-2"]);
+    assert_eq!(first["total_count"], 5);
+    assert_eq!(first["has_more"], true);
+    let next_after = first["next_after"]
+        .as_str()
+        .expect("first page must carry next_after when more cards remain")
+        .to_string();
+    assert_eq!(next_after, "cont-2");
+
+    // (b) walk the rest of the pages with `after`.
+    let second = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/cards?limit=2&after={next_after}"),
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = response_json(second).await;
+    assert_eq!(ids(&second), vec!["cont-3", "cont-4"]);
+    assert_eq!(second["total_count"], 5);
+    let next_after_2 = second["next_after"]
+        .as_str()
+        .expect("second page must still carry next_after")
+        .to_string();
+    assert_eq!(next_after_2, "cont-4");
+
+    let third = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/cards?limit=2&after={next_after_2}"),
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    let third = response_json(third).await;
+    assert_eq!(ids(&third), vec!["cont-5"]);
+    assert!(
+        third.get("next_after").is_none(),
+        "the last page must omit next_after: {third}"
+    );
+
+    let mut seen = ids(&first);
+    seen.extend(ids(&second));
+    seen.extend(ids(&third));
+    assert_eq!(
+        seen,
+        vec!["cont-1", "cont-2", "cont-3", "cont-4", "cont-5"],
+        "pages must union to the full order with no gaps or duplicates"
+    );
+
+    // A stale/unknown continuation token is rejected outright rather than
+    // silently resumed from the start.
+    let stale = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?limit=2&after=does-not-exist",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `/api/v1/cards/ready` counterpart to
+/// `list_cards_after_param_omitted_matches_first_page_and_continues_with_no_gaps_or_duplicates`
+/// -- same continuation contract, over the topologically-ordered ready set
+/// instead of the plain filtered/sorted one.
+#[tokio::test]
+async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no_gaps_or_duplicates(
+) {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    {
+        let mut store = state.store.lock().unwrap();
+        for (id, created_at) in [
+            ("ready-cont-1", 10),
+            ("ready-cont-2", 20),
+            ("ready-cont-3", 30),
+            ("ready-cont-4", 40),
+            ("ready-cont-5", 50),
+        ] {
+            let card = Card::new(CardId::new(id).unwrap(), format!("Card {id}"), "do it")
+                .unwrap()
+                .with_status(CardStatus::Ready)
+                .with_priority(Priority::P2)
+                .with_acceptance(["proof exists".to_string()])
+                .with_created_at(created_at);
+            store.import_cards(vec![card]).unwrap();
+        }
+    }
+    let app = app(state);
+    let ids = |value: &serde_json::Value| -> Vec<String> {
+        value["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // (a) no `after`: today's exact first-page response.
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready?limit=2",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await;
+    assert_eq!(ids(&first), vec!["ready-cont-1", "ready-cont-2"]);
+    assert_eq!(first["total_count"], 5);
+    assert_eq!(first["has_more"], true);
+    let next_after = first["next_after"]
+        .as_str()
+        .expect("first page must carry next_after when more cards remain")
+        .to_string();
+    assert_eq!(next_after, "ready-cont-2");
+
+    // (b) walk the rest of the pages with `after`.
+    let second = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/cards/ready?limit=2&after={next_after}"),
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = response_json(second).await;
+    assert_eq!(ids(&second), vec!["ready-cont-3", "ready-cont-4"]);
+    let next_after_2 = second["next_after"]
+        .as_str()
+        .expect("second page must still carry next_after")
+        .to_string();
+    assert_eq!(next_after_2, "ready-cont-4");
+
+    let third = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/cards/ready?limit=2&after={next_after_2}"),
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    let third = response_json(third).await;
+    assert_eq!(ids(&third), vec!["ready-cont-5"]);
+    assert!(
+        third.get("next_after").is_none(),
+        "the last page must omit next_after: {third}"
+    );
+
+    let mut seen = ids(&first);
+    seen.extend(ids(&second));
+    seen.extend(ids(&third));
+    assert_eq!(
+        seen,
+        vec![
+            "ready-cont-1",
+            "ready-cont-2",
+            "ready-cont-3",
+            "ready-cont-4",
+            "ready-cont-5"
+        ],
+        "pages must union to the full order with no gaps or duplicates"
+    );
+
+    // A stale/unknown continuation token is rejected outright rather than
+    // silently resumed from the start.
+    let stale = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/ready?limit=2&after=does-not-exist",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+}
+
 /// powder-mcp-unfiltered-enumeration (rev-125 fix): `GET /api/v1/cards`
 /// accepts an optional `include_terminal` query param so the remote MCP
 /// dispatch path can apply the same default terminal exclusion as local
