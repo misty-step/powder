@@ -4340,7 +4340,7 @@ fn migration_3_to_4_finishes_a_half_applied_run_column_drop() -> Result<()> {
     Ok(())
 }
 
-/// Every migration step from 1->19 must tolerate being invoked twice in a
+/// Every migration step from 1->21 must tolerate being invoked twice in a
 /// row against a database that already has its target schema (the shape a
 /// crash-and-retry boot produces once a step has fully applied but before
 /// `migrate()`'s loop reaches `SCHEMA_VERSION`) without erroring. Steps 11+
@@ -4382,6 +4382,8 @@ fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
     store.migrate_17_to_18()?;
     store.migrate_18_to_19()?;
     store.migrate_18_to_19()?;
+    store.migrate_20_to_21()?;
+    store.migrate_20_to_21()?;
 
     // Re-running every step twice must not have perturbed the fully
     // migrated schema: still at SCHEMA_VERSION, still able to round-trip a

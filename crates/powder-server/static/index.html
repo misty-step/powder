@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Powder Board</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231a1a1a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m10 20-1.25-2.5L6 18'/%3E%3Cpath d='M10 4 8.75 6.5 6 6'/%3E%3Cpath d='m14 20 1.25-2.5L18 18'/%3E%3Cpath d='m14 4 1.25 2.5L18 6'/%3E%3Cpath d='m17 21-3-6h-4'/%3E%3Cpath d='m17 3-3 6 1.5 3'/%3E%3Cpath d='M2 12h6.5L10 9'/%3E%3Cpath d='m20 10-1.5 2 1.5 2'/%3E%3Cpath d='M22 12h-6.5L14 15'/%3E%3Cpath d='m4 10 1.5 2L4 14'/%3E%3Cpath d='m7 21 3-6-1.5-3'/%3E%3Cpath d='m7 3 3 6h4'/%3E%3C/svg%3E">
   <script>
@@ -110,17 +110,22 @@
   <section id="quick-add-panel" class="pw-quick-add" hidden>
     <form id="quick-add-form" class="pw-quick-add-form">
       <label>
-        <span class="ae-chrome">Title</span>
-        <input id="quick-add-title" class="ae-input" type="text" autocomplete="off" required placeholder="What needs doing?">
+        <span class="ae-chrome">Title <span class="pw-optional">optional</span></span>
+        <input id="quick-add-title" class="ae-input" type="text" autocomplete="off" placeholder="Short title (first ramble line works too)">
       </label>
       <label>
-        <span class="ae-chrome">Notes</span>
-        <textarea id="quick-add-body" class="ae-input" rows="3" placeholder="Optional details"></textarea>
+        <span class="ae-chrome">Ramble</span>
+        <textarea id="quick-add-body" class="ae-input" rows="4" placeholder="Paste or type the whole thought here…"></textarea>
       </label>
       <label>
-        <span class="ae-chrome">Repo</span>
+        <span class="ae-chrome">Repo <span class="pw-optional">optional</span></span>
         <select id="quick-add-repo" class="pw-sort"></select>
       </label>
+      <label class="pw-quick-add-attach">
+        <span class="ae-chrome">Images <span class="pw-optional">paste or choose</span></span>
+        <input id="quick-add-attachments" type="file" accept="image/*" multiple>
+      </label>
+      <ul id="quick-add-attachment-list" class="pw-quick-add-attachment-list" aria-live="polite"></ul>
       <div class="pw-quick-add-actions">
         <button class="ae-button ae-button-compact" type="submit">File card</button>
         <button class="ae-button ae-button-quiet ae-button-compact" type="button" id="quick-add-cancel">Cancel</button>
@@ -278,6 +283,8 @@
     </div>
   </div>
 </div>
+
+<div id="pw-toast" class="pw-toast" role="status" aria-live="polite" hidden></div>
 
 <div id="powder-card-app" class="pw-detail-app" aria-live="polite">
   <header class="pw-detail-top ae-chrome">

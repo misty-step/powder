@@ -7,8 +7,8 @@ mod repository;
 
 pub use model::{
     clean_list, AcceptanceCriterion, Activity, ActivityId, ActivityType, ApprovalQueueRow,
-    Authority, AwaitingInput, Card, CardDetail, CardEvent, CardEventId, CardId, CardSource,
-    CardStatus, CardSummary, Claim, ClaimSummary, Comment, CriterionProof, DetailLevel,
+    AttachmentMeta, Authority, AwaitingInput, Card, CardDetail, CardEvent, CardEventId, CardId,
+    CardSource, CardStatus, CardSummary, Claim, ClaimSummary, Comment, CriterionProof, DetailLevel,
     DomainError, EpicEvidence, EpicFreshness, EpicState, Estimate, EvidenceKind, Link, LinkId,
     Priority, Run, RunDetail, RunId, RunState, WorkLogEntry,
 };

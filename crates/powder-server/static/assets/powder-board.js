@@ -57,6 +57,7 @@ const els = {
   app: document.getElementById("powder-board-app"),
   cardApp: document.getElementById("powder-card-app"),
   detailBody: document.getElementById("detail-body"),
+  detailScroll: document.querySelector(".pw-detail-scroll"),
   quickAddToggle: document.getElementById("quick-add-toggle"),
   quickAddPanel: document.getElementById("quick-add-panel"),
   quickAddForm: document.getElementById("quick-add-form"),
@@ -65,6 +66,8 @@ const els = {
   quickAddRepo: document.getElementById("quick-add-repo"),
   quickAddCancel: document.getElementById("quick-add-cancel"),
   quickAddMessage: document.getElementById("quick-add-message"),
+  quickAddAttachments: document.getElementById("quick-add-attachments"),
+  quickAddAttachmentList: document.getElementById("quick-add-attachment-list"),
   detailConnection: document.getElementById("detail-connection-status"),
   detailBoardLink: document.getElementById("detail-board-link"),
   detailHomeLink: document.getElementById("detail-home-link"),
@@ -126,6 +129,7 @@ const els = {
   cmdkInput: document.getElementById("cmdk-input"),
   cmdkList: document.getElementById("cmdk-list"),
   cmdkEmpty: document.getElementById("cmdk-empty"),
+  toast: document.getElementById("pw-toast"),
 };
 
 const state = {
@@ -160,6 +164,8 @@ const state = {
 };
 
 let railShare = 24;
+let quickAddFiles = [];
+let toastTimer = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -615,6 +621,7 @@ function normalizeCard(card) {
     explicitRepo: Boolean(card.repo),
     repoKey: cardRepo(card),
     displayStatus: displayStatus(card.status),
+    attachments: Array.isArray(card.attachments) ? card.attachments : [],
   };
 }
 
@@ -1044,14 +1051,17 @@ function quickAddRepoOptions() {
       if (right === "inbox") return 1;
       return left.localeCompare(right);
     });
-  return repos.length ? repos : ["inbox"];
+  return repos;
 }
 
 function renderQuickAddRepoOptions() {
   const previous = els.quickAddRepo.value;
-  els.quickAddRepo.innerHTML = quickAddRepoOptions()
-    .map((repo) => `<option value="${escapeHtml(repo)}">${escapeHtml(repo)}</option>`)
-    .join("");
+  const repos = quickAddRepoOptions();
+  els.quickAddRepo.innerHTML =
+    repos
+      .map((repo) => '<option value="' + escapeHtml(repo) + '">' + escapeHtml(repo) + '</option>')
+      .join("") +
+    '<option value="">no repo · local</option>';
   if (previous && [...els.quickAddRepo.options].some((option) => option.value === previous)) {
     els.quickAddRepo.value = previous;
   }
@@ -1069,28 +1079,104 @@ function hideQuickAdd() {
   els.quickAddToggle.setAttribute("aria-expanded", "false");
 }
 
-/// A mobile quick-add gets no id to think about: derive one from the
-/// chosen repo and the current second, which is unique enough for one
-/// human filing one card at a time (powder-925).
+function isImageFile(file) {
+  return Boolean(file && String(file.type || "").toLowerCase().startsWith("image/"));
+}
+
+function attachmentFilesFromClipboard(clipboard) {
+  const files = [];
+  if (!clipboard) return files;
+  for (const file of clipboard.files || []) {
+    if (isImageFile(file)) files.push(file);
+  }
+  for (const item of clipboard.items || []) {
+    if (item.kind === "file" && item.type.startsWith("image/")) {
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  return files;
+}
+
+function mergeQuickAddFiles(files) {
+  const images = files.filter(isImageFile);
+  const seen = new Set(quickAddFiles.map((file) => file.name + ":" + file.size + ":" + file.lastModified));
+  for (const file of images) {
+    const key = file.name + ":" + file.size + ":" + file.lastModified;
+    if (!seen.has(key)) {
+      quickAddFiles.push(file);
+      seen.add(key);
+    }
+  }
+  renderQuickAddAttachments();
+}
+
+function renderQuickAddAttachments() {
+  if (!els.quickAddAttachmentList) return;
+  els.quickAddAttachmentList.innerHTML = quickAddFiles
+    .map((file, index) => '<li><span>' + escapeHtml(file.name || ("image-" + (index + 1))) + '</span><span class="ae-chrome">' + Math.ceil(file.size / 1024) + ' KB</span></li>')
+    .join("");
+}
+
+function clearQuickAddFiles() {
+  quickAddFiles = [];
+  if (els.quickAddAttachments) els.quickAddAttachments.value = "";
+  renderQuickAddAttachments();
+}
+
 function quickAddCardId(repo) {
-  return `${repo}-${Math.floor(Date.now() / 1000)}`;
+  const prefix = repo || "capture";
+  return prefix + Date.now();
+}
+
+async function uploadCardAttachment(cardId, file) {
+  return apiJson("/api/v1/cards/" + encodePath(cardId) + "/attachments", {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "X-Attachment-Filename": file.name || "image",
+    },
+    body: file,
+  });
+}
+
+async function uploadQuickAddFiles(cardId, files) {
+  if (!files.length) return [];
+  const results = await Promise.allSettled(files.map((file) => uploadCardAttachment(cardId, file)));
+  return results
+    .map((result, index) => (result.status === "rejected" ? { file: files[index], error: result.reason } : null))
+    .filter(Boolean);
+}
+
+function showToast(message, kind = "info") {
+  if (!els.toast) return;
+  els.toast.hidden = false;
+  els.toast.dataset.kind = kind;
+  els.toast.textContent = message;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    els.toast.hidden = true;
+  }, 6500);
 }
 
 async function createCardFromQuickAdd(form) {
-  const title = els.quickAddTitle.value.trim();
+  const enteredTitle = els.quickAddTitle.value.trim();
+  const body = els.quickAddBody.value.trim();
+  const firstLine = body.split(/\r?\n/, 1)[0].trim();
+  const title = enteredTitle || firstLine.slice(0, 160);
   if (!title) {
-    els.quickAddMessage.textContent = "Title is required.";
+    els.quickAddMessage.textContent = "Add a title or a line of ramble first.";
     return;
   }
-  const repo = els.quickAddRepo.value || "inbox";
-  const body = els.quickAddBody.value.trim();
+  const repo = els.quickAddRepo.value.trim();
+  const attachments = quickAddFiles.slice();
   const payload = {
     id: quickAddCardId(repo),
     title,
     body,
     acceptance: [],
-    repo,
     status: "backlog",
+    ...(repo ? { repo } : {}),
   };
   els.quickAddMessage.textContent = "Filing...";
   try {
@@ -1100,12 +1186,23 @@ async function createCardFromQuickAdd(form) {
       body: JSON.stringify(payload),
     });
   } catch (err) {
-    els.quickAddMessage.textContent = `Failed: ${err.message || err}`;
+    els.quickAddMessage.textContent = "Failed: " + (err.message || err);
     return;
   }
   form.reset();
+  clearQuickAddFiles();
   hideQuickAdd();
+  let uploadFailures = [];
+  if (attachments.length) {
+    uploadFailures = await uploadQuickAddFiles(payload.id, attachments);
+  }
   els.quickAddMessage.textContent = "";
+  if (uploadFailures.length) {
+    const suffix = uploadFailures.length === 1 ? "image" : "images";
+    showToast("Card filed, but " + uploadFailures.length + " " + suffix + " could not be uploaded. Attachments are unavailable on this server.", "warn");
+  } else if (attachments.length) {
+    showToast(attachments.length + " " + (attachments.length === 1 ? "image" : "images") + " attached.", "ok");
+  }
   await loadBoard();
 }
 
@@ -1608,6 +1705,7 @@ async function loadCardRoute() {
     updateSuccessConnection();
     document.title = `${detail.card?.id || cardId} · Powder`;
     els.detailBody.innerHTML = detailHTML(detail.card, detail);
+    hydrateAttachmentImages();
   } catch (err) {
     const failure = classifyFailure(err);
     updateConnection(failure.connectionKind, failure.connectionLabel);
@@ -1624,8 +1722,65 @@ function detailError(cardId, message) {
   return `<section class="pw-detail-hero"><p class="ae-chrome">CARD</p><p class="pw-detail-title ae-strong">${escapeHtml(cardId)}</p><p class="pw-empty">${escapeHtml(message)}</p></section>`;
 }
 
+function attachmentPath(id) {
+  return "/api/v1/attachments/" + encodePath(id);
+}
+
+function attachmentHTML(attachments) {
+  if (!attachments.length) return empty("No attachments.");
+  return '<div class="pw-attachments">' + attachments.map((attachment) => {
+    const id = String(attachment.id || "");
+    const filename = String(attachment.filename || "image");
+    const src = attachmentPath(id);
+    return '<a class="pw-attachment" href="' + escapeHtml(src) + '" target="_blank" rel="noopener" aria-label="Open ' + escapeHtml(filename) + ' full size">' +
+      '<img class="pw-attachment-img" data-attachment-src="' + escapeHtml(src) + '" src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%271%27 height=%271%27%3E%3C/svg%3E" alt="' + escapeHtml(filename) + '" loading="lazy">' +
+      '<span class="pw-attachment-caption">' + escapeHtml(filename) + ' · ' + escapeHtml(String(attachment.size || 0)) + ' bytes</span></a>';
+  }).join("") + '</div>';
+}
+
+async function loadAttachmentImage(image) {
+  if (!image || image.dataset.loaded === "true" || image.dataset.loading === "true") return;
+  image.dataset.loading = "true";
+  try {
+    const response = await fetch(image.dataset.attachmentSrc, { headers: apiHeaders() });
+    if (!response.ok) throw new Error(response.status + " " + response.statusText);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    image.src = objectUrl;
+    image.dataset.loaded = "true";
+    const link = image.closest("a");
+    if (link) link.href = objectUrl;
+  } catch (_err) {
+    image.classList.add("is-unavailable");
+    image.alt = image.alt + " (unavailable)";
+  } finally {
+    delete image.dataset.loading;
+  }
+}
+
+function hydrateAttachmentImages() {
+  const images = [...(els.detailBody?.querySelectorAll(".pw-attachment-img[data-attachment-src]") || [])];
+  if (!images.length) return;
+  if (!("IntersectionObserver" in window)) {
+    images.forEach((image) => loadAttachmentImage(image));
+    return;
+  }
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      loadAttachmentImage(entry.target);
+      observer.unobserve(entry.target);
+    }
+  }, { root: els.detailScroll || null, rootMargin: "160px" });
+  images.forEach((image) => observer.observe(image));
+}
+
 function detailHTML(card, detail = {}) {
-  const normalized = normalizeCard(card);
+  const normalized = normalizeCard(
+    Array.isArray(detail.attachments) && !Array.isArray(card.attachments)
+      ? { ...card, attachments: detail.attachments }
+      : card,
+  );
   const meta = repoMeta(normalized.repoKey);
   const latestRun = latestRunFor(normalized, detail.runs || []);
   const timeline = timelineItems(detail);
@@ -1656,6 +1811,7 @@ function detailHTML(card, detail = {}) {
     <div class="pw-detail-grid">
       <div class="pw-detail-primary">
         ${section("DESCRIPTION", markdownHTML(normalized.body))}
+        ${section("ATTACHMENTS", attachmentHTML(normalized.attachments))}
         ${detail.epic_state ? section("EPIC PROGRESS", epicStateHTML(detail.epic_state)) : ""}
         ${(detail.children || []).length ? section("CHILDREN", childrenHTML(detail.children, detail.children_total)) : ""}
         ${section("ACCEPTANCE", acceptanceHTML(normalized))}
@@ -2260,7 +2416,20 @@ els.quickAddToggle.addEventListener("click", () => {
   if (els.quickAddPanel.hidden) showQuickAdd();
   else hideQuickAdd();
 });
-els.quickAddCancel.addEventListener("click", () => hideQuickAdd());
+els.quickAddCancel.addEventListener("click", () => {
+  clearQuickAddFiles();
+  hideQuickAdd();
+});
+els.quickAddAttachments?.addEventListener("change", (event) => {
+  mergeQuickAddFiles([...event.target.files]);
+});
+els.quickAddForm.addEventListener("paste", (event) => {
+  const files = attachmentFilesFromClipboard(event.clipboardData);
+  if (!files.length) return;
+  event.preventDefault();
+  mergeQuickAddFiles(files);
+  els.quickAddMessage.textContent = files.length === 1 ? "Pasted 1 image." : "Pasted " + files.length + " images.";
+});
 els.quickAddForm.addEventListener("submit", (event) => {
   event.preventDefault();
   createCardFromQuickAdd(event.currentTarget).catch((err) => {

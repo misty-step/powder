@@ -1,7 +1,10 @@
 use super::*;
 use axum::{
     body::{to_bytes, Body},
-    http::{Method, Request},
+    http::{
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
+        Method, Request, StatusCode,
+    },
 };
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -5479,4 +5482,282 @@ fn tailnet_mode_prefers_the_identity_header_over_a_bearer_token_when_both_are_pr
         actor.key_prefix.is_none(),
         "the identity header path must win, not the bearer-token fallback"
     );
+}
+
+#[tokio::test]
+async fn attachments_http_upload_fetch_round_trip_and_card_detail() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    let create = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"attachment-round-trip","title":"attachments","acceptance":["x"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let bytes = b"synthetic-png-bytes".to_vec();
+    let upload = app
+        .clone()
+        .oneshot(raw_attachment_request(
+            Method::POST,
+            "/api/v1/cards/attachment-round-trip/attachments",
+            Some(&raw_key),
+            "image/png",
+            Some("diagram.png"),
+            bytes.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+    let metadata = response_json(upload).await;
+    assert_eq!(metadata["filename"], "diagram.png");
+    assert_eq!(metadata["mime"], "image/png");
+    assert_eq!(metadata["size"], bytes.len());
+    assert!(metadata.get("created_at").is_none());
+    let attachment_id = metadata["id"].as_str().unwrap().to_owned();
+
+    let fetched = app
+        .clone()
+        .oneshot(authorized_empty_request(
+            Method::GET,
+            &format!("/api/v1/attachments/{attachment_id}"),
+            &raw_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(fetched.headers()[CONTENT_TYPE], "image/png");
+    assert_eq!(
+        fetched.headers()[CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+    let fetched_bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(fetched_bytes.as_ref(), bytes.as_slice());
+
+    let detail = app
+        .oneshot(authorized_empty_request(
+            Method::GET,
+            "/api/v1/cards/attachment-round-trip?detail=detailed",
+            &raw_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail = response_json(detail).await;
+    assert_eq!(detail["attachments"][0]["id"], attachment_id);
+    assert_eq!(detail["attachments"][0]["filename"], "diagram.png");
+    assert_eq!(detail["attachments"][0]["mime"], "image/png");
+    assert_eq!(detail["attachments"][0]["size"], bytes.len());
+    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+        event["subject_kind"] == "attachment"
+            && event["subject_id"] == attachment_id
+            && event["principal"].is_string()
+    }));
+}
+
+#[tokio::test]
+async fn attachments_dedupe_across_cards_and_detach_garbage_collects_blob() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    for id in ["attachment-dedupe-a", "attachment-dedupe-b"] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&raw_key),
+                &format!(r#"{{"id":"{id}","title":"{id}","acceptance":["x"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let bytes = b"same-image".to_vec();
+    let first = app
+        .clone()
+        .oneshot(raw_attachment_request(
+            Method::POST,
+            "/api/v1/cards/attachment-dedupe-a/attachments",
+            Some(&raw_key),
+            "image/webp",
+            Some("first.webp"),
+            bytes.clone(),
+        ))
+        .await
+        .unwrap();
+    let first = response_json(first).await;
+    let attachment_id = first["id"].as_str().unwrap().to_owned();
+    let second = app
+        .clone()
+        .oneshot(raw_attachment_request(
+            Method::POST,
+            "/api/v1/cards/attachment-dedupe-b/attachments",
+            Some(&raw_key),
+            "image/webp",
+            Some("second.webp"),
+            bytes,
+        ))
+        .await
+        .unwrap();
+    let second = response_json(second).await;
+    assert_eq!(second["id"], attachment_id);
+
+    let detach_first = app
+        .clone()
+        .oneshot(authorized_empty_request(
+            Method::DELETE,
+            &format!("/api/v1/cards/attachment-dedupe-a/attachments/{attachment_id}"),
+            &raw_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detach_first.status(), StatusCode::OK);
+    let shared_blob = app
+        .clone()
+        .oneshot(authorized_empty_request(
+            Method::GET,
+            &format!("/api/v1/attachments/{attachment_id}"),
+            &raw_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(shared_blob.status(), StatusCode::OK);
+
+    let detach_second = app
+        .clone()
+        .oneshot(authorized_empty_request(
+            Method::DELETE,
+            &format!("/api/v1/cards/attachment-dedupe-b/attachments/{attachment_id}"),
+            &raw_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detach_second.status(), StatusCode::OK);
+    let collected = app
+        .oneshot(authorized_empty_request(
+            Method::GET,
+            &format!("/api/v1/attachments/{attachment_id}"),
+            &raw_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(collected.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn attachments_reject_oversize_and_non_image_mime() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    let create = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"attachment-bounds","title":"attachments","acceptance":["x"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let oversize = app
+        .clone()
+        .oneshot(raw_attachment_request(
+            Method::POST,
+            "/api/v1/cards/attachment-bounds/attachments",
+            Some(&raw_key),
+            "image/png",
+            None,
+            vec![0_u8; 10 * 1024 * 1024 + 1],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversize.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bad_mime = app
+        .oneshot(raw_attachment_request(
+            Method::POST,
+            "/api/v1/cards/attachment-bounds/attachments",
+            Some(&raw_key),
+            "text/plain",
+            None,
+            b"not-an-image".to_vec(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_mime.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn attachments_require_auth_and_report_unknown_resources() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    let unauthenticated = app
+        .clone()
+        .oneshot(raw_attachment_request(
+            Method::POST,
+            "/api/v1/cards/missing/attachments",
+            None,
+            "image/png",
+            None,
+            b"bytes".to_vec(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let unknown_card = app
+        .clone()
+        .oneshot(raw_attachment_request(
+            Method::POST,
+            "/api/v1/cards/missing/attachments",
+            Some(&raw_key),
+            "image/png",
+            None,
+            b"bytes".to_vec(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_card.status(), StatusCode::NOT_FOUND);
+    let unknown_attachment = app
+        .oneshot(authorized_empty_request(
+            Method::GET,
+            "/api/v1/attachments/does-not-exist",
+            &raw_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_attachment.status(), StatusCode::NOT_FOUND);
+}
+
+fn raw_attachment_request(
+    method: Method,
+    uri: &str,
+    raw_key: Option<&str>,
+    mime: &str,
+    filename: Option<&str>,
+    bytes: Vec<u8>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Content-Type", mime);
+    if let Some(filename) = filename {
+        builder = builder.header("X-Attachment-Filename", filename);
+    }
+    if let Some(raw_key) = raw_key {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {raw_key}"));
+    }
+    builder.body(Body::from(bytes)).unwrap()
+}
+
+fn authorized_empty_request(method: Method, uri: &str, raw_key: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+        .body(Body::empty())
+        .unwrap()
 }
