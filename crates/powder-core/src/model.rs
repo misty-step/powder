@@ -1151,6 +1151,15 @@ pub struct Link {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    pub id: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
@@ -1235,6 +1244,7 @@ pub struct CardDetail {
     pub work_log: Vec<WorkLogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_log_total: Option<usize>,
+    pub attachments: Vec<AttachmentMeta>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<CardSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

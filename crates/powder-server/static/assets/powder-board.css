@@ -1526,3 +1526,248 @@ html:not([data-pw-route='card']) .pw-detail-app {
     display: none;
   }
 }
+
+
+/* powder-mobile-responsive-board: attachment presentation follows the existing
+   hairline/ink grammar; the thumbnail is a lazy image, while the surrounding
+   link is the full-size tap target. */
+.pw-attachments {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+  gap: 0.8rem;
+}
+
+.pw-attachment {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.45rem;
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius);
+  color: var(--ae-ink-muted);
+  text-decoration: none;
+}
+
+.pw-attachment:hover,
+.pw-attachment:focus-visible {
+  border-color: var(--ae-ink-muted);
+  color: var(--ae-ink);
+}
+
+.pw-attachment-img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  background: var(--ae-wash);
+}
+
+.pw-attachment-img.is-unavailable {
+  opacity: 0.35;
+}
+
+.pw-attachment-caption {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--ae-font-mono);
+  font-size: 11px;
+}
+
+.pw-optional {
+  color: var(--ae-ink-faint);
+  font-size: 0.9em;
+}
+
+.pw-quick-add-attach {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.pw-quick-add-attach input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius);
+  background: var(--ae-surface);
+  color: var(--ae-ink);
+  font: inherit;
+}
+
+.pw-quick-add-attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.7rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  color: var(--ae-ink-muted);
+  font-size: 12px;
+}
+
+.pw-quick-add-attachment-list li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.pw-toast {
+  position: fixed;
+  z-index: 100;
+  right: max(1.2rem, env(safe-area-inset-right));
+  bottom: max(1.2rem, env(safe-area-inset-bottom));
+  max-width: min(32rem, calc(100vw - 2.4rem));
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius);
+  background: var(--ae-surface);
+  color: var(--ae-ink);
+  box-shadow: 0 0.8rem 2rem rgba(0, 0, 0, 0.18);
+  font-size: 13px;
+}
+
+.pw-toast[data-kind='warn'] {
+  border-color: var(--ae-warn);
+}
+
+.pw-toast[data-kind='ok'] {
+  border-color: var(--ae-ok);
+}
+
+.pw-toast[hidden] {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  html,
+  body {
+    overflow-x: hidden;
+  }
+
+  .pw-top,
+  .pw-foot,
+  .pw-filters,
+  .pw-awaiting,
+  .pw-quick-add,
+  .pw-detail-top {
+    padding-inline-start: max(1.2rem, env(safe-area-inset-left));
+    padding-inline-end: max(1.2rem, env(safe-area-inset-right));
+  }
+
+  .pw-top-right {
+    width: 100%;
+    justify-content: flex-start;
+    gap: 0.4rem;
+  }
+
+  .pw-filter-btn,
+  .pw-icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+    height: 44px;
+  }
+
+  .pw-filters {
+    align-items: stretch;
+    gap: 0.7rem;
+  }
+
+  .pw-filter-group {
+    width: 100%;
+  }
+
+  .pw-filter-group .pw-search,
+  .pw-filter-group .pw-sort {
+    flex: 1 1 auto;
+    min-height: 44px;
+    box-sizing: border-box;
+  }
+
+  .pw-search input,
+  .pw-sort {
+    min-height: 44px;
+  }
+
+  .pw-chip-btn,
+  .pw-chip-btn .ae-chip {
+    min-height: 44px;
+  }
+
+  .pw-filter-clear {
+    min-height: 44px;
+    padding-inline: 0.6rem;
+    margin-left: 0;
+  }
+
+  .pw-quick-add-actions {
+    flex-wrap: wrap;
+  }
+
+  .pw-quick-add-actions button,
+  .pw-quick-add-attach input {
+    min-height: 44px;
+  }
+
+  .pw-board {
+    overflow-x: hidden;
+  }
+
+  .pw-detail-app {
+    min-height: 100svh;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .pw-detail-scroll {
+    overscroll-behavior-x: none;
+  }
+
+  .pw-detail-body {
+    width: min(100% - 2.4rem, 74rem);
+    max-width: calc(100% - 2.4rem);
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 640px) {
+  /* Keep the existing lane tabs as a useful announcement/quick-jump control,
+     but show every lane in one vertical scroll so no work is hidden behind a
+     second horizontal scroll surface. */
+  .pw-board {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1.2rem;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding-bottom: 1.2rem;
+  }
+
+  .pw-lane-switch {
+    display: flex;
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    flex: none;
+    margin: -0.35rem -0.2rem 0;
+    padding: 0.35rem 0.2rem;
+    background: var(--ae-surface);
+  }
+
+  .pw-lane {
+    display: flex;
+    flex: none;
+    min-height: 0;
+  }
+
+  .pw-lane-scroll {
+    flex: none;
+    overflow: visible;
+    padding-bottom: 0.4rem;
+  }
+}

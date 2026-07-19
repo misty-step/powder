@@ -14,9 +14,10 @@ use std::{
 };
 
 use axum::{
-    extract::{FromRequestParts, Path, Query, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State},
     http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
         request::Parts,
         HeaderMap, StatusCode,
     },
@@ -799,6 +800,15 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/parent", post(set_parent))
         .route("/api/v1/cards/{id}/criteria/check", post(check_criterion))
         .route("/api/v1/cards/{id}/links", post(add_link))
+        .route(
+            "/api/v1/cards/{id}/attachments",
+            post(upload_attachment).layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES)),
+        )
+        .route(
+            "/api/v1/cards/{id}/attachments/{attachment_id}",
+            axum::routing::delete(detach_attachment),
+        )
+        .route("/api/v1/attachments/{id}", get(get_attachment))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/work-log", post(append_work_log))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
@@ -1419,6 +1429,77 @@ async fn check_criterion(
     Ok(Json(card))
 }
 
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+async fn upload_attachment(
+    State(state): State<AppState>,
+    AuthActor(authenticated): AuthActor,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mime = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| is_supported_image_mime(value))
+        .ok_or_else(|| ApiError::unsupported_media_type("unsupported image MIME type"))?;
+    let filename = headers
+        .get("x-attachment-filename")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("attachment");
+    let card_id = CardId::new(id)?;
+    let attachment = lock_store(&state)?.attach_image_as(
+        &card_id,
+        body.as_ref(),
+        mime,
+        filename,
+        unix_now(),
+        &authenticated.authority(),
+    )?;
+    Ok(Json(json!({
+        "id": attachment.id,
+        "filename": attachment.filename,
+        "mime": attachment.mime,
+        "size": attachment.size,
+    })))
+}
+
+async fn get_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    authorize_read(&state, &headers)?;
+    let (mime, bytes) = lock_store(&state)?
+        .attachment_blob(&id)?
+        .ok_or_else(|| powder_core::DomainError::not_found("attachment", id.clone()))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, mime)
+        .header(CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| ApiError::internal(format!("building attachment response: {error}")))
+}
+
+async fn detach_attachment(
+    State(state): State<AppState>,
+    AuthActor(authenticated): AuthActor,
+    Path((id, attachment_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let card_id = CardId::new(id.clone())?;
+    lock_store(&state)?.detach_as(
+        &card_id,
+        &attachment_id,
+        unix_now(),
+        &authenticated.authority(),
+    )?;
+    Ok(Json(
+        json!({ "deleted": true, "card_id": id, "attachment_id": attachment_id }),
+    ))
+}
+
 async fn add_link(
     State(state): State<AppState>,
     AuthActor(authenticated): AuthActor,
@@ -1943,6 +2024,13 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActo
     }
 }
 
+fn is_supported_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(AUTHORIZATION)
@@ -2199,6 +2287,13 @@ impl ApiError {
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: message.into(),
         }
     }

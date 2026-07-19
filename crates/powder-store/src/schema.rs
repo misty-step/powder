@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -48,6 +48,25 @@ CREATE TABLE IF NOT EXISTS cards (
   parent TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, created_at, id);
+
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  bytes BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS card_attachments (
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+  filename TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  principal TEXT NOT NULL,
+  PRIMARY KEY(card_id, attachment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_card_attachments_card_created
+  ON card_attachments(card_id, created_at, attachment_id);
 CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent);
 
 CREATE TABLE IF NOT EXISTS repositories (

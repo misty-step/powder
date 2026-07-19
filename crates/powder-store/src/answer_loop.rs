@@ -37,6 +37,7 @@ impl Store {
         let links = load_link_section_for_card(&self.connection, card_id, detail)?;
         let comments = load_comments_for_card(&self.connection, card_id, detail)?;
         let work_log = load_work_log_for_card(&self.connection, card_id, detail)?;
+        let attachments = self.attachments_for_card(card_id)?;
         // The packet always rolls up every child; only the displayed child
         // list is bounded in concise mode.
         let all_children = load_children_for_card(&self.connection, card_id)?;
@@ -75,6 +76,7 @@ impl Store {
             comments_total: comments.total,
             work_log: work_log.items,
             work_log_total: work_log.total,
+            attachments,
             children,
             children_total,
             epic_state,

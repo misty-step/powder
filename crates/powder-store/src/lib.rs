@@ -4,14 +4,15 @@ use std::{collections::HashMap, fs, path::Path};
 
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
-    CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment, CriterionProof,
-    DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Run, RunId, RunState,
-    WorkLogEntry,
+    AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
+    CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
+    CriterionProof, DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Run,
+    RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 mod answer_loop;
 mod events;
@@ -508,6 +509,10 @@ impl Store {
                 19 => {
                     self.migrate_19_to_20()?;
                     20
+                }
+                20 => {
+                    self.migrate_20_to_21()?;
+                    21
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1152,6 +1157,33 @@ impl Store {
     /// Every legacy value remains untouched: the new columns are nullable,
     /// so old card events and outbound payloads retain their exact bytes and
     /// explicitly carry unknown provenance rather than a fabricated identity.
+    fn migrate_20_to_21(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS attachments (
+               id TEXT PRIMARY KEY,
+               mime TEXT NOT NULL,
+               size INTEGER NOT NULL,
+               bytes BLOB NOT NULL,
+               created_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS card_attachments (
+               card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+               attachment_id TEXT NOT NULL REFERENCES attachments(id) ON DELETE CASCADE,
+               filename TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               principal TEXT NOT NULL,
+               PRIMARY KEY(card_id, attachment_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_card_attachments_card_created
+               ON card_attachments(card_id, created_at, attachment_id);",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn migrate_19_to_20(&mut self) -> Result<()> {
         let needs_principal = !self.table_has_column("card_events", "principal")?;
         let needs_subject_kind = !self.table_has_column("card_events", "subject_kind")?;
@@ -2473,6 +2505,184 @@ impl Store {
         Ok(claim_receipt(card_id, &claim))
     }
 
+    pub fn attach_image(
+        &mut self,
+        card_id: &CardId,
+        bytes: &[u8],
+        mime: &str,
+        filename: &str,
+        principal: &str,
+        now: i64,
+    ) -> Result<AttachmentMeta> {
+        let authority = Authority::actor(principal.to_owned(), false);
+        self.attach_image_as(card_id, bytes, mime, filename, now, &authority)
+    }
+
+    pub fn attach_image_as(
+        &mut self,
+        card_id: &CardId,
+        bytes: &[u8],
+        mime: &str,
+        filename: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<AttachmentMeta> {
+        let mime = non_empty("mime", mime)?;
+        if !is_supported_image_mime(&mime) {
+            return Err(DomainError::validation(
+                "mime",
+                format!("unsupported image MIME type: {mime}"),
+            )
+            .into());
+        }
+        let filename = non_empty_scrubbed("filename", filename)?;
+        let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
+        let id = format!("{:x}", Sha256::digest(bytes));
+        let size = i64::try_from(bytes.len())
+            .map_err(|_| DomainError::validation("bytes", "image is too large to store"))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_card(&transaction, card_id)?;
+        transaction.execute(
+            "INSERT INTO attachments (id, mime, size, bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO NOTHING",
+            params![id, mime, size, bytes, now],
+        )?;
+        let (stored_mime, stored_size) = transaction.query_row(
+            "SELECT mime, size FROM attachments WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        transaction.execute(
+            "INSERT INTO card_attachments
+             (card_id, attachment_id, filename, created_at, principal)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(card_id, attachment_id) DO UPDATE SET
+               filename = excluded.filename,
+               created_at = excluded.created_at,
+               principal = excluded.principal",
+            params![card_id.as_str(), id, filename, now, principal],
+        )?;
+        append_attributed_card_event(
+            &transaction,
+            card_id,
+            MutationAudit {
+                event_type: "attachment",
+                actor: &principal,
+                payload: "attached image",
+                subject_kind: "attachment",
+                subject_id: &id,
+                authority,
+            },
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(AttachmentMeta {
+            id,
+            filename,
+            mime: stored_mime,
+            size: stored_size,
+            created_at: now,
+        })
+    }
+
+    pub fn attachment_blob(&self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT mime, bytes FROM attachments WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn detach(
+        &mut self,
+        card_id: &CardId,
+        attachment_id: &str,
+        principal: &str,
+        now: i64,
+    ) -> Result<()> {
+        let authority = Authority::actor(principal.to_owned(), false);
+        self.detach_as(card_id, attachment_id, now, &authority)
+    }
+
+    pub fn detach_as(
+        &mut self,
+        card_id: &CardId,
+        attachment_id: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<()> {
+        let attachment_id = non_empty("attachment_id", attachment_id)?;
+        let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_card(&transaction, card_id)?;
+        let removed = transaction.execute(
+            "DELETE FROM card_attachments
+             WHERE card_id = ?1 AND attachment_id = ?2",
+            params![card_id.as_str(), attachment_id],
+        )?;
+        if removed == 0 {
+            return Err(DomainError::not_found("attachment", attachment_id).into());
+        }
+        let referenced: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM card_attachments WHERE attachment_id = ?1",
+            [&attachment_id],
+            |row| row.get(0),
+        )?;
+        if referenced == 0 {
+            transaction.execute("DELETE FROM attachments WHERE id = ?1", [&attachment_id])?;
+        }
+        append_attributed_card_event(
+            &transaction,
+            card_id,
+            MutationAudit {
+                event_type: "attachment",
+                actor: &principal,
+                payload: "detached image",
+                subject_kind: "attachment",
+                subject_id: &attachment_id,
+                authority,
+            },
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn attachments_for_card(&self, card_id: &CardId) -> Result<Vec<AttachmentMeta>> {
+        load_card(&self.connection, card_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT card_attachments.attachment_id,
+                    card_attachments.filename,
+                    attachments.mime,
+                    attachments.size,
+                    card_attachments.created_at
+             FROM card_attachments
+             JOIN attachments ON attachments.id = card_attachments.attachment_id
+             WHERE card_attachments.card_id = ?1
+             ORDER BY card_attachments.created_at ASC, card_attachments.attachment_id ASC",
+        )?;
+        let attachments = statement
+            .query_map([card_id.as_str()], |row| {
+                Ok(AttachmentMeta {
+                    id: row.get(0)?,
+                    filename: row.get(1)?,
+                    mime: row.get(2)?,
+                    size: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(attachments)
+    }
+
     pub fn add_link(&mut self, card_id: &CardId, label: &str, url: &str, now: i64) -> Result<Link> {
         self.add_link_as(card_id, label, url, now, &Authority::unchecked())
     }
@@ -2950,6 +3160,13 @@ fn count_field_note_drafts_since(connection: &Connection, cutoff: i64) -> Result
         }
     }
     Ok(count)
+}
+
+fn is_supported_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
 }
 
 fn insert_link(
