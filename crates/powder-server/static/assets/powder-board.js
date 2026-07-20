@@ -1144,13 +1144,8 @@ function quickAddRepoOptions() {
 let repoComboActive = -1;
 
 function renderQuickAddRepoOptions() {
-  // Parity with the old <select>: a repo is preselected by default; clearing
-  // the field files repo-less ("no repo · local").
-  const repos = quickAddRepoOptions();
-  if (!els.quickAddRepo.value && !els.quickAddRepoInput.value && repos.length) {
-    els.quickAddRepo.value = repos[0];
-    els.quickAddRepoInput.value = repos[0];
-  }
+  // No repo is preselected: new captures default to the repo-less "general"
+  // bucket (operator ruling 2026-07-20); picking a repo is an explicit act.
   syncRepoCombo(els.quickAddRepoInput.value, false);
 }
 

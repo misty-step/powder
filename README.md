@@ -76,7 +76,7 @@ curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
 
 In `api-key` mode, read routes require a valid bearer key by default. Set
 `POWDER_PUBLIC_READS=true` only when the listener is on a genuinely private
-perimeter (e.g. internal Flycast/Tailscale ingress). See
+perimeter (e.g. internal Tailscale ingress). See
 [`docs/operations.md`](docs/operations.md) for the full read-auth posture and
 rollout runbook.
 
@@ -113,7 +113,7 @@ silently drift from what's in this README.
 - [Marketing site](https://misty-step.github.io/powder/) — screenshots and a
   feature tour.
 - [Self-hosting](docs/self-hosting.md) — the copy-pasteable deploy guide:
-  Docker/binary/systemd/Fly, the full env-var reference, webhooks, and
+  Docker/binary/systemd (plus a Fly reference), the full env-var reference, webhooks, and
   backup/restore.
 - [Operations](docs/operations.md) — auth modes, key rotation, remote-mode
   CLI/MCP transport, and production runbook lore.
