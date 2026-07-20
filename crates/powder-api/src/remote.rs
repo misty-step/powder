@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use powder_core::{AcceptanceCriterion, CardId, CardStatus, ClaimSummary, Estimate, Priority};
+use powder_core::{
+    AcceptanceCriterion, CardId, CardStatus, ClaimSummary, Estimate, Priority, Risk,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -368,6 +370,8 @@ pub struct ClientCardSummary {
     pub priority: Priority,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<Estimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<Risk>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -31,7 +31,7 @@ use axum::{
 use hmac::{Hmac, Mac};
 use powder_core::{
     canonical_repo_label, Authority, Card, CardId, CardStatus, DetailLevel, Estimate,
-    PapercutReport, Priority, ReadyQuery, RunId,
+    PapercutReport, Priority, ReadyQuery, Risk, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -445,6 +445,7 @@ struct CreateCardRequest {
     status: Option<String>,
     priority: Option<String>,
     estimate: Option<String>,
+    risk: Option<String>,
     labels: Option<Vec<String>>,
     repo: Option<String>,
     related: Option<Vec<String>>,
@@ -473,6 +474,7 @@ struct PatchCardRequest {
     status: Option<String>,
     priority: Option<String>,
     estimate: Option<String>,
+    risk: Option<String>,
     labels: Option<Vec<String>>,
     /// Repository reassignment (powder-repo-hygiene), admin-gated in
     /// `patch_card`. Absent -- don't touch. `""` (or any string that
@@ -493,6 +495,7 @@ impl PatchCardRequest {
             })
             .transpose()?;
         let estimate = self.estimate.as_deref().map(parse_estimate).transpose()?;
+        let risk = self.risk.as_deref().map(parse_risk).transpose()?;
         let repo = self.repo.map(|raw| canonical_repo_label(&raw));
 
         Ok(CardPatch {
@@ -503,6 +506,7 @@ impl PatchCardRequest {
             status,
             priority,
             estimate,
+            risk,
             labels: self.labels,
             repo,
         })
@@ -1261,6 +1265,7 @@ async fn create_card(
         .as_deref()
         .map(parse_estimate)
         .transpose()?;
+    let risk = request.risk.as_deref().map(parse_risk).transpose()?;
     let card_id = CardId::new(request.id)?;
     let mut card = Card::new(
         card_id.clone(),
@@ -1270,6 +1275,7 @@ async fn create_card(
     .with_status(status)
     .with_priority(priority)
     .with_estimate(estimate)
+    .with_risk(risk)
     .with_acceptance(request.acceptance)
     .with_proof_plan(request.proof_plan.unwrap_or_default())
     .with_created_at(now);
@@ -2185,6 +2191,20 @@ fn parse_estimate(raw: &str) -> Result<Estimate, ApiError> {
                 .iter()
                 .copied()
                 .map(Estimate::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })
+}
+
+fn parse_risk(raw: &str) -> Result<Risk, ApiError> {
+    Risk::parse(raw).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "invalid risk {raw:?}; valid: {}",
+            Risk::ALL
+                .iter()
+                .copied()
+                .map(Risk::as_str)
                 .collect::<Vec<_>>()
                 .join("|")
         ))

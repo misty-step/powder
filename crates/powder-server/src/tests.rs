@@ -1887,6 +1887,111 @@ async fn estimate_round_trips_through_create_patch_and_filters_list_and_ready() 
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Risk round-trips through create, get, patch, and list; absent risk
+/// stays None (no default invented), and an invalid value is a 400 naming
+/// the allowed values -- same contract shape as `estimate`'s round-trip
+/// test above, the orthogonal axis powder-risk-signal-field adds.
+#[tokio::test]
+async fn risk_round_trips_through_create_get_patch_and_list() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"risky-card","title":"Risky card","acceptance":["proof"],"status":"ready","risk":"low"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = response_json(created).await;
+    assert_eq!(created["risk"], "low");
+
+    let fetched = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/risky-card",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+    let fetched = response_json(fetched).await;
+    assert_eq!(fetched["card"]["risk"], "low");
+
+    let listed = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?limit=50",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let listed = response_json(listed).await;
+    let listed_card = listed["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["id"] == "risky-card")
+        .expect("risky-card present in list_cards");
+    assert_eq!(listed_card["risk"], "low");
+
+    let patched = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/risky-card",
+            Some(&raw_key),
+            r#"{"risk":"high"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched = response_json(patched).await;
+    assert_eq!(patched["risk"], "high");
+
+    let no_risk = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"no-risk-card","title":"No risk card","acceptance":["proof"]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(no_risk.status(), StatusCode::OK);
+    let no_risk = response_json(no_risk).await;
+    assert!(
+        no_risk.get("risk").is_none() || no_risk["risk"].is_null(),
+        "absent risk must stay None, not a fabricated default: {no_risk:?}"
+    );
+
+    let invalid = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"bad-risk","title":"t","acceptance":["x"],"risk":"catastrophic"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let invalid = response_json(invalid).await;
+    let message = invalid["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("low") && message.contains("medium") && message.contains("high"),
+        "400 must name the allowed risk values: {message}"
+    );
+}
+
 #[tokio::test]
 async fn board_stats_route_returns_compact_counts_without_listing_cards() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);

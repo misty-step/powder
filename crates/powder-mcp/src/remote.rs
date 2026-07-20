@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 
 use super::{
     card_id, claim_action, missing_required, optional_repository_tier,
-    optional_repository_visibility, optional_str, parse_estimate, parse_priority, parse_status,
-    required_claim_arg, required_str, run_id, run_id_for_claim, to_string, ClaimAction,
+    optional_repository_visibility, optional_str, parse_estimate, parse_priority, parse_risk,
+    parse_status, required_claim_arg, required_str, run_id, run_id_for_claim, to_string,
+    ClaimAction,
 };
 
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
@@ -96,6 +97,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 parse_estimate(value)?;
                 body["estimate"] = json!(value);
             }
+            if let Some(value) = optional_str(args, "risk") {
+                parse_risk(value)?;
+                body["risk"] = json!(value);
+            }
             if let Some(value) = args["labels"].as_array() {
                 body["labels"] = json!(value);
             }
@@ -147,6 +152,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = optional_str(args, "estimate") {
                 parse_estimate(value)?;
                 body["estimate"] = json!(value);
+            }
+            if let Some(value) = optional_str(args, "risk") {
+                parse_risk(value)?;
+                body["risk"] = json!(value);
             }
             if let Some(value) = args["labels"].as_array() {
                 body["labels"] = json!(value);

@@ -1682,7 +1682,8 @@ fn migration_14_to_15_drops_workspace_path_and_branch_name_from_existing_databas
               claim_expires_at INTEGER,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL,
-              parent TEXT
+              parent TEXT,
+              risk TEXT
             );
             CREATE TABLE repositories (
               name TEXT PRIMARY KEY,
@@ -1771,7 +1772,8 @@ fn migration_14_to_15_finishes_a_half_applied_branch_name_drop() -> Result<()> {
               claim_expires_at INTEGER,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL,
-              parent TEXT
+              parent TEXT,
+              risk TEXT
             );
             PRAGMA user_version = 14;
             "#,
@@ -1824,7 +1826,8 @@ fn migration_15_to_16_drops_autonomy_from_existing_databases() -> Result<()> {
               claim_expires_at INTEGER,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL,
-              parent TEXT
+              parent TEXT,
+              risk TEXT
             );
             CREATE TABLE repositories (
               name TEXT PRIMARY KEY,
@@ -4413,7 +4416,7 @@ fn migration_3_to_4_finishes_a_half_applied_run_column_drop() -> Result<()> {
     Ok(())
 }
 
-/// Every migration step from 1->21 must tolerate being invoked twice in a
+/// Every migration step from 1->22 must tolerate being invoked twice in a
 /// row against a database that already has its target schema (the shape a
 /// crash-and-retry boot produces once a step has fully applied but before
 /// `migrate()`'s loop reaches `SCHEMA_VERSION`) without erroring. Steps 11+
@@ -4457,6 +4460,8 @@ fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
     store.migrate_18_to_19()?;
     store.migrate_20_to_21()?;
     store.migrate_20_to_21()?;
+    store.migrate_21_to_22()?;
+    store.migrate_21_to_22()?;
 
     // Re-running every step twice must not have perturbed the fully
     // migrated schema: still at SCHEMA_VERSION, still able to round-trip a

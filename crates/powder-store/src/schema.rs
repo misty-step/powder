@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS cards (
   claim_expires_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  parent TEXT
+  parent TEXT,
+  risk TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, created_at, id);
 
@@ -385,17 +386,17 @@ ALTER TABLE cards DROP COLUMN autonomy;
 pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate, labels_json,
 assignee, related_json, blocks_json, blocked_by_json, repo, source_path,
 source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
-created_at, updated_at, parent";
+created_at, updated_at, parent, risk";
 
 pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
 source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at,
-claim_expires_at, created_at, updated_at, parent FROM cards WHERE id = ?1";
+claim_expires_at, created_at, updated_at, parent, risk FROM cards WHERE id = ?1";
 
 pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
 labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
 source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at,
-claim_expires_at, created_at, updated_at, parent FROM cards";
+claim_expires_at, created_at, updated_at, parent, risk FROM cards";
 
 pub const RUN_SELECT_SQL: &str =
     "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,

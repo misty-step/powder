@@ -261,6 +261,40 @@ impl Estimate {
     }
 }
 
+/// A coarse blast-radius x reversibility x uncertainty signal: the
+/// orthogonal axis to `Estimate` (which covers size/effort). Together the
+/// two let a manual-fire OMP loop read "how big" and "how dangerous" before
+/// claiming a card, without opening the full body. Optional everywhere,
+/// same as `Estimate` -- no card is required to carry a risk rating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Risk {
+    Low,
+    Medium,
+    High,
+}
+
+impl Risk {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 /// The status vocabulary (powder-status-vocabulary): seven statuses, down
 /// from the prior nine. `Claimed`/`Running` collapsed into a single
 /// `InProgress` -- the claim struct already carries who/lease/liveness, so a
@@ -509,6 +543,8 @@ pub struct Card {
     pub priority: Priority,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<Estimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<Risk>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,6 +580,8 @@ pub struct CardSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<Estimate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<Risk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
@@ -568,6 +606,7 @@ impl From<&Card> for CardSummary {
             status: card.status,
             priority: card.priority,
             estimate: card.estimate,
+            risk: card.risk,
             repo: card.repo.clone(),
             labels: card.labels.clone(),
             claim: card.claim.as_ref().map(ClaimSummary::from),
@@ -593,6 +632,8 @@ struct CardFields {
     priority: Priority,
     #[serde(default)]
     estimate: Option<Estimate>,
+    #[serde(default)]
+    risk: Option<Risk>,
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default)]
@@ -631,6 +672,7 @@ impl<'de> Deserialize<'de> for Card {
             status: fields.status,
             priority: fields.priority,
             estimate: fields.estimate,
+            risk: fields.risk,
             labels: fields.labels,
             assignee: fields.assignee,
             related: fields.related,
@@ -685,6 +727,7 @@ impl Card {
             status: CardStatus::Backlog,
             priority: Priority::default(),
             estimate: None,
+            risk: None,
             labels: Vec::new(),
             assignee: None,
             related: Vec::new(),
@@ -760,6 +803,11 @@ impl Card {
 
     pub fn with_estimate(mut self, estimate: Option<Estimate>) -> Self {
         self.estimate = estimate;
+        self
+    }
+
+    pub fn with_risk(mut self, risk: Option<Risk>) -> Self {
+        self.risk = risk;
         self
     }
 

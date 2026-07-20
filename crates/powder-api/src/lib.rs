@@ -26,7 +26,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards",
         intent: "create one new card in the instance database, rejecting duplicate ids; response includes a hint field when the created card has no acceptance criteria",
         body_shape: Some(
-            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely; estimate is one of S|M|L|XL; related/blocks/blocked_by are reciprocal -- naming an existing peer card mirrors the reverse edge onto it atomically (related is symmetric, blocks/blocked_by mirror each other); a peer id that doesn't exist is tolerated and simply not mirrored"#,
+            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"risk":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely; estimate is one of S|M|L|XL; risk is one of low|medium|high; related/blocks/blocked_by are reciprocal -- naming an existing peer card mirrors the reverse edge onto it atomically (related is symmetric, blocks/blocked_by mirror each other); a peer id that doesn't exist is tolerated and simply not mirrored"#,
         ),
     },
     ApiRoute {
@@ -106,7 +106,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}",
         intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
         body_shape: Some(
-            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"labels":null} -- every field is optional; only the fields present in the body are changed; any authenticated actor may patch and the change is audited with actor and field list; estimate is one of S|M|L|XL"#,
+            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"risk":null,"labels":null} -- every field is optional; only the fields present in the body are changed; any authenticated actor may patch and the change is audited with actor and field list; estimate is one of S|M|L|XL; risk is one of low|medium|high"#,
         ),
     },
     ApiRoute {

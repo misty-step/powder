@@ -3,7 +3,7 @@
 pub use powder_api::RemoteClient;
 use powder_core::{
     Authority, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel, Estimate,
-    PapercutReport, Priority, ReadyQuery, RunId,
+    PapercutReport, Priority, ReadyQuery, Risk, RunId,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -56,13 +56,13 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "create_card",
-        description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, and initial status; returns a minimal ack; get_card for full state. related/blocks/blocked_by set at creation mirror reciprocally onto each named peer that already exists (related is symmetric; blocks/blocked_by mirror each other); a peer id that doesn't exist yet is tolerated and simply not mirrored.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
+        description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, risk, and initial status; returns a minimal ack; get_card for full state. related/blocks/blocked_by set at creation mirror reciprocally onto each named peer that already exists (related is symmetric; blocks/blocked_by mirror each other); a peer id that doesn't exist yet is tolerated and simply not mirrored.",
+        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "update_card",
-        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, estimate, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. Any authenticated actor may patch; the change is audited with actor and field list.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, estimate, risk, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. Any authenticated actor may patch; the change is audited with actor and field list.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -454,6 +454,7 @@ pub fn call_tool_store(
             let estimate = optional_str(args, "estimate")
                 .map(parse_estimate)
                 .transpose()?;
+            let risk = optional_str(args, "risk").map(parse_risk).transpose()?;
             let mut card = Card::new(id, title, optional_str(args, "body").unwrap_or_default())
                 .map_err(to_string)?
                 .with_acceptance(acceptance)
@@ -461,6 +462,7 @@ pub fn call_tool_store(
                 .with_status(status)
                 .with_priority(priority)
                 .with_estimate(estimate)
+                .with_risk(risk)
                 .with_created_at(now);
             card.labels = string_array(args, "labels")?;
             card.related = card_ids_array(args, "related")?;
@@ -496,6 +498,7 @@ pub fn call_tool_store(
                 estimate: optional_str(args, "estimate")
                     .map(parse_estimate)
                     .transpose()?,
+                risk: optional_str(args, "risk").map(parse_risk).transpose()?,
                 labels: optional_string_array(args, "labels")?,
                 repo: None,
             };
@@ -1138,6 +1141,10 @@ fn parse_estimate(raw: &str) -> Result<Estimate, String> {
     Estimate::parse(raw).ok_or_else(|| invalid_enum_value("estimate", raw, estimate_valid_values()))
 }
 
+fn parse_risk(raw: &str) -> Result<Risk, String> {
+    Risk::parse(raw).ok_or_else(|| invalid_enum_value("risk", raw, risk_valid_values()))
+}
+
 fn detail_arg(args: &Value) -> Result<DetailLevel, String> {
     optional_str(args, "detail")
         .map(|raw| DetailLevel::parse(raw).ok_or_else(|| format!("invalid detail: {raw}")))
@@ -1206,6 +1213,15 @@ fn estimate_valid_values() -> String {
         .iter()
         .copied()
         .map(Estimate::as_str)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn risk_valid_values() -> String {
+    Risk::ALL
+        .iter()
+        .copied()
+        .map(Risk::as_str)
         .collect::<Vec<_>>()
         .join("|")
 }
