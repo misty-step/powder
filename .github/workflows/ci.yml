@@ -87,3 +87,32 @@ jobs:
           name: law-gate-report
           path: law/playwright-report/
           if-no-files-found: ignore
+
+  ui-toolchain-drift:
+    name: ui toolchain drift (committed dist)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install ui/ dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Build ui/ into crates/powder-server/static
+        run: npm run build
+        working-directory: ui
+
+      - name: Fail if the committed dist drifted from a fresh build
+        run: |
+          if ! git diff --exit-code -- crates/powder-server/static; then
+            echo "::error::crates/powder-server/static is out of date -- run 'npm ci && npm run build' in ui/ and commit the result." >&2
+            exit 1
+          fi

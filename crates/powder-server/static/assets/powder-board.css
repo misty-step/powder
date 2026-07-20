@@ -1,26 +1,25 @@
-:root {
-  --ae-accent: #2643d0;
-  --ae-accent-dark: #8c9eff;
-  /* powder-903: the one duration/easing the board <-> backlog <-> both view
-     switch uses everywhere -- the rail/board grid split, the rail's own
-     fade+slide, and the board's fade+slide all reference this so the three
-     stay visually synchronized instead of drifting out of step. */
-  --pw-view-duration: 220ms;
-}
-
-/* powder-903: prefers-reduced-motion collapses every view-switch transition
-   to effectively instant by way of this one custom property, rather than a
-   media query duplicated at each of the three rules that reference it (or a
-   JS matchMedia branch -- the old rail-share animation used one; this
-   removes the need for it entirely). */
-@media (prefers-reduced-motion: reduce) {
-  :root {
-    --pw-view-duration: 0.01ms;
+/*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */
+@layer theme {
+  :root, :host {
+    --font-display: "Geist", sans-serif;
   }
 }
 
-html,
-body {
+@layer utilities;
+
+:root {
+  --ae-accent: #2643d0;
+  --ae-accent-dark: #8c9eff;
+  --pw-view-duration: .22s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --pw-view-duration: .01ms;
+  }
+}
+
+html, body {
   height: 100%;
   overflow: hidden;
 }
@@ -30,60 +29,59 @@ body {
 }
 
 .pw-app {
+  background: var(--ae-surface);
+  flex-direction: column;
   height: 100dvh;
   display: flex;
-  flex-direction: column;
   overflow: hidden;
-  background: var(--ae-surface);
 }
 
-html[data-pw-route='card'] .pw-app {
-  display: none;
-}
-
-html:not([data-pw-route='card']) .pw-detail-app {
+html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-app {
   display: none;
 }
 
 .pw-detail-app {
+  background: var(--ae-surface);
+  flex-direction: column;
   height: 100dvh;
   display: flex;
-  flex-direction: column;
   overflow: hidden;
-  background: var(--ae-surface);
 }
 
-.ae-vt-mode::view-transition-old(root),
+.ae-vt-mode::view-transition-old(root) {
+  animation-duration: .24s;
+}
+
 .ae-vt-mode::view-transition-new(root) {
-  animation-duration: 240ms;
+  animation-duration: .24s;
 }
 
 .pw-top {
-  flex: none;
-  display: flex;
-  align-items: center;
   justify-content: space-between;
+  align-items: center;
   gap: var(--ae-space-3) var(--ae-space-6);
-  flex-wrap: wrap;
-  padding: 0.9em 2em 0;
   border-bottom: 1px solid var(--ae-line);
+  flex-wrap: wrap;
+  flex: none;
+  padding: .9em 2em 0;
+  display: flex;
 }
 
 .pw-brand {
-  display: inline-flex;
   align-items: center;
-  gap: 0.7em;
-  padding-bottom: 0.9em;
+  gap: .7em;
+  padding-bottom: .9em;
+  display: inline-flex;
 }
 
 .pw-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  border: 1px solid var(--ae-line);
   width: 1.9em;
   height: 1.9em;
-  border: 1px solid var(--ae-line);
   color: var(--ae-ink);
+  justify-content: center;
+  align-items: center;
+  display: inline-flex;
 }
 
 .pw-mark .ae-icon {
@@ -91,16 +89,15 @@ html:not([data-pw-route='card']) .pw-detail-app {
   height: 1.15em;
 }
 
-.pw-connection[data-kind='ok'] {
+.pw-connection[data-kind="ok"] {
   color: var(--ae-ok);
 }
 
-.pw-connection[data-kind='readonly'],
-.pw-connection[data-kind='auth'] {
+.pw-connection[data-kind="readonly"], .pw-connection[data-kind="auth"] {
   color: var(--ae-accent);
 }
 
-.pw-connection[data-kind='error'] {
+.pw-connection[data-kind="error"] {
   color: var(--ae-err);
 }
 
@@ -110,54 +107,43 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-top .ae-tabs button {
+  padding-bottom: .75em;
   font-size: 13px;
-  padding-bottom: 0.75em;
 }
 
-/* flex-wrap (powder-ui-awaiting-you review): this cluster holds several
-   items -- live indicator, quick-add, filter, and settings. Without
-   wrapping, a 390px viewport pushes #settings-toggle past the right edge,
-   and the app shell's overflow:hidden means no scrollbar exists to reach
-   it. Wrapping costs nothing on desktop (it only engages when out of
-   space) and keeps every control on-screen at any width. */
 .pw-top-right {
-  display: inline-flex;
-  align-items: center;
-  flex-wrap: wrap;
   justify-content: flex-end;
+  align-items: center;
   gap: var(--ae-space-2) var(--ae-space-4);
-  padding-bottom: 0.65em;
+  flex-wrap: wrap;
+  padding-bottom: .65em;
+  display: inline-flex;
 }
 
-.pw-filter-btn,
-.pw-icon-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.45em;
+.pw-filter-btn, .pw-icon-btn {
+  border-radius: var(--ae-radius);
   min-width: 2.1em;
   height: 2.1em;
-  background: transparent;
-  border: 0;
-  border-radius: var(--ae-radius);
-  padding: 0.3em 0.5em;
-  margin: 0;
   font: inherit;
-  font-size: 13px;
   color: var(--ae-ink-muted);
   cursor: pointer;
   transition: color var(--ae-quick) var(--ae-ease);
+  background: none;
+  border: 0;
+  justify-content: center;
+  align-items: center;
+  gap: .45em;
+  margin: 0;
+  padding: .3em .5em;
+  font-size: 13px;
+  display: inline-flex;
 }
 
-.pw-filter-btn:hover,
-.pw-filter-btn[aria-expanded='true'],
-.pw-icon-btn:hover,
-.pw-icon-btn[aria-expanded='true'] {
+.pw-filter-btn:hover, .pw-filter-btn[aria-expanded="true"], .pw-icon-btn:hover, .pw-icon-btn[aria-expanded="true"] {
   color: var(--ae-ink);
 }
 
-.pw-filter-btn .ae-icon,
-.pw-icon-btn .ae-icon {
+.pw-filter-btn .ae-icon, .pw-icon-btn .ae-icon {
   width: 1em;
   height: 1em;
 }
@@ -168,14 +154,14 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-auth {
-  flex: none;
-  display: grid;
-  grid-template-columns: minmax(16rem, 1fr) minmax(18rem, 1.1fr) auto;
-  gap: 1em;
-  align-items: start;
-  padding: 0.8em 2em;
   border-bottom: 1px solid var(--ae-line);
   background: var(--ae-wash);
+  flex: none;
+  grid-template-columns: minmax(16rem, 1fr) minmax(18rem, 1.1fr) auto;
+  align-items: start;
+  gap: 1em;
+  padding: .8em 2em;
+  display: grid;
 }
 
 .pw-auth[hidden] {
@@ -183,21 +169,21 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-mint-cmd {
-  display: flex;
   align-items: start;
-  gap: 0.5em;
-  margin-top: 0.45em;
+  gap: .5em;
+  margin-top: .45em;
+  display: flex;
 }
 
 .pw-auth code {
-  display: inline-block;
-  flex: 1 1 auto;
-  min-width: 0;
-  padding: 0.35em 0.5em;
   border: 1px solid var(--ae-line);
   background: var(--ae-surface);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  flex: auto;
+  min-width: 0;
+  padding: .35em .5em;
+  display: inline-block;
 }
 
 #copy-mint-command {
@@ -205,9 +191,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-auth-form {
-  display: flex;
   align-items: end;
-  gap: 0.8em;
+  gap: .8em;
+  display: flex;
 }
 
 .pw-auth-form label {
@@ -219,23 +205,20 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-settings-head {
-  display: flex;
-  align-items: baseline;
   justify-content: space-between;
+  align-items: baseline;
   gap: 1em;
+  display: flex;
 }
 
 .pw-settings-head .ae-h {
-  margin: 0 0 0.45em;
+  margin: 0 0 .45em;
 }
 
-/* powder-915: pairs the repository count with the zero-card "show empty"
-   toggle without disturbing the existing space-between two-child layout
-   above. */
 .pw-settings-head-meta {
-  display: inline-flex;
   align-items: baseline;
-  gap: 0.8em;
+  gap: .8em;
+  display: inline-flex;
 }
 
 .pw-repo-list {
@@ -243,85 +226,63 @@ html:not([data-pw-route='card']) .pw-detail-app {
   overflow-y: auto;
 }
 
-/* powder-915: a tier badge next to the repo name -- RepositorySummary
-   carries no `description` field (see PR design notes), so the honest
-   legibility gain here is the tier at a glance, not fabricated copy.
-   Grouped with the name in its own flex box so the row's outer
-   `justify-content: space-between` (name group vs. count) doesn't strand
-   the badge in the middle of the row. */
 .pw-repo-main-left {
-  display: inline-flex;
-  min-width: 0;
   align-items: baseline;
-  gap: 0.6em;
+  gap: .6em;
+  min-width: 0;
+  display: inline-flex;
 }
 
-/* The three tiers read differently at a glance, within the .ae-tag grammar
-   (mono, hairline, no fill, no hue -- tier is a lifecycle stage, not a
-   category, so it earns ink weight rather than a categorical hue): active
-   is full ink with a firmer hairline, backburner keeps the .ae-tag default
-   muted treatment, archived recedes to faint ink with a strike. All tokens,
-   so both themes get the same relative ordering for free. */
-.pw-repo-tier-badge[data-tier='active'] {
+.pw-repo-tier-badge[data-tier="active"] {
   color: var(--ae-ink);
   border-color: var(--ae-ink-muted);
 }
 
-.pw-repo-tier-badge[data-tier='archived'] {
+.pw-repo-tier-badge[data-tier="archived"] {
   color: var(--ae-ink-faint);
   text-decoration: line-through;
 }
 
-.pw-repo-create,
-.pw-repo-edit,
-.pw-repo-merge {
-  display: grid;
+.pw-repo-create, .pw-repo-edit, .pw-repo-merge {
   grid-template-columns: repeat(4, minmax(7rem, 1fr)) auto;
-  gap: 0.55em;
   align-items: end;
+  gap: .55em;
+  display: grid;
 }
 
 .pw-repo-create {
-  margin-bottom: 0.6em;
-  padding-bottom: 0.6em;
   border-bottom: 1px solid var(--ae-line);
+  margin-bottom: .6em;
+  padding-bottom: .6em;
 }
 
 .pw-repo-edit {
-  grid-template-columns: minmax(8rem, 1.2fr) minmax(8rem, 1.2fr) minmax(6rem, 0.7fr) auto auto;
-  margin-top: 0.45em;
+  grid-template-columns: minmax(8rem, 1.2fr) minmax(8rem, 1.2fr) minmax(6rem, .7fr) auto auto;
+  margin-top: .45em;
 }
 
 .pw-repo-merge {
   grid-template-columns: minmax(10rem, 1fr) auto;
-  margin-top: 0.45em;
+  margin-top: .45em;
 }
 
-.pw-repo-create label,
-.pw-repo-edit label,
-.pw-repo-merge label {
+.pw-repo-create label, .pw-repo-edit label, .pw-repo-merge label {
   min-width: 0;
 }
 
-.pw-repo-create .ae-chrome,
-.pw-repo-edit .ae-chrome,
-.pw-repo-merge .ae-chrome {
+.pw-repo-create .ae-chrome, .pw-repo-edit .ae-chrome, .pw-repo-merge .ae-chrome {
   display: block;
 }
 
-.pw-repo-create .ae-input,
-.pw-repo-edit .ae-input,
-.pw-repo-merge .ae-input,
-.pw-repo-edit .pw-sort,
-.pw-repo-create .pw-sort {
-  width: 100%;
+.pw-repo-create .ae-input, .pw-repo-edit .ae-input, .pw-repo-merge .ae-input, .pw-repo-edit .pw-sort, .pw-repo-create .pw-sort {
   box-sizing: border-box;
+  width: 100%;
   font-size: 13px;
 }
 
 .pw-repo-row {
   border-top: 1px solid var(--ae-line);
-  padding: 0.5em 0;
+  padding: .5em 0;
   font-size: 13px;
 }
 
@@ -330,55 +291,52 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-repo-main {
-  display: flex;
-  align-items: baseline;
   justify-content: space-between;
+  align-items: baseline;
   gap: 1em;
+  display: flex;
 }
 
 .pw-repo-name {
-  display: inline-flex;
   min-width: 0;
-  align-items: center;
-  gap: 0.45em;
   font-family: var(--ae-font-mono);
-  font-size: 12px;
   color: var(--ae-ink);
+  align-items: center;
+  gap: .45em;
+  font-size: 12px;
+  display: inline-flex;
 }
 
 .pw-repo-name .ae-icon {
+  flex: none;
   width: 1em;
   height: 1em;
-  flex: none;
 }
 
 .pw-repo-counts {
-  display: flex;
   flex-wrap: wrap;
-  gap: 0.35em;
-  margin: 0.35em 0 0;
+  gap: .35em;
+  margin: .35em 0 0;
+  display: flex;
 }
 
 .pw-repo-counts .ae-chip {
-  font-size: 11px;
   color: var(--ae-ink-muted);
+  font-size: 11px;
 }
 
 .pw-repo-alias {
-  margin: 0.35em 0 0;
   overflow-wrap: anywhere;
-  font-size: 12px;
   color: var(--ae-ink-faint);
+  margin: .35em 0 0;
+  font-size: 12px;
 }
 
-/* powder-925: the operator's mobile write path -- a single-purpose panel,
-   same toggle mechanics as .pw-auth (hidden attribute, not a modal), so it
-   works identically at 390px and on desktop with no separate mobile path. */
 .pw-quick-add {
-  flex: none;
-  padding: 0.8em 2em;
   border-bottom: 1px solid var(--ae-line);
   background: var(--ae-wash);
+  flex: none;
+  padding: .8em 2em;
 }
 
 .pw-quick-add[hidden] {
@@ -386,10 +344,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-quick-add-form {
-  display: flex;
   flex-direction: column;
-  gap: 0.8em;
+  gap: .8em;
   max-width: 32rem;
+  display: flex;
 }
 
 .pw-quick-add-form label {
@@ -397,8 +355,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-quick-add-actions {
+  gap: .8em;
   display: flex;
-  gap: 0.8em;
 }
 
 .pw-status-change {
@@ -406,16 +364,16 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-filters {
-  flex: none;
-  display: none;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 0.6em 1.2em;
-  padding: 0.8em 2em;
   border-bottom: 1px solid var(--ae-line);
-  font-size: 13px;
   color: var(--ae-ink-muted);
   animation: ae-enter var(--ae-quick) var(--ae-ease) both;
+  flex-wrap: wrap;
+  flex: none;
+  align-items: baseline;
+  gap: .6em 1.2em;
+  padding: .8em 2em;
+  font-size: 13px;
+  display: none;
 }
 
 .pw-filters.is-open {
@@ -423,33 +381,33 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-filter-group {
-  display: inline-flex;
-  align-items: baseline;
   flex-wrap: wrap;
-  gap: 0.45em;
+  align-items: baseline;
+  gap: .45em;
+  display: inline-flex;
 }
 
 .pw-filter-group > .ae-plate-cap {
-  margin: 0 0.4em 0 0;
+  margin: 0 .4em 0 0;
 }
 
 .pw-chip-btn {
-  background: transparent;
-  border: 0;
-  padding: 0;
-  margin: 0;
   font: inherit;
   cursor: pointer;
+  background: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
 }
 
 .pw-chip-btn .ae-chip {
-  display: inline-flex;
-  min-height: 1.85em;
   box-sizing: border-box;
-  align-items: center;
-  gap: 0.4em;
-  padding: 0.18em 0.6em;
+  min-height: 1.85em;
   transition: color var(--ae-quick) var(--ae-ease), opacity var(--ae-quick) var(--ae-ease);
+  align-items: center;
+  gap: .4em;
+  padding: .18em .6em;
+  display: inline-flex;
 }
 
 .pw-chip-btn .ae-chip .ae-icon {
@@ -457,21 +415,21 @@ html:not([data-pw-route='card']) .pw-detail-app {
   height: 1em;
 }
 
-.pw-chip-btn[aria-pressed='false'] .ae-chip {
+.pw-chip-btn[aria-pressed="false"] .ae-chip {
   color: var(--ae-ink-faint);
   border-color: var(--ae-line);
 }
 
 .pw-chip-btn:hover .ae-chip {
-  opacity: 0.8;
+  opacity: .8;
 }
 
 .pw-search {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45em;
   border-bottom: 1px solid var(--ae-line);
   color: var(--ae-ink);
+  align-items: center;
+  gap: .45em;
+  display: inline-flex;
 }
 
 .pw-search .ae-icon {
@@ -481,39 +439,39 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-search input {
-  width: 13rem;
-  background: transparent;
-  border: 0;
   border-radius: var(--ae-radius);
-  padding: 0.1em 0.2em;
+  width: 13rem;
   font: inherit;
-  font-size: 13px;
   color: var(--ae-ink);
+  background: none;
+  border: 0;
+  padding: .1em .2em;
+  font-size: 13px;
 }
 
 .pw-sort {
-  background: transparent;
   border: 0;
   border-bottom: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
-  padding: 0.1em 0.2em;
-  margin: 0;
   font: inherit;
-  font-size: 13px;
   color: var(--ae-ink);
   cursor: pointer;
+  background: none;
+  margin: 0;
+  padding: .1em .2em;
+  font-size: 13px;
 }
 
 .pw-filter-clear {
-  background: transparent;
-  border: 0;
-  padding: 0;
-  margin-left: auto;
   font: inherit;
-  font-size: 13px;
   color: var(--ae-ink-faint);
   cursor: pointer;
   transition: color var(--ae-quick) var(--ae-ease);
+  background: none;
+  border: 0;
+  margin-left: auto;
+  padding: 0;
+  font-size: 13px;
 }
 
 .pw-filter-clear:hover {
@@ -522,58 +480,45 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-main {
   --pw-rail-share: 24%;
-  flex: 1;
-  min-height: 0;
-  display: grid;
   grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));
-  /* powder-903: the whole board <-> backlog <-> both switch is now one
-     declarative CSS transition on the resolved grid track sizes, driven by
-     `--pw-rail-share` (set once, instantly, in JS -- see setView/
-     setRailShare in powder-board.js). No JS animation loop writes styles
-     every frame, so the transition is non-blocking by construction: board
-     controls stay responsive to clicks throughout (see the law spec), and
-     it is symmetric for free since both directions play the exact same
-     transition. */
+  min-height: 0;
   transition: grid-template-columns var(--pw-view-duration) var(--ae-ease);
+  flex: 1;
+  display: grid;
 }
 
 .pw-rail-wrap {
+  border-right: 1px solid var(--ae-line);
   min-width: 0;
   min-height: 0;
-  border-right: 1px solid var(--ae-line);
-  overflow: hidden;
   transition: border-color var(--pw-view-duration) var(--ae-ease);
+  overflow: hidden;
 }
 
-.pw-main[data-view='board'] .pw-rail-wrap,
-.pw-main[data-view='backlog'] .pw-rail-wrap {
-  border-right-color: transparent;
+.pw-main[data-view="board"] .pw-rail-wrap, .pw-main[data-view="backlog"] .pw-rail-wrap {
+  border-right-color: #0000;
 }
 
 .pw-rail-inner {
-  height: 100%;
-  min-width: 16rem;
   box-sizing: border-box;
-  display: flex;
+  opacity: 1;
+  min-width: 16rem;
+  height: 100%;
+  transition: opacity var(--pw-view-duration) var(--ae-ease), transform var(--pw-view-duration) var(--ae-ease), padding var(--pw-view-duration) var(--ae-ease), width var(--pw-view-duration) var(--ae-ease);
   flex-direction: column;
   padding: 1.5em 1.4em 0;
   font-size: 13px;
-  opacity: 1;
+  display: flex;
   transform: translateX(0);
-  transition:
-    opacity var(--pw-view-duration) var(--ae-ease),
-    transform var(--pw-view-duration) var(--ae-ease),
-    padding var(--pw-view-duration) var(--ae-ease),
-    width var(--pw-view-duration) var(--ae-ease);
 }
 
-.pw-main[data-view='board'] .pw-rail-inner {
+.pw-main[data-view="board"] .pw-rail-inner {
   opacity: 0;
-  transform: translateX(-0.75rem);
   pointer-events: none;
+  transform: translateX(-.75rem);
 }
 
-.pw-main[data-view='backlog'] .pw-rail-inner {
+.pw-main[data-view="backlog"] .pw-rail-inner {
   width: min(46rem, 100% - 4rem);
   margin-inline: auto;
   padding-inline: 0;
@@ -581,23 +526,23 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-rail-head {
   flex: none;
-  display: flex;
   justify-content: space-between;
   align-items: baseline;
+  display: flex;
 }
 
 .pw-rail-list {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
   padding-bottom: 1.5em;
+  overflow-y: auto;
 }
 
 .pw-rail-cap {
-  display: flex;
   align-items: center;
-  gap: 0.5em;
-  margin: 1.4em 0 0.2em;
+  gap: .5em;
+  margin: 1.4em 0 .2em;
+  display: flex;
 }
 
 .pw-rail-cap .ae-icon {
@@ -606,94 +551,87 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-rail-row {
-  display: block;
-  width: 100%;
   box-sizing: border-box;
-  text-decoration: none;
   text-align: left;
-  background: transparent;
   border: 0;
   border-top: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
-  padding: 0.5em 0;
-  margin: 0;
+  width: 100%;
   font: inherit;
-  font-size: 13px;
-  line-height: 1.55;
   color: var(--ae-ink-muted);
   cursor: pointer;
   transition: color var(--ae-quick) var(--ae-ease);
+  background: none;
+  margin: 0;
+  padding: .5em 0;
+  font-size: 13px;
+  line-height: 1.55;
+  text-decoration: none;
+  display: block;
 }
 
-.pw-rail-row:hover,
-.pw-rail-row:focus-visible {
+.pw-rail-row:hover, .pw-rail-row:focus-visible {
   color: var(--ae-ink);
 }
 
 .pw-rail-id {
-  display: block;
   font-family: var(--ae-font-mono);
-  font-size: 11px;
-  letter-spacing: 0.06em;
+  letter-spacing: .06em;
   color: var(--ae-ink-faint);
+  font-size: 11px;
+  display: block;
 }
 
 .pw-board {
   --pw-board-pad-inline: 2.2em;
   min-width: 0;
   min-height: 0;
-  display: grid;
+  padding: 1.5em var(--pw-board-pad-inline) 0;
+  opacity: 1;
+  transition: padding var(--pw-view-duration) var(--ae-ease), opacity var(--pw-view-duration) var(--ae-ease), transform var(--pw-view-duration) var(--ae-ease);
   grid-template-columns: repeat(3, minmax(15rem, 1fr));
   gap: 0 2.6em;
-  padding: 1.5em var(--pw-board-pad-inline) 0;
+  display: grid;
   overflow-x: auto;
-  opacity: 1;
   transform: translateX(0);
-  transition:
-    padding var(--pw-view-duration) var(--ae-ease),
-    opacity var(--pw-view-duration) var(--ae-ease),
-    transform var(--pw-view-duration) var(--ae-ease);
 }
 
-.pw-main[data-view='backlog'] .pw-board {
+.pw-main[data-view="backlog"] .pw-board {
   --pw-board-pad-inline: 0;
   opacity: 0;
-  transform: translateX(0.75rem);
   pointer-events: none;
+  transform: translateX(.75rem);
 }
 
-/* column switcher for the stacked mobile board (below 640px) — a plain
-   .ae-tabs instrument, hidden here because the 3-column grid has room for
-   every lane at this width already. */
 .pw-lane-switch {
-  display: none;
   grid-column: 1 / -1;
-  margin-bottom: 0.5em;
+  margin-bottom: .5em;
+  display: none;
 }
 
 .pw-lane {
-  display: flex;
   flex-direction: column;
-  min-height: 0;
   min-width: 0;
+  min-height: 0;
+  display: flex;
 }
 
 .pw-lane-h {
-  flex: none;
-  display: flex;
   justify-content: space-between;
   align-items: baseline;
   gap: var(--ae-space-4);
   border-bottom: 1px solid var(--ae-line);
-  padding-bottom: 0.5em;
-  margin-bottom: 0.9em;
+  flex: none;
+  margin-bottom: .9em;
+  padding-bottom: .5em;
+  display: flex;
 }
 
 .pw-lane-h .ae-h {
+  align-items: center;
+  gap: .5em;
   margin-bottom: 0;
   display: inline-flex;
-  align-items: center;
-  gap: 0.5em;
 }
 
 .pw-lane-h .ae-icon {
@@ -702,54 +640,53 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-lane-n {
-  font-size: 13px;
   color: var(--ae-ink-muted);
+  font-size: 13px;
 }
 
 .pw-lane-scroll {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
   padding: 2px 2px 1.8em;
+  overflow-y: auto;
 }
 
 .pw-card {
-  display: block;
-  width: 100%;
   box-sizing: border-box;
-  text-decoration: none;
   text-align: left;
-  background: transparent;
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
-  padding: 0.65em 0.9em 0.7em;
-  margin: 0 0 0.7em;
+  width: 100%;
   font: inherit;
   color: var(--ae-ink);
   cursor: pointer;
   transition: border-color var(--ae-quick) var(--ae-ease);
+  background: none;
+  margin: 0 0 .7em;
+  padding: .65em .9em .7em;
+  text-decoration: none;
+  display: block;
 }
 
-.pw-card:hover,
-.pw-card:focus-visible {
+.pw-card:hover, .pw-card:focus-visible {
   border-color: var(--ae-ink-muted);
 }
 
 .pw-card-top {
-  display: flex;
-  align-items: center;
-  gap: 0.5em;
   font-family: var(--ae-font-mono);
-  font-size: 11px;
-  letter-spacing: 0.08em;
+  letter-spacing: .08em;
   color: var(--ae-ink-faint);
-  margin-bottom: 0.15em;
+  align-items: center;
+  gap: .5em;
+  margin-bottom: .15em;
+  font-size: 11px;
+  display: flex;
 }
 
 .pw-card-top .ae-icon {
+  flex: none;
   width: 1em;
   height: 1em;
-  flex: none;
 }
 
 .pw-card-top .pw-id {
@@ -758,47 +695,46 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-card-t {
-  display: block;
   font-weight: var(--ae-w-medium);
   line-height: 1.45;
+  display: block;
 }
 
 .pw-card-meta {
-  display: flex;
-  align-items: center;
-  gap: 0.55em;
-  margin-top: 0.45em;
-  font-size: 13px;
   color: var(--ae-ink-muted);
+  align-items: center;
+  gap: .55em;
+  margin-top: .45em;
+  font-size: 13px;
+  display: flex;
 }
 
 .pw-rel-badges {
-  display: flex;
   flex-wrap: wrap;
-  gap: 0.35em;
-  margin-top: 0.45em;
+  gap: .35em;
+  margin-top: .45em;
+  display: flex;
 }
 
-.pw-rel-badge,
-.pw-rel-id {
-  display: inline-flex;
-  align-items: center;
-  min-height: 1.55em;
+.pw-rel-badge, .pw-rel-id {
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
-  padding: 0.05em 0.45em;
+  min-height: 1.55em;
   font-family: var(--ae-font-mono);
-  font-size: 11px;
   color: var(--ae-ink-muted);
+  align-items: center;
+  padding: .05em .45em;
+  font-size: 11px;
+  display: inline-flex;
 }
 
 .pw-rel-id {
-  margin: 0 0.2em 0.25em 0;
+  margin: 0 .2em .25em 0;
 }
 
 .pw-g {
-  display: inline-flex;
   flex: none;
+  display: inline-flex;
 }
 
 .pw-g .ae-icon {
@@ -807,33 +743,32 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-done-row {
-  display: flex;
-  width: 100%;
   box-sizing: border-box;
-  align-items: baseline;
-  gap: 0.6em;
-  text-decoration: none;
   text-align: left;
-  background: transparent;
   border: 0;
   border-top: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
-  padding: 0.45em 0;
-  margin: 0;
+  width: 100%;
   font: inherit;
-  font-size: 13px;
-  line-height: 1.6;
   color: var(--ae-ink-muted);
   cursor: pointer;
   transition: color var(--ae-quick) var(--ae-ease);
+  background: none;
+  align-items: baseline;
+  gap: .6em;
+  margin: 0;
+  padding: .45em 0;
+  font-size: 13px;
+  line-height: 1.6;
+  text-decoration: none;
+  display: flex;
 }
 
 .pw-done-row:first-child {
   border-top: 0;
 }
 
-.pw-done-row:hover,
-.pw-done-row:focus-visible {
+.pw-done-row:hover, .pw-done-row:focus-visible {
   color: var(--ae-ink);
 }
 
@@ -843,24 +778,21 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-done-id {
-  font-size: 11px;
   color: var(--ae-ink-faint);
   white-space: nowrap;
+  font-size: 11px;
 }
 
 .pw-blocked-cap {
-  margin: 1.5em 0 0.6em;
+  margin: 1.5em 0 .6em;
 }
 
 .pw-empty {
-  font-size: 13px;
   color: var(--ae-ink-faint);
-  padding: 0.4em 0;
+  padding: .4em 0;
+  font-size: 13px;
 }
 
-/* powder-ui-keyboard-firstrun: the brand-new-instance welcome state --
-   distinct from the plain "nothing under this filter" .pw-empty text so a
-   genuinely empty board reads as an onboarding moment, not a dead end. */
 .pw-empty-firstrun {
   color: var(--ae-ink-muted);
   max-width: 32rem;
@@ -868,32 +800,32 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-empty-firstrun .ae-h {
   color: var(--ae-ink);
-  margin-bottom: 0.5em;
+  margin-bottom: .5em;
 }
 
 .pw-empty-firstrun p {
-  margin-top: 0.6em;
+  margin-top: .6em;
 }
 
 .pw-empty-firstrun code {
-  display: inline-block;
-  max-width: 100%;
-  margin-top: 0.35em;
-  padding: 0.35em 0.5em;
-  overflow-x: auto;
   border: 1px solid var(--ae-line);
   background: var(--ae-wash);
   white-space: nowrap;
+  max-width: 100%;
+  margin-top: .35em;
+  padding: .35em .5em;
+  display: inline-block;
+  overflow-x: auto;
 }
 
 .pw-detail-top {
+  border-bottom: 1px solid var(--ae-line);
   flex: none;
-  display: grid;
   grid-template-columns: minmax(7rem, 1fr) auto minmax(7rem, 1fr);
   align-items: center;
   gap: 1em;
-  padding: 0.9em 2em;
-  border-bottom: 1px solid var(--ae-line);
+  padding: .9em 2em;
+  display: grid;
 }
 
 .pw-detail-top .pw-brand {
@@ -902,10 +834,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-detail-nav {
-  display: flex;
-  align-items: center;
-  gap: 0.85em;
   justify-self: start;
+  align-items: center;
+  gap: .85em;
+  display: flex;
 }
 
 .pw-board-link {
@@ -918,9 +850,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-detail-connection {
+  color: var(--ae-ink-muted);
   justify-self: end;
   margin: 0;
-  color: var(--ae-ink-muted);
 }
 
 .pw-detail-scroll {
@@ -936,34 +868,33 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-detail-hero {
-  padding-bottom: 1.35em;
   border-bottom: 1px solid var(--ae-line);
+  padding-bottom: 1.35em;
 }
 
 .pw-detail-title {
   max-width: 56rem;
-  margin-top: 0.7em;
+  margin-top: .7em;
   line-height: 1.5;
 }
 
 .pw-detail-meta {
-  display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.4em 0.9em;
-  margin-top: 0.8em;
+  gap: .4em .9em;
+  margin-top: .8em;
   font-size: 13px;
+  display: flex;
 }
 
 .pw-detail-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(18rem, 0.42fr);
-  gap: 3em;
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, .42fr);
   align-items: start;
+  gap: 3em;
+  display: grid;
 }
 
-.pw-detail-primary,
-.pw-detail-side {
+.pw-detail-primary, .pw-detail-side {
   min-width: 0;
 }
 
@@ -972,10 +903,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   padding-left: 1.6em;
 }
 
-.pw-md p,
-.pw-md ul,
-.pw-md pre {
-  margin-top: 0.8em;
+.pw-md p, .pw-md ul, .pw-md pre {
+  margin-top: .8em;
 }
 
 .pw-md ul {
@@ -983,11 +912,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-md li {
-  margin-top: 0.35em;
+  margin-top: .35em;
 }
 
-.pw-md code,
-.pw-md pre {
+.pw-md code, .pw-md pre {
   font-family: var(--ae-font-mono);
   font-size: 13px;
 }
@@ -997,10 +925,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-md pre {
-  overflow-x: auto;
   border: 1px solid var(--ae-line);
-  padding: 0.8em;
   background: var(--ae-wash);
+  padding: .8em;
+  overflow-x: auto;
 }
 
 .pw-md-head {
@@ -1008,60 +936,49 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-st {
-  display: inline-flex;
   align-items: center;
-  gap: 0.45em;
+  gap: .45em;
+  display: inline-flex;
 }
 
 .pw-sec {
   margin-top: 1.8em;
 }
 
-.pw-sec h3,
-.pw-sec .ae-h {
-  margin-bottom: 0.8em;
+.pw-sec h3, .pw-sec .ae-h {
+  margin-bottom: .8em;
 }
 
 .pw-body p {
-  margin-top: 0.8em;
+  margin-top: .8em;
 }
 
 .pw-trail {
-  list-style: none;
   margin: 0;
   padding: 0;
+  list-style: none;
 }
 
-.pw-trail li,
-.pw-def-row,
-.pw-link-row,
-.pw-acc-item {
+.pw-trail li, .pw-def-row, .pw-link-row, .pw-acc-item {
   border-top: 1px solid var(--ae-line);
-  padding: 0.55em 0;
+  padding: .55em 0;
 }
 
-.pw-trail li:first-child,
-.pw-def-row:first-child,
-.pw-link-row:first-child,
-.pw-acc-item:first-child {
+.pw-trail li:first-child, .pw-def-row:first-child, .pw-link-row:first-child, .pw-acc-item:first-child {
   border-top: 0;
 }
 
-.pw-trail-head,
-.pw-def-row,
-.pw-link-row,
-.pw-acc-item {
-  display: flex;
-  gap: 0.7em;
+.pw-trail-head, .pw-def-row, .pw-link-row, .pw-acc-item {
   align-items: baseline;
+  gap: .7em;
+  display: flex;
 }
 
-.pw-trail-head,
-.pw-def-row dt {
+.pw-trail-head, .pw-def-row dt {
   font-family: var(--ae-font-mono);
-  font-size: 11px;
-  letter-spacing: 0.06em;
+  letter-spacing: .06em;
   color: var(--ae-ink-faint);
+  font-size: 11px;
 }
 
 .pw-def-row dt {
@@ -1069,20 +986,20 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-def-row dd {
-  margin: 0;
-  min-width: 0;
   overflow-wrap: anywhere;
+  min-width: 0;
+  margin: 0;
 }
 
 .pw-worklog {
-  list-style: none;
   margin: 0;
   padding: 0;
+  list-style: none;
 }
 
 .pw-worklog-item {
   border-top: 1px solid var(--ae-line);
-  padding: 0.55em 0;
+  padding: .55em 0;
 }
 
 .pw-worklog-item:first-child {
@@ -1092,113 +1009,108 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-worklog-item summary {
   cursor: pointer;
   font-family: var(--ae-font-mono);
-  font-size: 11px;
-  letter-spacing: 0.06em;
+  letter-spacing: .06em;
   color: var(--ae-ink-faint);
+  font-size: 11px;
 }
 
 .pw-worklog-item p {
-  margin-top: 0.5em;
   overflow-wrap: anywhere;
+  margin-top: .5em;
 }
 
 .pw-link-row .ae-icon {
+  flex: none;
   width: 1em;
   height: 1em;
-  flex: none;
 }
 
 .pw-ask {
   border: 1px solid var(--ae-line);
-  padding: 0.9em 1.1em;
   margin-top: 1.4em;
+  padding: .9em 1.1em;
   font-size: 13px;
 }
 
 .pw-ask-cap {
-  display: flex;
-  align-items: center;
-  gap: 0.5em;
   font-family: var(--ae-font-mono);
-  font-size: 11px;
-  letter-spacing: 0.14em;
+  letter-spacing: .14em;
   color: var(--ae-ink-muted);
-  margin-bottom: 0.45em;
+  align-items: center;
+  gap: .5em;
+  margin-bottom: .45em;
+  font-size: 11px;
+  display: flex;
 }
 
 .pw-acc-list {
-  list-style: none;
   margin: 0;
   padding: 0;
+  list-style: none;
 }
 
 .pw-foot {
-  flex: none;
-  display: flex;
   justify-content: space-between;
   align-items: baseline;
   gap: var(--ae-space-4) var(--ae-space-6);
-  flex-wrap: wrap;
   border-top: 1px solid var(--ae-line);
-  padding: 0.3em 2em;
+  color: var(--ae-ink-faint);
+  flex-wrap: wrap;
+  flex: none;
+  padding: .3em 2em;
   font-size: 11px;
   line-height: 1.4;
-  color: var(--ae-ink-faint);
+  display: flex;
 }
 
 .pw-foot kbd {
   font-size: 10px;
 }
 
-/* powder-ui-awaiting-you: a status-line readout, not a control. It carries
-   no aria-live (announcements would spam screen readers); connectivity is
-   conveyed by data-state and event recency by the title tooltip. Transient
-   reconnects stay in the last stable state (see LIVE_TROUBLE_GRACE_MS). */
 .pw-live {
   font-family: var(--ae-font-mono);
-  font-size: 11px;
-  letter-spacing: 0.04em;
+  letter-spacing: .04em;
   color: var(--ae-ink-faint);
   white-space: nowrap;
+  font-size: 11px;
 }
 
-.pw-live[data-state='live'] {
+.pw-live[data-state="live"] {
   color: var(--ae-ok);
 }
 
-.pw-live[data-state='offline'] {
+.pw-live[data-state="offline"] {
   color: var(--ae-warn);
 }
 
-.pw-live[data-state='idle'] {
+.pw-live[data-state="idle"] {
   color: var(--ae-ink-faint);
 }
 
-/* type-to-search repo combobox (quick-add) */
 .pw-combo {
   position: relative;
 }
 
 .pw-combo-list {
-  position: absolute;
-  inset-inline: 0;
-  top: calc(100% + 2px);
   z-index: 30;
-  margin: 0;
-  padding: 0.25em 0;
-  list-style: none;
-  max-height: 14em;
-  overflow-y: auto;
   background: var(--ae-surface);
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius, 4px);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  inset-inline: 0;
+  max-height: 14em;
+  margin: 0;
+  padding: .25em 0;
+  list-style: none;
+  position: absolute;
+  top: calc(100% + 2px);
+  overflow-y: auto;
+  box-shadow: 0 6px 18px #0000001f;
 }
 
 .pw-combo-list li {
-  padding: 0.55em 0.7em;
-  font-size: 13px;
   cursor: pointer;
+  padding: .55em .7em;
+  font-size: 13px;
 }
 
 .pw-combo-list li.pw-combo-none {
@@ -1211,45 +1123,44 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-combo-field input {
-  flex: 1 1 auto;
+  flex: auto;
   width: auto;
 }
 
-.pw-combo-list li.is-active,
-.pw-combo-list li:hover {
+.pw-combo-list li.is-active, .pw-combo-list li:hover {
   background: var(--ae-wash);
 }
 
-/* instant-paint loading skeleton: shown only on a cache-less first load */
 .pw-skel {
+  gap: .6em;
+  padding: .4em 0;
   display: grid;
-  gap: 0.6em;
-  padding: 0.4em 0;
 }
 
 .pw-skel i {
-  height: 5em;
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius, 4px);
   background: var(--ae-wash);
-  opacity: 0.55;
-  animation: pw-skel-pulse 1.2s ease-in-out infinite alternate;
+  opacity: .55;
+  height: 5em;
+  animation: 1.2s ease-in-out infinite alternate pw-skel-pulse;
 }
 
 .pw-skel i:nth-child(2) {
-  animation-delay: 0.15s;
+  animation-delay: .15s;
 }
 
 .pw-skel i:nth-child(3) {
-  animation-delay: 0.3s;
+  animation-delay: .3s;
 }
 
 @keyframes pw-skel-pulse {
   from {
-    opacity: 0.3;
+    opacity: .3;
   }
+
   to {
-    opacity: 0.7;
+    opacity: .7;
   }
 }
 
@@ -1259,56 +1170,47 @@ html:not([data-pw-route='card']) .pw-detail-app {
   }
 }
 
-/* epic hierarchy (powder-ui-hierarchy-render) */
 .pw-epic-progress {
-  font-size: 13px;
   color: var(--ae-ink-muted);
+  font-size: 13px;
 }
 
 .pw-epic-warn {
-  display: flex;
-  align-items: center;
-  gap: 0.5em;
-  margin-top: 0.6em;
   color: var(--ae-warn);
+  align-items: center;
+  gap: .5em;
+  margin-top: .6em;
   font-size: 13px;
+  display: flex;
 }
 
 .pw-epic-warn .ae-icon {
+  flex: none;
   width: 1em;
   height: 1em;
-  flex: none;
 }
 
 .pw-epic-evidence {
-  margin-top: 0.6em;
+  margin-top: .6em;
 }
 
 .pw-parent-badge {
   text-decoration: none;
 }
 
-/* live updates (powder-epic-answer-board): a plain, non-animated highlight
-   -- the class is added and later removed on a timer, never transitioned,
-   so it is reduced-motion-safe by construction rather than by a media-query
-   opt-out. */
 .pw-card-live-changed {
   outline: 2px solid var(--ae-accent);
   outline-offset: 2px;
 }
 
-/* powder-ui-keyboard-firstrun: the ⌘K/Ctrl-K jump-to-card palette -- a
-   modal listbox filtering the board's own already-loaded card list (see PR
-   design notes). Plain fixed-overlay + panel, no motion beyond the
-   existing hover/focus treatments already covered by :focus-visible. */
 .pw-cmdk {
+  z-index: 60;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  display: flex;
   position: fixed;
   inset: 0;
-  z-index: 60;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding-top: 12vh;
 }
 
 .pw-cmdk[hidden] {
@@ -1316,48 +1218,48 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-cmdk-backdrop {
+  background: #00000073;
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.45);
 }
 
 .pw-cmdk-panel {
-  position: relative;
-  width: min(34rem, 90vw);
-  max-height: 70vh;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
   background: var(--ae-surface);
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
-  box-shadow: 0 1.2em 3em rgba(0, 0, 0, 0.28);
+  flex-direction: column;
+  width: min(34rem, 90vw);
+  max-height: 70vh;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 1.2em 3em #00000047;
 }
 
 .pw-cmdk-combobox {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 0.6em;
-  padding: 0.9em 1.1em;
   border-bottom: 1px solid var(--ae-line);
+  flex: none;
+  align-items: center;
+  gap: .6em;
+  padding: .9em 1.1em;
+  display: flex;
 }
 
 .pw-cmdk-combobox .ae-icon {
   width: 1em;
   height: 1em;
-  flex: none;
   color: var(--ae-ink-muted);
+  flex: none;
 }
 
 .pw-cmdk-input {
-  flex: 1;
   min-width: 0;
-  background: transparent;
-  border: 0;
   font: inherit;
-  font-size: 14px;
   color: var(--ae-ink);
+  background: none;
+  border: 0;
+  flex: 1;
+  font-size: 14px;
 }
 
 .pw-cmdk-input:focus-visible {
@@ -1367,20 +1269,20 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-cmdk-list {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  list-style: none;
   margin: 0;
-  padding: 0.4em;
+  padding: .4em;
+  list-style: none;
+  overflow-y: auto;
 }
 
 .pw-cmdk-item {
-  display: flex;
-  align-items: baseline;
-  gap: 0.7em;
-  padding: 0.55em 0.7em;
   border-radius: var(--ae-radius);
-  font-size: 13px;
   cursor: pointer;
+  align-items: baseline;
+  gap: .7em;
+  padding: .55em .7em;
+  font-size: 13px;
+  display: flex;
 }
 
 .pw-cmdk-item.is-active {
@@ -1389,48 +1291,63 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-cmdk-item-id {
-  flex: none;
   color: var(--ae-ink-faint);
+  flex: none;
 }
 
 .pw-cmdk-item-title {
-  min-width: 0;
-  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .pw-cmdk-empty {
-  padding: 0.7em 1.1em;
+  padding: .7em 1.1em;
 }
 
-.ae-cat-0 { color: var(--ae-cat-0); }
-.ae-cat-1 { color: var(--ae-cat-1); }
-.ae-cat-2 { color: var(--ae-cat-2); }
-.ae-cat-3 { color: var(--ae-cat-3); }
-.ae-cat-4 { color: var(--ae-cat-4); }
-.ae-cat-5 { color: var(--ae-cat-5); }
-.ae-cat-6 { color: var(--ae-cat-6); }
-.ae-cat-7 { color: var(--ae-cat-7); }
+.ae-cat-0 {
+  color: var(--ae-cat-0);
+}
+
+.ae-cat-1 {
+  color: var(--ae-cat-1);
+}
+
+.ae-cat-2 {
+  color: var(--ae-cat-2);
+}
+
+.ae-cat-3 {
+  color: var(--ae-cat-3);
+}
+
+.ae-cat-4 {
+  color: var(--ae-cat-4);
+}
+
+.ae-cat-5 {
+  color: var(--ae-cat-5);
+}
+
+.ae-cat-6 {
+  color: var(--ae-cat-6);
+}
+
+.ae-cat-7 {
+  color: var(--ae-cat-7);
+}
 
 @media (max-width: 760px) {
-  .pw-top,
-  .pw-foot,
-  .pw-filters {
+  .pw-top, .pw-foot, .pw-filters {
     padding-inline: 1.2rem;
   }
 
-  .pw-main,
-  .pw-main[data-view='board'],
-  .pw-main[data-view='backlog'] {
+  .pw-main, .pw-main[data-view="board"], .pw-main[data-view="backlog"] {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .pw-main:not([data-view='backlog']) .pw-rail-wrap {
-    display: none;
-  }
-
-  .pw-main[data-view='backlog'] .pw-board {
+  .pw-main:not([data-view="backlog"]) .pw-rail-wrap, .pw-main[data-view="backlog"] .pw-board {
     display: none;
   }
 
@@ -1448,9 +1365,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
     flex-wrap: wrap;
   }
 
-  .pw-repo-create,
-  .pw-repo-edit,
-  .pw-repo-merge {
+  .pw-repo-create, .pw-repo-edit, .pw-repo-merge {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -1460,8 +1375,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
     padding-inline: 1.2rem;
   }
 
-  .pw-detail-top .pw-brand,
-  .pw-detail-connection {
+  .pw-detail-top .pw-brand, .pw-detail-connection {
     justify-self: start;
   }
 
@@ -1481,10 +1395,6 @@ html:not([data-pw-route='card']) .pw-detail-app {
   }
 }
 
-/* below 640px the 3-column kanban no longer has room for even two lanes
-   at a legible width (powder-930) — stack to one column and swap the
-   lane in view with an explicit switcher instead of letting the grid
-   crop columns and force horizontal panning. */
 @media (max-width: 640px) {
   .pw-board {
     grid-template-columns: minmax(0, 1fr);
@@ -1499,135 +1409,122 @@ html:not([data-pw-route='card']) .pw-detail-app {
     display: none;
   }
 
-  .pw-board[data-lane='ready'] .pw-lane[data-lane='ready'],
-  .pw-board[data-lane='inprogress'] .pw-lane[data-lane='inprogress'],
-  .pw-board[data-lane='done'] .pw-lane[data-lane='done'] {
+  .pw-board[data-lane="ready"] .pw-lane[data-lane="ready"], .pw-board[data-lane="inprogress"] .pw-lane[data-lane="inprogress"], .pw-board[data-lane="done"] .pw-lane[data-lane="done"] {
     display: flex;
   }
 }
 
-/* the keyboard-shortcut hint is dead weight with no keyboard (powder-930):
-   coarse pointer is the touch signal, not viewport width, since a tablet
-   or a narrowed desktop window should keep the hint. Only the hint itself
-   hides -- the footer bar stays up so its home-affordance link (powder-942)
-   remains reachable on touch devices, which is exactly where it matters
-   most. */
 @media (pointer: coarse) {
   .pw-foot-hint {
     display: none;
   }
 }
 
-
-/* powder-mobile-responsive-board: attachment presentation follows the existing
-   hairline/ink grammar; the thumbnail is a lazy image, while the surrounding
-   link is the full-size tap target. */
 .pw-attachments {
-  display: grid;
   grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
-  gap: 0.8rem;
+  gap: .8rem;
+  display: grid;
 }
 
 .pw-attachment {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 0.4rem;
-  padding: 0.45rem;
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
+  min-width: 0;
   color: var(--ae-ink-muted);
+  flex-direction: column;
+  gap: .4rem;
+  padding: .45rem;
   text-decoration: none;
+  display: flex;
 }
 
-.pw-attachment:hover,
-.pw-attachment:focus-visible {
+.pw-attachment:hover, .pw-attachment:focus-visible {
   border-color: var(--ae-ink-muted);
   color: var(--ae-ink);
 }
 
 .pw-attachment-img {
-  display: block;
-  width: 100%;
   aspect-ratio: 4 / 3;
   object-fit: cover;
   background: var(--ae-wash);
+  width: 100%;
+  display: block;
 }
 
 .pw-attachment-img.is-unavailable {
-  opacity: 0.35;
+  opacity: .35;
 }
 
 .pw-attachment-caption {
-  min-width: 0;
-  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
   font-family: var(--ae-font-mono);
   font-size: 11px;
+  overflow: hidden;
 }
 
 .pw-optional {
   color: var(--ae-ink-faint);
-  font-size: 0.9em;
+  font-size: .9em;
 }
 
 .pw-quick-add-attach {
-  display: flex;
   flex-direction: column;
-  gap: 0.35rem;
+  gap: .35rem;
+  display: flex;
 }
 
 .pw-quick-add-attach input {
-  width: 100%;
   box-sizing: border-box;
-  padding: 0.45rem 0.55rem;
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
   background: var(--ae-surface);
+  width: 100%;
   color: var(--ae-ink);
   font: inherit;
+  padding: .45rem .55rem;
 }
 
 .pw-quick-add-attachment-list {
-  display: flex;
+  color: var(--ae-ink-muted);
   flex-wrap: wrap;
-  gap: 0.35rem 0.7rem;
-  list-style: none;
+  gap: .35rem .7rem;
   margin: 0;
   padding: 0;
-  color: var(--ae-ink-muted);
   font-size: 12px;
+  list-style: none;
+  display: flex;
 }
 
 .pw-quick-add-attachment-list li {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 0.4rem;
-  max-width: 100%;
   overflow-wrap: anywhere;
+  align-items: baseline;
+  gap: .4rem;
+  max-width: 100%;
+  display: inline-flex;
 }
 
 .pw-toast {
-  position: fixed;
   z-index: 100;
   right: max(1.2rem, env(safe-area-inset-right));
   bottom: max(1.2rem, env(safe-area-inset-bottom));
-  max-width: min(32rem, calc(100vw - 2.4rem));
-  padding: 0.8rem 1rem;
   border: 1px solid var(--ae-line);
   border-radius: var(--ae-radius);
   background: var(--ae-surface);
+  max-width: min(32rem, 100vw - 2.4rem);
   color: var(--ae-ink);
-  box-shadow: 0 0.8rem 2rem rgba(0, 0, 0, 0.18);
+  padding: .8rem 1rem;
   font-size: 13px;
+  position: fixed;
+  box-shadow: 0 .8rem 2rem #0000002e;
 }
 
-.pw-toast[data-kind='warn'] {
+.pw-toast[data-kind="warn"] {
   border-color: var(--ae-warn);
 }
 
-.pw-toast[data-kind='ok'] {
+.pw-toast[data-kind="ok"] {
   border-color: var(--ae-ok);
 }
 
@@ -1636,85 +1533,65 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 @media (max-width: 760px) {
-  html,
-  body {
+  html, body {
     overflow-x: hidden;
   }
 
-  .pw-top,
-  .pw-foot,
-  .pw-filters,
-  .pw-quick-add,
-  .pw-detail-top {
+  .pw-top, .pw-foot, .pw-filters, .pw-quick-add, .pw-detail-top {
     padding-inline-start: max(1.2rem, env(safe-area-inset-left));
     padding-inline-end: max(1.2rem, env(safe-area-inset-right));
   }
 
-  /* own the phone chrome (real-device regression, 2026-07-19): with
-     viewport-fit=cover the page extends under the status bar/notch, so the
-     header bars take the top inset, and the footer clears the home
-     indicator. env() resolves to 0 everywhere else, so desktop is
-     untouched. */
-  .pw-top,
-  .pw-detail-top {
-    padding-top: max(0.9em, env(safe-area-inset-top));
+  .pw-top, .pw-detail-top {
+    padding-top: max(.9em, env(safe-area-inset-top));
   }
 
   .pw-foot {
-    padding-bottom: max(0.4em, env(safe-area-inset-bottom));
+    padding-bottom: max(.4em, env(safe-area-inset-bottom));
   }
 
   .pw-top-right {
-    width: 100%;
     justify-content: flex-start;
-    gap: 0.4rem;
+    gap: .4rem;
+    width: 100%;
   }
 
-  .pw-filter-btn,
-  .pw-icon-btn {
+  .pw-filter-btn, .pw-icon-btn {
     min-width: 44px;
-    min-height: 44px;
     height: 44px;
+    min-height: 44px;
   }
 
   .pw-filters {
     align-items: stretch;
-    gap: 0.7rem;
+    gap: .7rem;
   }
 
   .pw-filter-group {
     width: 100%;
   }
 
-  .pw-filter-group .pw-search,
-  .pw-filter-group .pw-sort {
-    flex: 1 1 auto;
-    min-height: 44px;
+  .pw-filter-group .pw-search, .pw-filter-group .pw-sort {
     box-sizing: border-box;
-  }
-
-  .pw-search input,
-  .pw-sort {
+    flex: auto;
     min-height: 44px;
   }
 
-  .pw-chip-btn,
-  .pw-chip-btn .ae-chip {
+  .pw-search input, .pw-sort, .pw-chip-btn, .pw-chip-btn .ae-chip {
     min-height: 44px;
   }
 
   .pw-filter-clear {
     min-height: 44px;
-    padding-inline: 0.6rem;
     margin-left: 0;
+    padding-inline: .6rem;
   }
 
   .pw-quick-add-actions {
     flex-wrap: wrap;
   }
 
-  .pw-quick-add-actions button,
-  .pw-quick-add-attach input {
+  .pw-quick-add-actions button, .pw-quick-add-attach input {
     min-height: 44px;
   }
 
@@ -1732,46 +1609,42 @@ html:not([data-pw-route='card']) .pw-detail-app {
   }
 
   .pw-detail-body {
+    overflow-wrap: anywhere;
     width: min(100% - 2.4rem, 74rem);
     max-width: calc(100% - 2.4rem);
-    overflow-wrap: anywhere;
   }
 }
 
 @media (max-width: 640px) {
-  /* Keep the existing lane tabs as a useful announcement/quick-jump control,
-     but show every lane in one vertical scroll so no work is hidden behind a
-     second horizontal scroll surface. */
   .pw-board {
-    display: flex;
+    padding-bottom: max(1.2rem, env(safe-area-inset-bottom));
     flex-direction: column;
     align-items: stretch;
     gap: 1.2rem;
-    overflow-x: hidden;
-    overflow-y: auto;
-    padding-bottom: max(1.2rem, env(safe-area-inset-bottom));
+    display: flex;
+    overflow: hidden auto;
   }
 
   .pw-lane-switch {
+    z-index: 4;
+    background: var(--ae-surface);
+    flex: none;
+    margin: -.35rem -.2rem 0;
+    padding: .35rem .2rem;
     display: flex;
     position: sticky;
     top: 0;
-    z-index: 4;
-    flex: none;
-    margin: -0.35rem -0.2rem 0;
-    padding: 0.35rem 0.2rem;
-    background: var(--ae-surface);
   }
 
   .pw-lane {
-    display: flex;
     flex: none;
     min-height: 0;
+    display: flex;
   }
 
   .pw-lane-scroll {
     flex: none;
+    padding-bottom: .4rem;
     overflow: visible;
-    padding-bottom: 0.4rem;
   }
 }

@@ -1,0 +1,35 @@
+/* powder-ui-toolchain-foundation: Tailwind v4 wired into the Vite build.
+   CSS-first config (no tailwind.config.js needed in v4) -- this file *is*
+   the config. Deliberately imports only the theme tokens and utilities
+   layers, NOT preflight: the board's hand-authored aesthetic.css/
+   powder-board.css already define the reset/typography baseline this repo
+   ships today, and Preflight's margin/box-sizing resets would silently
+   change rendered output and break the law gate's Playwright assertions.
+
+   `source(none)` on both imports turns off Tailwind's automatic class-name
+   scanner entirely, and no `@source` directive is declared, so Tailwind's
+   *default* utilities/theme tokens stay empty on purpose: this repo's real
+   JS/HTML happen to contain plenty of ordinary English words ("hidden",
+   "block", "static", "filter", "transition", ...) that collide with real
+   Tailwind utility names, and letting the scanner loose on them silently
+   generated live `.hidden { display: none; }`-style rules with zero
+   opportunity for review -- and Tailwind's default theme tokens are
+   themselves usage-tree-shaken away when nothing references them, so an
+   inert import alone leaves no evidence in the built CSS beyond a banner
+   comment. The explicit `@theme static` block below forces its tokens to always be
+   generated (v4 tree-shakes an ordinary @theme block down to nothing when
+   unreferenced, same as the default palette) and is what proves
+   the pipeline is actually wired in and running, not just declared in
+   package.json. Once a later card (powder-ui-shadcn-replatform-epic)
+   starts building components against Tailwind utilities, point @source at
+   that component tree specifically instead of re-enabling automatic
+   detection. */
+@import "tailwindcss/theme.css" layer(theme) source(none);
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+
+/* --font-display names the Geist family index.html already loads via
+   Google Fonts, ready for the shadcn-replatform epic's utility classes to
+   reference. */
+@theme static {
+  --font-display: "Geist", sans-serif;
+}
