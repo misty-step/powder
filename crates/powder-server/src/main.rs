@@ -868,30 +868,65 @@ fn app(state: AppState) -> Router {
         )
 }
 
-async fn board_index() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/html; charset=utf-8")],
+/// Deploy-scoped conditional caching for the compiled-in board assets
+/// (powder-static-asset-cache-headers). These bytes only ever change when a
+/// new binary ships, so the build's git SHA identifies their content
+/// exactly. `no-cache` means "revalidate every use", not "don't store": a
+/// page load costs one conditional GET answered 304 until a deploy actually
+/// changes the bundle. Without any cache header, browsers heuristically
+/// cached the board JS for days -- live incident 2026-07-20: a tab running
+/// a week-old bundle (no SSE cursor priming, old reconnect loop) hammered
+/// the deployed instance with a full board refetch every ~2s and kept
+/// flapping its own live indicator. NEVER swap this for long immutable
+/// max-age without versioned asset URLs: deploys must invalidate instantly.
+fn static_asset(headers: &HeaderMap, mime: &'static str, body: &'static str) -> Response {
+    const ETAG: &str = concat!("\"", env!("POWDER_SERVER_GIT_SHA"), "\"");
+    let revalidated = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == ETAG));
+    let mut response = if revalidated {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(CONTENT_TYPE, mime)], body).into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(axum::http::header::ETAG, ETAG.parse().expect("static etag"));
+    headers.insert(
+        CACHE_CONTROL,
+        "no-cache".parse().expect("static cache-control"),
+    );
+    response
+}
+
+async fn board_index(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/html; charset=utf-8",
         include_str!("../static/index.html"),
     )
 }
 
-async fn aesthetic_css() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+async fn aesthetic_css(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/css; charset=utf-8",
         include_str!("../static/assets/aesthetic.css"),
     )
 }
 
-async fn board_css() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+async fn board_css(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/css; charset=utf-8",
         include_str!("../static/assets/powder-board.css"),
     )
 }
 
-async fn board_js() -> impl IntoResponse {
-    (
-        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+async fn board_js(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/javascript; charset=utf-8",
         include_str!("../static/assets/powder-board.js"),
     )
 }
