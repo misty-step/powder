@@ -115,8 +115,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 /* flex-wrap (powder-ui-awaiting-you review): this cluster holds several
-   items -- live indicator (whose "last event Xs ago" long form is the
-   widest), quick-add, filter, and settings. Without
+   items -- live indicator, quick-add, filter, and settings. Without
    wrapping, a 390px viewport pushes #settings-toggle past the right edge,
    and the app shell's overflow:hidden means no scrollbar exists to reach
    it. Wrapping costs nothing on desktop (it only engages when out of
@@ -1141,19 +1140,20 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: var(--ae-space-4) var(--ae-space-6);
   flex-wrap: wrap;
   border-top: 1px solid var(--ae-line);
-  padding: 0.55em 2em;
-  font-size: 13px;
-  color: var(--ae-ink-muted);
+  padding: 0.3em 2em;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--ae-ink-faint);
 }
 
 .pw-foot kbd {
-  font-size: 11px;
+  font-size: 10px;
 }
 
-/* powder-ui-awaiting-you: a status-line readout, not a control -- ticks
-   every second in JS, so it deliberately carries no aria-live (a per-second
-   announcement would spam screen readers). Connect/disconnect transitions
-   are conveyed by data-state, not motion. */
+/* powder-ui-awaiting-you: a status-line readout, not a control. It carries
+   no aria-live (announcements would spam screen readers); connectivity is
+   conveyed by data-state and event recency by the title tooltip. Transient
+   reconnects stay in the last stable state (see LIVE_TROUBLE_GRACE_MS). */
 .pw-live {
   font-family: var(--ae-font-mono);
   font-size: 11px;
@@ -1166,8 +1166,97 @@ html:not([data-pw-route='card']) .pw-detail-app {
   color: var(--ae-ok);
 }
 
-.pw-live[data-state='reconnecting'] {
+.pw-live[data-state='offline'] {
   color: var(--ae-warn);
+}
+
+.pw-live[data-state='idle'] {
+  color: var(--ae-ink-faint);
+}
+
+/* type-to-search repo combobox (quick-add) */
+.pw-combo {
+  position: relative;
+}
+
+.pw-combo-list {
+  position: absolute;
+  inset-inline: 0;
+  top: calc(100% + 2px);
+  z-index: 30;
+  margin: 0;
+  padding: 0.25em 0;
+  list-style: none;
+  max-height: 14em;
+  overflow-y: auto;
+  background: var(--ae-surface);
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius, 4px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+}
+
+.pw-combo-list li {
+  padding: 0.55em 0.7em;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.pw-combo-list li.pw-combo-none {
+  color: var(--ae-ink-muted);
+  font-style: italic;
+}
+
+.pw-combo-field {
+  width: 100%;
+}
+
+.pw-combo-field input {
+  flex: 1 1 auto;
+  width: auto;
+}
+
+.pw-combo-list li.is-active,
+.pw-combo-list li:hover {
+  background: var(--ae-wash);
+}
+
+/* instant-paint loading skeleton: shown only on a cache-less first load */
+.pw-skel {
+  display: grid;
+  gap: 0.6em;
+  padding: 0.4em 0;
+}
+
+.pw-skel i {
+  height: 5em;
+  border: 1px solid var(--ae-line);
+  border-radius: var(--ae-radius, 4px);
+  background: var(--ae-wash);
+  opacity: 0.55;
+  animation: pw-skel-pulse 1.2s ease-in-out infinite alternate;
+}
+
+.pw-skel i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.pw-skel i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes pw-skel-pulse {
+  from {
+    opacity: 0.3;
+  }
+  to {
+    opacity: 0.7;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pw-skel i {
+    animation: none;
+  }
 }
 
 /* epic hierarchy (powder-ui-hierarchy-render) */

@@ -572,7 +572,7 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
   await expect(page.locator(`#rail-list [data-id="${cardId}"]`)).toBeVisible({
     timeout: 15_000,
   });
-  await expect(page.locator("#live-indicator")).toContainText("last event", {
+  await expect(page.locator("#live-indicator")).toHaveAttribute("title", /last event/, {
     timeout: 5_000,
   });
 
@@ -581,19 +581,18 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
 
 // Review regression (powder-ui-awaiting-you review): the header's right
 // cluster holds several controls -- live indicator, quick-add, filter,
-// settings. Its worst case is a 390px viewport with the live indicator in
-// its long "live · last event Xs ago" form: before .pw-top-right learned to
-// flex-wrap, that combination pushed #settings-toggle fully off-viewport
-// with no scrollbar to reach it (the app shell is overflow:hidden). This
-// reproduces that state and asserts every header control stays inside the
-// viewport.
-test("board · mobile-390 · header controls stay on-screen with the long live indicator (powder-ui-awaiting-you review)", async ({
+// settings. Before .pw-top-right learned to flex-wrap, a 390px viewport
+// pushed #settings-toggle fully off-viewport with no scrollbar to reach it
+// (the app shell is overflow:hidden). This reproduces that state -- with a
+// real SSE event landed so the indicator is in its final connected form --
+// and asserts every header control stays inside the viewport.
+test("board · mobile-390 · header controls stay on-screen with the live indicator connected (powder-ui-awaiting-you review)", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 900 });
   const errors = await boot(page, "light");
 
-  // force the live indicator into its long form: land a real SSE event
+  // land a real SSE event so the indicator reaches its connected state
   await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
     timeout: 15_000,
   });
@@ -606,7 +605,7 @@ test("board · mobile-390 · header controls stay on-screen with the long live i
     },
   });
   expect(created.ok()).toBe(true);
-  await expect(page.locator("#live-indicator")).toContainText("last event", {
+  await expect(page.locator("#live-indicator")).toHaveAttribute("title", /last event/, {
     timeout: 15_000,
   });
 
