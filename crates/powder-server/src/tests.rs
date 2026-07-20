@@ -516,6 +516,102 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
 }
 
 #[tokio::test]
+async fn patch_card_repo_is_admin_gated_canonicalized_and_clearable() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("codex", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"repo-patchable","title":"Repo patchable card","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    // A non-admin, actor-scoped key can patch ordinary fields (existing
+    // powder-ruling-patch-scope rule) but not `repo`.
+    let scoped_ok = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/repo-patchable",
+            Some(&agent_key),
+            r#"{"title":"Still agent-writable"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(scoped_ok.status(), StatusCode::OK);
+
+    let scoped_forbidden = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/repo-patchable",
+            Some(&agent_key),
+            r#"{"repo":"canary"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(scoped_forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Admin can move it, and an alias slug canonicalizes at write time.
+    let moved = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/repo-patchable",
+            Some(&admin_key),
+            r#"{"repo":"misty-step/canary"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), StatusCode::OK);
+    let moved = response_json(moved).await;
+    assert_eq!(moved["repo"], "canary");
+
+    // Admin can also clear it back to repo-less with an empty string.
+    let cleared = app
+        .clone()
+        .oneshot(json_request(
+            Method::PATCH,
+            "/api/v1/cards/repo-patchable",
+            Some(&admin_key),
+            r#"{"repo":""}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let cleared = response_json(cleared).await;
+    assert!(
+        cleared.get("repo").is_none(),
+        "repo must be cleared, not left as empty string"
+    );
+
+    let detail = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/repo-patchable",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let detail = response_json(detail).await;
+    assert!(detail["card"].get("repo").is_none());
+}
+
+#[tokio::test]
 async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completion() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -1575,6 +1671,7 @@ async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
                 }),
                 store: Arc::new(Mutex::new(store)),
                 poison_count: Arc::new(AtomicU64::new(0)),
+                event_watch: tokio::sync::watch::channel(0i64).1,
             },
             key.raw_key,
         )
@@ -4506,6 +4603,7 @@ async fn readyz_fails_when_dead_letter_backlog_meets_threshold() {
         }),
         store: state.store,
         poison_count: state.poison_count,
+        event_watch: state.event_watch,
     };
     let app = app(state.clone());
 
@@ -5164,6 +5262,7 @@ fn test_state_with_public_reads(auth_mode: AuthMode, public_reads: bool) -> (App
         }),
         store: Arc::new(Mutex::new(store)),
         poison_count: Arc::new(AtomicU64::new(0)),
+        event_watch: tokio::sync::watch::channel(0i64).1,
     };
     (state, key.raw_key)
 }
@@ -5188,6 +5287,7 @@ fn test_state_with_field_note(
         }),
         store: Arc::new(Mutex::new(store)),
         poison_count: state.poison_count,
+        event_watch: state.event_watch,
     };
     (state, key)
 }
@@ -5204,6 +5304,7 @@ fn test_state_with_home_url(auth_mode: AuthMode, home_url: &str) -> (AppState, S
         }),
         store: state.store,
         poison_count: state.poison_count,
+        event_watch: state.event_watch,
     };
     (state, key)
 }
@@ -5221,6 +5322,7 @@ fn test_state_with_tailnet_backstop(proxy_secret: Option<&str>, tailnet_admin: b
         }),
         store: state.store,
         poison_count: state.poison_count,
+        event_watch: state.event_watch,
     }
 }
 

@@ -169,6 +169,18 @@ impl Store {
             .map(EventSubscriptionRecord::into_subscription)?
     }
 
+    /// Cheap sequence-only probe used by the SSE notify loop
+    /// (powder-sse-notify) to detect "something changed" without paying for
+    /// a full `list_event_tail` row fetch on every tick -- `MAX(sequence)`
+    /// is a single indexed-scan integer read.
+    pub fn latest_event_sequence(&self) -> Result<i64> {
+        Ok(self.connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM outbound_events",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn list_event_tail(&self, after_sequence: i64, limit: usize) -> Result<Vec<EventTailItem>> {
         let mut statement = self.connection.prepare(
             "SELECT sequence, payload_json

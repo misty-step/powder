@@ -497,6 +497,7 @@ pub fn call_tool_store(
                     .map(parse_estimate)
                     .transpose()?,
                 labels: optional_string_array(args, "labels")?,
+                repo: None,
             };
             let card = store
                 .patch_card(&card_id, patch, &authority_arg(args).actor_label(), now)
