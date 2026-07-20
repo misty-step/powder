@@ -439,6 +439,10 @@ fn approval_queue_and_answer_input_reject_stale_awaiting_run_after_reclaim() -> 
         store.list_approvals(10)?.is_empty(),
         "the old awaiting run is not the card's current claim"
     );
+    assert!(
+        store.list_awaiting_input(10)?.is_empty(),
+        "the old awaiting run is not the card's current claim"
+    );
     let err = store
         .answer_input(
             &first.run_id,

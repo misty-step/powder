@@ -114,9 +114,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
   padding-bottom: 0.75em;
 }
 
-/* flex-wrap (powder-ui-awaiting-you review): this cluster now holds up to
-   five items -- live indicator (whose "last event Xs ago" long form is the
-   widest), awaiting badge, quick-add, filter, and settings. Without
+/* flex-wrap (powder-ui-awaiting-you review): this cluster holds several
+   items -- live indicator (whose "last event Xs ago" long form is the
+   widest), quick-add, filter, and settings. Without
    wrapping, a 390px viewport pushes #settings-toggle past the right edge,
    and the app shell's overflow:hidden means no scrollbar exists to reach
    it. Wrapping costs nothing on desktop (it only engages when out of
@@ -1170,99 +1170,6 @@ html:not([data-pw-route='card']) .pw-detail-app {
   color: var(--ae-warn);
 }
 
-/* header badge that jumps to #awaiting-strip; hidden at zero so it never
-   claims header real estate when nothing needs the operator. */
-.pw-awaiting-jump {
-  color: var(--ae-warn);
-}
-
-.pw-awaiting-jump[hidden] {
-  display: none;
-}
-
-/* pinned, always-discoverable strip (not a 4th kanban lane -- see PR design
-   notes) that only occupies layout when there is something to answer. */
-.pw-awaiting {
-  flex: none;
-  padding: 0.8em 2em;
-  border-bottom: 1px solid var(--ae-line);
-  background: var(--ae-wash);
-}
-
-.pw-awaiting[hidden] {
-  display: none;
-}
-
-.pw-awaiting-head-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1em;
-}
-
-.pw-awaiting-head-row .ae-h {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5em;
-  margin: 0;
-}
-
-.pw-awaiting-head-row .ae-icon {
-  width: 1em;
-  height: 1em;
-}
-
-.pw-awaiting-list {
-  list-style: none;
-  margin: 0.7em 0 0;
-  padding: 0;
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
-  gap: 0.8em;
-}
-
-.pw-awaiting-item {
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
-  padding: 0.7em 0.9em;
-  font-size: 13px;
-  background: var(--ae-surface);
-}
-
-.pw-awaiting-head {
-  display: flex;
-  align-items: baseline;
-  gap: 0.6em;
-  flex-wrap: wrap;
-}
-
-.pw-awaiting-q {
-  margin-top: 0.45em;
-  overflow-wrap: anywhere;
-}
-
-.pw-awaiting-form {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5em;
-  margin-top: 0.6em;
-}
-
-.pw-awaiting-form label {
-  display: block;
-}
-
-.pw-awaiting-form .ae-input {
-  width: 100%;
-  box-sizing: border-box;
-  font-size: 13px;
-}
-
-.pw-awaiting-error {
-  color: var(--ae-err);
-  min-height: 1.2em;
-}
-
 /* epic hierarchy (powder-ui-hierarchy-render) */
 .pw-epic-progress {
   font-size: 13px;
@@ -1420,13 +1327,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
 @media (max-width: 760px) {
   .pw-top,
   .pw-foot,
-  .pw-filters,
-  .pw-awaiting {
+  .pw-filters {
     padding-inline: 1.2rem;
-  }
-
-  .pw-awaiting-list {
-    grid-template-columns: minmax(0, 1fr);
   }
 
   .pw-main,
@@ -1653,11 +1555,24 @@ html:not([data-pw-route='card']) .pw-detail-app {
   .pw-top,
   .pw-foot,
   .pw-filters,
-  .pw-awaiting,
   .pw-quick-add,
   .pw-detail-top {
     padding-inline-start: max(1.2rem, env(safe-area-inset-left));
     padding-inline-end: max(1.2rem, env(safe-area-inset-right));
+  }
+
+  /* own the phone chrome (real-device regression, 2026-07-19): with
+     viewport-fit=cover the page extends under the status bar/notch, so the
+     header bars take the top inset, and the footer clears the home
+     indicator. env() resolves to 0 everywhere else, so desktop is
+     untouched. */
+  .pw-top,
+  .pw-detail-top {
+    padding-top: max(0.9em, env(safe-area-inset-top));
+  }
+
+  .pw-foot {
+    padding-bottom: max(0.4em, env(safe-area-inset-bottom));
   }
 
   .pw-top-right {
@@ -1745,7 +1660,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
     gap: 1.2rem;
     overflow-x: hidden;
     overflow-y: auto;
-    padding-bottom: 1.2rem;
+    padding-bottom: max(1.2rem, env(safe-area-inset-bottom));
   }
 
   .pw-lane-switch {

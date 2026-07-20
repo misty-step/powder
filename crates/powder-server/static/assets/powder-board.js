@@ -17,7 +17,6 @@ const RAW_STATUSES = [
 const PAGE_LIMIT = 1000;
 const STORAGE_KEY = "powder-api-key";
 const BOARD_STATE_KEY = "powder-board-state";
-const ANSWER_ACTOR_KEY = "powder-answer-actor";
 const KEY_MINT_COMMAND =
   "powder key-create --db /data/powder.db --name operator --scope admin --show-secret";
 
@@ -74,11 +73,6 @@ const els = {
   footerHomeLink: document.getElementById("footer-home-link"),
   connection: document.getElementById("connection-status"),
   liveIndicator: document.getElementById("live-indicator"),
-  awaitingBadge: document.getElementById("awaiting-badge"),
-  awaitingBadgeCount: document.getElementById("awaiting-badge-count"),
-  awaitingStrip: document.getElementById("awaiting-strip"),
-  awaitingCount: document.getElementById("awaiting-count"),
-  awaitingList: document.getElementById("awaiting-list"),
   authPanel: document.getElementById("auth-panel"),
   repoSettingsCount: document.getElementById("repo-settings-count"),
   repoSettingsList: document.getElementById("repo-settings-list"),
@@ -139,7 +133,6 @@ const state = {
   needsSetup: false,
   cards: [],
   repositories: [],
-  awaiting: [],
   // powder-board-lane-fetch-cascade: statsTotals backs the lane header
   // counts unconditionally (board_stats is a plain SQL GROUP BY/COUNT(*),
   // immune to the PAGE_LIMIT cap); cardFetchErrors tracks which raw
@@ -283,7 +276,7 @@ function renderHomeLink(homeUrl) {
 // lane header count unconditionally, decoupled from whether that lane's
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
-  const [results, repositoryData, awaiting, statsTotals] = await Promise.all([
+  const [results, repositoryData, statsTotals] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
         const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
@@ -291,7 +284,6 @@ async function fetchBoardData() {
       }),
     ),
     apiJson("/api/v1/repositories?include_hidden=true"),
-    fetchAwaitingInput(),
     fetchBoardStats(),
   ]);
 
@@ -309,7 +301,6 @@ async function fetchBoardData() {
   return {
     cards: dedupeCards(cardGroups.flat()).map(normalizeCard),
     repositories: normalizeRepositories(repositoryData.repositories || []),
-    awaiting,
     statsTotals,
     cardFetchErrors,
   };
@@ -331,19 +322,6 @@ async function fetchBoardStats() {
   }
 }
 
-// powder-ui-awaiting-you: GET /api/v1/runs/awaiting-input -- every run
-// currently parked on an operator question, newest-wait-first from the
-// store. Read-only, so it never needs a write key.
-async function fetchAwaitingInput() {
-  try {
-    const data = await apiJson("/api/v1/runs/awaiting-input?limit=50");
-    return Array.isArray(data.awaiting) ? data.awaiting : [];
-  } catch (_err) {
-    // The awaiting strip is a convenience surface, not the primary board --
-    // a failure here must not block the rest of the board from loading.
-    return [];
-  }
-}
 
 async function loadBoard() {
   state.loading = true;
@@ -356,7 +334,6 @@ async function loadBoard() {
     const data = await fetchBoardData();
     state.cards = data.cards;
     state.repositories = data.repositories;
-    state.awaiting = data.awaiting;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
     state.loading = false;
@@ -389,7 +366,6 @@ async function refreshLive() {
     const changed = changedCardIds(state.cards, data.cards);
     state.cards = data.cards;
     state.repositories = data.repositories;
-    state.awaiting = data.awaiting;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
     state.detailCache.clear();
@@ -626,8 +602,8 @@ function normalizeCard(card) {
 }
 
 // powder-status-vocabulary: lane mapping over the seven statuses. READY is
-// `ready`; IN PROGRESS is `in_progress` plus `awaiting_input` (the
-// awaiting-you strip already differentiates the latter); DONE folds the
+// `ready`; IN PROGRESS is `in_progress` plus `awaiting_input` (the per-card
+// glyph already differentiates the latter); DONE folds the
 // three distinct terminal outcomes into one lane. `in_progress` is no
 // longer derived from claimed/running -- it is a real status now.
 function displayStatus(status) {
@@ -1406,7 +1382,6 @@ function laneStatTotal(displayLaneName) {
 }
 
 function render() {
-  renderAwaitingStrip();
   if (state.loading) {
     renderLoading();
     return;
@@ -1501,73 +1476,6 @@ function renderCounts(buckets) {
     (state.filters.search.trim() ? 1 : 0) +
     (state.showAllTiers ? 1 : 0);
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
-}
-
-// powder-ui-awaiting-you: "N agents are waiting on you" at a glance --
-// a pinned strip, default-visible whenever it is nonzero and hidden
-// entirely at zero (see PR design notes for the lane-vs-strip tradeoff),
-// plus a header badge so the count is discoverable even when the strip has
-// scrolled out of view.
-function renderAwaitingStrip() {
-  const items = state.awaiting || [];
-  const count = items.length;
-  if (els.awaitingStrip) els.awaitingStrip.hidden = count === 0;
-  if (els.awaitingCount) els.awaitingCount.textContent = count;
-  if (els.awaitingBadge) els.awaitingBadge.hidden = count === 0;
-  if (els.awaitingBadgeCount) els.awaitingBadgeCount.textContent = count;
-  if (els.awaitingList) {
-    els.awaitingList.innerHTML = items.map(awaitingItemHTML).join("");
-  }
-}
-
-function awaitingItemHTML(item) {
-  const card = item.card || {};
-  const run = item.run || {};
-  const question = item.question?.payload || "";
-  const savedActor = localStorage.getItem(ANSWER_ACTOR_KEY) || "";
-  return `
-    <li class="pw-awaiting-item" data-run-id="${escapeHtml(run.id)}">
-      <div class="pw-awaiting-head">
-        <a class="pw-rel-id" href="${escapeHtml(cardHref(card.id))}">${escapeHtml(card.id)}</a>
-        <span class="ae-item">${escapeHtml(card.title || "")}</span>
-      </div>
-      <p class="pw-awaiting-q">${escapeHtml(question)}</p>
-      <form class="pw-awaiting-form" data-run-id="${escapeHtml(run.id)}">
-        <label><span class="ae-chrome">Answered by</span><input class="ae-input" name="actor" type="text" autocomplete="off" required value="${escapeHtml(savedActor)}"></label>
-        <label><span class="ae-chrome">Answer</span><textarea class="ae-input" name="answer" rows="2" required></textarea></label>
-        <button class="ae-button ae-button-compact" type="submit">answer</button>
-        <p class="pw-awaiting-error" aria-live="polite"></p>
-      </form>
-    </li>
-  `;
-}
-
-async function submitAwaitingAnswer(form) {
-  const runId = form.dataset.runId;
-  const data = new FormData(form);
-  const actor = String(data.get("actor") || "").trim();
-  const answer = String(data.get("answer") || "").trim();
-  const errorNode = form.querySelector(".pw-awaiting-error");
-  if (errorNode) errorNode.textContent = "";
-  if (!actor || !answer) {
-    if (errorNode) errorNode.textContent = "Your name and an answer are both required.";
-    return;
-  }
-  const submitButton = form.querySelector("button[type=submit]");
-  if (submitButton) submitButton.disabled = true;
-  try {
-    await apiJson(`/api/v1/runs/${encodePath(runId)}/answer`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ actor, answer }),
-    });
-    localStorage.setItem(ANSWER_ACTOR_KEY, actor);
-    await loadBoard();
-  } catch (err) {
-    if (errorNode) errorNode.textContent = `Failed: ${err.message || err}`;
-  } finally {
-    if (submitButton) submitButton.disabled = false;
-  }
 }
 
 function saveBoardState() {
@@ -2508,19 +2416,6 @@ if (els.pasteApiKey && navigator.clipboard?.readText) {
     }
   });
 }
-els.awaitingList?.addEventListener("submit", (event) => {
-  const form = event.target;
-  if (!(form instanceof HTMLFormElement)) return;
-  event.preventDefault();
-  submitAwaitingAnswer(form);
-});
-els.awaitingBadge?.addEventListener("click", () => {
-  els.awaitingStrip?.scrollIntoView({
-    behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
-    block: "start",
-  });
-  els.awaitingList?.querySelector("input, textarea")?.focus();
-});
 els.cmdkToggle?.addEventListener("click", () => toggleCommandPalette());
 els.cmdk?.addEventListener("click", (event) => {
   if (event.target.closest("[data-cmdk-dismiss]")) closeCommandPalette();
