@@ -556,7 +556,7 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
   // (no Repository row means `repoPassesScope` can't find it) -- neither
   // has anything to do with live updates and both would make this test
   // flaky for the wrong reason. Omitting `repo` and dodging the numeric
-  // suffix keeps this card in the always-visible "local" bucket, same as
+  // suffix keeps this card in the always-visible "general" bucket, same as
   // the rest of this fixture's cards (see start-fixture-server.sh).
   const cardId = `law-gate-live-${Date.now()}x`;
   const created = await page.request.post("/api/v1/cards", {

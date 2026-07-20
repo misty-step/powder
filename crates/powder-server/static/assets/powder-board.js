@@ -828,12 +828,14 @@ function renderAuthIntro() {
   }
 }
 
+// Groups come from repository rows plus exactly one "general" bucket for
+// repo-less cards. The client never invents repos: inferring groups from
+// import source paths resurrected phantom repos ("15-two-authorizations")
+// after their cards were consolidated to repo:null (operator ruling
+// 2026-07-20: session/inbox/local/etc collapse into the general bucket).
 function cardRepo(card) {
-  if (card.repo) return canonicalRepoLabel(card.repo) || "local";
-  if (card.source?.path) {
-    return canonicalRepoLabel(card.source.path.replace(/\.md$/, "")) || "local";
-  }
-  return "local";
+  if (card.repo) return canonicalRepoLabel(card.repo) || "general";
+  return "general";
 }
 
 function canonicalRepoLabel(value) {
@@ -869,7 +871,7 @@ function normalizeRepositories(repositories) {
 function deriveRepositoriesFromCards() {
   const summaries = new Map();
   for (const card of state.cards) {
-    const repo = card.repoKey || "local";
+    const repo = card.repoKey || "general";
     const summary = summaries.get(repo) || {
       repo,
       name: repo,
@@ -1063,7 +1065,7 @@ function summaryForRepo(repo) {
 
 function repoPassesScope(repo) {
   const summary = summaryForRepo(repo);
-  if (!summary) return repo === "local" || state.showAllTiers;
+  if (!summary) return repo === "general" || state.showAllTiers;
   return repositoryPassesScope(summary);
 }
 
@@ -1149,7 +1151,7 @@ function renderQuickAddRepoOptions() {
   syncRepoCombo(els.quickAddRepoInput.value, false);
 }
 
-// "" is the synthetic "no repo · local" option -- always present so filing
+// "" is the synthetic "no repo · general" option -- always present so filing
 // without a repo is a clickable/arrow-reachable choice, not a caption the
 // operator has to interpret.
 function repoComboMatches(query) {
@@ -1166,7 +1168,7 @@ function syncRepoCombo(query, open) {
       const classes = [index === repoComboActive ? "is-active" : "", repo ? "" : "pw-combo-none"]
         .filter(Boolean)
         .join(" ");
-      return `<li id="quick-add-repo-opt-${index}" role="option" data-repo="${escapeHtml(repo)}"${index === repoComboActive ? ' aria-selected="true"' : ""}${classes ? ` class="${classes}"` : ""}>${repo ? escapeHtml(repo) : "no repo · local"}</li>`;
+      return `<li id="quick-add-repo-opt-${index}" role="option" data-repo="${escapeHtml(repo)}"${index === repoComboActive ? ' aria-selected="true"' : ""}${classes ? ` class="${classes}"` : ""}>${repo ? escapeHtml(repo) : "no repo · general"}</li>`;
     })
     .join("");
   const show = Boolean(open) && matches.length > 0;
@@ -1933,7 +1935,7 @@ function detailHTML(card, detail = {}) {
         ${section("RELATIONS", relationsHTML(normalized))}
         ${section("CLAIM / RUN HISTORY", runHistoryHTML(normalized, detail.runs || [], latestRun))}
         ${section("SOURCE", definitionHTML([
-          ["Repo / Source", normalized.repo || normalized.source?.path || "local"],
+          ["Repo / Source", normalized.repo || normalized.source?.path || "general"],
           ["Digest", normalized.source?.digest || "none"],
           ["Created", formatDate(normalized.created_at)],
           ["Updated", formatDate(normalized.updated_at)],
