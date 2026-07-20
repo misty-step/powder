@@ -3,7 +3,7 @@
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
     Authority, Card, CardId, CardStatus, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyQuery, RunId,
+    ReadyQuery, Risk, RunId,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
@@ -632,6 +632,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
+    let risk = flag_value(args, "--risk")
+        .map(parse_risk_flag)
+        .transpose()?;
 
     let related = card_ids_flag(args, "--related")?;
     let blocks = card_ids_flag(args, "--blocks")?;
@@ -652,6 +655,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .with_status(status)
         .with_priority(priority)
         .with_estimate(estimate)
+        .with_risk(risk)
         .with_acceptance(acceptance)
         .with_proof_plan(proof_plan.clone())
         .with_created_at(now);
@@ -685,6 +689,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         }
         if let Some(estimate) = estimate {
             payload["estimate"] = json!(estimate.as_str());
+        }
+        if let Some(risk) = risk {
+            payload["risk"] = json!(risk.as_str());
         }
         if let Some(parent) = parent {
             payload["parent"] = json!(parent.as_str());
@@ -725,6 +732,9 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         estimate: flag_value(args, "--estimate")
             .map(parse_estimate_flag)
             .transpose()?,
+        risk: flag_value(args, "--risk")
+            .map(parse_risk_flag)
+            .transpose()?,
         labels: flag_value(args, "--labels").map(split_csv),
         repo: None,
     };
@@ -755,6 +765,9 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         }
         if let Some(estimate) = patch.estimate {
             payload["estimate"] = json!(estimate.as_str());
+        }
+        if let Some(risk) = patch.risk {
+            payload["risk"] = json!(risk.as_str());
         }
         if let Some(labels) = patch.labels {
             payload["labels"] = json!(labels);
@@ -1727,6 +1740,20 @@ fn parse_estimate_flag(raw: &str) -> Result<Estimate, ShellError> {
                 .iter()
                 .copied()
                 .map(Estimate::as_str)
+                .collect::<Vec<_>>()
+                .join("|")
+        ))
+    })
+}
+
+fn parse_risk_flag(raw: &str) -> Result<Risk, ShellError> {
+    Risk::parse(raw).ok_or_else(|| {
+        ShellError::Invalid(format!(
+            "invalid --risk {raw:?}; valid: {}",
+            Risk::ALL
+                .iter()
+                .copied()
+                .map(Risk::as_str)
                 .collect::<Vec<_>>()
                 .join("|")
         ))

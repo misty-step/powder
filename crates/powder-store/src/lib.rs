@@ -6,8 +6,8 @@ use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Run,
-    RunId, RunState, WorkLogEntry,
+    CriterionProof, DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Risk,
+    Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -358,6 +358,7 @@ pub struct CardPatch {
     pub status: Option<CardStatus>,
     pub priority: Option<Priority>,
     pub estimate: Option<Estimate>,
+    pub risk: Option<Risk>,
     pub labels: Option<Vec<String>>,
     pub repo: Option<Option<String>>,
 }
@@ -521,6 +522,10 @@ impl Store {
                 20 => {
                     self.migrate_20_to_21()?;
                     21
+                }
+                21 => {
+                    self.migrate_21_to_22()?;
+                    22
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1192,6 +1197,20 @@ impl Store {
         Ok(())
     }
 
+    /// powder-risk-signal-field: the orthogonal blast-radius x
+    /// reversibility x uncertainty axis alongside `estimate` (v12->v13).
+    /// Nullable, guarded the same way `migrate_12_to_13` guards
+    /// `estimate` -- a crash between this `ALTER TABLE` and the
+    /// `PRAGMA user_version` bump must not re-issue the same `ADD COLUMN`
+    /// on retry and fail with "duplicate column name".
+    fn migrate_21_to_22(&mut self) -> Result<()> {
+        if !self.cards_has_column("risk")? {
+            self.connection
+                .execute_batch("ALTER TABLE cards ADD COLUMN risk TEXT;")?;
+        }
+        Ok(())
+    }
+
     fn migrate_19_to_20(&mut self) -> Result<()> {
         let needs_principal = !self.table_has_column("card_events", "principal")?;
         let needs_subject_kind = !self.table_has_column("card_events", "subject_kind")?;
@@ -1605,6 +1624,10 @@ impl Store {
         if let Some(estimate) = patch.estimate {
             card.estimate = Some(estimate);
             patched_fields.push("estimate");
+        }
+        if let Some(risk) = patch.risk {
+            card.risk = Some(risk);
+            patched_fields.push("risk");
         }
         if let Some(labels) = patch.labels {
             card.labels = clean_string_list(labels);
@@ -3235,7 +3258,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -3260,7 +3283,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                claim_expires_at = excluded.claim_expires_at,
                created_at = excluded.created_at,
                updated_at = excluded.updated_at,
-               parent = excluded.parent"
+               parent = excluded.parent,
+               risk = excluded.risk"
         ),
         params![
             card.id.as_str(),
@@ -3287,7 +3311,8 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             claim_expires_at,
             card.created_at,
             card.updated_at,
-            card.parent.as_ref().map(CardId::as_str)
+            card.parent.as_ref().map(CardId::as_str),
+            card.risk.map(Risk::as_str)
         ],
     )?;
     Ok(())
@@ -3867,6 +3892,7 @@ struct CardRecord {
     created_at: i64,
     updated_at: i64,
     parent: Option<String>,
+    risk: Option<String>,
 }
 
 impl CardRecord {
@@ -3897,6 +3923,7 @@ impl CardRecord {
             created_at: row.get(22)?,
             updated_at: row.get(23)?,
             parent: row.get(24)?,
+            risk: row.get(25)?,
         })
     }
 
@@ -3928,6 +3955,16 @@ impl CardRecord {
                     .map(|raw| {
                         Estimate::parse(&raw).ok_or(StoreError::InvalidStoredValue {
                             field: "cards.estimate",
+                            value: raw,
+                        })
+                    })
+                    .transpose()?,
+            )
+            .with_risk(
+                self.risk
+                    .map(|raw| {
+                        Risk::parse(&raw).ok_or(StoreError::InvalidStoredValue {
+                            field: "cards.risk",
                             value: raw,
                         })
                     })
