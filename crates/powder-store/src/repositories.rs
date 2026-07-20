@@ -477,16 +477,30 @@ impl Store {
         let names = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // One counts pass shared across every repository in the listing --
+        // see `all_repository_status_counts` for why this must not run
+        // per-repo.
+        let mut all_counts = all_repository_status_counts(&self.connection)?;
         names
             .into_iter()
             .map(|name| {
-                self.repository_summary(&name)?
+                let status_counts = all_counts.remove(&name).unwrap_or_default();
+                self.repository_summary_with_counts(&name, status_counts)?
                     .ok_or_else(|| DomainError::not_found("repository", name).into())
             })
             .collect()
     }
 
     fn repository_summary(&self, name: &str) -> Result<Option<RepositorySummary>> {
+        let status_counts = repository_status_counts(&self.connection, name)?;
+        self.repository_summary_with_counts(name, status_counts)
+    }
+
+    fn repository_summary_with_counts(
+        &self,
+        name: &str,
+        status_counts: BTreeMap<String, usize>,
+    ) -> Result<Option<RepositorySummary>> {
         let Some(record) = self
             .connection
             .query_row(
@@ -501,7 +515,6 @@ impl Store {
             return Ok(None);
         };
         let aliases = repository_aliases(&self.connection, &record.name)?;
-        let status_counts = repository_status_counts(&self.connection, &record.name)?;
         let card_count = status_counts.values().sum();
         Ok(Some(RepositorySummary {
             repo: record.name.clone(),
@@ -740,39 +753,84 @@ fn repository_aliases(connection: &Connection, repository_name: &str) -> Result<
     Ok(aliases)
 }
 
-fn repository_status_counts(
+/// Status counts for every repository in one pass (powder-repo-hot-path):
+/// the previous shape ran a full `cards` scan *per repository* and then
+/// `resolve_repository_name` (up to 3 queries) *per card row* just to
+/// filter that scan down to one repo -- ~N repos x M cards x 3 statements
+/// per `list_repositories()` call (~250k statements on the production
+/// instance), which pinned a core and, because the whole thing runs under
+/// the store mutex, starved every other request including the live-events
+/// tail. One `GROUP BY repo, status` query plus one memoized resolution per
+/// *distinct* stored repo string is O(M) total.
+fn all_repository_status_counts(
     connection: &Connection,
-    repository_name: &str,
-) -> Result<BTreeMap<String, usize>> {
-    let mut counts = BTreeMap::new();
-    let mut statement =
-        connection.prepare("SELECT repo, status FROM cards WHERE repo IS NOT NULL")?;
+) -> Result<BTreeMap<String, BTreeMap<String, usize>>> {
+    let mut statement = connection.prepare(
+        "SELECT repo, status, COUNT(*) FROM cards WHERE repo IS NOT NULL GROUP BY repo, status",
+    )?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (repo, status) in rows {
-        if resolve_repository_name(connection, &repo)?.as_deref() != Some(repository_name) {
-            continue;
-        }
+    let mut resolved_names: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for (repo, status, n) in rows {
+        let resolved = match resolved_names.get(&repo) {
+            Some(cached) => cached.clone(),
+            None => {
+                let value = resolve_repository_name(connection, &repo)?;
+                resolved_names.insert(repo.clone(), value.clone());
+                value
+            }
+        };
+        let Some(name) = resolved else { continue };
         let status = CardStatus::parse(&status).ok_or(StoreError::InvalidStoredValue {
             field: "cards.status",
             value: status,
         })?;
-        *counts.entry(status.as_str().to_string()).or_insert(0) += 1;
+        *counts
+            .entry(name)
+            .or_default()
+            .entry(status.as_str().to_string())
+            .or_insert(0) += usize::try_from(n).unwrap_or(0);
     }
     Ok(counts)
 }
 
+fn repository_status_counts(
+    connection: &Connection,
+    repository_name: &str,
+) -> Result<BTreeMap<String, usize>> {
+    Ok(all_repository_status_counts(connection)?
+        .remove(repository_name)
+        .unwrap_or_default())
+}
+
+/// Same one-pass + memoized-resolution shape as
+/// `all_repository_status_counts`, kept separate because this deliberately
+/// does *not* parse card statuses -- `delete_repository`'s guard must count
+/// every card pointing at the repo even if one carries a corrupt status.
 fn resolved_repository_card_count(connection: &Connection, repository_name: &str) -> Result<usize> {
-    let mut statement = connection.prepare("SELECT repo FROM cards WHERE repo IS NOT NULL")?;
+    let mut statement = connection
+        .prepare("SELECT repo, COUNT(*) FROM cards WHERE repo IS NOT NULL GROUP BY repo")?;
     let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().try_fold(0usize, |count, repo| {
+    rows.into_iter().try_fold(0usize, |count, (repo, n)| {
         let resolved = resolve_repository_name(connection, &repo)?;
-        Ok(count + usize::from(resolved.as_deref() == Some(repository_name)))
+        Ok(count
+            + if resolved.as_deref() == Some(repository_name) {
+                usize::try_from(n).unwrap_or(0)
+            } else {
+                0
+            })
     })
 }
 
