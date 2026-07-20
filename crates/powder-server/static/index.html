@@ -77,10 +77,6 @@
     </nav>
     <div class="pw-top-right">
       <span id="live-indicator" class="pw-live" data-state="idle" title="live board updates via SSE">live</span>
-      <button class="pw-filter-btn pw-awaiting-jump" id="awaiting-badge" type="button" aria-live="polite" hidden>
-        <svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg>
-        <span id="awaiting-badge-count">0</span> awaiting you
-      </button>
       <button class="pw-filter-btn" id="quick-add-toggle" type="button" aria-expanded="false" aria-controls="quick-add-panel">
         <svg class="ae-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
         file card
@@ -98,14 +94,6 @@
       </button>
     </div>
   </header>
-
-  <section id="awaiting-strip" class="pw-awaiting" aria-labelledby="awaiting-heading" hidden>
-    <header class="pw-awaiting-head-row">
-      <p class="ae-h" id="awaiting-heading"><svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg>AGENTS AWAITING YOU</p>
-      <span class="pw-lane-n ae-num" id="awaiting-count" aria-live="polite">0</span>
-    </header>
-    <ul id="awaiting-list" class="pw-awaiting-list"></ul>
-  </section>
 
   <section id="quick-add-panel" class="pw-quick-add" hidden>
     <form id="quick-add-form" class="pw-quick-add-form">

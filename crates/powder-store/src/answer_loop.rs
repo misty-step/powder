@@ -116,11 +116,14 @@ impl Store {
 
     pub fn list_awaiting_input(&self, limit: usize) -> Result<Vec<AwaitingInput>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,
-             created_at, updated_at
+            "SELECT runs.id, runs.card_id, runs.state, runs.principal, runs.agent,
+             runs.claim_expires_at, runs.proof, runs.created_at, runs.updated_at
              FROM runs
-             WHERE state = 'awaiting_input'
-             ORDER BY updated_at ASC, id ASC
+             JOIN cards ON cards.id = runs.card_id
+                       AND cards.claim_run_id = runs.id
+                       AND cards.status = 'awaiting_input'
+             WHERE runs.state = 'awaiting_input'
+             ORDER BY runs.updated_at ASC, runs.id ASC
              LIMIT ?1",
         )?;
         let runs = statement
@@ -148,6 +151,7 @@ impl Store {
              FROM runs
              JOIN cards ON cards.id = runs.card_id
                        AND cards.claim_run_id = runs.id
+                       AND cards.status = 'awaiting_input'
              JOIN links ON links.card_id = runs.card_id
              WHERE runs.state = 'awaiting_input'
                AND lower(ltrim(links.label)) LIKE 'approval%'

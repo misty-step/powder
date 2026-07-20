@@ -118,8 +118,8 @@ un-gate) the fleet.
 
 - **READY** = `ready` without unresolved blockers; ready cards *with*
   unresolved blockers render in the derived BLOCKED strip beneath the lane.
-- **IN PROGRESS** = `in_progress` + `awaiting_input` (the awaiting-you
-  strip and per-card glyph already differentiate the latter).
+- **IN PROGRESS** = `in_progress` + `awaiting_input` (the per-card glyph
+  already differentiates the latter).
 - **DONE** = `done` + `shipped` + `abandoned`, with distinct glyphs.
 - The backlog rail = `backlog`.
 

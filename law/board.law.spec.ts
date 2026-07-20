@@ -48,7 +48,7 @@ const SITE_ROUTES = [
 // `networkidle` ("no network connections for 500ms") can never fire on its
 // own with a permanent SSE stream open, so it would hang every board test
 // until the per-test timeout. Race it against a short bound instead of
-// awaiting it unconditionally: the initial card/repo/awaiting-input
+// awaiting it unconditionally: the initial card/repo
 // fetches this exists to wait out settle in well under that window, and
 // every assertion downstream already auto-retries via Playwright's own
 // polling, so a slightly loose settle point here does not weaken what the
@@ -323,29 +323,6 @@ test("board · prefers-reduced-motion collapses the view-switch transition (powd
   await assertLaw(page, { consoleErrors: errors });
 });
 
-// powder-ui-awaiting-you: the fixture DB seeds one run parked on an
-// operator question (law/scripts/start-fixture-server.sh, "awaiting-answer")
-// -- the strip and header badge must both surface its count by default,
-// in both themes. The actual answer-and-resume flow is a write and is
-// covered once, standalone, near the end of this file (answering it here
-// too would empty the strip for the second mode iteration).
-for (const mode of MODES) {
-  test(`board · awaiting-you strip · ${mode} · surfaces the pinned count and question (powder-ui-awaiting-you)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode);
-    await expect(page.locator("#awaiting-strip")).toBeVisible();
-    await expect(page.locator("#awaiting-badge")).toBeVisible();
-    await expect(page.locator("#awaiting-badge-count")).toHaveText("1");
-    await expect(page.locator("#awaiting-count")).toHaveText("1");
-    const item = page.locator(".pw-awaiting-item").first();
-    await expect(item).toContainText("awaiting-answer");
-    await expect(item).toContainText("Ship this behind a flag or straight to prod?");
-    await expect(item.locator("form.pw-awaiting-form")).toBeVisible();
-    await assertLaw(page, { consoleErrors: errors });
-  });
-}
-
 // powder-ui-hierarchy-render: get_card_detail already returns children,
 // children_total, and epic_state fully populated -- these prove
 // detailHTML() actually renders that packet instead of discarding it.
@@ -558,48 +535,6 @@ test("board · mobile-390 · operator can quick-add a card with no CLI (powder-9
   await assertLaw(page, { consoleErrors: errors });
 });
 
-// powder-ui-awaiting-you: the write half of the awaiting-you flow --
-// submitting an answer actually posts to /api/v1/runs/{id}/answer and the
-// run leaves awaiting_input. Standalone (not mode-looped) because it
-// consumes the fixture's one seeded elicitation; re-arms it afterward via
-// the same request-input endpoint the CLI uses, so a second local run
-// against the reused dev DB (see playwright.config.ts's
-// `reuseExistingServer`) still finds it awaiting.
-test("board · awaiting-you strip · submitting an answer resumes the run and empties the strip (powder-ui-awaiting-you)", async ({
-  page,
-}) => {
-  const errors = await boot(page, "light");
-  const item = page.locator(".pw-awaiting-item").first();
-  await expect(item).toContainText("awaiting-answer");
-  const runId = await item.getAttribute("data-run-id");
-  expect(runId).toBeTruthy();
-
-  await item.locator("input[name=actor]").fill("law-gate-operator");
-  await item.locator("textarea[name=answer]").fill("Ship it behind a flag.");
-  const answered = page.waitForResponse(
-    (response) =>
-      response.url().endsWith(`/api/v1/runs/${runId}/answer`) &&
-      response.request().method() === "POST",
-  );
-  await item.locator("button[type=submit]").click();
-  const response = await answered;
-  expect(response.status()).toBe(200);
-  expect((await response.json()).state).toBe("active");
-
-  await expect(page.locator("#awaiting-strip")).toBeHidden();
-  await expect(page.locator("#awaiting-badge")).toBeHidden();
-
-  const cardResponse = await page.request.get(`/api/v1/cards/awaiting-answer`);
-  expect((await cardResponse.json()).card.status).not.toBe("awaiting_input");
-
-  await assertLaw(page, { consoleErrors: errors });
-
-  const restored = await page.request.post(`/api/v1/runs/${runId}/input`, {
-    data: { question: "Ship this behind a flag or straight to prod?" },
-  });
-  expect(restored.ok(), "re-arm the fixture run for the next local run").toBe(true);
-});
-
 // powder-epic-answer-board: proves the board updates itself from the SSE
 // tail (GET /api/v1/events/tail), not just from its own write paths. The
 // card below is created out-of-band via page.request (bypassing the page's
@@ -644,22 +579,19 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
   await assertLaw(page, { consoleErrors: errors });
 });
 
-// Review regression (powder-ui-awaiting-you): the header's right cluster now
-// holds up to five items -- live indicator, awaiting badge, quick-add,
-// filter, settings. Its worst case is a 390px viewport with the live
-// indicator in its long "live · last event Xs ago" form AND the awaiting
-// badge showing: before .pw-top-right learned to flex-wrap, that combination
-// pushed #settings-toggle fully off-viewport with no scrollbar to reach it
-// (the app shell is overflow:hidden). This reproduces exactly that state and
-// asserts every header control stays inside the viewport.
-test("board · mobile-390 · header controls stay on-screen with the long live indicator and awaiting badge (powder-ui-awaiting-you review)", async ({
+// Review regression (powder-ui-awaiting-you review): the header's right
+// cluster holds several controls -- live indicator, quick-add, filter,
+// settings. Its worst case is a 390px viewport with the live indicator in
+// its long "live · last event Xs ago" form: before .pw-top-right learned to
+// flex-wrap, that combination pushed #settings-toggle fully off-viewport
+// with no scrollbar to reach it (the app shell is overflow:hidden). This
+// reproduces that state and asserts every header control stays inside the
+// viewport.
+test("board · mobile-390 · header controls stay on-screen with the long live indicator (powder-ui-awaiting-you review)", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 900 });
   const errors = await boot(page, "light");
-
-  // awaiting badge visible (fixture seeds one awaiting-input run)
-  await expect(page.locator("#awaiting-badge")).toBeVisible();
 
   // force the live indicator into its long form: land a real SSE event
   await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
@@ -680,7 +612,7 @@ test("board · mobile-390 · header controls stay on-screen with the long live i
 
   const viewport = page.viewportSize();
   expect(viewport).not.toBeNull();
-  for (const id of ["#settings-toggle", "#filter-btn", "#quick-add-toggle", "#awaiting-badge", "#live-indicator"]) {
+  for (const id of ["#settings-toggle", "#filter-btn", "#quick-add-toggle", "#live-indicator"]) {
     const box = await page.locator(id).boundingBox();
     expect(box, `${id} must have a bounding box`).not.toBeNull();
     expect(box!.x, `${id} must not start left of the viewport`).toBeGreaterThanOrEqual(0);
