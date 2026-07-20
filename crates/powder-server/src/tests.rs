@@ -2622,6 +2622,59 @@ async fn board_assets_are_served_with_specific_content_types() {
         .starts_with("text/css"));
     assert!(response_text(aesthetic).await.contains("aesthetic v0.25.0"));
 
+    // powder-static-asset-cache-headers: every asset carries a
+    // deploy-scoped ETag with `no-cache` revalidation, and a matching
+    // If-None-Match comes back 304 with no body re-download. NEVER a long
+    // immutable max-age here -- deploys must invalidate instantly.
+    let etag_probe = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/assets/powder-board.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let etag = etag_probe
+        .headers()
+        .get("etag")
+        .expect("assets must carry an ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        etag_probe.headers().get("cache-control").unwrap(),
+        "no-cache"
+    );
+    let revalidated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/assets/powder-board.js")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    let index_revalidated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/board")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(index_revalidated.status(), StatusCode::NOT_MODIFIED);
+
     let script = app
         .clone()
         .oneshot(
