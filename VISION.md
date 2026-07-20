@@ -61,9 +61,9 @@ future hosted version may exist, but the product core must not assume one.
 ## Product Shape
 
 **One deployable.** Powder should remain a Rust service with one Docker image,
-one SQLite database, one Fly-friendly deployment target, optional Litestream
-replication, health/readiness routes, first-run onboarding, and configuration
-through environment variables.
+one SQLite database, one plain-Linux-host deployment target (production runs on
+a DigitalOcean droplet), optional Litestream replication, health/readiness
+routes, first-run onboarding, and configuration through environment variables.
 
 **One semantic contract.** HTTP, CLI, MCP, and the shipped skill are adapters
 over the same domain language: cards, runs, activity, audit events, claims,
@@ -146,8 +146,8 @@ yet trustworthy enough for a fleet to depend on:
   list.
 - `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
   first-run onboarding state, API-key auth, and tailnet/none modes.
-- Docker, Fly, Litestream, and env examples follow the Canary-style
-  self-hosted deployment pattern.
+- Docker, systemd, Litestream, and env examples follow the Canary-style
+  self-hosted deployment pattern (Fly kept only as a self-hoster reference).
 
 The important remaining gaps are not polish. The audit trail needs to stay
 consistent across SQLite, HTTP, CLI, MCP, and the Kanban board; relations and
@@ -168,7 +168,8 @@ Kanban surface must keep making the same state legible to humans.
 ## Excellent In 6-12 Months
 
 Powder is the obvious self-hosted work ledger for agentic software teams. A new
-operator can deploy it on Fly, mount SQLite storage, choose tailnet or shared
+operator can deploy it on any plain Linux host or DigitalOcean droplet, mount
+SQLite storage, choose tailnet or shared
 secret auth, complete first-run onboarding, create or integrate cards through
 explicit APIs, configure rules and webhooks, inspect a beautiful Kanban board, and let agents
 safely ask:

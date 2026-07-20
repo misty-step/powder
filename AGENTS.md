@@ -29,9 +29,9 @@ boundary, or the self-hosting/deployment shape.
   data; synthetic migration fixtures belong under tests only. Instance data
   lives in the deployed SQLite database.
 - Follow the Canary-style deployment shape: one deployable Rust service, SQLite
-  path from env, WAL, Fly volume at `/data`, Litestream optional replication,
-  health and readiness routes, first-run bootstrap key, and tailnet-friendly
-  auth configuration.
+  path from env, WAL, host volume at `/data` (production is a DigitalOcean
+  droplet), Litestream optional replication, health and readiness routes,
+  first-run bootstrap key, and tailnet-friendly auth configuration.
 
 ## Gates
 

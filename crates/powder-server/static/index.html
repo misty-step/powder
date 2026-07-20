@@ -79,7 +79,7 @@
       <span id="live-indicator" class="pw-live" data-state="idle" title="live board updates via SSE">live</span>
       <button class="pw-filter-btn" id="quick-add-toggle" type="button" aria-expanded="false" aria-controls="quick-add-panel">
         <svg class="ae-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
-        file card
+        new card
       </button>
       <button class="pw-filter-btn" id="cmdk-toggle" type="button" aria-haspopup="dialog" aria-controls="cmdk">
         <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
@@ -98,15 +98,15 @@
   <section id="quick-add-panel" class="pw-quick-add" hidden>
     <form id="quick-add-form" class="pw-quick-add-form">
       <label>
-        <span class="ae-chrome">Title <span class="pw-optional">optional</span></span>
-        <input id="quick-add-title" class="ae-input" type="text" autocomplete="off" placeholder="Short title (first ramble line works too)">
+        <span class="ae-chrome">Title</span>
+        <input id="quick-add-title" class="ae-input" type="text" autocomplete="off" placeholder="Short title (first description line works too)">
       </label>
       <label>
-        <span class="ae-chrome">Ramble</span>
+        <span class="ae-chrome">Description</span>
         <textarea id="quick-add-body" class="ae-input" rows="4" placeholder="Paste or type the whole thought here…"></textarea>
       </label>
       <label class="pw-combo-label">
-        <span class="ae-chrome">Repo <span class="pw-optional">type to search · clear for none</span></span>
+        <span class="ae-chrome">Repo <span class="pw-optional">type to search · defaults to general</span></span>
         <div class="pw-combo">
           <span class="pw-search pw-combo-field"><svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="quick-add-repo-input" type="text" role="combobox" aria-expanded="false" aria-controls="quick-add-repo-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="no repo · local"></span>
           <input id="quick-add-repo" type="hidden" value="">
@@ -119,7 +119,7 @@
       </label>
       <ul id="quick-add-attachment-list" class="pw-quick-add-attachment-list" aria-live="polite"></ul>
       <div class="pw-quick-add-actions">
-        <button class="ae-button ae-button-compact" type="submit">File card</button>
+        <button class="ae-button ae-button-compact" type="submit">Save</button>
         <button class="ae-button ae-button-quiet ae-button-compact" type="button" id="quick-add-cancel">Cancel</button>
       </div>
       <p id="quick-add-message" class="ae-chrome" aria-live="polite"></p>

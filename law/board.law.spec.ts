@@ -516,7 +516,7 @@ test("board · mobile-390 · operator can quick-add a card with no CLI (powder-9
   await page.locator("#quick-add-title").fill("powder-925 law-gate quick add");
   await page.locator("#quick-add-body").fill("Filed touch-first, no CLI, from a 390px viewport.");
   const repoBeforeSubmit = await page.locator("#quick-add-repo").inputValue();
-  expect(repoBeforeSubmit.length, "repo picker must have a selected default").toBeGreaterThan(0);
+  expect(repoBeforeSubmit, "captures default to the repo-less general bucket (operator ruling 2026-07-20)").toBe("");
 
   const created = page.waitForResponse(
     (response) => response.url().endsWith("/api/v1/cards") && response.request().method() === "POST",
