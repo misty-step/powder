@@ -30,8 +30,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use powder_core::{
-    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyQuery, RunId,
+    canonical_repo_label, Authority, Card, CardId, CardStatus, DetailLevel, Estimate,
+    PapercutReport, Priority, ReadyQuery, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -81,6 +81,15 @@ struct AppState {
     /// attention via the readiness gate even though the process kept serving
     /// requests instead of crash-looping.
     poison_count: Arc<AtomicU64>,
+    /// Latest known `outbound_events.sequence` (powder-sse-notify): one
+    /// background poller (`event_notify_loop`) is the sole DB reader on
+    /// this cadence, and every live `tail_events` connection idles on a
+    /// clone of this receiver instead of independently polling the store --
+    /// O(1) poll cost instead of O(open connections). The watched value is
+    /// only a wake hint; each connection still does its own authoritative
+    /// `list_event_tail(cursor, ..)` catch-up read off its own cursor, so a
+    /// missed or coalesced notification can never drop an event.
+    event_watch: tokio::sync::watch::Receiver<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +474,12 @@ struct PatchCardRequest {
     priority: Option<String>,
     estimate: Option<String>,
     labels: Option<Vec<String>>,
+    /// Repository reassignment (powder-repo-hygiene), admin-gated in
+    /// `patch_card`. Absent -- don't touch. `""` (or any string that
+    /// canonicalizes to empty, e.g. all whitespace) -- clear to repo-less,
+    /// same convention the quick-add combobox already uses client-side for
+    /// "no repo · local". Anything else -- set to its canonical label.
+    repo: Option<String>,
 }
 
 impl PatchCardRequest {
@@ -478,6 +493,7 @@ impl PatchCardRequest {
             })
             .transpose()?;
         let estimate = self.estimate.as_deref().map(parse_estimate).transpose()?;
+        let repo = self.repo.map(|raw| canonical_repo_label(&raw));
 
         Ok(CardPatch {
             title: self.title,
@@ -488,6 +504,7 @@ impl PatchCardRequest {
             priority,
             estimate,
             labels: self.labels,
+            repo,
         })
     }
 }
@@ -700,11 +717,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("{msg}");
         canary::report_error("powder.store.schema_version", &msg);
     })?;
+    let (event_notify_tx, event_notify_rx) = tokio::sync::watch::channel(0i64);
     let state = AppState {
         config: Arc::new(config),
         store: Arc::new(Mutex::new(store)),
         poison_count: Arc::new(AtomicU64::new(0)),
+        event_watch: event_notify_rx,
     };
+    tokio::spawn(event_notify_loop(state.clone(), event_notify_tx));
 
     // powder-epic-truthful-ops: the only way to answer "what is actually
     // running" for a given instance used to be `curl /readyz` (schema
@@ -1267,20 +1287,23 @@ async fn file_papercut(
 async fn patch_card(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<PatchCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
     // powder-ruling-patch-scope: single-card field patches follow the same
     // rule as single-card authoring (powder-925) -- an actor-scoped key can
     // record an operator ruling (title/body/acceptance/priority) without the
-    // admin key; every patch is audited with actor and field list.
+    // admin key; every patch is audited with actor and field list. `repo`
+    // is the exception (powder-repo-hygiene): reassigning a card's board
+    // grouping is administrative, same tier as `merge_repository_alias`, so
+    // it requires admin scope even though the rest of the patch doesn't.
     let card_id = CardId::new(id)?;
-    let card = lock_store(&state)?.patch_card(
-        &card_id,
-        request.into_patch()?,
-        &actor.principal,
-        unix_now(),
-    )?;
+    let patch = request.into_patch()?;
+    if patch.repo.is_some() {
+        require_admin(&state, &headers)?;
+    }
+    let card = lock_store(&state)?.patch_card(&card_id, patch, &actor.principal, unix_now())?;
     Ok(Json(card))
 }
 
@@ -1714,6 +1737,7 @@ async fn tail_events(
     let limit = params.limit.unwrap_or(100).max(1);
     let live = params.live.unwrap_or(false);
     let stream_state = state.clone();
+    let mut watch_rx = state.event_watch.clone();
     let stream = async_stream::stream! {
         loop {
             let events = match lock_store(&stream_state)
@@ -1726,7 +1750,12 @@ async fn tail_events(
                     break;
                 }
             };
-            let empty = events.is_empty();
+            // A short page (fewer rows than `limit`) means this read caught
+            // up to the store's current tail -- there is nothing else
+            // waiting to be drained immediately. A full page means more
+            // backlog may still be sitting past `limit`, so loop again
+            // right away instead of idling.
+            let caught_up = events.len() < limit;
             for item in events {
                 cursor = item.sequence;
                 let event_type = item.event.event_type.clone();
@@ -1744,8 +1773,22 @@ async fn tail_events(
             if !live {
                 break;
             }
-            if empty {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            if caught_up {
+                // Idle until `event_notify_loop` observes a new row, or a
+                // bounded fallback tick in case a notification is ever
+                // coalesced away -- `watch` only retains the latest value,
+                // so this is purely a wake hint. The next loop iteration's
+                // `list_event_tail(cursor, ..)` is the actual source of
+                // truth and can never miss an event regardless of when (or
+                // whether) this wakes. If the sender is gone (the notify
+                // task died, or a test fixture never spawned one),
+                // `changed()` returns Err *immediately* -- degrade to a
+                // plain slow poll instead of spinning a hot loop on it.
+                if let Ok(Err(_sender_gone)) =
+                    tokio::time::timeout(Duration::from_secs(20), watch_rx.changed()).await
+                {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         }
     };
@@ -2140,6 +2183,38 @@ fn repository_upsert(
         tier,
         import_provenance: request.import_provenance,
     })
+}
+
+/// powder-sse-notify: the sole poller of `outbound_events` for live
+/// updates. Every `tail_events` SSE connection used to run this exact poll
+/// independently every 500ms while idle -- fine for one connection, but
+/// each concurrent live connection contended the same `Mutex<Store>` on
+/// the same cadence, and a handful of stale/background tabs (observed:
+/// 14 concurrent live connections) was enough to pin the process near
+/// 90% CPU and stall unrelated request handling. One poller here, fanned
+/// out to every connection over a `watch` channel, makes the DB-poll cost
+/// O(1) instead of O(open live connections).
+async fn event_notify_loop(state: AppState, tx: tokio::sync::watch::Sender<i64>) {
+    let mut last = 0i64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let latest = match lock_store(&state)
+            .and_then(|store| store.latest_event_sequence().map_err(ApiError::from))
+        {
+            Ok(latest) => latest,
+            Err(err) => {
+                tracing::warn!("event notify loop failed: {}", err.message);
+                continue;
+            }
+        };
+        if latest != last {
+            last = latest;
+            // `send` only errors when every receiver (all live `tail_events`
+            // connections plus the one held in `AppState`) has dropped --
+            // never true here since `AppState` always holds one.
+            let _ = tx.send(latest);
+        }
+    }
 }
 
 async fn delivery_loop(state: AppState) {

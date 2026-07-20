@@ -726,6 +726,7 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             .map(parse_estimate_flag)
             .transpose()?,
         labels: flag_value(args, "--labels").map(split_csv),
+        repo: None,
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;

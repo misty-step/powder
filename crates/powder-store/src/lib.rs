@@ -341,7 +341,14 @@ fn unix_now() -> i64 {
 
 /// Explicit partial update for mutable card fields. Fields left as `None`
 /// are preserved from the stored row; lifecycle/source/workspace fields are
-/// intentionally absent from this shape.
+/// intentionally absent from this shape. `repo` is the one repository-
+/// topology exception (powder-repo-hygiene): admin-gated at the HTTP layer
+/// since it moves a card between board groupings rather than editing the
+/// card's own content, but it lives here rather than behind a bulk-only
+/// endpoint because single-card repo corrections (an orphaned card, a
+/// mis-imported one) don't warrant `merge_repository_alias`'s all-matching-
+/// cards blast radius. `Some(None)` clears the card to repo-less; `None`
+/// (the field left off the patch entirely) leaves it untouched.
 #[derive(Debug, Clone, Default)]
 pub struct CardPatch {
     pub title: Option<String>,
@@ -352,6 +359,7 @@ pub struct CardPatch {
     pub priority: Option<Priority>,
     pub estimate: Option<Estimate>,
     pub labels: Option<Vec<String>>,
+    pub repo: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1606,6 +1614,10 @@ impl Store {
             card.status = status;
             patched_fields.push("status");
         }
+        if let Some(repo) = patch.repo {
+            card.repo = repo;
+            patched_fields.push("repo");
+        }
 
         if patched_fields.is_empty() {
             transaction.commit()?;
@@ -1622,9 +1634,17 @@ impl Store {
             &format!("patched {}", patched_fields.join(", ")),
             now,
         )?;
+        // `persist_card` canonicalizes `repo` at write time via
+        // `ensure_repository_entity` (an alias like "misty-step/canary"
+        // becomes "canary" in the DB row) but only borrows `card`, so the
+        // in-memory value above is still whatever the caller passed. Reload
+        // so the returned `Card` matches the row exactly -- same reason
+        // `create_card_with_events` reloads after its own `persist_card`
+        // call instead of returning its own `card` binding.
+        let saved = load_card(&transaction, card_id)?;
 
         transaction.commit()?;
-        Ok(card)
+        Ok(saved)
     }
 
     pub fn check_criterion(

@@ -2865,6 +2865,75 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
 }
 
 #[test]
+fn patch_card_can_set_and_clear_repo() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("patch-repo")?;
+    let card = sourced_card("patch-repo", 2, "sha256:v1");
+    store.import_cards(vec![card])?;
+
+    // Leaving `repo` untouched (`None`) preserves whatever the row already
+    // has -- distinct from `Some(None)`, which explicitly clears it.
+    let unpatched = store.patch_card(
+        &card_id,
+        CardPatch {
+            title: Some("still untouched repo".to_string()),
+            ..Default::default()
+        },
+        "operator",
+        10,
+    )?;
+    assert_eq!(unpatched.repo, None);
+
+    let moved = store.patch_card(
+        &card_id,
+        CardPatch {
+            repo: Some(Some("misty-step/canary".to_string())),
+            ..Default::default()
+        },
+        "operator",
+        20,
+    )?;
+    assert_eq!(
+        moved.repo.as_deref(),
+        Some("canary"),
+        "patch_card must return the write-time-canonicalized repo, not the raw alias"
+    );
+    let stored_repo: String = store.connection.query_row(
+        "SELECT repo FROM cards WHERE id = 'patch-repo'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_repo, "canary");
+
+    let cleared = store.patch_card(
+        &card_id,
+        CardPatch {
+            repo: Some(None),
+            ..Default::default()
+        },
+        "operator",
+        30,
+    )?;
+    assert_eq!(cleared.repo, None);
+
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed, 1_000_000)?
+        .expect("detail");
+    assert!(
+        detail
+            .events
+            .iter()
+            .filter(|event| event.event_type == "patch")
+            .filter(|event| event.payload.contains("repo"))
+            .count()
+            >= 2,
+        "both the set and the clear should be audited as repo patches"
+    );
+    Ok(())
+}
+
+#[test]
 fn card_event_v1_fixture_matches_the_documented_schema() {
     let fixture = include_str!("../tests/fixtures/card_event_v1.json");
     let raw: serde_json::Value = serde_json::from_str(fixture).unwrap();
