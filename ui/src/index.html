@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Powder Board</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231a1a1a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m10 20-1.25-2.5L6 18'/%3E%3Cpath d='M10 4 8.75 6.5 6 6'/%3E%3Cpath d='m14 20 1.25-2.5L18 18'/%3E%3Cpath d='m14 4 1.25 2.5L18 6'/%3E%3Cpath d='m17 21-3-6h-4'/%3E%3Cpath d='m17 3-3 6 1.5 3'/%3E%3Cpath d='M2 12h6.5L10 9'/%3E%3Cpath d='m20 10-1.5 2 1.5 2'/%3E%3Cpath d='M22 12h-6.5L14 15'/%3E%3Cpath d='m4 10 1.5 2L4 14'/%3E%3Cpath d='m7 21 3-6-1.5-3'/%3E%3Cpath d='m7 3 3 6h4'/%3E%3C/svg%3E">
+  <script>
+    try {
+      const mode = localStorage.getItem("ae-mode");
+      if (mode === "dark" || mode === "light") {
+        document.documentElement.classList.add(mode);
+        document.documentElement.setAttribute("data-ae-mode", mode);
+        document.documentElement.style.colorScheme = mode;
+      }
+    } catch (_err) {}
+    document.documentElement.setAttribute(
+      "data-pw-route",
+      /^\/c\/[^/]+$/.test(window.location.pathname) ? "card" : "board",
+    );
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&amp;family=Geist+Mono:wght@100..900&amp;display=swap">
+  <link rel="stylesheet" href="/assets/aesthetic.css">
+  <link rel="stylesheet" href="/assets/powder-board.css">
+</head>
+<body>
+<svg aria-hidden="true" class="pw-icons" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-snowflake" viewBox="0 0 24 24"><path d="m10 20-1.25-2.5L6 18"></path><path d="M10 4 8.75 6.5 6 6"></path><path d="m14 20 1.25-2.5L18 18"></path><path d="m14 4 1.25 2.5L18 6"></path><path d="m17 21-3-6h-4"></path><path d="m17 3-3 6 1.5 3"></path><path d="M2 12h6.5L10 9"></path><path d="m20 10-1.5 2 1.5 2"></path><path d="M22 12h-6.5L14 15"></path><path d="m4 10 1.5 2L4 14"></path><path d="m7 21 3-6-1.5-3"></path><path d="m7 3 3 6h4"></path></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></symbol>
+  <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"></circle></symbol>
+  <symbol id="i-proof" viewBox="0 0 24 24"><path d="M4 12.5 8.5 17 20 5.5"></path><path d="M4 19h16"></path></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 3 20 12 6 21 6 3"></polygon></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.06 12.35a1 1 0 0 1 0-.7 10.75 10.75 0 0 1 19.88 0 1 1 0 0 1 0 .7 10.75 10.75 0 0 1-19.88 0"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+  <symbol id="i-ask" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path><path d="M12 17h.01"></path></symbol>
+  <symbol id="i-block" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 20h16a2 2 0 0 0 1.73-2Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+  <symbol id="i-hand" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-4 0v5"></path><path d="M14 10V4a2 2 0 0 0-4 0v2"></path><path d="M10 10.5V6a2 2 0 0 0-4 0v8"></path><path d="m7 15-1.76-1.76a2 2 0 0 0-2.83 2.82l3.6 3.6A8 8 0 0 0 12 22a8 8 0 0 0 8-8V7a2 2 0 0 0-4 0v5"></path></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5Z"></path><path d="m2 12 10 5 10-5"></path><path d="m2 17 10 5 10-5"></path></symbol>
+  <symbol id="i-folders" viewBox="0 0 24 24"><path d="M20 17a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.9a2 2 0 0 1-1.69-.9l-.81-1.2a2 2 0 0 0-1.67-.9H8a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2Z"></path><path d="M2 8v11a2 2 0 0 0 2 2h14"></path></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"></circle><path d="M11 12 21 2"></path><path d="m16 7 2 2"></path><path d="m19 4 2 2"></path></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M9.67 2h4.66l.71 2.13c.44.16.86.34 1.25.57l2.02-1 3.3 3.3-1 2.02c.23.4.42.81.57 1.25L23.31 11v4.66l-2.13.71c-.15.44-.34.86-.57 1.25l1 2.02-3.3 3.3-2.02-1c-.4.23-.81.42-1.25.57l-.71 2.13H9.67l-.71-2.13a7.8 7.8 0 0 1-1.25-.57l-2.02 1-3.3-3.3 1-2.02a7.8 7.8 0 0 1-.57-1.25L.69 15.66V11l2.13-.71c.15-.44.34-.85.57-1.25l-1-2.02 3.3-3.3 2.02 1c.4-.23.81-.42 1.25-.57L9.67 2Z"></path><circle cx="12" cy="13.33" r="3"></circle></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.4"></path><path d="M3 12A9 9 0 0 1 18.5 5.6"></path><path d="M3 3v6h6"></path><path d="M21 21v-6h-6"></path></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 7.5A9 9 0 1 1 12 3Z"></path></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M14 2v6a2 2 0 0 0 .25.96l5.51 10.08A2 2 0 0 1 18 22H6a2 2 0 0 1-1.76-2.96l5.51-10.08A2 2 0 0 0 10 8V2"></path><path d="M6.45 15h11.09"></path><path d="M8.5 2h7"></path></symbol>
+  <symbol id="i-flower" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M12 16.5A4.5 4.5 0 1 1 7.5 12 4.5 4.5 0 1 1 12 7.5a4.5 4.5 0 1 1 4.5 4.5 4.5 4.5 0 1 1-4.5 4.5"></path></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24"><rect x="16" y="16" width="6" height="6"></rect><rect x="2" y="16" width="6" height="6"></rect><rect x="9" y="2" width="6" height="6"></rect><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"></path><path d="M12 12V8"></path></symbol>
+  <symbol id="i-bird" viewBox="0 0 24 24"><path d="M16 7h.01"></path><path d="M3.4 18H12a8 8 0 0 0 8-8V7a4 4 0 0 0-7.28-2.3L2 20"></path><path d="m20 7 2 .5-2 .5"></path><path d="M10 18v3"></path><path d="M14 17.75V21"></path></symbol>
+  <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></symbol>
+  <symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 22a1 1 0 0 1 0-20 10 9 0 0 1 10 9 5 5 0 0 1-5 5h-2.25a1.75 1.75 0 0 0-1.4 2.8l.3.4a1.75 1.75 0 0 1-1.4 2.8z"></path><circle cx="13.5" cy="6.5" r=".5"></circle><circle cx="17.5" cy="10.5" r=".5"></circle><circle cx="8.5" cy="7.5" r=".5"></circle><circle cx="6.5" cy="12.5" r=".5"></circle></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"></path></symbol>
+  <symbol id="i-landmark" viewBox="0 0 24 24"><path d="M10 18v-7"></path><path d="M11.12 2.2a2 2 0 0 1 1.76 0l7.87 3.85c.48.23.31.95-.22.95H3.47c-.53 0-.7-.72-.22-.95z"></path><path d="M14 18v-7"></path><path d="M18 18v-7"></path><path d="M3 22h18"></path><path d="M6 18v-7"></path></symbol>
+  <symbol id="i-factory" viewBox="0 0 24 24"><path d="M2 20a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8l-7 5V8l-7 5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"></path><path d="M17 18h1"></path><path d="M12 18h1"></path><path d="M7 18h1"></path></symbol>
+  <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M3 5v14a9 3 0 0 0 18 0V5"></path><path d="M3 12a9 3 0 0 0 18 0"></path></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"></polyline><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"></path></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"></path></symbol>
+</svg>
+
+<div id="powder-board-app" class="pw-app">
+  <header class="pw-top ae-chrome">
+    <div class="pw-brand">
+      <span class="pw-mark" aria-hidden="true"><svg class="ae-icon"><use href="#i-snowflake"></use></svg></span>
+      <span class="ae-name">POWDER</span>
+    </div>
+    <nav class="ae-tabs" id="tabs" role="tablist" aria-label="views">
+      <button id="tab-backlog" type="button" role="tab" aria-selected="false">Backlog</button>
+      <button id="tab-both" type="button" role="tab" aria-selected="true">Both</button>
+      <button id="tab-board" type="button" role="tab" aria-selected="false">Board</button>
+      <span class="ae-nav-ind" id="ind"></span>
+    </nav>
+    <div class="pw-top-right">
+      <span id="live-indicator" class="pw-live" data-state="idle" title="live board updates via SSE">live</span>
+      <button class="pw-filter-btn" id="quick-add-toggle" type="button" aria-expanded="false" aria-controls="quick-add-panel">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+        new card
+      </button>
+      <button class="pw-filter-btn" id="cmdk-toggle" type="button" aria-haspopup="dialog" aria-controls="cmdk">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+        jump <kbd>&#8984;K</kbd>
+      </button>
+      <button class="pw-filter-btn" id="filter-btn" type="button" aria-expanded="false" aria-controls="filters">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-filter"></use></svg>
+        filter<span class="pw-filter-n" id="filter-n"></span>
+      </button>
+      <button id="settings-toggle" class="pw-icon-btn" type="button" aria-label="connection and API key settings" aria-expanded="false" aria-controls="auth-panel">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-gear"></use></svg>
+      </button>
+    </div>
+  </header>
+
+  <section id="quick-add-panel" class="pw-quick-add" hidden>
+    <form id="quick-add-form" class="pw-quick-add-form">
+      <label>
+        <span class="ae-chrome">Title</span>
+        <input id="quick-add-title" class="ae-input" type="text" autocomplete="off" placeholder="Short title (first description line works too)">
+      </label>
+      <label>
+        <span class="ae-chrome">Description</span>
+        <textarea id="quick-add-body" class="ae-input" rows="4" placeholder="Paste or type the whole thought here…"></textarea>
+      </label>
+      <label class="pw-combo-label">
+        <span class="ae-chrome">Repo <span class="pw-optional">type to search · defaults to general</span></span>
+        <div class="pw-combo">
+          <span class="pw-search pw-combo-field"><svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="quick-add-repo-input" type="text" role="combobox" aria-expanded="false" aria-controls="quick-add-repo-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="no repo · general"></span>
+          <input id="quick-add-repo" type="hidden" value="">
+          <ul id="quick-add-repo-list" class="pw-combo-list" role="listbox" hidden></ul>
+        </div>
+      </label>
+      <label class="pw-quick-add-attach">
+        <span class="ae-chrome">Images <span class="pw-optional">paste or choose</span></span>
+        <input id="quick-add-attachments" type="file" accept="image/*" multiple>
+      </label>
+      <ul id="quick-add-attachment-list" class="pw-quick-add-attachment-list" aria-live="polite"></ul>
+      <div class="pw-quick-add-actions">
+        <button class="ae-button ae-button-compact" type="submit">Save</button>
+        <button class="ae-button ae-button-quiet ae-button-compact" type="button" id="quick-add-cancel">Cancel</button>
+      </div>
+      <p id="quick-add-message" class="ae-chrome" aria-live="polite"></p>
+    </form>
+  </section>
+
+  <section id="auth-panel" class="pw-auth" hidden>
+    <div>
+      <p id="auth-intro" class="ae-item">Checking this instance's access requirements&hellip;</p>
+      <p class="ae-chrome">Connection: <span id="connection-status" class="pw-connection" data-kind="loading">loading</span></p>
+      <p class="ae-chrome">Need a key? Mint one on the instance with:</p>
+      <span class="pw-mint-cmd">
+        <code id="mint-command">powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
+        <button id="copy-mint-command" class="ae-button ae-button-quiet ae-button-compact" type="button">copy</button>
+      </span>
+    </div>
+    <section class="pw-repo-settings" aria-label="repository settings">
+      <div class="pw-settings-head">
+        <p class="ae-h">REPOSITORIES</p>
+        <span class="pw-settings-head-meta">
+          <span id="repo-settings-count" class="ae-num">0</span>
+          <button id="repo-empty-toggle" class="pw-filter-clear" type="button" aria-pressed="false" hidden>show empty</button>
+        </span>
+      </div>
+      <form id="repo-create-form" class="pw-repo-create">
+        <label>
+          <span class="ae-chrome">Name</span>
+          <input id="repo-create-name" class="ae-input" type="text" autocomplete="off" placeholder="repo">
+        </label>
+        <label>
+          <span class="ae-chrome">Aliases</span>
+          <input id="repo-create-aliases" class="ae-input" type="text" autocomplete="off" placeholder="owner/repo,legacy">
+        </label>
+        <label>
+          <span class="ae-chrome">Provenance</span>
+          <input id="repo-create-provenance" class="ae-input" type="text" autocomplete="off" placeholder="manual">
+        </label>
+        <label>
+          <span class="ae-chrome">Visibility</span>
+          <select id="repo-create-visibility" class="pw-sort">
+            <option value="visible">visible</option>
+            <option value="hidden">hidden</option>
+          </select>
+        </label>
+        <label>
+          <span class="ae-chrome">Tier</span>
+          <select id="repo-create-tier" class="pw-sort">
+            <option value="active">active</option>
+            <option value="backburner" selected>backburner</option>
+            <option value="archived">archived</option>
+          </select>
+        </label>
+        <button class="ae-button ae-button-compact" type="submit">save</button>
+      </form>
+      <div id="repo-settings-list" class="pw-repo-list" aria-live="polite"></div>
+    </section>
+    <form id="api-key-form" class="pw-auth-form">
+      <label>
+        <span class="ae-chrome">API key</span>
+        <input id="api-key-input" class="ae-input" type="password" autocomplete="off" placeholder="paste key">
+      </label>
+      <button id="paste-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button" hidden>paste &amp; connect</button>
+      <button class="ae-button ae-button-compact" type="submit">save</button>
+      <button id="clear-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button">clear</button>
+      <p id="auth-message" class="ae-chrome"></p>
+    </form>
+  </section>
+
+  <div class="pw-filters" id="filters">
+    <span class="pw-filter-group" id="fg-repo" role="group" aria-label="filter by repository">
+      <span class="ae-plate-cap">REPO</span>
+    </span>
+    <span class="pw-filter-group" aria-label="repository tier scope">
+      <span class="ae-plate-cap">TIER</span>
+      <button class="pw-filter-clear" id="tier-toggle" type="button" aria-pressed="false">active only</button>
+    </span>
+    <span class="pw-filter-group" id="fg-prio" role="group" aria-label="filter by priority">
+      <span class="ae-plate-cap">PRIORITY</span>
+    </span>
+    <span class="pw-filter-group" aria-label="text search">
+      <span class="ae-plate-cap">SEARCH</span>
+      <span class="pw-search"><svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="text-filter" type="search" autocomplete="off" placeholder="title, label, body"></span>
+    </span>
+    <span class="pw-filter-group" aria-label="sort">
+      <span class="ae-plate-cap">SORT</span>
+      <select class="pw-sort" id="sort">
+        <option value="repo">by repo</option>
+        <option value="prio">by priority</option>
+        <option value="id">by id</option>
+      </select>
+    </span>
+    <button class="pw-filter-clear" id="repo-all" type="button">all repos</button>
+    <button class="pw-filter-clear" id="filter-clear" type="button">clear</button>
+  </div>
+
+  <div class="pw-main" id="main" data-view="both">
+    <aside class="pw-rail-wrap" aria-label="backlog">
+      <div class="pw-rail-inner">
+        <div class="pw-rail-head">
+          <span class="ae-h">BACKLOG</span>
+          <span class="pw-lane-n ae-num" id="bk-count">0</span>
+        </div>
+        <div class="pw-rail-list" id="rail-list"></div>
+      </div>
+    </aside>
+
+    <main class="pw-board" id="board" data-lane="ready">
+      <nav class="ae-tabs pw-lane-switch" id="lane-switch" role="tablist" aria-label="board column">
+        <button type="button" role="tab" data-lane="ready" aria-selected="true">Ready</button>
+        <button type="button" role="tab" data-lane="inprogress" aria-selected="false">In Progress</button>
+        <button type="button" role="tab" data-lane="done" aria-selected="false">Done</button>
+      </nav>
+      <section class="pw-lane" data-lane="ready" aria-label="ready">
+        <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-zap"></use></svg>READY</span><span class="pw-lane-n ae-num" id="rd-count">0</span></header>
+        <div class="pw-lane-scroll" id="lane-ready"></div>
+      </section>
+      <section class="pw-lane" data-lane="inprogress" aria-label="in progress">
+        <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-play"></use></svg>IN PROGRESS</span><span class="pw-lane-n ae-num" id="ip-count">0</span></header>
+        <div class="pw-lane-scroll" id="lane-inprog"></div>
+      </section>
+      <section class="pw-lane" data-lane="done" aria-label="done">
+        <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-check"></use></svg>DONE</span><span class="pw-lane-n ae-num" id="dn-count">0</span></header>
+        <div class="pw-lane-scroll" id="lane-done"></div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="pw-foot">
+    <span class="pw-foot-hint"><kbd>&#8984;K</kbd> jump · <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>f</kbd> filter · <kbd>Esc</kbd> back</span>
+    <a id="footer-home-link" class="pw-board-link" href="" hidden>sanctum</a>
+    <span class="pw-foot-brand">powder</span>
+  </footer>
+
+  <div id="cmdk" class="pw-cmdk" hidden>
+    <div class="pw-cmdk-backdrop" data-cmdk-dismiss></div>
+    <div class="pw-cmdk-panel" role="dialog" aria-modal="true" aria-label="Jump to card">
+      <div class="pw-cmdk-combobox">
+        <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+        <input
+          id="cmdk-input"
+          class="pw-cmdk-input"
+          type="text"
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="cmdk-list"
+          aria-autocomplete="list"
+          autocomplete="off"
+          placeholder="Jump to a card by id or title&hellip;"
+        >
+      </div>
+      <ul id="cmdk-list" class="pw-cmdk-list" role="listbox" aria-label="Matching cards"></ul>
+      <p id="cmdk-empty" class="pw-empty pw-cmdk-empty" hidden>No matching cards.</p>
+    </div>
+  </div>
+</div>
+
+<div id="pw-toast" class="pw-toast" role="status" aria-live="polite" hidden></div>
+
+<div id="powder-card-app" class="pw-detail-app" aria-live="polite">
+  <header class="pw-detail-top ae-chrome">
+    <div class="pw-detail-nav">
+      <a class="pw-board-link" id="detail-board-link" href="/board">board</a>
+      <a class="pw-board-link" id="detail-home-link" href="" hidden>sanctum</a>
+    </div>
+    <div class="pw-brand">
+      <span class="pw-mark" aria-hidden="true"><svg class="ae-icon"><use href="#i-snowflake"></use></svg></span>
+      <span class="ae-name">POWDER</span>
+    </div>
+    <p class="pw-detail-connection">Connection: <span id="detail-connection-status" class="pw-connection" data-kind="loading">loading</span></p>
+  </header>
+  <div class="pw-detail-scroll">
+    <main id="detail-body" class="pw-detail-body">
+      <p class="pw-empty">Loading card detail.</p>
+    </main>
+  </div>
+</div>
+
+<script src="/assets/powder-board.js" defer></script>
+</body>
+</html>
