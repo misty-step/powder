@@ -105,9 +105,13 @@
         <span class="ae-chrome">Ramble</span>
         <textarea id="quick-add-body" class="ae-input" rows="4" placeholder="Paste or type the whole thought here…"></textarea>
       </label>
-      <label>
-        <span class="ae-chrome">Repo <span class="pw-optional">optional</span></span>
-        <select id="quick-add-repo" class="pw-sort"></select>
+      <label class="pw-combo-label">
+        <span class="ae-chrome">Repo <span class="pw-optional">type to search · clear for none</span></span>
+        <div class="pw-combo">
+          <span class="pw-search pw-combo-field"><svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="quick-add-repo-input" type="text" role="combobox" aria-expanded="false" aria-controls="quick-add-repo-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="no repo · local"></span>
+          <input id="quick-add-repo" type="hidden" value="">
+          <ul id="quick-add-repo-list" class="pw-combo-list" role="listbox" hidden></ul>
+        </div>
       </label>
       <label class="pw-quick-add-attach">
         <span class="ae-chrome">Images <span class="pw-optional">paste or choose</span></span>
@@ -244,9 +248,9 @@
   </div>
 
   <footer class="pw-foot">
-    <span class="pw-foot-hint"><kbd>1</kbd> backlog · <kbd>2</kbd> both · <kbd>3</kbd> board · <kbd>f</kbd> filters · <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>&#8984;K</kbd> jump · <kbd>Esc</kbd> back</span>
+    <span class="pw-foot-hint"><kbd>&#8984;K</kbd> jump · <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>f</kbd> filter · <kbd>Esc</kbd> back</span>
     <a id="footer-home-link" class="pw-board-link" href="" hidden>sanctum</a>
-    <span>powder</span>
+    <span class="pw-foot-brand">powder</span>
   </footer>
 
   <div id="cmdk" class="pw-cmdk" hidden>

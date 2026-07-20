@@ -2551,7 +2551,7 @@ async fn board_assets_are_served_with_specific_content_types() {
         "card rows must link to /c/{{card_id}} for Bridge deep links"
     );
     assert!(
-        script.contains("function loadCardRoute()"),
+        script.contains("function loadCardRoute(options = {})"),
         "card detail routes must render from the same static asset"
     );
     assert!(script.contains("function classifyFailure("));

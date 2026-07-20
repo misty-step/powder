@@ -17,6 +17,7 @@ const RAW_STATUSES = [
 const PAGE_LIMIT = 1000;
 const STORAGE_KEY = "powder-api-key";
 const BOARD_STATE_KEY = "powder-board-state";
+const BOARD_CACHE_KEY = "powder-board-cache";
 const KEY_MINT_COMMAND =
   "powder key-create --db /data/powder.db --name operator --scope admin --show-secret";
 
@@ -35,6 +36,9 @@ const LIVE_REFRESH_DEBOUNCE_MS = 500;
 // least this often instead of trailing-edge-debouncing forever.
 const LIVE_REFRESH_MAX_WAIT_MS = 2_000;
 const LIVE_HIGHLIGHT_MS = 2_200;
+// Transient SSE drops and routine reconnects stay visually silent; only an
+// outage that persists past this grace window surfaces in the chrome.
+const LIVE_TROUBLE_GRACE_MS = 8_000;
 const LIVE_PRIME_LIMIT = 500;
 
 const KNOWN_REPO_META = {
@@ -63,6 +67,8 @@ const els = {
   quickAddTitle: document.getElementById("quick-add-title"),
   quickAddBody: document.getElementById("quick-add-body"),
   quickAddRepo: document.getElementById("quick-add-repo"),
+  quickAddRepoInput: document.getElementById("quick-add-repo-input"),
+  quickAddRepoList: document.getElementById("quick-add-repo-list"),
   quickAddCancel: document.getElementById("quick-add-cancel"),
   quickAddMessage: document.getElementById("quick-add-message"),
   quickAddAttachments: document.getElementById("quick-add-attachments"),
@@ -159,6 +165,12 @@ const state = {
 let railShare = 24;
 let quickAddFiles = [];
 let toastTimer = null;
+let silentRetryTimer = null;
+let statusChangeSeq = 0;
+const pendingOptimisticIds = new Set();
+const BOARD_CACHE_VERSION = 1;
+const BOARD_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SILENT_RETRY_MS = 15_000;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -323,26 +335,49 @@ async function fetchBoardStats() {
 }
 
 
-async function loadBoard() {
-  state.loading = true;
-  state.error = "";
-  state.errorKind = "";
-  updateConnection("loading", "loading");
-  render();
+async function loadBoard(options = {}) {
+  const silent = Boolean(options.silent);
+  if (!silent) {
+    state.loading = true;
+    state.error = "";
+    state.errorKind = "";
+    updateConnection("loading", "loading");
+    render();
+  }
   try {
     await loadOnboarding();
     const data = await fetchBoardData();
-    state.cards = data.cards;
+    state.cards = mergePendingOptimistic(data.cards);
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
     state.loading = false;
+    state.error = "";
+    state.errorKind = "";
     state.detailCache.clear();
+    saveBoardCache();
     updateSuccessConnection();
     buildFilters();
     renderRepositorySettings();
     render();
   } catch (err) {
+    // A silent reconcile keeps the cached render up (never repaints the
+    // board into an error shell), but it must not swallow failures: auth
+    // problems escalate to the auth panel, and anything else schedules a
+    // bounded retry so a warm-cache boot can't stay stale forever.
+    if (silent) {
+      const failure = classifyFailure(err);
+      updateConnection(failure.connectionKind, failure.connectionLabel);
+      if (failure.kind === "auth") {
+        showAuth(failure.action);
+      } else if (!silentRetryTimer) {
+        silentRetryTimer = setTimeout(() => {
+          silentRetryTimer = null;
+          loadBoard({ silent: true });
+        }, SILENT_RETRY_MS);
+      }
+      return;
+    }
     state.loading = false;
     const failure = classifyFailure(err);
     state.error = failure.message;
@@ -352,6 +387,58 @@ async function loadBoard() {
     if (failure.kind === "auth") showAuth(failure.action);
     render();
   }
+}
+
+// Instant-paint cache (stale-while-revalidate): the last good board payload
+// is persisted so a reload renders immediately from local data while
+// loadBoard({ silent: true }) reconciles against the API in the background.
+function saveBoardCache() {
+  try {
+    localStorage.setItem(
+      BOARD_CACHE_KEY,
+      JSON.stringify({
+        v: BOARD_CACHE_VERSION,
+        savedAt: Date.now(),
+        cards: state.cards,
+        repositories: state.repositories,
+        statsTotals: state.statsTotals,
+      }),
+    );
+  } catch (_err) {
+    // Quota/blocked: drop the stale snapshot rather than letting an old
+    // cache win the instant-paint race forever.
+    try {
+      localStorage.removeItem(BOARD_CACHE_KEY);
+    } catch (_err2) {}
+  }
+}
+
+function restoreBoardCache() {
+  try {
+    const snapshot = JSON.parse(localStorage.getItem(BOARD_CACHE_KEY) || "null");
+    if (!snapshot || snapshot.v !== BOARD_CACHE_VERSION) return false;
+    if (!Array.isArray(snapshot.cards) || !snapshot.cards.length) return false;
+    if (Date.now() - (snapshot.savedAt || 0) > BOARD_CACHE_MAX_AGE_MS) return false;
+    state.cards = snapshot.cards.map(normalizeCard);
+    state.repositories = snapshot.repositories || [];
+    state.statsTotals = snapshot.statsTotals || {};
+    state.loading = false;
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
+// Optimistically inserted cards survive a concurrent SSE refresh landing
+// while their POST is still in flight -- server payloads that don't know
+// the card yet get it re-merged instead of wiping it off the board.
+function mergePendingOptimistic(cards) {
+  if (!pendingOptimisticIds.size) return cards;
+  const present = new Set(cards.map((card) => card.id));
+  const kept = state.cards.filter(
+    (card) => pendingOptimisticIds.has(card.id) && !present.has(card.id),
+  );
+  return kept.length ? [...kept, ...cards] : cards;
 }
 
 // Live-triggered refresh (powder-epic-answer-board): re-uses fetchBoardData
@@ -364,7 +451,7 @@ async function refreshLive() {
   try {
     const data = await fetchBoardData();
     const changed = changedCardIds(state.cards, data.cards);
-    state.cards = data.cards;
+    state.cards = mergePendingOptimistic(data.cards);
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
@@ -424,13 +511,14 @@ let liveCursor = 0;
 let liveGeneration = 0;
 let liveRefreshTimer = null;
 let liveRefreshDeadline = 0;
-let liveTickTimer = null;
+let liveStarted = false;
+let liveTroubleTimer = null;
 let lastLiveEventAt = 0;
 let liveState = "connecting";
 
 function startLiveUpdates() {
-  if (liveTickTimer) return;
-  liveTickTimer = setInterval(renderLiveIndicator, 1000);
+  if (liveStarted) return;
+  liveStarted = true;
   primeLiveCursor().finally(() => connectLive());
 }
 
@@ -466,7 +554,6 @@ function advanceLiveCursor(block) {
 
 async function connectLive() {
   const generation = ++liveGeneration;
-  updateLiveIndicator("connecting");
   let response;
   try {
     response = await fetch(`/api/v1/events/tail?live=true&after=${liveCursor}`, {
@@ -477,10 +564,16 @@ async function connectLive() {
     return;
   }
   if (generation !== liveGeneration) return;
-  if (!response.ok || !response.body) {
+  // Content-Type gate: a reverse proxy with an SPA catch-all (or a captive
+  // portal) can serve HTML at this path with a 200 -- without the gate the
+  // indicator would report "live" against a stream that will never carry
+  // an event.
+  const contentType = response.headers.get("content-type") || "";
+  if (!response.ok || !response.body || !contentType.includes("text/event-stream")) {
     scheduleLiveReconnect(generation);
     return;
   }
+  updateLiveIndicator("live");
   // Do NOT reset the backoff on headers alone: a proxy that accepts the
   // request and then kills the stream immediately would otherwise collapse
   // the delay back to base on every attempt -- a tight ~1req/s reconnect
@@ -489,7 +582,6 @@ async function connectLive() {
   // both count) or survive LIVE_PROVEN_MS of wall-clock time.
   const connectedAt = Date.now();
   let proven = false;
-  updateLiveIndicator("live");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -522,7 +614,7 @@ async function connectLive() {
 }
 
 function scheduleLiveReconnect(generation) {
-  updateLiveIndicator("reconnecting");
+  updateLiveIndicator("pending");
   const delay = liveRetryDelay;
   liveRetryDelay = Math.min(LIVE_RETRY_MAX_MS, liveRetryDelay * 2);
   setTimeout(() => {
@@ -536,7 +628,7 @@ function handleLiveBlock(block) {
   const hasData = block.split("\n").some((line) => line.startsWith("data:"));
   if (!hasData) return; // keep-alive comment, not a domain event
   lastLiveEventAt = Date.now();
-  renderLiveIndicator();
+  updateLiveIndicator("live");
   scheduleLiveRefresh();
 }
 
@@ -561,27 +653,46 @@ function scheduleLiveRefresh() {
 }
 
 function updateLiveIndicator(nextState) {
-  liveState = nextState;
+  if (nextState === "live") {
+    liveState = "live";
+    if (liveTroubleTimer) {
+      clearTimeout(liveTroubleTimer);
+      liveTroubleTimer = null;
+    }
+  } else if (liveState === "live" || liveState === "connecting") {
+    // Entering trouble from a good (or boot) state: stay calm and only
+    // surface the outage if it persists past the grace window.
+    liveState = "pending";
+    if (!liveTroubleTimer) {
+      liveTroubleTimer = setTimeout(() => {
+        liveTroubleTimer = null;
+        liveState = "offline";
+        renderLiveIndicator();
+      }, LIVE_TROUBLE_GRACE_MS);
+    }
+  }
   renderLiveIndicator();
 }
 
 function renderLiveIndicator() {
   if (!els.liveIndicator) return;
-  els.liveIndicator.dataset.state = liveState;
-  if (liveState === "reconnecting") {
-    els.liveIndicator.textContent = "live · reconnecting…";
+  if (liveState === "offline") {
+    els.liveIndicator.dataset.state = "offline";
+    els.liveIndicator.textContent = "offline · retrying…";
+    els.liveIndicator.title = "live updates disconnected";
     return;
   }
-  if (liveState === "connecting" && !lastLiveEventAt) {
-    els.liveIndicator.textContent = "live · connecting…";
-    return;
-  }
-  if (!lastLiveEventAt) {
-    els.liveIndicator.textContent = "live";
-    return;
-  }
-  const seconds = Math.max(0, Math.round((Date.now() - lastLiveEventAt) / 1000));
-  els.liveIndicator.textContent = `live · last event ${seconds}s ago`;
+  // data-state "live" means the SSE tail is connected (same contract the
+  // law gate asserts) -- and stays "live" through the reconnect grace
+  // window ("pending") so transient drops never flash the chrome. "idle"
+  // is boot-before-first-connection only, with honest copy. Event recency
+  // lives in the tooltip, not churning chrome text.
+  const connected = liveState === "live" || liveState === "pending";
+  els.liveIndicator.dataset.state = connected ? "live" : "idle";
+  els.liveIndicator.textContent = connected ? "live" : "connecting…";
+  els.liveIndicator.title = lastLiveEventAt
+    ? `last event ${Math.max(0, Math.round((Date.now() - lastLiveEventAt) / 1000))}s ago`
+    : "waiting for events";
 }
 
 function dedupeCards(cards) {
@@ -1030,17 +1141,56 @@ function quickAddRepoOptions() {
   return repos;
 }
 
+let repoComboActive = -1;
+
 function renderQuickAddRepoOptions() {
-  const previous = els.quickAddRepo.value;
+  // Parity with the old <select>: a repo is preselected by default; clearing
+  // the field files repo-less ("no repo · local").
   const repos = quickAddRepoOptions();
-  els.quickAddRepo.innerHTML =
-    repos
-      .map((repo) => '<option value="' + escapeHtml(repo) + '">' + escapeHtml(repo) + '</option>')
-      .join("") +
-    '<option value="">no repo · local</option>';
-  if (previous && [...els.quickAddRepo.options].some((option) => option.value === previous)) {
-    els.quickAddRepo.value = previous;
+  if (!els.quickAddRepo.value && !els.quickAddRepoInput.value && repos.length) {
+    els.quickAddRepo.value = repos[0];
+    els.quickAddRepoInput.value = repos[0];
   }
+  syncRepoCombo(els.quickAddRepoInput.value, false);
+}
+
+// "" is the synthetic "no repo · local" option -- always present so filing
+// without a repo is a clickable/arrow-reachable choice, not a caption the
+// operator has to interpret.
+function repoComboMatches(query) {
+  const q = query.trim().toLowerCase();
+  const repos = quickAddRepoOptions();
+  return ["", ...(q ? repos.filter((repo) => repo.toLowerCase().includes(q)) : repos)];
+}
+
+function syncRepoCombo(query, open) {
+  const matches = repoComboMatches(query);
+  if (repoComboActive >= matches.length) repoComboActive = matches.length - 1;
+  els.quickAddRepoList.innerHTML = matches
+    .map((repo, index) => {
+      const classes = [index === repoComboActive ? "is-active" : "", repo ? "" : "pw-combo-none"]
+        .filter(Boolean)
+        .join(" ");
+      return `<li id="quick-add-repo-opt-${index}" role="option" data-repo="${escapeHtml(repo)}"${index === repoComboActive ? ' aria-selected="true"' : ""}${classes ? ` class="${classes}"` : ""}>${repo ? escapeHtml(repo) : "no repo · local"}</li>`;
+    })
+    .join("");
+  const show = Boolean(open) && matches.length > 0;
+  els.quickAddRepoList.hidden = !show;
+  els.quickAddRepoInput.setAttribute("aria-expanded", show ? "true" : "false");
+  if (show && repoComboActive >= 0) {
+    els.quickAddRepoInput.setAttribute("aria-activedescendant", `quick-add-repo-opt-${repoComboActive}`);
+    els.quickAddRepoList.children[repoComboActive]?.scrollIntoView({ block: "nearest" });
+  } else {
+    els.quickAddRepoInput.removeAttribute("aria-activedescendant");
+  }
+}
+
+function chooseQuickAddRepo(repo) {
+  els.quickAddRepo.value = repo;
+  els.quickAddRepoInput.value = repo;
+  repoComboActive = -1;
+  syncRepoCombo(repo, false);
+  els.quickAddBody.focus();
 }
 
 function showQuickAdd() {
@@ -1144,8 +1294,25 @@ async function createCardFromQuickAdd(form) {
     els.quickAddMessage.textContent = "Add a title or a line of ramble first.";
     return;
   }
-  const repo = els.quickAddRepo.value.trim();
+  // Resolve typed text against the known repositories -- the combobox is an
+  // affordance, not a new-repo minting path. Exact match wins, a unique
+  // substring match autocompletes, anything else blocks the submit.
+  const typed = els.quickAddRepo.value.trim();
+  let repo = "";
+  if (typed) {
+    const repos = quickAddRepoOptions();
+    const lower = typed.toLowerCase();
+    const exact = repos.find((name) => name.toLowerCase() === lower);
+    const matches = repos.filter((name) => name.toLowerCase().includes(lower));
+    if (exact) repo = exact;
+    else if (matches.length === 1) repo = matches[0];
+    else {
+      els.quickAddMessage.textContent = `Unknown repository "${typed}" — pick from the list, or clear the field for no repo.`;
+      return;
+    }
+  }
   const attachments = quickAddFiles.slice();
+  const now = Math.floor(Date.now() / 1000);
   const payload = {
     id: quickAddCardId(repo),
     title,
@@ -1154,7 +1321,19 @@ async function createCardFromQuickAdd(form) {
     status: "backlog",
     ...(repo ? { repo } : {}),
   };
-  els.quickAddMessage.textContent = "Filing...";
+  // Optimistic: the card lands on the board instantly; the POST confirms in
+  // the background and a failure rolls it back with the draft restored.
+  pendingOptimisticIds.add(payload.id);
+  state.cards = [
+    normalizeCard({ ...payload, priority: "p2", created_at: now, updated_at: now }),
+    ...state.cards,
+  ];
+  form.reset();
+  clearQuickAddFiles();
+  hideQuickAdd();
+  els.quickAddMessage.textContent = "";
+  buildFilters();
+  render();
   try {
     await apiJson("/api/v1/cards", {
       method: "POST",
@@ -1162,24 +1341,32 @@ async function createCardFromQuickAdd(form) {
       body: JSON.stringify(payload),
     });
   } catch (err) {
+    pendingOptimisticIds.delete(payload.id);
+    state.cards = state.cards.filter((card) => card.id !== payload.id);
+    buildFilters();
+    render();
+    showQuickAdd();
+    els.quickAddTitle.value = enteredTitle;
+    els.quickAddBody.value = body;
+    els.quickAddRepo.value = repo;
+    els.quickAddRepoInput.value = repo;
+    quickAddFiles = attachments;
+    renderQuickAddAttachments();
     els.quickAddMessage.textContent = "Failed: " + (err.message || err);
     return;
   }
-  form.reset();
-  clearQuickAddFiles();
-  hideQuickAdd();
+  pendingOptimisticIds.delete(payload.id);
   let uploadFailures = [];
   if (attachments.length) {
     uploadFailures = await uploadQuickAddFiles(payload.id, attachments);
   }
-  els.quickAddMessage.textContent = "";
   if (uploadFailures.length) {
     const suffix = uploadFailures.length === 1 ? "image" : "images";
     showToast("Card filed, but " + uploadFailures.length + " " + suffix + " could not be uploaded. Attachments are unavailable on this server.", "warn");
   } else if (attachments.length) {
     showToast(attachments.length + " " + (attachments.length === 1 ? "image" : "images") + " attached.", "ok");
   }
-  await loadBoard();
+  loadBoard({ silent: true });
 }
 
 async function mergeRepositoryAlias(form) {
@@ -1197,7 +1384,7 @@ async function mergeRepositoryAlias(form) {
   });
   form.reset();
   renderAuthState(`Merged ${alias}; re-homed ${result.rehomed_cards || 0} cards.`);
-  await loadBoard();
+  await loadBoard({ silent: true });
 }
 
 async function deleteRepository(name) {
@@ -1205,7 +1392,7 @@ async function deleteRepository(name) {
     method: "DELETE",
   });
   renderAuthState(`Repository ${name} deleted.`);
-  await loadBoard();
+  await loadBoard({ silent: true });
 }
 
 function cleanPriority(priority) {
@@ -1415,12 +1602,16 @@ function render() {
 }
 
 function renderLoading() {
-  const loading = empty("Loading cards from the Powder API.");
+  const loading = '<div class="pw-skel" aria-hidden="true"><i></i><i></i><i></i></div>';
   els.railList.innerHTML = loading;
   els.laneReady.innerHTML = loading;
   els.laneInProgress.innerHTML = loading;
   els.laneDone.innerHTML = loading;
-  renderCounts({ backlog: [], ready: [], blocked: [], inProgress: [], done: [] });
+  // No counts yet -- a blank digit is honest, a "0" is a claim.
+  for (const el of [els.backlogCount, els.readyCount, els.inProgressCount, els.doneCount]) {
+    el.textContent = "";
+  }
+  els.filterN.textContent = "";
 }
 
 function renderFailure() {
@@ -1592,21 +1783,33 @@ function chip(text) {
 }
 
 async function changeCardStatus(cardId, status) {
-  await apiJson(`/api/v1/cards/${encodePath(cardId)}/status`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status }),
-  });
-  await loadCardRoute();
+  // Optimistic: the select already shows the new status; confirm in the
+  // background and reload silently (no detail-page "loading" repaint).
+  // The sequence token keeps a slow older reload from repainting over a
+  // newer selection when the operator changes status rapidly.
+  const seq = ++statusChangeSeq;
+  try {
+    await apiJson(`/api/v1/cards/${encodePath(cardId)}/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+  } catch (err) {
+    if (seq === statusChangeSeq) await loadCardRoute({ silent: true });
+    throw err;
+  }
+  if (seq === statusChangeSeq) await loadCardRoute({ silent: true });
 }
 
-async function loadCardRoute() {
+async function loadCardRoute(options = {}) {
   const cardId = cardRouteId();
   if (!cardId) return;
   document.documentElement.setAttribute("data-pw-route", "card");
   els.detailBoardLink.href = boardRoute();
-  els.detailBody.innerHTML = detailLoading(cardId);
-  updateConnection("loading", "loading");
+  if (!options.silent) {
+    els.detailBody.innerHTML = detailLoading(cardId);
+    updateConnection("loading", "loading");
+  }
   try {
     await loadOnboarding();
     const detail = await apiJson(`/api/v1/cards/${encodePath(cardId)}`);
@@ -2344,6 +2547,48 @@ els.quickAddForm.addEventListener("submit", (event) => {
     els.quickAddMessage.textContent = `Failed: ${err.message || err}`;
   });
 });
+els.quickAddRepoInput?.addEventListener("input", () => {
+  els.quickAddRepo.value = els.quickAddRepoInput.value.trim();
+  repoComboActive = 0;
+  syncRepoCombo(els.quickAddRepoInput.value, true);
+});
+els.quickAddRepoInput?.addEventListener("focus", () => {
+  els.quickAddRepoInput.select();
+  repoComboActive = -1;
+  syncRepoCombo("", true);
+});
+els.quickAddRepoInput?.addEventListener("blur", () => {
+  setTimeout(() => syncRepoCombo(els.quickAddRepoInput.value, false), 120);
+});
+els.quickAddRepoInput?.addEventListener("keydown", (event) => {
+  const items = [...els.quickAddRepoList.querySelectorAll("[data-repo]")];
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    if (els.quickAddRepoList.hidden) {
+      syncRepoCombo(els.quickAddRepoInput.value, true);
+      return;
+    }
+    const delta = event.key === "ArrowDown" ? 1 : -1;
+    repoComboActive = items.length ? (repoComboActive + delta + items.length) % items.length : -1;
+    syncRepoCombo(els.quickAddRepoInput.value, true);
+  } else if (event.key === "Enter") {
+    if (!els.quickAddRepoList.hidden && repoComboActive >= 0 && items[repoComboActive]) {
+      event.preventDefault();
+      chooseQuickAddRepo(items[repoComboActive].dataset.repo);
+    }
+  } else if (event.key === "Escape") {
+    if (!els.quickAddRepoList.hidden) {
+      event.stopPropagation();
+      syncRepoCombo(els.quickAddRepoInput.value, false);
+    }
+  }
+});
+els.quickAddRepoList?.addEventListener("mousedown", (event) => {
+  const item = event.target.closest("[data-repo]");
+  if (!item) return;
+  event.preventDefault();
+  chooseQuickAddRepo(item.dataset.repo);
+});
 els.detailBody.addEventListener("change", (event) => {
   const select = event.target.closest("#detail-status-change");
   if (!select) return;
@@ -2376,6 +2621,9 @@ els.apiKeyForm.addEventListener("submit", (event) => {
   state.apiKey = els.apiKeyInput.value.trim();
   if (state.apiKey) localStorage.setItem(STORAGE_KEY, state.apiKey);
   else localStorage.removeItem(STORAGE_KEY);
+  // A key change changes what this browser is allowed to see -- never let
+  // the old identity's snapshot ghost-paint under the new one.
+  localStorage.removeItem(BOARD_CACHE_KEY);
   renderAuthState();
   loadBoard();
 });
@@ -2383,6 +2631,7 @@ els.clearApiKey.addEventListener("click", () => {
   state.apiKey = "";
   els.apiKeyInput.value = "";
   localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(BOARD_CACHE_KEY);
   renderAuthState();
   loadBoard();
 });
@@ -2507,10 +2756,20 @@ if (cardRouteId()) {
   loadCardRoute();
 } else {
   restoreBoardState();
+  const cached = restoreBoardCache();
   buildFilters();
   setRailShare(railShare);
   setView(state.view);
   placeIndicator();
-  loadBoard();
+  if (cached) {
+    renderRepositorySettings();
+    render();
+    loadBoard({ silent: true });
+  } else {
+    loadBoard();
+  }
   startLiveUpdates();
 }
+// Event recency lives in the indicator's tooltip; recompute it on hover so
+// it never reads stale on a quiet board.
+els.liveIndicator?.addEventListener("mouseenter", renderLiveIndicator);
