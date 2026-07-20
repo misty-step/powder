@@ -44,7 +44,7 @@ cargo run -q -p powder-cli -- create-card --db "$DB" --id powder-repo-example --
 # real elicitation to render and answer against. Deliberately no trailing
 # numeric id segment (`repo_from_numeric_card_id_prefix`, powder-core) --
 # a plain "-NNN" suffix would auto-assign a distinct repo and disturb the
-# "local"-repo sort order the existing board-card-link test's "first card
+# "general"-bucket sort order the existing board-card-link test's "first card
 # is 001" assumption depends on.
 cargo run -q -p powder-cli -- create-card --db "$DB" --id awaiting-answer --title "Needs an operator answer" --acceptance "operator responds" --status ready >/dev/null
 AWAITING_CLAIM="$(cargo run -q -p powder-cli -- claim awaiting-answer --db "$DB" --agent law-gate-agent --ttl 3600)"
