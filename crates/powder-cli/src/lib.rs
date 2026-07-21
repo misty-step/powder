@@ -2074,14 +2074,49 @@ mod tests {
     /// before a lane starts (powder-924): it must report the exact commit
     /// this build compiled from, not just an unchanging crate version that
     /// has sat at 0.1.0 since inception.
+    ///
+    /// Pins remote env explicitly (powder-cli-version-test-hermeticity):
+    /// `run()` reads real process env, so on a workstation with
+    /// `POWDER_API_BASE_URL` set this would make live /readyz calls and
+    /// flake on a server restart. Using `run_with_env` + `remote_env(None,
+    /// None)` keeps this assertion hermetic regardless of workstation env.
     #[test]
     fn cli_version_reports_the_build_commit() {
-        let output = run(&args(["version"])).unwrap();
+        let env = remote_env(None, None);
+        let output = run_with_env(&args(["version"]), &env).unwrap();
         assert!(output.starts_with("powder 0.1.0 (git "));
         assert!(!output.contains("(git )"), "must not embed an empty sha");
 
-        assert_eq!(run(&args(["--version"])).unwrap(), output);
-        assert_eq!(run(&args(["-v"])).unwrap(), output);
+        assert_eq!(run_with_env(&args(["--version"]), &env).unwrap(), output);
+        assert_eq!(run_with_env(&args(["-v"]), &env).unwrap(), output);
+    }
+
+    /// Alias equivalence must also hold when a remote is configured and
+    /// `version` queries /readyz for drift comparison, not just on the
+    /// offline path above -- exercised against a local test server so it
+    /// stays hermetic (powder-cli-version-test-hermeticity).
+    #[test]
+    fn cli_version_alias_equivalence_with_configured_remote() {
+        let local_sha = env!("POWDER_CLI_GIT_SHA");
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"ok": true, "version": "0.1.0", "git_sha": local_sha}),
+            ),
+            (
+                200,
+                json!({"ok": true, "version": "0.1.0", "git_sha": local_sha}),
+            ),
+            (
+                200,
+                json!({"ok": true, "version": "0.1.0", "git_sha": local_sha}),
+            ),
+        ]);
+        let env = remote_env(Some(&base_url), None);
+
+        let output = run_with_env(&args(["version"]), &env).unwrap();
+        assert_eq!(run_with_env(&args(["--version"]), &env).unwrap(), output);
+        assert_eq!(run_with_env(&args(["-v"]), &env).unwrap(), output);
     }
 
     /// powder-workstation-cli-convergence: no `POWDER_API_BASE_URL`

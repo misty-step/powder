@@ -1826,6 +1826,137 @@ mod tests {
         ))
     }
 
+    /// The regression powder-key-reresolve-per-epoch pins: a re-resolve is
+    /// not a single-shot budget spent once for the life of the process --
+    /// each 401 is its own epoch, and `key_cmd` re-runs again on a second,
+    /// unrelated rotation later in the same long-lived `RemoteClient`.
+    #[test]
+    fn a_second_key_rotation_later_in_the_process_also_self_heals() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (401, json!({"error": "invalid bearer token"})),
+            (
+                200,
+                json!({"cards": [], "total_count": 0, "has_more": false}),
+            ),
+            (401, json!({"error": "invalid bearer token"})),
+            (
+                200,
+                json!({"cards": [], "total_count": 0, "has_more": false}),
+            ),
+        ]);
+        let counter_path = unique_counter_path("two-rotations");
+        let key_cmd = sequential_key_cmd(
+            &counter_path,
+            &["sk_powder_boot", "sk_powder_r1", "sk_powder_r2"],
+        );
+        let client = RemoteClient::new_with_key_cmd(base_url, None, Some(key_cmd));
+
+        // Rotation 1.
+        let r1 = call_tool_remote(&client, "list_ready", &json!({})).unwrap();
+        assert_eq!(tool_payload(&r1)["total_count"], 0);
+
+        // Rotation 2: a later, separate dispatch call in the same process.
+        // If the re-resolve budget were spent by rotation 1, this call
+        // would still be sending `sk_powder_r1` and would strand here.
+        let r2 = call_tool_remote(&client, "list_ready", &json!({})).unwrap();
+        assert_eq!(tool_payload(&r2)["total_count"], 0);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_boot")
+        );
+        assert_eq!(
+            requests[1].authorization.as_deref(),
+            Some("Bearer sk_powder_r1")
+        );
+        assert_eq!(
+            requests[2].authorization.as_deref(),
+            Some("Bearer sk_powder_r1")
+        );
+        assert_eq!(
+            requests[3].authorization.as_deref(),
+            Some("Bearer sk_powder_r2")
+        );
+        let _ = std::fs::remove_file(&counter_path);
+    }
+
+    /// A transient `key_cmd` failure (locked keychain, momentarily
+    /// unreachable secrets manager) on one 401's retry attempt must not
+    /// spend a budget that later 401s depend on -- the next epoch gets its
+    /// own fresh attempt once the resolver is healthy again.
+    #[test]
+    fn a_transient_key_cmd_failure_does_not_spend_the_budget_for_a_later_rotation() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (401, json!({"error": "invalid bearer token"})),
+            (401, json!({"error": "invalid bearer token"})),
+            (
+                200,
+                json!({"cards": [], "total_count": 0, "has_more": false}),
+            ),
+        ]);
+        let counter_path = unique_counter_path("transient-then-recover");
+        // Invocation 1 (boot) succeeds; invocation 2 (the first 401's retry
+        // attempt) fails transiently (non-zero exit, no key printed);
+        // invocation 3+ (a later 401) succeeds with a fresh key.
+        let key_cmd = format!(
+            "n=$(( $(cat '{path}' 2>/dev/null || echo 0) + 1 )); printf '%s' \"$n\" > '{path}';              case $n in 1) printf '%s' sk_powder_boot;; 2) exit 1;; *) printf '%s' sk_powder_new;; esac",
+            path = counter_path.display()
+        );
+        let client = RemoteClient::new_with_key_cmd(base_url, None, Some(key_cmd));
+
+        // Call 1: 401, key_cmd transiently fails so no retry is attempted;
+        // the caller sees the plain diagnosable 401 for this epoch.
+        let err = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+        assert!(err.contains("http 401"));
+
+        // Call 2: a later, separate dispatch call hits 401 again; key_cmd
+        // is healthy again and this epoch must self-heal even though the
+        // previous epoch's retry attempt failed.
+        let ok = call_tool_remote(&client, "list_ready", &json!({})).unwrap();
+        assert_eq!(tool_payload(&ok)["total_count"], 0);
+
+        assert_eq!(recorded.lock().unwrap().len(), 3);
+        let _ = std::fs::remove_file(&counter_path);
+    }
+
+    /// Dedupe holds for a genuinely revoked deployment: when `key_cmd`
+    /// keeps resolving the exact same (already-failing) key -- no rotation
+    /// actually happened -- each 401 costs exactly one extra `key_cmd`
+    /// invocation and one extra HTTP round trip is never sent, not a
+    /// retry loop, across any number of separate calls.
+    #[test]
+    fn a_revoked_deployment_produces_bounded_key_cmd_invocations_not_a_retry_loop() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (401, json!({"error": "invalid bearer token"})),
+            (401, json!({"error": "invalid bearer token"})),
+        ]);
+        let counter_path = unique_counter_path("revoked");
+        let key_cmd = format!(
+            "n=$(( $(cat '{path}' 2>/dev/null || echo 0) + 1 )); printf '%s' \"$n\" > '{path}';              printf '%s' sk_powder_revoked",
+            path = counter_path.display()
+        );
+        let client = RemoteClient::new_with_key_cmd(base_url, None, Some(key_cmd));
+
+        let first = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+        let second = call_tool_remote(&client, "list_ready", &json!({})).unwrap_err();
+
+        assert!(first.contains("key may have been rotated"));
+        assert!(second.contains("key may have been rotated"));
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            2,
+            "an unchanging key_cmd result must never trigger a retry HTTP call"
+        );
+        let calls = std::fs::read_to_string(&counter_path).unwrap();
+        assert_eq!(
+            calls, "3",
+            "boot (1) + one resolve per 401 epoch (2) -- bounded, not a loop"
+        );
+        let _ = std::fs::remove_file(&counter_path);
+    }
+
     #[test]
     fn key_cmd_is_resolved_exactly_once_at_boot() {
         let counter_path = unique_counter_path("boot");
