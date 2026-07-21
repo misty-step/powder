@@ -1,11 +1,91 @@
 /*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */
 @layer theme {
   :root, :host {
+    --font-sans: "Geist", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --text-xs: 12px;
+    --text-sm: 13px;
+    --text-base: 14px;
+    --text-lg: 16px;
+    --text-xl: 18px;
+    --text-2xl: 22px;
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --text-md: 15px;
+    --radius-0: 0;
+    --color-surface: #fafaf9;
+    --color-surface-raised: #f4f4f2;
+    --color-surface-sunken: #efeeec;
+    --color-ink: #1c1c1a;
+    --color-muted: #6b6b67;
+    --color-faint: #9c9c97;
+    --color-line: #e7e6e2;
+    --color-accent: #4a4a8f;
+    --color-accent-ink: #fafaf9;
+    --color-danger: #a84138;
+    --color-ok: #15714b;
+    --color-warn: #8a5f32;
+    --pw-space-0: 0;
+    --pw-space-1: 2px;
+    --pw-space-2: 4px;
+    --pw-space-3: 8px;
+    --pw-space-4: 12px;
+    --pw-space-5: 16px;
+    --pw-space-6: 24px;
+    --pw-space-7: 32px;
+    --pw-space-8: 48px;
+    --pw-weight-regular: 400;
+    --pw-weight-medium: 500;
+    --pw-weight-semibold: 600;
+    --pw-ease: cubic-bezier(.23, 1, .32, 1);
+    --pw-quick: .16s;
+    --pw-soft: .24s;
+    --pw-measure-form: 32rem;
+    --pw-shadow-1: 0 1px 2px #0000000a;
+    --pw-shadow-pop: 0 6px 18px #0000001f;
+    --pw-line-width: 1px;
+    --pw-touch-target: 44px;
+    --pw-focus-width: 2px;
+    --pw-focus-offset: 2px;
+    --pw-focus-color: var(--color-ink);
     --font-display: "Geist", sans-serif;
   }
 }
 
 @layer utilities;
+
+:root.dark, :root[data-ae-mode="dark"] {
+  --color-surface: #161616;
+  --color-surface-raised: #1c1c1c;
+  --color-surface-sunken: #121212;
+  --color-ink: #ededec;
+  --color-muted: #909090;
+  --color-faint: #5e5e5e;
+  --color-line: #282828;
+  --color-accent: #9aa6ff;
+  --color-accent-ink: #161616;
+  --color-danger: #e58379;
+  --color-ok: #6fd2a8;
+  --color-warn: #c49d72;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light):not([data-ae-mode="light"]) {
+    --color-surface: #161616;
+    --color-surface-raised: #1c1c1c;
+    --color-surface-sunken: #121212;
+    --color-ink: #ededec;
+    --color-muted: #909090;
+    --color-faint: #5e5e5e;
+    --color-line: #282828;
+    --color-accent: #9aa6ff;
+    --color-accent-ink: #161616;
+    --color-danger: #e58379;
+    --color-ok: #6fd2a8;
+    --color-warn: #c49d72;
+  }
+}
 
 :root {
   --ae-accent: #2643d0;
@@ -333,20 +413,28 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
 }
 
 .pw-quick-add {
-  border-bottom: 1px solid var(--ae-line);
-  background: var(--ae-wash);
+  padding: var(--pw-space-4) var(--pw-space-6);
+  border-bottom: var(--pw-line-width) solid var(--color-line);
+  background: var(--color-surface-raised);
   flex: none;
-  padding: .8em 2em;
 }
 
 .pw-quick-add[hidden] {
   display: none;
 }
 
+.pw-quick-add-title {
+  font-size: var(--text-lg);
+  font-weight: var(--pw-weight-semibold);
+  color: var(--color-ink);
+  letter-spacing: .01em;
+  margin: 0;
+}
+
 .pw-quick-add-form {
+  gap: var(--pw-space-3);
+  max-width: var(--pw-measure-form);
   flex-direction: column;
-  gap: .8em;
-  max-width: 32rem;
   display: flex;
 }
 
@@ -354,9 +442,74 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
   display: block;
 }
 
+.pw-quick-add-form .ae-chrome {
+  margin-bottom: var(--pw-space-1);
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--pw-weight-medium);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  display: block;
+}
+
+.pw-quick-add-form .pw-optional {
+  margin-left: var(--pw-space-2);
+  color: var(--color-faint);
+  font-weight: var(--pw-weight-regular);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.pw-quick-add-form .ae-input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: var(--pw-space-2) var(--pw-space-3);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface-sunken);
+  color: var(--color-ink);
+  font: inherit;
+  font-size: var(--text-base);
+  transition: border-color var(--pw-quick) var(--pw-ease);
+}
+
+.pw-quick-add-form .ae-input::placeholder {
+  color: var(--color-faint);
+}
+
+.pw-quick-add-form .ae-input:focus-visible {
+  border-color: var(--color-ink);
+  box-shadow: 0 0 0 var(--pw-focus-width) var(--color-line);
+  outline: none;
+}
+
 .pw-quick-add-actions {
-  gap: .8em;
+  gap: var(--pw-space-3);
+  margin-top: var(--pw-space-1);
   display: flex;
+}
+
+.pw-quick-add-actions .ae-button {
+  border-radius: var(--radius-0);
+  font-size: var(--text-sm);
+  font-weight: var(--pw-weight-medium);
+  padding: var(--pw-space-2) var(--pw-space-5);
+}
+
+.pw-quick-add-actions .ae-button:not(.ae-button-quiet) {
+  background: var(--color-ink);
+  color: var(--color-accent-ink);
+  border-color: var(--color-ink);
+}
+
+.pw-quick-add-actions .ae-button-quiet {
+  color: var(--color-ink);
+  border-color: var(--color-line);
+  background: none;
+}
+
+.pw-quick-add-actions .ae-button-quiet:hover {
+  background: var(--color-surface-sunken);
 }
 
 .pw-status-change {
@@ -1092,29 +1245,30 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
 }
 
 .pw-combo-list {
-  z-index: 30;
-  background: var(--ae-surface);
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius, 4px);
   inset-inline: 0;
+  top: calc(100% + var(--pw-space-1));
+  z-index: 30;
+  padding: var(--pw-space-1) 0;
+  background: var(--color-surface);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
   max-height: 14em;
+  box-shadow: var(--pw-shadow-pop);
   margin: 0;
-  padding: .25em 0;
   list-style: none;
   position: absolute;
-  top: calc(100% + 2px);
   overflow-y: auto;
-  box-shadow: 0 6px 18px #0000001f;
 }
 
 .pw-combo-list li {
+  padding: var(--pw-space-2) var(--pw-space-3);
+  font-size: var(--text-sm);
+  color: var(--color-ink);
   cursor: pointer;
-  padding: .55em .7em;
-  font-size: 13px;
 }
 
 .pw-combo-list li.pw-combo-none {
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   font-style: italic;
 }
 
@@ -1122,13 +1276,42 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
   width: 100%;
 }
 
-.pw-combo-field input {
-  flex: auto;
+.pw-quick-add-form .pw-combo-field {
+  align-items: center;
+  gap: var(--pw-space-2);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface-sunken);
+  padding: var(--pw-space-1) var(--pw-space-3);
+  color: var(--color-ink);
+  display: inline-flex;
+}
+
+.pw-quick-add-form .pw-combo-field .ae-icon {
+  color: var(--color-faint);
+}
+
+.pw-quick-add-form .pw-combo-field input {
   width: auto;
+  font: inherit;
+  font-size: var(--text-base);
+  color: var(--color-ink);
+  background: none;
+  border: 0;
+  flex: auto;
+}
+
+.pw-quick-add-form .pw-combo-field input::placeholder {
+  color: var(--color-faint);
+}
+
+.pw-quick-add-form .pw-combo-field:focus-within {
+  border-color: var(--color-ink);
+  box-shadow: 0 0 0 var(--pw-focus-width) var(--color-line);
 }
 
 .pw-combo-list li.is-active, .pw-combo-list li:hover {
-  background: var(--ae-wash);
+  background: var(--color-surface-sunken);
 }
 
 .pw-skel {
@@ -1470,37 +1653,38 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
 }
 
 .pw-quick-add-attach {
+  gap: var(--pw-space-1);
   flex-direction: column;
-  gap: .35rem;
   display: flex;
 }
 
 .pw-quick-add-attach input {
   box-sizing: border-box;
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
-  background: var(--ae-surface);
   width: 100%;
-  color: var(--ae-ink);
+  padding: var(--pw-space-2) var(--pw-space-3);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface-sunken);
+  color: var(--color-ink);
   font: inherit;
-  padding: .45rem .55rem;
+  font-size: var(--text-base);
 }
 
 .pw-quick-add-attachment-list {
-  color: var(--ae-ink-muted);
+  gap: var(--pw-space-1) var(--pw-space-3);
+  color: var(--color-muted);
+  font-size: var(--text-xs);
   flex-wrap: wrap;
-  gap: .35rem .7rem;
   margin: 0;
   padding: 0;
-  font-size: 12px;
   list-style: none;
   display: flex;
 }
 
 .pw-quick-add-attachment-list li {
-  overflow-wrap: anywhere;
   align-items: baseline;
-  gap: .4rem;
+  gap: var(--pw-space-1);
+  overflow-wrap: anywhere;
   max-width: 100%;
   display: inline-flex;
 }
@@ -1592,7 +1776,7 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
   }
 
   .pw-quick-add-form .ae-input, .pw-quick-add-actions button, .pw-quick-add-attach input {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-board {

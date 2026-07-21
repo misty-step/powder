@@ -26,10 +26,12 @@
    detection. */
 @import "tailwindcss/theme.css" layer(theme) source(none);
 @import "tailwindcss/utilities.css" layer(utilities) source(none);
+@import "./tokens.css";
 
-/* --font-display names the Geist family index.html already loads via
-   Google Fonts, ready for the shadcn-replatform epic's utility classes to
-   reference. */
+/* --font-display is retained as a backwards-compatible alias for the
+   Geist family index.html already loads via Google Fonts; the canonical
+   sans family now lives in tokens.css as --font-sans (powder-ui-tone-down-
+   tokens). The shadcn-replatform primitives reference --font-sans. */
 @theme static {
   --font-display: "Geist", sans-serif;
 }
