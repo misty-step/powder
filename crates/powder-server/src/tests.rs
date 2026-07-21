@@ -322,6 +322,61 @@ async fn create_card_rejects_unknown_fields_by_name() {
 }
 
 #[tokio::test]
+async fn create_card_rejects_invalid_enum_fields_with_canonical_messages() {
+    // Seam contract (PR #165 / F1): invalid priority on the HTTP face 400s with
+    // the canonical message instead of silently defaulting to P2; estimate and
+    // risk follow the same seam.
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    for (body, expected) in [
+        (
+            r#"{"id":"invalid-priority-card","title":"Filed from API","acceptance":["proof"],"priority":"urgent"}"#,
+            r#"invalid priority "urgent"; valid: P0|P1|P2|P3"#,
+        ),
+        (
+            r#"{"id":"invalid-estimate-card","title":"Filed from API","acceptance":["proof"],"estimate":"huge"}"#,
+            r#"invalid estimate "huge"; valid: S|M|L|XL"#,
+        ),
+        (
+            r#"{"id":"invalid-risk-card","title":"Filed from API","acceptance":["proof"],"risk":"extreme"}"#,
+            r#"invalid risk "extreme"; valid: low|medium|high"#,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&raw_key),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert_eq!(
+            payload["error"].as_str().unwrap(),
+            expected,
+            "canonical seam message mismatch"
+        );
+    }
+
+    // None of the rejected creates may have persisted a card.
+    let listed = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?limit=100",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    let listed = response_json(listed).await;
+    assert_eq!(listed["cards"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn create_card_rejects_repo_conflicting_with_numeric_id_prefix() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
