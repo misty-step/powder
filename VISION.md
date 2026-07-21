@@ -29,6 +29,12 @@ Agent work needs durable coordination primitives:
 - a run timeline that survives handoff, crash, and compaction
 - proof links, completion records, and audit events a human can inspect
 - an explicit awaiting-input state instead of invented approvals
+- structured run telemetry — agents, models, token counts, estimated cost,
+  outcomes — so ticket work doubles as evaluation data
+- attached session history at each lifecycle step, hidden by default, for
+  forensics, debugging, and agent-composition optimization
+- a pile-first intake path: raw fodder lands repo-less by default and is
+  shaped later through explicit, audited resolutions
 
 Hosted task tools can store tickets, but they usually treat agents as API
 clients bolted onto a human workflow. Orchestrators can remember their own
@@ -88,6 +94,12 @@ raw per-ticket browsing one click away, not the landing page. Agents keep
 raw, full-fidelity access through the API/CLI/MCP contract regardless of
 what the human default renders (operator ruling, 2026-07-17: see
 `powder-epic-first-human-board`).
+At every scale the human face gains a durable answer loop (operator ruling,
+2026-07-21): a question asked on any surface becomes an audited request
+record, and an external worker writes back a cited answer — with principal,
+worker label, model, cost, and duration — through the same deterministic
+interfaces agents use. Answers accrete as inspectable rows; Powder still
+never calls a model.
 
 **Instance data stays in instances.** The public repo may contain Powder's own
 product-development epics, synthetic fixtures, and sample config. Imported or
@@ -138,7 +150,7 @@ yet trustworthy enough for a fleet to depend on:
   audit trail or minting a key per persona.
 - `powder-cli` can initialize an instance database, create cards, list ready
   work, claim, transition, and complete cards.
-- `powder-mcp` exposes the full agent toolset (20 default tools plus a
+- `powder-mcp` exposes the full agent toolset (21 default tools plus a
   9-tool admin add-on gated by `POWDER_MCP_TOOLSETS`) over stdio using the
   same domain model; it uses SQLite when `POWDER_DB_PATH` is set, or a
   deployed instance over HTTP when `POWDER_API_BASE_URL`/`POWDER_API_KEY`
@@ -147,7 +159,8 @@ yet trustworthy enough for a fleet to depend on:
 - `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
   first-run onboarding state, API-key auth, and tailnet/none modes.
 - Docker, systemd, Litestream, and env examples follow the Canary-style
-  self-hosted deployment pattern (Fly kept only as a self-hoster reference).
+  self-hosted deployment pattern; a hosted-platform example survives only as
+  the self-hoster reference in `docs/self-hosting.md`.
 
 The important remaining gaps are not polish. The audit trail needs to stay
 consistent across SQLite, HTTP, CLI, MCP, and the Kanban board; relations and
@@ -179,6 +192,10 @@ safely ask:
 
 Humans inspect the same state agents use. Each run and card change leaves a
 durable trail.
+Terminal history compresses into compact summaries by default while full
+events and proof stay retrievable. Run telemetry makes cost and
+effectiveness per agent and per model queryable, so the board doubles as
+the fleet's evaluation dataset.
 Private backlog data stays in the deployment that owns it. External workers can
 make intelligent judgments, but Powder remains the boring source of truth for
 what work exists, who holds it, what happened, and what proof settled it.

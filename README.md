@@ -74,9 +74,11 @@ curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
   -d '{"agent":"me"}'
 ```
 
-In `api-key` mode, read routes require a valid bearer key by default. Set
-`POWDER_PUBLIC_READS=true` only when the listener is on a genuinely private
-perimeter (e.g. internal Tailscale ingress). See
+Production runs one Rust service (`powder-server`) on a DigitalOcean droplet.
+SQLite lives at `/data` on a host volume with WAL enabled. Litestream
+replication is optional, and ingress is through the tailnet. In `api-key` mode,
+read routes require a valid bearer key by default; set `POWDER_PUBLIC_READS=true`
+only on a genuinely private tailnet perimeter. See
 [`docs/operations.md`](docs/operations.md) for the full read-auth posture and
 rollout runbook.
 
@@ -112,9 +114,11 @@ silently drift from what's in this README.
 
 - [Marketing site](https://misty-step.github.io/powder/) — screenshots and a
   feature tour.
-- [Self-hosting](docs/self-hosting.md) — the copy-pasteable deploy guide:
-  Docker/binary/systemd (plus a Fly reference), the full env-var reference, webhooks, and
-  backup/restore.
+- [Self-hosting](docs/self-hosting.md) — the copy-pasteable deploy guide for
+  Docker, binary, and systemd installs, plus the full env-var reference, webhooks,
+  and backup/restore. Production runs one Rust service on a DigitalOcean droplet
+  with SQLite at `/data` on a host volume; WAL is enabled, Litestream is optional,
+  and ingress is through the tailnet.
 - [Operations](docs/operations.md) — auth modes, key rotation, remote-mode
   CLI/MCP transport, and production runbook lore.
 - [MCP contract](SKILL.md) — the shipped agent-facing usage contract.
