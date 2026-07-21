@@ -1715,6 +1715,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
     flex-wrap: wrap;
   }
 
+  .pw-quick-add-form .ae-input {
+    min-height: 44px;
+  }
+
   .pw-quick-add-actions button,
   .pw-quick-add-attach input {
     min-height: 44px;
