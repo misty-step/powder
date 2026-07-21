@@ -2900,6 +2900,18 @@ mod tests {
         assert_eq!(repository["name"], "canary");
         assert_eq!(repository["import_provenance"], "manual");
 
+        // Repository rows are explicit-only (powder-repo-registry-tightness):
+        // register "legacy-canary" itself before filing a card under it, so
+        // the merge-alias step below has a real (if soon-to-be-merged) row
+        // to rehome rather than an implicitly auto-created one.
+        call_tool_store(
+            &mut store,
+            "upsert_repository",
+            &json!({"name": "legacy-canary"}),
+            11,
+        )
+        .unwrap();
+
         store
             .import_cards(vec![seeded_card("legacy", "Legacy", CardStatus::Ready, 11)])
             .unwrap();
