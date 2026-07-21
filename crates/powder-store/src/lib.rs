@@ -48,6 +48,7 @@ use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
     MIGRATE_12_TO_13, MIGRATE_13_TO_14, MIGRATE_14_TO_15, MIGRATE_15_TO_16, MIGRATE_2_TO_3,
     MIGRATE_5_TO_6, MIGRATE_6_TO_7, MIGRATE_7_TO_8, MIGRATE_9_TO_10, RUN_SELECT_SQL, SCHEMA,
+    SEARCH_SCHEMA,
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -80,6 +81,18 @@ pub enum StoreError {
 pub struct Store {
     connection: Connection,
     field_note_config: Option<FieldNoteConfig>,
+}
+
+/// One ranked result from the store-owned FTS5 index. The raw `rank` is
+/// SQLite `bm25` output; lower values rank ahead of higher values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchMatch {
+    pub source_table: String,
+    pub source_field: String,
+    pub card_id: CardId,
+    pub created_at: i64,
+    pub snippet: String,
+    pub rank: f64,
 }
 
 /// Validates every schema-v17 key-to-actor mapping before the migration can
@@ -439,6 +452,7 @@ impl Store {
             let next = match current {
                 0 => {
                     self.connection.execute_batch(SCHEMA)?;
+                    self.connection.execute_batch(SEARCH_SCHEMA)?;
                     self.apply_ratified_repository_tier_seed()?;
                     SCHEMA_VERSION
                 }
@@ -528,11 +542,51 @@ impl Store {
                     self.migrate_21_to_22()?;
                     22
                 }
+                22 => {
+                    self.migrate_22_to_23()?;
+                    23
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
                 .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
+    }
+
+    /// Searches card titles/bodies/criteria, comment bodies, and work-log
+    /// bodies. Query text is treated as a literal FTS phrase so identifiers
+    /// such as `powder-query-fts-store` and `SQLITE_BUSY` keep
+    /// their punctuation and cannot become FTS operators.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchMatch>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 || !self.table_exists("card_search_fts")? {
+            return Ok(Vec::new());
+        }
+        let match_query = format!("\"{}\"", query.replace('\"', "\"\""));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            "SELECT source_table, source_field, card_id, created_at,
+                    snippet(card_search_fts, 5, '<b>', '</b>', '…', 32),
+                    bm25(card_search_fts)
+             FROM card_search_fts
+             WHERE card_search_fts MATCH ?1
+             ORDER BY bm25(card_search_fts), source_table, source_field, card_id
+             LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![match_query, limit])?;
+        let mut matches = Vec::new();
+        while let Some(row) = rows.next()? {
+            let card_id = CardId::new(row.get::<_, String>(2)?)?;
+            matches.push(SearchMatch {
+                source_table: row.get(0)?,
+                source_field: row.get(1)?,
+                card_id,
+                created_at: row.get(3)?,
+                snippet: row.get(4)?,
+                rank: row.get(5)?,
+            });
+        }
+        Ok(matches)
     }
 
     /// powder-epic-truthful-ops: steps 1-10 originally ran their DDL
@@ -1209,6 +1263,52 @@ impl Store {
             self.connection
                 .execute_batch("ALTER TABLE cards ADD COLUMN risk TEXT;")?;
         }
+        Ok(())
+    }
+
+    /// Creates and backfills the external-content FTS5 index. Every source
+    /// row is copied through the same trigger-maintained search spine used by
+    /// live writes, so retrying after a crash can only replace the same
+    /// source-keyed documents and rebuild the derived index from source truth.
+    fn migrate_22_to_23(&mut self) -> Result<()> {
+        // A few unit fixtures intentionally carry only the table needed by an
+        // earlier migration. They are not searchable databases, so leave them
+        // untouched rather than creating triggers against absent source tables.
+        for table in ["cards", "comments", "work_log_entries"] {
+            if !self.table_exists(table)? {
+                return Ok(());
+            }
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SEARCH_SCHEMA)?;
+        transaction.execute_batch(
+            "INSERT OR REPLACE INTO search_documents
+               (source_table, source_field, source_id, created_at, card_id, content)
+             SELECT 'cards', 'title', id, created_at, id, title FROM cards
+             UNION ALL
+             SELECT 'cards', 'body', id, created_at, id, body FROM cards
+             UNION ALL
+             SELECT 'cards', 'criteria', id, created_at, id,
+                    COALESCE(
+                      NULLIF((SELECT group_concat(json_extract(value, '$.text'), ' ')
+                        FROM json_each(cards.criteria_json)
+                        WHERE json_type(value, '$.text') = 'text'), ''),
+                      (SELECT group_concat(value, ' ') FROM json_each(cards.acceptance_json)),
+                      '')
+             FROM cards
+             UNION ALL
+             SELECT 'comments', 'body', id, created_at, card_id, body FROM comments
+             UNION ALL
+             SELECT 'work_log_entries', 'body', id, created_at, card_id, body
+             FROM work_log_entries;",
+        )?;
+        transaction.execute(
+            "INSERT INTO card_search_fts(card_search_fts) VALUES ('rebuild')",
+            [],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
