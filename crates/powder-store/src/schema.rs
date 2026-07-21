@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -211,6 +211,112 @@ CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_del
 // column existence would skip the backfill forever after a crash between the
 // ALTER and the backfill. See that function's doc comment for the
 // three-phase, per-effect idempotency it needs instead.
+
+/// External-content FTS5 schema. The ordinary tables remain the source of truth;
+/// triggers keep this derived search spine synchronized in the same transaction
+/// as every source write, including direct SQL writers and migration fixtures.
+pub const SEARCH_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS search_documents (
+  doc_id INTEGER PRIMARY KEY,
+  source_table TEXT NOT NULL,
+  source_field TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  UNIQUE(source_table, source_field, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_search_documents_card ON search_documents(card_id, source_table, source_field, source_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS card_search_fts USING fts5(
+  source_table UNINDEXED,
+  source_field UNINDEXED,
+  source_id UNINDEXED,
+  created_at UNINDEXED,
+  card_id,
+  content,
+  content='search_documents',
+  content_rowid='doc_id',
+  tokenize = 'unicode61 tokenchars ''-_'''
+);
+
+CREATE TRIGGER IF NOT EXISTS search_documents_ai AFTER INSERT ON search_documents BEGIN
+  INSERT INTO card_search_fts(rowid, source_table, source_field, source_id, created_at, card_id, content)
+  VALUES (new.doc_id, new.source_table, new.source_field, new.source_id, new.created_at, new.card_id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS search_documents_ad AFTER DELETE ON search_documents BEGIN
+  INSERT INTO card_search_fts(card_search_fts, rowid, source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('delete', old.doc_id, old.source_table, old.source_field, old.source_id, old.created_at, old.card_id, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS search_documents_au AFTER UPDATE ON search_documents BEGIN
+  INSERT INTO card_search_fts(card_search_fts, rowid, source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('delete', old.doc_id, old.source_table, old.source_field, old.source_id, old.created_at, old.card_id, old.content);
+  INSERT INTO card_search_fts(rowid, source_table, source_field, source_id, created_at, card_id, content)
+  VALUES (new.doc_id, new.source_table, new.source_field, new.source_id, new.created_at, new.card_id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS cards_search_ai AFTER INSERT ON cards BEGIN
+  DELETE FROM search_documents WHERE source_table = 'cards' AND source_id = new.id;
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('cards', 'title', new.id, new.created_at, new.id, new.title);
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('cards', 'body', new.id, new.created_at, new.id, new.body);
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('cards', 'criteria', new.id, new.created_at, new.id,
+    COALESCE(
+      NULLIF((SELECT group_concat(json_extract(value, '$.text'), ' ')
+        FROM json_each(new.criteria_json)
+        WHERE json_type(value, '$.text') = 'text'), ''),
+      (SELECT group_concat(value, ' ') FROM json_each(new.acceptance_json)),
+      ''));
+END;
+CREATE TRIGGER IF NOT EXISTS cards_search_au AFTER UPDATE OF id, title, body, criteria_json, acceptance_json, created_at ON cards BEGIN
+  DELETE FROM search_documents WHERE source_table = 'cards' AND source_id = old.id;
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('cards', 'title', new.id, new.created_at, new.id, new.title);
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('cards', 'body', new.id, new.created_at, new.id, new.body);
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('cards', 'criteria', new.id, new.created_at, new.id,
+    COALESCE(
+      NULLIF((SELECT group_concat(json_extract(value, '$.text'), ' ')
+        FROM json_each(new.criteria_json)
+        WHERE json_type(value, '$.text') = 'text'), ''),
+      (SELECT group_concat(value, ' ') FROM json_each(new.acceptance_json)),
+      ''));
+END;
+CREATE TRIGGER IF NOT EXISTS cards_search_ad AFTER DELETE ON cards BEGIN
+  DELETE FROM search_documents WHERE source_table = 'cards' AND source_id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_search_ai AFTER INSERT ON comments BEGIN
+  DELETE FROM search_documents WHERE source_table = 'comments' AND source_id = new.id;
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('comments', 'body', new.id, new.created_at, new.card_id, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS comments_search_au AFTER UPDATE OF id, card_id, body, created_at ON comments BEGIN
+  DELETE FROM search_documents WHERE source_table = 'comments' AND source_id = old.id;
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('comments', 'body', new.id, new.created_at, new.card_id, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS comments_search_ad AFTER DELETE ON comments BEGIN
+  DELETE FROM search_documents WHERE source_table = 'comments' AND source_id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS work_log_search_ai AFTER INSERT ON work_log_entries BEGIN
+  DELETE FROM search_documents WHERE source_table = 'work_log_entries' AND source_id = new.id;
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('work_log_entries', 'body', new.id, new.created_at, new.card_id, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS work_log_search_au AFTER UPDATE OF id, card_id, body, created_at ON work_log_entries BEGIN
+  DELETE FROM search_documents WHERE source_table = 'work_log_entries' AND source_id = old.id;
+  INSERT INTO search_documents(source_table, source_field, source_id, created_at, card_id, content)
+  VALUES ('work_log_entries', 'body', new.id, new.created_at, new.card_id, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS work_log_search_ad AFTER DELETE ON work_log_entries BEGIN
+  DELETE FROM search_documents WHERE source_table = 'work_log_entries' AND source_id = old.id;
+END;
+"#;
 
 /// Existing keys were bcrypt-hashed; tag them explicitly so `verify_api_key`
 /// keeps using bcrypt for them (they never break) while every newly created

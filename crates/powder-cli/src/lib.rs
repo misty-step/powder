@@ -2,8 +2,9 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    Authority, Card, CardId, CardStatus, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyQuery, Risk, RunId,
+    normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
+    parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
+    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyQuery, Risk, RunId,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
@@ -620,10 +621,11 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     // real oracle exists.
     // --acceptance is repeatable: every occurrence contributes one criterion,
     // in order. A single occurrence keeps its historical behavior.
-    let acceptance: Vec<String> = flag_values(args, "--acceptance")
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let acceptance = normalize_acceptance(
+        flag_values(args, "--acceptance")
+            .into_iter()
+            .map(str::to_string),
+    );
     let proof_plan: Vec<String> = flag_value(args, "--proof-plan")
         .map(|value| vec![value.to_string()])
         .unwrap_or_default();
@@ -632,7 +634,8 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .transpose()?
         .unwrap_or_else(|| CardStatus::default_for_acceptance(&acceptance));
     let priority = flag_value(args, "--priority")
-        .and_then(Priority::parse)
+        .map(parse_priority_flag)
+        .transpose()?
         .unwrap_or_default();
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
@@ -722,17 +725,15 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         body: flag_value(args, "--body").map(str::to_string),
         acceptance: {
             let values = flag_values(args, "--acceptance");
-            (!values.is_empty()).then(|| values.into_iter().map(str::to_string).collect())
+            (!values.is_empty())
+                .then(|| normalize_acceptance(values.into_iter().map(str::to_string)))
         },
         proof_plan: flag_value(args, "--proof-plan").map(|value| vec![value.to_string()]),
         status: flag_value(args, "--status")
             .map(parse_status_flag)
             .transpose()?,
         priority: flag_value(args, "--priority")
-            .map(|raw| {
-                Priority::parse(raw)
-                    .ok_or_else(|| ShellError::Invalid(format!("invalid --priority: {raw}")))
-            })
+            .map(parse_priority_flag)
             .transpose()?,
         estimate: flag_value(args, "--estimate")
             .map(parse_estimate_flag)
@@ -740,7 +741,7 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         risk: flag_value(args, "--risk")
             .map(parse_risk_flag)
             .transpose()?,
-        labels: flag_value(args, "--labels").map(split_csv),
+        labels: flag_value(args, "--labels").map(|raw| normalize_labels(split_csv(raw))),
         repo: None,
     };
     let card = if let Some(db) = flag_value(args, "--db") {
@@ -1716,59 +1717,46 @@ fn required_run_flag(args: &[String]) -> Result<RunId, ShellError> {
 }
 
 fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, ShellError> {
-    flag_value(args, flag)
+    let field = match flag {
+        "--related" => CardField::Related,
+        "--blocks" => CardField::Blocks,
+        "--blocked-by" => CardField::BlockedBy,
+        _ => unreachable!("card relation parser called with {flag}"),
+    };
+    let values = flag_value(args, flag)
         .unwrap_or_default()
         .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| CardId::new(value).map_err(ShellError::from))
-        .collect()
+        .map(str::to_owned);
+    normalize_csv_relations(field, values).map_err(field_error)
 }
 
-/// powder-status-vocabulary: every `--status` call site routes through here
-/// so a retired status name (`claimed`, `running`, `blocked`) is rejected
-/// with an error that names the current seven-status vocabulary, not
-/// silently aliased onto a surviving status or swallowed into a default.
+fn field_error(error: CardFieldError) -> ShellError {
+    ShellError::Invalid(error.to_string())
+}
+
+fn cli_field_error(error: CardFieldError, flag: &str) -> ShellError {
+    let message = error.to_string();
+    let canonical = format!("invalid {}", error.field().as_str());
+    let cli = format!("invalid --{flag}");
+    ShellError::Invalid(message.replacen(&canonical, &cli, 1))
+}
+
+/// powder-status-vocabulary: every `--status` call site uses the shared
+/// parser, so retired names are rejected with the current vocabulary.
 fn parse_status_flag(raw: &str) -> Result<CardStatus, ShellError> {
-    CardStatus::parse(raw).ok_or_else(|| {
-        ShellError::Invalid(format!(
-            "invalid --status {raw:?}; valid: {}",
-            CardStatus::ALL
-                .iter()
-                .copied()
-                .map(CardStatus::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
+    parse_status(raw).map_err(|error| cli_field_error(error, "status"))
+}
+
+fn parse_priority_flag(raw: &str) -> Result<Priority, ShellError> {
+    parse_priority(raw).map_err(|error| cli_field_error(error, "priority"))
 }
 
 fn parse_estimate_flag(raw: &str) -> Result<Estimate, ShellError> {
-    Estimate::parse(raw).ok_or_else(|| {
-        ShellError::Invalid(format!(
-            "invalid --estimate {raw:?}; valid: {}",
-            Estimate::ALL
-                .iter()
-                .copied()
-                .map(Estimate::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
+    parse_estimate(raw).map_err(|error| cli_field_error(error, "estimate"))
 }
 
 fn parse_risk_flag(raw: &str) -> Result<Risk, ShellError> {
-    Risk::parse(raw).ok_or_else(|| {
-        ShellError::Invalid(format!(
-            "invalid --risk {raw:?}; valid: {}",
-            Risk::ALL
-                .iter()
-                .copied()
-                .map(Risk::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
+    parse_risk(raw).map_err(|error| cli_field_error(error, "risk"))
 }
 
 fn split_csv(raw: &str) -> Vec<String> {
@@ -1878,9 +1866,9 @@ fn json_priority(value: &Value) -> Result<&'static str, ShellError> {
         .ok_or_else(|| {
             ShellError::Store("remote response missing string field: priority".to_string())
         })?;
-    Priority::parse(raw)
+    parse_priority(raw)
         .map(|priority| priority.as_str())
-        .ok_or_else(|| ShellError::Store(format!("remote response invalid priority: {raw}")))
+        .map_err(|error| ShellError::Store(format!("remote response {error}")))
 }
 
 fn json_i64(value: &Value, field: &'static str) -> Result<i64, ShellError> {

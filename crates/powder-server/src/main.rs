@@ -29,9 +29,12 @@ use axum::{
     Json, Router,
 };
 use hmac::{Hmac, Mac};
+#[cfg(test)]
+use powder_core::Priority;
 use powder_core::{
-    canonical_repo_label, Authority, Card, CardId, CardStatus, DetailLevel, Estimate,
-    PapercutReport, Priority, ReadyQuery, Risk, RunId,
+    canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
+    parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
+    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyQuery, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -487,13 +490,7 @@ struct PatchCardRequest {
 impl PatchCardRequest {
     fn into_patch(self) -> Result<CardPatch, ApiError> {
         let status = self.status.as_deref().map(parse_status).transpose()?;
-        let priority = self
-            .priority
-            .as_deref()
-            .map(|raw| {
-                Priority::parse(raw).ok_or_else(|| ApiError::bad_request("invalid priority"))
-            })
-            .transpose()?;
+        let priority = self.priority.as_deref().map(parse_priority).transpose()?;
         let estimate = self.estimate.as_deref().map(parse_estimate).transpose()?;
         let risk = self.risk.as_deref().map(parse_risk).transpose()?;
         let repo = self.repo.map(|raw| canonical_repo_label(&raw));
@@ -501,13 +498,13 @@ impl PatchCardRequest {
         Ok(CardPatch {
             title: self.title,
             body: self.body,
-            acceptance: self.acceptance,
+            acceptance: self.acceptance.map(normalize_acceptance),
             proof_plan: self.proof_plan,
             status,
             priority,
             estimate,
             risk,
-            labels: self.labels,
+            labels: self.labels.map(normalize_labels),
             repo,
         })
     }
@@ -1249,16 +1246,18 @@ async fn create_card(
     // independent gate. An explicit-but-invalid status (including the
     // retired `claimed`/`running`/`blocked` names) is a 400 naming the
     // current vocabulary, never silently swallowed into the default.
+    let acceptance = normalize_acceptance(request.acceptance);
     let status = request
         .status
         .as_deref()
         .map(parse_status)
         .transpose()?
-        .unwrap_or_else(|| CardStatus::default_for_acceptance(&request.acceptance));
+        .unwrap_or_else(|| CardStatus::default_for_acceptance(&acceptance));
     let priority = request
         .priority
         .as_deref()
-        .and_then(Priority::parse)
+        .map(parse_priority)
+        .transpose()?
         .unwrap_or_default();
     let estimate = request
         .estimate
@@ -1276,13 +1275,13 @@ async fn create_card(
     .with_priority(priority)
     .with_estimate(estimate)
     .with_risk(risk)
-    .with_acceptance(request.acceptance)
+    .with_acceptance(acceptance)
     .with_proof_plan(request.proof_plan.unwrap_or_default())
     .with_created_at(now);
-    card.labels = request.labels.unwrap_or_default();
-    card.related = card_ids(request.related)?;
-    card.blocks = card_ids(request.blocks)?;
-    card.blocked_by = card_ids(request.blocked_by)?;
+    card.labels = normalize_labels(request.labels.unwrap_or_default());
+    card.related = card_ids(request.related, CardField::Related)?;
+    card.blocks = card_ids(request.blocks, CardField::Blocks)?;
+    card.blocked_by = card_ids(request.blocked_by, CardField::BlockedBy)?;
     card.parent = request.parent.map(CardId::new).transpose()?;
     card.repo = request.repo;
     let card = {
@@ -1454,9 +1453,9 @@ async fn update_relations(
     let card_id = CardId::new(id)?;
     let card = lock_store(&state)?.update_relations(
         &card_id,
-        card_ids(request.related)?,
-        card_ids(request.blocks)?,
-        card_ids(request.blocked_by)?,
+        card_ids(request.related, CardField::Related)?,
+        card_ids(request.blocks, CardField::Blocks)?,
+        card_ids(request.blocked_by, CardField::BlockedBy)?,
         unix_now(),
         &actor.authority(),
     )?;
@@ -2156,59 +2155,8 @@ fn trusted_tailnet_identity(headers: &HeaderMap) -> Option<&str> {
     })
 }
 
-fn card_ids(raw: Option<Vec<String>>) -> Result<Vec<CardId>, ApiError> {
-    raw.unwrap_or_default()
-        .into_iter()
-        .map(CardId::new)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(ApiError::from)
-}
-
-/// powder-status-vocabulary: every status string arriving over HTTP routes
-/// through here, so a retired status name (`claimed`, `running`, `blocked`)
-/// is rejected with a 400 that names the current seven-status vocabulary --
-/// never silently aliased onto a surviving status or swallowed into a
-/// default.
-fn parse_status(raw: &str) -> Result<CardStatus, ApiError> {
-    CardStatus::parse(raw).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "invalid status {raw:?}; valid: {}",
-            CardStatus::ALL
-                .iter()
-                .copied()
-                .map(CardStatus::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
-}
-
-fn parse_estimate(raw: &str) -> Result<Estimate, ApiError> {
-    Estimate::parse(raw).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "invalid estimate {raw:?}; valid: {}",
-            Estimate::ALL
-                .iter()
-                .copied()
-                .map(Estimate::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
-}
-
-fn parse_risk(raw: &str) -> Result<Risk, ApiError> {
-    Risk::parse(raw).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "invalid risk {raw:?}; valid: {}",
-            Risk::ALL
-                .iter()
-                .copied()
-                .map(Risk::as_str)
-                .collect::<Vec<_>>()
-                .join("|")
-        ))
-    })
+fn card_ids(raw: Option<Vec<String>>, field: CardField) -> Result<Vec<CardId>, ApiError> {
+    normalize_relations(field, raw.unwrap_or_default()).map_err(ApiError::from)
 }
 
 fn repository_upsert(
@@ -2461,6 +2409,12 @@ impl From<StoreError> for ApiError {
             StoreError::Domain(err) => ApiError::from(err),
             other => Self::internal(other.to_string()),
         }
+    }
+}
+
+impl From<CardFieldError> for ApiError {
+    fn from(value: CardFieldError) -> Self {
+        Self::bad_request(value.to_string())
     }
 }
 

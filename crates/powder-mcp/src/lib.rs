@@ -2,8 +2,11 @@
 
 pub use powder_api::RemoteClient;
 use powder_core::{
-    Authority, Card, CardDetail, CardId, CardStatus, CardSummary, DetailLevel, Estimate,
-    PapercutReport, Priority, ReadyQuery, Risk, RunId,
+    normalize_acceptance, normalize_labels, normalize_relations,
+    parse_estimate as parse_card_estimate, parse_priority as parse_card_priority,
+    parse_risk as parse_card_risk, parse_status as parse_card_status, Authority, Card, CardDetail,
+    CardField, CardId, CardStatus, CardSummary, DetailLevel, Estimate, PapercutReport, Priority,
+    ReadyQuery, Risk, RunId,
 };
 use powder_store::{
     BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
@@ -442,7 +445,7 @@ pub fn call_tool_store(
         "create_card" => {
             let id = CardId::new(required_str(args, "id")?).map_err(to_string)?;
             let title = required_str(args, "title")?;
-            let acceptance = string_array(args, "acceptance")?;
+            let acceptance = normalize_acceptance(string_array(args, "acceptance")?);
             let status = match optional_str(args, "status") {
                 Some(raw) => parse_status(raw)?,
                 None => CardStatus::default_for_acceptance(&acceptance),
@@ -464,7 +467,7 @@ pub fn call_tool_store(
                 .with_estimate(estimate)
                 .with_risk(risk)
                 .with_created_at(now);
-            card.labels = string_array(args, "labels")?;
+            card.labels = normalize_labels(string_array(args, "labels")?);
             card.related = card_ids_array(args, "related")?;
             card.blocks = card_ids_array(args, "blocks")?;
             card.blocked_by = card_ids_array(args, "blocked_by")?;
@@ -489,7 +492,7 @@ pub fn call_tool_store(
             let patch = CardPatch {
                 title: optional_str(args, "title").map(str::to_string),
                 body: optional_str(args, "body").map(str::to_string),
-                acceptance: optional_string_array(args, "acceptance")?,
+                acceptance: optional_string_array(args, "acceptance")?.map(normalize_acceptance),
                 proof_plan: optional_string_array(args, "proof_plan")?,
                 status: optional_str(args, "status").map(parse_status).transpose()?,
                 priority: optional_str(args, "priority")
@@ -499,7 +502,7 @@ pub fn call_tool_store(
                     .map(parse_estimate)
                     .transpose()?,
                 risk: optional_str(args, "risk").map(parse_risk).transpose()?,
-                labels: optional_string_array(args, "labels")?,
+                labels: optional_string_array(args, "labels")?.map(normalize_labels),
                 repo: None,
             };
             let card = store
@@ -1061,19 +1064,26 @@ fn run_id(args: &Value, key: &'static str) -> Result<RunId, String> {
 }
 
 fn card_ids_array(args: &Value, key: &'static str) -> Result<Vec<CardId>, String> {
-    args[key]
+    let field = match key {
+        "related" => CardField::Related,
+        "blocks" => CardField::Blocks,
+        "blocked_by" => CardField::BlockedBy,
+        _ => unreachable!("card relation parser called with {key}"),
+    };
+    let values = args[key]
         .as_array()
         .map(|items| {
             items
                 .iter()
                 .map(|item| {
                     item.as_str()
+                        .map(str::to_owned)
                         .ok_or_else(|| format!("{key} entries must be strings"))
-                        .and_then(|value| CardId::new(value).map_err(to_string))
                 })
-                .collect()
+                .collect::<Result<Vec<_>, _>>()
         })
-        .unwrap_or_else(|| Ok(Vec::new()))
+        .unwrap_or_else(|| Ok(Vec::new()))?;
+    normalize_relations(field, values).map_err(to_string)
 }
 
 fn string_array(args: &Value, key: &'static str) -> Result<Vec<String>, String> {
@@ -1130,19 +1140,19 @@ fn criterion_arg(args: &Value) -> Result<usize, String> {
 }
 
 fn parse_status(raw: &str) -> Result<CardStatus, String> {
-    CardStatus::parse(raw).ok_or_else(|| invalid_enum_value("status", raw, status_valid_values()))
+    parse_card_status(raw).map_err(to_string)
 }
 
 fn parse_priority(raw: &str) -> Result<Priority, String> {
-    Priority::parse(raw).ok_or_else(|| invalid_enum_value("priority", raw, priority_valid_values()))
+    parse_card_priority(raw).map_err(to_string)
 }
 
 fn parse_estimate(raw: &str) -> Result<Estimate, String> {
-    Estimate::parse(raw).ok_or_else(|| invalid_enum_value("estimate", raw, estimate_valid_values()))
+    parse_card_estimate(raw).map_err(to_string)
 }
 
 fn parse_risk(raw: &str) -> Result<Risk, String> {
-    Risk::parse(raw).ok_or_else(|| invalid_enum_value("risk", raw, risk_valid_values()))
+    parse_card_risk(raw).map_err(to_string)
 }
 
 fn detail_arg(args: &Value) -> Result<DetailLevel, String> {
@@ -1188,42 +1198,6 @@ fn optional_str<'a>(args: &'a Value, key: &'static str) -> Option<&'a str> {
 
 fn invalid_enum_value(field: &str, raw: &str, valid: String) -> String {
     format!("invalid {field} {raw:?}; valid: {valid}")
-}
-
-fn status_valid_values() -> String {
-    CardStatus::ALL
-        .iter()
-        .copied()
-        .map(CardStatus::as_str)
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn priority_valid_values() -> String {
-    Priority::ALL
-        .iter()
-        .copied()
-        .map(Priority::as_str)
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn estimate_valid_values() -> String {
-    Estimate::ALL
-        .iter()
-        .copied()
-        .map(Estimate::as_str)
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn risk_valid_values() -> String {
-    Risk::ALL
-        .iter()
-        .copied()
-        .map(Risk::as_str)
-        .collect::<Vec<_>>()
-        .join("|")
 }
 
 fn repository_visibility_valid_values() -> String {
