@@ -183,6 +183,21 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
 
+    // Repository rows are explicit-only (powder-repo-registry-tightness):
+    // register both repos before filing any card under them.
+    for name in ["example", "other"] {
+        store.upsert_repository(
+            RepositoryUpsert {
+                name: name.to_string(),
+                aliases: None,
+                visibility: None,
+                tier: None,
+                import_provenance: None,
+            },
+            1,
+        )?;
+    }
+
     let mut in_progress = ready_card("in-progress-1", 10);
     in_progress.status = CardStatus::InProgress;
     in_progress.repo = Some("misty-step/example".to_string());
@@ -1154,6 +1169,76 @@ fn repository_upsert_without_tier_preserves_existing_tier() -> Result<()> {
     )?;
 
     assert_eq!(updated.tier, RepositoryTier::Active);
+    Ok(())
+}
+
+/// powder-repo-registry-tightness: `repository_doctor` is a read-only report
+/// of repository rows still carrying a legacy auto-create provenance tag --
+/// the two write paths that predate explicit-only registration ("card repo"
+/// from `persist_card`'s old implicit-attach behavior, "existing card
+/// import" from the one-time `backfill_repositories_from_cards` migration
+/// sweep). Simulates two such legacy rows directly against the schema (the
+/// only way to produce one now that every live write path is explicit-only)
+/// and proves the doctor pass surfaces both, in ascending card_count order,
+/// while leaving an explicitly-registered repo out of the report and never
+/// mutating any row it looked at.
+#[test]
+fn repository_doctor_lists_legacy_auto_created_rows_without_mutating_them() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "explicit-one".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: Some("manual".to_string()),
+        },
+        1,
+    )?;
+
+    store.connection.execute(
+        "INSERT INTO repositories (name, visibility, tier, import_provenance, created_at, updated_at)
+         VALUES (?1, 'visible', 'backburner', ?2, ?3, ?3)",
+        rusqlite::params!["legacy-from-migration", "existing card import", 5_i64],
+    )?;
+    store.connection.execute(
+        "INSERT INTO repositories (name, visibility, tier, import_provenance, created_at, updated_at)
+         VALUES (?1, 'visible', 'backburner', ?2, ?3, ?3)",
+        rusqlite::params!["legacy-from-old-persist", "card repo", 6_i64],
+    )?;
+
+    let report = store.repository_doctor()?;
+    let suspicious_names = report
+        .suspicious
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        suspicious_names,
+        vec!["legacy-from-migration", "legacy-from-old-persist"],
+        "sorted by ascending card_count (both zero here) then name: {suspicious_names:?}"
+    );
+    assert!(
+        !suspicious_names.contains(&"explicit-one"),
+        "an explicitly registered repo must never be flagged: {suspicious_names:?}"
+    );
+    assert_eq!(report.suspicious[0].card_count, 0);
+    assert_eq!(
+        report.suspicious[0].import_provenance.as_deref(),
+        Some("existing card import")
+    );
+    assert_eq!(
+        report.suspicious[1].import_provenance.as_deref(),
+        Some("card repo")
+    );
+
+    // Read-only: the rows are still there, untouched, on a second pass.
+    let second = store.repository_doctor()?;
+    assert_eq!(second.suspicious.len(), 2);
+    assert!(store.get_repository("legacy-from-migration")?.is_some());
+    assert!(store.get_repository("legacy-from-old-persist")?.is_some());
     Ok(())
 }
 
@@ -5252,6 +5337,21 @@ fn field_note_generator_skips_repos_outside_the_allowlist() -> Result<()> {
         weekly_budget: 7,
     });
     store.migrate()?;
+    // Repository rows are explicit-only (powder-repo-registry-tightness):
+    // register "some-chore-repo" before filing a card under it -- it is
+    // deliberately kept OFF the field-note allowlist (only
+    // "misty-step/powder" is on it), which is the actual thing this test
+    // exercises.
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "some-chore-repo".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: None,
+        },
+        1,
+    )?;
     let card_id = CardId::new("chore-alpha")?;
     store.create_card_with_events(
         allowlisted_card("chore-alpha", "misty-step/some-chore-repo", 10),

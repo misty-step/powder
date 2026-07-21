@@ -31,10 +31,11 @@ pub use events::{
 pub use identity::{ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 use relations::{list_delta, mirror_delta, mirror_initial_relations};
 pub use relations::{RelationField, RelationsDoctorIssue, RelationsDoctorReport};
-use repositories::{ensure_repository_entity, resolve_repository_name};
+use repositories::{resolve_registered_repository_for_write, resolve_repository_name};
 pub use repositories::{
-    RepositoryMergeOutcome, RepositoryNormalizeChange, RepositoryNormalizeOutcome,
-    RepositorySummary, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
+    RepositoryDoctorEntry, RepositoryDoctorReport, RepositoryMergeOutcome,
+    RepositoryNormalizeChange, RepositoryNormalizeOutcome, RepositorySummary, RepositoryTier,
+    RepositoryUpsert, RepositoryVisibility,
 };
 /// The current on-disk schema version `Store::migrate` converges to.
 /// Public so a caller (`/readyz`'s schema-match gate is the motivating one)
@@ -1494,17 +1495,21 @@ impl Store {
             criterion.text = secrets::scrub_secrets(&criterion.text);
         }
         card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
+        // Numeric-id repo inference is explicit-conflict-detection only: a
+        // card id like `foo-123` never silently *attaches* repo "foo" (that
+        // was the powder-repo-registry-tightness bug -- see the "why" in the
+        // card). It still rejects an explicit `repo` that contradicts the
+        // id's numeric-suffix prefix, so a card can't be mis-filed under a
+        // conflicting repo by typo.
         if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
-            match card.repo.as_deref() {
-                Some(repo) if !canonical_repo_matches(repo, &derived_repo) => {
+            if let Some(repo) = card.repo.as_deref() {
+                if !canonical_repo_matches(repo, &derived_repo) {
                     return Err(DomainError::validation(
                         "repo",
                         format!("repo {repo} does not match numeric card id prefix {derived_repo}"),
                     )
                     .into());
                 }
-                None => card.repo = Some(derived_repo),
-                Some(_) => {}
             }
         }
         let transaction = self
@@ -1658,8 +1663,9 @@ impl Store {
             now,
         )?;
         // `persist_card` canonicalizes `repo` at write time via
-        // `ensure_repository_entity` (an alias like "misty-step/canary"
-        // becomes "canary" in the DB row) but only borrows `card`, so the
+        // `resolve_registered_repository_name` (an alias like
+        // "misty-step/canary" becomes "canary" in the DB row) but only
+        // borrows `card`, so the
         // in-memory value above is still whatever the caller passed. Reload
         // so the returned `Card` matches the row exactly -- same reason
         // `create_card_with_events` reloads after its own `persist_card`
@@ -3246,9 +3252,18 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     let repo = card
         .repo
         .as_deref()
-        .map(|repo| ensure_repository_entity(connection, repo, card.updated_at, Some("card repo")))
-        .transpose()?
-        .flatten();
+        .map(|repo| -> Result<String> {
+            resolve_registered_repository_for_write(connection, repo, card.updated_at)?.ok_or_else(|| {
+                DomainError::validation(
+                    "repo",
+                    format!(
+                        "unregistered repo \"{repo}\": register it first via POST /api/v1/repositories (or the repository-upsert CLI/MCP command)"
+                    ),
+                )
+                .into()
+            })
+        })
+        .transpose()?;
     let claim_principal = card.claim.as_ref().map(|claim| claim.principal.as_str());
     let claim_agent = card.claim.as_ref().map(|claim| claim.agent.as_str());
     let claim_run_id = card.claim.as_ref().map(|claim| claim.run_id.as_str());

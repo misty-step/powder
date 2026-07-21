@@ -260,7 +260,14 @@ async fn create_card_with_acceptance_defaults_to_ready_and_explicit_status_overr
 }
 
 #[tokio::test]
-async fn create_card_derives_repo_from_numeric_id_prefix_for_repo_filtered_lists() {
+async fn create_card_leaves_repo_null_for_a_numeric_id_but_id_derived_filtering_still_finds_it() {
+    // powder-repo-registry-tightness: a numeric card-id suffix (e.g.
+    // "misty-step-906") must never silently attach an inferred repo -- that
+    // was exactly how stray repository rows got born. The card stays
+    // repo:null. Read-time filtering still tolerates matching such a
+    // repo-less card by its id-derived repo (see
+    // `list_cards_page_after`'s filter), so it stays discoverable without
+    // ever creating a repository row for it.
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
@@ -276,7 +283,7 @@ async fn create_card_derives_repo_from_numeric_id_prefix_for_repo_filtered_lists
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
     let created = response_json(created).await;
-    assert_eq!(created["repo"], "misty-step");
+    assert!(created["repo"].is_null(), "created was: {created}");
 
     let listed = app
         .oneshot(json_request(
@@ -917,6 +924,18 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(in_progress.status(), StatusCode::OK);
+
+    let other_repo = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/repositories",
+            Some(&raw_key),
+            r#"{"name":"misty-step/other"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_repo.status(), StatusCode::OK);
 
     let created = app
         .clone()
@@ -1997,6 +2016,18 @@ async fn board_stats_route_returns_compact_counts_without_listing_cards() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
+    let stats_repo = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/repositories",
+            Some(&admin_key),
+            r#"{"name":"stats-repo","visibility":"visible","tier":"active"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stats_repo.status(), StatusCode::OK);
+
     let hidden = app
         .clone()
         .oneshot(json_request(
@@ -2159,6 +2190,18 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
         .find(|repository| repository["name"] == "canary")
         .expect("hidden canary repository");
     assert_eq!(canary["visibility"], "hidden");
+
+    let legacy_repo = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/repositories",
+            Some(&admin_key),
+            r#"{"name":"legacy-canary"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy_repo.status(), StatusCode::OK);
 
     let legacy = app
         .clone()
