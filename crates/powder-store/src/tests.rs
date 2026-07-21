@@ -3,6 +3,7 @@ use powder_core::{
     DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
 };
 
+use crate::schema::SCHEMA;
 use crate::{
     ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
     RelationField, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
@@ -4501,7 +4502,7 @@ fn migration_3_to_4_finishes_a_half_applied_run_column_drop() -> Result<()> {
     Ok(())
 }
 
-/// Every migration step from 1->22 must tolerate being invoked twice in a
+/// Every migration step from 1->23 must tolerate being invoked twice in a
 /// row against a database that already has its target schema (the shape a
 /// crash-and-retry boot produces once a step has fully applied but before
 /// `migrate()`'s loop reaches `SCHEMA_VERSION`) without erroring. Steps 11+
@@ -4547,6 +4548,8 @@ fn every_migration_step_is_idempotent_when_invoked_twice() -> Result<()> {
     store.migrate_20_to_21()?;
     store.migrate_21_to_22()?;
     store.migrate_21_to_22()?;
+    store.migrate_22_to_23()?;
+    store.migrate_22_to_23()?;
 
     // Re-running every step twice must not have perturbed the fully
     // migrated schema: still at SCHEMA_VERSION, still able to round-trip a
@@ -5876,5 +5879,238 @@ fn scrub_write_boundary_leaves_short_prose_mentions_untouched_end_to_end() -> Re
     let comment = store.add_comment(&card_id, "agent-a", prose, 21)?;
     assert_eq!(comment.body, prose);
 
+    Ok(())
+}
+
+#[test]
+fn fts_search_indexes_all_store_text_and_literal_tokens() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("powder-query-fts-store", 10);
+    card.title = "SQLite FTS5 index".to_string();
+    card.body = "The body records SQLITE_BUSY recovery details.".to_string();
+    card.criteria = vec![AcceptanceCriterion::new(
+        "criteria-token survives JSON flattening".to_string(),
+    )?];
+    store.upsert_card(card.clone())?;
+    let comment = store.add_comment(&card.id, "operator", "comment-token is searchable", 20)?;
+    let work_log = store.append_work_log(
+        &card.id,
+        "agent",
+        WorkLogAttribution::default(),
+        "work-log-token is searchable",
+        30,
+    )?;
+
+    let title = store.search("SQLite", 10)?;
+    assert!(title.iter().any(|hit| {
+        hit.source_table == "cards"
+            && hit.source_field == "title"
+            && hit.card_id == card.id
+            && hit.created_at == card.created_at
+            && hit.snippet.contains("<b>SQLite</b>")
+    }));
+    let body = store.search("SQLITE_BUSY", 10)?;
+    assert!(body.iter().any(|hit| {
+        hit.source_table == "cards" && hit.source_field == "body" && hit.card_id == card.id
+    }));
+    let card_id_hits = store.search("powder-query-fts-store", 10)?;
+    assert_eq!(card_id_hits.len(), 5);
+    assert!(card_id_hits.iter().all(|hit| hit.card_id == card.id));
+    assert!(store
+        .search("criteria-token", 10)?
+        .iter()
+        .any(|hit| hit.source_field == "criteria"));
+    assert!(store
+        .search("comment-token", 10)?
+        .iter()
+        .any(|hit| hit.source_table == "comments"));
+    assert!(store
+        .search("work-log-token", 10)?
+        .iter()
+        .any(|hit| hit.source_table == "work_log_entries"));
+    assert_eq!(comment.card_id, card.id);
+    assert_eq!(work_log.card_id, card.id);
+    Ok(())
+}
+
+#[test]
+fn fts_search_ranks_by_bm25_and_rolls_back_source_writes() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut exact = ready_card("rank-exact", 10);
+    exact.title = "rank-token".to_string();
+    let mut repeated = ready_card("rank-repeated", 20);
+    repeated.title = "different title".to_string();
+    repeated.body = "rank-token rank-token rank-token".to_string();
+    store.import_cards(vec![exact.clone(), repeated.clone()])?;
+
+    let ranked = store.search("rank-token", 10)?;
+    assert!(ranked.len() >= 2);
+    assert!(ranked.windows(2).all(|pair| pair[0].rank <= pair[1].rank));
+    assert!(ranked.iter().all(|hit| hit.rank.is_finite()));
+
+    let transaction = store
+        .connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT INTO comments (id, card_id, author, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "comment-rolled-back",
+            exact.id.as_str(),
+            "operator",
+            "ghost-token",
+            40_i64
+        ],
+    )?;
+    drop(transaction);
+    assert!(store.search("ghost-token", 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("fts-trigger-card", 10);
+    card.body = "old-card-token".to_string();
+    store.upsert_card(card.clone())?;
+    assert_eq!(store.search("old-card-token", 10)?.len(), 1);
+
+    card.body = "new-card-token".to_string();
+    store.upsert_card(card.clone())?;
+    assert!(store.search("old-card-token", 10)?.is_empty());
+    assert_eq!(store.search("new-card-token", 10)?.len(), 1);
+
+    store.connection.execute(
+        "INSERT INTO comments (id, card_id, author, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "fts-trigger-comment",
+            card.id.as_str(),
+            "operator",
+            "old-comment-token",
+            20_i64
+        ],
+    )?;
+    store.connection.execute(
+        "UPDATE comments SET body = ?1 WHERE id = ?2",
+        rusqlite::params!["new-comment-token", "fts-trigger-comment"],
+    )?;
+    assert!(store.search("old-comment-token", 10)?.is_empty());
+    assert_eq!(store.search("new-comment-token", 10)?.len(), 1);
+    store.connection.execute(
+        "INSERT OR REPLACE INTO comments (id, card_id, author, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "fts-trigger-comment",
+            card.id.as_str(),
+            "operator",
+            "replace-comment-token",
+            25_i64
+        ],
+    )?;
+    assert!(store.search("new-comment-token", 10)?.is_empty());
+    assert_eq!(store.search("replace-comment-token", 10)?.len(), 1);
+
+    store.connection.execute(
+        "INSERT INTO work_log_entries (id, card_id, agent, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "fts-trigger-work-log",
+            card.id.as_str(),
+            "agent",
+            "deleted-work-token",
+            30_i64
+        ],
+    )?;
+    assert_eq!(store.search("deleted-work-token", 10)?.len(), 1);
+    store.connection.execute(
+        "DELETE FROM work_log_entries WHERE id = ?1",
+        rusqlite::params!["fts-trigger-work-log"],
+    )?;
+    assert!(store.search("deleted-work-token", 10)?.is_empty());
+
+    store.connection.execute(
+        "DELETE FROM cards WHERE id = ?1",
+        rusqlite::params![card.id.as_str()],
+    )?;
+    assert!(store.search("new-card-token", 10)?.is_empty());
+    assert!(store.search("new-comment-token", 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn fts_migration_backfills_a_snapshot_idempotently() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.connection.execute_batch(SCHEMA)?;
+    let mut card = ready_card("snapshot-fts-card", 100);
+    card.title = "snapshot title".to_string();
+    card.body = "snapshot body".to_string();
+    card.criteria = vec![AcceptanceCriterion::new(
+        "snapshot-criteria-token".to_string(),
+    )?];
+    crate::persist_card(&store.connection, &card)?;
+    let mut legacy = ready_card("snapshot-legacy", 101);
+    legacy.acceptance = vec!["snapshot-legacy-acceptance-token".to_string()];
+    crate::persist_card(&store.connection, &legacy)?;
+    store.connection.execute(
+        "UPDATE cards SET acceptance_json = ?1, criteria_json = '[]' WHERE id = ?2",
+        rusqlite::params![
+            r#"["snapshot-legacy-acceptance-token"]"#,
+            legacy.id.as_str()
+        ],
+    )?;
+    store.connection.execute(
+        "INSERT INTO comments (id, card_id, author, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "snapshot-comment",
+            card.id.as_str(),
+            "operator",
+            "snapshot-comment-token",
+            110_i64
+        ],
+    )?;
+    store.connection.execute(
+        "INSERT INTO work_log_entries
+         (id, card_id, agent, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            "snapshot-work-log",
+            card.id.as_str(),
+            "agent",
+            "snapshot-work-log-token",
+            120_i64
+        ],
+    )?;
+    store.connection.execute_batch("PRAGMA user_version = 22")?;
+
+    store.migrate()?;
+    let first_count: i64 =
+        store
+            .connection
+            .query_row("SELECT count(*) FROM search_documents", [], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(first_count, 8);
+    assert_eq!(store.search("snapshot-criteria-token", 10)?.len(), 1);
+    assert_eq!(
+        store.search("snapshot-legacy-acceptance-token", 10)?.len(),
+        1
+    );
+    assert_eq!(store.search("snapshot-comment-token", 10)?.len(), 1);
+    assert_eq!(store.search("snapshot-work-log-token", 10)?.len(), 1);
+
+    store.migrate()?;
+    let second_count: i64 =
+        store
+            .connection
+            .query_row("SELECT count(*) FROM search_documents", [], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(second_count, first_count);
+    assert_eq!(store.search("snapshot-criteria-token", 10)?.len(), 1);
     Ok(())
 }
