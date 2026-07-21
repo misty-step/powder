@@ -6114,3 +6114,25 @@ fn fts_migration_backfills_a_snapshot_idempotently() -> Result<()> {
     assert_eq!(store.search("snapshot-criteria-token", 10)?.len(), 1);
     Ok(())
 }
+
+#[test]
+fn fts_search_times_10k_synthetic_cards() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let cards = (0..10_000)
+        .map(|index| {
+            let mut card = ready_card(&format!("bulk-search-{index}"), index);
+            card.title = format!("bulk-search-token card {index}");
+            card
+        })
+        .collect();
+    store.import_cards(cards)?;
+
+    let started = std::time::Instant::now();
+    let hits = store.search("bulk-search-token", 10)?;
+    let elapsed = started.elapsed();
+    println!("FTS5 search over 10,000 synthetic cards: {elapsed:?}");
+    assert_eq!(hits.len(), 10);
+    assert!(hits.iter().all(|hit| hit.source_field == "title"));
+    Ok(())
+}
