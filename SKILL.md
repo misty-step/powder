@@ -274,11 +274,13 @@ value until something restarts it. Two ways to handle this:
 - Set `POWDER_API_KEY_CMD` to a shell command that prints a fresh key on
   stdout (e.g. `security find-generic-password -a "$USER" -s
   powder-api-key -w`, or `op read op://Agents/POWDER_API_KEY__bridge/credential`).
-  `powder-mcp` runs it once at boot, and again, once, the first time a
-  request comes back `401` -- if the command resolves a different key than
-  the one that just failed, it transparently retries with the new key and
-  the caller never sees the rotation. `POWDER_API_KEY` remains the plain
-  fallback; leaving `POWDER_API_KEY_CMD` unset is unchanged behavior.
+  `powder-mcp` runs it once at boot, and again on every `401` epoch -- not
+  just the first one for the life of the process -- if the command resolves
+  a different key than the one that just failed, it transparently retries
+  with the new key and the caller never sees the rotation. A second (or
+  third) rotation later in the same long-lived subprocess self-heals the
+  same way. `POWDER_API_KEY` remains the plain fallback; leaving
+  `POWDER_API_KEY_CMD` unset is unchanged behavior.
 
 When both a rotation and a retry are exhausted, or `POWDER_API_KEY_CMD` isn't
 set, a `401` error names the key prefix `powder-mcp` used (matching the
