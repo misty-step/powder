@@ -28,10 +28,9 @@ boundary, or the self-hosting/deployment shape.
   imported/operator/customer card, run, claim, activity, or instance export
   data; synthetic migration fixtures belong under tests only. Instance data
   lives in the deployed SQLite database.
-- Follow the Canary-style deployment shape: one deployable Rust service, SQLite
-  path from env, WAL, host volume at `/data` (production is a DigitalOcean
-  droplet), Litestream optional replication, health and readiness routes,
-  first-run bootstrap key, and tailnet-friendly auth configuration.
+- Production runs one Rust service (`powder-server`) on a DigitalOcean droplet.
+  SQLite lives at `/data` on a host volume with WAL enabled. Litestream
+  replication is optional, and ingress is through the tailnet.
 
 ## Gates
 
