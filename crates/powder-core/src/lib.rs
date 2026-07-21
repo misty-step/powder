@@ -1,10 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod card_fields;
 mod model;
 mod queries;
 mod ready_order;
 mod repository;
 
+pub use card_fields::{
+    normalize_acceptance, normalize_card_strings, normalize_csv_relations, normalize_labels,
+    normalize_relations, parse_estimate, parse_priority, parse_risk, parse_status, CardField,
+    CardFieldError,
+};
 pub use model::{
     clean_list, AcceptanceCriterion, Activity, ActivityId, ActivityType, ApprovalQueueRow,
     AttachmentMeta, Authority, AwaitingInput, Card, CardDetail, CardEvent, CardEventId, CardId,
