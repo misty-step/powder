@@ -38,6 +38,7 @@ pub const COMMANDS: &[&str] = &[
     "repository-merge-alias",
     "repository-delete",
     "repository-normalize",
+    "repository-doctor",
     "claim",
     "release-claim",
     "renew-claim",
@@ -131,6 +132,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "repository-merge-alias" => repository_merge_alias(rest),
         [command, rest @ ..] if command == "repository-delete" => repository_delete(rest),
         [command, rest @ ..] if command == "repository-normalize" => repository_normalize(rest),
+        [command, rest @ ..] if command == "repository-doctor" => repository_doctor(rest),
         [command, rest @ ..] if command == "claim" => claim(rest, remote_env),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest, remote_env),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest, remote_env),
@@ -292,6 +294,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder repository-normalize --db ./data/powder.db --actor operator  (one-time sweep: canonicalizes any legacy non-canonical cards.repo rows and audits each change)\n",
+    );
+    help.push_str(
+        "  powder repository-doctor --db ./data/powder.db  (report-only: lists repository rows carrying a legacy auto-create provenance tag for review)\n",
     );
     help.push_str(
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000  (mirrors reciprocally onto 002, 003, and 004 atomically)\n",
@@ -1012,6 +1017,12 @@ fn repository_list(args: &[String]) -> Result<String, ShellError> {
         store.list_repositories().map_err(store_err)?
     };
     to_pretty_json(&serde_json::json!({ "repositories": repositories }))
+}
+
+fn repository_doctor(args: &[String]) -> Result<String, ShellError> {
+    let store = open_store(required_flag(args, "--db")?)?;
+    let report = store.repository_doctor().map_err(store_err)?;
+    to_pretty_json(&report)
 }
 
 fn repository_get(args: &[String]) -> Result<String, ShellError> {
@@ -2063,14 +2074,49 @@ mod tests {
     /// before a lane starts (powder-924): it must report the exact commit
     /// this build compiled from, not just an unchanging crate version that
     /// has sat at 0.1.0 since inception.
+    ///
+    /// Pins remote env explicitly (powder-cli-version-test-hermeticity):
+    /// `run()` reads real process env, so on a workstation with
+    /// `POWDER_API_BASE_URL` set this would make live /readyz calls and
+    /// flake on a server restart. Using `run_with_env` + `remote_env(None,
+    /// None)` keeps this assertion hermetic regardless of workstation env.
     #[test]
     fn cli_version_reports_the_build_commit() {
-        let output = run(&args(["version"])).unwrap();
+        let env = remote_env(None, None);
+        let output = run_with_env(&args(["version"]), &env).unwrap();
         assert!(output.starts_with("powder 0.1.0 (git "));
         assert!(!output.contains("(git )"), "must not embed an empty sha");
 
-        assert_eq!(run(&args(["--version"])).unwrap(), output);
-        assert_eq!(run(&args(["-v"])).unwrap(), output);
+        assert_eq!(run_with_env(&args(["--version"]), &env).unwrap(), output);
+        assert_eq!(run_with_env(&args(["-v"]), &env).unwrap(), output);
+    }
+
+    /// Alias equivalence must also hold when a remote is configured and
+    /// `version` queries /readyz for drift comparison, not just on the
+    /// offline path above -- exercised against a local test server so it
+    /// stays hermetic (powder-cli-version-test-hermeticity).
+    #[test]
+    fn cli_version_alias_equivalence_with_configured_remote() {
+        let local_sha = env!("POWDER_CLI_GIT_SHA");
+        let (base_url, _recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({"ok": true, "version": "0.1.0", "git_sha": local_sha}),
+            ),
+            (
+                200,
+                json!({"ok": true, "version": "0.1.0", "git_sha": local_sha}),
+            ),
+            (
+                200,
+                json!({"ok": true, "version": "0.1.0", "git_sha": local_sha}),
+            ),
+        ]);
+        let env = remote_env(Some(&base_url), None);
+
+        let output = run_with_env(&args(["version"]), &env).unwrap();
+        assert_eq!(run_with_env(&args(["--version"]), &env).unwrap(), output);
+        assert_eq!(run_with_env(&args(["-v"]), &env).unwrap(), output);
     }
 
     /// powder-workstation-cli-convergence: no `POWDER_API_BASE_URL`
@@ -2656,6 +2702,18 @@ mod tests {
         assert!(repository.contains("\"name\": \"canary\""));
         assert!(repository.contains("canary-app"));
 
+        // Repository rows are explicit-only (powder-repo-registry-tightness):
+        // register "legacy-canary" itself before filing a card under it, so
+        // the merge-alias step below has a real (if soon-to-be-merged) row
+        // to rehome rather than an implicitly auto-created one.
+        run(&args([
+            "repository-upsert",
+            "--db",
+            &db,
+            "--name",
+            "legacy-canary",
+        ]))
+        .unwrap();
         run(&args([
             "create-card",
             "--db",
@@ -2742,6 +2800,61 @@ mod tests {
         .unwrap();
         assert!(output.contains("\"scanned\": 1"), "output was: {output}");
         assert!(output.contains("\"changes\": []"), "output was: {output}");
+    }
+
+    /// powder-repo-registry-tightness: every card-write path this CLI
+    /// exposes is explicit-only now, so a board built purely through the
+    /// CLI's own public commands can never grow a "suspicious"
+    /// auto-created repository row for `repository-doctor` to flag -- that
+    /// is precisely the outcome this card delivers. This test locks in the
+    /// CLI plumbing (subcommand registered, accepts `--db`, returns the
+    /// report's JSON shape) and the zero-suspicious-rows guarantee for a
+    /// board with one explicitly registered repo; the actual detection of a
+    /// legacy flagged row is covered at the store level
+    /// (`repository_doctor_lists_legacy_auto_created_rows_without_mutating_them`),
+    /// since producing one requires reaching past every live write path.
+    #[test]
+    fn cli_repository_doctor_reports_no_suspicious_rows_for_an_explicitly_registered_board() {
+        assert!(COMMANDS.contains(&"repository-doctor"));
+
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-repository-doctor-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "repository-upsert",
+            "--db",
+            &db,
+            "--name",
+            "explicit-doctor-repo",
+        ]))
+        .unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "doctor-covered",
+            "--title",
+            "Doctor covered",
+            "--acceptance",
+            "proof exists",
+            "--repo",
+            "explicit-doctor-repo",
+        ]))
+        .unwrap();
+
+        let output = run(&args(["repository-doctor", "--db", &db])).unwrap();
+        assert!(
+            output.contains("\"suspicious\": []"),
+            "output was: {output}"
+        );
     }
 
     /// powder-dogfood-2026-07-14-nonreciprocal-relations: `update-relations`
@@ -3125,6 +3238,18 @@ mod tests {
         let issues_file = issues_file.to_string_lossy().to_string();
 
         run(&args(["init-db", "--db", &db])).unwrap();
+        // Repository rows are explicit-only (powder-repo-registry-tightness):
+        // register "example" before filing any card under it.
+        run(&args([
+            "repository-upsert",
+            "--db",
+            &db,
+            "--name",
+            "example",
+            "--tier",
+            "active",
+        ]))
+        .unwrap();
         let imported = run(&args([
             "import-github-issues",
             &issues_file,
@@ -3143,17 +3268,6 @@ mod tests {
             open_card["card"].get("acceptance").is_none(),
             "no fabricated acceptance"
         );
-        run(&args([
-            "repository-upsert",
-            "--db",
-            &db,
-            "--name",
-            "example",
-            "--tier",
-            "active",
-        ]))
-        .unwrap();
-
         let closed_card = run(&args(["get-card", "example-2", "--db", &db])).unwrap();
         assert!(closed_card.contains("\"status\": \"done\""));
 

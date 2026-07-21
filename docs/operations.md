@@ -175,9 +175,11 @@ it keeps sending the old value until something restarts it (powder-944).
 Restarting the MCP client always fixes this. To avoid the restart, set
 `POWDER_API_KEY_CMD` to a shell command that prints a fresh key on stdout
 (e.g. `security find-generic-password -a "$USER" -s powder-api-key -w`);
-`powder-mcp` runs it once at boot and again, once, on the first `401` a
-request hits, transparently retrying with whatever key that produces if it
-differs from the one that just failed. `POWDER_API_KEY` remains the plain
+`powder-mcp` runs it once at boot and again on every `401` epoch -- not just
+the first one for the life of the process -- transparently retrying with
+whatever key that produces if it differs from the one that just failed. A
+second (or third) rotation later in the same long-lived subprocess self-heals
+the same way. `POWDER_API_KEY` remains the plain
 fallback and is unchanged when `POWDER_API_KEY_CMD` is unset. A `401` that
 survives the retry (or has no `POWDER_API_KEY_CMD` to retry with) names the
 key prefix `powder-mcp` used and says to restart the client or configure

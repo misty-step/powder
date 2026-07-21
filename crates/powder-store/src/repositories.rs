@@ -117,6 +117,37 @@ pub struct RepositoryNormalizeChange {
     pub canonical_repo: String,
 }
 
+/// Repo strings that reached a `repositories` row through a legacy
+/// implicit-creation path -- `persist_card`'s pre-powder-repo-registry-
+/// tightness auto-attach, or the one-time `backfill_repositories_from_cards`
+/// migration -- rather than an explicit `POST /api/v1/repositories` /
+/// `repository-upsert` registration. `repository_doctor` flags rows
+/// stamped with one of these so an operator can review them.
+const AUTO_CREATED_IMPORT_PROVENANCE: [&str; 2] = ["card repo", "existing card import"];
+
+/// One repository row `Store::repository_doctor` flagged as possibly a
+/// stray auto-created row rather than a deliberately registered repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryDoctorEntry {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub tier: RepositoryTier,
+    pub import_provenance: Option<String>,
+    pub card_count: usize,
+    pub created_at: i64,
+}
+
+/// Result of [`Store::repository_doctor`]: how many repository rows exist
+/// in total, and every one of them still carrying an auto-create provenance
+/// tag. `suspicious` sorts by ascending `card_count` (then name) so the
+/// least-used -- and therefore most likely stray -- rows sort first. This
+/// pass is read-only: it never deletes, merges, or reclassifies a row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryDoctorReport {
+    pub scanned: usize,
+    pub suspicious: Vec<RepositoryDoctorEntry>,
+}
+
 impl Store {
     pub(crate) fn apply_ratified_repository_tier_seed(&mut self) -> Result<()> {
         let transaction = self
@@ -529,6 +560,55 @@ impl Store {
             updated_at: record.updated_at,
         }))
     }
+
+    /// List every repository row still carrying an auto-create provenance
+    /// tag (`"card repo"` from `persist_card`'s pre-powder-repo-registry-
+    /// tightness write path, or `"existing card import"` from the one-time
+    /// migration backfill) for operator review. Read-only: it never deletes,
+    /// merges, or reclassifies a row -- act on what it reports via
+    /// `upsert_repository`/`merge_repository_alias`.
+    pub fn repository_doctor(&self) -> Result<RepositoryDoctorReport> {
+        let scanned = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM repositories", [], |row| {
+                row.get::<_, i64>(0)
+            })? as usize;
+        let mut statement = self.connection.prepare(
+            "SELECT name FROM repositories WHERE import_provenance IN (?1, ?2) ORDER BY name ASC",
+        )?;
+        let names = statement
+            .query_map(
+                params![
+                    AUTO_CREATED_IMPORT_PROVENANCE[0],
+                    AUTO_CREATED_IMPORT_PROVENANCE[1]
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut suspicious = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(summary) = self.repository_summary(&name)? else {
+                continue;
+            };
+            suspicious.push(RepositoryDoctorEntry {
+                name: summary.name,
+                aliases: summary.aliases,
+                tier: summary.tier,
+                import_provenance: summary.import_provenance,
+                card_count: summary.card_count,
+                created_at: summary.created_at,
+            });
+        }
+        suspicious.sort_by(|a, b| {
+            a.card_count
+                .cmp(&b.card_count)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(RepositoryDoctorReport {
+            scanned,
+            suspicious,
+        })
+    }
 }
 
 pub(crate) fn ensure_repository_entity(
@@ -560,7 +640,15 @@ pub(crate) fn ensure_repository_entity(
     Ok(Some(name))
 }
 
-pub(crate) fn resolve_repository_name(
+/// Look up the canonical name an existing `repositories` row (or
+/// `repository_aliases` entry) resolves `raw_repo` to, WITHOUT ever
+/// falling back to a guessed canonical label for a repo that was never
+/// registered. `None` means "no row exists for this string, in any form" --
+/// the caller must reject the write rather than invent one (see
+/// `persist_card`, the sole write-time gate this backs). Contrast with
+/// `resolve_repository_name`, which is for read-time filtering/matching and
+/// intentionally falls back to a best-effort canonical guess.
+pub(crate) fn resolve_registered_repository_name(
     connection: &Connection,
     raw_repo: &str,
 ) -> Result<Option<String>> {
@@ -592,6 +680,9 @@ pub(crate) fn resolve_repository_name(
     let Some(canonical) = canonical_repo_label(&raw) else {
         return Ok(None);
     };
+    if canonical == raw {
+        return Ok(None);
+    }
     if let Some(name) = connection
         .query_row(
             "SELECT repository_name FROM repository_aliases WHERE alias = ?1",
@@ -602,7 +693,61 @@ pub(crate) fn resolve_repository_name(
     {
         return Ok(Some(name));
     }
-    Ok(Some(canonical))
+    if connection
+        .query_row(
+            "SELECT 1 FROM repositories WHERE name = ?1",
+            [canonical.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Ok(Some(canonical));
+    }
+    Ok(None)
+}
+
+/// Read-time/filter-time repo-name resolution: like
+/// `resolve_registered_repository_name`, but when nothing is registered it
+/// still returns a best-effort canonical guess instead of `None`, so callers
+/// that only ever *read* (list filtering, `get_repository`, the
+/// normalization sweep) keep matching legacy/unregistered strings leniently.
+/// Never used to decide whether a write may proceed -- see `persist_card`.
+pub(crate) fn resolve_repository_name(
+    connection: &Connection,
+    raw_repo: &str,
+) -> Result<Option<String>> {
+    if let Some(name) = resolve_registered_repository_name(connection, raw_repo)? {
+        return Ok(Some(name));
+    }
+    let raw = normalize_repository_token(raw_repo)?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    Ok(canonical_repo_label(&raw))
+}
+
+/// Write-time gate for `persist_card`: resolves `raw_repo` the same as
+/// `resolve_registered_repository_name` (`None` for anything unregistered,
+/// so the caller can reject the write), but additionally records `raw_repo`
+/// as an alias of the resolved repo when it isn't already the canonical
+/// name -- e.g. a card written with "misty-step/canary" against an
+/// already-registered "canary" repo gets that full slug recorded as a
+/// discoverable alias. This never creates a *repository* row, only (at
+/// most) an alias mapping onto one that a human already registered.
+pub(crate) fn resolve_registered_repository_for_write(
+    connection: &Connection,
+    raw_repo: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let raw = normalize_repository_token(raw_repo)?;
+    let Some(resolved) = resolve_registered_repository_name(connection, &raw)? else {
+        return Ok(None);
+    };
+    if raw != resolved {
+        insert_repository_alias(connection, &resolved, &raw, now, false)?;
+    }
+    Ok(Some(resolved))
 }
 
 pub(crate) fn normalize_repository_token(raw: &str) -> Result<String> {

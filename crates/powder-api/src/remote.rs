@@ -79,10 +79,17 @@ impl RemoteClient {
 
     /// `key_cmd` is `POWDER_API_KEY_CMD`: an optional shell command that
     /// resolves the API key, run once now (its result overrides `api_key`
-    /// on success) and again, once, the first time a request comes back
-    /// `401` -- the fix for a long-lived MCP subprocess stranded on a
-    /// rotated key with no way to pick up a fresh one short of a restart
-    /// (powder-944). `api_key` remains the plain fallback: with no
+    /// on success) and again on every `401` epoch -- not a single-shot
+    /// budget spent once for the life of the process, but a fresh
+    /// re-resolve attempt each time the currently active key newly starts
+    /// failing auth, so a long-lived MCP subprocess self-heals across any
+    /// number of key rotations, not just the first (powder-944, hardened
+    /// by powder-key-reresolve-per-epoch). A resolve that returns the same
+    /// key already in use is a no-op retry (dedupe: a genuinely revoked
+    /// deployment costs one bounded extra invocation per epoch, never a
+    /// retry loop), and a resolve that transiently fails (locked keychain,
+    /// non-zero exit, empty output) spends nothing -- the next epoch gets
+    /// its own attempt. `api_key` remains the plain fallback: with no
     /// `key_cmd`, or when it fails to resolve, behavior is unchanged.
     pub fn new_with_key_cmd(
         base_url: String,
@@ -129,9 +136,12 @@ impl RemoteClient {
 
     /// Send `method path` with the key active at call time; on a `401`,
     /// re-resolve `key_cmd` (if configured) and retry exactly once with
-    /// whatever key that produces. Tracks a 404 streak across calls so a
-    /// stale-base-URL class of failure (powder-965) gets a distinct steer
-    /// from an auth failure.
+    /// whatever key that produces. This runs on every call that 401s, not
+    /// just the first one ever seen by this client: each 401 is its own
+    /// re-resolve epoch, so a second (or third, ...) key rotation later in
+    /// the process is handled exactly like the first. Tracks a 404 streak
+    /// across calls so a stale-base-URL class of failure (powder-965) gets
+    /// a distinct steer from an auth failure.
     fn dispatch(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         let first_key = self.current_key();
         let mut result = self.send_once(method, path, body.as_ref(), first_key.as_deref());
