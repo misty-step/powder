@@ -378,29 +378,112 @@ html:not([data-pw-route='card']) .pw-detail-app {
    works identically at 390px and on desktop with no separate mobile path. */
 .pw-quick-add {
   flex: none;
-  padding: 0.8em 2em;
-  border-bottom: 1px solid var(--ae-line);
-  background: var(--ae-wash);
+  padding: var(--pw-space-4) var(--pw-space-6);
+  border-bottom: var(--pw-line-width) solid var(--color-line);
+  background: var(--color-surface-raised);
 }
 
 .pw-quick-add[hidden] {
   display: none;
 }
 
+/* powder-ui-tone-down-tokens: the panel title is the one place hierarchy
+   reads on this surface — a text-lg semibold title over sm/base labels —
+   so the type scale is exercised without exceeding the still-enforced
+   one-size law on the unmigrated board. */
+.pw-quick-add-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--pw-weight-semibold);
+  color: var(--color-ink);
+  letter-spacing: 0.01em;
+}
+
 .pw-quick-add-form {
   display: flex;
   flex-direction: column;
-  gap: 0.8em;
-  max-width: 32rem;
+  gap: var(--pw-space-3);
+  max-width: var(--pw-measure-form);
 }
 
 .pw-quick-add-form label {
   display: block;
 }
 
+/* scoped re-theme of the shared .ae-chrome label and .ae-input control so
+   the panel reads from the new role tokens, not the comic-ops --ae-* kit.
+   Every value below is a token reference; the literals live in tokens.css. */
+.pw-quick-add-form .ae-chrome {
+  display: block;
+  margin-bottom: var(--pw-space-1);
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--pw-weight-medium);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.pw-quick-add-form .pw-optional {
+  margin-left: var(--pw-space-2);
+  color: var(--color-faint);
+  font-weight: var(--pw-weight-regular);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.pw-quick-add-form .ae-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--pw-space-2) var(--pw-space-3);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface-sunken);
+  color: var(--color-ink);
+  font: inherit;
+  font-size: var(--text-base);
+  transition: border-color var(--pw-quick) var(--pw-ease);
+}
+
+.pw-quick-add-form .ae-input::placeholder {
+  color: var(--color-faint);
+}
+
+.pw-quick-add-form .ae-input:focus-visible {
+  outline: none;
+  border-color: var(--color-ink);
+  box-shadow: 0 0 0 var(--pw-focus-width) var(--color-line);
+}
+
 .pw-quick-add-actions {
   display: flex;
-  gap: 0.8em;
+  gap: var(--pw-space-3);
+  margin-top: var(--pw-space-1);
+}
+
+/* scoped re-theme of the shared .ae-button pair so the action row reads
+   from the new role tokens. min-height is left to the base .ae-button so no
+   px literal enters the migrated view code. */
+.pw-quick-add-actions .ae-button {
+  border-radius: var(--radius-0);
+  font-size: var(--text-sm);
+  font-weight: var(--pw-weight-medium);
+  padding: var(--pw-space-2) var(--pw-space-5);
+}
+
+.pw-quick-add-actions .ae-button:not(.ae-button-quiet) {
+  background: var(--color-ink);
+  color: var(--color-accent-ink);
+  border-color: var(--color-ink);
+}
+
+.pw-quick-add-actions .ae-button-quiet {
+  background: transparent;
+  color: var(--color-ink);
+  border-color: var(--color-line);
+}
+
+.pw-quick-add-actions .ae-button-quiet:hover {
+  background: var(--color-surface-sunken);
 }
 
 .pw-status-change {
@@ -1184,27 +1267,28 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-combo-list {
   position: absolute;
   inset-inline: 0;
-  top: calc(100% + 2px);
+  top: calc(100% + var(--pw-space-1));
   z-index: 30;
   margin: 0;
-  padding: 0.25em 0;
+  padding: var(--pw-space-1) 0;
   list-style: none;
   max-height: 14em;
   overflow-y: auto;
-  background: var(--ae-surface);
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius, 4px);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  background: var(--color-surface);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  box-shadow: var(--pw-shadow-pop);
 }
 
 .pw-combo-list li {
-  padding: 0.55em 0.7em;
-  font-size: 13px;
+  padding: var(--pw-space-2) var(--pw-space-3);
+  font-size: var(--text-sm);
+  color: var(--color-ink);
   cursor: pointer;
 }
 
 .pw-combo-list li.pw-combo-none {
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   font-style: italic;
 }
 
@@ -1212,14 +1296,46 @@ html:not([data-pw-route='card']) .pw-detail-app {
   width: 100%;
 }
 
-.pw-combo-field input {
+/* scoped re-theme of the shared .pw-search field the combobox wraps, so the
+   quick-add repo input reads from the new role tokens (the filters-panel
+   .pw-search stays on the comic-ops kit until its own migration card). */
+.pw-quick-add-form .pw-combo-field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pw-space-2);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface-sunken);
+  padding: var(--pw-space-1) var(--pw-space-3);
+  color: var(--color-ink);
+}
+
+.pw-quick-add-form .pw-combo-field .ae-icon {
+  color: var(--color-faint);
+}
+
+.pw-quick-add-form .pw-combo-field input {
   flex: 1 1 auto;
   width: auto;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: var(--text-base);
+  color: var(--color-ink);
+}
+
+.pw-quick-add-form .pw-combo-field input::placeholder {
+  color: var(--color-faint);
+}
+
+.pw-quick-add-form .pw-combo-field:focus-within {
+  border-color: var(--color-ink);
+  box-shadow: 0 0 0 var(--pw-focus-width) var(--color-line);
 }
 
 .pw-combo-list li.is-active,
 .pw-combo-list li:hover {
-  background: var(--ae-wash);
+  background: var(--color-surface-sunken);
 }
 
 /* instant-paint loading skeleton: shown only on a cache-less first load */
@@ -1577,35 +1693,36 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-quick-add-attach {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
+  gap: var(--pw-space-1);
 }
 
 .pw-quick-add-attach input {
   width: 100%;
   box-sizing: border-box;
-  padding: 0.45rem 0.55rem;
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
-  background: var(--ae-surface);
-  color: var(--ae-ink);
+  padding: var(--pw-space-2) var(--pw-space-3);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface-sunken);
+  color: var(--color-ink);
   font: inherit;
+  font-size: var(--text-base);
 }
 
 .pw-quick-add-attachment-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem 0.7rem;
+  gap: var(--pw-space-1) var(--pw-space-3);
   list-style: none;
   margin: 0;
   padding: 0;
-  color: var(--ae-ink-muted);
-  font-size: 12px;
+  color: var(--color-muted);
+  font-size: var(--text-xs);
 }
 
 .pw-quick-add-attachment-list li {
   display: inline-flex;
   align-items: baseline;
-  gap: 0.4rem;
+  gap: var(--pw-space-1);
   max-width: 100%;
   overflow-wrap: anywhere;
 }
@@ -1716,12 +1833,12 @@ html:not([data-pw-route='card']) .pw-detail-app {
   }
 
   .pw-quick-add-form .ae-input {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-quick-add-actions button,
   .pw-quick-add-attach input {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-board {
