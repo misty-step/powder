@@ -6,15 +6,22 @@
 //! `actor`/`admin` tool arguments needed.
 
 use powder_api::{parse_card_summary_page, urlencode, RemoteClient};
-use powder_core::DetailLevel;
+use powder_core::{normalize_acceptance, normalize_labels, DetailLevel};
 use serde_json::{json, Value};
 
 use super::{
-    card_id, claim_action, missing_required, optional_repository_tier,
+    card_id, card_ids_array, claim_action, missing_required, optional_repository_tier,
     optional_repository_visibility, optional_str, parse_estimate, parse_priority, parse_risk,
-    parse_status, required_claim_arg, required_str, run_id, run_id_for_claim, to_string,
-    ClaimAction,
+    parse_status, required_claim_arg, required_str, run_id, run_id_for_claim, string_array,
+    to_string, ClaimAction,
 };
+
+fn normalize_relation_wire(args: &Value, key: &'static str) -> Result<Value, String> {
+    Ok(json!(card_ids_array(args, key)?
+        .into_iter()
+        .map(|id| id.as_str().to_owned())
+        .collect::<Vec<_>>()))
+}
 
 pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Result<Value, String> {
     let payload = match name {
@@ -74,10 +81,10 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let mut body = json!({
                 "id": id,
                 "title": title,
-                "acceptance": args["acceptance"].as_array().cloned().unwrap_or_default(),
-                "related": args["related"].as_array().cloned().unwrap_or_default(),
-                "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
-                "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
+                "acceptance": normalize_acceptance(string_array(args, "acceptance")?),
+                "related": normalize_relation_wire(args, "related")?,
+                "blocks": normalize_relation_wire(args, "blocks")?,
+                "blocked_by": normalize_relation_wire(args, "blocked_by")?,
             });
             if let Some(value) = optional_str(args, "body") {
                 body["body"] = json!(value);
@@ -101,8 +108,8 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 parse_risk(value)?;
                 body["risk"] = json!(value);
             }
-            if let Some(value) = args["labels"].as_array() {
-                body["labels"] = json!(value);
+            if args["labels"].is_array() {
+                body["labels"] = json!(normalize_labels(string_array(args, "labels")?));
             }
             if let Some(value) = optional_str(args, "repo") {
                 body["repo"] = json!(value);
@@ -135,8 +142,8 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = optional_str(args, "body") {
                 body["body"] = json!(value);
             }
-            if let Some(value) = args["acceptance"].as_array() {
-                body["acceptance"] = json!(value);
+            if args["acceptance"].is_array() {
+                body["acceptance"] = json!(normalize_acceptance(string_array(args, "acceptance")?));
             }
             if let Some(value) = args["proof_plan"].as_array() {
                 body["proof_plan"] = json!(value);
@@ -282,9 +289,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 response = Some(client.post(
                     &format!("/api/v1/cards/{id}/relations"),
                     json!({
-                        "related": args["related"].as_array().cloned().unwrap_or_default(),
-                        "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
-                        "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
+                        "related": normalize_relation_wire(args, "related")?,
+                        "blocks": normalize_relation_wire(args, "blocks")?,
+                        "blocked_by": normalize_relation_wire(args, "blocked_by")?,
                     }),
                 )?);
             }
