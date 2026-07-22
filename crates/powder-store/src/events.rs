@@ -7,7 +7,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    from_json, non_empty, to_json, IdempotencyOutcome, Result, Store, StoreError, API_KEY_ALPHABET,
+    from_json, non_empty, to_json, IdempotencyOutcome, KeyedOperationContext, Result, Store,
+    StoreError, API_KEY_ALPHABET,
 };
 
 pub const CARD_EVENT_SCHEMA_VERSION: &str = "powder.card_event.v1";
@@ -453,9 +454,7 @@ impl Store {
             Operation::ReplayDeadLetter,
             resource,
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| replay_dead_letters_in_transaction(transaction, subscription_id, now),
         )
     }

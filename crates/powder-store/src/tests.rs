@@ -9,9 +9,9 @@ use powder_core::{
 use crate::schema::SCHEMA;
 use crate::{
     ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig,
-    IdempotencyRequest, ImportOutcome, ParentCoverageBucket, ParentIssueKind, RelationField,
-    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, SearchQuery, Store, StoreError,
-    WorkLogAttribution, API_KEY_ALPHABET,
+    IdempotencyRequest, ImportOutcome, KeyedOperationContext, ParentCoverageBucket,
+    ParentIssueKind, RelationField, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result,
+    SearchQuery, Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -1215,9 +1215,7 @@ fn keyed_dead_letter_replay_is_atomic_and_replay_safe() -> Result<()> {
             Operation::ReplayDeadLetter,
             "dead_letter:all",
             &serde_json::json!({"subscription_id": null}),
-            "dead-letter-rollback",
-            now,
-            &admin,
+            KeyedOperationContext::new(now, "dead-letter-rollback", &admin),
             |_| Err(DomainError::conflict("forced rollback").into()),
         )
         .unwrap_err();
@@ -1247,9 +1245,7 @@ fn keyed_dead_letter_replay_is_atomic_and_replay_safe() -> Result<()> {
             Operation::ReplayDeadLetter,
             "dead_letter:all",
             &serde_json::json!({"subscription_id": "different"}),
-            "dead-letter-rollback",
-            now + 2,
-            &admin,
+            KeyedOperationContext::new(now + 2, "dead-letter-rollback", &admin),
             |_| Err(DomainError::conflict("receipt must prevent execution").into()),
         )
         .unwrap_err();
@@ -1455,9 +1451,7 @@ fn keyed_repository_mutations_replay_conflict_and_rollback_atomically() -> Resul
             Operation::DeleteRepository,
             "repository:keyed-delete",
             &serde_json::json!({"name": "different"}),
-            "repo-delete",
-            29,
-            &admin,
+            KeyedOperationContext::new(29, "repo-delete", &admin),
             |_| Err(DomainError::conflict("receipt must prevent execution").into()),
         )
         .unwrap_err();
@@ -1482,9 +1476,7 @@ fn keyed_repository_mutations_replay_conflict_and_rollback_atomically() -> Resul
             Operation::NormalizeRepositories,
             "repositories:all",
             &serde_json::json!({"normalize": true}),
-            "repo-normalize",
-            31,
-            &admin,
+            KeyedOperationContext::new(31, "repo-normalize", &admin),
             |_| Err(DomainError::conflict("forced rollback").into()),
         )
         .unwrap_err();
@@ -1504,9 +1496,7 @@ fn keyed_repository_mutations_replay_conflict_and_rollback_atomically() -> Resul
             Operation::NormalizeRepositories,
             "repositories:all",
             &serde_json::json!({"normalize": false}),
-            "repo-normalize",
-            34,
-            &admin,
+            KeyedOperationContext::new(34, "repo-normalize", &admin),
             |_| Err(DomainError::conflict("receipt must prevent execution").into()),
         )
         .unwrap_err();
@@ -4689,19 +4679,15 @@ fn keyed_claim_transitions_replay_without_duplicate_mutation_or_audit() -> Resul
         &card_ids[3],
         &transfer.run_id,
         "agent-b",
-        20,
         50,
-        "transfer-1",
-        &authority,
+        KeyedOperationContext::new(20, "transfer-1", &authority),
     )?;
     let transferred_retry = store.transfer_claim_keyed(
         &card_ids[3],
         &transfer.run_id,
         "agent-b",
-        21,
         50,
-        "transfer-1",
-        &authority,
+        KeyedOperationContext::new(21, "transfer-1", &authority),
     )?;
     assert!(!transferred.replayed);
     assert!(transferred_retry.replayed);
@@ -4711,10 +4697,8 @@ fn keyed_claim_transitions_replay_without_duplicate_mutation_or_audit() -> Resul
         &card_ids[3],
         &transfer.run_id,
         "agent-c",
-        22,
         50,
-        "transfer-1",
-        &authority,
+        KeyedOperationContext::new(22, "transfer-1", &authority),
     );
     assert!(matches!(
         conflict,
@@ -8385,7 +8369,7 @@ fn keyed_idempotency_replays_conflicts_and_gc_is_durable() {
     let error = store
         .with_idempotency::<IdempotencyTestReceipt, _>(&mismatch, |_| unreachable!())
         .unwrap_err();
-    assert_eq!(error.to_string().contains("different payload"), true);
+    assert!(error.to_string().contains("different payload"));
     assert_eq!(
         match error {
             StoreError::Domain(ref domain) => domain.denial_class(),
@@ -8472,9 +8456,7 @@ fn keyed_store_mutations_do_not_duplicate_real_rows() {
             "worker-a",
             attribution,
             "doing",
-            13,
-            "log-1",
-            &authority,
+            KeyedOperationContext::new(13, "log-1", &authority),
         )
         .unwrap();
     assert!(!log.replayed);
@@ -8484,9 +8466,7 @@ fn keyed_store_mutations_do_not_duplicate_real_rows() {
             "worker-a",
             attribution,
             "doing",
-            13,
-            "log-1",
-            &authority,
+            KeyedOperationContext::new(13, "log-1", &authority),
         )
         .unwrap();
     assert!(log_replay.replayed);
@@ -8566,9 +8546,7 @@ fn keyed_link_attachment_and_answer_delivery_replay_atomically() -> Result<()> {
         b"image-bytes",
         "image/png",
         "proof.png",
-        13,
-        "image-1",
-        &admin,
+        KeyedOperationContext::new(13, "image-1", &admin),
     )?;
     assert!(!image.replayed);
     let image_replay = store.attach_image_as_keyed(
@@ -8576,9 +8554,7 @@ fn keyed_link_attachment_and_answer_delivery_replay_atomically() -> Result<()> {
         b"image-bytes",
         "image/png",
         "proof.png",
-        14,
-        "image-1",
-        &admin,
+        KeyedOperationContext::new(14, "image-1", &admin),
     )?;
     assert!(image_replay.replayed);
     assert_eq!(store.attachments_for_card(&card_id)?.len(), 1);
@@ -8625,9 +8601,11 @@ fn every_keyed_matrix_operation_has_one_store_executor() {
                 operation,
                 format!("matrix:{}", operation.as_str()),
                 &payload,
-                format!("key-{}", operation.as_str()).as_str(),
-                100,
-                &authority,
+                KeyedOperationContext::new(
+                    100,
+                    format!("key-{}", operation.as_str()).as_str(),
+                    &authority,
+                ),
                 |_| Ok(operation.as_str().to_string()),
             )
             .unwrap();

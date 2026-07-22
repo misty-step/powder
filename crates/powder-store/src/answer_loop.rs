@@ -9,8 +9,8 @@ use powder_core::{
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    load_all_cards, load_card, non_empty, non_empty_scrubbed, schema::RUN_SELECT_SQL, Result,
-    RunRecord, Store, StoreError,
+    load_all_cards, load_card, non_empty, non_empty_scrubbed, schema::RUN_SELECT_SQL,
+    KeyedOperationContext, Result, RunRecord, Store, StoreError,
 };
 
 const CONCISE_DETAIL_LIMIT: i64 = 20;
@@ -219,9 +219,7 @@ impl Store {
             Operation::AnswerInput,
             format!("run:{}", run_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 answer_input_in_transaction(transaction, run_id, actor, answer, now, authority)
             },

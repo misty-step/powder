@@ -808,7 +808,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept error request");
             let mut request = [0_u8; 4096];
-            stream.read(&mut request).expect("read error request");
+            let _ = stream.read(&mut request).expect("read error request");
             let response = format!(
                 "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()

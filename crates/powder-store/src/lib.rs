@@ -156,6 +156,24 @@ pub struct IdempotencyOutcome<T> {
     pub replayed: bool,
 }
 
+/// Shared request metadata for a keyed mutation.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyedOperationContext<'a> {
+    now: i64,
+    idempotency_key: &'a str,
+    authority: &'a Authority,
+}
+
+impl<'a> KeyedOperationContext<'a> {
+    pub fn new(now: i64, idempotency_key: &'a str, authority: &'a Authority) -> Self {
+        Self {
+            now,
+            idempotency_key,
+            authority,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     pub q: String,
@@ -830,9 +848,7 @@ impl Store {
         operation: Operation,
         resource: impl Into<String>,
         payload: &P,
-        key: &str,
-        now: i64,
-        authority: &Authority,
+        context: KeyedOperationContext<'_>,
         mutation: F,
     ) -> Result<IdempotencyOutcome<T>>
     where
@@ -840,6 +856,11 @@ impl Store {
         P: Serialize,
         F: FnOnce(&Transaction<'_>) -> Result<T>,
     {
+        let KeyedOperationContext {
+            now,
+            idempotency_key: key,
+            authority,
+        } = context;
         if !matches!(
             operation.rule().idempotency,
             powder_core::IdempotencyMode::Keyed
@@ -2421,9 +2442,7 @@ impl Store {
             Operation::PatchCard,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| patch_card_in_transaction(transaction, card_id, patch, authority, now),
         )
     }
@@ -2477,18 +2496,19 @@ impl Store {
         criterion: usize,
         actor: &str,
         checked: bool,
-        now: i64,
-        idempotency_key: &str,
-        authority: &Authority,
+        context: KeyedOperationContext<'_>,
     ) -> Result<IdempotencyOutcome<Card>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
         let payload = json!({"criterion": criterion, "actor": actor, "checked": checked});
         self.with_keyed_operation(
             Operation::CheckCriterion,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 check_criterion_in_transaction(
                     transaction,
@@ -3478,9 +3498,7 @@ impl Store {
             Operation::UpdateStatus,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 update_status_in_transaction(transaction, card_id, status, now, authority)
             },
@@ -3529,10 +3547,13 @@ impl Store {
         related: Vec<CardId>,
         blocks: Vec<CardId>,
         blocked_by: Vec<CardId>,
-        now: i64,
-        idempotency_key: &str,
-        authority: &Authority,
+        context: KeyedOperationContext<'_>,
     ) -> Result<IdempotencyOutcome<Card>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
         let payload = json!({
             "related": related,
             "blocks": blocks,
@@ -3542,9 +3563,7 @@ impl Store {
             Operation::UpdateRelations,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 update_relations_in_transaction(
                     transaction,
@@ -3592,9 +3611,7 @@ impl Store {
             Operation::SetParent,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| set_parent_in_transaction(transaction, card_id, parent, now, authority),
         )
     }
@@ -3627,9 +3644,7 @@ impl Store {
             Operation::ReleaseClaim,
             format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 release_claim_in_transaction(transaction, card_id, run_id, now, authority)
             },
@@ -3667,9 +3682,7 @@ impl Store {
             Operation::RenewClaim,
             format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 renew_claim_in_transaction(
                     transaction,
@@ -3712,9 +3725,7 @@ impl Store {
             Operation::HeartbeatClaim,
             format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 heartbeat_claim_in_transaction(transaction, card_id, run_id, now, authority)
             },
@@ -3755,19 +3766,20 @@ impl Store {
         card_id: &CardId,
         run_id: &RunId,
         to_agent: &str,
-        now: i64,
         ttl_seconds: u64,
-        idempotency_key: &str,
-        authority: &Authority,
+        context: KeyedOperationContext<'_>,
     ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
         let payload = json!({"run_id": run_id, "to_agent": to_agent, "ttl_seconds": ttl_seconds, "action": "transfer"});
         self.with_keyed_operation(
             Operation::TransferClaim,
             format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 transfer_claim_in_transaction(
                     transaction,
@@ -3826,19 +3838,20 @@ impl Store {
         bytes: &[u8],
         mime: &str,
         filename: &str,
-        now: i64,
-        idempotency_key: &str,
-        authority: &Authority,
+        context: KeyedOperationContext<'_>,
     ) -> Result<IdempotencyOutcome<AttachmentMeta>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
         let digest = format!("{:x}", Sha256::digest(bytes));
         let payload = json!({"digest": digest, "mime": mime, "filename": filename});
         self.with_keyed_operation(
             Operation::AttachImage,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 attach_image_in_transaction(
                     transaction,
@@ -3903,9 +3916,7 @@ impl Store {
             Operation::DetachImage,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 detach_in_transaction(transaction, card_id, attachment_id, now, authority)
             },
@@ -3973,9 +3984,7 @@ impl Store {
             Operation::AddLink,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| add_link_in_transaction(transaction, card_id, label, url, now, authority),
         )
     }
@@ -4097,10 +4106,13 @@ impl Store {
         agent: &str,
         attribution: WorkLogAttribution<'_>,
         body: &str,
-        now: i64,
-        idempotency_key: &str,
-        authority: &Authority,
+        context: KeyedOperationContext<'_>,
     ) -> Result<IdempotencyOutcome<WorkLogEntry>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
         let payload = json!({
             "agent": agent,
             "model": attribution.model,
@@ -4159,9 +4171,7 @@ impl Store {
             Operation::RequestInput,
             format!("run:{}", run_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 request_input_in_transaction(transaction, run_id, question, now, authority)
             },
@@ -4222,9 +4232,7 @@ impl Store {
             Operation::CompleteCard,
             format!("card:{}", card_id.as_str()),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 complete_card_in_transaction(
                     transaction,

@@ -2653,9 +2653,17 @@ mod tests {
         assert!(admin
             .authorize_operation(Operation::CompleteCard, None, None, 10)
             .is_ok());
-        assert!(agent
-            .authorize_operation(Operation::ClaimCard, None, None, 10)
-            .is_ok());
+        assert!(
+            agent
+                .authorize_operation_with_worker(
+                    Operation::ClaimCard,
+                    None,
+                    None,
+                    Some("worker-a"),
+                    10,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2674,9 +2682,9 @@ mod tests {
             .authorize_operation(Operation::RequestInput, Some(&claim), Some(&other_run), 5)
             .unwrap_err();
         assert_eq!(error.denial_class(), Some(DenialClass::CrossResource));
-        assert_eq!(Operation::RequestInput.rule().audit.run, true);
-        assert_eq!(Operation::UpdateStatus.rule().audit.reason, true);
-        assert_eq!(Operation::WorkLog.rule().audit.semantic_identity, true);
+        assert!(Operation::RequestInput.rule().audit.run);
+        assert!(Operation::UpdateStatus.rule().audit.reason);
+        assert!(Operation::WorkLog.rule().audit.semantic_identity);
     }
 
     #[test]

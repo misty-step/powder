@@ -42,8 +42,9 @@ use powder_core::{
 };
 use powder_shell::unix_now;
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, SearchQuery, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig,
+    KeyedOperationContext, RepositoryTier, RepositoryUpsert, RepositoryVisibility, SearchQuery,
+    Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1444,14 +1445,12 @@ async fn delete_repository(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
-    lock_store(&state)?
-        .delete_repository_with_authority_keyed(
-            &name,
-            unix_now(),
-            idempotency_key,
-            &actor.authority(),
-        )?
-        .value;
+    lock_store(&state)?.delete_repository_with_authority_keyed(
+        &name,
+        unix_now(),
+        idempotency_key,
+        &actor.authority(),
+    )?;
     Ok(Json(json!({ "deleted": true, "repository": name })))
 }
 
@@ -1740,10 +1739,8 @@ async fn transfer_claim(
             &card_id,
             &run_id,
             &request.to_agent,
-            unix_now(),
             request.ttl_seconds.unwrap_or(3600),
-            idempotency_key,
-            &actor.authority(),
+            KeyedOperationContext::new(unix_now(), idempotency_key, &actor.authority()),
         )?
         .value;
     Ok(Json(json!(receipt)))
@@ -1789,9 +1786,7 @@ async fn update_relations(
             related,
             blocks,
             blocked_by,
-            unix_now(),
-            idempotency_key,
-            &actor.authority(),
+            KeyedOperationContext::new(unix_now(), idempotency_key, &actor.authority()),
         )?
         .value;
     Ok(Json(card))
@@ -1837,9 +1832,7 @@ async fn check_criterion(
             request.criterion,
             &request.actor,
             request.checked.unwrap_or(true),
-            unix_now(),
-            idempotency_key,
-            &authenticated.authority(),
+            KeyedOperationContext::new(unix_now(), idempotency_key, &authenticated.authority()),
         )?
         .value;
     Ok(Json(card))
@@ -1873,9 +1866,7 @@ async fn upload_attachment(
             body.as_ref(),
             mime,
             filename,
-            unix_now(),
-            idempotency_key,
-            &authenticated.authority(),
+            KeyedOperationContext::new(unix_now(), idempotency_key, &authenticated.authority()),
         )?
         .value;
     Ok(Json(json!({
@@ -1988,9 +1979,7 @@ async fn append_work_log(
             &request.agent,
             attribution,
             &request.body,
-            unix_now(),
-            idempotency_key,
-            &authenticated.authority(),
+            KeyedOperationContext::new(unix_now(), idempotency_key, &authenticated.authority()),
         )?
         .value;
     Ok(Json(json!(entry)))

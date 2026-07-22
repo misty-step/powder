@@ -9,8 +9,9 @@ use powder_core::{
     ReadyCursor, ReadyQuery, Risk, RunId,
 };
 use powder_store::{
-    BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, SearchQuery, Store,
+    BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput,
+    KeyedOperationContext, RepositoryTier, RepositoryUpsert, RepositoryVisibility, SearchQuery,
+    Store,
 };
 use serde_json::{json, Value};
 
@@ -663,7 +664,7 @@ pub fn call_tool_store_with_authority(
                 .merge_repository_alias_with_authority_keyed(
                     alias,
                     target,
-                    &authority,
+                    authority,
                     now,
                     required_idempotency_key(args)?,
                 )
@@ -755,9 +756,11 @@ pub fn call_tool_store_with_authority(
                     criterion,
                     actor,
                     checked,
-                    now,
-                    required_idempotency_key(args)?,
-                    authority_arg(args, authority)?,
+                    KeyedOperationContext::new(
+                        now,
+                        required_idempotency_key(args)?,
+                        authority_arg(args, authority)?,
+                    ),
                 )
                 .map_err(to_string)?;
             let mut payload = criterion_ack_payload(&outcome.value, criterion, checked);
@@ -788,9 +791,11 @@ pub fn call_tool_store_with_authority(
                             card_ids_array(args, "related")?,
                             card_ids_array(args, "blocks")?,
                             card_ids_array(args, "blocked_by")?,
-                            now,
-                            idempotency_key,
-                            authority_arg(args, authority)?,
+                            KeyedOperationContext::new(
+                                now,
+                                idempotency_key,
+                                authority_arg(args, authority)?,
+                            ),
                         )
                         .map(|outcome| {
                             replayed |= outcome.replayed;
@@ -873,9 +878,11 @@ pub fn call_tool_store_with_authority(
                     agent,
                     attribution,
                     body,
-                    now,
-                    required_idempotency_key(args)?,
-                    authority_arg(args, authority)?,
+                    KeyedOperationContext::new(
+                        now,
+                        required_idempotency_key(args)?,
+                        authority_arg(args, authority)?,
+                    ),
                 )
                 .map_err(to_string)?;
             keyed_value(outcome)?
@@ -1285,10 +1292,8 @@ fn manage_claim_store(
                     &card_id,
                     &run_id,
                     to_agent,
-                    now,
                     ttl_seconds,
-                    required_idempotency_key(args)?,
-                    authority,
+                    KeyedOperationContext::new(now, required_idempotency_key(args)?, authority),
                 )
                 .map_err(to_string)?;
             keyed_value(outcome)

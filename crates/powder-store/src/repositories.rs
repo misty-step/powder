@@ -4,7 +4,10 @@ use powder_core::{canonical_repo_label, Authority, CardStatus, DomainError, Oper
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::{non_empty, non_empty_scrubbed, IdempotencyOutcome, Result, Store, StoreError};
+use crate::{
+    non_empty, non_empty_scrubbed, IdempotencyOutcome, KeyedOperationContext, Result, Store,
+    StoreError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -280,9 +283,7 @@ impl Store {
             Operation::UpsertRepository,
             format!("repository:{}", resource_name),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 let name = upsert_repository_in_transaction(transaction, upsert, now, authority)?;
                 repository_summary_on_connection(transaction, &name)?
@@ -320,9 +321,7 @@ impl Store {
             Operation::DeleteRepository,
             format!("repository:{}", name),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| delete_repository_in_transaction(transaction, name, authority),
         )
     }
@@ -380,9 +379,7 @@ impl Store {
             Operation::MergeRepositoryAlias,
             format!("repository:{}", target),
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 let actor = authority.actor_label();
                 let (target_name, canonical_alias, rehomed_cards) =
@@ -553,9 +550,7 @@ impl Store {
             Operation::NormalizeRepositories,
             "repositories:all",
             &payload,
-            idempotency_key,
-            now,
-            authority,
+            KeyedOperationContext::new(now, idempotency_key, authority),
             |transaction| {
                 let actor = authority.actor_label();
                 normalize_repository_strings_in_transaction(transaction, &actor, now, authority)

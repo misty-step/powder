@@ -12,8 +12,8 @@ use powder_shell::{
     namespace_cards_for_repo, unix_now, ParsedCard, ShellError,
 };
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
-    SearchQuery, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, KeyedOperationContext, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility, SearchQuery, Store, StoreError,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -840,9 +840,7 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
             card_ids_flag(args, "--related")?,
             card_ids_flag(args, "--blocks")?,
             card_ids_flag(args, "--blocked-by")?,
-            now,
-            &idempotency_key(args)?,
-            &authority(args),
+            KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
         )
         .map_err(store_err)?
         .value;
@@ -1544,10 +1542,8 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
                 &card_id,
                 &run_id,
                 to_agent,
-                now,
                 ttl_seconds,
-                &idempotency_key(args)?,
-                &authority(args),
+                KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
             )
             .map_err(store_err)?
             .value;
@@ -1777,9 +1773,7 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                     criterion,
                     actor,
                     checked,
-                    now,
-                    &idempotency_key(args)?,
-                    &authority(args),
+                    KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
                 )
                 .map_err(store_err)?,
         )?
@@ -1901,9 +1895,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                     agent,
                     attribution,
                     body,
-                    now,
-                    &idempotency_key(args)?,
-                    &authority(args),
+                    KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
                 )
                 .map_err(store_err)?,
         )?
