@@ -4628,6 +4628,126 @@ fn concurrent_claims_allow_exactly_one_active_lease() -> Result<()> {
 }
 
 #[test]
+fn keyed_claim_transitions_replay_without_duplicate_mutation_or_audit() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let authority = Authority::principal("agent-a", false);
+    let card_ids = [
+        CardId::new("release")?,
+        CardId::new("renew")?,
+        CardId::new("heartbeat")?,
+        CardId::new("transfer")?,
+    ];
+    store.import_cards(
+        card_ids
+            .iter()
+            .map(|id| ready_card(id.as_str(), 2))
+            .collect(),
+    )?;
+
+    let release = store.claim_card(&card_ids[0], "agent-a", 10, 60, &authority)?;
+    let renew = store.claim_card(&card_ids[1], "agent-a", 10, 60, &authority)?;
+    let heartbeat = store.claim_card(&card_ids[2], "agent-a", 10, 60, &authority)?;
+    let transfer = store.claim_card(&card_ids[3], "agent-a", 10, 60, &authority)?;
+
+    let released =
+        store.release_claim_keyed(&card_ids[0], &release.run_id, 20, "release-1", &authority)?;
+    let released_retry =
+        store.release_claim_keyed(&card_ids[0], &release.run_id, 21, "release-1", &authority)?;
+    assert!(!released.replayed);
+    assert!(released_retry.replayed);
+    assert_eq!(released.value, released_retry.value);
+
+    let renewed =
+        store.renew_claim_keyed(&card_ids[1], &renew.run_id, 20, 50, "renew-1", &authority)?;
+    let renewed_retry =
+        store.renew_claim_keyed(&card_ids[1], &renew.run_id, 21, 50, "renew-1", &authority)?;
+    assert!(!renewed.replayed);
+    assert!(renewed_retry.replayed);
+    assert_eq!(renewed.value, renewed_retry.value);
+    assert_eq!(renewed.value.expires_at, 70);
+
+    let heartbeated = store.heartbeat_claim_keyed(
+        &card_ids[2],
+        &heartbeat.run_id,
+        20,
+        "heartbeat-1",
+        &authority,
+    )?;
+    let heartbeated_retry = store.heartbeat_claim_keyed(
+        &card_ids[2],
+        &heartbeat.run_id,
+        21,
+        "heartbeat-1",
+        &authority,
+    )?;
+    assert!(!heartbeated.replayed);
+    assert!(heartbeated_retry.replayed);
+    assert_eq!(heartbeated.value, heartbeated_retry.value);
+
+    let transferred = store.transfer_claim_keyed(
+        &card_ids[3],
+        &transfer.run_id,
+        "agent-b",
+        20,
+        50,
+        "transfer-1",
+        &authority,
+    )?;
+    let transferred_retry = store.transfer_claim_keyed(
+        &card_ids[3],
+        &transfer.run_id,
+        "agent-b",
+        21,
+        50,
+        "transfer-1",
+        &authority,
+    )?;
+    assert!(!transferred.replayed);
+    assert!(transferred_retry.replayed);
+    assert_eq!(transferred.value, transferred_retry.value);
+
+    let conflict = store.transfer_claim_keyed(
+        &card_ids[3],
+        &transfer.run_id,
+        "agent-c",
+        22,
+        50,
+        "transfer-1",
+        &authority,
+    );
+    assert!(matches!(
+        conflict,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdempotencyConflict,
+            ..
+        }))
+    ));
+
+    for (card_id, needle) in [
+        (&card_ids[0], "released"),
+        (&card_ids[1], "renewed"),
+        (&card_ids[2], "heartbeat"),
+        (&card_ids[3], "transferred"),
+    ] {
+        let detail = store
+            .get_card_detail(card_id, DetailLevel::Detailed, 100)?
+            .expect("card detail");
+        let prefix = format!("{needle} ");
+        assert_eq!(
+            detail
+                .activities
+                .iter()
+                .filter(|activity| activity.payload.starts_with(&prefix))
+                .count(),
+            1,
+            "duplicate delivery must not append a second {needle} activity"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn renew_claim_extends_the_card_and_run_lease() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

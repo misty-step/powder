@@ -3609,30 +3609,31 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let claim = card.release_claim(run_id, now)?;
-        persist_card(&transaction, &card)?;
-        release_run(&transaction, run_id, now)?;
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("released {card_id}"),
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
-        events::append_outbound_card_event_with_authority(
-            &transaction,
-            &card,
-            "moved-to-ready",
-            authority,
-            json!({"source": "release_claim", "run_id": run_id.as_str()}),
-            now,
-        )?;
+        let receipt = release_claim_in_transaction(&transaction, card_id, run_id, now, authority)?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
+    }
+
+    pub fn release_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let payload = json!({"run_id": run_id, "action": "release"});
+        self.with_keyed_operation(
+            Operation::ReleaseClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                release_claim_in_transaction(transaction, card_id, run_id, now, authority)
+            },
+        )
     }
 
     pub fn renew_claim(
@@ -3646,30 +3647,40 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let claim = card.renew_claim(run_id, now, ttl_seconds)?;
-        persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET claim_expires_at = ?2, updated_at = ?3
-             WHERE id = ?1",
-            params![run_id.as_str(), claim.expires_at, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("renewed {card_id} until {}", claim.expires_at),
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
+        let receipt =
+            renew_claim_in_transaction(&transaction, card_id, run_id, now, ttl_seconds, authority)?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
+    }
+
+    pub fn renew_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        ttl_seconds: u64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let payload = json!({"run_id": run_id, "ttl_seconds": ttl_seconds, "action": "renew"});
+        self.with_keyed_operation(
+            Operation::RenewClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                renew_claim_in_transaction(
+                    transaction,
+                    card_id,
+                    run_id,
+                    now,
+                    ttl_seconds,
+                    authority,
+                )
+            },
+        )
     }
 
     pub fn heartbeat_claim(
@@ -3682,39 +3693,38 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let claim = card.heartbeat_claim(run_id, now)?;
-        persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET updated_at = ?2
-             WHERE id = ?1",
-            params![run_id.as_str(), now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("heartbeat {card_id}"),
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
+        let receipt =
+            heartbeat_claim_in_transaction(&transaction, card_id, run_id, now, authority)?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
     }
 
-    /// Hand an active claim to a different agent atomically (powder-936):
-    /// no release-then-race window where a third party could grab the card
-    /// between the release and the intended recipient's claim. Invocable by
-    /// the current holder or an admin, same as renew/release/heartbeat.
-    /// Same run id throughout -- this is a handoff on the existing lease,
-    /// not a new claim -- so the activity trail records one transfer event
-    /// naming both agents rather than a release paired with a claim.
+    pub fn heartbeat_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let payload = json!({"run_id": run_id, "action": "heartbeat"});
+        self.with_keyed_operation(
+            Operation::HeartbeatClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                heartbeat_claim_in_transaction(transaction, card_id, run_id, now, authority)
+            },
+        )
+    }
+
+    /// Hand an active claim to a different agent atomically (powder-936).
+    /// The keyed variant records the request receipt with the mutation, so a
+    /// retried delivery returns the original transfer without adding a second
+    /// audit event or changing the lease again.
     pub fn transfer_claim(
         &mut self,
         card_id: &CardId,
@@ -3727,31 +3737,49 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let from_agent = card.claim_holder().unwrap_or_default().to_string();
-        let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
-        persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET agent = ?2, claim_expires_at = ?3, updated_at = ?4
-             WHERE id = ?1",
-            params![run_id.as_str(), to_agent, claim.expires_at, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity_attributed(
+        let receipt = transfer_claim_in_transaction(
             &transaction,
+            card_id,
             run_id,
-            ActivityType::Action,
-            &format!("transferred {card_id} from {from_agent} to {to_agent}"),
-            authority.principal_name(),
-            Some(authority.role_label()),
+            to_agent,
             now,
+            ttl_seconds,
+            authority,
         )?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
+    }
+
+    pub fn transfer_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        to_agent: &str,
+        now: i64,
+        ttl_seconds: u64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let payload = json!({"run_id": run_id, "to_agent": to_agent, "ttl_seconds": ttl_seconds, "action": "transfer"});
+        self.with_keyed_operation(
+            Operation::TransferClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                transfer_claim_in_transaction(
+                    transaction,
+                    card_id,
+                    run_id,
+                    to_agent,
+                    now,
+                    ttl_seconds,
+                    authority,
+                )
+            },
+        )
     }
 
     pub fn attach_image(
@@ -5519,6 +5547,138 @@ fn close_run_for_status(
         return Err(DomainError::not_found("run", run_id.to_string()).into());
     }
     Ok(())
+}
+
+fn release_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    now: i64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    authority.require_holder(card.claim_principal())?;
+    let claim = card.release_claim(run_id, now)?;
+    persist_card(transaction, &card)?;
+    release_run(transaction, run_id, now)?;
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("released {card_id}"),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    events::append_outbound_card_event_with_authority(
+        transaction,
+        &card,
+        "moved-to-ready",
+        authority,
+        json!({"source": "release_claim", "run_id": run_id.as_str()}),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
+}
+
+fn renew_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    now: i64,
+    ttl_seconds: u64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    authority.require_holder(card.claim_principal())?;
+    let claim = card.renew_claim(run_id, now, ttl_seconds)?;
+    persist_card(transaction, &card)?;
+    let updated = transaction.execute(
+        "UPDATE runs
+         SET claim_expires_at = ?2, updated_at = ?3
+         WHERE id = ?1",
+        params![run_id.as_str(), claim.expires_at, now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("renewed {card_id} until {}", claim.expires_at),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
+}
+
+fn heartbeat_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    now: i64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    authority.require_holder(card.claim_principal())?;
+    let claim = card.heartbeat_claim(run_id, now)?;
+    persist_card(transaction, &card)?;
+    let updated = transaction.execute(
+        "UPDATE runs
+         SET updated_at = ?2
+         WHERE id = ?1",
+        params![run_id.as_str(), now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("heartbeat {card_id}"),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
+}
+
+fn transfer_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    to_agent: &str,
+    now: i64,
+    ttl_seconds: u64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    authority.require_holder(card.claim_principal())?;
+    let from_agent = card.claim_holder().unwrap_or_default().to_string();
+    let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
+    persist_card(transaction, &card)?;
+    let updated = transaction.execute(
+        "UPDATE runs
+         SET agent = ?2, claim_expires_at = ?3, updated_at = ?4
+         WHERE id = ?1",
+        params![run_id.as_str(), to_agent, claim.expires_at, now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("transferred {card_id} from {from_agent} to {to_agent}"),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
 }
 
 fn claim_receipt(card_id: &CardId, claim: &Claim) -> ClaimReceipt {

@@ -270,7 +270,7 @@ impl Operation {
             | Self::CompleteCard => (Correct, Card, Principal, Keyed),
             Self::ClaimCard => (Execute, None, Worker, RetrySafe),
             Self::ReleaseClaim | Self::RenewClaim | Self::HeartbeatClaim | Self::TransferClaim => {
-                (Execute, Card, Worker, RetrySafe)
+                (Execute, Card, Worker, Keyed)
             }
             Self::WorkLog | Self::AddLink => (Execute, Card, Worker, Keyed),
             Self::AddComment => (Execute, None, Principal, Keyed),
@@ -2590,6 +2590,32 @@ mod tests {
             Operation::Destructive.rule().capability,
             OperationCapability::Destructive
         );
+    }
+
+    #[test]
+    fn operation_matrix_serializes_every_rule_with_required_audit_provenance() {
+        for operation in Operation::ALL {
+            let rule = operation.rule();
+            let encoded = serde_json::to_value(rule).expect("operation rule serializes");
+            assert_eq!(encoded["operation"], operation.as_str());
+            assert_eq!(encoded["audit"]["operation"], true);
+            assert_eq!(encoded["audit"]["resource"], true);
+            assert_eq!(encoded["audit"]["principal"], true);
+            assert_eq!(encoded["audit"]["role"], true);
+            assert!(encoded["capability"].as_str().is_some());
+            assert!(encoded["claim"].as_str().is_some());
+            assert!(encoded["identity"].as_str().is_some());
+            assert!(encoded["idempotency"].as_str().is_some());
+        }
+
+        for operation in [
+            Operation::ReleaseClaim,
+            Operation::RenewClaim,
+            Operation::HeartbeatClaim,
+            Operation::TransferClaim,
+        ] {
+            assert_eq!(operation.rule().idempotency, IdempotencyMode::Keyed);
+        }
     }
 
     #[test]
