@@ -9,7 +9,10 @@ use axum::{
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 use tower::ServiceExt;
@@ -6244,11 +6247,20 @@ fn spawn_verifying_webhook(secret: &'static str) -> (String, mpsc::Receiver<Capt
     (url, receiver)
 }
 
+static TEST_IDEMPOTENCY_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 fn json_request(method: Method, uri: &str, raw_key: Option<&str>, body: &str) -> Request<Body> {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header("Content-Type", "application/json");
+        .header("Content-Type", "application/json")
+        .header(
+            "Idempotency-Key",
+            format!(
+                "test-request-{}",
+                TEST_IDEMPOTENCY_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
+        );
     if let Some(raw_key) = raw_key {
         builder = builder.header(AUTHORIZATION, format!("Bearer {raw_key}"));
     }

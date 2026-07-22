@@ -37,8 +37,8 @@ use powder_core::Priority;
 use powder_core::{
     canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
     parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
-    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyCursor, ReadyQuery,
-    RunId,
+    CardFieldError, CardId, CardStatus, DenialClass, DetailLevel, PapercutReport, ReadyCursor,
+    ReadyQuery, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -1451,6 +1451,7 @@ async fn get_card(
 async fn create_card(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Json(request): Json<CreateCardRequest>,
 ) -> Result<Json<Value>, ApiError> {
     // powder-925: single-card authoring is agent-accessible, same as
@@ -1502,9 +1503,12 @@ async fn create_card(
     card.blocked_by = card_ids(request.blocked_by, CardField::BlockedBy)?;
     card.parent = request.parent.map(CardId::new).transpose()?;
     card.repo = request.repo;
+    let idempotency_key = required_idempotency_key(&headers)?;
     let card = {
         let mut store = lock_store(&state)?;
-        store.create_card_with_events_as(card, &actor.authority(), now)?
+        store
+            .create_card_with_events_as_keyed(card, idempotency_key, &actor.authority(), now)?
+            .value
     };
     let mut payload = json!(card);
     if card.acceptance.is_empty() {
@@ -1804,23 +1808,29 @@ async fn add_link(
 async fn add_comment(
     State(state): State<AppState>,
     AuthActor(authenticated): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<CommentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id)?;
-    let comment = lock_store(&state)?.add_comment_as(
-        &card_id,
-        &request.author,
-        &request.body,
-        unix_now(),
-        &authenticated.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let comment = lock_store(&state)?
+        .add_comment_as_keyed(
+            &card_id,
+            &request.author,
+            &request.body,
+            unix_now(),
+            idempotency_key,
+            &authenticated.authority(),
+        )?
+        .value;
     Ok(Json(json!(comment)))
 }
 
 async fn append_work_log(
     State(state): State<AppState>,
     AuthActor(authenticated): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<WorkLogRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1831,14 +1841,18 @@ async fn append_work_log(
         harness: request.harness.as_deref(),
         run_id: request.run_id.as_deref(),
     };
-    let entry = lock_store(&state)?.append_work_log_as(
-        &card_id,
-        &request.agent,
-        attribution,
-        &request.body,
-        unix_now(),
-        &authenticated.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let entry = lock_store(&state)?
+        .append_work_log_as_keyed(
+            &card_id,
+            &request.agent,
+            attribution,
+            &request.body,
+            unix_now(),
+            idempotency_key,
+            &authenticated.authority(),
+        )?
+        .value;
     Ok(Json(json!(entry)))
 }
 
@@ -2209,6 +2223,22 @@ impl FromRequestParts<AppState> for AdminActor {
     ) -> Result<Self, Self::Rejection> {
         require_admin(state, &parts.headers).map(AdminActor)
     }
+}
+
+fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get("idempotency-key")
+        .ok_or_else(|| ApiError::bad_request("missing Idempotency-Key header for keyed mutation"))?
+        .to_str()
+        .map(str::trim)
+        .map_err(|_| ApiError::bad_request("Idempotency-Key must be valid ASCII"))
+        .and_then(|key| {
+            if key.is_empty() {
+                Err(ApiError::bad_request("Idempotency-Key cannot be empty"))
+            } else {
+                Ok(key)
+            }
+        })
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
@@ -2592,6 +2622,7 @@ fn lock_store(state: &AppState) -> Result<MutexGuard<'_, Store>, ApiError> {
 struct ApiError {
     status: StatusCode,
     message: String,
+    denial_class: Option<DenialClass>,
 }
 
 impl ApiError {
@@ -2599,6 +2630,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            denial_class: None,
         }
     }
 
@@ -2606,6 +2638,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            denial_class: Some(DenialClass::Unauthenticated),
         }
     }
 
@@ -2613,6 +2646,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
             message: message.into(),
+            denial_class: None,
         }
     }
 
@@ -2620,6 +2654,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            denial_class: None,
         }
     }
 
@@ -2627,6 +2662,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            denial_class: None,
         }
     }
 }
@@ -2637,6 +2673,7 @@ impl IntoResponse for ApiError {
             self.status,
             Json(json!({
                 "error": self.message,
+                "denial_class": self.denial_class.map(DenialClass::as_str),
             })),
         )
             .into_response()
@@ -2661,22 +2698,30 @@ impl From<CardFieldError> for ApiError {
 
 impl From<powder_core::DomainError> for ApiError {
     fn from(value: powder_core::DomainError) -> Self {
+        let denial_class = value.denial_class();
         match value {
-            powder_core::DomainError::Validation { .. } => Self::bad_request(value.to_string()),
+            powder_core::DomainError::Validation { .. } => Self {
+                status: StatusCode::BAD_REQUEST,
+                message: value.to_string(),
+                denial_class,
+            },
             powder_core::DomainError::NotFound { .. } => Self {
                 status: StatusCode::NOT_FOUND,
                 message: value.to_string(),
+                denial_class,
             },
             powder_core::DomainError::Conflict(_) | powder_core::DomainError::ClaimExpired(_) => {
                 Self {
                     status: StatusCode::CONFLICT,
                     message: value.to_string(),
+                    denial_class,
                 }
             }
             powder_core::DomainError::Forbidden(_)
             | powder_core::DomainError::AuthorityDenied { .. } => Self {
                 status: StatusCode::FORBIDDEN,
                 message: value.to_string(),
+                denial_class,
             },
         }
     }

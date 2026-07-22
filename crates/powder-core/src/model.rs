@@ -128,8 +128,9 @@ pub enum OperationCapability {
     Destructive,
 }
 
-/// Claim ownership required by an operation. Corrections intentionally do not
-/// require a claim: claims coordinate worker execution and never own card truth.
+/// Claim ownership required by an operation. Worker agents must hold the current
+/// claim where the matrix says so; admin and trusted-local authority bypass that
+/// requirement for explicit corrections, while claims never own card truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimRequirement {
@@ -296,7 +297,7 @@ impl Operation {
                 principal: true,
                 role: true,
                 semantic_identity: !matches!(identity, IdentityRequirement::None),
-                run: matches!(claim, ClaimRequirement::CurrentRun),
+                run: !matches!(claim, ClaimRequirement::None),
                 reason: matches!(
                     capability,
                     OperationCapability::CardCorrection | OperationCapability::Destructive
