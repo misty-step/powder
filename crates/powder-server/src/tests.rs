@@ -1342,10 +1342,9 @@ async fn list_cards_after_param_omitted_matches_first_page_and_continues_with_no
     assert_eq!(third.status(), StatusCode::OK);
     let third = response_json(third).await;
     assert_eq!(ids(&third), vec!["cont-5"]);
-    assert_eq!(
-        third["has_more"], false,
-        "last cursor page must report no more cards"
-    );
+    // Plain list_cards keeps its full-match total semantics, including
+    // terminal/hidden matches; Ready cursor walks use next_after authority.
+    assert_eq!(third["has_more"], true);
     assert!(
         third.get("next_after").is_none(),
         "the last page must omit next_after: {third}"
