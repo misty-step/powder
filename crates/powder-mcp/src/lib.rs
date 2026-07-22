@@ -1330,7 +1330,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 21);
+        assert_eq!(default_tools.len(), 22);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
