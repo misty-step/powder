@@ -6,8 +6,8 @@ use powder_core::{
 use crate::schema::SCHEMA;
 use crate::{
     ApiKeyScope, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
-    RelationField, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, Store,
-    StoreError, WorkLogAttribution, API_KEY_ALPHABET,
+    ParentCoverageBucket, ParentIssueKind, RelationField, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility, Result, Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -2290,10 +2290,10 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
     assert_eq!(report.scanned, 2);
     assert_eq!(report.issue_count(), 1);
     let issue = &report.issues[0];
-    assert_eq!(issue.card_id.as_str(), "a");
+    assert_eq!(issue.card_id.as_deref(), Some("a"));
     assert_eq!(issue.field, RelationField::Blocks);
-    assert_eq!(issue.target_id.as_str(), "x");
-    assert_eq!(issue.expected_mirror_field, RelationField::BlockedBy);
+    assert_eq!(issue.target_id.as_deref(), Some("x"));
+    assert_eq!(issue.expected_mirror_field, Some(RelationField::BlockedBy));
     assert!(!issue.repaired);
 
     // Report-only mode must not have written anything.
@@ -2319,6 +2319,280 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
     // Idempotent: nothing left to repair.
     let second = store.relations_doctor("operator", 70, true)?;
     assert_eq!(second.issue_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn parent_graph_doctor_classifies_corruption_and_refuses_ambiguous_repair() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("epic", 10),
+        ready_card("middle", 11),
+        ready_card("leaf", 12),
+        ready_card("plain", 13),
+        ready_card("dangling", 14),
+        ready_card("self", 15),
+        ready_card("cycle-a", 16),
+        ready_card("cycle-b", 17),
+        ready_card("invalid-parent", 18),
+        ready_card("invalid-id", 19),
+    ])?;
+    store
+        .connection
+        .execute("UPDATE cards SET parent = 'epic' WHERE id = 'middle'", [])?;
+    store
+        .connection
+        .execute("UPDATE cards SET parent = 'middle' WHERE id = 'leaf'", [])?;
+    let clean = store.parent_graph_report()?;
+    assert!(clean.issues.is_empty());
+    assert!(clean.coverage.is_complete());
+    assert_eq!(clean.coverage.classified, 10);
+    store.connection.execute_batch(
+        "UPDATE cards SET parent = 'epic' WHERE id = 'middle';
+         UPDATE cards SET parent = 'middle' WHERE id = 'leaf';
+         UPDATE cards SET parent = 'ghost' WHERE id = 'dangling';
+         UPDATE cards SET parent = 'self' WHERE id = 'self';
+         UPDATE cards SET parent = 'cycle-b' WHERE id = 'cycle-a';
+         UPDATE cards SET parent = 'cycle-a' WHERE id = 'cycle-b';
+         UPDATE cards SET parent = '   ' WHERE id = 'invalid-parent';
+         UPDATE cards SET id = ' ' WHERE id = 'invalid-id';",
+    )?;
+
+    let graph = store.parent_graph_report()?;
+    assert_eq!(graph.scanned, 10);
+    assert_eq!(graph.issues.len(), 6);
+    assert!(graph.issues.iter().any(|issue| {
+        issue.card_id.as_deref() == Some("dangling")
+            && issue.kind == ParentIssueKind::DanglingParent
+            && issue.parent_id.as_deref() == Some("ghost")
+    }));
+    assert!(graph.issues.iter().any(|issue| {
+        issue.card_id.as_deref() == Some("self") && issue.kind == ParentIssueKind::SelfParent
+    }));
+    assert_eq!(
+        graph
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == ParentIssueKind::Cycle)
+            .count(),
+        2
+    );
+    assert!(graph.issues.iter().any(|issue| {
+        issue.card_id.as_deref() == Some("invalid-parent")
+            && issue.kind == ParentIssueKind::InvalidStoredId
+    }));
+    assert!(graph.issues.iter().any(|issue| {
+        issue.kind == ParentIssueKind::InvalidStoredId && issue.card_id.as_deref() == Some(" ")
+    }));
+
+    assert_eq!(graph.coverage.scanned, 10);
+    assert_eq!(graph.coverage.classified, 4);
+    assert_eq!(graph.coverage.unclassified, 6);
+    assert_eq!(graph.coverage.duplicate, 0);
+    assert!(!graph.coverage.is_complete());
+    let assignment = |id: &str| {
+        graph
+            .coverage
+            .assignments
+            .iter()
+            .find(|entry| entry.card_id == id)
+            .expect("coverage assignment")
+    };
+    assert_eq!(
+        assignment("epic").bucket,
+        ParentCoverageBucket::EpicAncestor
+    );
+    assert_eq!(assignment("epic").ancestor_id.as_deref(), Some("epic"));
+    assert_eq!(assignment("plain").bucket, ParentCoverageBucket::Unsorted);
+    assert_eq!(assignment("middle").ancestor_id.as_deref(), Some("epic"));
+    assert_eq!(assignment("leaf").ancestor_id.as_deref(), Some("epic"));
+
+    let report = store.relations_doctor("operator", 30, false)?;
+    assert_eq!(report.scanned, 10);
+    assert_eq!(report.parent_issues, graph.issues);
+    assert!(report.parent_repair_refusal.is_none());
+    assert!(!report.repaired);
+
+    let repaired = store.relations_doctor("operator", 31, true)?;
+    assert_eq!(repaired.parent_issues, graph.issues);
+    assert!(repaired.parent_issues.iter().all(|issue| !issue.repaired));
+    assert!(repaired
+        .parent_repair_refusal
+        .as_deref()
+        .is_some_and(|message| message.starts_with("refused parent repair:")));
+    assert!(repaired.issues.is_empty());
+    Ok(())
+}
+
+#[test]
+fn relations_doctor_repairs_mirrors_when_parent_repair_is_refused() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("source", 10),
+        ready_card("target", 11),
+        ready_card("invalid", 12),
+    ])?;
+    store.connection.execute_batch(
+        "UPDATE cards SET id = ' ' WHERE id = 'invalid';
+         UPDATE cards SET blocks_json = '[\"target\"]' WHERE id = 'source';",
+    )?;
+
+    let report = store.relations_doctor("operator", 20, false)?;
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(report.issues[0].card_id.as_deref(), Some("source"));
+    assert_eq!(report.issues[0].target_id.as_deref(), Some("target"));
+    assert_eq!(report.parent_issues.len(), 1);
+    assert!(report.parent_repair_refusal.is_none());
+
+    let repaired = store.relations_doctor("operator", 21, true)?;
+    assert_eq!(repaired.issues.len(), 1);
+    assert!(repaired.issues[0].repaired);
+    assert!(repaired
+        .parent_repair_refusal
+        .as_deref()
+        .is_some_and(|message| message.starts_with("refused parent repair:")));
+    let target_blocked_by: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'target'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(target_blocked_by, "[\"source\"]");
+
+    let second = store.relations_doctor("operator", 22, true)?;
+    assert!(second.issues.is_empty());
+    assert_eq!(second.parent_issues.len(), 1);
+    assert!(second.parent_repair_refusal.is_some());
+    Ok(())
+}
+
+#[test]
+fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("source", 10),
+        ready_card("target", 11),
+        ready_card("self", 12),
+        ready_card("malformed", 13),
+        ready_card("invalid", 14),
+    ])?;
+    store.connection.execute_batch(
+        "UPDATE cards SET parent = X'626c6f62' WHERE id = 'target';
+         UPDATE cards SET parent = ' self ' WHERE id = 'self';
+         UPDATE cards SET blocks_json = '[\"target\"]' WHERE id = 'source';
+         UPDATE cards SET blocks_json = 'not-json' WHERE id = 'malformed';
+         UPDATE cards SET blocked_by_json = '[\" beta\"]' WHERE id = 'invalid';",
+    )?;
+    let before_parent: String = store.connection.query_row(
+        "SELECT quote(parent) FROM cards WHERE id = 'target'",
+        [],
+        |row| row.get(0),
+    )?;
+    let before_malformed: String = store.connection.query_row(
+        "SELECT blocks_json FROM cards WHERE id = 'malformed'",
+        [],
+        |row| row.get(0),
+    )?;
+    let before_invalid: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'invalid'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let report = store.relations_doctor("operator", 20, false)?;
+    assert_eq!(report.parent_issues.len(), 2);
+    assert_eq!(report.issues.len(), 3);
+    assert!(report.issues.iter().any(|issue| {
+        issue.kind == crate::RelationIssueKind::InvalidStoredValue
+            && issue.field == RelationField::Blocks
+            && issue.evidence.contains("malformed")
+    }));
+    assert!(report.issues.iter().any(|issue| {
+        issue.kind == crate::RelationIssueKind::InvalidStoredValue
+            && issue.target_id.as_deref() == Some(" beta")
+            && issue.field == RelationField::BlockedBy
+    }));
+    assert!(report.issues.iter().any(|issue| {
+        issue.kind == crate::RelationIssueKind::Asymmetric
+            && issue.card_id.as_deref() == Some("source")
+            && issue.target_id.as_deref() == Some("target")
+    }));
+
+    let repaired = store.relations_doctor("operator", 21, true)?;
+    assert!(repaired.parent_repair_refusal.is_some());
+    assert!(repaired
+        .issues
+        .iter()
+        .any(|issue| { issue.kind == crate::RelationIssueKind::Asymmetric && issue.repaired }));
+    assert!(repaired
+        .issues
+        .iter()
+        .filter(|issue| { issue.kind == crate::RelationIssueKind::InvalidStoredValue })
+        .all(|issue| !issue.repaired));
+    let after_parent: String = store.connection.query_row(
+        "SELECT quote(parent) FROM cards WHERE id = 'target'",
+        [],
+        |row| row.get(0),
+    )?;
+    let after_malformed: String = store.connection.query_row(
+        "SELECT blocks_json FROM cards WHERE id = 'malformed'",
+        [],
+        |row| row.get(0),
+    )?;
+    let after_invalid: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'invalid'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(after_parent, before_parent);
+    assert_eq!(after_malformed, before_malformed);
+    assert_eq!(after_invalid, before_invalid);
+
+    let second = store.relations_doctor("operator", 22, true)?;
+    assert_eq!(second.issues.len(), 2);
+    assert!(second
+        .issues
+        .iter()
+        .all(|issue| issue.kind == crate::RelationIssueKind::InvalidStoredValue));
+    assert!(second.parent_repair_refusal.is_some());
+    Ok(())
+}
+
+#[test]
+fn parent_graph_doctor_rejects_noncanonical_parent_and_card_ids() -> Result<()> {
+    let mut parent_store = Store::open_in_memory()?;
+    parent_store.migrate()?;
+    parent_store.import_cards(vec![ready_card("epic", 10), ready_card("child", 11)])?;
+    parent_store
+        .connection
+        .execute("UPDATE cards SET parent = 'epic ' WHERE id = 'child'", [])?;
+
+    let parent_report = parent_store.parent_graph_report()?;
+    assert_eq!(parent_report.scanned, 2);
+    assert_eq!(parent_report.coverage.classified, 1);
+    assert_eq!(parent_report.coverage.unclassified, 1);
+    assert!(parent_report.issues.iter().any(|issue| {
+        issue.card_id.as_deref() == Some("child")
+            && issue.parent_id.as_deref() == Some("epic ")
+            && issue.kind == ParentIssueKind::InvalidStoredId
+    }));
+
+    let mut card_store = Store::open_in_memory()?;
+    card_store.migrate()?;
+    card_store.import_cards(vec![ready_card("epic", 10), ready_card("child", 11)])?;
+    card_store
+        .connection
+        .execute("UPDATE cards SET id = 'child ' WHERE id = 'child'", [])?;
+
+    let card_report = card_store.parent_graph_report()?;
+    assert_eq!(card_report.scanned, 2);
+    assert_eq!(card_report.coverage.classified, 1);
+    assert_eq!(card_report.coverage.unclassified, 1);
+    assert!(card_report.issues.iter().any(|issue| {
+        issue.card_id.as_deref() == Some("child ") && issue.kind == ParentIssueKind::InvalidStoredId
+    }));
     Ok(())
 }
 

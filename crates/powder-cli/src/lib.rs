@@ -303,13 +303,13 @@ pub fn help() -> String {
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000  (mirrors reciprocally onto 002, 003, and 004 atomically)\n",
     );
     help.push_str(
-        "  powder relations-doctor --db ./data/powder.db  (report-only: cards whose blocks/blocked_by/related disagree with a peer)\n",
+        "  powder relations-doctor --db ./data/powder.db  (report-only: relation asymmetry, malformed relation values, plus dangling/self/cycle/invalid parent edges; nested parents remain valid)\n",
     );
     help.push_str(
-        "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (symmetrizes every found issue and audits each fix)\n",
+        "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (audited relation mirror repair; malformed relation values stay unchanged; parent repair refuses with evidence)\n",
     );
     help.push_str(
-        "    (--repair always ADDS the missing mirror edge, never deletes the one-sided edge: a half-applied removal is indistinguishable from a missing mirror-add, so repair resurrects it. Inspect the report first; finish intended removals via update-relations.)\n",
+        "    (--repair always ADDS missing relation mirrors, never invents parents; parent findings are refused with evidence because raw state has no unambiguous audited correction.)\n",
     );
     help.push_str("  powder set-parent 002 --db ./data/powder.db --parent 001\n");
     help.push_str("  powder set-parent 002 --db ./data/powder.db --clear\n");
@@ -2899,6 +2899,14 @@ mod tests {
         assert!(report.contains("\"scanned\": 2"), "report was: {report}");
         assert!(report.contains("\"issues\": []"), "report was: {report}");
         assert!(
+            report.contains("\"parent_issues\": []"),
+            "report was: {report}"
+        );
+        assert!(
+            report.contains("\"parent_repair_refusal\": null"),
+            "report was: {report}"
+        );
+        assert!(
             report.contains("\"repaired\": false"),
             "report was: {report}"
         );
@@ -2914,6 +2922,11 @@ mod tests {
         .unwrap();
         assert!(
             repaired.contains("\"issues\": []"),
+            "report was: {repaired}"
+        );
+        assert!(
+            repaired.contains("\"parent_issues\": []")
+                && repaired.contains("\"parent_repair_refusal\": null"),
             "report was: {repaired}"
         );
         assert!(

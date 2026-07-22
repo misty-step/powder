@@ -209,14 +209,19 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    ssh root@<box> 'powder relations-doctor --db /data/apps/powder/powder.db --repair --actor operator'
    ```
 
-   Run the report *before* repairing: repair uses union semantics (it adds
-   the missing mirror edge, never deletes the one-sided edge), so it cannot
-   distinguish a missing mirror-add from a half-applied removal — if the
-   report shows an edge you know was meant to be deleted, delete it via
-   `update-relations` instead of letting repair resurrect it. The repair is
-   idempotent and audited per touched card; a clean second run reports zero
-   issues. This step is a one-time backfill, not a recurring deploy step —
-   it can be dropped from this runbook once the live board reports clean.
+   Run the report *before* repairing: normal doctor runs are read-only and
+   include deterministic `parent_issues` findings for dangling, self, cycle,
+   and invalid persisted parent edges, plus typed `issues` findings when relation
+   JSON is malformed or contains noncanonical IDs. Repair uses union semantics for
+   relation mirrors (it adds the missing mirror edge, never deletes the one-sided edge),
+   so it cannot distinguish a missing mirror-add from a half-applied removal —
+   if the report shows an edge you know was meant to be deleted, delete it via
+   `update-relations` instead of letting repair resurrect it. Parent repair
+   is refused with `parent_repair_refusal`: the doctor never invents a parent
+   from corrupted raw state. The relation repair is idempotent and audited per
+   touched card; a clean second run reports zero issues. This step is a one-time
+   backfill for relation mirrors, not a recurring deploy step — it can be
+   dropped from this runbook once the live board reports clean.
 7. **Post-deploy checklist item (lead, not this task):** re-verify the
    Canary heartbeat against the live box after the swap. This is a manual
    step for whoever drove the deploy to do against the real instance --
