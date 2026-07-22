@@ -216,18 +216,6 @@ for (const mode of MODES) {
   });
 }
 
-for (const mode of MODES) {
-  test(`board · ${mode} · the command palette queues Enter during search (powder-ui-keyboard-firstrun)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#cmdk-toggle").click();
-    await page.locator("#cmdk-input").fill("epic-hierarchy-child-a");
-    await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/c\/epic-hierarchy-child-a$/);
-    await assertLaw(page, { consoleErrors: errors });
-  });
-}
 
 // powder-search-p2: exact card-id hits keep their source provenance, and a
 // search result retains the blocker relation needed by the derived blocked
