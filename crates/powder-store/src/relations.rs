@@ -26,7 +26,7 @@
 //! visible to the caller who made the write. Doing both sides inside the
 //! same SQLite transaction as the primary write removes the window
 //! entirely: a relations write either lands consistent on every touched
-//! card or it doesn't land at all. [`Store::relations_doctor`] still
+//! card or it doesn't land at all. [`Store::relations_doctor_with_authority`] still
 //! exists (criterion 2) as a safety net for graphs written before this
 //! guarantee existed, or written directly against the database, bypassing
 //! every face -- not as the mechanism that keeps new writes honest.
@@ -63,7 +63,7 @@
 //! which validates via `ensure_parent_linkable`) -- `update_relations`
 //! already let a card name an id that doesn't exist. We keep that: a
 //! dangling id is not an error, mirroring is just skipped for it (nothing
-//! exists to mirror onto), and [`Store::relations_doctor`] does not report
+//! exists to mirror onto), and [`Store::relations_doctor_with_authority`] does not report
 //! it as an issue -- there is no peer to disagree with. If the referenced
 //! card is created later, its own write (or a `relations_doctor --repair`
 //! pass) is what reconciles it; nothing here backfills automatically.
@@ -88,12 +88,12 @@
 //! (which unmirrors atomically) instead of letting repair re-add them.
 use std::collections::{HashMap, HashSet};
 
-use powder_core::{Authority, Card, CardId};
+use powder_core::{Authority, Card, CardId, Operation};
 use rusqlite::{types::Value, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::from_str;
 
-use crate::{append_card_event, append_card_event_with_authority, non_empty};
+use crate::{append_card_event, append_card_event_with_authority};
 use crate::{Result, Store};
 
 /// Which pair of lists one edge connects. `Related` mirrors into the same
@@ -295,9 +295,10 @@ fn mirror_relation_change_for_doctor(
     field: RelationField,
     self_id: &CardId,
     add: bool,
-    actor: &str,
+    authority: &Authority,
     now: i64,
 ) -> Result<bool> {
+    let actor = authority.actor_label();
     mirror_relation_change_inner(
         connection,
         other_id,
@@ -306,8 +307,8 @@ fn mirror_relation_change_for_doctor(
         add,
         MirrorChangeOptions {
             reject_corrupt: false,
-            actor,
-            authority: None,
+            actor: &actor,
+            authority: Some(authority),
             now,
         },
     )
@@ -1101,14 +1102,14 @@ impl Store {
     /// unambiguous source truth from which this command could invent a parent.
     /// A repair pass therefore refuses parent changes while preserving the
     /// existing audited union repair for reciprocal relation edges.
-    pub fn relations_doctor(
+    pub fn relations_doctor_with_authority(
         &mut self,
-        actor: &str,
+        authority: &Authority,
         now: i64,
         repair: bool,
     ) -> Result<RelationsDoctorReport> {
-        let actor = non_empty("actor", actor)?;
         if repair {
+            authority.authorize_operation(Operation::Destructive, None, None, now)?;
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1138,7 +1139,7 @@ impl Store {
                     field,
                     &card_id,
                     true,
-                    &actor,
+                    authority,
                     now,
                 )? {
                     issue.repaired = true;

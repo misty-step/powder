@@ -66,14 +66,18 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
     let (link_id, first_comment_id, second_comment_id, work_log_id) = {
         let mut store = Store::open(&path).expect("open store");
         store.migrate().expect("migrate fresh store");
-        assert_eq!(SCHEMA_VERSION, 26);
+        assert_eq!(SCHEMA_VERSION, 27);
         store
             .import_cards(vec![ready_card(card_id.as_str())])
             .expect("import card");
 
+        let operator = Authority::principal("roster", true);
         store
-            .check_criterion_as(&card_id, 0, "operator", true, 50, &authority)
+            .check_criterion_as(&card_id, 0, "operator", true, 50, &operator)
             .expect("check criterion");
+        let claim = store
+            .claim_card(&card_id, "worker-a", 50, 600, &authority)
+            .expect("claim card");
         let link = store
             .add_link_as(
                 &card_id,
@@ -84,16 +88,19 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
             )
             .expect("add link");
         let first = store
-            .add_comment_as(&card_id, "operator", "first", 50, &authority)
+            .add_comment_as(&card_id, "roster", "first", 50, &authority)
             .expect("add first comment");
         let second = store
-            .add_comment_as(&card_id, "operator", "second", 50, &authority)
+            .add_comment_as(&card_id, "roster", "second", 50, &authority)
             .expect("add second comment");
         let work_log = store
             .append_work_log_as(
                 &card_id,
                 "worker-a",
-                WorkLogAttribution::default(),
+                WorkLogAttribution {
+                    run_id: Some(claim.run_id.as_str()),
+                    ..WorkLogAttribution::default()
+                },
                 "investigating",
                 50,
                 &authority,
@@ -111,7 +118,7 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
         assert!(detail
             .comments
             .iter()
-            .all(|comment| comment.author == "operator"));
+            .all(|comment| comment.author == "roster"));
         assert_eq!(detail.work_log[0].agent, "worker-a");
         assert!(detail.comments.iter().any(|comment| comment.id == first.id));
         assert!(detail
@@ -129,8 +136,8 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
         for (kind, subject_id, semantic_actor) in [
             ("criterion", "0", "operator"),
             ("link", link.id.as_str(), "roster"),
-            ("comment", first.id.as_str(), "operator"),
-            ("comment", second.id.as_str(), "operator"),
+            ("comment", first.id.as_str(), "roster"),
+            ("comment", second.id.as_str(), "roster"),
             ("work_log", work_log.id.as_str(), "worker-a"),
         ] {
             assert!(attributed.iter().any(|event| {
@@ -235,14 +242,20 @@ fn outbound_failure_rolls_back_domain_row_and_audit_event() {
     let mut store = Store::open(&path).expect("reopen store");
     let authority = Authority::principal("roster", false);
     let error = store
-        .add_comment_as(&card_id, "operator", "must roll back", 70, &authority)
+        .add_comment_as(&card_id, "roster", "must roll back", 70, &authority)
         .expect_err("outbound failure aborts comment");
     assert!(error.to_string().contains("forced outbound failure"));
+    let claim = store
+        .claim_card(&card_id, "worker-a", 70, 600, &authority)
+        .expect("claim card");
     let error = store
         .append_work_log_as(
             &card_id,
             "worker-a",
-            WorkLogAttribution::default(),
+            WorkLogAttribution {
+                run_id: Some(claim.run_id.as_str()),
+                ..WorkLogAttribution::default()
+            },
             "must roll back",
             70,
             &authority,
@@ -370,7 +383,7 @@ fn sanitized_schema_19_snapshot_migrates_losslessly_and_old_envelope_deserialize
     let mut store = Store::open(&path).expect("open schema 19 snapshot");
     store.migrate().expect("migrate snapshot");
     store.migrate().expect("retry is idempotent");
-    assert_eq!(store.schema_version().expect("schema version"), 26);
+    assert_eq!(store.schema_version().expect("schema version"), 27);
     for item in store.list_event_tail(0, 20).expect("read old envelopes") {
         assert_eq!(item.event.principal, None);
         assert_eq!(item.event.audit_event_id, None);
@@ -404,7 +417,7 @@ fn schema_v20_adds_only_audit_provenance_columns() {
     let path = temp_db("principal-schema");
     let mut store = Store::open(&path).expect("open store");
     store.migrate().expect("migrate fresh store");
-    assert_eq!(SCHEMA_VERSION, 26);
+    assert_eq!(SCHEMA_VERSION, 27);
     drop(store);
 
     let connection = Connection::open(&path).expect("open inspection database");
@@ -436,14 +449,21 @@ fn authority_principal_is_independent_of_api_key_scope_or_semantic_worker() {
     store
         .import_cards(vec![ready_card(card_id.as_str())])
         .expect("import card");
+    let authority = Authority::principal(verified.principal, false);
+    let claim = store
+        .claim_card(&card_id, "worker-not-roster", 3, 600, &authority)
+        .expect("claim card");
     store
         .append_work_log_as(
             &card_id,
             "worker-not-roster",
-            WorkLogAttribution::default(),
+            WorkLogAttribution {
+                run_id: Some(claim.run_id.as_str()),
+                ..WorkLogAttribution::default()
+            },
             "one principal, another worker",
             3,
-            &Authority::principal(verified.principal, false),
+            &authority,
         )
         .expect("append as semantic worker");
     let detail = store

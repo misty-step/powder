@@ -741,6 +741,7 @@ name = "powder-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -753,6 +754,7 @@ dependencies = [
  "powder-mcp",
  "powder-shell",
  "powder-store",
+ "serde",
  "serde_json",
  "ureq",
 ]

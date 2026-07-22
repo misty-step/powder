@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 27;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -143,6 +143,11 @@ CREATE TABLE IF NOT EXISTS card_events (
   role TEXT,
   subject_kind TEXT,
   subject_id TEXT,
+  operation TEXT,
+  resource TEXT,
+  semantic_identity TEXT,
+  run_id TEXT,
+  reason TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_card_events_card_created ON card_events(card_id, created_at);
@@ -226,6 +231,20 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
   attempted_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_delivery_attempts(delivery_id, attempt_number);
+
+CREATE TABLE IF NOT EXISTS operation_idempotency (
+  operation TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  principal TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(operation, resource, principal, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_operation_idempotency_expires
+  ON operation_idempotency(expires_at);
 "#;
 
 // The `MIGRATE_1_TO_2` step (create `actors`, add `api_keys.actor_id`,

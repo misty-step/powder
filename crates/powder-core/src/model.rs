@@ -14,6 +14,10 @@ pub enum DomainError {
     },
     Conflict(String),
     Forbidden(String),
+    AuthorityDenied {
+        class: DenialClass,
+        message: String,
+    },
     /// A mutation targeted a claim that has expired but has not yet been
     /// reclaimed by a new agent. Distinct from `Conflict` (wrong run, wrong
     /// status) so a caller can tell "your claim went stale, renew failed --
@@ -48,6 +52,23 @@ impl DomainError {
     pub fn claim_expired(message: impl Into<String>) -> Self {
         Self::ClaimExpired(message.into())
     }
+
+    pub fn authority_denied(class: DenialClass, message: impl Into<String>) -> Self {
+        Self::AuthorityDenied {
+            class,
+            message: message.into(),
+        }
+    }
+
+    pub fn denial_class(&self) -> Option<DenialClass> {
+        match self {
+            Self::AuthorityDenied { class, .. } => Some(*class),
+            Self::ClaimExpired(_) => Some(DenialClass::ClaimExpired),
+            Self::Forbidden(_) => Some(DenialClass::Capability),
+            Self::Conflict(_) => None,
+            Self::Validation { .. } | Self::NotFound { .. } => None,
+        }
+    }
 }
 
 impl fmt::Display for DomainError {
@@ -57,6 +78,7 @@ impl fmt::Display for DomainError {
             Self::NotFound { entity, id } => write!(f, "{entity} not found: {id}"),
             Self::Conflict(message) => f.write_str(message),
             Self::Forbidden(message) => f.write_str(message),
+            Self::AuthorityDenied { message, .. } => f.write_str(message),
             Self::ClaimExpired(message) => f.write_str(message),
         }
     }
@@ -68,8 +90,10 @@ impl std::error::Error for DomainError {}
 /// leases; worker labels remain explicit claim/run metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
-    /// No identity enforcement: single-operator surfaces (CLI/MCP without an
-    /// explicit actor, or HTTP auth disabled) that predate real identity.
+    /// No identity enforcement: trusted single-operator CLI usage or an
+    /// explicitly auth-disabled loopback HTTP surface. Local MCP must provide
+    /// transport authority; a missing MCP principal is an unauthenticated error,
+    /// never an implicit Unchecked mutation.
     Unchecked,
     Principal {
         name: String,
@@ -91,6 +115,275 @@ impl PrincipalRole {
             Self::Admin => "admin",
             Self::Agent => "agent",
             Self::Unchecked => "unchecked",
+        }
+    }
+}
+
+/// Stable capability classes shared by every mutation face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationCapability {
+    CardCorrection,
+    WorkerExecution,
+    RepositoryAdmin,
+    SecurityAdmin,
+    Destructive,
+}
+
+/// Claim ownership required by an operation. Worker agents must hold the current
+/// claim where the matrix says so; admin and trusted-local authority bypass that
+/// requirement for explicit corrections, while claims never own card truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimRequirement {
+    None,
+    CurrentCardClaim,
+    CurrentRun,
+    /// The current run and principal/worker must match, but release remains
+    /// allowed after the lease expires so the holder can cleanly relinquish it.
+    CurrentRunAllowExpired,
+}
+
+/// Identity-bearing payload fields are metadata, never a source of authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityRequirement {
+    None,
+    Principal,
+    Worker,
+    Run,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdempotencyMode {
+    None,
+    RetrySafe,
+    Keyed,
+}
+
+/// The complete mutation vocabulary. Keep this list exhaustive: adapters must
+/// select an operation here instead of inventing face-local policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    CreateCard,
+    PatchCard,
+    CheckCriterion,
+    UpdateStatus,
+    UpdateRelations,
+    SetParent,
+    CompleteCard,
+    ClaimCard,
+    ReleaseClaim,
+    RenewClaim,
+    HeartbeatClaim,
+    TransferClaim,
+    WorkLog,
+    AddLink,
+    AddComment,
+    RequestInput,
+    AnswerInput,
+    AttachImage,
+    DetachImage,
+    UpsertRepository,
+    MergeRepositoryAlias,
+    DeleteRepository,
+    NormalizeRepositories,
+    CreateApiKey,
+    RevokeApiKey,
+    CreateSubscription,
+    DisableSubscription,
+    ReplayDeadLetter,
+    Destructive,
+}
+
+/// Audit fields required for every operation. The first four fields are
+/// invariant across all mutations; the remaining fields are enabled by the
+/// operation's semantic identity/claim requirements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRequirement {
+    pub operation: bool,
+    pub resource: bool,
+    pub principal: bool,
+    pub role: bool,
+    pub semantic_identity: bool,
+    pub run: bool,
+    pub reason: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationRule {
+    pub operation: Operation,
+    pub capability: OperationCapability,
+    pub claim: ClaimRequirement,
+    pub identity: IdentityRequirement,
+    pub idempotency: IdempotencyMode,
+    pub audit: AuditRequirement,
+}
+
+impl Operation {
+    pub const ALL: [Self; 29] = [
+        Self::CreateCard,
+        Self::PatchCard,
+        Self::CheckCriterion,
+        Self::UpdateStatus,
+        Self::UpdateRelations,
+        Self::SetParent,
+        Self::CompleteCard,
+        Self::ClaimCard,
+        Self::ReleaseClaim,
+        Self::RenewClaim,
+        Self::HeartbeatClaim,
+        Self::TransferClaim,
+        Self::WorkLog,
+        Self::AddLink,
+        Self::AddComment,
+        Self::RequestInput,
+        Self::AnswerInput,
+        Self::AttachImage,
+        Self::DetachImage,
+        Self::UpsertRepository,
+        Self::MergeRepositoryAlias,
+        Self::DeleteRepository,
+        Self::NormalizeRepositories,
+        Self::CreateApiKey,
+        Self::RevokeApiKey,
+        Self::CreateSubscription,
+        Self::DisableSubscription,
+        Self::ReplayDeadLetter,
+        Self::Destructive,
+    ];
+
+    pub const fn rule(self) -> OperationRule {
+        use ClaimRequirement::{CurrentCardClaim as Card, CurrentRun as Run, None};
+        use IdempotencyMode::{Keyed, None as NoKey, RetrySafe};
+        use IdentityRequirement::{Principal, Run as RunIdentity, Worker};
+        use OperationCapability::{
+            CardCorrection as Correct, Destructive as Destroy, RepositoryAdmin as Repo,
+            SecurityAdmin as Security, WorkerExecution as Execute,
+        };
+        let (capability, claim, identity, idempotency) = match self {
+            Self::CreateCard => (Correct, None, Principal, Keyed),
+            Self::PatchCard
+            | Self::CheckCriterion
+            | Self::UpdateStatus
+            | Self::UpdateRelations
+            | Self::SetParent
+            | Self::CompleteCard => (Correct, Card, Principal, Keyed),
+            Self::ClaimCard => (Execute, None, Worker, RetrySafe),
+            Self::ReleaseClaim => (
+                Execute,
+                ClaimRequirement::CurrentRunAllowExpired,
+                Worker,
+                Keyed,
+            ),
+            Self::RenewClaim | Self::HeartbeatClaim | Self::TransferClaim => {
+                (Execute, Run, Worker, Keyed)
+            }
+            Self::WorkLog | Self::AddLink => (Execute, Card, Worker, Keyed),
+            Self::AddComment => (Execute, None, Principal, Keyed),
+            Self::AttachImage | Self::DetachImage => (Execute, Card, Principal, Keyed),
+            Self::RequestInput | Self::AnswerInput => (Execute, Run, RunIdentity, Keyed),
+            Self::UpsertRepository
+            | Self::MergeRepositoryAlias
+            | Self::DeleteRepository
+            | Self::NormalizeRepositories => (Repo, None, Principal, Keyed),
+            Self::CreateApiKey | Self::CreateSubscription => (Security, None, Principal, NoKey),
+            Self::RevokeApiKey | Self::DisableSubscription => {
+                (Security, None, Principal, RetrySafe)
+            }
+            Self::ReplayDeadLetter => (Security, None, Principal, Keyed),
+            Self::Destructive => (Destroy, None, Principal, NoKey),
+        };
+        OperationRule {
+            operation: self,
+            capability,
+            claim,
+            identity,
+            idempotency,
+            audit: AuditRequirement {
+                operation: true,
+                resource: true,
+                principal: true,
+                role: true,
+                semantic_identity: !matches!(identity, IdentityRequirement::None),
+                run: !matches!(claim, ClaimRequirement::None),
+                reason: matches!(
+                    capability,
+                    OperationCapability::CardCorrection | OperationCapability::Destructive
+                ),
+            },
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateCard => "create_card",
+            Self::PatchCard => "patch_card",
+            Self::CheckCriterion => "check_criterion",
+            Self::UpdateStatus => "update_status",
+            Self::UpdateRelations => "update_relations",
+            Self::SetParent => "set_parent",
+            Self::CompleteCard => "complete_card",
+            Self::ClaimCard => "claim_card",
+            Self::ReleaseClaim => "release_claim",
+            Self::RenewClaim => "renew_claim",
+            Self::HeartbeatClaim => "heartbeat_claim",
+            Self::TransferClaim => "transfer_claim",
+            Self::WorkLog => "work_log",
+            Self::AddLink => "add_link",
+            Self::AddComment => "add_comment",
+            Self::RequestInput => "request_input",
+            Self::AnswerInput => "answer_input",
+            Self::AttachImage => "attach_image",
+            Self::DetachImage => "detach_image",
+            Self::UpsertRepository => "upsert_repository",
+            Self::MergeRepositoryAlias => "merge_repository_alias",
+            Self::DeleteRepository => "delete_repository",
+            Self::NormalizeRepositories => "normalize_repositories",
+            Self::CreateApiKey => "create_api_key",
+            Self::RevokeApiKey => "revoke_api_key",
+            Self::CreateSubscription => "create_subscription",
+            Self::DisableSubscription => "disable_subscription",
+            Self::ReplayDeadLetter => "replay_dead_letter",
+            Self::Destructive => "destructive",
+        }
+    }
+}
+
+impl OperationCapability {
+    pub const fn allows(self, role: PrincipalRole) -> bool {
+        matches!(role, PrincipalRole::Admin | PrincipalRole::Unchecked)
+            || matches!(role, PrincipalRole::Agent)
+                && matches!(self, Self::CardCorrection | Self::WorkerExecution)
+    }
+}
+
+/// Stable denial classes let HTTP, CLI, MCP, and UI render the same result
+/// without parsing human-facing error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialClass {
+    Unauthenticated,
+    Capability,
+    ClaimRequired,
+    ClaimExpired,
+    IdentityMismatch,
+    CrossResource,
+    IdempotencyConflict,
+}
+
+impl DenialClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::Capability => "capability",
+            Self::ClaimRequired => "claim_required",
+            Self::ClaimExpired => "claim_expired",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::CrossResource => "cross_resource",
+            Self::IdempotencyConflict => "idempotency_conflict",
         }
     }
 }
@@ -147,24 +440,6 @@ impl Authority {
         }
     }
 
-    /// A non-admin actor may only mutate a card that they hold the active
-    /// claim on. `holder` is `None` when the card has no active claim.
-    pub fn require_holder(&self, holder: Option<&str>) -> Result<(), DomainError> {
-        match self {
-            Self::Unchecked => Ok(()),
-            Self::Principal { is_admin: true, .. } => Ok(()),
-            Self::Principal {
-                name,
-                is_admin: false,
-            } => match holder {
-                Some(current) if current == name => Ok(()),
-                _ => Err(DomainError::forbidden(format!(
-                    "principal {name} does not hold the active claim"
-                ))),
-            },
-        }
-    }
-
     pub fn role(&self) -> PrincipalRole {
         match self {
             Self::Unchecked => PrincipalRole::Unchecked,
@@ -194,6 +469,169 @@ impl Authority {
         match self {
             Self::Unchecked => None,
             Self::Principal { name, .. } => Some(name),
+        }
+    }
+
+    /// Evaluate the shared matrix against transport authority and the current
+    /// claim snapshot. Semantic payload labels are checked separately with
+    /// `require_identity`; they can never select a role or elevate capability.
+    pub fn authorize_operation(
+        &self,
+        operation: Operation,
+        claim: Option<&Claim>,
+        run_id: Option<&RunId>,
+        now: i64,
+    ) -> Result<(), DomainError> {
+        self.authorize_operation_with_worker(operation, claim, run_id, None, now)
+    }
+
+    /// Evaluate the matrix with optional semantic worker metadata. A worker
+    /// label is never authority; when an operation carries one it must match
+    /// both the authenticated principal's current claim and the target run.
+    pub fn authorize_operation_with_worker(
+        &self,
+        operation: Operation,
+        claim: Option<&Claim>,
+        run_id: Option<&RunId>,
+        worker: Option<&str>,
+        now: i64,
+    ) -> Result<(), DomainError> {
+        let rule = operation.rule();
+        if !rule.capability.allows(self.role()) {
+            return Err(DomainError::authority_denied(
+                DenialClass::Capability,
+                format!(
+                    "{} authority cannot perform {}",
+                    self.role_label(),
+                    operation.as_str()
+                ),
+            ));
+        }
+        if matches!(self.role(), PrincipalRole::Admin | PrincipalRole::Unchecked) {
+            return Ok(());
+        }
+        // Claim-bound worker identity is checked after the claim requirement.
+        // A missing claim is a stable claim_required denial, not an incidental
+        // missing-worker error. ClaimCard has no claim requirement and still
+        // requires its requested worker label here.
+        if matches!(rule.claim, ClaimRequirement::None)
+            && matches!(rule.identity, IdentityRequirement::Worker)
+            && worker.is_none()
+        {
+            return Err(DomainError::authority_denied(
+                DenialClass::IdentityMismatch,
+                format!("operation {} requires a worker label", operation.as_str()),
+            ));
+        }
+        match rule.claim {
+            ClaimRequirement::None => Ok(()),
+            ClaimRequirement::CurrentCardClaim => match claim {
+                Some(current) if current.is_expired(now) => Err(DomainError::authority_denied(
+                    DenialClass::ClaimExpired,
+                    format!(
+                        "operation {} requires an unexpired claim",
+                        operation.as_str()
+                    ),
+                )),
+                Some(current) if self.principal_name() != Some(current.principal.as_str()) => {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!(
+                            "operation {} targets another principal's claim",
+                            operation.as_str()
+                        ),
+                    ))
+                }
+                Some(current)
+                    if matches!(rule.identity, IdentityRequirement::Worker)
+                        && worker != Some(current.agent.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::IdentityMismatch,
+                        format!("operation {} targets another worker", operation.as_str()),
+                    ))
+                }
+                Some(_) => Ok(()),
+                None => Err(DomainError::authority_denied(
+                    DenialClass::ClaimRequired,
+                    format!(
+                        "operation {} requires the current card claim",
+                        operation.as_str()
+                    ),
+                )),
+            },
+            ClaimRequirement::CurrentRun => match (claim, run_id) {
+                (Some(current), Some(_target)) if current.is_expired(now) => {
+                    Err(DomainError::authority_denied(
+                        DenialClass::ClaimExpired,
+                        format!("operation {} requires an unexpired run", operation.as_str()),
+                    ))
+                }
+                (Some(current), Some(target)) if current.run_id != *target => {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!("operation {} targets another run", operation.as_str()),
+                    ))
+                }
+                (Some(current), Some(_))
+                    if self.principal_name() != Some(current.principal.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!(
+                            "operation {} targets another principal's run",
+                            operation.as_str()
+                        ),
+                    ))
+                }
+                (Some(current), Some(_))
+                    if matches!(rule.identity, IdentityRequirement::Worker)
+                        && worker != Some(current.agent.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::IdentityMismatch,
+                        format!("operation {} targets another worker", operation.as_str()),
+                    ))
+                }
+                (Some(_), Some(_)) => Ok(()),
+                _ => Err(DomainError::authority_denied(
+                    DenialClass::ClaimRequired,
+                    format!("operation {} requires the current run", operation.as_str()),
+                )),
+            },
+            ClaimRequirement::CurrentRunAllowExpired => match (claim, run_id) {
+                (Some(current), Some(target)) if current.run_id != *target => {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!("operation {} targets another run", operation.as_str()),
+                    ))
+                }
+                (Some(current), Some(_))
+                    if self.principal_name() != Some(current.principal.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!(
+                            "operation {} targets another principal's run",
+                            operation.as_str()
+                        ),
+                    ))
+                }
+                (Some(current), Some(_))
+                    if matches!(rule.identity, IdentityRequirement::Worker)
+                        && worker != Some(current.agent.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::IdentityMismatch,
+                        format!("operation {} targets another worker", operation.as_str()),
+                    ))
+                }
+                (Some(_), Some(_)) => Ok(()),
+                _ => Err(DomainError::authority_denied(
+                    DenialClass::ClaimRequired,
+                    format!("operation {} requires the current run", operation.as_str()),
+                )),
+            },
         }
     }
 }
@@ -1239,6 +1677,21 @@ pub struct CardEvent {
     pub subject_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
+    /// Canonical operation selected from the shared authority matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Stable resource identifier targeted by the operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// Semantic worker/actor label supplied by the caller, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_identity: Option<String>,
+    /// Current worker run when the operation is run-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Explicit operator/admin correction or destructive-operation reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub created_at: i64,
 }
 
@@ -2115,5 +2568,263 @@ mod tests {
         let released = card.apply_status(CardStatus::Ready, 30);
         assert!(released.is_some());
         assert!(card.claim.is_none());
+    }
+
+    #[test]
+    fn operation_matrix_is_exhaustive_and_declarative() {
+        assert_eq!(Operation::ALL.len(), 29);
+        for operation in Operation::ALL {
+            let rule = operation.rule();
+            assert_eq!(rule.operation, operation);
+            assert!(!operation.as_str().is_empty());
+        }
+        assert_eq!(
+            Operation::UpdateStatus.rule().claim,
+            ClaimRequirement::CurrentCardClaim
+        );
+        assert_eq!(Operation::ClaimCard.rule().claim, ClaimRequirement::None);
+        assert_eq!(
+            Operation::WorkLog.rule().claim,
+            ClaimRequirement::CurrentCardClaim
+        );
+        assert_eq!(
+            Operation::ReleaseClaim.rule().claim,
+            ClaimRequirement::CurrentRunAllowExpired
+        );
+        for operation in [
+            Operation::RenewClaim,
+            Operation::HeartbeatClaim,
+            Operation::TransferClaim,
+        ] {
+            assert_eq!(operation.rule().claim, ClaimRequirement::CurrentRun);
+        }
+        assert_eq!(
+            Operation::RequestInput.rule().claim,
+            ClaimRequirement::CurrentRun
+        );
+        assert_eq!(
+            Operation::DeleteRepository.rule().capability,
+            OperationCapability::RepositoryAdmin
+        );
+        assert_eq!(
+            Operation::CreateApiKey.rule().idempotency,
+            IdempotencyMode::None,
+            "one-shot API-key secrets must never be replayed or persisted"
+        );
+        assert_eq!(
+            Operation::CreateSubscription.rule().idempotency,
+            IdempotencyMode::None,
+            "one-shot webhook secrets must never be replayed or persisted"
+        );
+        assert_eq!(
+            Operation::RevokeApiKey.rule().idempotency,
+            IdempotencyMode::RetrySafe
+        );
+        assert_eq!(
+            Operation::DisableSubscription.rule().idempotency,
+            IdempotencyMode::RetrySafe
+        );
+        assert_eq!(
+            Operation::ReplayDeadLetter.rule().idempotency,
+            IdempotencyMode::Keyed
+        );
+        assert_eq!(
+            Operation::Destructive.rule().capability,
+            OperationCapability::Destructive
+        );
+    }
+
+    #[test]
+    fn operation_matrix_serializes_every_rule_with_required_audit_provenance() {
+        for operation in Operation::ALL {
+            let rule = operation.rule();
+            let encoded = serde_json::to_value(rule).expect("operation rule serializes");
+            assert_eq!(encoded["operation"], operation.as_str());
+            assert_eq!(encoded["audit"]["operation"], true);
+            assert_eq!(encoded["audit"]["resource"], true);
+            assert_eq!(encoded["audit"]["principal"], true);
+            assert_eq!(encoded["audit"]["role"], true);
+            assert!(encoded["capability"].as_str().is_some());
+            assert!(encoded["claim"].as_str().is_some());
+            assert!(encoded["identity"].as_str().is_some());
+            assert!(encoded["idempotency"].as_str().is_some());
+        }
+
+        for operation in [
+            Operation::ReleaseClaim,
+            Operation::RenewClaim,
+            Operation::HeartbeatClaim,
+            Operation::TransferClaim,
+        ] {
+            assert_eq!(operation.rule().idempotency, IdempotencyMode::Keyed);
+        }
+    }
+
+    #[test]
+    fn capability_policy_never_promotes_agent_or_payload_labels() {
+        assert!(OperationCapability::CardCorrection.allows(PrincipalRole::Agent));
+        assert!(!OperationCapability::RepositoryAdmin.allows(PrincipalRole::Agent));
+        assert!(OperationCapability::RepositoryAdmin.allows(PrincipalRole::Admin));
+        assert!(OperationCapability::WorkerExecution.allows(PrincipalRole::Agent));
+        assert_eq!(DenialClass::IdentityMismatch.as_str(), "identity_mismatch");
+    }
+
+    #[test]
+    fn agent_corrections_require_current_unexpired_claim_but_admin_bypasses() {
+        let agent = Authority::principal("principal-a", false);
+        let admin = Authority::principal("operator", true);
+        let run_id = RunId::new("run-1").unwrap();
+        let claim = Claim {
+            principal: "principal-a".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: run_id.clone(),
+            acquired_at: 1,
+            expires_at: 10,
+        };
+        let missing = agent
+            .authorize_operation(Operation::UpdateStatus, None, None, 5)
+            .unwrap_err();
+        assert_eq!(missing.denial_class(), Some(DenialClass::ClaimRequired));
+        assert!(agent
+            .authorize_operation(Operation::UpdateStatus, Some(&claim), None, 5)
+            .is_ok());
+        let expired = agent
+            .authorize_operation(Operation::CompleteCard, Some(&claim), None, 10)
+            .unwrap_err();
+        assert_eq!(expired.denial_class(), Some(DenialClass::ClaimExpired));
+        assert!(admin
+            .authorize_operation(Operation::CompleteCard, None, None, 10)
+            .is_ok());
+        assert!(
+            agent
+                .authorize_operation_with_worker(
+                    Operation::ClaimCard,
+                    None,
+                    None,
+                    Some("worker-a"),
+                    10,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn run_bound_operations_reject_cross_run_and_preserve_structured_class() {
+        let agent = Authority::principal("principal-a", false);
+        let current_run = RunId::new("run-1").unwrap();
+        let other_run = RunId::new("run-2").unwrap();
+        let claim = Claim {
+            principal: "principal-a".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: current_run.clone(),
+            acquired_at: 1,
+            expires_at: 20,
+        };
+        let error = agent
+            .authorize_operation(Operation::RequestInput, Some(&claim), Some(&other_run), 5)
+            .unwrap_err();
+        assert_eq!(error.denial_class(), Some(DenialClass::CrossResource));
+        assert!(Operation::RequestInput.rule().audit.run);
+        assert!(Operation::UpdateStatus.rule().audit.reason);
+        assert!(Operation::WorkLog.rule().audit.semantic_identity);
+    }
+
+    #[test]
+    fn claim_transition_matrix_rejects_wrong_workers() {
+        let authority = Authority::principal("integration", false);
+        let run_id = RunId::new("run-1").unwrap();
+        let claim = Claim {
+            principal: "integration".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: run_id.clone(),
+            acquired_at: 1,
+            expires_at: 20,
+        };
+        for operation in [
+            Operation::ReleaseClaim,
+            Operation::RenewClaim,
+            Operation::HeartbeatClaim,
+            Operation::TransferClaim,
+        ] {
+            let error = authority
+                .authorize_operation_with_worker(
+                    operation,
+                    Some(&claim),
+                    Some(&run_id),
+                    Some("worker-b"),
+                    5,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.denial_class(),
+                Some(DenialClass::IdentityMismatch),
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_matrix_allows_expired_matching_run_only() {
+        let authority = Authority::principal("integration", false);
+        let run_id = RunId::new("run-1").unwrap();
+        let other_run = RunId::new("run-2").unwrap();
+        let claim = Claim {
+            principal: "integration".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: run_id.clone(),
+            acquired_at: 1,
+            expires_at: 5,
+        };
+        assert!(authority
+            .authorize_operation_with_worker(
+                Operation::ReleaseClaim,
+                Some(&claim),
+                Some(&run_id),
+                Some("worker-a"),
+                10,
+            )
+            .is_ok());
+        let error = authority
+            .authorize_operation_with_worker(
+                Operation::ReleaseClaim,
+                Some(&claim),
+                Some(&other_run),
+                Some("worker-a"),
+                10,
+            )
+            .unwrap_err();
+        assert_eq!(error.denial_class(), Some(DenialClass::CrossResource));
+    }
+
+    #[test]
+    fn same_principal_different_worker_is_not_claim_holder() {
+        let authority = Authority::principal("integration", false);
+        let run_id = RunId::new("run-1").unwrap();
+        let claim = Claim {
+            principal: "integration".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: run_id.clone(),
+            acquired_at: 1,
+            expires_at: 20,
+        };
+        let error = authority
+            .authorize_operation_with_worker(
+                Operation::WorkLog,
+                Some(&claim),
+                Some(&run_id),
+                Some("worker-b"),
+                5,
+            )
+            .unwrap_err();
+        assert_eq!(error.denial_class(), Some(DenialClass::IdentityMismatch));
+        assert!(authority
+            .authorize_operation_with_worker(
+                Operation::WorkLog,
+                Some(&claim),
+                Some(&run_id),
+                Some("worker-a"),
+                5,
+            )
+            .is_ok());
     }
 }

@@ -1,14 +1,17 @@
+use serde::{Deserialize, Serialize};
+
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DetailLevel, DomainError, Estimate, Priority, ReadyCursor, ReadyQuery, Risk, RunId, RunState,
+    DenialClass, DetailLevel, DomainError, Estimate, Operation, Priority, ReadyCursor, ReadyQuery,
+    Risk, RunId, RunState,
 };
 
 use crate::schema::SCHEMA;
 use crate::{
     ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig,
-    ImportOutcome, ParentCoverageBucket, ParentIssueKind, RelationField, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Result, SearchQuery, Store, StoreError,
-    WorkLogAttribution, API_KEY_ALPHABET,
+    IdempotencyRequest, ImportOutcome, KeyedOperationContext, ParentCoverageBucket,
+    ParentIssueKind, RelationField, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result,
+    SearchQuery, Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -33,6 +36,15 @@ fn ready_card_without_acceptance(id: &str, created_at: i64) -> Card {
         .with_status(CardStatus::Ready)
         .with_priority(Priority::P0)
         .with_created_at(created_at)
+}
+
+fn assert_authority_denial<T: std::fmt::Debug>(result: Result<T>, expected: DenialClass) {
+    match result {
+        Err(StoreError::Domain(DomainError::AuthorityDenied { class, .. })) => {
+            assert_eq!(class, expected);
+        }
+        other => panic!("expected {expected:?} denial, got {other:?}"),
+    }
 }
 
 fn search_page_matches(
@@ -1068,6 +1080,198 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
 }
 
 #[test]
+fn admin_one_shots_and_retry_safe_transitions_are_atomic() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let admin = Authority::principal("operator", true);
+    let agent = Authority::principal("agent", false);
+
+    let denied = store
+        .create_api_key_with_authority("denied", ApiKeyScope::Agent, 1, &agent)
+        .unwrap_err();
+    assert_eq!(
+        match denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+
+    let created =
+        store.create_api_key_with_authority("one-shot-agent", ApiKeyScope::Agent, 2, &admin)?;
+    assert!(!created.raw_key.is_empty());
+    assert_eq!(
+        store.connection.query_row(
+            "SELECT COUNT(*) FROM operation_idempotency WHERE operation = 'create_api_key'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    let key_row = store
+        .list_api_keys()?
+        .into_iter()
+        .find(|key| key.id == created.id)
+        .expect("created key metadata");
+    assert_eq!(key_row.revoked_at, None);
+
+    let revoke_denied = store
+        .revoke_api_key_with_authority(&created.id, 3, &agent)
+        .unwrap_err();
+    assert_eq!(
+        match revoke_denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+    store.revoke_api_key_with_authority(&created.id, 4, &admin)?;
+    store.revoke_api_key_with_authority(&created.id, 5, &admin)?;
+    let revoked = store
+        .list_api_keys()?
+        .into_iter()
+        .find(|key| key.id == created.id)
+        .expect("revoked key metadata");
+    assert_eq!(revoked.revoked_at, Some(4));
+    assert!(store.verify_api_key(&created.raw_key, 6)?.is_none());
+
+    let subscription_denied = store
+        .create_event_subscription_with_authority(
+            "https://example.test/denied",
+            vec!["completed".to_string()],
+            7,
+            &agent,
+        )
+        .unwrap_err();
+    assert_eq!(
+        match subscription_denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+    let created_subscription = store.create_event_subscription_with_authority(
+        "https://example.test/one-shot",
+        vec!["completed".to_string()],
+        8,
+        &admin,
+    )?;
+    assert!(!created_subscription.signing_secret.is_empty());
+    assert_eq!(
+        store.connection.query_row(
+            "SELECT COUNT(*) FROM operation_idempotency WHERE operation = 'create_subscription'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+
+    let disable_denied = store
+        .disable_event_subscription_with_authority(&created_subscription.subscription.id, 9, &agent)
+        .unwrap_err();
+    assert_eq!(
+        match disable_denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+    let disabled = store.disable_event_subscription_with_authority(
+        &created_subscription.subscription.id,
+        10,
+        &admin,
+    )?;
+    assert_eq!(disabled.disabled_at, Some(10));
+    let disabled_again = store.disable_event_subscription_with_authority(
+        &created_subscription.subscription.id,
+        11,
+        &admin,
+    )?;
+    assert_eq!(disabled_again.disabled_at, Some(10));
+    Ok(())
+}
+
+#[test]
+fn keyed_dead_letter_replay_is_atomic_and_replay_safe() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let admin = Authority::principal("operator", true);
+    let subscription = store.create_event_subscription_with_authority(
+        "https://example.test/replay",
+        vec!["completed".to_string()],
+        1,
+        &admin,
+    )?;
+    store.import_cards(vec![ready_card("keyed-dlq", 2)])?;
+    store.complete_card(&CardId::new("keyed-dlq")?, None, Vec::new(), 3, &admin)?;
+
+    let mut now = 3_i64;
+    for _ in 0..6 {
+        for delivery in store.due_webhook_deliveries(now, 10)? {
+            store.record_webhook_delivery_failure(
+                &delivery.id,
+                Some(500),
+                "forced failure",
+                now,
+            )?;
+        }
+        now += 300;
+    }
+    assert_eq!(store.list_dead_letter_deliveries(10)?.len(), 1);
+
+    let forced_rollback = store
+        .with_keyed_operation::<usize, _, _>(
+            Operation::ReplayDeadLetter,
+            "dead_letter:all",
+            &serde_json::json!({"subscription_id": null}),
+            KeyedOperationContext::new(now, "dead-letter-rollback", &admin),
+            |_| Err(DomainError::conflict("forced rollback").into()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        forced_rollback,
+        StoreError::Domain(DomainError::Conflict(_))
+    ));
+    let replayed = store.replay_dead_letters_with_authority_keyed(
+        None,
+        now,
+        "dead-letter-rollback",
+        &admin,
+    )?;
+    assert!(!replayed.replayed);
+    assert_eq!(replayed.value, 1);
+    let replay = store.replay_dead_letters_with_authority_keyed(
+        None,
+        now + 1,
+        "dead-letter-rollback",
+        &admin,
+    )?;
+    assert!(replay.replayed);
+    assert_eq!(replay.value, 1);
+
+    let conflict = store
+        .with_keyed_operation::<usize, _, _>(
+            Operation::ReplayDeadLetter,
+            "dead_letter:all",
+            &serde_json::json!({"subscription_id": "different"}),
+            KeyedOperationContext::new(now + 2, "dead-letter-rollback", &admin),
+            |_| Err(DomainError::conflict("receipt must prevent execution").into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        match conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+    assert!(store.list_dead_letter_deliveries(10)?.is_empty());
+    assert_eq!(store.due_webhook_deliveries(now, 10)?.len(), 1);
+    assert_eq!(subscription.subscription.disabled_at, None);
+    Ok(())
+}
+
+#[test]
 fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -1108,6 +1312,216 @@ fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
 
     store.delete_repository("powder")?;
     assert!(store.get_repository("powder")?.is_none());
+    Ok(())
+}
+
+#[test]
+fn keyed_repository_mutations_replay_conflict_and_rollback_atomically() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let admin = Authority::principal("operator", true);
+
+    // A failed keyed mutation must not leave a receipt behind: the same key can
+    // be retried with a corrected payload and executes exactly once.
+    let invalid = store
+        .upsert_repository_with_authority_keyed(
+            RepositoryUpsert {
+                name: "keyed-upsert".to_string(),
+                aliases: Some(vec![String::new()]),
+                visibility: None,
+                tier: None,
+                import_provenance: None,
+            },
+            10,
+            "repo-upsert",
+            &admin,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        StoreError::Domain(DomainError::Validation { .. })
+    ));
+    assert!(store.get_repository("keyed-upsert")?.is_none());
+
+    let upsert = RepositoryUpsert {
+        name: "keyed-upsert".to_string(),
+        aliases: Some(vec!["ku".to_string()]),
+        visibility: None,
+        tier: None,
+        import_provenance: None,
+    };
+    let first =
+        store.upsert_repository_with_authority_keyed(upsert.clone(), 11, "repo-upsert", &admin)?;
+    assert!(!first.replayed);
+    let replay = store.upsert_repository_with_authority_keyed(upsert, 12, "repo-upsert", &admin)?;
+    assert!(replay.replayed);
+    let conflict = store
+        .upsert_repository_with_authority_keyed(
+            RepositoryUpsert {
+                name: "keyed-upsert".to_string(),
+                aliases: Some(vec!["different".to_string()]),
+                visibility: None,
+                tier: None,
+                import_provenance: None,
+            },
+            13,
+            "repo-upsert",
+            &admin,
+        )
+        .unwrap_err();
+    assert_eq!(
+        match conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "legacy/keyed".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: None,
+        },
+        19,
+    )?;
+    let mut card = ready_card("keyed-merge-card", 20);
+    card.repo = Some("legacy/keyed".to_string());
+    store.import_cards(vec![card])?;
+    let invalid_merge = store
+        .merge_repository_alias_with_authority_keyed("", "merged", &admin, 21, "repo-merge")
+        .unwrap_err();
+    assert!(matches!(
+        invalid_merge,
+        StoreError::Domain(DomainError::Validation { .. })
+    ));
+    let merged = store.merge_repository_alias_with_authority_keyed(
+        "legacy/keyed",
+        "merged",
+        &admin,
+        22,
+        "repo-merge",
+    )?;
+    assert!(!merged.replayed);
+    assert_eq!(merged.value.rehomed_cards, 1);
+    let merged_replay = store.merge_repository_alias_with_authority_keyed(
+        "legacy/keyed",
+        "merged",
+        &admin,
+        23,
+        "repo-merge",
+    )?;
+    assert!(merged_replay.replayed);
+    let merge_conflict = store
+        .merge_repository_alias_with_authority_keyed(
+            "other-alias",
+            "merged",
+            &admin,
+            24,
+            "repo-merge",
+        )
+        .unwrap_err();
+    assert_eq!(
+        match merge_conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+
+    let invalid_delete = store
+        .delete_repository_with_authority_keyed("keyed-delete", 25, "repo-delete", &admin)
+        .unwrap_err();
+    assert!(matches!(
+        invalid_delete,
+        StoreError::Domain(DomainError::NotFound { .. })
+    ));
+    store.upsert_repository_with_authority(
+        RepositoryUpsert {
+            name: "keyed-delete".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: None,
+        },
+        26,
+        &admin,
+    )?;
+    let deleted =
+        store.delete_repository_with_authority_keyed("keyed-delete", 27, "repo-delete", &admin)?;
+    assert!(!deleted.replayed);
+    let deleted_replay =
+        store.delete_repository_with_authority_keyed("keyed-delete", 28, "repo-delete", &admin)?;
+    assert!(deleted_replay.replayed);
+    let delete_conflict = store
+        .with_keyed_operation::<(), _, _>(
+            Operation::DeleteRepository,
+            "repository:keyed-delete",
+            &serde_json::json!({"name": "different"}),
+            KeyedOperationContext::new(29, "repo-delete", &admin),
+            |_| Err(DomainError::conflict("receipt must prevent execution").into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        match delete_conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+    assert!(store.get_repository("keyed-delete")?.is_none());
+
+    let mut normalize_card = ready_card("keyed-normalize-card", 30);
+    normalize_card.repo = Some("canary".to_string());
+    store.import_cards(vec![normalize_card])?;
+    store.connection.execute(
+        "UPDATE cards SET repo = 'misty-step/canary' WHERE id = 'keyed-normalize-card'",
+        [],
+    )?;
+    let forced_rollback = store
+        .with_keyed_operation::<(), _, _>(
+            Operation::NormalizeRepositories,
+            "repositories:all",
+            &serde_json::json!({"normalize": true}),
+            KeyedOperationContext::new(31, "repo-normalize", &admin),
+            |_| Err(DomainError::conflict("forced rollback").into()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        forced_rollback,
+        StoreError::Domain(DomainError::Conflict(_))
+    ));
+    let normalized =
+        store.normalize_repository_strings_with_authority_keyed(&admin, 32, "repo-normalize")?;
+    assert!(!normalized.replayed);
+    assert_eq!(normalized.value.normalized(), 1);
+    let normalized_replay =
+        store.normalize_repository_strings_with_authority_keyed(&admin, 33, "repo-normalize")?;
+    assert!(normalized_replay.replayed);
+    let normalize_conflict = store
+        .with_keyed_operation::<(), _, _>(
+            Operation::NormalizeRepositories,
+            "repositories:all",
+            &serde_json::json!({"normalize": false}),
+            KeyedOperationContext::new(34, "repo-normalize", &admin),
+            |_| Err(DomainError::conflict("receipt must prevent execution").into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        match normalize_conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+    let stored_repo: String = store.connection.query_row(
+        "SELECT repo FROM cards WHERE id = 'keyed-normalize-card'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_repo, "canary");
     Ok(())
 }
 
@@ -1538,7 +1952,7 @@ fn schema_v25_database_migrates_ready_snapshot_tables() -> Result<()> {
         "DROP TABLE ready_snapshot_items; DROP TABLE ready_snapshots; PRAGMA user_version = 25;",
     )?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 26);
+    assert_eq!(store.schema_version()?, 27);
     assert!(store.table_exists("ready_snapshots")?);
     assert!(store.table_exists("ready_snapshot_items")?);
     store.migrate()?;
@@ -2595,7 +3009,8 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
         [],
     )?;
 
-    let report = store.relations_doctor("operator", 50, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 50, false)?;
     assert_eq!(report.scanned, 2);
     assert_eq!(report.issue_count(), 1);
     let issue = &report.issues[0];
@@ -2611,7 +3026,8 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
         .expect("x detail");
     assert!(x_detail.card.blocked_by.is_empty());
 
-    let repaired = store.relations_doctor("operator", 60, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 60, true)?;
     assert_eq!(repaired.issue_count(), 1);
     assert!(repaired.issues[0].repaired);
 
@@ -2626,7 +3042,8 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
     }));
 
     // Idempotent: nothing left to repair.
-    let second = store.relations_doctor("operator", 70, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 70, true)?;
     assert_eq!(second.issue_count(), 0);
     Ok(())
 }
@@ -2717,13 +3134,15 @@ fn parent_graph_doctor_classifies_corruption_and_refuses_ambiguous_repair() -> R
     assert_eq!(assignment("middle").ancestor_id.as_deref(), Some("epic"));
     assert_eq!(assignment("leaf").ancestor_id.as_deref(), Some("epic"));
 
-    let report = store.relations_doctor("operator", 30, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 30, false)?;
     assert_eq!(report.scanned, 10);
     assert_eq!(report.parent_issues, graph.issues);
     assert!(report.parent_repair_refusal.is_none());
     assert!(!report.repaired);
 
-    let repaired = store.relations_doctor("operator", 31, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 31, true)?;
     assert_eq!(repaired.parent_issues, graph.issues);
     assert!(repaired.parent_issues.iter().all(|issue| !issue.repaired));
     assert!(repaired
@@ -2803,14 +3222,16 @@ fn relations_doctor_repairs_mirrors_when_parent_repair_is_refused() -> Result<()
          UPDATE cards SET blocks_json = '[\"target\"]' WHERE id = 'source';",
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.issues.len(), 1);
     assert_eq!(report.issues[0].card_id.as_deref(), Some("source"));
     assert_eq!(report.issues[0].target_id.as_deref(), Some("target"));
     assert_eq!(report.parent_issues.len(), 1);
     assert!(report.parent_repair_refusal.is_none());
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert_eq!(repaired.issues.len(), 1);
     assert!(repaired.issues[0].repaired);
     assert!(repaired
@@ -2824,7 +3245,8 @@ fn relations_doctor_repairs_mirrors_when_parent_repair_is_refused() -> Result<()
     )?;
     assert_eq!(target_blocked_by, "[\"source\"]");
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert!(second.issues.is_empty());
     assert_eq!(second.parent_issues.len(), 1);
     assert!(second.parent_repair_refusal.is_some());
@@ -2908,7 +3330,8 @@ fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<
         |row| row.get(0),
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.parent_issues.len(), 2);
     assert_eq!(report.issues.len(), 3);
     assert!(report.issues.iter().any(|issue| {
@@ -2927,7 +3350,8 @@ fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<
             && issue.target_id.as_deref() == Some("target")
     }));
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert!(repaired.parent_repair_refusal.is_some());
     assert!(repaired
         .issues
@@ -2957,7 +3381,8 @@ fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<
     assert_eq!(after_malformed, before_malformed);
     assert_eq!(after_invalid, before_invalid);
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert_eq!(second.issues.len(), 2);
     assert!(second
         .issues
@@ -2987,7 +3412,8 @@ fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
         |row| row.get(0),
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.issues.len(), 1);
     assert_eq!(
         report.issues[0].kind,
@@ -2996,7 +3422,8 @@ fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
     assert_eq!(report.issues[0].field, RelationField::Blocks);
     assert!(report.issues[0].evidence.contains("not a text id"));
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert_eq!(repaired.issues.len(), 1);
     assert!(!repaired.issues[0].repaired);
     let source_after: String = store.connection.query_row(
@@ -3012,7 +3439,8 @@ fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
     assert_eq!(source_after, source_before);
     assert_eq!(target_after, target_before);
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert_eq!(second.issues.len(), 1);
     assert!(!second.issues[0].repaired);
     Ok(())
@@ -3038,7 +3466,8 @@ fn reciprocal_mixed_field_stays_indeterminate() -> Result<()> {
         |row| row.get(0),
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.issues.len(), 1);
     assert_eq!(
         report.issues[0].kind,
@@ -3047,7 +3476,8 @@ fn reciprocal_mixed_field_stays_indeterminate() -> Result<()> {
     assert_eq!(report.issues[0].card_id.as_deref(), Some("alpha"));
     assert_eq!(report.issues[0].field, RelationField::Blocks);
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert_eq!(repaired.issues.len(), 1);
     assert!(!repaired.issues[0].repaired);
     let after_alpha: String = store.connection.query_row(
@@ -3063,7 +3493,8 @@ fn reciprocal_mixed_field_stays_indeterminate() -> Result<()> {
     assert_eq!(after_alpha, before_alpha);
     assert_eq!(after_beta, before_beta);
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert_eq!(second.issues.len(), 1);
     assert_eq!(
         second.issues[0].kind,
@@ -3696,7 +4127,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
         &Authority::actor("agent-a", false),
     )?;
 
-    let patched = store.patch_card(
+    let patched = store.patch_card_as(
         &card_id,
         CardPatch {
             title: Some("Patched title".to_string()),
@@ -3708,7 +4139,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
             ]),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         20,
     )?;
 
@@ -3750,24 +4181,24 @@ fn patch_card_can_set_and_clear_repo() -> Result<()> {
 
     // Leaving `repo` untouched (`None`) preserves whatever the row already
     // has -- distinct from `Some(None)`, which explicitly clears it.
-    let unpatched = store.patch_card(
+    let unpatched = store.patch_card_as(
         &card_id,
         CardPatch {
             title: Some("still untouched repo".to_string()),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         10,
     )?;
     assert_eq!(unpatched.repo, None);
 
-    let moved = store.patch_card(
+    let moved = store.patch_card_as(
         &card_id,
         CardPatch {
             repo: Some(Some("misty-step/canary".to_string())),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         20,
     )?;
     assert_eq!(
@@ -3782,13 +4213,13 @@ fn patch_card_can_set_and_clear_repo() -> Result<()> {
     )?;
     assert_eq!(stored_repo, "canary");
 
-    let cleared = store.patch_card(
+    let cleared = store.patch_card_as(
         &card_id,
         CardPatch {
             repo: Some(None),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         30,
     )?;
     assert_eq!(cleared.repo, None);
@@ -3846,7 +4277,7 @@ fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call
         &card_id,
         CardStatus::Done,
         12,
-        &Authority::actor("external-closer", false),
+        &Authority::principal("external-closer", true),
     )?;
 
     assert_eq!(closed.status, CardStatus::Done);
@@ -4192,6 +4623,120 @@ fn concurrent_claims_allow_exactly_one_active_lease() -> Result<()> {
         .list_ready(ReadyQuery::new(10, 10))?
         .iter()
         .all(|card| card.id != card_id));
+    Ok(())
+}
+
+#[test]
+fn keyed_claim_transitions_replay_without_duplicate_mutation_or_audit() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let authority = Authority::principal("agent-a", false);
+    let card_ids = [
+        CardId::new("release")?,
+        CardId::new("renew")?,
+        CardId::new("heartbeat")?,
+        CardId::new("transfer")?,
+    ];
+    store.import_cards(
+        card_ids
+            .iter()
+            .map(|id| ready_card(id.as_str(), 2))
+            .collect(),
+    )?;
+
+    let release = store.claim_card(&card_ids[0], "agent-a", 10, 60, &authority)?;
+    let renew = store.claim_card(&card_ids[1], "agent-a", 10, 60, &authority)?;
+    let heartbeat = store.claim_card(&card_ids[2], "agent-a", 10, 60, &authority)?;
+    let transfer = store.claim_card(&card_ids[3], "agent-a", 10, 60, &authority)?;
+
+    let released =
+        store.release_claim_keyed(&card_ids[0], &release.run_id, 20, "release-1", &authority)?;
+    let released_retry =
+        store.release_claim_keyed(&card_ids[0], &release.run_id, 21, "release-1", &authority)?;
+    assert!(!released.replayed);
+    assert!(released_retry.replayed);
+    assert_eq!(released.value, released_retry.value);
+
+    let renewed =
+        store.renew_claim_keyed(&card_ids[1], &renew.run_id, 20, 50, "renew-1", &authority)?;
+    let renewed_retry =
+        store.renew_claim_keyed(&card_ids[1], &renew.run_id, 21, 50, "renew-1", &authority)?;
+    assert!(!renewed.replayed);
+    assert!(renewed_retry.replayed);
+    assert_eq!(renewed.value, renewed_retry.value);
+    assert_eq!(renewed.value.expires_at, 70);
+
+    let heartbeated = store.heartbeat_claim_keyed(
+        &card_ids[2],
+        &heartbeat.run_id,
+        20,
+        "heartbeat-1",
+        &authority,
+    )?;
+    let heartbeated_retry = store.heartbeat_claim_keyed(
+        &card_ids[2],
+        &heartbeat.run_id,
+        21,
+        "heartbeat-1",
+        &authority,
+    )?;
+    assert!(!heartbeated.replayed);
+    assert!(heartbeated_retry.replayed);
+    assert_eq!(heartbeated.value, heartbeated_retry.value);
+
+    let transferred = store.transfer_claim_keyed(
+        &card_ids[3],
+        &transfer.run_id,
+        "agent-b",
+        50,
+        KeyedOperationContext::new(20, "transfer-1", &authority),
+    )?;
+    let transferred_retry = store.transfer_claim_keyed(
+        &card_ids[3],
+        &transfer.run_id,
+        "agent-b",
+        50,
+        KeyedOperationContext::new(21, "transfer-1", &authority),
+    )?;
+    assert!(!transferred.replayed);
+    assert!(transferred_retry.replayed);
+    assert_eq!(transferred.value, transferred_retry.value);
+
+    let conflict = store.transfer_claim_keyed(
+        &card_ids[3],
+        &transfer.run_id,
+        "agent-c",
+        50,
+        KeyedOperationContext::new(22, "transfer-1", &authority),
+    );
+    assert!(matches!(
+        conflict,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdempotencyConflict,
+            ..
+        }))
+    ));
+
+    for (card_id, needle) in [
+        (&card_ids[0], "released"),
+        (&card_ids[1], "renewed"),
+        (&card_ids[2], "heartbeat"),
+        (&card_ids[3], "transferred"),
+    ] {
+        let detail = store
+            .get_card_detail(card_id, DetailLevel::Detailed, 100)?
+            .expect("card detail");
+        let prefix = format!("{needle} ");
+        assert_eq!(
+            detail
+                .activities
+                .iter()
+                .filter(|activity| activity.payload.starts_with(&prefix))
+                .count(),
+            1,
+            "duplicate delivery must not append a second {needle} activity"
+        );
+    }
     Ok(())
 }
 
@@ -5462,32 +6007,252 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
 
     assert!(matches!(
         store.release_claim(&card_id, &claim.run_id, 20, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.renew_claim(&card_id, &claim.run_id, 20, 60, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.heartbeat_claim(&card_id, &claim.run_id, 20, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.transfer_claim(&card_id, &claim.run_id, "agent-c", 20, 3600, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.request_input(&claim.run_id, "Approve?", 20, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::CrossResource,
+            ..
+        }))
     ));
 
-    // audit-over-enforcement: any actor may set status/complete, but not
-    // mutate another actor's lease heartbeat/renew/release path.
-    store.update_status(&card_id, CardStatus::InProgress, 20, &intruder)?;
-    let completed = store.complete_card(&card_id, None, Vec::new(), 21, &intruder)?;
-    assert_eq!(completed.status, CardStatus::Done);
+    // Worker execution and lifecycle effects are claim-bound; only the
+    // operator/admin correction path may bypass the holder lease.
+    assert!(matches!(
+        store.update_status(&card_id, CardStatus::InProgress, 20, &intruder),
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::CrossResource,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        store.complete_card(&card_id, None, Vec::new(), 21, &intruder),
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::CrossResource,
+            ..
+        }))
+    ));
     let card = store.get_card(&card_id)?.expect("card");
-    assert!(card.claim.is_none());
+    assert_eq!(
+        card.claim.as_ref().map(|current| current.run_id.clone()),
+        Some(claim.run_id)
+    );
+    Ok(())
+}
+
+#[test]
+fn claim_transition_authority_returns_matrix_denial_classes() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let ids = [
+        "missing-claim",
+        "wrong-principal",
+        "expired-release",
+        "expired-renew",
+        "expired-heartbeat",
+        "expired-transfer",
+    ];
+    store.import_cards(ids.iter().map(|id| ready_card(id, 2)).collect())?;
+    let holder = Authority::actor("principal-a", false);
+    let missing_id = CardId::new("missing-claim")?;
+    let missing_run = RunId::new("missing-run")?;
+
+    for result in [
+        store
+            .release_claim(&missing_id, &missing_run, 20, &holder)
+            .map(|_| ()),
+        store
+            .renew_claim(&missing_id, &missing_run, 20, 60, &holder)
+            .map(|_| ()),
+        store
+            .heartbeat_claim(&missing_id, &missing_run, 20, &holder)
+            .map(|_| ()),
+        store
+            .transfer_claim(&missing_id, &missing_run, "worker-b", 20, 60, &holder)
+            .map(|_| ()),
+    ] {
+        assert_authority_denial(result, DenialClass::ClaimRequired);
+    }
+
+    let wrong_id = CardId::new("wrong-principal")?;
+    let wrong_claim = store.claim_card(&wrong_id, "worker-a", 10, 3_600, &holder)?;
+    let intruder = Authority::actor("principal-b", false);
+    assert_authority_denial(
+        store.release_claim(&wrong_id, &wrong_claim.run_id, 20, &intruder),
+        DenialClass::CrossResource,
+    );
+    assert_authority_denial(
+        store.renew_claim(&wrong_id, &wrong_claim.run_id, 20, 60, &intruder),
+        DenialClass::CrossResource,
+    );
+    assert_authority_denial(
+        store.heartbeat_claim(&wrong_id, &wrong_claim.run_id, 20, &intruder),
+        DenialClass::CrossResource,
+    );
+    assert_authority_denial(
+        store.transfer_claim(
+            &wrong_id,
+            &wrong_claim.run_id,
+            "worker-b",
+            20,
+            3_600,
+            &intruder,
+        ),
+        DenialClass::CrossResource,
+    );
+
+    for (id, operation) in [
+        ("expired-release", Operation::ReleaseClaim),
+        ("expired-renew", Operation::RenewClaim),
+        ("expired-heartbeat", Operation::HeartbeatClaim),
+        ("expired-transfer", Operation::TransferClaim),
+    ] {
+        let id = CardId::new(id)?;
+        let claim = store.claim_card(&id, "worker-a", 10, 5, &holder)?;
+        let result = match operation {
+            Operation::ReleaseClaim => store
+                .release_claim(&id, &claim.run_id, 30, &holder)
+                .map(|_| ()),
+            Operation::RenewClaim => store
+                .renew_claim(&id, &claim.run_id, 30, 60, &holder)
+                .map(|_| ()),
+            Operation::HeartbeatClaim => store
+                .heartbeat_claim(&id, &claim.run_id, 30, &holder)
+                .map(|_| ()),
+            Operation::TransferClaim => store
+                .transfer_claim(&id, &claim.run_id, "worker-b", 30, 60, &holder)
+                .map(|_| ()),
+            _ => unreachable!("only claim transitions are covered"),
+        };
+        if matches!(operation, Operation::ReleaseClaim) {
+            assert!(result.is_ok());
+        } else {
+            assert_authority_denial(result, DenialClass::ClaimExpired);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn claim_transition_operations_accept_holder_and_admin() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("holder-matrix", 2),
+        ready_card("admin-matrix", 2),
+    ])?;
+    let holder = Authority::actor("principal-a", false);
+    let admin = Authority::actor("operator", true);
+
+    let holder_id = CardId::new("holder-matrix")?;
+    let holder_claim = store.claim_card(&holder_id, "worker-a", 10, 3_600, &holder)?;
+    let renewed = store.renew_claim(&holder_id, &holder_claim.run_id, 20, 60, &holder)?;
+    assert_eq!(renewed.expires_at, 80);
+    let heartbeated = store.heartbeat_claim(&holder_id, &holder_claim.run_id, 21, &holder)?;
+    assert_eq!(heartbeated.run_id, holder_claim.run_id);
+    let transferred = store.transfer_claim(
+        &holder_id,
+        &holder_claim.run_id,
+        "worker-b",
+        22,
+        60,
+        &holder,
+    )?;
+    assert_eq!(transferred.agent, "worker-b");
+    let released = store.release_claim(&holder_id, &holder_claim.run_id, 23, &holder)?;
+    assert_eq!(released.run_id, holder_claim.run_id);
+
+    let admin_id = CardId::new("admin-matrix")?;
+    let admin_claim = store.claim_card(&admin_id, "worker-a", 10, 3_600, &holder)?;
+    assert!(store
+        .renew_claim(&admin_id, &admin_claim.run_id, 20, 60, &admin)
+        .is_ok());
+    assert!(store
+        .heartbeat_claim(&admin_id, &admin_claim.run_id, 21, &admin)
+        .is_ok());
+    let admin_transfer =
+        store.transfer_claim(&admin_id, &admin_claim.run_id, "worker-b", 22, 60, &admin)?;
+    assert_eq!(admin_transfer.agent, "worker-b");
+    assert!(store
+        .release_claim(&admin_id, &admin_claim.run_id, 23, &admin)
+        .is_ok());
+    Ok(())
+}
+
+#[test]
+fn holder_matrix_rejects_wrong_worker_and_expired_annotations() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("authority-annotations")?;
+    store.import_cards(vec![ready_card("authority-annotations", 2)])?;
+    let holder = Authority::actor("integration", false);
+    let claim = store.claim_card(&card_id, "worker-a", 10, 10, &holder)?;
+
+    let link = store.add_link_as(&card_id, "proof", "https://example.test/proof", 11, &holder)?;
+    assert_eq!(link.card_id, card_id);
+
+    let wrong_worker = store.append_work_log_as(
+        &card_id,
+        "worker-b",
+        WorkLogAttribution {
+            run_id: Some(claim.run_id.as_str()),
+            ..WorkLogAttribution::default()
+        },
+        "must be denied",
+        12,
+        &holder,
+    );
+    assert!(matches!(
+        wrong_worker,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::IdentityMismatch,
+            ..
+        }))
+    ));
+
+    let expired = store.append_work_log_as(
+        &card_id,
+        "worker-a",
+        WorkLogAttribution {
+            run_id: Some(claim.run_id.as_str()),
+            ..WorkLogAttribution::default()
+        },
+        "expired claim must be denied",
+        20,
+        &holder,
+    );
+    assert!(matches!(
+        expired,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::ClaimExpired,
+            ..
+        }))
+    ));
     Ok(())
 }
 
@@ -5550,7 +6315,10 @@ fn claim_card_records_principal_separately_from_worker() -> Result<()> {
     );
     assert!(matches!(
         wrong_principal,
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     store.release_claim(
         &card_id,
@@ -5635,16 +6403,19 @@ fn answer_input_rejects_actor_impersonation() -> Result<()> {
     );
     assert!(matches!(
         err,
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdentityMismatch,
+            ..
+        }))
     ));
 
-    // the actor answering as themselves is allowed even though they are not the claim holder.
+    // A successful answer must come from the current claim holder/run.
     let answered = store.answer_input(
         &claim.run_id,
-        "codex",
+        "agent-a",
         "Approved",
         13,
-        &Authority::actor("codex", false),
+        &Authority::actor("agent-a", false),
     )?;
     assert_eq!(answered.state, RunState::Active);
     Ok(())
@@ -6565,14 +7336,14 @@ fn acceptance_and_proof_plan_carrying_a_fresh_key_read_back_scrubbed() -> Result
     }
 
     // Patch path: replacement acceptance/proof_plan lists get the same scrub.
-    let patched = store.patch_card(
+    let patched = store.patch_card_as(
         &card_id,
         CardPatch {
             acceptance: Some(vec![format!("rotate {} afterwards", leaked.raw_key)]),
             proof_plan: Some(vec![format!("readback without {}", leaked.raw_key)]),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         20,
     )?;
     for text in patched
@@ -6787,7 +7558,7 @@ fn fts_v24_rebuild_makes_card_ids_exact_metadata() -> Result<()> {
         limit: 10,
         ..SearchQuery::default()
     })?;
-    assert_eq!(store.schema_version()?, 26);
+    assert_eq!(store.schema_version()?, 27);
     assert_eq!(page.total_count, 1);
     assert_eq!(page.matches.len(), 1);
     assert_eq!(page.matches[0].source_kind, "cards");
@@ -7702,4 +8473,357 @@ fn search_page_shapes_recall_filters_cursor_and_safe_snippets() -> Result<()> {
     });
     assert!(matches!(malformed, Err(StoreError::InvalidSearchCursor(_))));
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IdempotencyTestReceipt {
+    value: String,
+}
+
+#[test]
+fn keyed_idempotency_replays_conflicts_and_gc_is_durable() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.migrate().unwrap();
+    let payload = serde_json::json!({"title": "same"});
+    let authority = Authority::principal("principal-a", false);
+    let request = IdempotencyRequest::from_payload(
+        Operation::PatchCard,
+        "card:powder-1",
+        &authority,
+        "request-1",
+        &payload,
+        100,
+        60,
+    )
+    .unwrap();
+    let mut executions = 0;
+    let first = store
+        .with_idempotency(&request, |_| {
+            executions += 1;
+            Ok(IdempotencyTestReceipt {
+                value: "receipt-1".to_string(),
+            })
+        })
+        .unwrap();
+    assert!(!first.replayed);
+    assert_eq!(first.value.value, "receipt-1");
+    let replay = store
+        .with_idempotency(&request, |_| {
+            executions += 1;
+            Ok(IdempotencyTestReceipt {
+                value: "wrong".to_string(),
+            })
+        })
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.value.value, "receipt-1");
+    assert_eq!(executions, 1);
+
+    let mismatch = IdempotencyRequest::from_payload(
+        Operation::PatchCard,
+        "card:powder-1",
+        &authority,
+        "request-1",
+        &serde_json::json!({"title": "different"}),
+        100,
+        60,
+    )
+    .unwrap();
+    let error = store
+        .with_idempotency::<IdempotencyTestReceipt, _>(&mismatch, |_| unreachable!())
+        .unwrap_err();
+    assert!(error.to_string().contains("different payload"));
+    assert_eq!(
+        match error {
+            StoreError::Domain(ref domain) => domain.denial_class(),
+            _ => None,
+        },
+        Some(powder_core::DenialClass::IdempotencyConflict)
+    );
+
+    assert_eq!(store.gc_idempotency(200, 10).unwrap(), 1);
+    let after_gc = IdempotencyRequest::from_payload(
+        Operation::PatchCard,
+        "card:powder-1",
+        &authority,
+        "request-1",
+        &payload,
+        200,
+        60,
+    )
+    .unwrap();
+    let fresh = store
+        .with_idempotency(&after_gc, |_| {
+            executions += 1;
+            Ok(IdempotencyTestReceipt {
+                value: "receipt-2".to_string(),
+            })
+        })
+        .unwrap();
+    assert!(!fresh.replayed);
+    assert_eq!(executions, 2);
+}
+
+#[test]
+fn keyed_store_mutations_do_not_duplicate_real_rows() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.migrate().unwrap();
+    let authority = Authority::principal("principal-a", false);
+    let card_id = CardId::new("keyed-card").unwrap();
+    let card = Card::new(card_id.clone(), "Keyed", "body")
+        .unwrap()
+        .with_status(CardStatus::Ready)
+        .with_acceptance(["proof".to_string()]);
+    let created = store
+        .create_card_with_events_as_keyed(card.clone(), "create-1", &authority, 10)
+        .unwrap();
+    assert!(!created.replayed);
+    let replay = store
+        .create_card_with_events_as_keyed(card, "create-1", &authority, 10)
+        .unwrap();
+    assert!(replay.replayed);
+
+    let impersonation = store
+        .add_comment_as_keyed(
+            &card_id,
+            "semantic-author",
+            "forged",
+            11,
+            "comment-forged",
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        impersonation,
+        StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdentityMismatch,
+            ..
+        })
+    ));
+
+    let comment = store
+        .add_comment_as_keyed(
+            &card_id,
+            "principal-a",
+            "hello",
+            11,
+            "comment-1",
+            &authority,
+        )
+        .unwrap();
+    assert!(!comment.replayed);
+    let comment_replay = store
+        .add_comment_as_keyed(
+            &card_id,
+            "principal-a",
+            "hello",
+            11,
+            "comment-1",
+            &authority,
+        )
+        .unwrap();
+    assert!(comment_replay.replayed);
+
+    let claim = store
+        .claim_card(&card_id, "worker-a", 12, 100, &authority)
+        .unwrap();
+    let criterion_impersonation = store
+        .check_criterion_as_keyed(
+            &card_id,
+            0,
+            "semantic-actor",
+            true,
+            KeyedOperationContext::new(13, "criterion-forged", &authority),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        criterion_impersonation,
+        StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdentityMismatch,
+            ..
+        })
+    ));
+    let checked = store
+        .check_criterion_as_keyed(
+            &card_id,
+            0,
+            "principal-a",
+            true,
+            KeyedOperationContext::new(13, "criterion-valid", &authority),
+        )
+        .unwrap();
+    assert_eq!(
+        checked.value.criteria[0].checked_by.as_deref(),
+        Some("principal-a")
+    );
+    let attribution = WorkLogAttribution {
+        run_id: Some(claim.run_id.as_str()),
+        ..WorkLogAttribution::default()
+    };
+    let log = store
+        .append_work_log_as_keyed(
+            &card_id,
+            "worker-a",
+            attribution,
+            "doing",
+            KeyedOperationContext::new(13, "log-1", &authority),
+        )
+        .unwrap();
+    assert!(!log.replayed);
+    let log_replay = store
+        .append_work_log_as_keyed(
+            &card_id,
+            "worker-a",
+            attribution,
+            "doing",
+            KeyedOperationContext::new(13, "log-1", &authority),
+        )
+        .unwrap();
+    assert!(log_replay.replayed);
+
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed, 13)
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.comments.len(), 1);
+    assert_eq!(detail.work_log.len(), 1);
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.operation.as_deref() == Some("create_card")));
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.operation.as_deref() == Some("add_comment")));
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.operation.as_deref() == Some("work_log")));
+}
+
+#[test]
+fn keyed_link_attachment_and_answer_delivery_replay_atomically() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("keyed-lifecycle")?;
+    store.import_cards(vec![ready_card("keyed-lifecycle", 2)])?;
+    let admin = Authority::principal("operator", true);
+
+    let first_link = store.add_link_as_keyed(
+        &card_id,
+        "proof",
+        "https://example.test/proof",
+        10,
+        "link-1",
+        &admin,
+    )?;
+    assert!(!first_link.replayed);
+    let replay_link = store.add_link_as_keyed(
+        &card_id,
+        "proof",
+        "https://example.test/proof",
+        11,
+        "link-1",
+        &admin,
+    )?;
+    assert!(replay_link.replayed);
+    assert_eq!(
+        store.connection.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM links WHERE card_id = ?1",
+            [card_id.as_str()],
+            |row| row.get(0),
+        )?,
+        1
+    );
+    let conflict = store.add_link_as_keyed(
+        &card_id,
+        "other",
+        "https://example.test/other",
+        12,
+        "link-1",
+        &admin,
+    );
+    assert!(matches!(
+        conflict,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdempotencyConflict,
+            ..
+        }))
+    ));
+
+    let image = store.attach_image_as_keyed(
+        &card_id,
+        b"image-bytes",
+        "image/png",
+        "proof.png",
+        KeyedOperationContext::new(13, "image-1", &admin),
+    )?;
+    assert!(!image.replayed);
+    let image_replay = store.attach_image_as_keyed(
+        &card_id,
+        b"image-bytes",
+        "image/png",
+        "proof.png",
+        KeyedOperationContext::new(14, "image-1", &admin),
+    )?;
+    assert!(image_replay.replayed);
+    assert_eq!(store.attachments_for_card(&card_id)?.len(), 1);
+    store.detach_as_keyed(&card_id, &image.value.id, 15, "detach-1", &admin)?;
+    let detached = store.detach_as_keyed(&card_id, &image.value.id, 16, "detach-1", &admin)?;
+    assert!(detached.replayed);
+
+    let worker = Authority::principal("worker", false);
+    let claim = store.claim_card(&card_id, "worker", 20, 3600, &worker)?;
+    store.update_status(&card_id, CardStatus::InProgress, 21, &worker)?;
+    let requested =
+        store.request_input_keyed(&claim.run_id, "Approve?", 22, "request-1", &worker)?;
+    assert!(!requested.replayed);
+    let requested_replay =
+        store.request_input_keyed(&claim.run_id, "Approve?", 23, "request-1", &worker)?;
+    assert!(requested_replay.replayed);
+    let answered =
+        store.answer_input_keyed(&claim.run_id, "worker", "Approved", 24, "answer-1", &worker)?;
+    assert!(!answered.replayed);
+    let answered_replay =
+        store.answer_input_keyed(&claim.run_id, "worker", "Approved", 25, "answer-1", &worker)?;
+    assert!(answered_replay.replayed);
+    assert_eq!(answered.value.state, RunState::Active);
+    Ok(())
+}
+
+#[test]
+fn every_keyed_matrix_operation_has_one_store_executor() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.migrate().unwrap();
+    let authority = Authority::principal("matrix-principal", false);
+    let payload = serde_json::json!({"operation": "matrix"});
+    let mut keyed = 0;
+    for operation in Operation::ALL {
+        if !matches!(
+            operation.rule().idempotency,
+            powder_core::IdempotencyMode::Keyed
+        ) {
+            continue;
+        }
+        keyed += 1;
+        let result = store
+            .with_keyed_operation(
+                operation,
+                format!("matrix:{}", operation.as_str()),
+                &payload,
+                KeyedOperationContext::new(
+                    100,
+                    format!("key-{}", operation.as_str()).as_str(),
+                    &authority,
+                ),
+                |_| Ok(operation.as_str().to_string()),
+            )
+            .unwrap();
+        assert!(
+            !result.replayed,
+            "first {} delivery replayed",
+            operation.as_str()
+        );
+    }
+    assert!(keyed > 0);
 }

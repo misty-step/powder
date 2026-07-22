@@ -25,6 +25,7 @@ fn live_tail_delivers_events_created_while_idle() {
     // idling in the notify-wait state.
     let created = ureq::post(&format!("{base}/api/v1/cards"))
         .set("Authorization", &auth_header)
+        .set("Idempotency-Key", "sse-live-before")
         .send_json(json!({
             "id": "sse-live-before",
             "title": "created before the live connection",
@@ -71,6 +72,7 @@ fn live_tail_delivers_events_created_while_idle() {
     // specifically the wake path working.
     let created = ureq::post(&format!("{base}/api/v1/cards"))
         .set("Authorization", &auth_header)
+        .set("Idempotency-Key", "sse-live-after")
         .send_json(json!({
             "id": "sse-live-after",
             "title": "created while the live connection idles",

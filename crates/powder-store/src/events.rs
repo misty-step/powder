@@ -1,12 +1,15 @@
 use std::collections::BTreeSet;
 
-use powder_core::{Card, CardStatus, DomainError};
-use rusqlite::{params, Connection, OptionalExtension};
+use powder_core::{Authority, Card, CardStatus, DomainError, Operation};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{from_json, non_empty, to_json, Result, Store, StoreError, API_KEY_ALPHABET};
+use super::{
+    from_json, non_empty, to_json, IdempotencyOutcome, KeyedOperationContext, Result, Store,
+    StoreError, API_KEY_ALPHABET,
+};
 
 pub const CARD_EVENT_SCHEMA_VERSION: &str = "powder.card_event.v1";
 pub const EVENT_TYPES: &[&str] = &[
@@ -103,33 +106,32 @@ impl Store {
         event_filter: Vec<String>,
         now: i64,
     ) -> Result<EventSubscriptionCreated> {
-        let url = validate_url(url)?;
-        let event_filter = normalize_event_filter(event_filter)?;
-        let signing_secret = format!("whsec_powder_{}", nanoid::nanoid!(32, &API_KEY_ALPHABET));
-        let subscription = EventSubscription {
-            id: format!("sub-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)),
+        self.create_event_subscription_with_authority(
             url,
             event_filter,
-            created_at: now,
-            disabled_at: None,
-        };
-        self.connection.execute(
-            "INSERT INTO event_subscriptions (
-                id, url, event_filter_json, signing_secret_hash, signing_secret, created_at, disabled_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![
-                subscription.id.as_str(),
-                subscription.url.as_str(),
-                to_json(&subscription.event_filter)?,
-                sha256_hex(signing_secret.as_bytes()),
-                signing_secret.as_str(),
-                subscription.created_at
-            ],
-        )?;
-        Ok(EventSubscriptionCreated {
-            subscription,
-            signing_secret,
-        })
+            now,
+            &Authority::unchecked(),
+        )
+    }
+
+    /// Create a webhook subscription in one transaction. This operation is
+    /// deliberately one-shot: the signing secret is disclosed once and never
+    /// persisted in an idempotency receipt.
+    pub fn create_event_subscription_with_authority(
+        &mut self,
+        url: &str,
+        event_filter: Vec<String>,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<EventSubscriptionCreated> {
+        authority.authorize_operation(Operation::CreateSubscription, None, None, now)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let created =
+            create_event_subscription_in_transaction(&transaction, url, event_filter, now)?;
+        transaction.commit()?;
+        Ok(created)
     }
 
     pub fn list_event_subscriptions(&self) -> Result<Vec<EventSubscription>> {
@@ -151,24 +153,29 @@ impl Store {
         subscription_id: &str,
         now: i64,
     ) -> Result<EventSubscription> {
-        let updated = self.connection.execute(
-            "UPDATE event_subscriptions
-             SET disabled_at = COALESCE(disabled_at, ?2)
-             WHERE id = ?1",
-            params![subscription_id, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("event_subscription", subscription_id).into());
-        }
-        self.connection
-            .query_row(
-                "SELECT id, url, event_filter_json, created_at, disabled_at
-                 FROM event_subscriptions
-                 WHERE id = ?1",
-                [subscription_id],
-                EventSubscriptionRecord::from_row,
-            )
-            .map(EventSubscriptionRecord::into_subscription)?
+        self.disable_event_subscription_with_authority(
+            subscription_id,
+            now,
+            &Authority::unchecked(),
+        )
+    }
+
+    /// Disable is a retry-safe transition: a duplicate call preserves the
+    /// original disabled timestamp and returns the same durable row.
+    pub fn disable_event_subscription_with_authority(
+        &mut self,
+        subscription_id: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<EventSubscription> {
+        authority.authorize_operation(Operation::DisableSubscription, None, None, now)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let subscription =
+            disable_event_subscription_in_transaction(&transaction, subscription_id, now)?;
+        transaction.commit()?;
+        Ok(subscription)
     }
 
     /// Cheap sequence-only probe used by the SSE notify loop
@@ -426,46 +433,30 @@ impl Store {
         subscription_id: Option<&str>,
         now: i64,
     ) -> Result<usize> {
-        let transaction = self.connection.transaction()?;
-        let delivery_ids: Vec<String> = {
-            let mut statement = transaction.prepare(
-                "SELECT deliveries.id FROM webhook_deliveries deliveries
-                 JOIN event_subscriptions subscriptions
-                   ON subscriptions.id = deliveries.subscription_id
-                 WHERE deliveries.status = 'dead_letter'
-                   AND subscriptions.disabled_at IS NULL
-                   AND (?1 IS NULL OR deliveries.subscription_id = ?1)
-                 ORDER BY deliveries.updated_at ASC, deliveries.id ASC",
-            )?;
-            let rows = statement
-                .query_map(params![subscription_id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
-        };
-        for delivery_id in &delivery_ids {
-            transaction.execute(
-                "UPDATE webhook_deliveries
-                 SET status = 'pending',
-                     attempt_count = 0,
-                     next_attempt_at = ?2,
-                     last_attempt_at = NULL,
-                     last_status = NULL,
-                     last_error = NULL,
-                     updated_at = ?2
-                 WHERE id = ?1",
-                params![delivery_id, now],
-            )?;
-            insert_delivery_attempt(
-                &transaction,
-                delivery_id,
-                0,
-                None,
-                Some("replayed by operator: requeued from dead-letter"),
-                now,
-            )?;
-        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let replayed = replay_dead_letters_in_transaction(&transaction, subscription_id, now)?;
         transaction.commit()?;
-        Ok(delivery_ids.len())
+        Ok(replayed)
+    }
+
+    pub fn replay_dead_letters_with_authority_keyed(
+        &mut self,
+        subscription_id: Option<&str>,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<usize>> {
+        let payload = serde_json::json!({"subscription_id": subscription_id});
+        let resource = format!("dead_letter:{}", subscription_id.unwrap_or("all"));
+        self.with_keyed_operation(
+            Operation::ReplayDeadLetter,
+            resource,
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| replay_dead_letters_in_transaction(transaction, subscription_id, now),
+        )
     }
 
     fn delivery_attempt_count(&self, delivery_id: &str) -> Result<i64> {
@@ -478,6 +469,111 @@ impl Store {
             .optional()?
             .ok_or_else(|| DomainError::not_found("webhook_delivery", delivery_id).into())
     }
+}
+
+fn create_event_subscription_in_transaction(
+    transaction: &Transaction<'_>,
+    url: &str,
+    event_filter: Vec<String>,
+    now: i64,
+) -> Result<EventSubscriptionCreated> {
+    let url = validate_url(url)?;
+    let event_filter = normalize_event_filter(event_filter)?;
+    let signing_secret = format!("whsec_powder_{}", nanoid::nanoid!(32, &API_KEY_ALPHABET));
+    let subscription = EventSubscription {
+        id: format!("sub-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)),
+        url,
+        event_filter,
+        created_at: now,
+        disabled_at: None,
+    };
+    transaction.execute(
+        "INSERT INTO event_subscriptions (
+            id, url, event_filter_json, signing_secret_hash, signing_secret, created_at, disabled_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+        params![
+            subscription.id.as_str(),
+            subscription.url.as_str(),
+            to_json(&subscription.event_filter)?,
+            sha256_hex(signing_secret.as_bytes()),
+            signing_secret.as_str(),
+            subscription.created_at
+        ],
+    )?;
+    Ok(EventSubscriptionCreated {
+        subscription,
+        signing_secret,
+    })
+}
+
+fn disable_event_subscription_in_transaction(
+    transaction: &Transaction<'_>,
+    subscription_id: &str,
+    now: i64,
+) -> Result<EventSubscription> {
+    let updated = transaction.execute(
+        "UPDATE event_subscriptions
+         SET disabled_at = COALESCE(disabled_at, ?2)
+         WHERE id = ?1",
+        params![subscription_id, now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("event_subscription", subscription_id).into());
+    }
+    transaction
+        .query_row(
+            "SELECT id, url, event_filter_json, created_at, disabled_at
+             FROM event_subscriptions
+             WHERE id = ?1",
+            [subscription_id],
+            EventSubscriptionRecord::from_row,
+        )
+        .map(EventSubscriptionRecord::into_subscription)?
+}
+
+fn replay_dead_letters_in_transaction(
+    transaction: &Transaction<'_>,
+    subscription_id: Option<&str>,
+    now: i64,
+) -> Result<usize> {
+    let delivery_ids: Vec<String> = {
+        let mut statement = transaction.prepare(
+            "SELECT deliveries.id FROM webhook_deliveries deliveries
+             JOIN event_subscriptions subscriptions
+               ON subscriptions.id = deliveries.subscription_id
+             WHERE deliveries.status = 'dead_letter'
+               AND subscriptions.disabled_at IS NULL
+               AND (?1 IS NULL OR deliveries.subscription_id = ?1)
+             ORDER BY deliveries.updated_at ASC, deliveries.id ASC",
+        )?;
+        let rows = statement
+            .query_map(params![subscription_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for delivery_id in &delivery_ids {
+        transaction.execute(
+            "UPDATE webhook_deliveries
+             SET status = 'pending',
+                 attempt_count = 0,
+                 next_attempt_at = ?2,
+                 last_attempt_at = NULL,
+                 last_status = NULL,
+                 last_error = NULL,
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![delivery_id, now],
+        )?;
+        insert_delivery_attempt(
+            transaction,
+            delivery_id,
+            0,
+            None,
+            Some("replayed by operator: requeued from dead-letter"),
+            now,
+        )?;
+    }
+    Ok(delivery_ids.len())
 }
 
 struct OutboundCardEventOptions<'a> {

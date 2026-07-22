@@ -119,6 +119,7 @@ fn server_lifecycle_over_real_http() {
     });
     let created = ureq::post(&format!("{base}/api/v1/cards"))
         .set("Authorization", &auth_header)
+        .set("Idempotency-Key", "socket-smoke-create")
         .send_json(create_body)
         .expect("authenticated create_card should succeed");
     assert_eq!(created.status(), 200, "create_card should return 200");
@@ -133,6 +134,7 @@ fn server_lifecycle_over_real_http() {
     let complete_body = json!({ "proof": "socket smoke drove this lifecycle over real HTTP" });
     let completed = ureq::post(&format!("{base}/api/v1/cards/{card_id}/complete"))
         .set("Authorization", &auth_header)
+        .set("Idempotency-Key", "socket-smoke-complete")
         .send_json(complete_body)
         .expect("authenticated complete should succeed");
     assert_eq!(completed.status(), 200, "complete should return 200");

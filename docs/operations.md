@@ -102,6 +102,8 @@ never an error.
 
 Rollup `coverage` is the full visibility-scoped parent-graph classification/reachability envelope. A row's `status_counts` covers only its root epic's direct children or its parentless leaf itself (parentless leaves are grouped into repository `Unsorted` rows), so nested-epic row sums do not have to equal `coverage.accounted_cards`.
 
+Local SQLite CLI mutations authenticate as the trusted process principal from `POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin process principal is used. `--actor`, `--author`, and `--agent` are semantic audit labels only, and `--admin` is rejected.
+
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
 falling back to ephemeral state. `update-relations`, `set-parent`, `get-run`,
@@ -506,3 +508,11 @@ admin key can touch.
 ## Search contract
 
 `GET /api/v1/cards/search` and `powder search --json` use the same store-backed query. Pass `q` plus optional `source_kind`/`source_field`, status, repo, label, priority, estimate, risk, `created_after`/`created_before`, `updated_after`/`updated_before`, `limit`, and opaque `after`. Search includes card title/body/criteria, comments, and work logs. A single term is exact-or-prefix; multiple terms are unordered within an FTS window. Hyphen and underscore compounds are exact tokens, so sub-token searches are intentionally limited; snippets are plain untrusted text and clients must escape them before HTML. Cursors are bound to the query and filter fingerprint; reusing one with changed filters returns an invalid-cursor error. A valid cursor is an offset into the deterministic result ordering, so concurrent inserts, edits, or deletes can shift later pages; restart the search when a live board changes.
+
+
+### MCP process identity
+
+For local MCP, configure `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent|admin` in the
+trusted process environment. The local dispatcher passes that authority into every
+Store mutation. It rejects missing identity as `unauthenticated`; caller-supplied
+`actor`, `agent`, or `answered_by` fields never select the principal or role.

@@ -12,11 +12,15 @@ use powder_shell::{
     namespace_cards_for_repo, unix_now, ParsedCard, ShellError,
 };
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
-    SearchQuery, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, KeyedOperationContext, RepositoryTier, RepositoryUpsert,
+    RepositoryVisibility, SearchQuery, Store, StoreError,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_IDEMPOTENCY_KEY: AtomicU64 = AtomicU64::new(0);
 
 pub const COMMANDS: &[&str] = &[
     "version",
@@ -110,6 +114,7 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
 }
 
 fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    reject_admin_flag(args)?;
     match args {
         [] => Ok(help()),
         [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
@@ -314,7 +319,7 @@ pub fn help() -> String {
         "  powder relations-doctor --db ./data/powder.db  (report-only: relation asymmetry, malformed relation values, plus dangling/self/cycle/invalid parent edges; nested parents remain valid)\n",
     );
     help.push_str(
-        "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (audited relation mirror repair; malformed relation values stay unchanged; parent repair refuses with evidence)\n",
+        "  powder relations-doctor --db ./data/powder.db --repair  (audited relation mirror repair; malformed relation values stay unchanged; parent repair refuses with evidence)\n",
     );
     help.push_str(
         "    (--repair always ADDS missing relation mirrors, never invents parents; parent findings are refused with evidence because raw state has no unambiguous audited correction.)\n",
@@ -353,16 +358,15 @@ pub fn help() -> String {
     help.push_str("  powder subscription-list --db ./data/powder.db\n");
     help.push_str("  powder subscription-disable sub-id --db ./data/powder.db\n");
     help.push_str("  powder dead-letter-list --db ./data/powder.db\n");
-    help.push_str("  powder dead-letter-replay --db ./data/powder.db [--subscription sub-id]\n");
+    help.push_str("  powder dead-letter-replay --db ./data/powder.db --idempotency-key replay-001 [--subscription sub-id]\n");
     help.push_str("  powder event-tail --db ./data/powder.db --after 0 --limit 20\n");
     help.push_str(
         "  powder update-status 001 --db ./data/powder.db --status in_progress --actor codex\n\n",
     );
     help.push_str(
-        "authority:\n  add --actor <name> to audit status, relation, and completion changes. \
-         Claim impersonation and lease mutations (release/renew/heartbeat/request-input) still \
-         check the caller against the claim holder unless --admin is supplied. Omitting --actor \
-         keeps direct-DB-access trust and records unchecked audit events.\n\n",
+        "authority:\n  local mutations use POWDER_PRINCIPAL (or the fixed trusted local-cli admin principal). \
+         --actor, --author, and --agent are semantic audit labels only; they never grant authority. \
+         --admin is not accepted.\n\n",
     );
     help.push_str("api contract:\n");
     help.push_str(&powder_api::route_summary());
@@ -425,7 +429,9 @@ fn key_create(args: &[String]) -> Result<String, ShellError> {
         .unwrap_or(ApiKeyScope::Agent);
     let now = unix_now();
     let mut store = open_store(required_flag(args, "--db")?)?;
-    let key = store.create_api_key(name, scope, now).map_err(store_err)?;
+    let key = store
+        .create_api_key_with_authority(name, scope, now, &admin_authority(args))
+        .map_err(store_err)?;
 
     if show_secret {
         // The warning is for the human; stdout stays machine-readable so
@@ -480,7 +486,9 @@ fn key_revoke(args: &[String]) -> Result<String, ShellError> {
         .copied()
         .ok_or_else(|| ShellError::Invalid("key-revoke requires a key id".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    store.revoke_api_key(key_id, now).map_err(store_err)?;
+    store
+        .revoke_api_key_with_authority(key_id, now, &admin_authority(args))
+        .map_err(store_err)?;
     Ok(format!("revoked\t{key_id}\n"))
 }
 
@@ -680,9 +688,16 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         card.blocked_by = blocked_by;
         card.parent = parent;
         card.repo = repo;
-        json!(store
-            .create_card_with_events_as(card, &authority(args), now)
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .create_card_with_events_as_keyed(
+                    card,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                    now,
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({
             "id": id,
@@ -712,7 +727,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         if let Some(parent) = parent {
             payload["parent"] = json!(parent.as_str());
         }
-        client.post("/api/v1/cards", payload).map_err(remote_err)?
+        client
+            .post_with_key("/api/v1/cards", payload, &idempotency_key(args)?)
+            .map_err(remote_err)?
     } else {
         return Err(missing_transport("create-card"));
     };
@@ -754,9 +771,17 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .patch_card_as(&card_id, patch, &authority(args), now)
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .patch_card_as_keyed(
+                    &card_id,
+                    patch,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                    now,
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({});
         if let Some(title) = patch.title {
@@ -787,7 +812,11 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             payload["labels"] = json!(labels);
         }
         client
-            .patch(&format!("/api/v1/cards/{card_id}"), payload)
+            .patch_with_key(
+                &format!("/api/v1/cards/{card_id}"),
+                payload,
+                &idempotency_key(args)?,
+            )
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("update-card"));
@@ -806,15 +835,15 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
     let card_id = positional_card_id(args, "update-relations")?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .update_relations(
+        .update_relations_keyed(
             &card_id,
             card_ids_flag(args, "--related")?,
             card_ids_flag(args, "--blocks")?,
             card_ids_flag(args, "--blocked-by")?,
-            now,
-            &authority(args),
+            KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
         )
-        .map_err(store_err)?;
+        .map_err(store_err)?
+        .value;
     Ok(format!("relations\t{}\n", card.id))
 }
 
@@ -828,11 +857,10 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
 /// the report before repairing.
 fn relations_doctor(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
-    let actor = flag_value(args, "--actor").unwrap_or("operator");
     let repair = has_flag(args, "--repair");
     let mut store = open_store(required_flag(args, "--db")?)?;
     let report = store
-        .relations_doctor(actor, now, repair)
+        .relations_doctor_with_authority(&admin_authority(args), now, repair)
         .map_err(store_err)?;
     to_pretty_json(&report)
 }
@@ -855,8 +883,15 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
     };
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .set_parent(&card_id, parent, now, &authority(args))
-        .map_err(store_err)?;
+        .set_parent_keyed(
+            &card_id,
+            parent,
+            now,
+            &idempotency_key(args)?,
+            &authority(args),
+        )
+        .map_err(store_err)?
+        .value;
     Ok(format!(
         "parent\t{}\t{}\n",
         card.id,
@@ -1232,7 +1267,7 @@ fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 "/api/v1/cards/papercut",
                 json!({
                     "agent": report.agent,
@@ -1241,6 +1276,7 @@ fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
                     "model": report.model,
                     "harness": report.harness,
                 }),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1300,8 +1336,8 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
         })
         .transpose()?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    let repository = store
-        .upsert_repository_with_authority(
+    let repository_outcome = store
+        .upsert_repository_with_authority_keyed(
             RepositoryUpsert {
                 name,
                 aliases: aliases_flag(args),
@@ -1310,9 +1346,13 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
                 import_provenance: flag_value(args, "--import-provenance").map(str::to_string),
             },
             now,
+            &idempotency_key(args)?,
             &admin_authority(args),
         )
         .map_err(store_err)?;
+    let mut repository = serde_json::to_value(repository_outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    repository["replayed"] = json!(repository_outcome.replayed);
     to_pretty_json(&repository)
 }
 
@@ -1327,21 +1367,36 @@ fn repository_merge_alias(args: &[String]) -> Result<String, ShellError> {
     }
     let mut store = open_store(required_flag(args, "--db")?)?;
     let outcome = store
-        .merge_repository_alias_with_authority(alias, target, &auth, now)
+        .merge_repository_alias_with_authority_keyed(
+            alias,
+            target,
+            &auth,
+            now,
+            &idempotency_key(args)?,
+        )
         .map_err(store_err)?;
-    to_pretty_json(&outcome)
+    let mut value = serde_json::to_value(outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    value["replayed"] = json!(outcome.replayed);
+    to_pretty_json(&value)
 }
 
 fn repository_delete(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
     let name = positional(args)
         .first()
         .copied()
         .ok_or_else(|| ShellError::Invalid("repository-delete requires a name".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    store
-        .delete_repository_with_authority(name, &admin_authority(args))
+    let outcome = store
+        .delete_repository_with_authority_keyed(
+            name,
+            now,
+            &idempotency_key(args)?,
+            &admin_authority(args),
+        )
         .map_err(store_err)?;
-    Ok(format!("deleted\t{name}\n"))
+    Ok(format!("deleted\t{name}\t{}\n", outcome.replayed))
 }
 
 /// powder-904: admin-ish, local-db-only sweep -- normalizes every card
@@ -1356,10 +1411,13 @@ fn repository_normalize(args: &[String]) -> Result<String, ShellError> {
         let auth = admin_authority(args);
         let mut store = open_store(required_flag(args, "--db")?)?;
         store
-            .normalize_repository_strings_with_authority(&auth, now)
+            .normalize_repository_strings_with_authority_keyed(&auth, now, &idempotency_key(args)?)
             .map_err(store_err)?
     };
-    to_pretty_json(&outcome)
+    let mut value = serde_json::to_value(outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    value["replayed"] = json!(outcome.replayed);
+    to_pretty_json(&value)
 }
 
 fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1397,14 +1455,22 @@ fn release_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (released_card_id, released_run_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .release_claim(&card_id, &run_id, now, &authority(args))
-            .map_err(store_err)?;
+            .release_claim_keyed(
+                &card_id,
+                &run_id,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (claim.card_id.to_string(), claim.run_id.to_string())
     } else if let Some(client) = remote_env.client() {
         let released = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/release"),
                 json!({"run_id": run_id.as_str()}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (
@@ -1425,8 +1491,16 @@ fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let (renewed_card_id, renewed_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
-            .map_err(store_err)?;
+            .renew_claim_keyed(
+                &card_id,
+                &run_id,
+                now,
+                ttl_seconds,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (
             claim.card_id.to_string(),
             claim.run_id.to_string(),
@@ -1434,9 +1508,10 @@ fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         )
     } else if let Some(client) = remote_env.client() {
         let renewed = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/renew"),
                 json!({"run_id": run_id.as_str(), "ttl_seconds": ttl_seconds}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (
@@ -1463,15 +1538,15 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
     {
         let mut store = open_store(db)?;
         let claim = store
-            .transfer_claim(
+            .transfer_claim_keyed(
                 &card_id,
                 &run_id,
                 to_agent,
-                now,
                 ttl_seconds,
-                &authority(args),
+                KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
             )
-            .map_err(store_err)?;
+            .map_err(store_err)?
+            .value;
         (
             claim.card_id.to_string(),
             claim.run_id.to_string(),
@@ -1480,9 +1555,10 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
         )
     } else if let Some(client) = remote_env.client() {
         let transferred = client
-                .post(
+                .post_with_key(
                     &format!("/api/v1/cards/{card_id}/transfer"),
                     json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
+                    &idempotency_key(args)?,
                 )
                 .map_err(remote_err)?;
         (
@@ -1506,8 +1582,15 @@ fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErr
     let (beat_card_id, beat_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .heartbeat_claim(&card_id, &run_id, now, &authority(args))
-            .map_err(store_err)?;
+            .heartbeat_claim_keyed(
+                &card_id,
+                &run_id,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (
             claim.card_id.to_string(),
             claim.run_id.to_string(),
@@ -1515,9 +1598,10 @@ fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErr
         )
     } else if let Some(client) = remote_env.client() {
         let beat = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/heartbeat"),
                 json!({"run_id": run_id.as_str()}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (
@@ -1601,14 +1685,24 @@ fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shell
     let answer = required_flag(args, "--answer")?;
     let run = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .answer_input(&run_id, actor, answer, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .answer_input_keyed(
+                    &run_id,
+                    actor,
+                    answer,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/runs/{run_id}/answer"),
                 json!({"actor": actor, "answer": answer}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1634,14 +1728,23 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .update_status(&card_id, status, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .update_status_keyed(
+                    &card_id,
+                    status,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/status"),
                 json!({"status": status.as_str()}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1663,14 +1766,23 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let checked = !has_flag(args, "--unchecked");
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .check_criterion_as(&card_id, criterion, actor, checked, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .check_criterion_as_keyed(
+                    &card_id,
+                    criterion,
+                    actor,
+                    checked,
+                    KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/criteria/check"),
                 json!({"criterion": criterion, "actor": actor, "checked": checked}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1693,14 +1805,23 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     let (link_card_id, link_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let link = store
-            .add_link_as(&card_id, label, url, now, &authority(args))
-            .map_err(store_err)?;
+            .add_link_as_keyed(
+                &card_id,
+                label,
+                url,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (link.card_id.to_string(), link.id.to_string())
     } else if let Some(client) = remote_env.client() {
         let link = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/links"),
                 json!({"label": label, "url": url}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (json_string(&link, "card_id")?, json_string(&link, "id")?)
@@ -1718,14 +1839,24 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let body = required_flag(args, "--body")?;
     let comment = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .add_comment_as(&card_id, author, body, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .add_comment_as_keyed(
+                    &card_id,
+                    author,
+                    body,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/comments"),
                 json!({"author": author, "body": body}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1757,12 +1888,20 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .append_work_log_as(&card_id, agent, attribution, body, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .append_work_log_as_keyed(
+                    &card_id,
+                    agent,
+                    attribution,
+                    body,
+                    KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/work-log"),
                 json!({
                     "agent": agent,
@@ -1772,6 +1911,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                     "harness": harness,
                     "run_id": run_id,
                 }),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1796,14 +1936,22 @@ fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (awaiting_run_id, awaiting_card_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let run = store
-            .request_input(&run_id, question, now, &authority(args))
-            .map_err(store_err)?;
+            .request_input_keyed(
+                &run_id,
+                question,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (run.id.to_string(), run.card_id.to_string())
     } else if let Some(client) = remote_env.client() {
         let run = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/runs/{run_id}/input"),
                 json!({"question": question}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (json_string(&run, "id")?, json_string(&run, "card_id")?)
@@ -1822,9 +1970,18 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let criterion_proofs = criterion_proofs_flag(args)?;
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .complete_card_keyed(
+                    &card_id,
+                    proof,
+                    criterion_proofs,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         let mut body = json!({});
         if let Some(proof) = proof {
@@ -1837,7 +1994,11 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
                 .collect::<Vec<_>>());
         }
         client
-            .post(&format!("/api/v1/cards/{card_id}/complete"), body)
+            .post_with_key(
+                &format!("/api/v1/cards/{card_id}/complete"),
+                body,
+                &idempotency_key(args)?,
+            )
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("complete-card"));
@@ -1854,7 +2015,12 @@ fn subscription_create(args: &[String]) -> Result<String, ShellError> {
     let url = required_flag(args, "--url")?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let created = store
-        .create_event_subscription(url, event_filter_flag(args)?, now)
+        .create_event_subscription_with_authority(
+            url,
+            event_filter_flag(args)?,
+            now,
+            &admin_authority(args),
+        )
         .map_err(store_err)?;
     if has_flag(args, "--show-secret") {
         Ok(format!(
@@ -1884,7 +2050,7 @@ fn subscription_disable(args: &[String]) -> Result<String, ShellError> {
         .ok_or_else(|| ShellError::Invalid("subscription-disable requires an id".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let subscription = store
-        .disable_event_subscription(subscription_id, now)
+        .disable_event_subscription_with_authority(subscription_id, now, &admin_authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "disabled\t{}\t{}\n",
@@ -1914,10 +2080,19 @@ fn dead_letter_list(args: &[String]) -> Result<String, ShellError> {
 fn dead_letter_replay(args: &[String]) -> Result<String, ShellError> {
     let mut store = open_store(required_flag(args, "--db")?)?;
     let subscription_id = flag_value(args, "--subscription");
+    let idempotency_key = required_flag(args, "--idempotency-key")?;
     let replayed = store
-        .replay_dead_letters(subscription_id, unix_now())
+        .replay_dead_letters_with_authority_keyed(
+            subscription_id,
+            unix_now(),
+            idempotency_key,
+            &admin_authority(args),
+        )
         .map_err(store_err)?;
-    to_pretty_json(&serde_json::json!({ "replayed": replayed }))
+    to_pretty_json(&serde_json::json!({
+        "replayed": replayed.value,
+        "replayed_delivery": replayed.replayed,
+    }))
 }
 
 fn event_tail(args: &[String]) -> Result<String, ShellError> {
@@ -1930,6 +2105,64 @@ fn event_tail(args: &[String]) -> Result<String, ShellError> {
             .list_event_tail(after, parse_limit(args).unwrap_or(20))
             .map_err(store_err)?
     }))
+}
+
+fn idempotency_key(args: &[String]) -> Result<String, ShellError> {
+    let mut values = Vec::new();
+    let mut supplied = false;
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--idempotency-key" {
+            supplied = true;
+            let value = args.get(index + 1).ok_or_else(|| {
+                ShellError::Invalid("--idempotency-key requires a value".to_string())
+            })?;
+            let value = value.trim();
+            if value.is_empty() || value.starts_with("--") {
+                return Err(ShellError::Invalid(
+                    "--idempotency-key requires a non-empty value".to_string(),
+                ));
+            }
+            values.push(value);
+        } else if let Some(value) = arg.strip_prefix("--idempotency-key=") {
+            supplied = true;
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ShellError::Invalid(
+                    "--idempotency-key requires a non-empty value".to_string(),
+                ));
+            }
+            values.push(value);
+        }
+    }
+    if !supplied {
+        let sequence = NEXT_IDEMPOTENCY_KEY.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        return Ok(format!(
+            "powder-cli-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+    }
+    let first = values[0];
+    if values.iter().any(|value| *value != first) {
+        return Err(ShellError::Invalid(
+            "conflicting --idempotency-key values are not accepted".to_string(),
+        ));
+    }
+    Ok(first.to_string())
+}
+
+fn keyed_json<T: serde::Serialize>(
+    outcome: powder_store::IdempotencyOutcome<T>,
+) -> Result<Value, ShellError> {
+    let mut value = serde_json::to_value(outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("replayed".to_string(), json!(outcome.replayed));
+    }
+    Ok(value)
 }
 
 fn open_store(path: &str) -> Result<Store, ShellError> {
@@ -2065,24 +2298,39 @@ fn criterion_flag(args: &[String]) -> Result<usize, ShellError> {
         .map_err(|err| ShellError::Invalid(format!("invalid --criterion {raw}: {err}")))
 }
 
-/// Build the `Authority` a mutation is checked against from `--actor` (and
-/// `--admin`). Omitting `--actor` preserves prior CLI behavior exactly: a
-/// direct-DB-access operator is trusted and no ownership check runs.
-fn authority(args: &[String]) -> Authority {
-    match flag_value(args, "--actor") {
-        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
-        None => Authority::actor("operator", true),
-    }
+/// Build the trusted process authority for a local SQLite mutation.
+///
+/// `--actor`, `--author`, and `--agent` are semantic audit inputs only; they
+/// never construct or elevate the authenticated principal. A deployment may set
+/// `POWDER_PRINCIPAL` in the trusted process environment. Otherwise the
+/// single-operator local CLI uses its fixed `local-cli` admin principal.
+fn local_authority() -> Authority {
+    let principal = std::env::var("POWDER_PRINCIPAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "local-cli".to_string());
+    Authority::principal(principal, true)
 }
 
-/// Repository registry writes are operator/admin mutations. Direct SQLite
-/// callers retain the local operator default, while an explicit actor must
-/// carry the admin capability rather than being inferred from its label.
-fn admin_authority(args: &[String]) -> Authority {
-    match flag_value(args, "--actor") {
-        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
-        None => Authority::actor("operator", true),
+fn authority(_args: &[String]) -> Authority {
+    local_authority()
+}
+
+fn admin_authority(_args: &[String]) -> Authority {
+    local_authority()
+}
+
+fn reject_admin_flag(args: &[String]) -> Result<(), ShellError> {
+    if args
+        .iter()
+        .any(|arg| arg == "--admin" || arg.starts_with("--admin="))
+    {
+        return Err(ShellError::Invalid(
+            "--admin is not accepted; authority comes from trusted process configuration"
+                .to_string(),
+        ));
     }
+    Ok(())
 }
 
 fn reject_principal_flag(args: &[String]) -> Result<(), ShellError> {
@@ -2205,7 +2453,6 @@ fn flag_takes_value(flag: &str) -> bool {
         "--dry-run"
             | "--show-secret"
             | "--redacted"
-            | "--admin"
             | "--include-hidden"
             | "--unchecked"
             | "--repair"
@@ -2896,7 +3143,6 @@ mod tests {
             "0",
             "--actor",
             "operator",
-            "--admin",
         ]))
         .unwrap();
         assert_eq!(checked, "criterion\tproof-plan\t0\tchecked\n");
@@ -3101,7 +3347,6 @@ mod tests {
             "canary",
             "--actor",
             "operator",
-            "--admin",
         ]))
         .unwrap();
         assert!(merged.contains("\"rehomed_cards\": 1"));
@@ -3159,7 +3404,6 @@ mod tests {
             &db,
             "--actor",
             "operator",
-            "--admin",
         ]))
         .unwrap();
         assert!(output.contains("\"scanned\": 1"), "output was: {output}");
@@ -3287,15 +3531,7 @@ mod tests {
             "report was: {report}"
         );
 
-        let repaired = run(&args([
-            "relations-doctor",
-            "--db",
-            &db,
-            "--repair",
-            "--actor",
-            "operator",
-        ]))
-        .unwrap();
+        let repaired = run(&args(["relations-doctor", "--db", &db, "--repair"])).unwrap();
         assert!(
             repaired.contains("\"issues\": []"),
             "report was: {repaired}"
@@ -3398,6 +3634,23 @@ mod tests {
         assert!(card.contains("\"agent\": \"codex\""));
         assert!(card.contains("\"model\": \"claude-sonnet-5\""));
         assert!(card.contains("\"body\": \"tracing the claim expiry bug\""));
+    }
+
+    #[test]
+    fn cli_rejects_removed_admin_flag_before_mutation() {
+        let err = run(&args([
+            "update-status",
+            "card",
+            "--status",
+            "ready",
+            "--admin",
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ShellError::Invalid(message)
+                if message == "--admin is not accepted; authority comes from trusted process configuration"
+        ));
     }
 
     #[test]
@@ -3583,7 +3836,14 @@ mod tests {
         let listed = run(&args(["dead-letter-list", "--db", &db])).unwrap();
         assert!(listed.contains("\"event_type\": \"completed\""));
 
-        let replayed = run(&args(["dead-letter-replay", "--db", &db])).unwrap();
+        let replayed = run(&args([
+            "dead-letter-replay",
+            "--db",
+            &db,
+            "--idempotency-key",
+            "replay-001",
+        ]))
+        .unwrap();
         assert!(replayed.contains("\"replayed\": 1"));
 
         let listed_after = run(&args(["dead-letter-list", "--db", &db])).unwrap();
@@ -3591,7 +3851,14 @@ mod tests {
 
         // A second replay with nothing left dead-lettered is a legitimate
         // no-op, not an error.
-        let replayed_again = run(&args(["dead-letter-replay", "--db", &db])).unwrap();
+        let replayed_again = run(&args([
+            "dead-letter-replay",
+            "--db",
+            &db,
+            "--idempotency-key",
+            "replay-002",
+        ]))
+        .unwrap();
         assert!(replayed_again.contains("\"replayed\": 0"));
     }
 
@@ -4006,7 +4273,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_actor_flag_enforces_claim_holder_like_http_and_mcp() {
+    fn cli_actor_flag_is_semantic_for_local_admin_corrections() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-holder-{}.db",
             std::time::SystemTime::now()
@@ -4067,7 +4334,7 @@ mod tests {
         .unwrap();
         assert!(completed.contains("completed\tholder-test\tdone"));
         let card = run(&args(["get-card", "holder-test", "--db", &db])).unwrap();
-        assert!(card.contains("\"actor\": \"intruder\""));
+        assert!(card.contains("\"actor\": \"local-cli\""));
         assert!(card.contains("in_progress -> done"));
     }
 
@@ -4123,7 +4390,7 @@ mod tests {
         let card = run(&args(["get-card", "relation-test", "--db", &db])).unwrap();
         assert!(card.contains("\"related\": [\n      \"peer-c\""));
         assert!(card.contains("\"blocked_by\": [\n      \"parent-a\""));
-        assert!(card.contains("\"actor\": \"operator\""));
+        assert!(card.contains("\"actor\": \"local-cli\""));
     }
 
     #[test]
@@ -4434,6 +4701,70 @@ mod tests {
     }
 
     #[test]
+    fn cli_idempotency_key_override_is_stable_and_conflicts_fail() {
+        let explicit = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "replay-1",
+        ]);
+        assert_eq!(idempotency_key(&explicit).unwrap(), "replay-1");
+        let repeated = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "replay-1",
+            "--idempotency-key",
+            "replay-1",
+        ]);
+        assert_eq!(idempotency_key(&repeated).unwrap(), "replay-1");
+        let conflicting = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "replay-1",
+            "--idempotency-key",
+            "replay-2",
+        ]);
+        let error = idempotency_key(&conflicting).unwrap_err().to_string();
+        assert!(error.contains("conflicting --idempotency-key"));
+        let empty = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "",
+        ]);
+        assert!(idempotency_key(&empty)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a non-empty"));
+        let missing = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+        ]);
+        assert!(idempotency_key(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a value"));
+        let generated = args(["update-status", "card-1", "--status", "done"]);
+        let first = idempotency_key(&generated).unwrap();
+        let second = idempotency_key(&generated).unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with("powder-cli-"));
+    }
+
+    #[test]
     fn cli_remote_mode_uses_http_for_the_accepted_card_commands() {
         let (base_url, recorded) = spawn_test_server(vec![
             (
@@ -4521,6 +4852,8 @@ mod tests {
                 "misty-step/powder",
                 "--related",
                 "remote-1",
+                "--idempotency-key",
+                "create-replay",
             ]),
             &env,
         )
@@ -4590,6 +4923,14 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| { request.authorization.as_deref() == Some("Bearer sk_powder_test") }));
+        assert_eq!(
+            requests[3].idempotency_key.as_deref(),
+            Some("create-replay")
+        );
+        assert!(requests[4].idempotency_key.is_none());
+        for index in [5usize, 6, 7] {
+            assert!(requests[index].idempotency_key.is_some());
+        }
         assert_eq!(
             requests[3].body,
             Some(json!({
@@ -5132,6 +5473,7 @@ Serve grid thumbnails instead of full originals.\n\n\
         method: String,
         path: String,
         authorization: Option<String>,
+        idempotency_key: Option<String>,
         body: Option<Value>,
     }
 
@@ -5162,6 +5504,7 @@ Serve grid thumbnails instead of full originals.\n\n\
 
                 let mut content_length = 0usize;
                 let mut authorization = None;
+                let mut idempotency_key = None;
                 loop {
                     let mut header_line = String::new();
                     reader.read_line(&mut header_line).expect("read header");
@@ -5173,6 +5516,9 @@ Serve grid thumbnails instead of full originals.\n\n\
                     }
                     if let Some(value) = header_line.strip_prefix("Authorization:") {
                         authorization = Some(value.trim().to_string());
+                    }
+                    if let Some(value) = header_line.strip_prefix("Idempotency-Key:") {
+                        idempotency_key = Some(value.trim().to_string());
                     }
                 }
 
@@ -5187,6 +5533,7 @@ Serve grid thumbnails instead of full originals.\n\n\
                     method,
                     path,
                     authorization,
+                    idempotency_key,
                     body: request_body,
                 });
 

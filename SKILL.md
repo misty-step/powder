@@ -153,9 +153,10 @@ Default agent persona (23 tools):
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
 - `update_card`: patch title, body, acceptance, proof_plan, status, priority,
-  or labels on an existing card (`PATCH /api/v1/cards/{id}`). Any
-  authenticated actor may patch; every patch is audited with actor and field
-  list, so recording an operator ruling never requires the admin key.
+  or labels on an existing card (`PATCH /api/v1/cards/{id}`). Agent-scoped
+  callers need the current unexpired claim; an authenticated admin may correct
+  card truth without one. Powder derives audit principal and role from the
+  transport credential rather than trusting caller-supplied labels.
 
 Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all` (9 tools; 32 tools total):
 
@@ -319,3 +320,12 @@ cargo test --workspace
 - Do not import from Gradient or Hermes `kanban.db`.
 - Do not add personal or operator backlog data to the Powder repository.
 - Do not treat exit zero as completion without a status update and audit trail.
+
+
+Local CLI mutations use the trusted process principal from `POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin process principal is used. `--actor`, `--author`, and `--agent` are semantic labels only, and `--admin` is rejected.
+
+Local MCP also requires trusted launch identity before it can mutate a local
+SQLite instance. Set `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent|admin` in the MCP process environment. A missing or invalid
+identity returns an unauthenticated error; MCP never defaults to operator or
+unchecked authority. Tool `actor`, `agent`, and `answered_by` values are semantic labels only and
+must match the process principal when the operation requires identity.

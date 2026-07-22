@@ -71,6 +71,7 @@ curl -s http://localhost:4000/healthz
 
 curl -s -X POST http://localhost:4000/api/v1/cards \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: first-card-create" \
   -d '{"id":"first-card","title":"My first card","acceptance":["it exists"]}'
 
 curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \

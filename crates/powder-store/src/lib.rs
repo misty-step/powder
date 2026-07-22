@@ -10,8 +10,8 @@ use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim, ClaimReceipt,
-    Comment, CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId,
-    Priority, ReadyCursor, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
+    Comment, CriterionProof, DenialClass, DomainError, EpicFreshness, EpicState, Estimate, Link,
+    LinkId, Operation, Priority, ReadyCursor, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{
     functions::{Context, FunctionFlags},
@@ -98,6 +98,80 @@ pub enum StoreError {
 pub struct Store {
     connection: Connection,
     field_note_config: Option<FieldNoteConfig>,
+}
+
+/// Durable request identity for a keyed mutation. The digest is computed from
+/// the complete semantic payload before the mutation enters a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRequest {
+    pub operation: Operation,
+    pub resource: String,
+    pub principal: String,
+    pub key: String,
+    pub payload_digest: String,
+    pub now: i64,
+    pub expires_at: i64,
+}
+
+impl IdempotencyRequest {
+    pub fn from_payload<P: Serialize>(
+        operation: Operation,
+        resource: impl Into<String>,
+        authority: &Authority,
+        key: impl Into<String>,
+        payload: &P,
+        now: i64,
+        ttl_seconds: i64,
+    ) -> Result<Self> {
+        let payload = serde_json::to_vec(payload)?;
+        let resource = non_empty("resource", &resource.into())?;
+        let principal = authority
+            .principal_name()
+            .ok_or_else(|| {
+                DomainError::authority_denied(
+                    DenialClass::Unauthenticated,
+                    "keyed mutations require an authenticated principal",
+                )
+            })?
+            .to_string();
+        let key = non_empty("idempotency_key", &key.into())?;
+        if ttl_seconds <= 0 {
+            return Err(DomainError::validation("ttl_seconds", "must be positive").into());
+        }
+        Ok(Self {
+            operation,
+            resource,
+            principal,
+            key,
+            payload_digest: format!("sha256:{:x}", Sha256::digest(payload)),
+            now,
+            expires_at: now.saturating_add(ttl_seconds),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyOutcome<T> {
+    pub value: T,
+    pub replayed: bool,
+}
+
+/// Shared request metadata for a keyed mutation.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyedOperationContext<'a> {
+    now: i64,
+    idempotency_key: &'a str,
+    authority: &'a Authority,
+}
+
+impl<'a> KeyedOperationContext<'a> {
+    pub fn new(now: i64, idempotency_key: &'a str, authority: &'a Authority) -> Self {
+        Self {
+            now,
+            idempotency_key,
+            authority,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -530,12 +604,57 @@ pub struct WorkLogAttribution<'a> {
 }
 
 struct MutationAudit<'a> {
+    operation: Operation,
     event_type: &'a str,
     actor: &'a str,
     payload: &'a str,
+    resource: &'a str,
+    semantic_identity: Option<&'a str>,
+    run_id: Option<&'a RunId>,
+    reason: Option<&'a str>,
     subject_kind: &'a str,
     subject_id: &'a str,
     authority: &'a Authority,
+}
+
+/// Every authority-aware card mutation enters this evaluator after loading
+/// the current claim snapshot. A worker can only act for its own principal,
+/// current unexpired claim, semantic worker label, and (when supplied) run.
+/// Admin/trusted-local authority is deliberately the correction escape hatch.
+fn authorize_card_operation(
+    authority: &Authority,
+    operation: Operation,
+    card: &Card,
+    run_id: Option<&RunId>,
+    worker: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    authority.authorize_operation_with_worker(
+        operation,
+        card.claim.as_ref(),
+        run_id,
+        worker,
+        now,
+    )?;
+    if matches!(authority.role(), powder_core::PrincipalRole::Agent) {
+        if let Some(target_run) = run_id {
+            let Some(claim) = card.claim.as_ref() else {
+                return Err(DomainError::authority_denied(
+                    DenialClass::ClaimRequired,
+                    format!("operation {} requires the current run", operation.as_str()),
+                )
+                .into());
+            };
+            if claim.run_id != *target_run {
+                return Err(DomainError::authority_denied(
+                    DenialClass::CrossResource,
+                    format!("operation {} targets another run", operation.as_str()),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Store {
@@ -709,11 +828,168 @@ impl Store {
                     self.migrate_25_to_26()?;
                     26
                 }
+                26 => {
+                    self.migrate_26_to_27()?;
+                    27
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
                 .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
+    }
+
+    /// Canonical Store boundary for every matrix operation whose rule is
+    /// keyed. Faces supply only semantic payload/resource data; principal and
+    /// role come from the authenticated authority, and the closure runs inside
+    /// the same transaction as the durable receipt.
+    pub fn with_keyed_operation<T, P, F>(
+        &mut self,
+        operation: Operation,
+        resource: impl Into<String>,
+        payload: &P,
+        context: KeyedOperationContext<'_>,
+        mutation: F,
+    ) -> Result<IdempotencyOutcome<T>>
+    where
+        T: Serialize + DeserializeOwned,
+        P: Serialize,
+        F: FnOnce(&Transaction<'_>) -> Result<T>,
+    {
+        let KeyedOperationContext {
+            now,
+            idempotency_key: key,
+            authority,
+        } = context;
+        if !matches!(
+            operation.rule().idempotency,
+            powder_core::IdempotencyMode::Keyed
+        ) {
+            return Err(DomainError::validation(
+                "operation",
+                format!("{} is not keyed", operation.as_str()),
+            )
+            .into());
+        }
+        let request = IdempotencyRequest::from_payload(
+            operation,
+            resource,
+            authority,
+            key,
+            payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, mutation)
+    }
+
+    /// Execute one keyed mutation and persist its receipt in the same
+    /// transaction as the mutation. Immediate locking serializes duplicate
+    /// deliveries, so a replay returns the original value without running the
+    /// mutation closure again; a different payload under the same key returns a
+    /// stable structured idempotency_conflict denial.
+    pub fn with_idempotency<T, F>(
+        &mut self,
+        request: &IdempotencyRequest,
+        mutation: F,
+    ) -> Result<IdempotencyOutcome<T>>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce(&Transaction<'_>) -> Result<T>,
+    {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM operation_idempotency
+             WHERE operation = ?1 AND resource = ?2 AND principal = ?3
+               AND idempotency_key = ?4 AND expires_at <= ?5",
+            params![
+                request.operation.as_str(),
+                request.resource,
+                request.principal,
+                request.key,
+                request.now,
+            ],
+        )?;
+        let existing = transaction
+            .query_row(
+                "SELECT payload_digest, receipt_json
+                 FROM operation_idempotency
+                 WHERE operation = ?1 AND resource = ?2 AND principal = ?3
+                   AND idempotency_key = ?4",
+                params![
+                    request.operation.as_str(),
+                    request.resource,
+                    request.principal,
+                    request.key,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((digest, receipt_json)) = existing {
+            if digest != request.payload_digest {
+                return Err(DomainError::authority_denied(
+                    DenialClass::IdempotencyConflict,
+                    format!(
+                        "idempotency key already records a different payload for {} {}",
+                        request.operation.as_str(),
+                        request.resource
+                    ),
+                )
+                .into());
+            }
+            let value = serde_json::from_str(&receipt_json)?;
+            transaction.commit()?;
+            return Ok(IdempotencyOutcome {
+                value,
+                replayed: true,
+            });
+        }
+        let value = mutation(&transaction)?;
+        let receipt_json = serde_json::to_string(&value)?;
+        transaction.execute(
+            "INSERT INTO operation_idempotency
+             (operation, resource, principal, idempotency_key, payload_digest,
+              receipt_json, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                request.operation.as_str(),
+                request.resource,
+                request.principal,
+                request.key,
+                request.payload_digest,
+                receipt_json,
+                request.now,
+                request.expires_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(IdempotencyOutcome {
+            value,
+            replayed: false,
+        })
+    }
+
+    /// Remove expired request receipts. This is bounded so an operator can run
+    /// it safely from a maintenance loop without monopolizing the store.
+    pub fn gc_idempotency(&mut self, now: i64, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM operation_idempotency
+             WHERE rowid IN (
+                 SELECT rowid FROM operation_idempotency
+                 WHERE expires_at <= ?1 ORDER BY expires_at ASC, rowid ASC LIMIT ?2
+             )",
+            params![now, limit as i64],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Searches through the FTS spine with SQL-side ranking, filtering, and
@@ -1665,6 +1941,54 @@ impl Store {
         self.ensure_principal_role_columns()
     }
 
+    fn migrate_26_to_27(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (column, sql) in [
+            (
+                "operation",
+                "ALTER TABLE card_events ADD COLUMN operation TEXT;",
+            ),
+            (
+                "resource",
+                "ALTER TABLE card_events ADD COLUMN resource TEXT;",
+            ),
+            (
+                "semantic_identity",
+                "ALTER TABLE card_events ADD COLUMN semantic_identity TEXT;",
+            ),
+            ("run_id", "ALTER TABLE card_events ADD COLUMN run_id TEXT;"),
+            ("reason", "ALTER TABLE card_events ADD COLUMN reason TEXT;"),
+        ] {
+            let present: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('card_events') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                transaction.execute_batch(sql)?;
+            }
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS operation_idempotency (
+               operation TEXT NOT NULL,
+               resource TEXT NOT NULL,
+               principal TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL,
+               payload_digest TEXT NOT NULL,
+               receipt_json TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL,
+               PRIMARY KEY(operation, resource, principal, idempotency_key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_operation_idempotency_expires
+               ON operation_idempotency(expires_at);",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn migrate_25_to_26(&self) -> Result<()> {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS ready_snapshots (
@@ -1997,86 +2321,41 @@ impl Store {
 
     pub fn create_card_with_events_as(
         &mut self,
-        mut card: Card,
+        card: Card,
         authority: &Authority,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", &authority.actor_label())?;
-        let card_id = card.id.clone();
-        card.title = secrets::scrub_secrets(&card.title);
-        card.body = secrets::scrub_secrets(&card.body);
-        // `acceptance` and `criteria` carry the same author-supplied text
-        // (with_acceptance derives one from the other); scrub both with the
-        // same deterministic function so they stay consistent.
-        card.acceptance = scrub_string_list(std::mem::take(&mut card.acceptance));
-        for criterion in &mut card.criteria {
-            criterion.text = secrets::scrub_secrets(&criterion.text);
-        }
-        card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
-        // Numeric-id repo inference is explicit-conflict-detection only: a
-        // card id like `foo-123` never silently *attaches* repo "foo" (that
-        // was the powder-repo-registry-tightness bug -- see the "why" in the
-        // card). It still rejects an explicit `repo` that contradicts the
-        // id's numeric-suffix prefix, so a card can't be mis-filed under a
-        // conflicting repo by typo.
-        if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
-            if let Some(repo) = card.repo.as_deref() {
-                if !canonical_repo_matches(repo, &derived_repo) {
-                    return Err(DomainError::validation(
-                        "repo",
-                        format!("repo {repo} does not match numeric card id prefix {derived_repo}"),
-                    )
-                    .into());
-                }
-            }
-        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if load_card_optional(&transaction, &card_id)?.is_some() {
-            return Err(DomainError::conflict(format!("card already exists: {card_id}")).into());
-        }
-        if let Some(parent_id) = card.parent.clone() {
-            ensure_parent_linkable(&transaction, &card_id, &parent_id)?;
-        }
-        persist_card(&transaction, &card)?;
-        let saved = load_card(&transaction, &card_id)?;
-        append_card_event_with_authority(
-            &transaction,
-            &saved.id,
-            "create",
-            &actor,
-            "created card",
-            now,
-            authority,
-        )?;
-        if let Some(parent_id) = saved.parent.as_ref() {
-            append_card_event_with_authority(
-                &transaction,
-                parent_id,
-                "decompose",
-                &actor,
-                &format!("child {card_id} created"),
-                now,
-                authority,
-            )?;
-        }
-        // A card born with related/blocks/blocked_by already set mirrors
-        // those edges onto the named peers in the same transaction --
-        // reciprocity is a birth-time guarantee, not something the caller
-        // has to establish with follow-up update_relations calls
-        // (powder-dogfood-2026-07-14-nonreciprocal-relations).
-        mirror_initial_relations_with_authority(&transaction, &saved, authority, now)?;
-        events::append_outbound_card_event_with_authority(
-            &transaction,
-            &saved,
-            "card-created",
-            authority,
-            json!({"source": "create-card"}),
-            now,
-        )?;
+        let saved = create_card_in_transaction(&transaction, card, authority, now)?;
         transaction.commit()?;
         Ok(saved)
+    }
+
+    /// Keyed card creation commits the card, audit event, outbound event, and
+    /// receipt atomically. A duplicate delivery returns the original card.
+    pub fn create_card_with_events_as_keyed(
+        &mut self,
+        card: Card,
+        idempotency_key: &str,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let resource = format!("card:{}", card.id.as_str());
+        let payload = serde_json::json!({"card": card, "reason": "create"});
+        let request = IdempotencyRequest::from_payload(
+            Operation::CreateCard,
+            resource,
+            authority,
+            idempotency_key,
+            &payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, |transaction| {
+            create_card_in_transaction(transaction, card, authority, now)
+        })
     }
 
     /// File a one-call papercut. The report maps deterministically to a
@@ -2142,82 +2421,30 @@ impl Store {
         authority: &Authority,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        let mut patched_fields = Vec::new();
-
-        if let Some(title) = patch.title {
-            card.title = non_empty_scrubbed("title", &title)?;
-            patched_fields.push("title");
-        }
-        if let Some(body) = patch.body {
-            card.body = secrets::scrub_secrets(&body);
-            patched_fields.push("body");
-        }
-        if let Some(acceptance) = patch.acceptance {
-            card = card.with_acceptance(scrub_string_list(acceptance));
-            patched_fields.push("acceptance");
-        }
-        if let Some(proof_plan) = patch.proof_plan {
-            card = card.with_proof_plan(scrub_string_list(proof_plan));
-            patched_fields.push("proof_plan");
-        }
-        if let Some(priority) = patch.priority {
-            card.priority = priority;
-            patched_fields.push("priority");
-        }
-        if let Some(estimate) = patch.estimate {
-            card.estimate = Some(estimate);
-            patched_fields.push("estimate");
-        }
-        if let Some(risk) = patch.risk {
-            card.risk = Some(risk);
-            patched_fields.push("risk");
-        }
-        if let Some(labels) = patch.labels {
-            card.labels = clean_string_list(labels);
-            patched_fields.push("labels");
-        }
-        if let Some(status) = patch.status {
-            card.status = status;
-            patched_fields.push("status");
-        }
-        if let Some(repo) = patch.repo {
-            card.repo = repo;
-            patched_fields.push("repo");
-        }
-
-        if patched_fields.is_empty() {
-            transaction.commit()?;
-            return Ok(card);
-        }
-
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        append_card_event_with_authority(
-            &transaction,
-            card_id,
-            "patch",
-            &actor,
-            &format!("patched {}", patched_fields.join(", ")),
-            now,
-            authority,
-        )?;
-        // `persist_card` canonicalizes `repo` at write time via
-        // `resolve_registered_repository_name` (an alias like
-        // "misty-step/canary" becomes "canary" in the DB row) but only
-        // borrows `card`, so the
-        // in-memory value above is still whatever the caller passed. Reload
-        // so the returned `Card` matches the row exactly -- same reason
-        // `create_card_with_events` reloads after its own `persist_card`
-        // call instead of returning its own `card` binding.
-        let saved = load_card(&transaction, card_id)?;
-
+        let saved = patch_card_in_transaction(&transaction, card_id, patch, authority, now)?;
         transaction.commit()?;
         Ok(saved)
+    }
+
+    pub fn patch_card_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        patch: CardPatch,
+        idempotency_key: &str,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({"patch": format!("{patch:?}")});
+        self.with_keyed_operation(
+            Operation::PatchCard,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| patch_card_in_transaction(transaction, card_id, patch, authority, now),
+        )
     }
 
     pub fn check_criterion(
@@ -2247,49 +2474,55 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        let criterion_state = criterion_mut(&mut card, criterion)?;
-        if checked {
-            criterion_state.checked_by = Some(actor.clone());
-            criterion_state.checked_at = Some(now);
-        } else {
-            criterion_state.checked_by = None;
-            criterion_state.checked_at = None;
-        }
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        let subject_id = criterion.to_string();
-        append_attributed_card_event(
+        let card = check_criterion_in_transaction(
             &transaction,
             card_id,
-            MutationAudit {
-                event_type: "criterion",
-                actor: &actor,
-                payload: &format!(
-                    "criterion {} {}",
-                    criterion,
-                    if checked { "checked" } else { "unchecked" }
-                ),
-                subject_kind: "criterion",
-                subject_id: &subject_id,
-                authority,
-            },
+            criterion,
+            actor,
+            checked,
             now,
+            authority,
         )?;
         transaction.commit()?;
         Ok(card)
     }
 
-    /// Repair a card's acceptance criteria by re-parsing the oracle source
-    /// and applying the result while preserving checked/proof state for any
-    /// criterion whose identity survives (same position and unchanged text,
-    /// or stored text is a truncation-prefix of the new text). Status,
-    /// claim, relations, comments, and source provenance are left untouched
-    /// -- only the criteria text and the structured criteria columns change.
+    pub fn check_criterion_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        criterion: usize,
+        actor: &str,
+        checked: bool,
+        context: KeyedOperationContext<'_>,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
+        let payload = json!({"criterion": criterion, "actor": actor, "checked": checked});
+        self.with_keyed_operation(
+            Operation::CheckCriterion,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                check_criterion_in_transaction(
+                    transaction,
+                    card_id,
+                    criterion,
+                    actor,
+                    checked,
+                    now,
+                    authority,
+                )
+            },
+        )
+    }
+
     pub fn repair_criteria(
         &mut self,
         card_id: &CardId,
@@ -3132,6 +3365,13 @@ impl Store {
     ) -> Result<ClaimReceipt> {
         let agent = non_empty("agent", agent)?;
         let principal = authority.actor_label();
+        authority.authorize_operation_with_worker(
+            Operation::ClaimCard,
+            None,
+            None,
+            Some(agent.as_str()),
+            now,
+        )?;
         if ttl_seconds == 0 {
             return Err(DomainError::validation(
                 "ttl_seconds",
@@ -3240,55 +3480,29 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        let previous = card.status;
-        let released_claim = card.apply_status(status, now);
-        persist_card(&transaction, &card)?;
-        if let Some(claim) = released_claim {
-            close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
-            append_activity_attributed(
-                &transaction,
-                &claim.run_id,
-                ActivityType::Action,
-                &format!("status set {card_id} to {}", status.as_str()),
-                authority.principal_name(),
-                Some(authority.role_label()),
-                now,
-            )?;
-        }
-        append_card_event_with_authority(
-            &transaction,
-            card_id,
-            "status",
-            &authority.actor_label(),
-            &format!("{} -> {}", previous.as_str(), status.as_str()),
-            now,
-            authority,
-        )?;
-        if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
-            events::append_outbound_card_event_with_authority(
-                &transaction,
-                &card,
-                event_type,
-                authority,
-                json!({
-                    "previous_status": previous.as_str(),
-                    "status": status.as_str()
-                }),
-                now,
-            )?;
-        }
-        if status.is_terminal() && !previous.is_terminal() {
-            append_parent_rollup_event_with_authority(
-                &transaction,
-                &card,
-                authority,
-                &format!("child {card_id} reached {}", status.as_str()),
-                now,
-            )?;
-        }
+        let card = update_status_in_transaction(&transaction, card_id, status, now, authority)?;
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn update_status_keyed(
+        &mut self,
+        card_id: &CardId,
+        status: CardStatus,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({"status": status.as_str()});
+        self.with_keyed_operation(
+            Operation::UpdateStatus,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                update_status_in_transaction(transaction, card_id, status, now, authority)
+            },
+        )
     }
 
     /// Replace a card's `related`/`blocks`/`blocked_by` lists and mirror
@@ -3314,55 +3528,54 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        let actor = authority.actor_label();
-
-        let related_delta = list_delta(&card.related, &related);
-        let blocks_delta = list_delta(&card.blocks, &blocks);
-        let blocked_by_delta = list_delta(&card.blocked_by, &blocked_by);
-
-        card.apply_relations(related, blocks, blocked_by, now);
-        persist_card(&transaction, &card)?;
-        append_card_event_with_authority(
+        let card = update_relations_in_transaction(
             &transaction,
             card_id,
-            "relations",
-            &actor,
-            &format!(
-                "related={:?} blocks={:?} blocked_by={:?}",
-                card.related, card.blocks, card.blocked_by
-            ),
+            related,
+            blocks,
+            blocked_by,
             now,
             authority,
         )?;
-
-        mirror_delta_with_authority(
-            &transaction,
-            card_id,
-            RelationField::Related,
-            &related_delta,
-            authority,
-            now,
-        )?;
-        mirror_delta_with_authority(
-            &transaction,
-            card_id,
-            RelationField::Blocks,
-            &blocks_delta,
-            authority,
-            now,
-        )?;
-        mirror_delta_with_authority(
-            &transaction,
-            card_id,
-            RelationField::BlockedBy,
-            &blocked_by_delta,
-            authority,
-            now,
-        )?;
-
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn update_relations_keyed(
+        &mut self,
+        card_id: &CardId,
+        related: Vec<CardId>,
+        blocks: Vec<CardId>,
+        blocked_by: Vec<CardId>,
+        context: KeyedOperationContext<'_>,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
+        let payload = json!({
+            "related": related,
+            "blocks": blocks,
+            "blocked_by": blocked_by,
+        });
+        self.with_keyed_operation(
+            Operation::UpdateRelations,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                update_relations_in_transaction(
+                    transaction,
+                    card_id,
+                    related,
+                    blocks,
+                    blocked_by,
+                    now,
+                    authority,
+                )
+            },
+        )
     }
 
     /// Set or clear a card's explicit parent edge. Validates that the parent
@@ -3380,60 +3593,27 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        let previous = card.parent.clone();
-        if previous == parent {
-            transaction.commit()?;
-            return Ok(card);
-        }
-        if let Some(new_parent) = parent.as_ref() {
-            ensure_parent_linkable(&transaction, card_id, new_parent)?;
-        }
-        card.parent = parent.clone();
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        let actor = authority.actor_label();
-        let label = |value: &Option<CardId>| {
-            value
-                .as_ref()
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        };
-        append_card_event_with_authority(
-            &transaction,
-            card_id,
-            "hierarchy",
-            &actor,
-            &format!("parent {} -> {}", label(&previous), label(&parent)),
-            now,
-            authority,
-        )?;
-        if let Some(old_parent) = previous.as_ref() {
-            if load_card_optional(&transaction, old_parent)?.is_some() {
-                append_card_event_with_authority(
-                    &transaction,
-                    old_parent,
-                    "hierarchy",
-                    &actor,
-                    &format!("child {card_id} unlinked"),
-                    now,
-                    authority,
-                )?;
-            }
-        }
-        if let Some(new_parent) = parent.as_ref() {
-            append_card_event_with_authority(
-                &transaction,
-                new_parent,
-                "decompose",
-                &actor,
-                &format!("child {card_id} linked"),
-                now,
-                authority,
-            )?;
-        }
+        let card = set_parent_in_transaction(&transaction, card_id, parent, now, authority)?;
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn set_parent_keyed(
+        &mut self,
+        card_id: &CardId,
+        parent: Option<CardId>,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({"parent": parent});
+        self.with_keyed_operation(
+            Operation::SetParent,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| set_parent_in_transaction(transaction, card_id, parent, now, authority),
+        )
     }
 
     pub fn release_claim(
@@ -3446,30 +3626,29 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let claim = card.release_claim(run_id, now)?;
-        persist_card(&transaction, &card)?;
-        release_run(&transaction, run_id, now)?;
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("released {card_id}"),
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
-        events::append_outbound_card_event_with_authority(
-            &transaction,
-            &card,
-            "moved-to-ready",
-            authority,
-            json!({"source": "release_claim", "run_id": run_id.as_str()}),
-            now,
-        )?;
+        let receipt = release_claim_in_transaction(&transaction, card_id, run_id, now, authority)?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
+    }
+
+    pub fn release_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let payload = json!({"run_id": run_id, "action": "release"});
+        self.with_keyed_operation(
+            Operation::ReleaseClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                release_claim_in_transaction(transaction, card_id, run_id, now, authority)
+            },
+        )
     }
 
     pub fn renew_claim(
@@ -3483,30 +3662,38 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let claim = card.renew_claim(run_id, now, ttl_seconds)?;
-        persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET claim_expires_at = ?2, updated_at = ?3
-             WHERE id = ?1",
-            params![run_id.as_str(), claim.expires_at, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("renewed {card_id} until {}", claim.expires_at),
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
+        let receipt =
+            renew_claim_in_transaction(&transaction, card_id, run_id, now, ttl_seconds, authority)?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
+    }
+
+    pub fn renew_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        ttl_seconds: u64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let payload = json!({"run_id": run_id, "ttl_seconds": ttl_seconds, "action": "renew"});
+        self.with_keyed_operation(
+            Operation::RenewClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                renew_claim_in_transaction(
+                    transaction,
+                    card_id,
+                    run_id,
+                    now,
+                    ttl_seconds,
+                    authority,
+                )
+            },
+        )
     }
 
     pub fn heartbeat_claim(
@@ -3519,39 +3706,36 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let claim = card.heartbeat_claim(run_id, now)?;
-        persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET updated_at = ?2
-             WHERE id = ?1",
-            params![run_id.as_str(), now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Action,
-            &format!("heartbeat {card_id}"),
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
+        let receipt =
+            heartbeat_claim_in_transaction(&transaction, card_id, run_id, now, authority)?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
     }
 
-    /// Hand an active claim to a different agent atomically (powder-936):
-    /// no release-then-race window where a third party could grab the card
-    /// between the release and the intended recipient's claim. Invocable by
-    /// the current holder or an admin, same as renew/release/heartbeat.
-    /// Same run id throughout -- this is a handoff on the existing lease,
-    /// not a new claim -- so the activity trail records one transfer event
-    /// naming both agents rather than a release paired with a claim.
+    pub fn heartbeat_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let payload = json!({"run_id": run_id, "action": "heartbeat"});
+        self.with_keyed_operation(
+            Operation::HeartbeatClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                heartbeat_claim_in_transaction(transaction, card_id, run_id, now, authority)
+            },
+        )
+    }
+
+    /// Hand an active claim to a different agent atomically (powder-936).
+    /// The keyed variant records the request receipt with the mutation, so a
+    /// retried delivery returns the original transfer without adding a second
+    /// audit event or changing the lease again.
     pub fn transfer_claim(
         &mut self,
         card_id: &CardId,
@@ -3564,31 +3748,50 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authority.require_holder(card.claim_principal())?;
-        let from_agent = card.claim_holder().unwrap_or_default().to_string();
-        let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
-        persist_card(&transaction, &card)?;
-        let updated = transaction.execute(
-            "UPDATE runs
-             SET agent = ?2, claim_expires_at = ?3, updated_at = ?4
-             WHERE id = ?1",
-            params![run_id.as_str(), to_agent, claim.expires_at, now],
-        )?;
-        if updated == 0 {
-            return Err(DomainError::not_found("run", run_id.to_string()).into());
-        }
-        append_activity_attributed(
+        let receipt = transfer_claim_in_transaction(
             &transaction,
+            card_id,
             run_id,
-            ActivityType::Action,
-            &format!("transferred {card_id} from {from_agent} to {to_agent}"),
-            authority.principal_name(),
-            Some(authority.role_label()),
+            to_agent,
             now,
+            ttl_seconds,
+            authority,
         )?;
         transaction.commit()?;
-        Ok(claim_receipt(card_id, &claim))
+        Ok(receipt)
+    }
+
+    pub fn transfer_claim_keyed(
+        &mut self,
+        card_id: &CardId,
+        run_id: &RunId,
+        to_agent: &str,
+        ttl_seconds: u64,
+        context: KeyedOperationContext<'_>,
+    ) -> Result<IdempotencyOutcome<ClaimReceipt>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
+        let payload = json!({"run_id": run_id, "to_agent": to_agent, "ttl_seconds": ttl_seconds, "action": "transfer"});
+        self.with_keyed_operation(
+            Operation::TransferClaim,
+            format!("claim:{}:{}", card_id.as_str(), run_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                transfer_claim_in_transaction(
+                    transaction,
+                    card_id,
+                    run_id,
+                    to_agent,
+                    now,
+                    ttl_seconds,
+                    authority,
+                )
+            },
+        )
     }
 
     pub fn attach_image(
@@ -3613,65 +3816,54 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<AttachmentMeta> {
-        let mime = non_empty("mime", mime)?;
-        if !is_supported_image_mime(&mime) {
-            return Err(DomainError::validation(
-                "mime",
-                format!("unsupported image MIME type: {mime}"),
-            )
-            .into());
-        }
-        let filename = non_empty_scrubbed("filename", filename)?;
-        let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
-        let id = format!("{:x}", Sha256::digest(bytes));
-        let size = i64::try_from(bytes.len())
-            .map_err(|_| DomainError::validation("bytes", "image is too large to store"))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_card(&transaction, card_id)?;
-        transaction.execute(
-            "INSERT INTO attachments (id, mime, size, bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO NOTHING",
-            params![id, mime, size, bytes, now],
-        )?;
-        let (stored_mime, stored_size) = transaction.query_row(
-            "SELECT mime, size FROM attachments WHERE id = ?1",
-            [&id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )?;
-        transaction.execute(
-            "INSERT INTO card_attachments
-             (card_id, attachment_id, filename, created_at, principal)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(card_id, attachment_id) DO UPDATE SET
-               filename = excluded.filename,
-               created_at = excluded.created_at,
-               principal = excluded.principal",
-            params![card_id.as_str(), id, filename, now, principal],
-        )?;
-        append_attributed_card_event(
+        let attachment = attach_image_in_transaction(
             &transaction,
             card_id,
-            MutationAudit {
-                event_type: "attachment",
-                actor: &principal,
-                payload: "attached image",
-                subject_kind: "attachment",
-                subject_id: &id,
-                authority,
-            },
+            bytes,
+            mime,
+            filename,
             now,
+            authority,
         )?;
         transaction.commit()?;
-        Ok(AttachmentMeta {
-            id,
-            filename,
-            mime: stored_mime,
-            size: stored_size,
-            created_at: now,
-        })
+        Ok(attachment)
+    }
+
+    pub fn attach_image_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        bytes: &[u8],
+        mime: &str,
+        filename: &str,
+        context: KeyedOperationContext<'_>,
+    ) -> Result<IdempotencyOutcome<AttachmentMeta>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let payload = json!({"digest": digest, "mime": mime, "filename": filename});
+        self.with_keyed_operation(
+            Operation::AttachImage,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                attach_image_in_transaction(
+                    transaction,
+                    card_id,
+                    bytes,
+                    mime,
+                    filename,
+                    now,
+                    authority,
+                )
+            },
+        )
     }
 
     pub fn attachment_blob(&self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
@@ -3703,43 +3895,32 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<()> {
-        let attachment_id = non_empty("attachment_id", attachment_id)?;
-        let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_card(&transaction, card_id)?;
-        let removed = transaction.execute(
-            "DELETE FROM card_attachments
-             WHERE card_id = ?1 AND attachment_id = ?2",
-            params![card_id.as_str(), attachment_id],
-        )?;
-        if removed == 0 {
-            return Err(DomainError::not_found("attachment", attachment_id).into());
-        }
-        let referenced: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM card_attachments WHERE attachment_id = ?1",
-            [&attachment_id],
-            |row| row.get(0),
-        )?;
-        if referenced == 0 {
-            transaction.execute("DELETE FROM attachments WHERE id = ?1", [&attachment_id])?;
-        }
-        append_attributed_card_event(
-            &transaction,
-            card_id,
-            MutationAudit {
-                event_type: "attachment",
-                actor: &principal,
-                payload: "detached image",
-                subject_kind: "attachment",
-                subject_id: &attachment_id,
-                authority,
-            },
-            now,
-        )?;
+        detach_in_transaction(&transaction, card_id, attachment_id, now, authority)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn detach_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        attachment_id: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<()>> {
+        let payload = json!({"attachment_id": attachment_id});
+        self.with_keyed_operation(
+            Operation::DetachImage,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                detach_in_transaction(transaction, card_id, attachment_id, now, authority)
+            },
+        )
     }
 
     pub fn attachments_for_card(&self, card_id: &CardId) -> Result<Vec<AttachmentMeta>> {
@@ -3784,23 +3965,28 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_card(&transaction, card_id)?;
-        let link = insert_link(&transaction, card_id, label, url, now)?;
-        append_attributed_card_event(
-            &transaction,
-            card_id,
-            MutationAudit {
-                event_type: "link",
-                actor: authority.principal_name().unwrap_or("unchecked"),
-                payload: "added link",
-                subject_kind: "link",
-                subject_id: link.id.as_str(),
-                authority,
-            },
-            now,
-        )?;
+        let link = add_link_in_transaction(&transaction, card_id, label, url, now, authority)?;
         transaction.commit()?;
         Ok(link)
+    }
+
+    pub fn add_link_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        label: &str,
+        url: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Link>> {
+        let payload = json!({"label": label, "url": url});
+        self.with_keyed_operation(
+            Operation::AddLink,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| add_link_in_transaction(transaction, card_id, label, url, now, authority),
+        )
     }
 
     /// Not claim-holder-gated, matching `add_link`: attaching a comment is
@@ -3827,57 +4013,44 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let card = load_card(&transaction, card_id)?;
-        let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
-        let comment = Comment {
-            id: id.clone(),
-            card_id: card_id.clone(),
-            author: non_empty_scrubbed("author", author)?,
-            body: non_empty_scrubbed("body", body)?,
-            created_at: now,
-        };
-        transaction.execute(
-            "INSERT INTO comments (id, card_id, author, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id,
-                comment.card_id.as_str(),
-                comment.author,
-                comment.body,
-                comment.created_at
-            ],
-        )?;
-        let audit_event = append_attributed_card_event(
-            &transaction,
-            card_id,
-            MutationAudit {
-                event_type: "comment",
-                actor: &comment.author,
-                payload: "added comment",
-                subject_kind: "comment",
-                subject_id: &comment.id,
-                authority,
-            },
-            now,
-        )?;
-        events::append_outbound_card_event_for_audit(
-            &transaction,
-            &card,
-            "comment-added",
-            &comment.author,
-            json!({"author": comment.author.as_str(), "body": comment.body.as_str()}),
-            now,
-            &audit_event,
-        )?;
+        let comment =
+            add_comment_in_transaction(&transaction, card_id, author, body, now, authority)?;
         transaction.commit()?;
         Ok(comment)
     }
 
-    /// Not claim-holder-gated, matching `add_comment`/`add_link`: appending
-    /// work_log context is additive, not an exclusive mutation of the
-    /// card's own state -- any authenticated caller may narrate their own
-    /// work. Only `agent` is required attribution; every field on
-    /// `attribution` is whatever the calling surface can supply.
+    /// Keyed comment delivery uses the durable operation receipt ledger. The
+    /// receipt is committed with the comment and outbound event, so retries
+    /// cannot append a second comment or webhook.
+    pub fn add_comment_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        author: &str,
+        body: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Comment>> {
+        let payload = json!({"author": author, "body": body});
+        let request = IdempotencyRequest::from_payload(
+            Operation::AddComment,
+            format!("card:{}", card_id.as_str()),
+            authority,
+            idempotency_key,
+            &payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, |transaction| {
+            add_comment_in_transaction(transaction, card_id, author, body, now, authority)
+        })
+    }
+
+    /// Worker work-log delivery requires the current unexpired card claim for
+    /// authenticated principals, and the semantic agent/run labels must match
+    /// that claim. The labels remain attribution, never capability; trusted
+    /// unchecked callers are retained only for direct local compatibility.
+    /// Every field on `attribution` is whatever the calling surface can supply.
     /// `body` is scrubbed for known secret shapes before it is ever
     /// persisted (powder-943 governance ruling: this becomes fleet-retro
     /// synthesis input, so it gets the same scrub discipline as any other
@@ -3912,67 +4085,62 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let card = load_card(&transaction, card_id)?;
-        let run_id = attribution.run_id.map(RunId::new).transpose()?;
-        let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
-        let entry = WorkLogEntry {
-            id: id.clone(),
-            card_id: card_id.clone(),
-            agent: non_empty("agent", agent)?,
-            // Attribution fields are caller-supplied free text too --
-            // `reasoning` especially is documented chain-of-thought, the
-            // highest-risk leak class this module's scrub exists for.
-            model: attribution.model.map(secrets::scrub_secrets),
-            reasoning: attribution.reasoning.map(secrets::scrub_secrets),
-            harness: attribution.harness.map(secrets::scrub_secrets),
-            run_id,
-            body: non_empty_scrubbed("body", body)?,
-            created_at: now,
-        };
-        transaction.execute(
-            "INSERT INTO work_log_entries
-             (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                entry.card_id.as_str(),
-                entry.agent,
-                entry.model,
-                entry.reasoning,
-                entry.harness,
-                entry.run_id.as_ref().map(RunId::as_str),
-                entry.body,
-                entry.created_at,
-            ],
-        )?;
-        let audit_event = append_attributed_card_event(
+        let entry = append_work_log_in_transaction(
             &transaction,
             card_id,
-            MutationAudit {
-                event_type: "work-log",
-                actor: &entry.agent,
-                payload: "appended work log",
-                subject_kind: "work_log",
-                subject_id: &entry.id,
-                authority,
-            },
+            agent,
+            attribution,
+            body,
             now,
-        )?;
-        events::append_outbound_card_event_for_audit(
-            &transaction,
-            &card,
-            "work-log-appended",
-            &entry.agent,
-            json!({
-                "agent": entry.agent.as_str(),
-                "model": entry.model,
-                "harness": entry.harness,
-            }),
-            now,
-            &audit_event,
+            authority,
         )?;
         transaction.commit()?;
         Ok(entry)
+    }
+
+    /// Keyed work-log delivery stores the receipt with the work-log row and
+    /// outbound event, making duplicate agent delivery harmless.
+    pub fn append_work_log_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        context: KeyedOperationContext<'_>,
+    ) -> Result<IdempotencyOutcome<WorkLogEntry>> {
+        let KeyedOperationContext {
+            now,
+            idempotency_key,
+            authority,
+        } = context;
+        let payload = json!({
+            "agent": agent,
+            "model": attribution.model,
+            "reasoning": attribution.reasoning,
+            "harness": attribution.harness,
+            "run_id": attribution.run_id,
+            "body": body,
+        });
+        let request = IdempotencyRequest::from_payload(
+            Operation::WorkLog,
+            format!("card:{}", card_id.as_str()),
+            authority,
+            idempotency_key,
+            &payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, |transaction| {
+            append_work_log_in_transaction(
+                transaction,
+                card_id,
+                agent,
+                attribution,
+                body,
+                now,
+                authority,
+            )
+        })
     }
 
     pub fn request_input(
@@ -3982,56 +4150,32 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Run> {
-        let question = non_empty_scrubbed("question", question)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut run = answer_loop::load_run(&transaction, run_id)?;
-        let mut card = load_card(&transaction, &run.card_id)?;
-        if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
-            return Err(DomainError::conflict(format!(
-                "run {run_id} is not the current claim for card {}",
-                card.id
-            ))
-            .into());
-        }
-        authority.require_holder(card.claim_principal())?;
-
-        card.status = CardStatus::AwaitingInput;
-        card.updated_at = now;
-        run.state = RunState::AwaitingInput;
-        run.updated_at = now;
-
-        persist_card(&transaction, &card)?;
-        persist_run(&transaction, &run)?;
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Elicitation,
-            &question,
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
-        append_card_event_with_authority(
-            &transaction,
-            &card.id,
-            "status",
-            &authority.actor_label(),
-            "awaiting input",
-            now,
-            authority,
-        )?;
-        events::append_outbound_card_event_with_authority(
-            &transaction,
-            &card,
-            "awaiting-input",
-            authority,
-            json!({"run_id": run_id.as_str(), "question": question}),
-            now,
-        )?;
+        let run = request_input_in_transaction(&transaction, run_id, question, now, authority)?;
         transaction.commit()?;
         Ok(run)
+    }
+
+    pub fn request_input_keyed(
+        &mut self,
+        run_id: &RunId,
+        question: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Run>> {
+        let payload = json!({"question": question});
+        self.with_keyed_operation(
+            Operation::RequestInput,
+            format!("run:{}", run_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                request_input_in_transaction(transaction, run_id, question, now, authority)
+            },
+        )
     }
 
     pub fn complete_card(
@@ -4050,89 +4194,57 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-
-        let previous = card.status;
-        let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
-
-        card.status = CardStatus::Done;
-        card.claim = None;
-        for criterion_proof in criterion_proofs {
-            let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
-            criterion.proof_links.push(CriterionProof {
-                url: criterion_proof.url,
-                actor: authority.actor_label(),
-                created_at: now,
-            });
-        }
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        if let Some(run_id) = run_id {
-            close_run_for_status(
-                &transaction,
-                &run_id,
-                CardStatus::Done,
-                now,
-                proof.as_deref(),
-            )?;
-            append_activity_attributed(
-                &transaction,
-                &run_id,
-                ActivityType::Response,
-                proof
-                    .as_deref()
-                    .map(|proof| format!("completed: {proof}"))
-                    .unwrap_or_else(|| "completed without proof".to_string())
-                    .as_str(),
-                authority.principal_name(),
-                Some(authority.role_label()),
-                now,
-            )?;
-        }
-        append_card_event_with_authority(
+        let card = complete_card_in_transaction(
             &transaction,
             card_id,
-            "status",
-            &authority.actor_label(),
-            &format!("{} -> done", previous.as_str()),
+            proof,
+            criterion_proofs,
+            field_note_config,
             now,
             authority,
         )?;
-        if !previous.is_terminal() {
-            events::append_outbound_card_event_with_authority(
-                &transaction,
-                &card,
-                "completed",
-                authority,
-                json!({
-                    "previous_status": previous.as_str(),
-                    "status": card.status.as_str(),
-                    "proof": proof,
-                    "criteria": card.criteria
-                }),
-                now,
-            )?;
-            append_parent_rollup_event_with_authority(
-                &transaction,
-                &card,
-                authority,
-                &proof
-                    .as_deref()
-                    .map(|proof| {
-                        format!(
-                            "child {card_id} completed with proof: {}",
-                            EpicState::proof_snippet(proof)
-                        )
-                    })
-                    .unwrap_or_else(|| format!("child {card_id} completed without proof")),
-                now,
-            )?;
-            if let Some(config) = &field_note_config {
-                maybe_spawn_field_note_draft(&transaction, &card, proof.as_deref(), config, now)?;
-            }
-        }
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn complete_card_keyed(
+        &mut self,
+        card_id: &CardId,
+        proof: Option<&str>,
+        criterion_proofs: Vec<CriterionProofInput>,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let proof = proof
+            .map(|value| non_empty_scrubbed("proof", value))
+            .transpose()?;
+        let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+        let field_note_config = self.field_note_config.clone();
+        let payload = json!({
+            "proof": proof,
+            "criterion_proofs": criterion_proofs
+                .iter()
+                .map(|item| json!({"criterion": item.criterion, "url": item.url}))
+                .collect::<Vec<_>>(),
+        });
+        self.with_keyed_operation(
+            Operation::CompleteCard,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                complete_card_in_transaction(
+                    transaction,
+                    card_id,
+                    proof,
+                    criterion_proofs,
+                    field_note_config,
+                    now,
+                    authority,
+                )
+            },
+        )
     }
 }
 
@@ -4287,6 +4399,234 @@ fn insert_link(
         ],
     )?;
     Ok(link)
+}
+
+fn add_link_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    label: &str,
+    url: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<Link> {
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(
+        authority,
+        Operation::AddLink,
+        &card,
+        None,
+        card.claim.as_ref().map(|claim| claim.agent.as_str()),
+        now,
+    )?;
+    let link = insert_link(transaction, card_id, label, url, now)?;
+    let actor = authority.actor_label();
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::AddLink,
+            resource: card_id.as_str(),
+            semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
+            reason: None,
+            event_type: "link",
+            actor: &actor,
+            payload: "added link",
+            subject_kind: "link",
+            subject_id: link.id.as_str(),
+            authority,
+        },
+        now,
+    )?;
+    Ok(link)
+}
+
+fn attach_image_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    bytes: &[u8],
+    mime: &str,
+    filename: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<AttachmentMeta> {
+    let mime = non_empty("mime", mime)?;
+    if !is_supported_image_mime(&mime) {
+        return Err(DomainError::validation(
+            "mime",
+            format!("unsupported image MIME type: {mime}"),
+        )
+        .into());
+    }
+    let filename = non_empty_scrubbed("filename", filename)?;
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::AttachImage, &card, None, None, now)?;
+    let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
+    let id = format!("{:x}", Sha256::digest(bytes));
+    let size = i64::try_from(bytes.len())
+        .map_err(|_| DomainError::validation("bytes", "image is too large to store"))?;
+    transaction.execute(
+        "INSERT INTO attachments (id, mime, size, bytes, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO NOTHING",
+        params![id, mime, size, bytes, now],
+    )?;
+    let (stored_mime, stored_size) = transaction.query_row(
+        "SELECT mime, size FROM attachments WHERE id = ?1",
+        [&id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    transaction.execute(
+        "INSERT INTO card_attachments
+         (card_id, attachment_id, filename, created_at, principal)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(card_id, attachment_id) DO UPDATE SET
+           filename = excluded.filename, created_at = excluded.created_at,
+           principal = excluded.principal",
+        params![card_id.as_str(), id, filename, now, principal],
+    )?;
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::AttachImage,
+            resource: card_id.as_str(),
+            semantic_identity: Some(principal.as_str()),
+            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
+            reason: Some("attachment correction"),
+            event_type: "attachment",
+            actor: &principal,
+            payload: "attached image",
+            subject_kind: "attachment",
+            subject_id: &id,
+            authority,
+        },
+        now,
+    )?;
+    Ok(AttachmentMeta {
+        id,
+        filename,
+        mime: stored_mime,
+        size: stored_size,
+        created_at: now,
+    })
+}
+
+fn detach_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    attachment_id: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<()> {
+    let attachment_id = non_empty("attachment_id", attachment_id)?;
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::DetachImage, &card, None, None, now)?;
+    let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
+    let removed = transaction.execute(
+        "DELETE FROM card_attachments WHERE card_id = ?1 AND attachment_id = ?2",
+        params![card_id.as_str(), attachment_id],
+    )?;
+    if removed == 0 {
+        return Err(DomainError::not_found("attachment", attachment_id).into());
+    }
+    let referenced: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM card_attachments WHERE attachment_id = ?1",
+        [&attachment_id],
+        |row| row.get(0),
+    )?;
+    if referenced == 0 {
+        transaction.execute("DELETE FROM attachments WHERE id = ?1", [&attachment_id])?;
+    }
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::DetachImage,
+            resource: card_id.as_str(),
+            semantic_identity: Some(principal.as_str()),
+            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
+            reason: Some("attachment correction"),
+            event_type: "attachment",
+            actor: &principal,
+            payload: "detached image",
+            subject_kind: "attachment",
+            subject_id: &attachment_id,
+            authority,
+        },
+        now,
+    )?;
+    Ok(())
+}
+
+fn request_input_in_transaction(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    question: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<Run> {
+    let question = non_empty_scrubbed("question", question)?;
+    let mut run = answer_loop::load_run(transaction, run_id)?;
+    let mut card = load_card(transaction, &run.card_id)?;
+    if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
+        return Err(DomainError::conflict(format!(
+            "run {run_id} is not the current claim for card {}",
+            card.id
+        ))
+        .into());
+    }
+    authorize_card_operation(
+        authority,
+        Operation::RequestInput,
+        &card,
+        Some(run_id),
+        None,
+        now,
+    )?;
+    card.status = CardStatus::AwaitingInput;
+    card.updated_at = now;
+    run.state = RunState::AwaitingInput;
+    run.updated_at = now;
+    persist_card(transaction, &card)?;
+    persist_run(transaction, &run)?;
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Elicitation,
+        &question,
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    let actor = authority.actor_label();
+    append_attributed_card_event(
+        transaction,
+        &card.id,
+        MutationAudit {
+            operation: Operation::RequestInput,
+            resource: card.id.as_str(),
+            semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+            run_id: Some(run_id),
+            reason: None,
+            event_type: "request-input",
+            actor: &actor,
+            payload: "awaiting input",
+            subject_kind: "run",
+            subject_id: run_id.as_str(),
+            authority,
+        },
+        now,
+    )?;
+    events::append_outbound_card_event_with_authority(
+        transaction,
+        &card,
+        "awaiting-input",
+        authority,
+        json!({"run_id": run_id.as_str(), "question": question}),
+        now,
+    )?;
+    Ok(run)
 }
 
 fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
@@ -4464,6 +4804,625 @@ fn append_card_event(
     )
 }
 
+fn complete_card_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    proof: Option<String>,
+    criterion_proofs: Vec<CriterionProofInput>,
+    field_note_config: Option<FieldNoteConfig>,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::CompleteCard, &card, None, None, now)?;
+    let previous = card.status;
+    let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
+    card.status = CardStatus::Done;
+    card.claim = None;
+    for criterion_proof in criterion_proofs {
+        let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
+        criterion.proof_links.push(CriterionProof {
+            url: criterion_proof.url,
+            actor: authority.actor_label(),
+            created_at: now,
+        });
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    if let Some(run_id) = run_id {
+        close_run_for_status(
+            transaction,
+            &run_id,
+            CardStatus::Done,
+            now,
+            proof.as_deref(),
+        )?;
+        append_activity_attributed(
+            transaction,
+            &run_id,
+            ActivityType::Response,
+            proof
+                .as_deref()
+                .map(|value| format!("completed: {value}"))
+                .unwrap_or_else(|| "completed without proof".to_string())
+                .as_str(),
+            authority.principal_name(),
+            Some(authority.role_label()),
+            now,
+        )?;
+    }
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "status",
+        &authority.actor_label(),
+        &format!("{} -> done", previous.as_str()),
+        now,
+        authority,
+    )?;
+    if !previous.is_terminal() {
+        events::append_outbound_card_event_with_authority(
+            transaction,
+            &card,
+            "completed",
+            authority,
+            json!({"previous_status": previous.as_str(), "status": card.status.as_str(), "proof": proof, "criteria": card.criteria}),
+            now,
+        )?;
+        append_parent_rollup_event_with_authority(
+            transaction,
+            &card,
+            authority,
+            &proof
+                .as_deref()
+                .map(|value| {
+                    format!(
+                        "child {card_id} completed with proof: {}",
+                        EpicState::proof_snippet(value)
+                    )
+                })
+                .unwrap_or_else(|| format!("child {card_id} completed without proof")),
+            now,
+        )?;
+        if let Some(config) = &field_note_config {
+            maybe_spawn_field_note_draft(transaction, &card, proof.as_deref(), config, now)?;
+        }
+    }
+    Ok(card)
+}
+
+fn set_parent_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    parent: Option<CardId>,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::SetParent, &card, None, None, now)?;
+    let previous = card.parent.clone();
+    if previous == parent {
+        return Ok(card);
+    }
+    if let Some(new_parent) = parent.as_ref() {
+        ensure_parent_linkable(transaction, card_id, new_parent)?;
+    }
+    card.parent = parent.clone();
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    let actor = authority.actor_label();
+    let label = |value: &Option<CardId>| {
+        value
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "none".to_string())
+    };
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "hierarchy",
+        &actor,
+        &format!("parent {} -> {}", label(&previous), label(&parent)),
+        now,
+        authority,
+    )?;
+    if let Some(old_parent) = previous.as_ref() {
+        if load_card_optional(transaction, old_parent)?.is_some() {
+            append_card_event_with_authority(
+                transaction,
+                old_parent,
+                "hierarchy",
+                &actor,
+                &format!("child {card_id} unlinked"),
+                now,
+                authority,
+            )?;
+        }
+    }
+    if let Some(new_parent) = parent.as_ref() {
+        append_card_event_with_authority(
+            transaction,
+            new_parent,
+            "decompose",
+            &actor,
+            &format!("child {card_id} linked"),
+            now,
+            authority,
+        )?;
+    }
+    Ok(card)
+}
+
+fn update_relations_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    related: Vec<CardId>,
+    blocks: Vec<CardId>,
+    blocked_by: Vec<CardId>,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(
+        authority,
+        Operation::UpdateRelations,
+        &card,
+        None,
+        None,
+        now,
+    )?;
+    let actor = authority.actor_label();
+    let related_delta = list_delta(&card.related, &related);
+    let blocks_delta = list_delta(&card.blocks, &blocks);
+    let blocked_by_delta = list_delta(&card.blocked_by, &blocked_by);
+    card.apply_relations(related, blocks, blocked_by, now);
+    persist_card(transaction, &card)?;
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "relations",
+        &actor,
+        &format!(
+            "related={:?} blocks={:?} blocked_by={:?}",
+            card.related, card.blocks, card.blocked_by
+        ),
+        now,
+        authority,
+    )?;
+    mirror_delta_with_authority(
+        transaction,
+        card_id,
+        RelationField::Related,
+        &related_delta,
+        authority,
+        now,
+    )?;
+    mirror_delta_with_authority(
+        transaction,
+        card_id,
+        RelationField::Blocks,
+        &blocks_delta,
+        authority,
+        now,
+    )?;
+    mirror_delta_with_authority(
+        transaction,
+        card_id,
+        RelationField::BlockedBy,
+        &blocked_by_delta,
+        authority,
+        now,
+    )?;
+    Ok(card)
+}
+
+fn update_status_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    status: CardStatus,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::UpdateStatus, &card, None, None, now)?;
+    let previous = card.status;
+    let released_claim = card.apply_status(status, now);
+    persist_card(transaction, &card)?;
+    if let Some(claim) = released_claim {
+        close_run_for_status(transaction, &claim.run_id, status, now, None)?;
+        append_activity_attributed(
+            transaction,
+            &claim.run_id,
+            ActivityType::Action,
+            &format!("status set {card_id} to {}", status.as_str()),
+            authority.principal_name(),
+            Some(authority.role_label()),
+            now,
+        )?;
+    }
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "status",
+        &authority.actor_label(),
+        &format!("{} -> {}", previous.as_str(), status.as_str()),
+        now,
+        authority,
+    )?;
+    if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
+        events::append_outbound_card_event_with_authority(
+            transaction,
+            &card,
+            event_type,
+            authority,
+            json!({"previous_status": previous.as_str(), "status": status.as_str()}),
+            now,
+        )?;
+    }
+    if status.is_terminal() && !previous.is_terminal() {
+        append_parent_rollup_event_with_authority(
+            transaction,
+            &card,
+            authority,
+            &format!("child {card_id} reached {}", status.as_str()),
+            now,
+        )?;
+    }
+    Ok(card)
+}
+
+fn check_criterion_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    criterion: usize,
+    actor: &str,
+    checked: bool,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let actor = non_empty("actor", actor)?;
+    authority.require_identity(&actor).map_err(|error| {
+        DomainError::authority_denied(DenialClass::IdentityMismatch, error.to_string())
+    })?;
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::CheckCriterion, &card, None, None, now)?;
+    let criterion_state = criterion_mut(&mut card, criterion)?;
+    if checked {
+        criterion_state.checked_by = Some(actor.clone());
+        criterion_state.checked_at = Some(now);
+    } else {
+        criterion_state.checked_by = None;
+        criterion_state.checked_at = None;
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    let subject_id = criterion.to_string();
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::CheckCriterion,
+            resource: card_id.as_str(),
+            semantic_identity: Some(actor.as_str()),
+            run_id: None,
+            reason: Some("criterion correction"),
+            event_type: "criterion",
+            actor: &actor,
+            payload: &format!(
+                "criterion {} {}",
+                criterion,
+                if checked { "checked" } else { "unchecked" }
+            ),
+            subject_kind: "criterion",
+            subject_id: &subject_id,
+            authority,
+        },
+        now,
+    )?;
+    Ok(card)
+}
+
+fn patch_card_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    patch: CardPatch,
+    authority: &Authority,
+    now: i64,
+) -> Result<Card> {
+    let actor = non_empty("actor", &authority.actor_label())?;
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::PatchCard, &card, None, None, now)?;
+    let mut patched_fields = Vec::new();
+    if let Some(title) = patch.title {
+        card.title = non_empty_scrubbed("title", &title)?;
+        patched_fields.push("title");
+    }
+    if let Some(body) = patch.body {
+        card.body = secrets::scrub_secrets(&body);
+        patched_fields.push("body");
+    }
+    if let Some(acceptance) = patch.acceptance {
+        card = card.with_acceptance(scrub_string_list(acceptance));
+        patched_fields.push("acceptance");
+    }
+    if let Some(proof_plan) = patch.proof_plan {
+        card = card.with_proof_plan(scrub_string_list(proof_plan));
+        patched_fields.push("proof_plan");
+    }
+    if let Some(priority) = patch.priority {
+        card.priority = priority;
+        patched_fields.push("priority");
+    }
+    if let Some(estimate) = patch.estimate {
+        card.estimate = Some(estimate);
+        patched_fields.push("estimate");
+    }
+    if let Some(risk) = patch.risk {
+        card.risk = Some(risk);
+        patched_fields.push("risk");
+    }
+    if let Some(labels) = patch.labels {
+        card.labels = clean_string_list(labels);
+        patched_fields.push("labels");
+    }
+    if let Some(status) = patch.status {
+        card.status = status;
+        patched_fields.push("status");
+    }
+    if let Some(repo) = patch.repo {
+        card.repo = repo;
+        patched_fields.push("repo");
+    }
+    if patched_fields.is_empty() {
+        return Ok(card);
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "patch",
+        &actor,
+        &format!("patched {}", patched_fields.join(", ")),
+        now,
+        authority,
+    )?;
+    load_card(transaction, card_id)
+}
+
+fn create_card_in_transaction(
+    transaction: &Transaction<'_>,
+    mut card: Card,
+    authority: &Authority,
+    now: i64,
+) -> Result<Card> {
+    let actor = non_empty("actor", &authority.actor_label())?;
+    let card_id = card.id.clone();
+    card.title = secrets::scrub_secrets(&card.title);
+    card.body = secrets::scrub_secrets(&card.body);
+    card.acceptance = scrub_string_list(std::mem::take(&mut card.acceptance));
+    for criterion in &mut card.criteria {
+        criterion.text = secrets::scrub_secrets(&criterion.text);
+    }
+    card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
+    if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
+        if let Some(repo) = card.repo.as_deref() {
+            if !canonical_repo_matches(repo, &derived_repo) {
+                return Err(DomainError::validation(
+                    "repo",
+                    format!("repo {repo} does not match numeric card id prefix {derived_repo}"),
+                )
+                .into());
+            }
+        }
+    }
+    if load_card_optional(transaction, &card_id)?.is_some() {
+        return Err(DomainError::conflict(format!("card already exists: {card_id}")).into());
+    }
+    if let Some(parent_id) = card.parent.clone() {
+        ensure_parent_linkable(transaction, &card_id, &parent_id)?;
+    }
+    persist_card(transaction, &card)?;
+    let saved = load_card(transaction, &card_id)?;
+    append_card_event_with_authority(
+        transaction,
+        &saved.id,
+        "create",
+        &actor,
+        "created card",
+        now,
+        authority,
+    )?;
+    if let Some(parent_id) = saved.parent.as_ref() {
+        append_card_event_with_authority(
+            transaction,
+            parent_id,
+            "decompose",
+            &actor,
+            &format!("child {card_id} created"),
+            now,
+            authority,
+        )?;
+    }
+    mirror_initial_relations_with_authority(transaction, &saved, authority, now)?;
+    events::append_outbound_card_event_with_authority(
+        transaction,
+        &saved,
+        "card-created",
+        authority,
+        json!({"source": "create-card"}),
+        now,
+    )?;
+    Ok(saved)
+}
+
+fn append_work_log_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    agent: &str,
+    attribution: WorkLogAttribution<'_>,
+    body: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<WorkLogEntry> {
+    let card = load_card(transaction, card_id)?;
+    let run_id = attribution.run_id.map(RunId::new).transpose()?;
+    let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+    let entry = WorkLogEntry {
+        id: id.clone(),
+        card_id: card_id.clone(),
+        agent: non_empty("agent", agent)?,
+        model: attribution.model.map(secrets::scrub_secrets),
+        reasoning: attribution.reasoning.map(secrets::scrub_secrets),
+        harness: attribution.harness.map(secrets::scrub_secrets),
+        run_id,
+        body: non_empty_scrubbed("body", body)?,
+        created_at: now,
+    };
+    authorize_card_operation(
+        authority,
+        Operation::WorkLog,
+        &card,
+        entry.run_id.as_ref(),
+        Some(entry.agent.as_str()),
+        now,
+    )?;
+    transaction.execute(
+        "INSERT INTO work_log_entries
+         (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            entry.card_id.as_str(),
+            entry.agent,
+            entry.model,
+            entry.reasoning,
+            entry.harness,
+            entry.run_id.as_ref().map(RunId::as_str),
+            entry.body,
+            entry.created_at,
+        ],
+    )?;
+    let audit_event = append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::WorkLog,
+            resource: card_id.as_str(),
+            semantic_identity: Some(entry.agent.as_str()),
+            run_id: entry.run_id.as_ref(),
+            reason: None,
+            event_type: "work-log",
+            actor: &entry.agent,
+            payload: "appended work log",
+            subject_kind: "work_log",
+            subject_id: &entry.id,
+            authority,
+        },
+        now,
+    )?;
+    events::append_outbound_card_event_for_audit(
+        transaction,
+        &card,
+        "work-log-appended",
+        &entry.agent,
+        json!({
+            "agent": entry.agent.as_str(),
+            "model": entry.model,
+            "harness": entry.harness,
+        }),
+        now,
+        &audit_event,
+    )?;
+    Ok(entry)
+}
+
+fn add_comment_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    author: &str,
+    body: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<Comment> {
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::AddComment, &card, None, None, now)?;
+    let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+    let comment = Comment {
+        id: id.clone(),
+        card_id: card_id.clone(),
+        author: non_empty_scrubbed("author", author)?,
+        body: non_empty_scrubbed("body", body)?,
+        created_at: now,
+    };
+    authority
+        .require_identity(&comment.author)
+        .map_err(|error| {
+            DomainError::authority_denied(DenialClass::IdentityMismatch, error.to_string())
+        })?;
+    transaction.execute(
+        "INSERT INTO comments (id, card_id, author, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            id,
+            comment.card_id.as_str(),
+            comment.author,
+            comment.body,
+            comment.created_at
+        ],
+    )?;
+    let audit_event = append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::AddComment,
+            resource: card_id.as_str(),
+            semantic_identity: Some(comment.author.as_str()),
+            run_id: None,
+            reason: None,
+            event_type: "comment",
+            actor: &comment.author,
+            payload: "added comment",
+            subject_kind: "comment",
+            subject_id: &comment.id,
+            authority,
+        },
+        now,
+    )?;
+    events::append_outbound_card_event_for_audit(
+        transaction,
+        &card,
+        "comment-added",
+        &comment.author,
+        json!({"author": comment.author.as_str(), "body": comment.body.as_str()}),
+        now,
+        &audit_event,
+    )?;
+    Ok(comment)
+}
+
+fn operation_for_event(event_type: &str, payload: &str) -> Option<Operation> {
+    match event_type {
+        "create" => Some(Operation::CreateCard),
+        "patch" | "repair" => Some(Operation::PatchCard),
+        "status" | "rollup" => Some(Operation::UpdateStatus),
+        "relations" => Some(Operation::UpdateRelations),
+        "hierarchy" | "decompose" => Some(Operation::SetParent),
+        "claim" => Some(Operation::ClaimCard),
+        "release" => Some(Operation::ReleaseClaim),
+        "renew" => Some(Operation::RenewClaim),
+        "heartbeat" => Some(Operation::HeartbeatClaim),
+        "transfer" => Some(Operation::TransferClaim),
+        "attachment" if payload.contains("detach") => Some(Operation::DetachImage),
+        "attachment" => Some(Operation::AttachImage),
+        "link" => Some(Operation::AddLink),
+        "comment" => Some(Operation::AddComment),
+        "work-log" => Some(Operation::WorkLog),
+        "complete" => Some(Operation::CompleteCard),
+        _ => None,
+    }
+}
+
 fn append_card_event_with_authority(
     connection: &Connection,
     card_id: &CardId,
@@ -4483,11 +5442,21 @@ fn append_card_event_with_authority(
         role: Some(authority.role_label().to_string()),
         subject_kind: None,
         subject_id: None,
+        operation: operation_for_event(event_type, payload)
+            .map(|operation| operation.as_str().to_string()),
+        resource: Some(format!("card:{}", card_id.as_str())),
+        semantic_identity: Some(actor.to_string()),
+        run_id: None,
+        reason: operation_for_event(event_type, payload)
+            .filter(|operation| operation.rule().audit.reason)
+            .map(|_| payload.to_string()),
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO card_events (id, card_id, event_type, actor, payload, principal, role, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO card_events (
+           id, card_id, event_type, actor, payload, principal, role,
+           operation, resource, semantic_identity, run_id, reason, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
@@ -4496,6 +5465,11 @@ fn append_card_event_with_authority(
             event.payload.as_str(),
             event.principal.as_deref(),
             event.role.as_deref(),
+            event.operation.as_deref(),
+            event.resource.as_deref(),
+            event.semantic_identity.as_deref(),
+            event.run_id.as_deref(),
+            event.reason.as_deref(),
             event.created_at
         ],
     )?;
@@ -4518,13 +5492,18 @@ fn append_attributed_card_event(
         role: Some(audit.authority.role_label().to_string()),
         subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
         subject_id: Some(non_empty("subject_id", audit.subject_id)?),
+        operation: Some(audit.operation.as_str().to_string()),
+        resource: Some(non_empty("resource", audit.resource)?),
+        semantic_identity: audit.semantic_identity.map(str::to_string),
+        run_id: audit.run_id.map(ToString::to_string),
+        reason: audit.reason.map(str::to_string),
         created_at: now,
     };
     connection.execute(
         "INSERT INTO card_events (
            id, card_id, event_type, actor, payload, principal, role,
-           subject_kind, subject_id, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+           subject_kind, subject_id, operation, resource, semantic_identity, run_id, reason, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
@@ -4535,6 +5514,11 @@ fn append_attributed_card_event(
             event.role.as_deref(),
             event.subject_kind.as_deref(),
             event.subject_id.as_deref(),
+            event.operation.as_deref(),
+            event.resource.as_deref(),
+            event.semantic_identity.as_deref(),
+            event.run_id.as_deref(),
+            event.reason.as_deref(),
             event.created_at,
         ],
     )?;
@@ -4579,6 +5563,170 @@ fn close_run_for_status(
         return Err(DomainError::not_found("run", run_id.to_string()).into());
     }
     Ok(())
+}
+
+fn release_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    now: i64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::ReleaseClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
+    let claim = card.release_claim(run_id, now)?;
+    persist_card(transaction, &card)?;
+    release_run(transaction, run_id, now)?;
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("released {card_id}"),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    events::append_outbound_card_event_with_authority(
+        transaction,
+        &card,
+        "moved-to-ready",
+        authority,
+        json!({"source": "release_claim", "run_id": run_id.as_str()}),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
+}
+
+fn renew_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    now: i64,
+    ttl_seconds: u64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::RenewClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
+    let claim = card.renew_claim(run_id, now, ttl_seconds)?;
+    persist_card(transaction, &card)?;
+    let updated = transaction.execute(
+        "UPDATE runs
+         SET claim_expires_at = ?2, updated_at = ?3
+         WHERE id = ?1",
+        params![run_id.as_str(), claim.expires_at, now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("renewed {card_id} until {}", claim.expires_at),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
+}
+
+fn heartbeat_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    now: i64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::HeartbeatClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
+    let claim = card.heartbeat_claim(run_id, now)?;
+    persist_card(transaction, &card)?;
+    let updated = transaction.execute(
+        "UPDATE runs
+         SET updated_at = ?2
+         WHERE id = ?1",
+        params![run_id.as_str(), now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("heartbeat {card_id}"),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
+}
+
+fn transfer_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    run_id: &RunId,
+    to_agent: &str,
+    now: i64,
+    ttl_seconds: u64,
+    authority: &Authority,
+) -> Result<ClaimReceipt> {
+    let mut card = load_card(transaction, card_id)?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::TransferClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
+    let from_agent = card.claim_holder().unwrap_or_default().to_string();
+    let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
+    persist_card(transaction, &card)?;
+    let updated = transaction.execute(
+        "UPDATE runs
+         SET agent = ?2, claim_expires_at = ?3, updated_at = ?4
+         WHERE id = ?1",
+        params![run_id.as_str(), to_agent, claim.expires_at, now],
+    )?;
+    if updated == 0 {
+        return Err(DomainError::not_found("run", run_id.to_string()).into());
+    }
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Action,
+        &format!("transferred {card_id} from {from_agent} to {to_agent}"),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    Ok(claim_receipt(card_id, &claim))
 }
 
 fn claim_receipt(card_id: &CardId, claim: &Claim) -> ClaimReceipt {
