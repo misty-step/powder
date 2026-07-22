@@ -728,7 +728,7 @@ test("board · mobile-390 · header controls stay on-screen with the live indica
 
   const viewport = page.viewportSize();
   expect(viewport).not.toBeNull();
-  for (const id of ["#settings-toggle", "#filter-btn", "#quick-add-toggle", "#live-indicator"]) {
+  for (const id of ["#settings-toggle", "#filter-btn", "#quick-add-toggle", "#cmdk-toggle", "#live-indicator"]) {
     const box = await page.locator(id).boundingBox();
     expect(box, `${id} must have a bounding box`).not.toBeNull();
     expect(box!.x, `${id} must not start left of the viewport`).toBeGreaterThanOrEqual(0);

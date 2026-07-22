@@ -721,8 +721,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 /* powder-ui-tone-down-tokens: the panel title is the one place hierarchy
    reads on this surface — a text-lg semibold title over sm/base labels —
-   so the type scale is exercised without exceeding the still-enforced
-   one-size law on the unmigrated board. */
+   so the type scale is exercised with deliberate hierarchy. */
 .pw-quick-add-title {
   margin: 0;
   font-size: var(--text-lg);
@@ -793,7 +792,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 /* scoped re-theme of the shared .pw-button pair so the action row reads
    from the new role tokens. min-height is left to the base .pw-button so no
-   px literal enters the migrated view code. */
+   px literal enters view code. */
 .pw-quick-add-actions .pw-button {
   border-radius: var(--radius-0);
   font-size: var(--text-sm);
@@ -1644,9 +1643,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   width: 100%;
 }
 
-/* scoped re-theme of the shared .pw-search field the combobox wraps, so the
-   quick-add repo input reads from the new role tokens (the filters-panel
-   .pw-search stays on the comic-ops kit until its own migration card). */
+/* Scoped re-theme of the shared .pw-search field the combobox wraps, so the
+   quick-add repo input reads from the same role tokens as the filters panel. */
 .pw-quick-add-form .pw-combo-field {
   display: inline-flex;
   align-items: center;
@@ -1927,9 +1925,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
   .pw-filter-btn,
   .pw-icon-btn {
-    min-width: 44px;
-    min-height: 44px;
-    height: 44px;
+    min-width: var(--pw-touch-target);
+    min-height: var(--pw-touch-target);
+    height: var(--pw-touch-target);
   }
 
   .pw-filters {
@@ -1944,22 +1942,22 @@ html:not([data-pw-route='card']) .pw-detail-app {
   .pw-filter-group .pw-search,
   .pw-filter-group .pw-sort {
     flex: 1 1 auto;
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
     box-sizing: border-box;
   }
 
   .pw-search input,
   .pw-sort {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-chip-btn,
   .pw-chip-btn .pw-chip {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-filter-clear {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
     padding-inline: 0.6rem;
     margin-left: 0;
   }

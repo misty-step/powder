@@ -2,13 +2,12 @@
    powder-ui-tone-down-tokens: the single source of truth for the
    shadcn / Base UI replatform. This is the toned-down Misty Step zone.
 
-   The comic-ops laws that used to govern the board — radius=0 enforced
-   everywhere and a single <=16px font size — are retired here. Radius
-   becomes a *scale* (0 is one option, not a law) and type becomes a
-   *scale* (hierarchy, spacing, and typography are the bar). Every value
-   lives in this file as a Tailwind 4 @theme token — a CSS custom
-   property. Migrated views consume tokens via var(--…); they never
-   carry raw hex or px literals. The raw values live here, once.
+   Radius and type use independent scales so hierarchy, spacing, typography, and
+   shape remain deliberate. Every value lives in this file as a Tailwind 4
+   @theme token — a CSS custom property. Powder components use var(--…) for
+   semantic colors, touch targets, focus, motion, and named component values.
+   Existing board rules retain some literal type, spacing, and border values; that
+   current debt is governed by later tone-token work.
 
    Token namespaces follow Tailwind 4 so the shadcn primitives can be
    themed with generated utilities (bg-surface, text-ink, border-line,
@@ -25,36 +24,30 @@
    ────────────────────────────────────────────────────────────────── */
 
 @theme static {
-  /* ── type scale: hierarchy is the bar (replaces the one-size law) ──
-     Each step pairs a size with a line-height. The migrated quick-add
-     panel uses xs/sm/base/lg today (all <=16px, law-safe alongside the
-     still-unmigrated board); xl/2xl are reserved for the board-view
-     migration card, which retires the <=16px law board-wide. */
+  /* ── type scale: hierarchy is the bar ──
+     Each step pairs a size with a line-height. Components choose the
+     appropriate step for their role; xl/2xl support board headings. */
   --text-xs: 12px;   /* micro chrome: counts, kbd hints, attachment chips */
   --text-sm: 13px;   /* chrome: labels, captions, button text, meta        */
   --text-base: 14px; /* body: inputs, inline body copy                      */
   --text-md: 15px;   /* subheading / emphasized body                        */
   --text-lg: 16px;   /* panel + section heading                             */
-  --text-xl: 18px;   /* page heading  (board-view migration card)           */
-  --text-2xl: 22px;  /* hero / board title (board-view migration card)      */
+  --text-xl: 18px;   /* page heading                                      */
+  --text-2xl: 22px;  /* hero / board title                              */
 
   --font-sans: "Geist", "Helvetica Neue", Helvetica, Arial, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  /* ── radii scale: radius is a value, not a law (the 0 law is retired) ──
-     The reference surface uses radius-0 (the calm choice) so it stays
-     visually consistent with the still-unmigrated board; sm/md/lg are
-     the scale the board-view migration draws from. */
+  /* ── radii scale: semantic shape options ──
+     The reference surface uses radius-0 (the calm choice); sm/md/lg
+     provide denser or more tactile options for other surfaces. */
   --radius-0: 0;
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
 
   /* ── color roles: semantic, single source (light scheme defaults) ──
-     Calmer than the comic-ops palette: softer surface, ink lifted off
-     pure black, a muted indigo accent instead of the aggressive #2643d0.
-     Roles, not hues: a migrated view names what a color *means*, never
-     which hex it is. */
+     Roles, not hues: a view names what a color *means*, never which hex it is. */
   --color-surface: #fafaf9;          /* page ground                          */
   --color-surface-raised: #f4f4f2;   /* panels, quick-add, popovers          */
   --color-surface-sunken: #efeeec;   /* wells, inputs at rest                */
@@ -79,7 +72,7 @@
   --color-cat-6: #3d5a80;
   --color-cat-7: #a1452e;
 
-  /* ── spacing scale: 4px base. Consumers use these, never ad-hoc px ── */
+  /* ── spacing scale: 4px base. Tokenized consumers use these values. ── */
   --pw-space-0: 0;
   --pw-space-1: 2px;
   --pw-space-2: 4px;
@@ -90,7 +83,7 @@
   --pw-space-7: 32px;
   --pw-space-8: 48px;
 
-  /* ── weights: toned-down — 800 black retires, 600 carries headings ── */
+  /* ── weights: restrained hierarchy ── */
   --pw-weight-regular: 400;
   --pw-weight-medium: 500;
   --pw-weight-semibold: 600;
@@ -106,11 +99,11 @@
   --pw-shadow-pop: 0 6px 18px rgba(0, 0, 0, 0.12);
 
   /* hairline width: the one structural pixel — borders and dividers draw this
-     so a migrated view never carries a bare 1px literal. */
+     so tokenized rules do not carry a bare 1px literal. */
   --pw-line-width: 1px;
 
   /* touch target floor: the WCAG 2.5.5 44px minimum, as one named value so
-     migrated surfaces never carry the literal into view code. */
+     tokenized surfaces do not carry the literal into view code. */
   --pw-touch-target: 44px;
 
   /* ── focus: one ring contract for every interactive primitive ── */

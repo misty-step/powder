@@ -4,10 +4,10 @@
 Base UI replatform. Powder owns this restrained operational palette and every
 component contract directly.
 
-The prior uniform-style constraints are retired by this layer:
+The design system uses independent radius and type scales:
 
-- radius becomes a **scale** (`--radius-0` is one option, not a law); and
-- type becomes a **scale** (hierarchy, spacing, and typography are the bar).
+- radius is a **scale** (`--radius-0` is one option); and
+- type is a **scale** (hierarchy, spacing, and typography are the bar).
 
 Every value lives in `tokens.css` once, as a Tailwind 4 `@theme` token — a CSS
 custom property. The token namespaces follow Tailwind 4 so the shadcn
@@ -15,27 +15,32 @@ primitives can be themed with generated utilities (`bg-surface`, `text-ink`,
 `border-line`, `text-sm`, `rounded-md`, …) **and** every token is also a plain
 CSS custom property for direct `var()` use in hand-authored CSS.
 
-## The contract every migrated view must follow
+## Current contract
 
-1. **Consume tokens, never literals.** A migrated view references tokens via
-   `var(--…)`. It carries **no raw hex or px literals** — the literal values
-   live in `tokens.css`, once. `em`/`rem`/`%` may appear where they are
-   genuinely relative (line-heights, content measures), but a color, a font
-   size, a spacing value, a radius, a shadow, or a touch target is a token
-   reference or nothing.
-2. **Name roles, not hues.** Use the semantic color roles (`--color-surface`,
+Tokenized board surfaces use semantic roles, named component values, touch-target
+minimums, focus, motion, and dark/light re-resolution from this file. New rules
+should adopt a named token whenever one exists. Existing board rules still contain
+literal type, spacing, and border values; that is current tokenization debt governed
+by later tone-token work.
+
+1. **Consume tokens for adopted roles.** A tokenized surface references values via
+   `var(--…)`; raw colors, touch targets, focus rings, and named component values
+   belong in `tokens.css` rather than view rules. Relative `em`/`rem`/`%` values
+   remain valid where they express content measures or line-height.
+2. **Name roles, not hues.** Use semantic color roles (`--color-surface`,
    `--color-ink`, `--color-muted`, `--color-line`, `--color-accent`,
-   `--color-danger`, …). A migrated view never says which hex a color is; it
-   says what the color *means*. The role re-resolves per scheme.
-3. **Use the scales.** Spacing from `--pw-space-*`, type from `--text-*`,
-   radius from `--radius-*`, weight from `--pw-weight-*`, focus from
-   `--pw-focus-*`, motion from `--pw-ease`/`--pw-quick`/`--pw-soft`.
-4. **One focus ring.** Interactive primitives draw the focus ring from
-   `--pw-focus-*`; no ad-hoc outline colors or widths.
-5. **Dark/light is automatic.** Do not branch on mode in view code. The role
-   tokens re-resolve under `:root.dark` / `[data-pw-mode='dark']` and the OS
-   `prefers-color-scheme: dark` fallback. The Powder-owned `pw-mode`
-   localStorage toggle pins an explicit preference.
+   `--color-danger`, …). A component says what a color means; the role re-resolves
+   per scheme.
+3. **Use the scales where adopted.** Tokenized rules draw spacing from
+   `--pw-space-*`, type from `--text-*`, radius from `--radius-*`, weight from
+   `--pw-weight-*`, focus from `--pw-focus-*`, and motion from
+   `--pw-ease`/`--pw-quick`/`--pw-soft`.
+4. **One focus ring.** Tokenized interactive primitives draw the focus ring from
+   `--pw-focus-*`; they do not add ad-hoc outline colors or widths.
+5. **Dark/light is automatic.** Do not branch on mode in view code. Role tokens
+   re-resolve under `:root.dark` / `[data-pw-mode='dark']` and the OS
+   `prefers-color-scheme: dark` fallback; the `pw-mode` localStorage toggle
+   pins an explicit preference.
 
 ## Token reference
 
@@ -48,13 +53,13 @@ CSS custom property for direct `var()` use in hand-authored CSS.
 | `--text-base` | 14px | body: inputs, inline body copy |
 | `--text-md` | 15px | subheading / emphasized body |
 | `--text-lg` | 16px | panel + section heading |
-| `--text-xl` | 18px | page heading *(board-view migration card)* |
-| `--text-2xl` | 22px | hero / board title *(board-view migration card)* |
+| `--text-xl` | 18px | page heading |
+| `--text-2xl` | 22px | hero / board title |
 
 `--font-sans` (Geist) and `--font-mono` (Geist Mono) name the families
 `index.html` loads via Google Fonts.
 
-### Radii scale (`--radius-*`) — radius is a value, not a law
+### Radii scale (`--radius-*`) — semantic shape options
 
 `--radius-0` (0), `--radius-sm` (4px), `--radius-md` (6px), `--radius-lg` (8px).
 The reference surface uses `--radius-0` (the calm choice); `sm`/`md`/`lg`
@@ -87,7 +92,7 @@ Light defaults (in `@theme`); dark re-resolves under `:root.dark` /
 ### Weights (`--pw-weight-*`)
 
 `--pw-weight-regular` (400), `--pw-weight-medium` (500), `--pw-weight-semibold` (600).
-The comic-ops 800 black is retired; 600 carries headings.
+The restrained weight scale uses 600 for headings.
 
 ### Focus (`--pw-focus-*`)
 
@@ -107,11 +112,8 @@ Feedback, never decoration. `--pw-quick` 160ms, `--pw-soft` 240ms,
 ## Reference implementation
 
 The **quick-add panel** (`#quick-add-panel`, `.pw-quick-add*` in
-`powder-board.css`) is the reference implementation: every value in its rules is
-a token reference, it exercises the type scale (a `--text-lg` panel title over
-`--text-sm` labels and `--text-base` inputs), the spacing scale, the role
-colors, the focus ring, and dark/light parity — all while staying within the
-still-enforced `radius-0` / `<=16px` invariants so the law gate holds while the
-rest of the board is unmigrated. The board-view migration card retires those
-invariants board-wide and draws `--text-xl`/`--text-2xl` and `--radius-md`/`lg`
-from this same layer.
+`powder-board.css`) demonstrates the current contract: semantic role colors,
+tokenized touch targets, the shared focus ring, dark/light parity, and named
+component values. Its typography and spacing use the defined scales where those
+tokens are adopted. Existing board rules still contain literal type, spacing, and
+border values; that current debt is governed by later tone-token work.
