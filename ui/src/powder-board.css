@@ -41,9 +41,8 @@ html[data-pw-route='card'] .pw-app {
   display: none;
 }
 
-/* ── base component primitives (migrated from aesthetic.css, token-backed) ──
-   These definitions replace the base styles aesthetic.css provided. Every
-   value is a token reference; no raw hex or px literals. The scoped
+/* ── base component primitives (Powder-owned and token-backed) ───────────────
+   Every value is a token reference; no raw hex or px literals. The scoped
    overrides below (e.g. .pw-quick-add-form .pw-chrome) layer on top. */
 
 body {
@@ -55,7 +54,7 @@ body {
   line-height: 1.6;
   cursor: default;
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
+  text-rendering: optimizelegibility;
 }
 
 h1, h2, h3, h4, h5, h6, p, li, dt, dd, blockquote, figcaption, label,
@@ -96,7 +95,7 @@ a {
 
 a:hover {
   color: var(--color-accent);
-  text-decoration-color: currentColor;
+  text-decoration-color: currentcolor;
 }
 
 /* ── component classes ── */
@@ -104,7 +103,7 @@ a:hover {
 .pw-icon {
   width: 1.2em;
   height: 1.2em;
-  stroke: currentColor;
+  stroke: currentcolor;
   fill: none;
   flex: none;
 }
@@ -271,7 +270,7 @@ textarea.pw-input {
   font-size: var(--text-xs);
   line-height: 1.6;
   letter-spacing: 0.06em;
-  border: var(--pw-line-width) solid currentColor;
+  border: var(--pw-line-width) solid currentcolor;
   padding: 0.12em 0.55em;
   color: var(--color-muted);
 }
@@ -743,9 +742,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: block;
 }
 
-/* scoped re-theme of the shared .pw-chrome label and .pw-input control so
-   the panel reads from the new role tokens, not the old aesthetic kit.
-   Every value below is a token reference; the literals live in tokens.css. */
+/* scoped theme for the shared .pw-chrome label and .pw-input control.
+   Every value below is a token reference; literals live in tokens.css. */
 .pw-quick-add-form .pw-chrome {
   display: block;
   margin-bottom: var(--pw-space-1);

@@ -63,7 +63,7 @@
 
 @layer utilities;
 
-:root.dark, :root[data-ae-mode="dark"] {
+:root.dark, :root[data-pw-mode="dark"] {
   --color-surface: #161616;
   --color-surface-raised: #1c1c1c;
   --color-surface-sunken: #121212;
@@ -87,7 +87,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not(.light):not([data-ae-mode="light"]) {
+  :root:not(.light):not([data-pw-mode="light"]) {
     --color-surface: #161616;
     --color-surface-raised: #1c1c1c;
     --color-surface-sunken: #121212;
@@ -354,7 +354,7 @@ textarea.pw-input {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   letter-spacing: .06em;
-  border: var(--pw-line-width) solid currentColor;
+  border: var(--pw-line-width) solid currentcolor;
   color: var(--color-muted);
   align-items: baseline;
   gap: .5em;

@@ -1,11 +1,10 @@
 # Powder UI design tokens
 
-`ui/src/tokens.css` is the **single source of truth** for the shadcn / Base UI
-replatform — the toned-down Misty Step zone that replaces the comic-ops
-`aesthetic.css` treatment on migrated surfaces.
+`ui/src/tokens.css` is the **single source of truth** for Powder's shadcn /
+Base UI replatform. Powder owns this restrained operational palette and every
+component contract directly.
 
-The comic-ops laws that used to govern the board — **radius=0 enforced
-everywhere** and a **single <=16px font size** — are retired by this layer:
+The prior uniform-style constraints are retired by this layer:
 
 - radius becomes a **scale** (`--radius-0` is one option, not a law); and
 - type becomes a **scale** (hierarchy, spacing, and typography are the bar).
@@ -34,10 +33,9 @@ CSS custom property for direct `var()` use in hand-authored CSS.
 4. **One focus ring.** Interactive primitives draw the focus ring from
    `--pw-focus-*`; no ad-hoc outline colors or widths.
 5. **Dark/light is automatic.** Do not branch on mode in view code. The role
-   tokens re-resolve under `:root.dark` / `[data-ae-mode='dark']` and the OS
-   `prefers-color-scheme: dark` fallback, mirroring the existing `ae-mode`
-   localStorage toggle — the same toggle drives both the old `--ae-*` kit
-   (unmigrated surfaces) and this `--color-*` layer in lockstep.
+   tokens re-resolve under `:root.dark` / `[data-pw-mode='dark']` and the OS
+   `prefers-color-scheme: dark` fallback. The Powder-owned `pw-mode`
+   localStorage toggle pins an explicit preference.
 
 ## Token reference
 
@@ -59,14 +57,13 @@ CSS custom property for direct `var()` use in hand-authored CSS.
 ### Radii scale (`--radius-*`) — radius is a value, not a law
 
 `--radius-0` (0), `--radius-sm` (4px), `--radius-md` (6px), `--radius-lg` (8px).
-The reference surface uses `--radius-0` (the calm choice) so it stays visually
-consistent with the still-unmigrated board; `sm`/`md`/`lg` are the scale the
-board-view migration draws from.
+The reference surface uses `--radius-0` (the calm choice); `sm`/`md`/`lg`
+complete the scale for denser or more tactile Powder surfaces.
 
 ### Color roles (`--color-*`) — semantic, single source
 
 Light defaults (in `@theme`); dark re-resolves under `:root.dark` /
-`[data-ae-mode='dark']` and the OS fallback.
+`[data-pw-mode='dark']` and the OS fallback.
 
 | token | role |
 |---|---|

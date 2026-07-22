@@ -7,10 +7,10 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231a1a1a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m10 20-1.25-2.5L6 18'/%3E%3Cpath d='M10 4 8.75 6.5 6 6'/%3E%3Cpath d='m14 20 1.25-2.5L18 18'/%3E%3Cpath d='m14 4 1.25 2.5L18 6'/%3E%3Cpath d='m17 21-3-6h-4'/%3E%3Cpath d='m17 3-3 6 1.5 3'/%3E%3Cpath d='M2 12h6.5L10 9'/%3E%3Cpath d='m20 10-1.5 2 1.5 2'/%3E%3Cpath d='M22 12h-6.5L14 15'/%3E%3Cpath d='m4 10 1.5 2L4 14'/%3E%3Cpath d='m7 21 3-6-1.5-3'/%3E%3Cpath d='m7 3 3 6h4'/%3E%3C/svg%3E">
   <script>
     try {
-      const mode = localStorage.getItem("ae-mode");
+      const mode = localStorage.getItem("pw-mode");
       if (mode === "dark" || mode === "light") {
         document.documentElement.classList.add(mode);
-        document.documentElement.setAttribute("data-ae-mode", mode);
+        document.documentElement.setAttribute("data-pw-mode", mode);
         document.documentElement.style.colorScheme = mode;
       }
     } catch (_err) {}
@@ -200,10 +200,10 @@
       <span class="pw-caption">PRIORITY</span>
     </span>
     <span class="pw-filter-group" id="fg-estimate" role="group" aria-label="filter by estimate">
-      <span class="ae-plate-cap">ESTIMATE</span>
+      <span class="pw-caption">ESTIMATE</span>
     </span>
     <span class="pw-filter-group" id="fg-risk" role="group" aria-label="filter by risk">
-      <span class="ae-plate-cap">RISK</span>
+      <span class="pw-caption">RISK</span>
     </span>
     <span class="pw-filter-group" aria-label="text search">
       <span class="pw-caption">SEARCH</span>

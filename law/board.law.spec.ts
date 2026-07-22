@@ -82,7 +82,7 @@ async function waitForSettled(page: Page) {
 
 async function boot(page: Page, mode: (typeof MODES)[number], path = "/board") {
   const errors = collectConsoleErrors(page);
-  await page.addInitScript((m) => localStorage.setItem("ae-mode", m), mode);
+  await page.addInitScript((m) => localStorage.setItem("pw-mode", m), mode);
   await page.goto(path);
   await waitForSettled(page);
   return errors;
@@ -94,7 +94,7 @@ async function bootSite(
   route: (typeof SITE_ROUTES)[number],
 ) {
   const errors = collectConsoleErrors(page);
-  await page.addInitScript((m) => localStorage.setItem("ae-mode", m), mode);
+  await page.addInitScript((m) => localStorage.setItem("pw-mode", m), mode);
   await page.goto(pathToFileURL(path.join(SITE_ROOT, route.path)).href);
   await page.waitForLoadState("networkidle");
   return errors;
@@ -554,7 +554,7 @@ test("board · touch device · keyboard-shortcut hint hides, footer bar and home
   });
   const page = await context.newPage();
   const errors = collectConsoleErrors(page);
-  await page.addInitScript(() => localStorage.setItem("ae-mode", "light"));
+  await page.addInitScript(() => localStorage.setItem("pw-mode", "light"));
   await page.goto("/board");
   await waitForSettled(page);
   await expect(page.locator(".pw-foot")).toBeVisible();

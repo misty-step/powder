@@ -1303,13 +1303,13 @@ function renderReadyFacet(group, key, values, label) {
   const allChip = document.createElement("button");
   allChip.className = "pw-chip-btn"; allChip.type = "button";
   allChip.setAttribute("aria-pressed", String(state.filters[key].size === 0));
-  allChip.innerHTML = `<span class="ae-chip">all ${escapeHtml(label)}</span>`;
+  allChip.innerHTML = `<span class="pw-chip">all ${escapeHtml(label)}</span>`;
   allChip.addEventListener("click", () => { state.filters[key].clear(); saveBoardState(); buildFilters(); render(); void refreshReadyForFilters(); });
   group.appendChild(allChip);
   for (const value of values) {
     const button = document.createElement("button"); button.className = "pw-chip-btn"; button.type = "button";
     button.dataset[key] = value; button.setAttribute("aria-pressed", String(state.filters[key].has(value)));
-    button.innerHTML = `<span class="ae-chip">${escapeHtml(value)}</span>`;
+    button.innerHTML = `<span class="pw-chip">${escapeHtml(value)}</span>`;
     button.addEventListener("click", () => {
       if (state.filters[key].has(value)) state.filters[key].clear();
       else { state.filters[key].clear(); state.filters[key].add(value); }

@@ -16,14 +16,13 @@
    a plain CSS custom property for direct var() use in hand-authored CSS
    (the quick-add panel, the reference implementation, uses them this way).
 
-   Dark/light parity mirrors the existing board mode toggle: index.html
-   pins <html class="dark|light" data-ae-mode="dark|light"> from
-   localStorage("ae-mode") and falls back to the OS via
-   prefers-color-scheme. The role tokens (surface / ink / …) re-resolve
-   per scheme in the blocks under the @theme, so the same ae-mode toggle
-   drives both the old --ae-* kit (unmigrated surfaces) and this new
-   --color-* layer (migrated surfaces) in lockstep. See ui/TOKENS.md for
-   the contract every migrated view must follow. ──────────────────── */
+   Dark/light parity follows the Powder board mode toggle: index.html
+   pins <html class="dark|light" data-pw-mode="dark|light"> from
+   localStorage("pw-mode") and falls back to the OS via
+   prefers-color-scheme. Role tokens (surface / ink / …) re-resolve
+   per scheme, so every Powder-owned surface uses the same semantic
+   color contract. See ui/TOKENS.md for the contract every view follows.
+   ────────────────────────────────────────────────────────────────── */
 
 @theme static {
   /* ── type scale: hierarchy is the bar (replaces the one-size law) ──
@@ -70,8 +69,7 @@
   --color-warn: #8a5f32;             /* warning                              */
 
   /* ── categorical colors: repo identity hues (8 buckets, hashed by repo name).
-     Migrated from aesthetic.css's --ae-cat-0..7 so repo identity colors
-     survive the aesthetic.css deletion. Same hues, tokenized. ── */
+     These preserve stable repo identity while owning the palette locally. ── */
   --color-cat-0: #8c2f1f;
   --color-cat-1: #2c6e62;
   --color-cat-2: #a67c1e;
@@ -123,12 +121,11 @@
 
 /* ── dark scheme: re-resolve the role tokens.
    Unlayered so the cascade beats the @layer theme :root emit above
-   (unlayered rules outrank layered ones). Mirrors aesthetic.css's mode
-   mechanics so the existing ae-mode toggle drives both kits in lockstep. */
+   (unlayered rules outrank layered ones). */
 
-/* pinned dark (localStorage ae-mode === "dark") */
+/* pinned dark (localStorage pw-mode === "dark") */
 :root.dark,
-:root[data-ae-mode='dark'] {
+:root[data-pw-mode='dark'] {
   --color-surface: #161616;
   --color-surface-raised: #1c1c1c;
   --color-surface-sunken: #121212;
@@ -153,7 +150,7 @@
 
 /* auto dark: follow the OS unless the page pinned a light mode */
 @media (prefers-color-scheme: dark) {
-  :root:not(.light):not([data-ae-mode='light']) {
+  :root:not(.light):not([data-pw-mode='light']) {
     --color-surface: #161616;
     --color-surface-raised: #1c1c1c;
     --color-surface-sunken: #121212;
