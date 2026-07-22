@@ -139,6 +139,9 @@ pub enum ClaimRequirement {
     None,
     CurrentCardClaim,
     CurrentRun,
+    /// The current run and principal/worker must match, but release remains
+    /// allowed after the lease expires so the holder can cleanly relinquish it.
+    CurrentRunAllowExpired,
 }
 
 /// Identity-bearing payload fields are metadata, never a source of authority.
@@ -269,8 +272,14 @@ impl Operation {
             | Self::SetParent
             | Self::CompleteCard => (Correct, Card, Principal, Keyed),
             Self::ClaimCard => (Execute, None, Worker, RetrySafe),
-            Self::ReleaseClaim | Self::RenewClaim | Self::HeartbeatClaim | Self::TransferClaim => {
-                (Execute, Card, Worker, Keyed)
+            Self::ReleaseClaim => (
+                Execute,
+                ClaimRequirement::CurrentRunAllowExpired,
+                Worker,
+                Keyed,
+            ),
+            Self::RenewClaim | Self::HeartbeatClaim | Self::TransferClaim => {
+                (Execute, Run, Worker, Keyed)
             }
             Self::WorkLog | Self::AddLink => (Execute, Card, Worker, Keyed),
             Self::AddComment => (Execute, None, Principal, Keyed),
@@ -519,7 +528,14 @@ impl Authority {
         if matches!(self.role(), PrincipalRole::Admin | PrincipalRole::Unchecked) {
             return Ok(());
         }
-        if matches!(rule.identity, IdentityRequirement::Worker) && worker.is_none() {
+        // Claim-bound worker identity is checked after the claim requirement.
+        // A missing claim is a stable claim_required denial, not an incidental
+        // missing-worker error. ClaimCard has no claim requirement and still
+        // requires its requested worker label here.
+        if matches!(rule.claim, ClaimRequirement::None)
+            && matches!(rule.identity, IdentityRequirement::Worker)
+            && worker.is_none()
+        {
             return Err(DomainError::authority_denied(
                 DenialClass::IdentityMismatch,
                 format!("operation {} requires a worker label", operation.as_str()),
@@ -569,6 +585,39 @@ impl Authority {
                         format!("operation {} requires an unexpired run", operation.as_str()),
                     ))
                 }
+                (Some(current), Some(target)) if current.run_id != *target => {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!("operation {} targets another run", operation.as_str()),
+                    ))
+                }
+                (Some(current), Some(_))
+                    if self.principal_name() != Some(current.principal.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!(
+                            "operation {} targets another principal's run",
+                            operation.as_str()
+                        ),
+                    ))
+                }
+                (Some(current), Some(_))
+                    if matches!(rule.identity, IdentityRequirement::Worker)
+                        && worker != Some(current.agent.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::IdentityMismatch,
+                        format!("operation {} targets another worker", operation.as_str()),
+                    ))
+                }
+                (Some(_), Some(_)) => Ok(()),
+                _ => Err(DomainError::authority_denied(
+                    DenialClass::ClaimRequired,
+                    format!("operation {} requires the current run", operation.as_str()),
+                )),
+            },
+            ClaimRequirement::CurrentRunAllowExpired => match (claim, run_id) {
                 (Some(current), Some(target)) if current.run_id != *target => {
                     Err(DomainError::authority_denied(
                         DenialClass::CrossResource,
@@ -2557,6 +2606,17 @@ mod tests {
             ClaimRequirement::CurrentCardClaim
         );
         assert_eq!(
+            Operation::ReleaseClaim.rule().claim,
+            ClaimRequirement::CurrentRunAllowExpired
+        );
+        for operation in [
+            Operation::RenewClaim,
+            Operation::HeartbeatClaim,
+            Operation::TransferClaim,
+        ] {
+            assert_eq!(operation.rule().claim, ClaimRequirement::CurrentRun);
+        }
+        assert_eq!(
             Operation::RequestInput.rule().claim,
             ClaimRequirement::CurrentRun
         );
@@ -2685,6 +2745,73 @@ mod tests {
         assert!(Operation::RequestInput.rule().audit.run);
         assert!(Operation::UpdateStatus.rule().audit.reason);
         assert!(Operation::WorkLog.rule().audit.semantic_identity);
+    }
+
+    #[test]
+    fn claim_transition_matrix_rejects_wrong_workers() {
+        let authority = Authority::principal("integration", false);
+        let run_id = RunId::new("run-1").unwrap();
+        let claim = Claim {
+            principal: "integration".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: run_id.clone(),
+            acquired_at: 1,
+            expires_at: 20,
+        };
+        for operation in [
+            Operation::ReleaseClaim,
+            Operation::RenewClaim,
+            Operation::HeartbeatClaim,
+            Operation::TransferClaim,
+        ] {
+            let error = authority
+                .authorize_operation_with_worker(
+                    operation,
+                    Some(&claim),
+                    Some(&run_id),
+                    Some("worker-b"),
+                    5,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.denial_class(),
+                Some(DenialClass::IdentityMismatch),
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_matrix_allows_expired_matching_run_only() {
+        let authority = Authority::principal("integration", false);
+        let run_id = RunId::new("run-1").unwrap();
+        let other_run = RunId::new("run-2").unwrap();
+        let claim = Claim {
+            principal: "integration".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: run_id.clone(),
+            acquired_at: 1,
+            expires_at: 5,
+        };
+        assert!(authority
+            .authorize_operation_with_worker(
+                Operation::ReleaseClaim,
+                Some(&claim),
+                Some(&run_id),
+                Some("worker-a"),
+                10,
+            )
+            .is_ok());
+        let error = authority
+            .authorize_operation_with_worker(
+                Operation::ReleaseClaim,
+                Some(&claim),
+                Some(&other_run),
+                Some("worker-a"),
+                10,
+            )
+            .unwrap_err();
+        assert_eq!(error.denial_class(), Some(DenialClass::CrossResource));
     }
 
     #[test]

@@ -38,6 +38,15 @@ fn ready_card_without_acceptance(id: &str, created_at: i64) -> Card {
         .with_created_at(created_at)
 }
 
+fn assert_authority_denial<T: std::fmt::Debug>(result: Result<T>, expected: DenialClass) {
+    match result {
+        Err(StoreError::Domain(DomainError::AuthorityDenied { class, .. })) => {
+            assert_eq!(class, expected);
+        }
+        other => panic!("expected {expected:?} denial, got {other:?}"),
+    }
+}
+
 fn search_page_matches(
     store: &Store,
     query: &str,
@@ -5998,19 +6007,31 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
 
     assert!(matches!(
         store.release_claim(&card_id, &claim.run_id, 20, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.renew_claim(&card_id, &claim.run_id, 20, 60, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.heartbeat_claim(&card_id, &claim.run_id, 20, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.transfer_claim(&card_id, &claim.run_id, "agent-c", 20, 3600, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     assert!(matches!(
         store.request_input(&claim.run_id, "Approve?", 20, &intruder),
@@ -6041,6 +6062,135 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
         card.claim.as_ref().map(|current| current.run_id.clone()),
         Some(claim.run_id)
     );
+    Ok(())
+}
+
+#[test]
+fn claim_transition_authority_returns_matrix_denial_classes() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let ids = [
+        "missing-claim",
+        "wrong-principal",
+        "expired-release",
+        "expired-renew",
+        "expired-heartbeat",
+        "expired-transfer",
+    ];
+    store.import_cards(ids.iter().map(|id| ready_card(id, 2)).collect())?;
+    let holder = Authority::actor("principal-a", false);
+    let missing_id = CardId::new("missing-claim")?;
+    let missing_run = RunId::new("missing-run")?;
+
+    for result in [
+        store.release_claim(&missing_id, &missing_run, 20, &holder).map(|_| ()),
+        store.renew_claim(&missing_id, &missing_run, 20, 60, &holder).map(|_| ()),
+        store.heartbeat_claim(&missing_id, &missing_run, 20, &holder).map(|_| ()),
+        store
+            .transfer_claim(&missing_id, &missing_run, "worker-b", 20, 60, &holder)
+            .map(|_| ()),
+    ] {
+        assert_authority_denial(result, DenialClass::ClaimRequired);
+    }
+
+    let wrong_id = CardId::new("wrong-principal")?;
+    let wrong_claim = store.claim_card(&wrong_id, "worker-a", 10, 3_600, &holder)?;
+    let intruder = Authority::actor("principal-b", false);
+    assert_authority_denial(
+        store.release_claim(&wrong_id, &wrong_claim.run_id, 20, &intruder),
+        DenialClass::CrossResource,
+    );
+    assert_authority_denial(
+        store.renew_claim(&wrong_id, &wrong_claim.run_id, 20, 60, &intruder),
+        DenialClass::CrossResource,
+    );
+    assert_authority_denial(
+        store.heartbeat_claim(&wrong_id, &wrong_claim.run_id, 20, &intruder),
+        DenialClass::CrossResource,
+    );
+    assert_authority_denial(
+        store.transfer_claim(&wrong_id, &wrong_claim.run_id, "worker-b", 20, 3_600, &intruder),
+        DenialClass::CrossResource,
+    );
+
+    for (id, operation) in [
+        ("expired-release", Operation::ReleaseClaim),
+        ("expired-renew", Operation::RenewClaim),
+        ("expired-heartbeat", Operation::HeartbeatClaim),
+        ("expired-transfer", Operation::TransferClaim),
+    ] {
+        let id = CardId::new(id)?;
+        let claim = store.claim_card(&id, "worker-a", 10, 5, &holder)?;
+        let result = match operation {
+            Operation::ReleaseClaim => store
+                .release_claim(&id, &claim.run_id, 30, &holder)
+                .map(|_| ()),
+            Operation::RenewClaim => store
+                .renew_claim(&id, &claim.run_id, 30, 60, &holder)
+                .map(|_| ()),
+            Operation::HeartbeatClaim => store
+                .heartbeat_claim(&id, &claim.run_id, 30, &holder)
+                .map(|_| ()),
+            Operation::TransferClaim => store
+                .transfer_claim(&id, &claim.run_id, "worker-b", 30, 60, &holder)
+                .map(|_| ()),
+            _ => unreachable!("only claim transitions are covered"),
+        };
+        if matches!(operation, Operation::ReleaseClaim) {
+            assert!(result.is_ok());
+        } else {
+            assert_authority_denial(result, DenialClass::ClaimExpired);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn claim_transition_operations_accept_holder_and_admin() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("holder-matrix", 2), ready_card("admin-matrix", 2)])?;
+    let holder = Authority::actor("principal-a", false);
+    let admin = Authority::actor("operator", true);
+
+    let holder_id = CardId::new("holder-matrix")?;
+    let holder_claim = store.claim_card(&holder_id, "worker-a", 10, 3_600, &holder)?;
+    let renewed = store.renew_claim(&holder_id, &holder_claim.run_id, 20, 60, &holder)?;
+    assert_eq!(renewed.expires_at, 80);
+    let heartbeated = store.heartbeat_claim(&holder_id, &holder_claim.run_id, 21, &holder)?;
+    assert_eq!(heartbeated.run_id, holder_claim.run_id);
+    let transferred = store.transfer_claim(
+        &holder_id,
+        &holder_claim.run_id,
+        "worker-b",
+        22,
+        60,
+        &holder,
+    )?;
+    assert_eq!(transferred.agent, "worker-b");
+    let released = store.release_claim(&holder_id, &holder_claim.run_id, 23, &holder)?;
+    assert_eq!(released.run_id, holder_claim.run_id);
+
+    let admin_id = CardId::new("admin-matrix")?;
+    let admin_claim = store.claim_card(&admin_id, "worker-a", 10, 3_600, &holder)?;
+    assert!(store
+        .renew_claim(&admin_id, &admin_claim.run_id, 20, 60, &admin)
+        .is_ok());
+    assert!(store
+        .heartbeat_claim(&admin_id, &admin_claim.run_id, 21, &admin)
+        .is_ok());
+    let admin_transfer = store.transfer_claim(
+        &admin_id,
+        &admin_claim.run_id,
+        "worker-b",
+        22,
+        60,
+        &admin,
+    )?;
+    assert_eq!(admin_transfer.agent, "worker-b");
+    assert!(store
+        .release_claim(&admin_id, &admin_claim.run_id, 23, &admin)
+        .is_ok());
     Ok(())
 }
 
@@ -6155,7 +6305,10 @@ fn claim_card_records_principal_separately_from_worker() -> Result<()> {
     );
     assert!(matches!(
         wrong_principal,
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::CrossResource,
+            ..
+        }))
     ));
     store.release_claim(
         &card_id,

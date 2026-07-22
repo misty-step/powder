@@ -5573,7 +5573,15 @@ fn release_claim_in_transaction(
     authority: &Authority,
 ) -> Result<ClaimReceipt> {
     let mut card = load_card(transaction, card_id)?;
-    authority.require_holder(card.claim_principal())?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::ReleaseClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
     let claim = card.release_claim(run_id, now)?;
     persist_card(transaction, &card)?;
     release_run(transaction, run_id, now)?;
@@ -5606,7 +5614,15 @@ fn renew_claim_in_transaction(
     authority: &Authority,
 ) -> Result<ClaimReceipt> {
     let mut card = load_card(transaction, card_id)?;
-    authority.require_holder(card.claim_principal())?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::RenewClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
     let claim = card.renew_claim(run_id, now, ttl_seconds)?;
     persist_card(transaction, &card)?;
     let updated = transaction.execute(
@@ -5638,7 +5654,15 @@ fn heartbeat_claim_in_transaction(
     authority: &Authority,
 ) -> Result<ClaimReceipt> {
     let mut card = load_card(transaction, card_id)?;
-    authority.require_holder(card.claim_principal())?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::HeartbeatClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
     let claim = card.heartbeat_claim(run_id, now)?;
     persist_card(transaction, &card)?;
     let updated = transaction.execute(
@@ -5672,7 +5696,15 @@ fn transfer_claim_in_transaction(
     authority: &Authority,
 ) -> Result<ClaimReceipt> {
     let mut card = load_card(transaction, card_id)?;
-    authority.require_holder(card.claim_principal())?;
+    let worker = card.claim.as_ref().map(|claim| claim.agent.as_str());
+    authorize_card_operation(
+        authority,
+        Operation::TransferClaim,
+        &card,
+        Some(run_id),
+        worker,
+        now,
+    )?;
     let from_agent = card.claim_holder().unwrap_or_default().to_string();
     let claim = card.transfer_claim(run_id, to_agent, now, ttl_seconds)?;
     persist_card(transaction, &card)?;
