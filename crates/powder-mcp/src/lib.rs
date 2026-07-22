@@ -70,12 +70,12 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, risk, and initial status; returns a minimal ack; get_card for full state. related/blocks/blocked_by set at creation mirror reciprocally onto each named peer that already exists (related is symmetric; blocks/blocked_by mirror each other); a peer id that doesn't exist yet is tolerated and simply not mirrored.",
-        input_schema: r#"{"type":"object","required":["id","title"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["id","title","idempotency_key"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "update_card",
         description: "Patch explicit mutable fields (title, body, acceptance, proof_plan, status, priority, estimate, risk, labels) on one existing card without replacing protected lifecycle or source metadata. Supplying acceptance replaces the criteria text; returns a minimal ack; get_card for full state. Any authenticated actor may patch; the change is audited with actor and field list.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","idempotency_key"],"properties":{"card_id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"labels":{"type":"array","items":{"type":"string"}},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "list_repositories",
@@ -85,22 +85,22 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "upsert_repository",
         description: "Create or update one repository entity with canonical name, aliases, visibility, tier, and import provenance.",
-        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"tier":{"type":"string","enum":["active","backburner","archived"]},"import_provenance":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["name","idempotency_key"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"tier":{"type":"string","enum":["active","backburner","archived"]},"import_provenance":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "merge_repository_alias",
         description: "Merge an alias or duplicate repository string into a canonical repository and audit every re-homed card.",
-        input_schema: r#"{"type":"object","required":["alias","into"],"properties":{"alias":{"type":"string"},"into":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["alias","into","idempotency_key"],"properties":{"alias":{"type":"string"},"into":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "delete_repository",
         description: "Delete an unused repository entity and its aliases.",
-        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["name","idempotency_key"],"properties":{"name":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "manage_claim",
         description: "Manage the claim lease for one card. action=claim requires the semantic worker label agent and returns authenticated principal, agent, and run_id; one remote integration principal may coordinate multiple workers. action=renew, heartbeat, release, or transfer requires run_id; action=transfer also requires to_agent. ttl_seconds applies to claim, renew, and transfer. actor/admin are optional local-store authority args. Heartbeat or renew before lease expiry.",
-        input_schema: r#"{"type":"object","required":["card_id","action"],"properties":{"card_id":{"type":"string"},"action":{"type":"string","enum":["claim","renew","heartbeat","release","transfer"]},"agent":{"type":"string"},"to_agent":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","action"],"properties":{"card_id":{"type":"string"},"action":{"type":"string","enum":["claim","renew","heartbeat","release","transfer"]},"agent":{"type":"string"},"to_agent":{"type":"string"},"run_id":{"type":"string"},"ttl_seconds":{"type":"integer","minimum":1},"actor":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "get_card",
@@ -125,52 +125,52 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "answer_input",
         description: "Answer an awaiting-input run with an actor-attributed response and resume it.",
-        input_schema: r#"{"type":"object","required":["run_id","actor","answer"],"properties":{"run_id":{"type":"string"},"actor":{"type":"string"},"answer":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["run_id","actor","answer","idempotency_key"],"properties":{"run_id":{"type":"string"},"actor":{"type":"string"},"answer":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "update_status",
         description: "Set a card to any status in one call and record an audit event; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id","status"],"properties":{"card_id":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","status","idempotency_key"],"properties":{"card_id":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "check_criterion",
         description: "Mark one acceptance criterion checked or unchecked and audit actor/time; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","criterion","actor"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","criterion","actor","idempotency_key"],"properties":{"card_id":{"type":"string"},"criterion":{"type":"integer","minimum":0},"actor":{"type":"string"},"checked":{"type":"boolean"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "update_relations",
         description: "Replace a card's related, blocks, and blocked_by relation lists, and/or set its parent edge: parent links the card under an epic, clear_parent unlinks it. Passing only parent/clear_parent leaves the relation lists untouched. Relation writes are reciprocal and atomic: only the ids added or removed vs. the card's prior lists are mirrored onto each named peer that exists (related is symmetric; blocks/blocked_by mirror each other), in the same transaction, so the two sides can never observably disagree; a dangling peer id is tolerated and simply not mirrored. Returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"clear_parent":{"type":"boolean"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","idempotency_key"],"properties":{"card_id":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"clear_parent":{"type":"boolean"},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "add_link",
         description: "Attach a proof, PR, CI, artifact, or reference URL to a card.",
-        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","label","url"],"properties":{"card_id":{"type":"string"},"label":{"type":"string"},"url":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","label","url","idempotency_key"],"properties":{"card_id":{"type":"string"},"label":{"type":"string"},"url":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "add_comment",
         description: "Attach an actor-attributed comment to a card, visible immediately via get_card/get_run.",
-        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","author","body"],"properties":{"card_id":{"type":"string"},"author":{"type":"string"},"body":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","author","body","idempotency_key"],"properties":{"card_id":{"type":"string"},"author":{"type":"string"},"body":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "append_work_log",
         description: "Append a high-frequency, fully-attributed work_log entry while actively working a card: context, current activity, issues, chain of thought. Call this often while working, not just at completion -- distinct from add_comment, which stays low-frequency and human-facing. agent is required; model/reasoning/harness/run_id are whatever attribution the calling surface can supply. body is scrubbed for known secret shapes server-side before storage.",
-        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","agent","body"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["card_id","agent","body","idempotency_key"],"properties":{"card_id":{"type":"string"},"agent":{"type":"string"},"body":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string"},"harness":{"type":"string"},"run_id":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "report_papercut",
         description: "File friction the moment you feel it -- too many tokens, too many calls, confusing errors, missing capability, anything awkward; one call; do not stop working; do not fix it yourself; dedup happens at groom time. Returns a minimal ack; the papercut is stored as a backlog card labeled 'papercut'.",
-        input_schema: r#"{"type":"object","additionalProperties":false,"required":["agent","body"],"properties":{"agent":{"type":"string"},"body":{"type":"string"},"service":{"type":"string"},"model":{"type":"string"},"harness":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","additionalProperties":false,"required":["agent","body","idempotency_key"],"properties":{"agent":{"type":"string"},"body":{"type":"string"},"service":{"type":"string"},"model":{"type":"string"},"harness":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "request_input",
         description: "Pause a run in awaiting_input with the exact operator question. Optional actor/admin are checked against the claim holder.",
-        input_schema: r#"{"type":"object","required":["run_id","question"],"properties":{"run_id":{"type":"string"},"question":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["run_id","question","idempotency_key"],"properties":{"run_id":{"type":"string"},"question":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "complete_card",
         description: "Set a card done, optionally recording a proof artifact or URL and proof links attached to criteria; returns a minimal ack; get_card for full state.",
-        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}}},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
+        input_schema: r#"{"type":"object","required":["card_id","idempotency_key"],"properties":{"card_id":{"type":"string"},"proof":{"type":"string"},"criterion_proofs":{"type":"array","items":{"type":"object","required":["criterion","url"],"properties":{"criterion":{"type":"integer","minimum":0},"url":{"type":"string"}}}},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
     },
     ToolDef {
         name: "create_event_subscription",
@@ -578,15 +578,21 @@ pub fn call_tool_store_with_authority(
                 .transpose()
                 .map_err(to_string)?;
             card.repo = optional_str(args, "repo").map(str::to_string);
-            let card = store
-                .create_card_with_events_as(card, authority_arg(args, authority)?, now)
+            let outcome = store
+                .create_card_with_events_as_keyed(
+                    card,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                    now,
+                )
                 .map_err(to_string)?;
-            let mut payload = card_ack_payload(&card);
-            if card.acceptance.is_empty() {
+            let mut payload = card_ack_payload(&outcome.value);
+            if outcome.value.acceptance.is_empty() {
                 payload["hint"] = json!(
                     "no acceptance criteria; the card cannot be claimed until it carries an oracle"
                 );
             }
+            payload["replayed"] = json!(outcome.replayed);
             payload
         }
         "update_card" => {
@@ -607,10 +613,18 @@ pub fn call_tool_store_with_authority(
                 labels: optional_string_array(args, "labels")?.map(normalize_labels),
                 repo: None,
             };
-            let card = store
-                .patch_card_as(&card_id, patch, authority_arg(args, authority)?, now)
+            let outcome = store
+                .patch_card_as_keyed(
+                    &card_id,
+                    patch,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                    now,
+                )
                 .map_err(to_string)?;
-            card_ack_payload(&card)
+            let mut payload = card_ack_payload(&outcome.value);
+            payload["replayed"] = json!(outcome.replayed);
+            payload
         }
         "list_repositories" => {
             if args["include_hidden"].as_bool().unwrap_or(false) {
@@ -621,8 +635,8 @@ pub fn call_tool_store_with_authority(
         }
         "upsert_repository" => {
             let name = required_str(args, "name")?.to_string();
-            json!(store
-                .upsert_repository_with_authority(
+            let outcome = store
+                .upsert_repository_with_authority_keyed(
                     RepositoryUpsert {
                         name,
                         aliases: optional_string_array(args, "aliases")?,
@@ -632,9 +646,11 @@ pub fn call_tool_store_with_authority(
                             .map(str::to_string),
                     },
                     now,
+                    required_idempotency_key(args)?,
                     admin_authority_arg(args, authority)?,
                 )
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "merge_repository_alias" => {
             let alias = required_str(args, "alias")?;
@@ -643,16 +659,28 @@ pub fn call_tool_store_with_authority(
             if let Some(actor) = optional_str(args, "actor") {
                 authority.require_identity(actor).map_err(to_string)?;
             }
-            json!(store
-                .merge_repository_alias_with_authority(alias, target, &authority, now)
-                .map_err(to_string)?)
+            let outcome = store
+                .merge_repository_alias_with_authority_keyed(
+                    alias,
+                    target,
+                    &authority,
+                    now,
+                    required_idempotency_key(args)?,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "delete_repository" => {
             let name = required_str(args, "name")?;
-            store
-                .delete_repository_with_authority(name, admin_authority_arg(args, authority)?)
+            let outcome = store
+                .delete_repository_with_authority_keyed(
+                    name,
+                    now,
+                    required_idempotency_key(args)?,
+                    admin_authority_arg(args, authority)?,
+                )
                 .map_err(to_string)?;
-            json!({"deleted": true, "repository": name})
+            json!({"deleted": true, "repository": name, "replayed": outcome.replayed})
         }
         "manage_claim" => manage_claim_store(store, args, now, authority)?,
         "get_card" => {
@@ -687,17 +715,33 @@ pub fn call_tool_store_with_authority(
             let run_id = run_id(args, "run_id")?;
             let actor = required_str(args, "actor")?;
             let answer = required_str(args, "answer")?;
-            json!(store
-                .answer_input(&run_id, actor, answer, now, authority_arg(args, authority)?)
-                .map_err(to_string)?)
+            let outcome = store
+                .answer_input_keyed(
+                    &run_id,
+                    actor,
+                    answer,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = parse_status(required_str(args, "status")?)?;
-            let card = store
-                .update_status(&card_id, status, now, authority_arg(args, authority)?)
+            let outcome = store
+                .update_status_keyed(
+                    &card_id,
+                    status,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                )
                 .map_err(to_string)?;
-            card_ack_payload(&card)
+            let mut payload = card_ack_payload(&outcome.value);
+            payload["replayed"] = json!(outcome.replayed);
+            payload
         }
         "check_criterion" => {
             reject_principal_arg(args)?;
@@ -705,17 +749,20 @@ pub fn call_tool_store_with_authority(
             let criterion = criterion_arg(args)?;
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
-            let card = store
-                .check_criterion_as(
+            let outcome = store
+                .check_criterion_as_keyed(
                     &card_id,
                     criterion,
                     actor,
                     checked,
                     now,
+                    required_idempotency_key(args)?,
                     authority_arg(args, authority)?,
                 )
                 .map_err(to_string)?;
-            criterion_ack_payload(&card, criterion, checked)
+            let mut payload = criterion_ack_payload(&outcome.value, criterion, checked);
+            payload["replayed"] = json!(outcome.replayed);
+            payload
         }
         "update_relations" => {
             let card_id = card_id(args, "card_id")?;
@@ -731,17 +778,24 @@ pub fn call_tool_store_with_authority(
                 || !args["blocked_by"].is_null();
             let hierarchy_requested = parent_arg.is_some() || clear_parent;
             let mut card = None;
+            let mut replayed = false;
+            let idempotency_key = required_idempotency_key(args)?;
             if lists_present || !hierarchy_requested {
                 card = Some(
                     store
-                        .update_relations(
+                        .update_relations_keyed(
                             &card_id,
                             card_ids_array(args, "related")?,
                             card_ids_array(args, "blocks")?,
                             card_ids_array(args, "blocked_by")?,
                             now,
+                            idempotency_key,
                             authority_arg(args, authority)?,
                         )
+                        .map(|outcome| {
+                            replayed |= outcome.replayed;
+                            outcome.value
+                        })
                         .map_err(to_string)?,
                 );
             }
@@ -749,30 +803,58 @@ pub fn call_tool_store_with_authority(
                 let parent = parent_arg.map(CardId::new).transpose().map_err(to_string)?;
                 card = Some(
                     store
-                        .set_parent(&card_id, parent, now, authority_arg(args, authority)?)
+                        .set_parent_keyed(
+                            &card_id,
+                            parent,
+                            now,
+                            idempotency_key,
+                            authority_arg(args, authority)?,
+                        )
+                        .map(|outcome| {
+                            replayed |= outcome.replayed;
+                            outcome.value
+                        })
                         .map_err(to_string)?,
                 );
             }
             let card = card.expect("relations or hierarchy branch always runs");
-            relation_ack_payload(&card)
+            let mut payload = relation_ack_payload(&card);
+            payload["replayed"] = json!(replayed);
+            payload
         }
         "add_link" => {
             reject_principal_arg(args)?;
             let card_id = card_id(args, "card_id")?;
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
-            json!(store
-                .add_link_as(&card_id, label, url, now, authority_arg(args, authority)?)
-                .map_err(to_string)?)
+            let outcome = store
+                .add_link_as_keyed(
+                    &card_id,
+                    label,
+                    url,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "add_comment" => {
             reject_principal_arg(args)?;
             let card_id = card_id(args, "card_id")?;
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
-            json!(store
-                .add_comment_as(&card_id, author, body, now, authority_arg(args, authority)?)
-                .map_err(to_string)?)
+            let outcome = store
+                .add_comment_as_keyed(
+                    &card_id,
+                    author,
+                    body,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "append_work_log" => {
             reject_principal_arg(args)?;
@@ -785,16 +867,18 @@ pub fn call_tool_store_with_authority(
                 harness: optional_str(args, "harness"),
                 run_id: optional_str(args, "run_id"),
             };
-            json!(store
-                .append_work_log_as(
+            let outcome = store
+                .append_work_log_as_keyed(
                     &card_id,
                     agent,
                     attribution,
                     body,
                     now,
-                    authority_arg(args, authority)?
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
                 )
-                .map_err(to_string)?)
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "report_papercut" => {
             let report = PapercutReport {
@@ -804,35 +888,66 @@ pub fn call_tool_store_with_authority(
                 model: optional_str(args, "model").map(str::to_string),
                 harness: optional_str(args, "harness").map(str::to_string),
             };
-            let card = store
-                .file_papercut_as(&report, authority_arg(args, authority)?, now)
+            let resolved_repo = report
+                .service
+                .as_deref()
+                .map(|service| store.get_repository(service))
+                .transpose()
+                .map_err(to_string)?
+                .flatten()
+                .map(|summary| summary.repo);
+            let card = powder_core::papercut::file_papercut(
+                report,
+                resolved_repo.as_deref(),
+                now,
+                papercut_card_id(required_idempotency_key(args)?)?,
+            )
+            .map_err(to_string)?;
+            let outcome = store
+                .create_card_with_events_as_keyed(
+                    card,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                    now,
+                )
                 .map_err(to_string)?;
             json!({
-                "id": card.id.as_str(),
-                "title": card.title,
-                "status": card.status.as_str(),
-                "labels": card.labels,
+                "id": outcome.value.id.as_str(),
+                "title": outcome.value.title,
+                "status": outcome.value.status.as_str(),
+                "labels": outcome.value.labels,
+                "replayed": outcome.replayed,
             })
         }
         "request_input" => {
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
             let question = required_str(args, "question")?;
-            json!(store
-                .request_input(&run_id, question, now, authority_arg(args, authority)?)
-                .map_err(to_string)?)
+            let outcome = store
+                .request_input_keyed(
+                    &run_id,
+                    question,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "complete_card" => {
             let card_id = card_id(args, "card_id")?;
-            let card = store
-                .complete_card(
+            let outcome = store
+                .complete_card_keyed(
                     &card_id,
                     optional_str(args, "proof"),
                     criterion_proofs_arg(args)?,
                     now,
+                    required_idempotency_key(args)?,
                     authority_arg(args, authority)?,
                 )
                 .map_err(to_string)?;
-            card_ack_payload(&card)
+            let mut payload = card_ack_payload(&outcome.value);
+            payload["replayed"] = json!(outcome.replayed);
+            payload
         }
         "create_event_subscription" => {
             let url = required_str(args, "url")?;
@@ -1115,39 +1230,70 @@ fn manage_claim_store(
     let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
     let authority = authority_arg(args, transport_authority)?;
 
-    Ok(match action {
+    match action {
         ClaimAction::Claim => {
             let agent = required_claim_arg(args, action, "agent")?;
-            json!(store
-                .claim_card(&card_id, agent, now, ttl_seconds, &authority)
-                .map_err(to_string)?)
+            Ok(json!(store
+                .claim_card(&card_id, agent, now, ttl_seconds, authority)
+                .map_err(to_string)?))
         }
         ClaimAction::Renew => {
             let run_id = run_id_for_claim(args, action)?;
-            json!(store
-                .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority)
-                .map_err(to_string)?)
+            let outcome = store
+                .renew_claim_keyed(
+                    &card_id,
+                    &run_id,
+                    now,
+                    ttl_seconds,
+                    required_idempotency_key(args)?,
+                    authority,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)
         }
         ClaimAction::Heartbeat => {
             let run_id = run_id_for_claim(args, action)?;
-            json!(store
-                .heartbeat_claim(&card_id, &run_id, now, &authority)
-                .map_err(to_string)?)
+            let outcome = store
+                .heartbeat_claim_keyed(
+                    &card_id,
+                    &run_id,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)
         }
         ClaimAction::Release => {
             let run_id = run_id_for_claim(args, action)?;
-            json!(store
-                .release_claim(&card_id, &run_id, now, &authority)
-                .map_err(to_string)?)
+            let outcome = store
+                .release_claim_keyed(
+                    &card_id,
+                    &run_id,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)
         }
         ClaimAction::Transfer => {
             let run_id = run_id_for_claim(args, action)?;
             let to_agent = required_claim_arg(args, action, "to_agent")?;
-            json!(store
-                .transfer_claim(&card_id, &run_id, to_agent, now, ttl_seconds, &authority)
-                .map_err(to_string)?)
+            let outcome = store
+                .transfer_claim_keyed(
+                    &card_id,
+                    &run_id,
+                    to_agent,
+                    now,
+                    ttl_seconds,
+                    required_idempotency_key(args)?,
+                    authority,
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)
         }
-    })
+    }
 }
 
 fn claim_action(args: &Value) -> Result<ClaimAction, String> {
@@ -1466,6 +1612,38 @@ fn reject_principal_arg(args: &Value) -> Result<(), String> {
     }
 }
 
+fn required_idempotency_key(args: &Value) -> Result<&str, String> {
+    let key = args["idempotency_key"]
+        .as_str()
+        .ok_or_else(|| "missing idempotency_key: caller-generated key is required".to_string())?;
+    if key.trim().is_empty() {
+        return Err("idempotency_key must be non-empty".to_string());
+    }
+    if !key.is_ascii() {
+        return Err("idempotency_key must contain only ASCII characters".to_string());
+    }
+    Ok(key)
+}
+
+fn keyed_value<T: serde::Serialize>(
+    outcome: powder_store::IdempotencyOutcome<T>,
+) -> Result<Value, String> {
+    let mut value = serde_json::to_value(outcome.value).map_err(to_string)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("replayed".to_string(), json!(outcome.replayed));
+        Ok(value)
+    } else {
+        Ok(json!({"value": value, "replayed": outcome.replayed}))
+    }
+}
+
+fn papercut_card_id(idempotency_key: &str) -> Result<CardId, String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    idempotency_key.hash(&mut hasher);
+    CardId::new(format!("papercut-{:016x}", hasher.finish())).map_err(to_string)
+}
+
 fn to_string(err: impl std::fmt::Display) -> String {
     err.to_string()
 }
@@ -1520,7 +1698,13 @@ mod tests {
             properties["actor"].is_object(),
             "actor must be a top-level property, not nested inside criterion_proofs"
         );
-        assert!(properties["admin"].is_object());
+        assert!(properties["admin"].is_null());
+        assert!(properties["idempotency_key"].is_object());
+        assert!(complete_card["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "idempotency_key"));
         assert!(properties["criterion_proofs"]["items"]["properties"]["url"].is_object());
 
         let get_card = tools
@@ -1942,21 +2126,21 @@ mod tests {
         call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "heartbeat", "run_id": run_id}),
+            &json!({"card_id": "005", "action": "heartbeat", "run_id": run_id, "idempotency_key": "workflow-heartbeat"}),
             12,
         )
         .unwrap();
         call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "renew", "run_id": run_id, "ttl_seconds": 60}),
+            &json!({"card_id": "005", "action": "renew", "run_id": run_id, "ttl_seconds": 60, "idempotency_key": "workflow-renew"}),
             13,
         )
         .unwrap();
         let transferred = call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "transfer", "run_id": run_id, "to_agent": "codex-b", "ttl_seconds": 60}),
+            &json!({"card_id": "005", "action": "transfer", "run_id": run_id, "to_agent": "codex-b", "ttl_seconds": 60, "idempotency_key": "workflow-transfer"}),
             13,
         )
         .unwrap();
@@ -1970,7 +2154,7 @@ mod tests {
         call_tool_store(
             &mut store,
             "request_input",
-            &json!({"run_id": run_id, "question": "Need approval?"}),
+            &json!({"run_id": run_id, "question": "Need approval?", "idempotency_key": "workflow-request"}),
             14,
         )
         .unwrap();
@@ -1983,7 +2167,7 @@ mod tests {
         call_tool_store(
             &mut store,
             "answer_input",
-            &json!({"run_id": run_id, "actor": "operator", "answer": "Approved"}),
+            &json!({"run_id": run_id, "actor": "operator", "answer": "Approved", "idempotency_key": "workflow-answer"}),
             16,
         )
         .unwrap();
@@ -1995,7 +2179,7 @@ mod tests {
         call_tool_store(
             &mut store,
             "manage_claim",
-            &json!({"card_id": "005", "action": "release", "run_id": run_id}),
+            &json!({"card_id": "005", "action": "release", "run_id": run_id, "idempotency_key": "workflow-release"}),
             18,
         )
         .unwrap();

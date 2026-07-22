@@ -754,6 +754,7 @@ dependencies = [
  "powder-mcp",
  "powder-shell",
  "powder-store",
+ "serde",
  "serde_json",
  "ureq",
 ]
