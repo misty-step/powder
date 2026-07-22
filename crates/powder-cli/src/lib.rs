@@ -286,6 +286,9 @@ pub fn help() -> String {
         "  powder list-cards --db ./data/powder.db --status ready --repo misty-step/example\n",
     );
     help.push_str(
+        "  powder board-rollups --json --db ./data/powder.db --limit 20 [--after e:epic] [--include-hidden]\n",
+    );
+    help.push_str(
         "  powder papercut 'too many tokens to file a simple bug' --agent codex [--service canary]\n",
     );
     help.push_str("  powder repository-list --db ./data/powder.db --include-hidden\n");
@@ -967,18 +970,24 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
 /// authenticated HTTP API. `--json` is accepted explicitly because
 /// rollups are intended for agent consumption; JSON remains the sole wire shape.
 fn board_rollups(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let limit = parse_limit(args).unwrap_or(20);
+    let limit = parse_limit(args).unwrap_or(20).clamp(1, 100);
     let after = flag_value(args, "--after").map(str::to_string);
+    let include_hidden = has_flag(args, "--include-hidden");
     let value = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
-        serde_json::to_value(store.board_rollups(powder_store::BoardRollupsQuery {
-            limit,
-            after,
-            now: unix_now(),
-        }).map_err(store_err)?)
-            .map_err(|error| ShellError::Invalid(error.to_string()))?
+        serde_json::to_value(
+            store
+                .board_rollups(powder_store::BoardRollupsQuery {
+                    limit,
+                    after,
+                    now: unix_now(),
+                    include_hidden,
+                })
+                .map_err(store_err)?,
+        )
+        .map_err(|error| ShellError::Invalid(error.to_string()))?
     } else if let Some(client) = remote_env.client() {
-        let mut query = format!("limit={limit}");
+        let mut query = format!("limit={limit}&include_hidden={include_hidden}");
         if let Some(after) = after {
             query.push_str(&format!("&after={}", urlencode(&after)));
         }
@@ -4062,7 +4071,14 @@ mod tests {
         )]);
         let env = remote_env(Some(&base_url), Some("sk_powder_test"));
         let output = run_with_env(
-            &args(["board-rollups", "--json", "--limit", "1", "--after", "e:epic"]),
+            &args([
+                "board-rollups",
+                "--json",
+                "--limit",
+                "1",
+                "--after",
+                "e:epic",
+            ]),
             &env,
         )
         .unwrap();
@@ -4071,8 +4087,14 @@ mod tests {
         assert_eq!(payload["coverage"]["complete"], true);
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "GET");
-        assert_eq!(requests[0].path, "/api/v1/board/rollups?limit=1&after=e%3Aepic");
-        assert_eq!(requests[0].authorization.as_deref(), Some("Bearer sk_powder_test"));
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/board/rollups?limit=1&include_hidden=false&after=e%3Aepic"
+        );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
+        );
     }
 
     #[test]
@@ -4709,13 +4731,29 @@ Serve grid thumbnails instead of full originals.\n\n\
         let db = db.to_string_lossy().to_string();
         run(&args(["init-db", "--db", &db])).unwrap();
         run(&args([
-            "create-card", "--db", &db, "--id", "cli-epic", "--title", "Epic",
-            "--acceptance", "proof",
-        ])).unwrap();
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "cli-epic",
+            "--title",
+            "Epic",
+            "--acceptance",
+            "proof",
+        ]))
+        .unwrap();
         run(&args([
-            "create-card", "--db", &db, "--id", "cli-leaf", "--title", "Leaf",
-            "--acceptance", "proof",
-        ])).unwrap();
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "cli-leaf",
+            "--title",
+            "Leaf",
+            "--acceptance",
+            "proof",
+        ]))
+        .unwrap();
         let output = run(&args(["board-rollups", "--json", "--db", &db])).unwrap();
         let payload: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(payload["total_count"], 1);

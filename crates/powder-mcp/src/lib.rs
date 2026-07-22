@@ -9,8 +9,8 @@ use powder_core::{
     ReadyQuery, Risk, RunId,
 };
 use powder_store::{
-    BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, Store,
+    BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
+    RepositoryUpsert, RepositoryVisibility, Store,
 };
 use serde_json::{json, Value};
 
@@ -60,7 +60,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "board_rollups",
         description: "Return deterministic top-level epic and per-repository Unsorted rollups with direct-child status counts, criteria sums, active claims, freshness, and global parent-graph coverage; use this before list_cards when you need the human board shape.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"after":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"after":{"type":"string"},"include_hidden":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "create_card",
@@ -450,9 +450,10 @@ pub fn call_tool_store(
         "board_rollups" => {
             let page = store
                 .board_rollups(BoardRollupsQuery {
-                    limit: args["limit"].as_u64().unwrap_or(20) as usize,
+                    limit: args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize,
                     after: args["after"].as_str().map(str::to_string),
                     now,
+                    include_hidden: args["include_hidden"].as_bool().unwrap_or(false),
                 })
                 .map_err(to_string)?;
             json!(page)
@@ -1505,6 +1506,7 @@ mod tests {
                 "list_ready",
                 "list_cards",
                 "board_stats",
+                "board_rollups",
                 "create_card",
                 "update_card",
                 "list_repositories",
@@ -1525,7 +1527,7 @@ mod tests {
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 21);
+        assert_eq!(default_names.len(), 22);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1537,7 +1539,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 30);
+        assert_eq!(admin_names.len(), 31);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -2236,7 +2238,13 @@ mod tests {
     fn mcp_board_rollups_local_returns_canonical_envelope() {
         let mut store = Store::open_in_memory().unwrap();
         store.migrate().unwrap();
-        call_tool_store(&mut store, "upsert_repository", &json!({"name": "repo-a"}), 1).unwrap();
+        call_tool_store(
+            &mut store,
+            "upsert_repository",
+            &json!({"name": "repo-a"}),
+            1,
+        )
+        .unwrap();
         for (id, repo) in [("mcp-leaf-a", Some("repo-a")), ("mcp-leaf-b", None)] {
             call_tool_store(
                 &mut store,
@@ -2246,7 +2254,8 @@ mod tests {
             )
             .unwrap();
         }
-        let result = call_tool_store(&mut store, "board_rollups", &json!({"limit": 1}), 20).unwrap();
+        let result =
+            call_tool_store(&mut store, "board_rollups", &json!({"limit": 1}), 20).unwrap();
         let payload = tool_payload(&result);
         assert_eq!(payload["total_count"], 2);
         assert!(payload["has_more"].as_bool().unwrap());

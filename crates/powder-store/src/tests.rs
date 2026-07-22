@@ -5,9 +5,10 @@ use powder_core::{
 
 use crate::schema::SCHEMA;
 use crate::{
-    ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig, ImportOutcome,
-    ParentCoverageBucket, ParentIssueKind, RelationField, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, Result, Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET,
+    ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig,
+    ImportOutcome, ParentCoverageBucket, ParentIssueKind, RelationField, RepositoryTier,
+    RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError, WorkLogAttribution,
+    API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -2422,6 +2423,61 @@ fn parent_graph_doctor_classifies_corruption_and_refuses_ambiguous_repair() -> R
         .as_deref()
         .is_some_and(|message| message.starts_with("refused parent repair:")));
     assert!(repaired.issues.is_empty());
+    Ok(())
+}
+
+#[test]
+fn parent_graph_coverage_rejects_descendants_of_invalid_parent() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("invalid-root", 10),
+        ready_card("valid-child", 11),
+    ])?;
+    store.connection.execute_batch(
+        "UPDATE cards SET parent = X'626c6f62' WHERE id = 'invalid-root';
+         UPDATE cards SET parent = 'invalid-root' WHERE id = 'valid-child';",
+    )?;
+
+    let report = store.parent_graph_report()?;
+    assert!(report.issues.iter().any(|issue| {
+        issue.card_id.as_deref() == Some("invalid-root")
+            && issue.kind == ParentIssueKind::InvalidStoredId
+    }));
+    assert_eq!(report.coverage.scanned, 2);
+    assert_eq!(report.coverage.classified, 0);
+    assert_eq!(report.coverage.unclassified, 2);
+    assert!(report.coverage.assignments.is_empty());
+    assert!(!report.coverage.is_complete());
+    Ok(())
+}
+
+#[test]
+fn parent_cycle_evidence_preserves_real_parent_edges() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("cycle-a", 10),
+        ready_card("cycle-b", 11),
+        ready_card("cycle-c", 12),
+    ])?;
+    store.connection.execute_batch(
+        "UPDATE cards SET parent = 'cycle-c' WHERE id = 'cycle-a';
+         UPDATE cards SET parent = 'cycle-a' WHERE id = 'cycle-b';
+         UPDATE cards SET parent = 'cycle-b' WHERE id = 'cycle-c';",
+    )?;
+
+    let report = store.parent_graph_report()?;
+    let cycle_evidence = report
+        .issues
+        .iter()
+        .filter(|issue| issue.kind == ParentIssueKind::Cycle)
+        .map(|issue| issue.evidence.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(cycle_evidence.len(), 3);
+    assert!(cycle_evidence
+        .iter()
+        .all(|evidence| *evidence == "parent cycle: cycle-a -> cycle-c -> cycle-b"));
     Ok(())
 }
 
@@ -6546,7 +6602,11 @@ fn board_rollups_majority_parentless_fleet_has_constant_rollup_rows() -> Result<
         .map(|index| ready_card(&format!("fleet-{index:04}"), index))
         .collect::<Vec<_>>();
     store.import_cards(cards)?;
-    let page = store.board_rollups(BoardRollupsQuery { limit: 20, now: 10_000, ..Default::default() })?;
+    let page = store.board_rollups(BoardRollupsQuery {
+        limit: 20,
+        now: 10_000,
+        ..Default::default()
+    })?;
     assert_eq!(page.total_count, 1);
     assert_eq!(page.rollups.len(), 1);
     assert_eq!(page.rollups[0].kind, "unsorted");
@@ -6570,31 +6630,255 @@ fn board_rollups_are_flat_paginated_and_lossless() -> Result<()> {
         ready_card("leaf-b", 14),
         ready_card("leaf-general", 15),
     ])?;
-    store.set_parent(&CardId::new("nested")?, Some(CardId::new("epic")?), 20, &authority)?;
-    store.set_parent(&CardId::new("child-done")?, Some(CardId::new("nested")?), 21, &authority)?;
-    store.connection.execute("UPDATE cards SET status = 'done', repo = 'repo-a' WHERE id = 'child-done'", [])?;
-    store.connection.execute("UPDATE cards SET status = 'future_status', repo = 'repo-a' WHERE id = 'leaf-a'", [])?;
-    store.connection.execute("UPDATE cards SET repo = 'repo-a' WHERE id IN ('epic','nested','leaf-b')", [])?;
-    let first = store.board_rollups(BoardRollupsQuery { limit: 1, now: 100, ..Default::default() })?;
+    store.set_parent(
+        &CardId::new("nested")?,
+        Some(CardId::new("epic")?),
+        20,
+        &authority,
+    )?;
+    store.set_parent(
+        &CardId::new("child-done")?,
+        Some(CardId::new("nested")?),
+        21,
+        &authority,
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET status = 'done', repo = 'repo-a' WHERE id = 'child-done'",
+        [],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET status = 'future_status', repo = 'repo-a' WHERE id = 'leaf-a'",
+        [],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET repo = 'repo-a' WHERE id IN ('epic','nested','leaf-b')",
+        [],
+    )?;
+    let first = store.board_rollups(BoardRollupsQuery {
+        limit: 1,
+        now: 100,
+        ..Default::default()
+    })?;
     assert_eq!(first.total_count, 3);
     assert!(first.has_more);
     assert_eq!(first.coverage.total_cards, 6);
     assert_eq!(first.coverage.accounted_cards, 6);
+    assert_eq!(first.coverage.root_epics, 1);
+    assert_eq!(first.coverage.unsorted_cards, 3);
+    assert_eq!(first.coverage.parent_issue_count, 0);
     assert!(first.coverage.complete);
-    let second = store.board_rollups(BoardRollupsQuery { limit: 10, after: first.next_after.clone(), now: 100 })?;
+    let second = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        after: first.next_after.clone(),
+        now: 100,
+        include_hidden: false,
+    })?;
     assert_eq!(first.rollups.len() + second.rollups.len(), 3);
-    let all = store.board_rollups(BoardRollupsQuery { limit: 10, now: 100, ..Default::default() })?;
-    let epic = all.rollups.iter().find(|row| row.kind == "epic").expect("epic row");
+    let all = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 100,
+        ..Default::default()
+    })?;
+    let epic = all
+        .rollups
+        .iter()
+        .find(|row| row.kind == "epic")
+        .expect("epic row");
     assert_eq!(epic.card_id.as_ref().map(CardId::as_str), Some("epic"));
     assert_eq!(epic.status_counts.get("ready"), Some(&1));
     assert_eq!(epic.status_counts.get("done"), None);
-    let unsorted = all.rollups.iter().find(|row| row.kind == "unsorted" && row.repo.as_deref() == Some("repo-a")).expect("repo bucket");
+    let unsorted = all
+        .rollups
+        .iter()
+        .find(|row| row.kind == "unsorted" && row.repo.as_deref() == Some("repo-a"))
+        .expect("repo bucket");
     assert_eq!(unsorted.status_counts.get("future_status"), Some(&1));
     assert_eq!(unsorted.status_counts.get("ready"), Some(&1));
-    assert_eq!(all.rollups.iter().filter(|row| row.kind == "unsorted" && row.repo.is_none()).count(), 1);
+    let general = all
+        .rollups
+        .iter()
+        .find(|row| row.kind == "unsorted" && row.repo.is_none())
+        .expect("general bucket");
+    assert_eq!(general.title, "General");
+    assert!(all
+        .rollups
+        .iter()
+        .filter(|row| row.kind == "unsorted" && row.repo.is_some())
+        .all(|row| row.title == "Unsorted"));
+    let stale = store
+        .board_rollups(BoardRollupsQuery {
+            limit: 1,
+            after: Some("u:missing".to_string()),
+            now: 100,
+            include_hidden: false,
+        })
+        .unwrap_err();
+    assert!(stale
+        .to_string()
+        .contains("stale or filtered-out continuation token"));
     Ok(())
 }
 
+#[test]
+fn board_rollups_sql_aggregates_majority_parentless_10k_fleet() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let epic_id = CardId::new("scale-epic")?;
+    let child = ready_card("scale-child", 1)
+        .with_status(CardStatus::Done)
+        .with_parent(Some(epic_id.clone()));
+    let statuses = [
+        CardStatus::Backlog,
+        CardStatus::Ready,
+        CardStatus::InProgress,
+        CardStatus::AwaitingInput,
+        CardStatus::Done,
+        CardStatus::Shipped,
+        CardStatus::Abandoned,
+    ];
+    let mut cards = Vec::with_capacity(10_000);
+    cards.push(ready_card(epic_id.as_str(), 0));
+    cards.push(child);
+    for index in 0..9_998 {
+        cards.push(
+            ready_card(&format!("scale-leaf-{index:05}"), (index + 2) as i64)
+                .with_status(statuses[index % statuses.len()]),
+        );
+    }
+    store.import_cards(cards)?;
+    let started = std::time::Instant::now();
+    let page = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10_000,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "rollup query took {elapsed:?}"
+    );
+    assert_eq!(page.total_count, 2);
+    assert_eq!(page.rollups.len(), 2);
+    assert_eq!(page.coverage.total_cards, 10_000);
+    assert_eq!(page.coverage.accounted_cards, 10_000);
+    assert_eq!(page.coverage.root_epics, 1);
+    assert_eq!(page.coverage.unsorted_cards, 9_998);
+    assert!(page.coverage.complete);
+    let epic = page.rollups.iter().find(|row| row.kind == "epic").unwrap();
+    assert_eq!(epic.status_counts.get("done"), Some(&1));
+    let general = page
+        .rollups
+        .iter()
+        .find(|row| row.kind == "unsorted" && row.repo.is_none())
+        .unwrap();
+    assert_eq!(general.title, "General");
+    assert_eq!(general.status_counts.values().sum::<usize>(), 9_998);
+    assert_eq!(general.status_counts.get("backlog"), Some(&1_429));
+    assert_eq!(general.status_counts.get("ready"), Some(&1_429));
+    for status in [
+        "in_progress",
+        "awaiting_input",
+        "done",
+        "shipped",
+        "abandoned",
+    ] {
+        assert_eq!(
+            general.status_counts.get(status),
+            Some(&1_428),
+            "status {status}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn board_rollups_report_dirty_parent_edges_without_leaking_issues() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("dirty-root", 1),
+        ready_card("dirty-leaf", 2),
+    ])?;
+    store.connection.execute(
+        "UPDATE cards SET parent = 'missing-parent' WHERE id = 'dirty-leaf'",
+        [],
+    )?;
+    let page = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert!(!page.coverage.complete);
+    assert_eq!(page.coverage.parent_issue_count, 1);
+    assert_eq!(page.coverage.total_cards, 2);
+    assert_eq!(page.coverage.accounted_cards, 1);
+    let encoded = serde_json::to_value(page)?;
+    assert!(encoded["coverage"]["issues"].is_null());
+    assert!(encoded["coverage"]["assignments"].is_null());
+    assert!(encoded["rollups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["title"] == "General"));
+    Ok(())
+}
+
+#[test]
+fn board_rollups_respect_hidden_repository_scope() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "secret".to_string(),
+            aliases: None,
+            visibility: Some(RepositoryVisibility::Hidden),
+            tier: Some(RepositoryTier::Active),
+            import_provenance: Some("rollup fixture".to_string()),
+        },
+        1,
+    )?;
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "visible".to_string(),
+            aliases: None,
+            visibility: Some(RepositoryVisibility::Visible),
+            tier: Some(RepositoryTier::Active),
+            import_provenance: Some("rollup fixture".to_string()),
+        },
+        1,
+    )?;
+    let mut hidden = ready_card("hidden-leaf", 1);
+    hidden.repo = Some("secret".to_string());
+    let mut visible = ready_card("visible-leaf", 2);
+    visible.repo = Some("visible".to_string());
+    store.import_cards(vec![hidden, visible])?;
+    let visible_page = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert_eq!(visible_page.coverage.total_cards, 1);
+    assert_eq!(visible_page.coverage.unsorted_cards, 1);
+    assert!(visible_page
+        .rollups
+        .iter()
+        .all(|row| row.repo.as_deref() != Some("secret")));
+    let all_page = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: true,
+        ..Default::default()
+    })?;
+    assert_eq!(all_page.coverage.total_cards, 2);
+    assert!(all_page
+        .rollups
+        .iter()
+        .any(|row| row.repo.as_deref() == Some("secret")));
+    Ok(())
+}
 
 #[test]
 fn fts_search_times_10k_synthetic_cards() -> Result<()> {

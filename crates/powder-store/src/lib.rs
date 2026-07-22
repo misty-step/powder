@@ -1,13 +1,17 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::{BTreeMap, HashMap}, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::Path,
+};
 
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Risk,
-    Run, RunId, RunState, WorkLogEntry,
+    CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId, Priority,
+    ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -343,7 +347,13 @@ impl Serialize for BoardRollupStatusCounts {
     {
         use serde::ser::SerializeMap;
         const KNOWN: [&str; 7] = [
-            "backlog", "ready", "in_progress", "awaiting_input", "done", "shipped", "abandoned",
+            "backlog",
+            "ready",
+            "in_progress",
+            "awaiting_input",
+            "done",
+            "shipped",
+            "abandoned",
         ];
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
         for key in KNOWN {
@@ -357,12 +367,6 @@ impl Serialize for BoardRollupStatusCounts {
             }
         }
         map.end()
-    }
-}
-
-impl BoardRollupStatusCounts {
-    fn increment(&mut self, status: &str) {
-        *self.0.entry(status.to_string()).or_default() += 1;
     }
 }
 
@@ -406,6 +410,7 @@ pub struct BoardRollupsQuery {
     pub limit: usize,
     pub after: Option<String>,
     pub now: i64,
+    pub include_hidden: bool,
 }
 
 impl BoardStatsCounts {
@@ -491,86 +496,6 @@ struct MutationAudit<'a> {
     subject_id: &'a str,
     authority: &'a Authority,
 }
-
-#[derive(Debug)]
-struct BoardRollupCard {
-id: CardId,
-title: String,
-parent: Option<CardId>,
-repo: Option<String>,
-status: String,
-criteria_checked: usize,
-criteria_total: usize,
-claim_expires_at: Option<i64>,
-updated_at: i64,
-}
-
-fn add_rollup_child(rollup: &mut BoardRollup, child: &BoardRollupCard, now: i64) {
-rollup.status_counts.increment(&child.status);
-rollup.criteria_checked += child.criteria_checked;
-rollup.criteria_total += child.criteria_total;
-if child.claim_expires_at.is_some_and(|expires_at| expires_at > now) {
-    rollup.active_claims += 1;
-}
-rollup.freshness = Some(match rollup.freshness {
-    None => EpicFreshness {
-        oldest_update: child.updated_at,
-        newest_update: child.updated_at,
-    },
-    Some(freshness) => EpicFreshness {
-        oldest_update: freshness.oldest_update.min(child.updated_at),
-        newest_update: freshness.newest_update.max(child.updated_at),
-    },
-});
-}
-
-fn board_rollup_coverage(
-records: &[BoardRollupCard],
-children: &HashMap<CardId, Vec<&BoardRollupCard>>,
-) -> BoardRollupCoverage {
-let by_id = records
-    .iter()
-    .map(|card| (card.id.clone(), card))
-    .collect::<HashMap<_, _>>();
-let root_epics = records
-    .iter()
-    .filter(|card| card.parent.is_none() && children.contains_key(&card.id))
-    .count();
-let unsorted_cards = records
-    .iter()
-    .filter(|card| card.parent.is_none() && !children.contains_key(&card.id))
-    .count();
-let mut accounted_cards = 0;
-let mut parent_issue_count = 0;
-for card in records {
-    let mut current = card;
-    let mut seen = std::collections::HashSet::new();
-    loop {
-        if !seen.insert(current.id.clone()) {
-            parent_issue_count += 1;
-            break;
-        }
-        let Some(parent_id) = current.parent.as_ref() else {
-            accounted_cards += 1;
-            break;
-        };
-        let Some(parent) = by_id.get(parent_id) else {
-            parent_issue_count += 1;
-            break;
-        };
-        current = parent;
-    }
-}
-BoardRollupCoverage {
-    total_cards: records.len(),
-    accounted_cards,
-    root_epics,
-    unsorted_cards,
-    parent_issue_count,
-    complete: accounted_cards == records.len() && parent_issue_count == 0,
-}
-}
-
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -2370,132 +2295,202 @@ impl Store {
         Ok(stats)
     }
 
-    /// Return deterministic top-level epic and parentless-leaf rollups without
-    /// loading card details or recomposing EpicState. The query reads the board
-    /// rows once; all arithmetic and pagination remain bounded in Rust.
+    /// Return deterministic top-level epic and parentless-leaf rollups using
+    /// SQL aggregation. Parent graph coverage is scanned separately so page
+    /// size never changes the global accounting envelope.
     pub fn board_rollups(&self, query: BoardRollupsQuery) -> Result<BoardRollups> {
         let mut statement = self.connection.prepare(
-            "SELECT id, title, parent, repo, status, criteria_json,
-                    claim_expires_at, updated_at
-             FROM cards
-             ORDER BY id",
+            r#"
+            WITH visible_cards AS (
+                SELECT CAST(c.id AS TEXT) AS id, CAST(c.title AS TEXT) AS title, c.parent,
+                       CAST(c.repo AS TEXT) AS repo, CAST(c.status AS TEXT) AS status,
+                       CAST(c.criteria_json AS TEXT) AS criteria_json, c.claim_agent,
+                       c.claim_expires_at, CAST(c.updated_at AS INTEGER) AS updated_at
+                FROM cards c
+                LEFT JOIN repositories r ON r.name = c.repo
+                WHERE ?1 OR COALESCE(r.visibility, 'visible') = 'visible'
+            )
+            SELECT
+                'epic' AS kind,
+                CAST(p.id AS TEXT) AS card_id,
+                CAST(p.title AS TEXT) AS title,
+                CAST(p.repo AS TEXT) AS repo,
+                CAST(c.status AS TEXT) AS status,
+                COUNT(*) AS card_count,
+                SUM(CASE WHEN json_valid(c.criteria_json) THEN
+                    (SELECT COUNT(*) FROM json_each(c.criteria_json) AS criterion
+                     WHERE json_extract(criterion.value, '$.checked_at') IS NOT NULL
+                        OR json_extract(criterion.value, '$.checked_by') IS NOT NULL)
+                    ELSE 0 END) AS criteria_checked,
+                SUM(CASE WHEN json_valid(c.criteria_json)
+                    THEN json_array_length(c.criteria_json) ELSE 0 END) AS criteria_total,
+                SUM(CASE WHEN c.claim_agent IS NOT NULL
+                              AND c.claim_expires_at > ?2 THEN 1 ELSE 0 END) AS active_claims,
+                MIN(c.updated_at) AS oldest_update,
+                MAX(c.updated_at) AS newest_update
+            FROM visible_cards p
+            JOIN visible_cards c
+              ON typeof(c.parent) = 'text' AND c.parent = p.id
+            WHERE p.parent IS NULL
+            GROUP BY p.id, p.title, p.repo, c.status
+            UNION ALL
+            SELECT
+                'unsorted' AS kind,
+                NULL AS card_id,
+                NULL AS title,
+                CAST(c.repo AS TEXT) AS repo,
+                CAST(c.status AS TEXT) AS status,
+                COUNT(*) AS card_count,
+                SUM(CASE WHEN json_valid(c.criteria_json) THEN
+                    (SELECT COUNT(*) FROM json_each(c.criteria_json) AS criterion
+                     WHERE json_extract(criterion.value, '$.checked_at') IS NOT NULL
+                        OR json_extract(criterion.value, '$.checked_by') IS NOT NULL)
+                    ELSE 0 END) AS criteria_checked,
+                SUM(CASE WHEN json_valid(c.criteria_json)
+                    THEN json_array_length(c.criteria_json) ELSE 0 END) AS criteria_total,
+                SUM(CASE WHEN c.claim_agent IS NOT NULL
+                              AND c.claim_expires_at > ?2 THEN 1 ELSE 0 END) AS active_claims,
+                MIN(c.updated_at) AS oldest_update,
+                MAX(c.updated_at) AS newest_update
+            FROM visible_cards c
+            WHERE c.parent IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM visible_cards child
+                  WHERE typeof(child.parent) = 'text' AND child.parent = c.id
+              )
+            GROUP BY c.repo, c.status
+            "#,
         )?;
-        let records = statement
-            .query_map([], |row| {
-                let criteria_json: String = row.get(5)?;
-                let criteria = serde_json::from_str::<serde_json::Value>(&criteria_json)
-                    .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
-                        5,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    ))?;
-                let criteria_total = criteria.as_array().map_or(0, Vec::len);
-                let criteria_checked = criteria
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|criterion| {
-                        criterion.get("checked_at").is_some_and(|value| !value.is_null())
-                            || criterion.get("checked_by").is_some_and(|value| !value.is_null())
-                    })
-                    .count();
-                Ok(BoardRollupCard {
-                    id: CardId::new(row.get::<_, String>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?,
-                    title: row.get(1)?,
-                    parent: row.get::<_, Option<String>>(2)?.map(CardId::new).transpose().map_err(|error| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error)))?,
-                    repo: row.get(3)?,
-                    status: row.get(4)?,
-                    criteria_checked,
-                    criteria_total,
-                    claim_expires_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let by_id = records
-            .iter()
-            .map(|card| (card.id.clone(), card))
-            .collect::<HashMap<_, _>>();
-        let mut children = HashMap::<CardId, Vec<&BoardRollupCard>>::new();
-        for card in &records {
-            if let Some(parent) = card.parent.as_ref().filter(|parent| by_id.contains_key(*parent)) {
-                if parent != &card.id {
-                    children.entry(parent.clone()).or_default().push(card);
-                }
-            }
-        }
-
-        let mut rows = Vec::<(String, BoardRollup)>::new();
-        for card in &records {
-            if card.parent.is_some() {
-                continue;
-            }
-            if let Some(direct_children) = children.get(&card.id) {
-                if direct_children.is_empty() {
-                    continue;
-                }
-                let mut rollup = BoardRollup {
-                    kind: "epic".to_string(),
-                    card_id: Some(card.id.clone()),
-                    repo: card.repo.clone(),
-                    title: card.title.clone(),
-                    status_counts: BoardRollupStatusCounts::default(),
-                    criteria_checked: 0,
-                    criteria_total: 0,
-                    active_claims: 0,
-                    freshness: None,
-                };
-                for child in direct_children {
-                    add_rollup_child(&mut rollup, child, query.now);
-                }
-                rows.push((format!("e:{}", card.id), rollup));
-            }
-        }
-
-        let mut unsorted = BTreeMap::<Option<String>, Vec<&BoardRollupCard>>::new();
-        for card in &records {
-            if card.parent.is_none() && !children.contains_key(&card.id) {
-                unsorted.entry(card.repo.clone()).or_default().push(card);
-            }
-        }
-        for (repo, cards) in unsorted {
-            let mut rollup = BoardRollup {
-                kind: "unsorted".to_string(),
-                card_id: None,
+        let mut rows = BTreeMap::<String, BoardRollup>::new();
+        let sql_rows =
+            statement.query_map(params![query.include_hidden as i64, query.now], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })?;
+        for row in sql_rows {
+            let (
+                kind,
+                raw_card_id,
+                raw_title,
+                repo,
+                status,
+                card_count,
+                criteria_checked,
+                criteria_total,
+                active_claims,
+                oldest_update,
+                newest_update,
+            ) = row?;
+            let card_id = match raw_card_id {
+                Some(raw) => match CardId::new(raw) {
+                    Ok(card_id) => Some(card_id),
+                    Err(_) => continue,
+                },
+                None => None,
+            };
+            let key = match card_id.as_ref() {
+                Some(card_id) => format!("e:{card_id}"),
+                None => format!("u:{}", repo.as_deref().unwrap_or("")),
+            };
+            let rollup = rows.entry(key).or_insert_with(|| BoardRollup {
+                kind: kind.clone(),
+                card_id: card_id.clone(),
                 repo: repo.clone(),
-                title: "Unsorted".to_string(),
+                title: raw_title.unwrap_or_else(|| {
+                    if repo.is_none() {
+                        "General".to_string()
+                    } else {
+                        "Unsorted".to_string()
+                    }
+                }),
                 status_counts: BoardRollupStatusCounts::default(),
                 criteria_checked: 0,
                 criteria_total: 0,
                 active_claims: 0,
                 freshness: None,
-            };
-            for card in cards {
-                add_rollup_child(&mut rollup, card, query.now);
+            });
+            let count = usize::try_from(card_count.max(0)).unwrap_or(usize::MAX);
+            let checked = usize::try_from(criteria_checked.max(0)).unwrap_or(usize::MAX);
+            let total = usize::try_from(criteria_total.max(0)).unwrap_or(usize::MAX);
+            let active = usize::try_from(active_claims.max(0)).unwrap_or(usize::MAX);
+            let status_count = rollup.status_counts.0.entry(status).or_default();
+            *status_count = status_count.saturating_add(count);
+            rollup.criteria_checked = rollup.criteria_checked.saturating_add(checked);
+            rollup.criteria_total = rollup.criteria_total.saturating_add(total);
+            rollup.active_claims = rollup.active_claims.saturating_add(active);
+            if let (Some(oldest_update), Some(newest_update)) = (oldest_update, newest_update) {
+                rollup.freshness = Some(match rollup.freshness {
+                    None => EpicFreshness {
+                        oldest_update,
+                        newest_update,
+                    },
+                    Some(freshness) => EpicFreshness {
+                        oldest_update: freshness.oldest_update.min(oldest_update),
+                        newest_update: freshness.newest_update.max(newest_update),
+                    },
+                });
             }
-            let cursor = format!("u:{}", repo.as_deref().unwrap_or(""));
-            rows.push((cursor, rollup));
         }
 
-        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let rows = rows.into_iter().collect::<Vec<_>>();
         let total_count = rows.len();
-        let start = query
-            .after
-            .as_deref()
-            .map_or(0, |after| rows.partition_point(|(key, _)| key.as_str() <= after));
-        let limit = query.limit.max(1);
-        let end = (start + limit).min(rows.len());
+        let start = match query.after.as_deref() {
+            None => 0,
+            Some(after) => {
+                let index = rows.iter().position(|(key, _)| key == after).ok_or_else(|| {
+                    DomainError::validation(
+                        "after",
+                        format!("rollup {after} is not in the current result set (stale or filtered-out continuation token)"),
+                    )
+                })?;
+                index.saturating_add(1)
+            }
+        };
+        let limit = query.limit.clamp(1, 100);
+        let end = start.saturating_add(limit).min(rows.len());
         let has_more = end < rows.len();
-        let next_after = has_more.then(|| rows[end - 1].0.clone());
+        let next_after = has_more.then(|| rows[end.saturating_sub(1)].0.clone());
         let rollups = rows
-            .into_iter()
+            .iter()
             .skip(start)
             .take(limit)
-            .map(|(_, rollup)| rollup)
+            .map(|(_, rollup)| rollup.clone())
             .collect();
 
-        let coverage = board_rollup_coverage(&records, &children);
+        let report = self.parent_graph_report_scoped(query.include_hidden)?;
+        let coverage = BoardRollupCoverage {
+            total_cards: report.coverage.scanned,
+            accounted_cards: report.coverage.classified,
+            root_epics: report
+                .coverage
+                .assignments
+                .iter()
+                .filter(|assignment| {
+                    assignment.bucket == ParentCoverageBucket::EpicAncestor
+                        && assignment.ancestor_id.as_deref() == Some(assignment.card_id.as_str())
+                })
+                .count(),
+            unsorted_cards: report
+                .coverage
+                .assignments
+                .iter()
+                .filter(|assignment| assignment.bucket == ParentCoverageBucket::Unsorted)
+                .count(),
+            parent_issue_count: report.issues.len(),
+            complete: report.coverage.is_complete() && report.issues.is_empty(),
+        };
         Ok(BoardRollups {
             rollups,
             total_count,

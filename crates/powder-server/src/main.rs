@@ -431,6 +431,7 @@ struct BoardStatsParams {
 struct BoardRollupsParams {
     limit: Option<usize>,
     after: Option<String>,
+    include_hidden: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1151,11 +1152,17 @@ async fn board_rollups(
     headers: HeaderMap,
     Query(params): Query<BoardRollupsParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
+    let include_hidden = params.include_hidden.unwrap_or(false);
+    if include_hidden {
+        require_admin(&state, &headers)?;
+    } else {
+        authorize_read(&state, &headers)?;
+    }
     let rollups = lock_store(&state)?.board_rollups(powder_store::BoardRollupsQuery {
-        limit: params.limit.unwrap_or(20).max(1),
+        limit: params.limit.unwrap_or(20).clamp(1, 100),
         after: params.after,
         now: unix_now(),
+        include_hidden,
     })?;
     Ok(Json(json!(rollups)))
 }
