@@ -199,7 +199,6 @@ impl Store {
     ) -> Result<Run> {
         let actor = non_empty("actor", actor)?;
         let answer = non_empty_scrubbed("answer", answer)?;
-        authority.require_identity(&actor)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -240,6 +239,24 @@ impl Store {
             &format!("answered by {actor}: {answer}"),
             authority.principal_name(),
             Some(authority.role_label()),
+            now,
+        )?;
+        super::append_attributed_card_event(
+            &transaction,
+            &card.id,
+            super::MutationAudit {
+                operation: Operation::AnswerInput,
+                resource: card.id.as_str(),
+                semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+                run_id: Some(run_id),
+                reason: None,
+                event_type: "answer-input",
+                actor: &actor,
+                payload: "answered input",
+                subject_kind: "run",
+                subject_id: run_id.as_str(),
+                authority,
+            },
             now,
         )?;
         transaction.commit()?;

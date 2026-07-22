@@ -71,9 +71,13 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
             .import_cards(vec![ready_card(card_id.as_str())])
             .expect("import card");
 
+        let operator = Authority::principal("roster", true);
         store
-            .check_criterion_as(&card_id, 0, "operator", true, 50, &authority)
+            .check_criterion_as(&card_id, 0, "operator", true, 50, &operator)
             .expect("check criterion");
+        let claim = store
+            .claim_card(&card_id, "worker-a", 50, 600, &authority)
+            .expect("claim card");
         let link = store
             .add_link_as(
                 &card_id,
@@ -93,7 +97,10 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
             .append_work_log_as(
                 &card_id,
                 "worker-a",
-                WorkLogAttribution::default(),
+                WorkLogAttribution {
+                    run_id: Some(claim.run_id.as_str()),
+                    ..WorkLogAttribution::default()
+                },
                 "investigating",
                 50,
                 &authority,
@@ -238,11 +245,17 @@ fn outbound_failure_rolls_back_domain_row_and_audit_event() {
         .add_comment_as(&card_id, "operator", "must roll back", 70, &authority)
         .expect_err("outbound failure aborts comment");
     assert!(error.to_string().contains("forced outbound failure"));
+    let claim = store
+        .claim_card(&card_id, "worker-a", 70, 600, &authority)
+        .expect("claim card");
     let error = store
         .append_work_log_as(
             &card_id,
             "worker-a",
-            WorkLogAttribution::default(),
+            WorkLogAttribution {
+                run_id: Some(claim.run_id.as_str()),
+                ..WorkLogAttribution::default()
+            },
             "must roll back",
             70,
             &authority,
@@ -436,14 +449,21 @@ fn authority_principal_is_independent_of_api_key_scope_or_semantic_worker() {
     store
         .import_cards(vec![ready_card(card_id.as_str())])
         .expect("import card");
+    let authority = Authority::principal(verified.principal, false);
+    let claim = store
+        .claim_card(&card_id, "worker-not-roster", 3, 600, &authority)
+        .expect("claim card");
     store
         .append_work_log_as(
             &card_id,
             "worker-not-roster",
-            WorkLogAttribution::default(),
+            WorkLogAttribution {
+                run_id: Some(claim.run_id.as_str()),
+                ..WorkLogAttribution::default()
+            },
             "one principal, another worker",
             3,
-            &Authority::principal(verified.principal, false),
+            &authority,
         )
         .expect("append as semantic worker");
     let detail = store

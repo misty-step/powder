@@ -4305,14 +4305,23 @@ impl Store {
             Some(authority.role_label()),
             now,
         )?;
-        append_card_event_with_authority(
+        append_attributed_card_event(
             &transaction,
             &card.id,
-            "status",
-            &authority.actor_label(),
-            "awaiting input",
+            MutationAudit {
+                operation: Operation::RequestInput,
+                resource: card.id.as_str(),
+                semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+                run_id: Some(run_id),
+                reason: None,
+                event_type: "request-input",
+                actor: &authority.actor_label(),
+                payload: "awaiting input",
+                subject_kind: "run",
+                subject_id: run_id.as_str(),
+                authority,
+            },
             now,
-            authority,
         )?;
         events::append_outbound_card_event_with_authority(
             &transaction,
