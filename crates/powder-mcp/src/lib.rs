@@ -39,7 +39,7 @@ pub struct ToolDef {
     pub input_schema: &'static str,
 }
 
-pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. File friction the moment you feel it using report_papercut: too many tokens, too many calls, confusing errors, anything awkward; one call; do not stop working; do not fix it yourself; dedup happens at groom time. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin.";
+pub const INSTRUCTIONS: &str = "Powder operating contract: use list_ready before claiming work; claim exactly one card at a time with manage_claim action=claim. Cards without acceptance criteria cannot be claimed. The card is the spec: call get_card and read its goal, criteria, proof plan, relations, claim state, and recent activity before working. Lists are summaries for scanning; use get_card for full detail. Append append_work_log frequently while working: current context, progress, blockers, evidence, and attribution. Use add_comment only for low-frequency, human-facing updates. File friction the moment you feel it using report_papercut: too many tokens, too many calls, confusing errors, anything awkward; one call; do not stop working; do not fix it yourself; dedup happens at groom time. On long runs, call manage_claim action=heartbeat or action=renew before the lease gets stale. If you stop voluntarily, call manage_claim action=release. If an operator decision is required, request_input and pause; do not invent approval. Complete with complete_card only when the card's criteria are satisfied, and include proof such as a PR, command transcript, artifact, deploy, or readback. Admin tools (webhooks, keys, repository admin) are hidden unless the server runs with POWDER_MCP_TOOLSETS=admin. Local mutations also require trusted POWDER_MCP_PRINCIPAL and POWDER_MCP_ROLE; tool actor labels cannot grant authority.";
 
 pub const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -282,7 +282,7 @@ pub fn tool_defs_json_for(toolset: Toolset) -> Value {
 }
 
 pub fn handle_json_rpc_store(store: &mut Store, request: &Value, now: i64) -> Option<Value> {
-    handle_json_rpc_store_with_toolset(store, request, now, Toolset::Default)
+    handle_json_rpc_store_with_authority(store, request, now, Toolset::Default, None)
 }
 
 pub fn handle_json_rpc_store_with_toolset(
@@ -290,6 +290,16 @@ pub fn handle_json_rpc_store_with_toolset(
     request: &Value,
     now: i64,
     toolset: Toolset,
+) -> Option<Value> {
+    handle_json_rpc_store_with_authority(store, request, now, toolset, None)
+}
+
+pub fn handle_json_rpc_store_with_authority(
+    store: &mut Store,
+    request: &Value,
+    now: i64,
+    toolset: Toolset,
+    authority: Option<&Authority>,
 ) -> Option<Value> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
@@ -308,7 +318,7 @@ pub fn handle_json_rpc_store_with_toolset(
             let params = &request["params"];
             let name = params["name"].as_str().unwrap_or("");
             let args = &params["arguments"];
-            call_tool_store_with_toolset(store, name, args, now, toolset)
+            call_tool_store_with_authority(store, name, args, now, toolset, authority)
         }
         "ping" => Ok(json!({})),
         other => Err(format!("method not found: {other}")),
@@ -384,6 +394,26 @@ pub fn call_tool_store_with_toolset(
     call_tool_store(store, name, args, now)
 }
 
+pub fn call_tool_store(
+    store: &mut Store,
+    name: &str,
+    args: &Value,
+    now: i64,
+) -> Result<Value, String> {
+    #[cfg(test)]
+    let authority = Some(Authority::principal("operator", true));
+    #[cfg(not(test))]
+    let authority = None;
+    call_tool_store_with_authority(
+        store,
+        name,
+        args,
+        now,
+        Toolset::WithAdmin,
+        authority.as_ref(),
+    )
+}
+
 pub fn call_tool_remote_with_toolset(
     client: &RemoteClient,
     name: &str,
@@ -394,12 +424,15 @@ pub fn call_tool_remote_with_toolset(
     call_tool_remote(client, name, args)
 }
 
-pub fn call_tool_store(
+pub fn call_tool_store_with_authority(
     store: &mut Store,
     name: &str,
     args: &Value,
     now: i64,
+    toolset: Toolset,
+    authority: Option<&Authority>,
 ) -> Result<Value, String> {
+    ensure_tool_enabled(name, toolset)?;
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -546,7 +579,7 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             card.repo = optional_str(args, "repo").map(str::to_string);
             let card = store
-                .create_card_with_events_as(card, &authority_arg(args), now)
+                .create_card_with_events_as(card, authority_arg(args, authority)?, now)
                 .map_err(to_string)?;
             let mut payload = card_ack_payload(&card);
             if card.acceptance.is_empty() {
@@ -575,7 +608,7 @@ pub fn call_tool_store(
                 repo: None,
             };
             let card = store
-                .patch_card_as(&card_id, patch, &authority_arg(args), now)
+                .patch_card_as(&card_id, patch, authority_arg(args, authority)?, now)
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -599,14 +632,14 @@ pub fn call_tool_store(
                             .map(str::to_string),
                     },
                     now,
-                    &admin_authority_arg(args),
+                    admin_authority_arg(args, authority)?,
                 )
                 .map_err(to_string)?)
         }
         "merge_repository_alias" => {
             let alias = required_str(args, "alias")?;
             let target = required_str(args, "into")?;
-            let authority = admin_authority_arg(args);
+            let authority = admin_authority_arg(args, authority)?;
             if let Some(actor) = optional_str(args, "actor") {
                 authority.require_identity(actor).map_err(to_string)?;
             }
@@ -617,11 +650,11 @@ pub fn call_tool_store(
         "delete_repository" => {
             let name = required_str(args, "name")?;
             store
-                .delete_repository_with_authority(name, &admin_authority_arg(args))
+                .delete_repository_with_authority(name, admin_authority_arg(args, authority)?)
                 .map_err(to_string)?;
             json!({"deleted": true, "repository": name})
         }
-        "manage_claim" => manage_claim_store(store, args, now)?,
+        "manage_claim" => manage_claim_store(store, args, now, authority)?,
         "get_card" => {
             let card_id = card_id(args, "card_id")?;
             let detail_level = detail_arg(args)?;
@@ -655,14 +688,14 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let answer = required_str(args, "answer")?;
             json!(store
-                .answer_input(&run_id, actor, answer, now, &authority_arg(args))
+                .answer_input(&run_id, actor, answer, now, authority_arg(args, authority)?)
                 .map_err(to_string)?)
         }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = parse_status(required_str(args, "status")?)?;
             let card = store
-                .update_status(&card_id, status, now, &authority_arg(args))
+                .update_status(&card_id, status, now, authority_arg(args, authority)?)
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -679,7 +712,7 @@ pub fn call_tool_store(
                     actor,
                     checked,
                     now,
-                    &authority_arg(args),
+                    authority_arg(args, authority)?,
                 )
                 .map_err(to_string)?;
             criterion_ack_payload(&card, criterion, checked)
@@ -707,7 +740,7 @@ pub fn call_tool_store(
                             card_ids_array(args, "blocks")?,
                             card_ids_array(args, "blocked_by")?,
                             now,
-                            &authority_arg(args),
+                            authority_arg(args, authority)?,
                         )
                         .map_err(to_string)?,
                 );
@@ -716,7 +749,7 @@ pub fn call_tool_store(
                 let parent = parent_arg.map(CardId::new).transpose().map_err(to_string)?;
                 card = Some(
                     store
-                        .set_parent(&card_id, parent, now, &authority_arg(args))
+                        .set_parent(&card_id, parent, now, authority_arg(args, authority)?)
                         .map_err(to_string)?,
                 );
             }
@@ -729,7 +762,7 @@ pub fn call_tool_store(
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
             json!(store
-                .add_link_as(&card_id, label, url, now, &authority_arg(args))
+                .add_link_as(&card_id, label, url, now, authority_arg(args, authority)?)
                 .map_err(to_string)?)
         }
         "add_comment" => {
@@ -738,7 +771,7 @@ pub fn call_tool_store(
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
             json!(store
-                .add_comment_as(&card_id, author, body, now, &authority_arg(args))
+                .add_comment_as(&card_id, author, body, now, authority_arg(args, authority)?)
                 .map_err(to_string)?)
         }
         "append_work_log" => {
@@ -759,7 +792,7 @@ pub fn call_tool_store(
                     attribution,
                     body,
                     now,
-                    &authority_arg(args)
+                    authority_arg(args, authority)?
                 )
                 .map_err(to_string)?)
         }
@@ -772,7 +805,7 @@ pub fn call_tool_store(
                 harness: optional_str(args, "harness").map(str::to_string),
             };
             let card = store
-                .file_papercut_as(&report, &authority_arg(args), now)
+                .file_papercut_as(&report, authority_arg(args, authority)?, now)
                 .map_err(to_string)?;
             json!({
                 "id": card.id.as_str(),
@@ -785,7 +818,7 @@ pub fn call_tool_store(
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
             let question = required_str(args, "question")?;
             json!(store
-                .request_input(&run_id, question, now, &authority_arg(args))
+                .request_input(&run_id, question, now, authority_arg(args, authority)?)
                 .map_err(to_string)?)
         }
         "complete_card" => {
@@ -796,7 +829,7 @@ pub fn call_tool_store(
                     optional_str(args, "proof"),
                     criterion_proofs_arg(args)?,
                     now,
-                    &authority_arg(args),
+                    authority_arg(args, authority)?,
                 )
                 .map_err(to_string)?;
             card_ack_payload(&card)
@@ -1071,11 +1104,16 @@ impl ClaimAction {
     }
 }
 
-fn manage_claim_store(store: &mut Store, args: &Value, now: i64) -> Result<Value, String> {
+fn manage_claim_store(
+    store: &mut Store,
+    args: &Value,
+    now: i64,
+    transport_authority: Option<&Authority>,
+) -> Result<Value, String> {
     let action = claim_action(args)?;
     let card_id = card_id(args, "card_id")?;
     let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-    let authority = authority_arg(args);
+    let authority = authority_arg(args, transport_authority)?;
 
     Ok(match action {
         ClaimAction::Claim => {
@@ -1365,26 +1403,55 @@ fn field_role(key: &'static str) -> &'static str {
 /// `actor`/`admin` tool arguments. Omitting `actor` preserves prior MCP
 /// behavior exactly: a stdio-local caller is trusted and no ownership check
 /// runs, matching the CLI's `--actor` default.
-fn authority_arg(args: &Value) -> Authority {
-    match args["actor"]
-        .as_str()
-        .map(str::trim)
+/// Resolve local MCP identity from the trusted process/session environment. Tool
+/// arguments remain semantic labels and cannot select this principal or role.
+pub fn local_authority_from_env() -> Result<Authority, String> {
+    let principal = std::env::var("POWDER_MCP_PRINCIPAL")
+        .ok()
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-    {
-        Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
-        None => Authority::actor("operator", true),
+        .ok_or_else(|| {
+            "unauthenticated: local MCP requires POWDER_MCP_PRINCIPAL from the trusted session"
+                .to_string()
+        })?;
+    let role = std::env::var("POWDER_MCP_ROLE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .ok_or_else(|| {
+            "unauthenticated: local MCP requires POWDER_MCP_ROLE=agent|admin from the trusted session"
+                .to_string()
+        })?;
+    match role.as_str() {
+        "admin" => Ok(Authority::principal(principal, true)),
+        "agent" => Ok(Authority::principal(principal, false)),
+        _ => Err("unauthenticated: local MCP POWDER_MCP_ROLE must be agent or admin".to_string()),
     }
 }
 
-fn admin_authority_arg(args: &Value) -> Authority {
-    match args["actor"]
+fn authority_arg<'a>(
+    args: &Value,
+    transport_authority: Option<&'a Authority>,
+) -> Result<&'a Authority, String> {
+    let authority = transport_authority.ok_or_else(|| {
+        "unauthenticated: local MCP requires POWDER_MCP_PRINCIPAL and POWDER_MCP_ROLE from the trusted session".to_string()
+    })?;
+    if let Some(actor) = args["actor"]
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
-        None => Authority::actor("operator", true),
+        authority.require_identity(actor).map_err(to_string)?;
     }
+    Ok(authority)
+}
+
+fn admin_authority_arg<'a>(
+    args: &Value,
+    transport_authority: Option<&'a Authority>,
+) -> Result<&'a Authority, String> {
+    let authority = authority_arg(args, transport_authority)?;
+    authority.require_admin().map_err(to_string)?;
+    Ok(authority)
 }
 
 fn reject_principal_arg(args: &Value) -> Result<(), String> {
@@ -1670,6 +1737,32 @@ mod tests {
         assert!(admin_names.contains(&"list_dead_letters"));
         assert!(admin_names.contains(&"tail_events"));
         assert!(admin_names.contains(&"list_keys"));
+    }
+
+    #[test]
+    fn local_store_dispatch_rejects_missing_transport_authority() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "create_card",
+                "arguments": {
+                    "id": "unauthenticated-mcp",
+                    "title": "must fail",
+                    "acceptance": ["proof"]
+                }
+            }
+        });
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let response = handle_json_rpc_store(&mut store, &request, 10).unwrap();
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("unauthenticated:"));
+        assert!(store
+            .get_card(&CardId::new("unauthenticated-mcp").unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

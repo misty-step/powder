@@ -319,3 +319,10 @@ cargo test --workspace
 - Do not import from Gradient or Hermes `kanban.db`.
 - Do not add personal or operator backlog data to the Powder repository.
 - Do not treat exit zero as completion without a status update and audit trail.
+
+
+Local MCP also requires trusted launch identity before it can mutate a local
+SQLite instance. Set `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent|admin` in the MCP process environment. A missing or invalid
+identity returns an unauthenticated error; MCP never defaults to operator or
+unchecked authority. Tool `actor`, `agent`, and `answered_by` values are semantic labels only and
+must match the process principal when the operation requires identity.

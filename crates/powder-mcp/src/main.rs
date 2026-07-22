@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 
-use powder_mcp::{RemoteClient, Toolset};
+use powder_mcp::{local_authority_from_env, RemoteClient, Toolset};
 use powder_shell::unix_now;
 use powder_store::Store;
 use serde_json::Value;
@@ -45,7 +45,14 @@ fn main() {
     }
 
     if let Ok(db_path) = std::env::var("POWDER_DB_PATH") {
-        match run_persistent(&db_path, toolset) {
+        let authority = match local_authority_from_env() {
+            Ok(authority) => authority,
+            Err(err) => {
+                eprintln!("powder-mcp: {err}");
+                std::process::exit(1);
+            }
+        };
+        match run_persistent(&db_path, toolset, authority) {
             Ok(()) => return,
             Err(err) => {
                 eprintln!("powder-mcp: persistent mode failed: {err}");
@@ -79,7 +86,11 @@ fn version() -> String {
     )
 }
 
-fn run_persistent(db_path: &str, toolset: Toolset) -> Result<(), Box<dyn std::error::Error>> {
+fn run_persistent(
+    db_path: &str,
+    toolset: Toolset,
+    authority: powder_core::Authority,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open(db_path)?;
     store.migrate()?;
     let stdin = io::stdin();
@@ -98,11 +109,12 @@ fn run_persistent(db_path: &str, toolset: Toolset) -> Result<(), Box<dyn std::er
             }
         };
 
-        if let Some(response) = powder_mcp::handle_json_rpc_store_with_toolset(
+        if let Some(response) = powder_mcp::handle_json_rpc_store_with_authority(
             &mut store,
             &request,
             unix_now(),
             toolset,
+            Some(&authority),
         ) {
             if let Ok(line) = serde_json::to_string(&response) {
                 let _ = writeln!(stdout, "{line}");

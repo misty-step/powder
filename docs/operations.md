@@ -506,3 +506,11 @@ admin key can touch.
 ## Search contract
 
 `GET /api/v1/cards/search` and `powder search --json` use the same store-backed query. Pass `q` plus optional `source_kind`/`source_field`, status, repo, label, priority, estimate, risk, `created_after`/`created_before`, `updated_after`/`updated_before`, `limit`, and opaque `after`. Search includes card title/body/criteria, comments, and work logs. A single term is exact-or-prefix; multiple terms are unordered within an FTS window. Hyphen and underscore compounds are exact tokens, so sub-token searches are intentionally limited; snippets are plain untrusted text and clients must escape them before HTML. Cursors are bound to the query and filter fingerprint; reusing one with changed filters returns an invalid-cursor error. A valid cursor is an offset into the deterministic result ordering, so concurrent inserts, edits, or deletes can shift later pages; restart the search when a live board changes.
+
+
+### MCP process identity
+
+For local MCP, configure `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent|admin` in the
+trusted process environment. The local dispatcher passes that authority into every
+Store mutation. It rejects missing identity as `unauthenticated`; caller-supplied
+`actor`, `agent`, or `answered_by` fields never select the principal or role.

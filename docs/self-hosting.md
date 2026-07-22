@@ -434,3 +434,12 @@ point the `powder` CLI and `powder-mcp` at a deployed server instead of a
 local SQLite file. Full remote-mode command coverage, MCP tool-set gating,
 and key-rotation lore live in
 [`docs/operations.md`](operations.md#cli-remote-mode-transport).
+
+
+### Local MCP authority
+
+A local `powder-mcp` process must receive identity from its trusted launch/session,
+not from tool arguments. Set `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent` or `admin` alongside
+`POWDER_DB_PATH`. If either value is missing or invalid, local mutations fail with
+`unauthenticated`; the process never falls back to `operator` or `Unchecked`. MCP `actor`,
+`agent`, and answer labels remain semantic audit data and cannot grant authority.
