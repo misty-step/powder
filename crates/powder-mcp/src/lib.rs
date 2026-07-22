@@ -10,7 +10,7 @@ use powder_core::{
 };
 use powder_store::{
     BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Store,
+    RepositoryUpsert, RepositoryVisibility, SearchQuery, Store,
 };
 use serde_json::{json, Value};
 
@@ -51,6 +51,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "list_cards",
         description: "Scan card summaries by optional status/repo/estimate/label filter, not just ready-eligible ones. With no status filter, done/shipped/abandoned cards are hidden by default (set include_terminal:true to see them too); total_count in the response always reports the full matching count, terminal cards included, so a hidden card is never mistaken for a nonexistent one. An explicit status filter (e.g. status:done) always returns matching cards regardless of include_terminal. Use get_card for full card detail before implementation.",
         input_schema: r#"{"type":"object","properties":{"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"repo":{"type":"string"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"label":{"type":"string"},"limit":{"type":"integer","minimum":1},"include_terminal":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "search_cards",
+        description: "Search card summaries plus indexed card text, comments, and work logs. Query terms use exact-or-prefix matching; multiple terms are unordered within a small FTS window. Hyphen and underscore compounds are exact tokens, so use the full identifier or a prefix rather than a sub-token. Returns {matches,total_count,has_more,next_after?}; snippets are plain untrusted text.",
+        input_schema: r#"{"type":"object","required":["q"],"properties":{"q":{"type":"string"},"source":{"type":"string"},"source_kind":{"type":"string"},"source_field":{"type":"string"},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"repo":{"type":"string"},"label":{"type":"string"},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"source_created_after":{"type":"integer"},"source_created_before":{"type":"integer"},"created_after":{"type":"integer"},"created_before":{"type":"integer"},"updated_after":{"type":"integer"},"updated_before":{"type":"integer"},"limit":{"type":"integer","minimum":1},"after":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "board_stats",
@@ -439,6 +444,40 @@ pub fn call_tool_store(
                 page.total_count,
                 page.excluded_terminal_count,
             )?
+        }
+        "search_cards" => {
+            let q = required_str(args, "q")?;
+            let parse_time = |key: &'static str| optional_i64(args, key);
+            let status = optional_str(args, "status").map(parse_status).transpose()?;
+            let priority = optional_str(args, "priority")
+                .map(parse_priority)
+                .transpose()?;
+            let estimate = optional_str(args, "estimate")
+                .map(parse_estimate)
+                .transpose()?;
+            let risk = optional_str(args, "risk").map(parse_risk).transpose()?;
+            let query = SearchQuery {
+                q: q.to_string(),
+                source_kind: optional_str(args, "source_kind")
+                    .or_else(|| optional_str(args, "source"))
+                    .map(str::to_string),
+                source_field: optional_str(args, "source_field").map(str::to_string),
+                status,
+                repo: optional_str(args, "repo").map(str::to_string),
+                label: optional_str(args, "label").map(str::to_string),
+                priority,
+                estimate,
+                risk,
+                source_created_after: parse_time("source_created_after")?,
+                source_created_before: parse_time("source_created_before")?,
+                created_after: parse_time("created_after")?,
+                created_before: parse_time("created_before")?,
+                updated_after: parse_time("updated_after")?,
+                updated_before: parse_time("updated_before")?,
+                limit: args["limit"].as_u64().unwrap_or(20).max(1) as usize,
+                after: optional_str(args, "after").map(str::to_string),
+            };
+            json!(store.search_page(&query).map_err(to_string)?)
         }
         "board_stats" => json!(store
             .board_stats(BoardStatsQuery {
@@ -1212,6 +1251,18 @@ fn optional_str<'a>(args: &'a Value, key: &'static str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+fn optional_i64(args: &Value, key: &'static str) -> Result<Option<i64>, String> {
+    if let Some(value) = args[key].as_i64() {
+        return Ok(Some(value));
+    }
+    optional_str(args, key)
+        .map(|raw| {
+            raw.parse::<i64>()
+                .map_err(|err| format!("invalid {key}: {err}"))
+        })
+        .transpose()
+}
+
 fn invalid_enum_value(field: &str, raw: &str, valid: String) -> String {
     format!("invalid {field} {raw:?}; valid: {valid}")
 }
@@ -1330,7 +1381,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 22);
+        assert_eq!(default_tools.len(), 23);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1505,6 +1556,7 @@ mod tests {
             vec![
                 "list_ready",
                 "list_cards",
+                "search_cards",
                 "board_stats",
                 "board_rollups",
                 "create_card",
@@ -1527,7 +1579,7 @@ mod tests {
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 22);
+        assert_eq!(default_names.len(), 23);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1539,7 +1591,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 31);
+        assert_eq!(admin_names.len(), 32);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -3621,4 +3673,43 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect()
     }
+}
+
+#[test]
+fn mcp_search_cards_local_returns_nested_card_and_cursor_page() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.migrate().unwrap();
+    let mut card = Card::new(
+        CardId::new("mcp-search-id").unwrap(),
+        "Needle title",
+        "second first",
+    )
+    .unwrap();
+    card = card
+        .with_status(CardStatus::Ready)
+        .with_acceptance(["proof".to_string()]);
+    store.import_cards(vec![card]).unwrap();
+    let response = call_tool_store(
+        &mut store,
+        "search_cards",
+        &json!({"q":"needle", "limit":1}),
+        10,
+    )
+    .unwrap();
+    let first: Value =
+        serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(first["matches"][0]["card"]["id"], "mcp-search-id");
+    assert_eq!(first["matches"][0]["source_kind"], "cards");
+    assert_eq!(first["matches"][0]["source_field"], "title");
+    assert_eq!(first["has_more"], false);
+    let future = call_tool_store(
+        &mut store,
+        "search_cards",
+        &json!({"q":"needle", "created_after": 9_999_999_999_i64}),
+        11,
+    )
+    .unwrap();
+    let future_payload: Value =
+        serde_json::from_str(future["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(future_payload["total_count"], 0);
 }

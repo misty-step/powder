@@ -150,8 +150,8 @@ yet trustworthy enough for a fleet to depend on:
   audit trail or minting a key per persona.
 - `powder-cli` can initialize an instance database, create cards, list ready
   work, claim, transition, and complete cards.
-- `powder-mcp` exposes the full agent toolset (22 default tools plus a
-  9-tool admin add-on gated by `POWDER_MCP_TOOLSETS`) over stdio using the
+- `powder-mcp` exposes the full agent toolset (23 default tools plus a
+  9-tool admin add-on (32 tools total) gated by `POWDER_MCP_TOOLSETS`) over stdio using the
   same domain model; it uses SQLite when `POWDER_DB_PATH` is set, or a
   deployed instance over HTTP when `POWDER_API_BASE_URL`/`POWDER_API_KEY`
   are set instead. See `SKILL.md`'s "Expected MCP Tools" for the current

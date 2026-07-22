@@ -31,6 +31,12 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/api/v1/cards/search",
+        intent: "search cards and indexed comments/work logs with q, source/status/repo/label/priority/estimate/risk/time filters and opaque cursor pagination; response is {matches,total_count,has_more,next_after?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        body_shape: None,
+    },
+    ApiRoute {
+        method: "GET",
         path: "/api/v1/cards/ready",
         intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more,cycle_card_ids?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
@@ -356,6 +362,7 @@ mod tests {
         assert!(paths.contains(&"/api/v1/events/dead-letter"));
         assert!(paths.contains(&"/api/v1/events/dead-letter/replay"));
         assert!(paths.contains(&"/api/v1/events/tail"));
+        assert!(paths.contains(&"/api/v1/cards/search"));
         assert!(paths.contains(&"/api/v1/keys"));
         assert!(paths.contains(&"/api/v1/keys/{id}/revoke"));
     }

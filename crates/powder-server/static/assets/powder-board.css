@@ -591,6 +591,16 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
   color: var(--ae-ink-muted);
 }
 
+.pw-search-status {
+  min-width: 4.5em;
+  color: var(--ae-ink-faint);
+  font-size: 11px;
+}
+
+.pw-search-status[data-state="error"] {
+  color: var(--ae-danger, #a33);
+}
+
 .pw-search input {
   border-radius: var(--ae-radius);
   width: 13rem;
@@ -1458,6 +1468,12 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
   overflow-y: auto;
 }
 
+.pw-cmdk-status {
+  color: var(--ae-ink-faint);
+  padding: .55em .7em;
+  font-size: 13px;
+}
+
 .pw-cmdk-item {
   border-radius: var(--ae-radius);
   cursor: pointer;
@@ -1476,6 +1492,19 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
 .pw-cmdk-item-id {
   color: var(--ae-ink-faint);
   flex: none;
+}
+
+.pw-cmdk-item-source, .pw-cmdk-item-snippet {
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  color: var(--ae-ink-faint);
+  font-size: 11px;
+  overflow: hidden;
+}
+
+.pw-cmdk-item-snippet {
+  flex: 1;
 }
 
 .pw-cmdk-item-title {

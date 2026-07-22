@@ -565,6 +565,16 @@ html:not([data-pw-route='card']) .pw-detail-app {
   color: var(--ae-ink-muted);
 }
 
+.pw-search-status {
+  min-width: 4.5em;
+  color: var(--ae-ink-faint);
+  font-size: 11px;
+}
+
+.pw-search-status[data-state="error"] {
+  color: var(--ae-danger, #a33);
+}
+
 .pw-search input {
   width: 13rem;
   background: transparent;
@@ -1491,6 +1501,12 @@ html:not([data-pw-route='card']) .pw-detail-app {
   padding: 0.4em;
 }
 
+.pw-cmdk-status {
+  padding: 0.55em 0.7em;
+  color: var(--ae-ink-faint);
+  font-size: 13px;
+}
+
 .pw-cmdk-item {
   display: flex;
   align-items: baseline;
@@ -1509,6 +1525,20 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-cmdk-item-id {
   flex: none;
   color: var(--ae-ink-faint);
+}
+
+.pw-cmdk-item-source,
+.pw-cmdk-item-snippet {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ae-ink-faint);
+  font-size: 11px;
+}
+
+.pw-cmdk-item-snippet {
+  flex: 1;
 }
 
 .pw-cmdk-item-title {

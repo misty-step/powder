@@ -12,7 +12,7 @@ use powder_shell::{
 };
 use powder_store::{
     ApiKeyScope, CardFilter, CardPatch, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
-    Store, StoreError,
+    SearchQuery, Store, StoreError,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -33,6 +33,7 @@ pub const COMMANDS: &[&str] = &[
     "list-ready",
     "list-cards",
     "board-rollups",
+    "search",
     "papercut",
     "repository-list",
     "repository-get",
@@ -128,6 +129,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
         [command, rest @ ..] if command == "board-rollups" => board_rollups(rest, remote_env),
+        [command, rest @ ..] if command == "search" => search(rest, remote_env),
         [command, rest @ ..] if command == "papercut" => papercut(rest, remote_env),
         [command, rest @ ..] if command == "repository-list" => repository_list(rest),
         [command, rest @ ..] if command == "repository-get" => repository_get(rest),
@@ -900,6 +902,141 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         out.push_str("no-ready-cards\n");
     }
     Ok(out)
+}
+
+/// Search cards and indexed comments/work logs. The JSON envelope is shared with
+/// the HTTP and MCP surfaces; --json is accepted explicitly for scripts.
+fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let positionals = positional(args);
+    if positionals.len() > 1 {
+        return Err(ShellError::Invalid(
+            "search accepts one positional query; quote multi-word queries or use --q".to_string(),
+        ));
+    }
+    let positional_query = positionals.into_iter().next();
+    let q = flag_value(args, "--q")
+        .or(positional_query)
+        .ok_or_else(|| ShellError::Invalid("search requires --q <text>".to_string()))?;
+    let limit = parse_limit(args).unwrap_or(20).max(1);
+    let status = flag_value(args, "--status")
+        .map(parse_status_flag)
+        .transpose()?;
+    let priority = flag_value(args, "--priority")
+        .map(parse_priority_flag)
+        .transpose()?;
+    let estimate = flag_value(args, "--estimate")
+        .map(parse_estimate_flag)
+        .transpose()?;
+    let risk = flag_value(args, "--risk")
+        .map(parse_risk_flag)
+        .transpose()?;
+    let parse_time = |flag: &'static str| -> Result<Option<i64>, ShellError> {
+        flag_value(args, flag)
+            .map(|raw| {
+                raw.parse::<i64>()
+                    .map_err(|err| ShellError::Invalid(format!("invalid {flag}: {err}")))
+            })
+            .transpose()
+    };
+    let source_kind = flag_value(args, "--source-kind")
+        .or_else(|| flag_value(args, "--source"))
+        .map(str::to_string);
+    let query = SearchQuery {
+        q: q.to_string(),
+        source_kind,
+        source_field: flag_value(args, "--source-field").map(str::to_string),
+        status,
+        repo: flag_value(args, "--repo").map(str::to_string),
+        label: flag_value(args, "--label").map(str::to_string),
+        priority,
+        estimate,
+        risk,
+        source_created_after: parse_time("--source-created-after")?,
+        source_created_before: parse_time("--source-created-before")?,
+        created_after: parse_time("--created-after")?,
+        created_before: parse_time("--created-before")?,
+        updated_after: parse_time("--updated-after")?,
+        updated_before: parse_time("--updated-before")?,
+        limit,
+        after: flag_value(args, "--after").map(str::to_string),
+    };
+    let payload = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        json!(store.search_page(&query).map_err(store_err)?)
+    } else if let Some(client) = remote_env.client() {
+        let mut parts = vec![("q", q.to_string()), ("limit", limit.to_string())];
+        let add = |parts: &mut Vec<(&str, String)>, key: &'static str, value: Option<String>| {
+            if let Some(value) = value {
+                parts.push((key, value));
+            }
+        };
+        add(&mut parts, "source_kind", query.source_kind.clone());
+        add(&mut parts, "source_field", query.source_field.clone());
+        add(
+            &mut parts,
+            "status",
+            status.map(|value| value.as_str().to_string()),
+        );
+        add(&mut parts, "repo", query.repo.clone());
+        add(&mut parts, "label", query.label.clone());
+        add(
+            &mut parts,
+            "priority",
+            priority.map(|value| value.as_str().to_string()),
+        );
+        add(
+            &mut parts,
+            "estimate",
+            estimate.map(|value| value.as_str().to_string()),
+        );
+        add(
+            &mut parts,
+            "risk",
+            risk.map(|value| value.as_str().to_string()),
+        );
+        add(
+            &mut parts,
+            "source_created_after",
+            query.source_created_after.map(|value| value.to_string()),
+        );
+        add(
+            &mut parts,
+            "source_created_before",
+            query.source_created_before.map(|value| value.to_string()),
+        );
+        add(
+            &mut parts,
+            "created_after",
+            query.created_after.map(|value| value.to_string()),
+        );
+        add(
+            &mut parts,
+            "created_before",
+            query.created_before.map(|value| value.to_string()),
+        );
+        add(
+            &mut parts,
+            "updated_after",
+            query.updated_after.map(|value| value.to_string()),
+        );
+        add(
+            &mut parts,
+            "updated_before",
+            query.updated_before.map(|value| value.to_string()),
+        );
+        add(&mut parts, "after", query.after.clone());
+        let query_string = parts
+            .into_iter()
+            .map(|(key, value)| format!("{key}={}", urlencode(&value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        client
+            .get(&format!("/api/v1/cards/search?{query_string}"))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("search"));
+    };
+    serde_json::to_string(&payload).map_err(|err| ShellError::Store(err.to_string()))
 }
 
 /// Enumerate cards by status/repo, not just ready-eligible ones -- a card
@@ -1984,6 +2121,7 @@ fn flag_takes_value(flag: &str) -> bool {
             | "--include-hidden"
             | "--unchecked"
             | "--repair"
+            | "--json"
     )
 }
 
@@ -2280,6 +2418,113 @@ mod tests {
             renew_err,
             ShellError::Invalid(message) if message == "invalid --ttl: not-a-number"
         ));
+    }
+
+    #[test]
+    fn cli_search_json_uses_store_contract() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-search-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "cli-search",
+            "--title",
+            "Needle CLI",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "backlog",
+        ]))
+        .unwrap();
+        let output = run(&args([
+            "search",
+            "--json",
+            "--db",
+            &db,
+            "--q",
+            "needle",
+            "--status",
+            "backlog",
+            "--created-after",
+            "0",
+        ]))
+        .unwrap();
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["matches"][0]["card"]["id"], "cli-search");
+        assert_eq!(payload["matches"][0]["source_kind"], "cards");
+        assert_eq!(payload["total_count"], 1);
+
+        // A positional query remains safe after value-taking flags; parser
+        // must not mistake the database path or filter value for q.
+        let positional_output = run(&args([
+            "search", "--json", "--db", &db, "needle", "--status", "backlog", "--limit", "1",
+        ]))
+        .unwrap();
+        let positional_payload: Value = serde_json::from_str(&positional_output).unwrap();
+        assert_eq!(positional_payload["matches"][0]["card"]["id"], "cli-search");
+        assert_eq!(positional_payload["total_count"], 1);
+
+        let unquoted =
+            run(&args(["search", "--json", "--db", &db, "needle", "second"])).unwrap_err();
+        assert!(matches!(
+            unquoted,
+            ShellError::Invalid(message) if message.contains("one positional query")
+        ));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn cli_remote_search_forwards_filters_and_auth() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "matches": [{
+                    "card": {"id": "remote-search", "title": "Needle remote"},
+                    "source_kind": "cards", "source_field": "title", "source_created_at": 10,
+                    "snippet": "Needle remote", "rank": -1.0
+                }],
+                "total_count": 1, "has_more": false
+            }),
+        )]);
+        let output = run_with_env(
+            &args([
+                "search",
+                "--json",
+                "--q",
+                "needle",
+                "--source",
+                "cards",
+                "--status",
+                "backlog",
+                "--created-after",
+                "10",
+                "--limit",
+                "1",
+            ]),
+            &remote_env(Some(&base_url), Some("sk_powder_search")),
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["matches"][0]["card"]["id"], "remote-search");
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].path.contains("/api/v1/cards/search?"));
+        assert!(requests[0].path.contains("q=needle"));
+        assert!(requests[0].path.contains("source_kind=cards"));
+        assert!(requests[0].path.contains("created_after=10"));
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_search")
+        );
     }
 
     #[test]

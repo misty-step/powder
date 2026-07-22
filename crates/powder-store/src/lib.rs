@@ -9,9 +9,9 @@ use std::{
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
-    CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId, Priority,
-    ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
+    CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim, ClaimReceipt,
+    Comment, CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId,
+    Priority, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
@@ -84,6 +84,8 @@ pub enum StoreError {
     UnsupportedSchema(u32),
     #[error("stored {field} value is invalid: {value}")]
     InvalidStoredValue { field: &'static str, value: String },
+    #[error("invalid search cursor: {0}")]
+    InvalidSearchCursor(String),
 }
 
 pub struct Store {
@@ -91,16 +93,44 @@ pub struct Store {
     field_note_config: Option<FieldNoteConfig>,
 }
 
-/// One ranked result from the store-owned FTS5 index. The raw `rank` is
-/// SQLite `bm25` output; lower values rank ahead of higher values.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchMatch {
-    pub source_table: String,
+#[derive(Debug, Clone, Default)]
+pub struct SearchQuery {
+    pub q: String,
+    pub source_kind: Option<String>,
+    pub source_field: Option<String>,
+    pub status: Option<CardStatus>,
+    pub repo: Option<String>,
+    pub label: Option<String>,
+    pub priority: Option<Priority>,
+    pub estimate: Option<Estimate>,
+    pub risk: Option<Risk>,
+    pub source_created_after: Option<i64>,
+    pub source_created_before: Option<i64>,
+    pub created_after: Option<i64>,
+    pub created_before: Option<i64>,
+    pub updated_after: Option<i64>,
+    pub updated_before: Option<i64>,
+    pub limit: usize,
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SearchResult {
+    pub card: CardSummary,
+    pub source_kind: String,
     pub source_field: String,
-    pub card_id: CardId,
-    pub created_at: i64,
+    pub source_created_at: i64,
     pub snippet: String,
     pub rank: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SearchPage {
+    pub matches: Vec<SearchResult>,
+    pub total_count: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
 }
 
 /// Validates every schema-v17 key-to-actor mapping before the migration can
@@ -649,36 +679,173 @@ impl Store {
     /// bodies. Query text is treated as a literal FTS phrase so identifiers
     /// such as `powder-query-fts-store` and `SQLITE_BUSY` keep
     /// their punctuation and cannot become FTS operators.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchMatch>> {
-        let query = query.trim();
-        if query.is_empty() || limit == 0 || !self.table_exists("card_search_fts")? {
+    fn search_rows(&self, query: &str) -> Result<Vec<RawSearchMatch>> {
+        let Some(match_query) = rewrite_search_query(query) else {
             return Ok(Vec::new());
-        }
-        let match_query = format!("\"{}\"", query.replace('\"', "\"\""));
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        };
         let mut statement = self.connection.prepare(
-            "SELECT source_table, source_field, card_id, created_at,
-                    snippet(card_search_fts, 5, '<b>', '</b>', '…', 32),
-                    bm25(card_search_fts)
+            "SELECT source_table, source_field, source_id, card_id, created_at,
+                    snippet(card_search_fts, 5, '', '', '…', 32), bm25(card_search_fts)
              FROM card_search_fts
              WHERE card_search_fts MATCH ?1
-             ORDER BY bm25(card_search_fts), source_table, source_field, card_id
-             LIMIT ?2",
+             ORDER BY bm25(card_search_fts), source_table, source_field, card_id, source_id",
         )?;
-        let mut rows = statement.query(params![match_query, limit])?;
+        let mut rows = statement.query(params![match_query])?;
         let mut matches = Vec::new();
         while let Some(row) = rows.next()? {
-            let card_id = CardId::new(row.get::<_, String>(2)?)?;
-            matches.push(SearchMatch {
+            matches.push(RawSearchMatch {
                 source_table: row.get(0)?,
                 source_field: row.get(1)?,
-                card_id,
-                created_at: row.get(3)?,
-                snippet: row.get(4)?,
-                rank: row.get(5)?,
+                _source_id: row.get(2)?,
+                card_id: CardId::new(row.get::<_, String>(3)?)?,
+                created_at: row.get(4)?,
+                snippet: row.get(5)?,
+                rank: row.get(6)?,
+            });
+        }
+        let prefix = escape_like_prefix(query);
+        let mut id_statement = self.connection.prepare(
+            "SELECT DISTINCT 'cards', 'id', card_id, card_id, created_at, card_id, -1000.0
+             FROM search_documents
+             WHERE source_table = 'cards' AND (card_id = ?1 OR card_id LIKE ?2 ESCAPE '\\')",
+        )?;
+        let mut id_rows = id_statement.query(params![query, format!("{prefix}%")])?;
+        while let Some(row) = id_rows.next()? {
+            matches.push(RawSearchMatch {
+                source_table: row.get(0)?,
+                source_field: row.get(1)?,
+                _source_id: row.get(2)?,
+                card_id: CardId::new(row.get::<_, String>(3)?)?,
+                created_at: row.get(4)?,
+                snippet: row.get(5)?,
+                rank: row.get(6)?,
             });
         }
         Ok(matches)
+    }
+
+    /// Search through the FTS spine with deliberate recall shaping and card filters.
+    /// Query terms are quoted and rewritten as prefixes; multiple terms use FTS5
+    /// NEAR so their order is not treated as an accidental phrase. The index keeps
+    /// hyphen and underscore compounds as single tokens, so a sub-token such as
+    /// fts does not match powder-query-fts-store; callers should use the full
+    /// identifier or a prefix (for example powder-query).
+    pub fn search_page(&self, query: &SearchQuery) -> Result<SearchPage> {
+        let query_text = query.q.trim();
+        if query_text.is_empty() || query.limit == 0 || !self.table_exists("card_search_fts")? {
+            return Ok(SearchPage {
+                matches: Vec::new(),
+                total_count: 0,
+                has_more: false,
+                next_after: None,
+            });
+        }
+        let mut rows = self.search_rows(query_text)?;
+        let repo_filter = query.repo.as_deref().and_then(canonical_repo_label);
+        let mut summaries = HashMap::<String, CardSummary>::new();
+        let mut results = Vec::new();
+        for row in rows.drain(..) {
+            if !search_source_matches(query.source_kind.as_deref(), &row.source_table)
+                || query
+                    .source_field
+                    .as_deref()
+                    .is_some_and(|wanted| !wanted.eq_ignore_ascii_case(&row.source_field))
+                || query
+                    .source_created_after
+                    .is_some_and(|value| row.created_at < value)
+                || query
+                    .source_created_before
+                    .is_some_and(|value| row.created_at > value)
+            {
+                continue;
+            }
+            let key = row.card_id.as_str().to_string();
+            let summary = if let Some(summary) = summaries.get(&key).cloned() {
+                summary
+            } else {
+                let card = match self.get_card(&row.card_id)? {
+                    Some(card) => card,
+                    None => continue,
+                };
+                if query.status.is_some_and(|value| card.status != value)
+                    || query.priority.is_some_and(|value| card.priority != value)
+                    || query
+                        .estimate
+                        .is_some_and(|value| card.estimate != Some(value))
+                    || query.risk.is_some_and(|value| card.risk != Some(value))
+                    || query
+                        .created_after
+                        .is_some_and(|value| card.created_at < value)
+                    || query
+                        .created_before
+                        .is_some_and(|value| card.created_at > value)
+                    || query
+                        .updated_after
+                        .is_some_and(|value| card.updated_at < value)
+                    || query
+                        .updated_before
+                        .is_some_and(|value| card.updated_at > value)
+                    || query.label.as_ref().is_some_and(|wanted| {
+                        !card
+                            .labels
+                            .iter()
+                            .any(|label| label.eq_ignore_ascii_case(wanted.trim()))
+                    })
+                    || repo_filter.as_deref().is_some_and(|wanted| {
+                        !card
+                            .repo
+                            .as_deref()
+                            .is_some_and(|repo| canonical_repo_matches(repo, wanted))
+                            && repo_from_numeric_card_id_prefix(card.id.as_str()).as_deref()
+                                != Some(wanted)
+                    })
+                {
+                    continue;
+                }
+                let summary = card.summary();
+                summaries.insert(key.clone(), summary.clone());
+                summary
+            };
+            results.push(SearchResult {
+                card: summary,
+                source_kind: row.source_table,
+                source_field: row.source_field,
+                source_created_at: row.created_at,
+                snippet: row.snippet,
+                rank: row.rank,
+            });
+        }
+        results.sort_by(|left, right| {
+            left.rank
+                .partial_cmp(&right.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.source_kind.cmp(&right.source_kind))
+                .then_with(|| left.source_field.cmp(&right.source_field))
+                .then_with(|| left.card.id.as_str().cmp(right.card.id.as_str()))
+                .then_with(|| left.source_created_at.cmp(&right.source_created_at))
+        });
+        let total_count = results.len();
+        let fingerprint = search_query_fingerprint(query);
+        let offset = query
+            .after
+            .as_deref()
+            .map(|cursor| decode_search_cursor(cursor, &fingerprint))
+            .transpose()?
+            .unwrap_or(0);
+        let start = offset.min(total_count);
+        let end = start.saturating_add(query.limit).min(total_count);
+        let matches = results
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .collect::<Vec<_>>();
+        let has_more = end < total_count;
+        Ok(SearchPage {
+            matches,
+            total_count,
+            has_more,
+            next_after: has_more.then(|| encode_search_cursor(&fingerprint, end)),
+        })
     }
 
     /// powder-epic-truthful-ops: steps 1-10 originally ran their DDL
@@ -3926,6 +4093,156 @@ fn load_card_optional(connection: &Connection, card_id: &CardId) -> Result<Optio
         .optional()?
         .map(|record| card_from_record(connection, record))
         .transpose()
+}
+
+#[derive(Debug)]
+struct RawSearchMatch {
+    source_table: String,
+    source_field: String,
+    _source_id: String,
+    card_id: CardId,
+    created_at: i64,
+    snippet: String,
+    rank: f64,
+}
+
+fn search_source_matches(wanted: Option<&str>, actual: &str) -> bool {
+    let Some(wanted) = wanted.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let wanted = wanted.to_ascii_lowercase();
+    match actual {
+        "cards" => wanted == "cards" || wanted == "card",
+        "comments" => wanted == "comments" || wanted == "comment",
+        "work_log_entries" => matches!(
+            wanted.as_str(),
+            "work_log_entries" | "work-log" | "work_log" | "worklog"
+        ),
+        _ => wanted == actual,
+    }
+}
+
+fn quote_fts_prefix(term: &str) -> String {
+    format!("\"{}\"*", term.replace('"', "\"\""))
+}
+
+fn quote_fts_exact(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+fn rewrite_search_query(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    match terms.as_slice() {
+        [] => None,
+        [term] => Some(format!(
+            "({} OR {})",
+            quote_fts_exact(term),
+            quote_fts_prefix(term)
+        )),
+        terms => Some(format!(
+            "NEAR({}, 10)",
+            terms
+                .iter()
+                .map(|term| quote_fts_prefix(term))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
+    }
+}
+
+fn escape_like_prefix(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn search_query_fingerprint(query: &SearchQuery) -> String {
+    let values = [
+        query.q.trim().to_string(),
+        query.source_kind.clone().unwrap_or_default(),
+        query.source_field.clone().unwrap_or_default(),
+        query
+            .status
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default(),
+        query.repo.clone().unwrap_or_default(),
+        query.label.clone().unwrap_or_default(),
+        query
+            .priority
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default(),
+        query
+            .estimate
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default(),
+        query
+            .risk
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default(),
+        query
+            .source_created_after
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        query
+            .source_created_before
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        query
+            .created_after
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        query
+            .created_before
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        query
+            .updated_after
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        query
+            .updated_before
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    ];
+    format!("{:x}", Sha256::digest(values.join("\u{1f}").as_bytes()))
+}
+
+fn encode_search_cursor(fingerprint: &str, offset: usize) -> String {
+    format!("v1:{fingerprint}:{offset}")
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_search_cursor(raw: &str, expected_fingerprint: &str) -> Result<usize> {
+    if raw.is_empty() || !raw.is_ascii() || !raw.len().is_multiple_of(2) {
+        return Err(StoreError::InvalidSearchCursor(raw.to_string()));
+    }
+    let bytes = (0..raw.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&raw[index..index + 2], 16)
+                .map_err(|_| StoreError::InvalidSearchCursor(raw.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let payload =
+        String::from_utf8(bytes).map_err(|_| StoreError::InvalidSearchCursor(raw.to_string()))?;
+    let mut fields = payload.split(':');
+    if fields.next() != Some("v1") || fields.next() != Some(expected_fingerprint) {
+        return Err(StoreError::InvalidSearchCursor(
+            "cursor does not match query or filters".to_string(),
+        ));
+    }
+    fields
+        .next()
+        .filter(|value| !value.is_empty() && fields.next().is_none())
+        .ok_or_else(|| StoreError::InvalidSearchCursor(raw.to_string()))?
+        .parse::<usize>()
+        .map_err(|_| StoreError::InvalidSearchCursor(raw.to_string()))
 }
 
 fn card_from_record(connection: &Connection, record: CardRecord) -> Result<Card> {

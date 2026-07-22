@@ -39,7 +39,7 @@ use powder_core::{
 use powder_shell::unix_now;
 use powder_store::{
     ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Store, StoreError,
+    RepositoryUpsert, RepositoryVisibility, SearchQuery, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -385,6 +385,31 @@ struct ReadyParams {
     /// interim-vs-scale-proof-pagination distinction, which applies
     /// identically here.
     after: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchParams {
+    q: Option<String>,
+    source: Option<String>,
+    source_kind: Option<String>,
+    source_field: Option<String>,
+    status: Option<String>,
+    repo: Option<String>,
+    label: Option<String>,
+    priority: Option<String>,
+    estimate: Option<String>,
+    risk: Option<String>,
+    limit: Option<usize>,
+    after: Option<String>,
+    source_created_after: Option<String>,
+    source_created_before: Option<String>,
+    created_after: Option<String>,
+    created_before: Option<String>,
+    updated_after: Option<String>,
+    updated_before: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,6 +827,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/board/rollups", get(board_rollups))
         .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
+        .route("/api/v1/cards/search", get(search_cards))
         .route("/api/v1/cards/papercut", post(file_papercut))
         .route("/api/v1/cards/ready", get(list_ready))
         .route(
@@ -1046,6 +1072,57 @@ async fn list_ready(
         &page.cycle_card_ids,
         page.next_after,
     )))
+}
+
+/// Search cards and their comments/work logs through the shared FTS contract.
+async fn search_cards(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_read(&state, &headers)?;
+    let parse_time = |name: &'static str, value: Option<String>| -> Result<Option<i64>, ApiError> {
+        value
+            .map(|raw| {
+                raw.parse::<i64>()
+                    .map_err(|err| ApiError::bad_request(format!("invalid {name}: {err}")))
+            })
+            .transpose()
+    };
+    let status = params.status.as_deref().map(parse_status).transpose()?;
+    let priority = params.priority.as_deref().map(parse_priority).transpose()?;
+    let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
+    let risk = params.risk.as_deref().map(parse_risk).transpose()?;
+    let source_kind = params.source_kind.or(params.source);
+    let created_after = params.created_after.or(params.from);
+    let created_before = params.created_before.or(params.to);
+    let q = params
+        .q
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("search requires q"))?;
+    let query = SearchQuery {
+        q,
+        source_kind,
+        source_field: params.source_field,
+        status,
+        repo: params.repo,
+        label: params.label,
+        priority,
+        estimate,
+        risk,
+        source_created_after: parse_time("source_created_after", params.source_created_after)?,
+        source_created_before: parse_time("source_created_before", params.source_created_before)?,
+        created_after: parse_time("created_after", created_after)?,
+        created_before: parse_time("created_before", created_before)?,
+        updated_after: parse_time("updated_after", params.updated_after)?,
+        updated_before: parse_time("updated_before", params.updated_before)?,
+        limit: params.limit.unwrap_or(20).max(1),
+        after: params.after,
+    };
+    let page = lock_store(&state)?.search_page(&query)?;
+    Ok(Json(
+        serde_json::to_value(page).map_err(|err| ApiError::internal(err.to_string()))?,
+    ))
 }
 
 /// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
@@ -2435,6 +2512,7 @@ impl From<StoreError> for ApiError {
     fn from(value: StoreError) -> Self {
         match value {
             StoreError::Domain(err) => ApiError::from(err),
+            StoreError::InvalidSearchCursor(message) => Self::bad_request(message),
             other => Self::internal(other.to_string()),
         }
     }
