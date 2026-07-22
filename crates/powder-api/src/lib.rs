@@ -62,7 +62,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/board/rollups",
-        intent: "return deterministic top-level epic and per-repository Unsorted rollups with direct-child status counts, criteria sums, active claims, freshness, and global graph coverage; optional limit and after query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "return deterministic top-level epic and per-repository Unsorted rollups with status counts for each root epic's direct children or each parentless leaf itself, criteria sums, active claims, freshness, and a full visibility-scoped parent-graph classification/reachability coverage envelope; nested-epic rollup sums need not equal coverage.accounted_cards; optional limit and after query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {

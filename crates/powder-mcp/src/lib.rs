@@ -59,7 +59,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "board_rollups",
-        description: "Return deterministic top-level epic and per-repository Unsorted rollups with direct-child status counts, criteria sums, active claims, freshness, and global parent-graph coverage; use this before list_cards when you need the human board shape.",
+        description: "Return deterministic top-level epic and per-repository Unsorted rollups with status counts for each root epic's direct children or each parentless leaf itself, criteria sums, active claims, freshness, and a full visibility-scoped parent-graph classification/reachability coverage envelope; nested-epic rollup sums need not equal coverage.accounted_cards. Use this before list_cards when you need the human board shape.",
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"after":{"type":"string"},"include_hidden":{"type":"boolean"}}}"#,
     },
     ToolDef {
