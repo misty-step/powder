@@ -9,9 +9,9 @@ use std::{
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
-    CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId, Priority,
-    ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
+    CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim, ClaimReceipt,
+    Comment, CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId,
+    Priority, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};

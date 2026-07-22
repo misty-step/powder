@@ -7,8 +7,8 @@ use crate::schema::SCHEMA;
 use crate::{
     ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig,
     ImportOutcome, ParentCoverageBucket, ParentIssueKind, RelationField, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Result, SearchQuery, Store, StoreError, WorkLogAttribution,
-    API_KEY_ALPHABET,
+    RepositoryUpsert, RepositoryVisibility, Result, SearchQuery, Store, StoreError,
+    WorkLogAttribution, API_KEY_ALPHABET,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -6495,7 +6495,10 @@ fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
         rusqlite::params!["new-comment-token", "fts-trigger-comment"],
     )?;
     assert!(search_page_matches(&store, "old-comment-token", 10)?.is_empty());
-    assert_eq!(search_page_matches(&store, "new-comment-token", 10)?.len(), 1);
+    assert_eq!(
+        search_page_matches(&store, "new-comment-token", 10)?.len(),
+        1
+    );
     store.connection.execute(
         "INSERT OR REPLACE INTO comments (id, card_id, author, body, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -6508,7 +6511,10 @@ fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
         ],
     )?;
     assert!(search_page_matches(&store, "new-comment-token", 10)?.is_empty());
-    assert_eq!(search_page_matches(&store, "replace-comment-token", 10)?.len(), 1);
+    assert_eq!(
+        search_page_matches(&store, "replace-comment-token", 10)?.len(),
+        1
+    );
 
     store.connection.execute(
         "INSERT INTO work_log_entries (id, card_id, agent, body, created_at)
@@ -6521,7 +6527,10 @@ fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
             30_i64
         ],
     )?;
-    assert_eq!(search_page_matches(&store, "deleted-work-token", 10)?.len(), 1);
+    assert_eq!(
+        search_page_matches(&store, "deleted-work-token", 10)?.len(),
+        1
+    );
     store.connection.execute(
         "DELETE FROM work_log_entries WHERE id = ?1",
         rusqlite::params!["fts-trigger-work-log"],
@@ -6591,13 +6600,22 @@ fn fts_migration_backfills_a_snapshot_idempotently() -> Result<()> {
                 row.get(0)
             })?;
     assert_eq!(first_count, 8);
-    assert_eq!(search_page_matches(&store, "snapshot-criteria-token", 10)?.len(), 1);
+    assert_eq!(
+        search_page_matches(&store, "snapshot-criteria-token", 10)?.len(),
+        1
+    );
     assert_eq!(
         search_page_matches(&store, "snapshot-legacy-acceptance-token", 10)?.len(),
         1
     );
-    assert_eq!(search_page_matches(&store, "snapshot-comment-token", 10)?.len(), 1);
-    assert_eq!(search_page_matches(&store, "snapshot-work-log-token", 10)?.len(), 1);
+    assert_eq!(
+        search_page_matches(&store, "snapshot-comment-token", 10)?.len(),
+        1
+    );
+    assert_eq!(
+        search_page_matches(&store, "snapshot-work-log-token", 10)?.len(),
+        1
+    );
 
     store.migrate()?;
     let second_count: i64 =
@@ -6607,7 +6625,10 @@ fn fts_migration_backfills_a_snapshot_idempotently() -> Result<()> {
                 row.get(0)
             })?;
     assert_eq!(second_count, first_count);
-    assert_eq!(search_page_matches(&store, "snapshot-criteria-token", 10)?.len(), 1);
+    assert_eq!(
+        search_page_matches(&store, "snapshot-criteria-token", 10)?.len(),
+        1
+    );
     Ok(())
 }
 
