@@ -427,6 +427,12 @@ struct BoardStatsParams {
     include_hidden: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BoardRollupsParams {
+    limit: Option<usize>,
+    after: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct DetailParams {
     detail: Option<DetailLevel>,
@@ -792,6 +798,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/onboarding", get(onboarding))
         .route("/api/v1/routes", get(routes))
         .route("/api/v1/stats", get(board_stats))
+        .route("/api/v1/board/rollups", get(board_rollups))
         .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/papercut", post(file_papercut))
@@ -1137,6 +1144,20 @@ async fn board_stats(
         now: unix_now(),
     })?;
     Ok(Json(json!(stats)))
+}
+
+async fn board_rollups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<BoardRollupsParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_read(&state, &headers)?;
+    let rollups = lock_store(&state)?.board_rollups(powder_store::BoardRollupsQuery {
+        limit: params.limit.unwrap_or(20).max(1),
+        after: params.after,
+        now: unix_now(),
+    })?;
+    Ok(Json(json!(rollups)))
 }
 
 async fn list_repositories(

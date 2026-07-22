@@ -9,7 +9,7 @@ use powder_core::{
     ReadyQuery, Risk, RunId,
 };
 use powder_store::{
-    BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
+    BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
     RepositoryVisibility, Store,
 };
 use serde_json::{json, Value};
@@ -56,6 +56,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "board_stats",
         description: "call before list_cards when you need board shape, not card contents.",
         input_schema: r#"{"type":"object","properties":{"repo":{"type":"string"},"include_hidden":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "board_rollups",
+        description: "Return deterministic top-level epic and per-repository Unsorted rollups with direct-child status counts, criteria sums, active claims, freshness, and global parent-graph coverage; use this before list_cards when you need the human board shape.",
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"after":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "create_card",
@@ -442,6 +447,16 @@ pub fn call_tool_store(
                 now,
             })
             .map_err(to_string)?),
+        "board_rollups" => {
+            let page = store
+                .board_rollups(BoardRollupsQuery {
+                    limit: args["limit"].as_u64().unwrap_or(20) as usize,
+                    after: args["after"].as_str().map(str::to_string),
+                    now,
+                })
+                .map_err(to_string)?;
+            json!(page)
+        }
         "create_card" => {
             let id = CardId::new(required_str(args, "id")?).map_err(to_string)?;
             let title = required_str(args, "title")?;
@@ -2215,6 +2230,29 @@ mod tests {
             call_tool_store(&mut store, "list_cards", &json!({"label": "papercut"}), 20).unwrap();
         let listed_payload = tool_payload(&listed);
         assert_eq!(listed_payload["total_count"], 1);
+    }
+
+    #[test]
+    fn mcp_board_rollups_local_returns_canonical_envelope() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(&mut store, "upsert_repository", &json!({"name": "repo-a"}), 1).unwrap();
+        for (id, repo) in [("mcp-leaf-a", Some("repo-a")), ("mcp-leaf-b", None)] {
+            call_tool_store(
+                &mut store,
+                "create_card",
+                &json!({"id": id, "title": id, "acceptance": ["proof"], "repo": repo}),
+                10,
+            )
+            .unwrap();
+        }
+        let result = call_tool_store(&mut store, "board_rollups", &json!({"limit": 1}), 20).unwrap();
+        let payload = tool_payload(&result);
+        assert_eq!(payload["total_count"], 2);
+        assert!(payload["has_more"].as_bool().unwrap());
+        assert_eq!(payload["coverage"]["total_cards"], 2);
+        assert_eq!(payload["coverage"]["accounted_cards"], 2);
+        assert!(payload["rollups"][0]["status_counts"].is_object());
     }
 
     #[test]

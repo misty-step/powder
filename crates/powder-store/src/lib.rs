@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::{BTreeMap, HashMap}, fs, path::Path};
 
 use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, Claim, ClaimReceipt, Comment,
-    CriterionProof, DomainError, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Risk,
+    CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId, Priority, ReadyQuery, Risk,
     Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -325,6 +325,89 @@ pub struct BoardStatsCounts {
     pub active_claims: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoardRollupStatusCounts(pub BTreeMap<String, usize>);
+
+impl std::ops::Deref for BoardRollupStatusCounts {
+    type Target = BTreeMap<String, usize>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for BoardRollupStatusCounts {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        const KNOWN: [&str; 7] = [
+            "backlog", "ready", "in_progress", "awaiting_input", "done", "shipped", "abandoned",
+        ];
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for key in KNOWN {
+            if let Some(value) = self.0.get(key) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        for (key, value) in &self.0 {
+            if !KNOWN.contains(&key.as_str()) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl BoardRollupStatusCounts {
+    fn increment(&mut self, status: &str) {
+        *self.0.entry(status.to_string()).or_default() += 1;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BoardRollup {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<CardId>,
+    pub repo: Option<String>,
+    pub title: String,
+    pub status_counts: BoardRollupStatusCounts,
+    pub criteria_checked: usize,
+    pub criteria_total: usize,
+    pub active_claims: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<EpicFreshness>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BoardRollupCoverage {
+    pub total_cards: usize,
+    pub accounted_cards: usize,
+    pub root_epics: usize,
+    pub unsorted_cards: usize,
+    pub parent_issue_count: usize,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BoardRollups {
+    pub rollups: Vec<BoardRollup>,
+    pub total_count: usize,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+    pub coverage: BoardRollupCoverage,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BoardRollupsQuery {
+    pub limit: usize,
+    pub after: Option<String>,
+    pub now: i64,
+}
+
 impl BoardStatsCounts {
     fn add(&mut self, status: CardStatus, cards: usize, active_claims: usize) {
         self.cards += cards;
@@ -408,6 +491,86 @@ struct MutationAudit<'a> {
     subject_id: &'a str,
     authority: &'a Authority,
 }
+
+#[derive(Debug)]
+struct BoardRollupCard {
+id: CardId,
+title: String,
+parent: Option<CardId>,
+repo: Option<String>,
+status: String,
+criteria_checked: usize,
+criteria_total: usize,
+claim_expires_at: Option<i64>,
+updated_at: i64,
+}
+
+fn add_rollup_child(rollup: &mut BoardRollup, child: &BoardRollupCard, now: i64) {
+rollup.status_counts.increment(&child.status);
+rollup.criteria_checked += child.criteria_checked;
+rollup.criteria_total += child.criteria_total;
+if child.claim_expires_at.is_some_and(|expires_at| expires_at > now) {
+    rollup.active_claims += 1;
+}
+rollup.freshness = Some(match rollup.freshness {
+    None => EpicFreshness {
+        oldest_update: child.updated_at,
+        newest_update: child.updated_at,
+    },
+    Some(freshness) => EpicFreshness {
+        oldest_update: freshness.oldest_update.min(child.updated_at),
+        newest_update: freshness.newest_update.max(child.updated_at),
+    },
+});
+}
+
+fn board_rollup_coverage(
+records: &[BoardRollupCard],
+children: &HashMap<CardId, Vec<&BoardRollupCard>>,
+) -> BoardRollupCoverage {
+let by_id = records
+    .iter()
+    .map(|card| (card.id.clone(), card))
+    .collect::<HashMap<_, _>>();
+let root_epics = records
+    .iter()
+    .filter(|card| card.parent.is_none() && children.contains_key(&card.id))
+    .count();
+let unsorted_cards = records
+    .iter()
+    .filter(|card| card.parent.is_none() && !children.contains_key(&card.id))
+    .count();
+let mut accounted_cards = 0;
+let mut parent_issue_count = 0;
+for card in records {
+    let mut current = card;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(current.id.clone()) {
+            parent_issue_count += 1;
+            break;
+        }
+        let Some(parent_id) = current.parent.as_ref() else {
+            accounted_cards += 1;
+            break;
+        };
+        let Some(parent) = by_id.get(parent_id) else {
+            parent_issue_count += 1;
+            break;
+        };
+        current = parent;
+    }
+}
+BoardRollupCoverage {
+    total_cards: records.len(),
+    accounted_cards,
+    root_epics,
+    unsorted_cards,
+    parent_issue_count,
+    complete: accounted_cards == records.len() && parent_issue_count == 0,
+}
+}
+
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -2205,6 +2368,141 @@ impl Store {
                 .add(status, card_count, active_claim_count);
         }
         Ok(stats)
+    }
+
+    /// Return deterministic top-level epic and parentless-leaf rollups without
+    /// loading card details or recomposing EpicState. The query reads the board
+    /// rows once; all arithmetic and pagination remain bounded in Rust.
+    pub fn board_rollups(&self, query: BoardRollupsQuery) -> Result<BoardRollups> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, parent, repo, status, criteria_json,
+                    claim_expires_at, updated_at
+             FROM cards
+             ORDER BY id",
+        )?;
+        let records = statement
+            .query_map([], |row| {
+                let criteria_json: String = row.get(5)?;
+                let criteria = serde_json::from_str::<serde_json::Value>(&criteria_json)
+                    .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    ))?;
+                let criteria_total = criteria.as_array().map_or(0, Vec::len);
+                let criteria_checked = criteria
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|criterion| {
+                        criterion.get("checked_at").is_some_and(|value| !value.is_null())
+                            || criterion.get("checked_by").is_some_and(|value| !value.is_null())
+                    })
+                    .count();
+                Ok(BoardRollupCard {
+                    id: CardId::new(row.get::<_, String>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?,
+                    title: row.get(1)?,
+                    parent: row.get::<_, Option<String>>(2)?.map(CardId::new).transpose().map_err(|error| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error)))?,
+                    repo: row.get(3)?,
+                    status: row.get(4)?,
+                    criteria_checked,
+                    criteria_total,
+                    claim_expires_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let by_id = records
+            .iter()
+            .map(|card| (card.id.clone(), card))
+            .collect::<HashMap<_, _>>();
+        let mut children = HashMap::<CardId, Vec<&BoardRollupCard>>::new();
+        for card in &records {
+            if let Some(parent) = card.parent.as_ref().filter(|parent| by_id.contains_key(*parent)) {
+                if parent != &card.id {
+                    children.entry(parent.clone()).or_default().push(card);
+                }
+            }
+        }
+
+        let mut rows = Vec::<(String, BoardRollup)>::new();
+        for card in &records {
+            if card.parent.is_some() {
+                continue;
+            }
+            if let Some(direct_children) = children.get(&card.id) {
+                if direct_children.is_empty() {
+                    continue;
+                }
+                let mut rollup = BoardRollup {
+                    kind: "epic".to_string(),
+                    card_id: Some(card.id.clone()),
+                    repo: card.repo.clone(),
+                    title: card.title.clone(),
+                    status_counts: BoardRollupStatusCounts::default(),
+                    criteria_checked: 0,
+                    criteria_total: 0,
+                    active_claims: 0,
+                    freshness: None,
+                };
+                for child in direct_children {
+                    add_rollup_child(&mut rollup, child, query.now);
+                }
+                rows.push((format!("e:{}", card.id), rollup));
+            }
+        }
+
+        let mut unsorted = BTreeMap::<Option<String>, Vec<&BoardRollupCard>>::new();
+        for card in &records {
+            if card.parent.is_none() && !children.contains_key(&card.id) {
+                unsorted.entry(card.repo.clone()).or_default().push(card);
+            }
+        }
+        for (repo, cards) in unsorted {
+            let mut rollup = BoardRollup {
+                kind: "unsorted".to_string(),
+                card_id: None,
+                repo: repo.clone(),
+                title: "Unsorted".to_string(),
+                status_counts: BoardRollupStatusCounts::default(),
+                criteria_checked: 0,
+                criteria_total: 0,
+                active_claims: 0,
+                freshness: None,
+            };
+            for card in cards {
+                add_rollup_child(&mut rollup, card, query.now);
+            }
+            let cursor = format!("u:{}", repo.as_deref().unwrap_or(""));
+            rows.push((cursor, rollup));
+        }
+
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let total_count = rows.len();
+        let start = query
+            .after
+            .as_deref()
+            .map_or(0, |after| rows.partition_point(|(key, _)| key.as_str() <= after));
+        let limit = query.limit.max(1);
+        let end = (start + limit).min(rows.len());
+        let has_more = end < rows.len();
+        let next_after = has_more.then(|| rows[end - 1].0.clone());
+        let rollups = rows
+            .into_iter()
+            .skip(start)
+            .take(limit)
+            .map(|(_, rollup)| rollup)
+            .collect();
+
+        let coverage = board_rollup_coverage(&records, &children);
+        Ok(BoardRollups {
+            rollups,
+            total_count,
+            has_more,
+            next_after,
+            coverage,
+        })
     }
 
     pub fn claim_card(

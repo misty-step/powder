@@ -32,6 +32,7 @@ pub const COMMANDS: &[&str] = &[
     "set-parent",
     "list-ready",
     "list-cards",
+    "board-rollups",
     "papercut",
     "repository-list",
     "repository-get",
@@ -126,6 +127,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "set-parent" => set_parent(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
+        [command, rest @ ..] if command == "board-rollups" => board_rollups(rest, remote_env),
         [command, rest @ ..] if command == "papercut" => papercut(rest, remote_env),
         [command, rest @ ..] if command == "repository-list" => repository_list(rest),
         [command, rest @ ..] if command == "repository-get" => repository_get(rest),
@@ -959,6 +961,34 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         out.push_str("no-cards\n");
     }
     Ok(out)
+}
+
+/// Return the same bounded board rollup envelope over local SQLite or the
+/// authenticated HTTP API. `--json` is accepted explicitly because
+/// rollups are intended for agent consumption; JSON remains the sole wire shape.
+fn board_rollups(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let limit = parse_limit(args).unwrap_or(20);
+    let after = flag_value(args, "--after").map(str::to_string);
+    let value = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        serde_json::to_value(store.board_rollups(powder_store::BoardRollupsQuery {
+            limit,
+            after,
+            now: unix_now(),
+        }).map_err(store_err)?)
+            .map_err(|error| ShellError::Invalid(error.to_string()))?
+    } else if let Some(client) = remote_env.client() {
+        let mut query = format!("limit={limit}");
+        if let Some(after) = after {
+            query.push_str(&format!("&after={}", urlencode(&after)));
+        }
+        client
+            .get(&format!("/api/v1/board/rollups?{query}"))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("board-rollups"));
+    };
+    to_pretty_json(&value)
 }
 
 /// File a one-call papercut. The body is every positional argument joined
@@ -1993,6 +2023,7 @@ mod tests {
         assert!(COMMANDS.contains(&"update-card"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"list-cards"));
+        assert!(COMMANDS.contains(&"board-rollups"));
         assert!(COMMANDS.contains(&"repository-list"));
         assert!(COMMANDS.contains(&"repository-get"));
         assert!(COMMANDS.contains(&"repository-upsert"));
@@ -4018,6 +4049,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_board_rollups_remote_forwards_cursor_and_returns_json() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "rollups": [{"kind":"unsorted","repo":null,"title":"Unsorted","status_counts":{"ready":1}}],
+                "total_count": 2,
+                "has_more": true,
+                "next_after": "u:repo-a",
+                "coverage": {"total_cards": 3,"accounted_cards": 3,"root_epics": 1,"unsorted_cards": 1,"parent_issue_count": 0,"complete": true}
+            }),
+        )]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+        let output = run_with_env(
+            &args(["board-rollups", "--json", "--limit", "1", "--after", "e:epic"]),
+            &env,
+        )
+        .unwrap();
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["total_count"], 2);
+        assert_eq!(payload["coverage"]["complete"], true);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v1/board/rollups?limit=1&after=e%3Aepic");
+        assert_eq!(requests[0].authorization.as_deref(), Some("Bearer sk_powder_test"));
+    }
+
+    #[test]
     fn cli_remote_mode_uses_http_for_the_accepted_card_commands() {
         let (base_url, recorded) = spawn_test_server(vec![
             (
@@ -4637,6 +4695,33 @@ Serve grid thumbnails instead of full originals.\n\n\
         assert!(comments
             .iter()
             .any(|c| c["body"] == "manual Sploot repair note"));
+    }
+
+    #[test]
+    fn cli_board_rollups_json_reads_local_store() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-rollups-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card", "--db", &db, "--id", "cli-epic", "--title", "Epic",
+            "--acceptance", "proof",
+        ])).unwrap();
+        run(&args([
+            "create-card", "--db", &db, "--id", "cli-leaf", "--title", "Leaf",
+            "--acceptance", "proof",
+        ])).unwrap();
+        let output = run(&args(["board-rollups", "--json", "--db", &db])).unwrap();
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["total_count"], 1);
+        assert_eq!(payload["coverage"]["total_cards"], 2);
+        assert_eq!(payload["coverage"]["accounted_cards"], 2);
+        assert_eq!(payload["rollups"][0]["kind"], "unsorted");
     }
 
     #[test]
