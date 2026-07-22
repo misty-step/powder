@@ -1670,10 +1670,13 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS ready_snapshots (
                id TEXT PRIMARY KEY,
                query_fingerprint TEXT NOT NULL,
+               ordered_digest TEXT NOT NULL DEFAULT '',
                created_at INTEGER NOT NULL,
                expires_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_ready_snapshots_expires ON ready_snapshots(expires_at);
+             CREATE INDEX IF NOT EXISTS idx_ready_snapshots_query_digest
+               ON ready_snapshots(query_fingerprint, ordered_digest, expires_at);
              CREATE TABLE IF NOT EXISTS ready_snapshot_items (
                snapshot_id TEXT NOT NULL REFERENCES ready_snapshots(id) ON DELETE CASCADE,
                position INTEGER NOT NULL,
@@ -2419,10 +2422,10 @@ impl Store {
     }
 
     /// Continuation-aware Ready listing. A first page materializes a durable
-    /// SQLite snapshot when more cards remain; follow-up pages use the opaque
-    /// v3 cursor position, skip departed cards, and append new arrivals after
-    /// captured positions. The HTTP bare-card-id fallback is the only legacy
-    /// path and is never emitted by this Store.
+    /// SQLite snapshot when more cards remain; identical first-page polls reuse
+    /// an unexpired snapshot by ordered-card digest. Follow-up pages use the
+    /// opaque v3 cursor position, skip departed cards, and append new arrivals
+    /// after captured positions. Every continuation is v3 and query-bound.
     pub fn list_ready_page_after(
         &self,
         query: ReadyQuery,
@@ -2503,37 +2506,55 @@ impl Store {
             );
         }
 
+        if after.is_some() && !after.is_some_and(ReadyCursor::is_durable) {
+            return Err(DomainError::validation("after", "invalid continuation cursor").into());
+        }
         if after.is_none() && ordered_cards.len() > query.limit {
-            let snapshot_id = loop {
-                let candidate =
+            let ordered_digest = ready_order_digest(&ordered_cards);
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "DELETE FROM ready_snapshots WHERE expires_at <= ?1",
+                [query.now],
+            )?;
+            let existing = transaction
+                .query_row(
+                    "SELECT id FROM ready_snapshots
+                     WHERE query_fingerprint = ?1 AND ordered_digest = ?2 AND expires_at > ?3
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    rusqlite::params![query.fingerprint(), ordered_digest, query.now],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let snapshot_id = if let Some(snapshot_id) = existing {
+                transaction.commit()?;
+                snapshot_id
+            } else {
+                let snapshot_id =
                     format!("ready-snapshot-{}", nanoid::nanoid!(20, &API_KEY_ALPHABET));
-                let transaction = self.connection.unchecked_transaction()?;
                 transaction.execute(
-                    "DELETE FROM ready_snapshots WHERE expires_at <= ?1",
-                    [query.now],
-                )?;
-                let inserted = transaction.execute(
-                    "INSERT OR IGNORE INTO ready_snapshots(id, query_fingerprint, created_at, expires_at)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO ready_snapshots(id, query_fingerprint, ordered_digest, created_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     rusqlite::params![
-                        candidate,
+                        snapshot_id,
                         query.fingerprint(),
+                        ordered_digest,
                         query.now,
                         query.now.saturating_add(READY_SNAPSHOT_TTL_SECONDS),
                     ],
                 )?;
-                if inserted == 0 {
-                    transaction.rollback()?;
-                    continue;
-                }
                 for (position, card) in ordered_cards.iter().enumerate() {
                     transaction.execute(
                         "INSERT INTO ready_snapshot_items(snapshot_id, position, card_id) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![candidate, i64::try_from(position).unwrap_or(i64::MAX), card.id.as_str()],
+                        rusqlite::params![
+                            snapshot_id,
+                            i64::try_from(position).unwrap_or(i64::MAX),
+                            card.id.as_str()
+                        ],
                     )?;
                 }
                 transaction.commit()?;
-                break candidate;
+                snapshot_id
             };
             let end = query.limit.max(1).min(ordered_cards.len());
             let cards = ordered_cards.into_iter().take(end).collect::<Vec<_>>();
@@ -2549,19 +2570,16 @@ impl Store {
             });
         }
 
-        // Preserve the documented HTTP bare-card-id fallback. It is not
-        // emitted by this Store and retains the historical stale-anchor error.
-        let (cards, next_after) = paginate_ordered_cards(
-            ordered_cards,
-            query.limit,
-            after.map(|cursor| &cursor.anchor),
-        )?;
+        let cards = ordered_cards
+            .into_iter()
+            .take(query.limit.max(1))
+            .collect::<Vec<_>>();
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count: 0,
             cycle_card_ids,
-            next_after,
+            next_after: None,
             ready_cursor: None,
         })
     }
@@ -2598,7 +2616,7 @@ impl Store {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
-        let Some((fingerprint, expires_at)) = metadata else {
+        let Some((fingerprint, _expires_at)) = metadata else {
             transaction.commit()?;
             return Err(
                 DomainError::validation("after", "unknown or expired continuation cursor").into(),
@@ -2611,10 +2629,6 @@ impl Store {
                 "stale continuation cursor: query filters do not match",
             )
             .into());
-        }
-        if query.now >= expires_at {
-            transaction.commit()?;
-            return Err(DomainError::validation("after", "expired continuation cursor").into());
         }
         let snapshot_ids = {
             let mut statement = transaction
@@ -2642,6 +2656,15 @@ impl Store {
             if inserted > 0 {
                 next_position += 1;
             }
+        }
+        let snapshot_len = usize::try_from(next_position).map_err(|_| {
+            DomainError::validation("after", "invalid continuation cursor position")
+        })?;
+        if cursor.position() >= snapshot_len {
+            transaction.commit()?;
+            return Err(
+                DomainError::validation("after", "invalid continuation cursor position").into(),
+            );
         }
         let start_position = i64::try_from(cursor.position()).map_err(|_| {
             DomainError::validation("after", "invalid continuation cursor position")
@@ -4746,6 +4769,17 @@ pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
 /// and [`Store::list_ready_page_after`] (powder-cards-api-paged-continuation):
 /// `cards` is the caller's already fully-computed, already-ordered eligible
 /// list (post filter, post sort/topological-order, pre-truncate) -- this
+fn ready_order_digest(cards: &[Card]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ready-order-v1\0");
+    for card in cards {
+        let bytes = card.id.as_str().as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 /// helper never touches the database or recomputes anything, it only walks
 /// that in-memory `Vec` to find where a prior page left off.
 ///

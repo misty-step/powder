@@ -53,10 +53,13 @@ CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, 
 CREATE TABLE IF NOT EXISTS ready_snapshots (
   id TEXT PRIMARY KEY,
   query_fingerprint TEXT NOT NULL,
+  ordered_digest TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ready_snapshots_expires ON ready_snapshots(expires_at);
+CREATE INDEX IF NOT EXISTS idx_ready_snapshots_query_digest
+  ON ready_snapshots(query_fingerprint, ordered_digest, expires_at);
 
 CREATE TABLE IF NOT EXISTS ready_snapshot_items (
   snapshot_id TEXT NOT NULL REFERENCES ready_snapshots(id) ON DELETE CASCADE,

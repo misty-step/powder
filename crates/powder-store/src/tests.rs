@@ -1417,6 +1417,120 @@ fn durable_ready_cursor_survives_reopen_and_expires_with_gc() -> Result<()> {
 }
 
 #[test]
+fn ready_snapshot_reuses_identical_first_page_and_rebuilds_on_changed_set() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("reuse-a", 1),
+        ready_card("reuse-b", 2),
+        ready_card("reuse-c", 3),
+    ])?;
+    let query = ReadyQuery::new(100, 1);
+    let first = store.list_ready_page(query.clone())?;
+    let first_cursor = ReadyCursor::decode_for_query(
+        first.ready_cursor.as_deref().expect("first cursor"),
+        &query,
+    )?;
+    let first_snapshots: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM ready_snapshots", [], |row| row.get(0))?;
+    let second = store.list_ready_page(query.clone())?;
+    let second_cursor = ReadyCursor::decode_for_query(
+        second.ready_cursor.as_deref().expect("second cursor"),
+        &query,
+    )?;
+    assert_eq!(second_cursor.snapshot_id(), first_cursor.snapshot_id());
+    let second_snapshots: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM ready_snapshots", [], |row| row.get(0))?;
+    assert_eq!(second_snapshots, first_snapshots);
+
+    store.import_cards(vec![ready_card("reuse-before", 0)])?;
+    let changed = store.list_ready_page(query.clone())?;
+    let changed_cursor = ReadyCursor::decode_for_query(
+        changed.ready_cursor.as_deref().expect("changed cursor"),
+        &query,
+    )?;
+    assert_ne!(changed_cursor.snapshot_id(), first_cursor.snapshot_id());
+    let changed_snapshots: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM ready_snapshots", [], |row| row.get(0))?;
+    assert_eq!(changed_snapshots, first_snapshots + 1);
+    Ok(())
+}
+
+#[test]
+fn concurrent_ready_first_pages_reuse_one_snapshot() -> Result<()> {
+    let path = temp_db("ready-snapshot-contention");
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![
+            ready_card("concurrent-a", 1),
+            ready_card("concurrent-b", 2),
+            ready_card("concurrent-c", 3),
+            ready_card("concurrent-d", 4),
+        ])?;
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let query = ReadyQuery::new(100, 1);
+    let handles = (0..8)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let path = path.clone();
+            let query = query.clone();
+            std::thread::spawn(move || -> std::result::Result<String, String> {
+                let store = Store::open(&path).map_err(|err| err.to_string())?;
+                barrier.wait();
+                store
+                    .list_ready_page(query)
+                    .map_err(|err| err.to_string())?
+                    .ready_cursor
+                    .ok_or_else(|| "concurrent first page did not return a cursor".to_string())
+            })
+        })
+        .collect::<Vec<_>>();
+    let cursors = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("snapshot worker should not panic"))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|value| StoreError::InvalidStoredValue {
+            field: "ready snapshot concurrency",
+            value,
+        })?;
+    let decoded = cursors
+        .iter()
+        .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert!(decoded
+        .windows(2)
+        .all(|pair| pair[0].snapshot_id() == pair[1].snapshot_id()));
+
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    let snapshots: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM ready_snapshots", [], |row| row.get(0))?;
+    let items: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM ready_snapshot_items", [], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(snapshots, 1);
+    assert_eq!(items, 4);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    Ok(())
+}
+
+#[test]
 fn schema_v25_database_migrates_ready_snapshot_tables() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.connection.execute_batch(crate::schema::SCHEMA)?;
@@ -1447,9 +1561,22 @@ fn durable_ready_cursor_rejects_tamper_and_query_mismatch() -> Result<()> {
     let unknown = format!("v3.{}.ready-snapshot-unknown.1", query.fingerprint());
     let unknown_cursor = ReadyCursor::decode_for_query(&unknown, &query)?;
     let error = store
-        .list_ready_page_after(query, Some(&unknown_cursor))
+        .list_ready_page_after(query.clone(), Some(&unknown_cursor))
         .unwrap_err();
     assert!(error.to_string().contains("unknown") || error.to_string().contains("expired"));
+
+    let cursor = ReadyCursor::decode_for_query(&raw, &query)?;
+    let tampered = ReadyCursor::for_snapshot(
+        &query,
+        cursor.snapshot_id().expect("snapshot id").to_string(),
+        usize::MAX,
+    );
+    let error = store
+        .list_ready_page_after(query, Some(&tampered))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("invalid continuation cursor position"));
     Ok(())
 }
 

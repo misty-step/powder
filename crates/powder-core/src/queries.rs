@@ -60,29 +60,17 @@ impl ReadyQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyCursor {
     fingerprint: String,
-    /// Only used by the documented HTTP bare-card-id fallback. Durable v3
-    /// cursors carry an opaque snapshot id and stable position instead.
-    pub anchor: CardId,
+    /// Durable v3 cursors carry only an opaque snapshot id and stable position.
     snapshot_id: Option<String>,
     position: usize,
 }
 
 impl ReadyCursor {
-    pub fn for_bare_anchor(query: &ReadyQuery, anchor: CardId) -> Self {
-        Self {
-            fingerprint: query.fingerprint(),
-            anchor,
-            snapshot_id: None,
-            position: 0,
-        }
-    }
-
     /// Construct the bounded, durable cursor returned by Store-backed Ready
     /// pagination. The token contains no card IDs or eligible-set data.
     pub fn for_snapshot(query: &ReadyQuery, snapshot_id: String, position: usize) -> Self {
         Self {
             fingerprint: query.fingerprint(),
-            anchor: CardId::new("cursor-anchor").expect("static cursor anchor is canonical"),
             snapshot_id: Some(snapshot_id),
             position,
         }
@@ -104,7 +92,7 @@ impl ReadyCursor {
         let snapshot_id = self
             .snapshot_id
             .as_deref()
-            .expect("bare-card-id cursors are not encoded");
+            .expect("durable cursors always carry a snapshot id");
         format!("v3.{}.{}.{}", self.fingerprint, snapshot_id, self.position)
     }
 

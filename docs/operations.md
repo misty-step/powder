@@ -265,7 +265,7 @@ Ready pages use a durable, store-backed v3 snapshot cursor. Its URL token contai
 
 The captured Ready order is immutable. A card claimed, deleted, or otherwise no longer eligible before a later page is skipped without moving the cursor backwards or requiring the departed anchor. Cards that become eligible after page one are appended after the captured positions in the current dependency order. This gives a lossless walk: no duplicate or omission from departures, cycles remain reported, and mid-walk arrivals do not reorder already captured work. Retrying the same cursor is deterministic because the position is carried in the token, not mutable shared state.
 
-The documented HTTP bare-card-id `after` form remains a narrow compatibility fallback. New Ready responses always return v3 cursors. CLI remote calls forward `after` unchanged; only local SQLite calls decode it before entering Store. MCP local and remote calls use the same opaque value.
+Ready pagination uses only opaque v3 `after` cursors bound to the query filters and a durable SQLite snapshot. CLI and MCP local calls decode the same v3 value before entering Store; remote calls forward it unchanged. A bare card ID is rejected rather than guessed, so a departed anchor cannot duplicate or skip work.
 
 Ready `has_more` and `next_after` are position-aware. Continue while `next_after` is present; `total_count` reports the current eligible count and may change as claims or arrivals occur. Plain `/api/v1/cards` continuation retains its existing card-id behavior and does not receive Ready snapshot semantics.
 

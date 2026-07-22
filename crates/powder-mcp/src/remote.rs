@@ -50,7 +50,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 query.push_str(&format!("&after={}", urlencode(after)));
             }
             let response = client.get(&format!("/api/v1/cards/ready?{query}"))?;
-            remote_card_summary_page_payload(response)?
+            remote_card_summary_page_payload(response, true)?
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -82,7 +82,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 explicit_status.is_some() || args["include_terminal"].as_bool().unwrap_or(false);
             query.push_str(&format!("&include_terminal={include_terminal}"));
             let response = client.get(&format!("/api/v1/cards?{query}"))?;
-            remote_card_summary_page_payload(response)?
+            remote_card_summary_page_payload(response, false)?
         }
         "search_cards" => {
             let q = required_str(args, "q")?;
@@ -531,7 +531,7 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
     }
 }
 
-fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
+fn remote_card_summary_page_payload(response: Value, ready: bool) -> Result<Value, String> {
     // This decoder intentionally uses `ClientCardSummary` instead of
     // `Vec<Card>` so that one unknown/future status value cannot abort the
     // whole listing. The raw string is preserved and passed through.
@@ -548,7 +548,11 @@ fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
         "total_count": total_count,
         "has_more": has_more,
     });
-    if let Some(hint) =
+    if ready {
+        if next_after.is_some() {
+            payload["hint"] = json!("more cards; continue with next_after");
+        }
+    } else if let Some(hint) =
         crate::list_cards_hint(summaries.len(), total_count, excluded_terminal_count)
     {
         payload["hint"] = json!(hint);

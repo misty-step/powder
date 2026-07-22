@@ -1159,15 +1159,7 @@ async fn list_ready(
     let after = params
         .after
         .as_deref()
-        .map(|raw| {
-            if raw.contains('.') {
-                ReadyCursor::decode_for_query(raw, &query)
-            } else {
-                CardId::new(raw.to_string())
-                    .map(|anchor| ReadyCursor::for_bare_anchor(&query, anchor))
-                    .map_err(|err| powder_core::DomainError::validation("after", err.to_string()))
-            }
-        })
+        .map(|raw| ReadyCursor::decode_for_query(raw, &query))
         .transpose()?;
     let page = lock_store(&state)?.list_ready_page_after(query.clone(), after.as_ref())?;
     Ok(Json(card_list_page_json(
