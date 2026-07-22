@@ -738,11 +738,16 @@ struct RawParentRow {
     repo: Option<String>,
 }
 
-fn raw_parent_rows(connection: &Connection) -> Result<Vec<RawParentRow>> {
-    let mut statement =
-        connection.prepare("SELECT rowid, id, parent, repo FROM cards ORDER BY rowid")?;
+fn raw_parent_rows(connection: &Connection, include_hidden: bool) -> Result<Vec<RawParentRow>> {
+    let mut statement = connection.prepare(
+        "SELECT c.rowid, c.id, c.parent, c.repo
+         FROM cards c
+         LEFT JOIN repositories r ON r.name = c.repo
+         WHERE ?1 OR COALESCE(r.visibility, 'visible') = 'visible'
+         ORDER BY c.rowid",
+    )?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([include_hidden as i64], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Value>(1)?,
@@ -785,13 +790,19 @@ fn parent_cycle_members(
     parents: &HashMap<String, Option<String>>,
     ids: &HashSet<String>,
 ) -> Option<Vec<String>> {
-    let mut path = Vec::new();
+    let mut path: Vec<String> = Vec::new();
     let mut positions = HashMap::new();
     let mut current = start.to_string();
     loop {
         if let Some(position) = positions.get(&current) {
             let mut cycle = path[*position..].to_vec();
-            cycle.sort();
+            let canonical_start = cycle
+                .iter()
+                .enumerate()
+                .min_by(|left, right| left.1.cmp(right.1))
+                .map(|(index, _)| index)
+                .expect("cycle is non-empty");
+            cycle.rotate_left(canonical_start);
             return Some(cycle);
         }
         positions.insert(current.clone(), path.len());
@@ -859,6 +870,9 @@ fn classify_parent_coverage(
             if !seen.insert(current.clone()) || cycle_cards.contains(current.as_str()) {
                 break None;
             }
+            if invalid_parent_cards.contains(&current) {
+                break None;
+            }
             let Some(Some(parent)) = parents.get(&current) else {
                 break Some(current);
             };
@@ -891,8 +905,8 @@ fn classify_parent_coverage(
     }
 }
 
-fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
-    let rows = raw_parent_rows(connection)?;
+fn scan_parent_graph(connection: &Connection, include_hidden: bool) -> Result<ParentGraphReport> {
+    let rows = raw_parent_rows(connection, include_hidden)?;
     let mut ids = HashSet::new();
     let mut parents = HashMap::new();
     let mut invalid_parent_cards = HashSet::new();
@@ -1042,7 +1056,13 @@ impl Store {
     /// Return raw parent-edge diagnostics and the full-board coverage
     /// classification shared by the relations doctor and rollup queries.
     pub fn parent_graph_report(&self) -> Result<ParentGraphReport> {
-        scan_parent_graph(&self.connection)
+        scan_parent_graph(&self.connection, true)
+    }
+
+    /// Return parent graph coverage for the same visible repository scope as a
+    /// board read. The relations doctor keeps using the global report above.
+    pub fn parent_graph_report_scoped(&self, include_hidden: bool) -> Result<ParentGraphReport> {
+        scan_parent_graph(&self.connection, include_hidden)
     }
 
     /// Report relation symmetry plus parent-edge drift. Parent findings are
@@ -1061,7 +1081,7 @@ impl Store {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let parent_report = scan_parent_graph(&transaction)?;
+            let parent_report = scan_parent_graph(&transaction, true)?;
             let rows = raw_relation_rows(&transaction)?;
             let mut issues = find_relation_issues(&rows);
             for issue in &mut issues {
@@ -1114,7 +1134,7 @@ impl Store {
                 repaired: true,
             });
         }
-        let parent_report = scan_parent_graph(&self.connection)?;
+        let parent_report = scan_parent_graph(&self.connection, true)?;
         let rows = raw_relation_rows(&self.connection)?;
         let issues = find_relation_issues(&rows);
         Ok(RelationsDoctorReport {

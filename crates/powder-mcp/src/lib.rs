@@ -9,8 +9,8 @@ use powder_core::{
     ReadyQuery, Risk, RunId,
 };
 use powder_store::{
-    BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, Store,
+    BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
+    RepositoryUpsert, RepositoryVisibility, Store,
 };
 use serde_json::{json, Value};
 
@@ -56,6 +56,11 @@ pub const TOOLS: &[ToolDef] = &[
         name: "board_stats",
         description: "call before list_cards when you need board shape, not card contents.",
         input_schema: r#"{"type":"object","properties":{"repo":{"type":"string"},"include_hidden":{"type":"boolean"}}}"#,
+    },
+    ToolDef {
+        name: "board_rollups",
+        description: "Return deterministic top-level epic and per-repository Unsorted rollups with status counts for each root epic's direct children or each parentless leaf itself, criteria sums, active claims, freshness, and a full visibility-scoped parent-graph classification/reachability coverage envelope; nested-epic rollup sums need not equal coverage.accounted_cards. Use this before list_cards when you need the human board shape.",
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"after":{"type":"string"},"include_hidden":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "create_card",
@@ -442,6 +447,17 @@ pub fn call_tool_store(
                 now,
             })
             .map_err(to_string)?),
+        "board_rollups" => {
+            let page = store
+                .board_rollups(BoardRollupsQuery {
+                    limit: args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize,
+                    after: args["after"].as_str().map(str::to_string),
+                    now,
+                    include_hidden: args["include_hidden"].as_bool().unwrap_or(false),
+                })
+                .map_err(to_string)?;
+            json!(page)
+        }
         "create_card" => {
             let id = CardId::new(required_str(args, "id")?).map_err(to_string)?;
             let title = required_str(args, "title")?;
@@ -1314,7 +1330,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 21);
+        assert_eq!(default_tools.len(), 22);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1490,6 +1506,7 @@ mod tests {
                 "list_ready",
                 "list_cards",
                 "board_stats",
+                "board_rollups",
                 "create_card",
                 "update_card",
                 "list_repositories",
@@ -1510,7 +1527,7 @@ mod tests {
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 21);
+        assert_eq!(default_names.len(), 22);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1522,7 +1539,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 30);
+        assert_eq!(admin_names.len(), 31);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));
@@ -2215,6 +2232,36 @@ mod tests {
             call_tool_store(&mut store, "list_cards", &json!({"label": "papercut"}), 20).unwrap();
         let listed_payload = tool_payload(&listed);
         assert_eq!(listed_payload["total_count"], 1);
+    }
+
+    #[test]
+    fn mcp_board_rollups_local_returns_canonical_envelope() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "upsert_repository",
+            &json!({"name": "repo-a"}),
+            1,
+        )
+        .unwrap();
+        for (id, repo) in [("mcp-leaf-a", Some("repo-a")), ("mcp-leaf-b", None)] {
+            call_tool_store(
+                &mut store,
+                "create_card",
+                &json!({"id": id, "title": id, "acceptance": ["proof"], "repo": repo}),
+                10,
+            )
+            .unwrap();
+        }
+        let result =
+            call_tool_store(&mut store, "board_rollups", &json!({"limit": 1}), 20).unwrap();
+        let payload = tool_payload(&result);
+        assert_eq!(payload["total_count"], 2);
+        assert!(payload["has_more"].as_bool().unwrap());
+        assert_eq!(payload["coverage"]["total_cards"], 2);
+        assert_eq!(payload["coverage"]["accounted_cards"], 2);
+        assert!(payload["rollups"][0]["status_counts"].is_object());
     }
 
     #[test]

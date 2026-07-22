@@ -81,6 +81,9 @@ never an error.
 | --- | --- | --- | --- |
 | `list-ready` | SQLite query | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
 | `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\ttitle` or `no-cards` |
+| `board-rollups --json` | SQLite aggregate query | `GET /api/v1/board/rollups` | Pretty JSON `{rollups,total_count,has_more,next_after?,coverage}` |
+
+
 | `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
 | `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus` |
 | `update-card` | SQLite patch write | `PATCH /api/v1/cards/{id}` | `updated\tid\tpriority\tstatus` |
@@ -97,6 +100,8 @@ never an error.
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
 | `answer-input` | SQLite run resume | `POST /api/v1/runs/{id}/answer` | `answered-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
+
+Rollup `coverage` is the full visibility-scoped parent-graph classification/reachability envelope. A row's `status_counts` covers only its root epic's direct children or its parentless leaf itself (parentless leaves are grouped into repository `Unsorted` rows), so nested-epic row sums do not have to equal `coverage.accounted_cards`.
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
@@ -213,7 +218,7 @@ data is written only to temp SQLite DBs, never to checked-in backlog data.
 Agents that talk to the HTTP API directly, without the CLI or MCP, can read
 `GET /api/v1/routes` for the full route contract with example request bodies
 naming required fields -- `POST /api/v1/cards` and
-`POST /api/v1/cards/{id}/links` are two routes agents have previously had to
+`GET /api/v1/board/rollups` and `POST /api/v1/cards/{id}/links` are two routes agents have previously had to
 trial-and-error against raw serde deserialize errors.
 
 `update_card`/`PATCH /api/v1/cards/{id}` patches title, body, acceptance,

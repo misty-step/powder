@@ -75,6 +75,15 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             client.get(&format!("/api/v1/stats?{query}"))?
         }
+        "board_rollups" => {
+            let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100);
+            let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
+            let mut query = format!("limit={limit}&include_hidden={include_hidden}");
+            if let Some(after) = optional_str(args, "after") {
+                query.push_str(&format!("&after={}", urlencode(after)));
+            }
+            client.get(&format!("/api/v1/board/rollups?{query}"))?
+        }
         "create_card" => {
             let id = required_str(args, "id")?;
             let title = required_str(args, "title")?;
@@ -1310,6 +1319,38 @@ mod tests {
         assert_eq!(
             requests[0].path,
             "/api/v1/stats?include_hidden=true&repo=misty-step%2Fexample"
+        );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
+        );
+    }
+
+    #[test]
+    fn board_rollups_remote_dispatches_page_and_cursor() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "rollups": [{"kind":"unsorted","repo":null,"title":"Unsorted","status_counts":{"ready":1}}],
+                "total_count": 2,
+                "has_more": true,
+                "next_after": "u:repo-a",
+                "coverage": {"total_cards": 3,"accounted_cards": 3,"root_epics": 1,"unsorted_cards": 1,"parent_issue_count": 0,"complete": true}
+            }),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_test".to_string()));
+        let result = call_tool_remote(
+            &client,
+            "board_rollups",
+            &json!({"limit": 1, "after": "e:epic"}),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&result)["total_count"], 2);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/board/rollups?limit=1&include_hidden=false&after=e%3Aepic"
         );
         assert_eq!(
             requests[0].authorization.as_deref(),

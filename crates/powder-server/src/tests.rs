@@ -2162,6 +2162,164 @@ async fn board_stats_route_returns_compact_counts_without_listing_cards() {
 }
 
 #[tokio::test]
+async fn board_rollups_route_returns_global_page_and_coverage() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    for body in [
+        r#"{"id":"http-epic","title":"Epic","acceptance":["proof"]}"#,
+        r#"{"id":"http-child","title":"Child","acceptance":["proof"],"status":"done","parent":"http-epic"}"#,
+        r#"{"id":"http-leaf","title":"Leaf","acceptance":["proof"]}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/cards",
+                Some(&admin_key),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/board/rollups?limit=1",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_json(response).await;
+    assert_eq!(page["total_count"], 2);
+    assert_eq!(page["coverage"]["total_cards"], 3);
+    assert_eq!(page["coverage"]["accounted_cards"], 3);
+    assert!(page["coverage"]["complete"].as_bool().unwrap());
+    assert_eq!(page["rollups"].as_array().unwrap().len(), 1);
+    assert!(page["has_more"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
+    async fn seed_rollup_fixture(app: &AppState, admin_key: &str) {
+        let router = super::app(app.clone());
+        let hidden_repo = router
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/repositories",
+                Some(admin_key),
+                r#"{"name":"secret-rollups","visibility":"hidden","tier":"active"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(hidden_repo.status(), StatusCode::OK);
+        for body in [
+            r#"{"id":"public-rollup","title":"Public rollup","acceptance":["proof"],"status":"ready"}"#,
+            r#"{"id":"secret-rollup","title":"Secret rollup","acceptance":["proof"],"status":"ready","repo":"secret-rollups"}"#,
+        ] {
+            let created = router
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    "/api/v1/cards",
+                    Some(admin_key),
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(created.status(), StatusCode::OK);
+        }
+    }
+
+    let (private_state, private_admin_key) = test_state(AuthMode::ApiKey);
+    let private_agent_key = private_state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("rollup-reader", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    seed_rollup_fixture(&private_state, &private_admin_key).await;
+    let private_app = app(private_state);
+
+    let no_bearer = private_app
+        .clone()
+        .oneshot(json_request(Method::GET, "/api/v1/board/rollups", None, ""))
+        .await
+        .unwrap();
+    assert_eq!(no_bearer.status(), StatusCode::UNAUTHORIZED);
+
+    let non_admin_hidden = private_app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/board/rollups?include_hidden=true",
+            Some(&private_agent_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(non_admin_hidden.status(), StatusCode::FORBIDDEN);
+
+    let admin_hidden = private_app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/board/rollups?include_hidden=true",
+            Some(&private_admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(admin_hidden.status(), StatusCode::OK);
+    let admin_hidden_body = response_text(admin_hidden).await;
+    assert!(admin_hidden_body.contains("secret-rollups"));
+
+    let (public_state, public_admin_key) = test_state_with_public_reads(AuthMode::ApiKey, true);
+    seed_rollup_fixture(&public_state, &public_admin_key).await;
+    let public_app = app(public_state);
+
+    let public_default = public_app
+        .clone()
+        .oneshot(json_request(Method::GET, "/api/v1/board/rollups", None, ""))
+        .await
+        .unwrap();
+    assert_eq!(public_default.status(), StatusCode::OK);
+    let public_default_body = response_text(public_default).await;
+    assert!(public_default_body.contains("General"));
+    assert!(!public_default_body.contains("secret-rollups"));
+
+    let public_hidden_without_admin = public_app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/board/rollups?include_hidden=true",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        public_hidden_without_admin.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let public_hidden_admin = public_app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/board/rollups?include_hidden=true",
+            Some(&public_admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(public_hidden_admin.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -2697,6 +2855,7 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
         "/api/v1/cards?status=ready",
         "/api/v1/approvals",
         "/api/v1/cards/board-readable",
+        "/api/v1/board/rollups",
     ] {
         let response = app
             .clone()
@@ -2714,10 +2873,26 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
             StatusCode::OK,
             "POWDER_PUBLIC_READS=true board read route {route} should not need a bearer token"
         );
-        let body = response_text(response).await;
         if route == "/api/v1/approvals" {
+            let body = response_text(response).await;
             assert!(body.contains("\"approvals\":[]") || body.contains("\"approvals\": []"));
+        } else if route == "/api/v1/board/rollups" {
+            // Parentless cards intentionally aggregate into a General row with
+            // no card id; prove this seeded card is accounted for semantically.
+            let page = response_json(response).await;
+            assert_eq!(page["total_count"], 1);
+            assert_eq!(page["coverage"]["total_cards"], 1);
+            assert_eq!(page["coverage"]["accounted_cards"], 1);
+            assert_eq!(page["coverage"]["unsorted_cards"], 1);
+            let ready_cards: u64 = page["rollups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["status_counts"]["ready"].as_u64().unwrap_or_default())
+                .sum();
+            assert_eq!(ready_cards, 1);
         } else {
+            let body = response_text(response).await;
             assert!(
                 body.contains("board-readable"),
                 "read route {route} should expose the seeded card"

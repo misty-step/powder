@@ -52,7 +52,7 @@ sweep with `list_cards label:papercut` (MCP) or
 
 ## Expected MCP Tools
 
-Default agent persona (21 tools):
+Default agent persona (22 tools):
 
 - `list_ready`: return claimable cards from active repositories, ordered so
   no card appears after another card in the response it transitively
@@ -84,6 +84,7 @@ Default agent persona (21 tools):
 - `board_stats`: return board-shape counts (by status and repo), not card
   contents; call this before `list_cards` when you only need the shape of
   the board.
+- `board_rollups`: return deterministic top-level epic and per-repository `Unsorted` rollups. Each row's status counts, criteria, claims, and freshness cover only the root epic's direct children or the parentless leaf itself; `coverage` is the full visibility-scoped parent-graph classification/reachability envelope, so nested-epic row sums need not equal `coverage.accounted_cards`. Use `limit` and `after` for stable pagination; coverage is global and does not change across pages.
 - `create_card`: create one card with optional acceptance criteria, proof
   plan, relations, parent (decomposing an epic), repository, estimate, and
   initial status; returns a minimal ack -- `get_card` for full state.
