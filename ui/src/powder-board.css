@@ -720,15 +720,26 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: none;
 }
 
-/* powder-ui-tone-down-tokens: the panel title is the one place hierarchy
-   reads on this surface — a text-lg semibold title over sm/base labels —
-   so the type scale is exercised with deliberate hierarchy. */
+/* The title is the one place hierarchy reads on this surface — a text-lg
+   semibold title over sm/base labels — so the type scale is exercised with
+   deliberate hierarchy. */
 .pw-quick-add-title {
   margin: 0;
   font-size: var(--text-lg);
   font-weight: var(--pw-weight-semibold);
   color: var(--color-ink);
   letter-spacing: 0.01em;
+}
+
+/* Honest copy: explains the title-from-description fallback without jargon. */
+.pw-quick-add-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+  font-weight: var(--pw-weight-regular);
+  text-transform: none;
+  letter-spacing: 0;
+  line-height: 1.5;
 }
 
 .pw-quick-add-form {
@@ -815,6 +826,46 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-quick-add-actions .pw-button-quiet:hover {
   background: var(--color-surface-sunken);
+}
+
+/* Duplicate-submit prevention: the submit button is disabled during the
+   API call, so the disabled style must read from tokens, not bare opacity. */
+.pw-quick-add-actions .pw-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* Attachment remove button: compact, tokenized, 44px on mobile. */
+.pw-quick-add-remove {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5em;
+  height: 1.5em;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-faint);
+  font-size: var(--text-base);
+  line-height: 1;
+  cursor: pointer;
+  transition: color var(--pw-quick) var(--pw-ease), background var(--pw-quick) var(--pw-ease);
+}
+
+.pw-quick-add-remove:hover {
+  color: var(--color-danger);
+  background: var(--color-surface-sunken);
+}
+
+.pw-quick-add-remove:focus-visible {
+  outline: var(--pw-focus-width) solid var(--pw-focus-color);
+  outline-offset: var(--pw-focus-offset);
+}
+
+.pw-quick-add-remove:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .pw-status-change {
@@ -1976,6 +2027,20 @@ html:not([data-pw-route='card']) .pw-detail-app {
     min-height: var(--pw-touch-target);
   }
 
+  .pw-quick-add-remove {
+    min-width: var(--pw-touch-target);
+    min-height: var(--pw-touch-target);
+  }
+
+  .pw-retry-actions button,
+  .pw-retry-remove {
+    min-height: var(--pw-touch-target);
+  }
+
+  .pw-retry-remove {
+    min-width: var(--pw-touch-target);
+  }
+
   .pw-board {
     overflow-x: hidden;
   }
@@ -2186,6 +2251,86 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: var(--pw-space-1);
   max-width: 100%;
   overflow-wrap: anywhere;
+}
+
+/* Attachment retry banner: visible after card creation when image uploads
+   fail. The failed File objects are retained until success, removal, or
+   dismiss — the user can retry without reselecting files. Token-backed to
+   match the quick-add panel's visual language. */
+.pw-retry-banner[hidden] {
+  display: none;
+}
+
+.pw-retry-banner {
+  flex: none;
+  padding: var(--pw-space-3) var(--pw-space-6);
+  border-bottom: var(--pw-line-width) solid var(--color-warn);
+  background: var(--color-surface-raised);
+}
+
+.pw-retry-entry {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pw-space-2);
+  max-width: var(--pw-measure-form);
+}
+
+.pw-retry-label {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-ink);
+}
+
+.pw-retry-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pw-space-1) var(--pw-space-3);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+}
+
+.pw-retry-files li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--pw-space-1);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.pw-retry-actions {
+  display: flex;
+  gap: var(--pw-space-3);
+}
+
+.pw-retry-actions .pw-button {
+  border-radius: var(--radius-0);
+  font-size: var(--text-sm);
+  font-weight: var(--pw-weight-medium);
+  padding: var(--pw-space-2) var(--pw-space-5);
+}
+
+.pw-retry-actions .pw-button:not(.pw-button-quiet) {
+  background: var(--color-ink);
+  color: var(--color-accent-ink);
+  border-color: var(--color-ink);
+}
+
+.pw-retry-actions .pw-button-quiet {
+  background: transparent;
+  color: var(--color-ink);
+  border-color: var(--color-line);
+}
+
+.pw-retry-actions .pw-button-quiet:hover {
+  background: var(--color-surface-sunken);
+}
+
+.pw-retry-actions .pw-button:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .pw-toast {
