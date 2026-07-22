@@ -480,7 +480,7 @@ fn load_activities_for_card(
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
                 "SELECT activities.id, activities.run_id, activities.activity_type,
-                        activities.payload, activities.created_at
+                        activities.payload, activities.principal, activities.role, activities.created_at
                  FROM activities
                  JOIN runs ON runs.id = activities.run_id
                  WHERE runs.card_id = ?1
@@ -545,7 +545,7 @@ fn load_activities_for_run(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT id, run_id, activity_type, payload, created_at
+                "SELECT id, run_id, activity_type, payload, principal, role, created_at
                  FROM activities
                  WHERE run_id = ?1
                  ORDER BY created_at DESC, rowid DESC
@@ -608,7 +608,7 @@ fn load_events_for_card(
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, event_type, actor, payload,
-                        principal, subject_kind, subject_id, created_at
+                        principal, role, subject_kind, subject_id, created_at
                  FROM card_events
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, rowid DESC
@@ -651,7 +651,7 @@ fn count_events_for_card(connection: &Connection, card_id: &CardId) -> Result<us
 fn latest_elicitation(connection: &Connection, run_id: &RunId) -> Result<Option<Activity>> {
     connection
         .query_row(
-            "SELECT id, run_id, activity_type, payload, created_at
+            "SELECT id, run_id, activity_type, payload, principal, role, created_at
              FROM activities
              WHERE run_id = ?1 AND activity_type = 'elicitation'
              ORDER BY created_at DESC, rowid DESC

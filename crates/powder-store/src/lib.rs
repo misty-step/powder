@@ -1891,18 +1891,20 @@ impl Store {
     }
 
     fn ensure_principal_role_columns(&self) -> Result<()> {
-        if !self.table_has_column("runs", "role")? {
+        if self.table_exists("runs")? && !self.table_has_column("runs", "role")? {
             self.connection.execute_batch(
                 "ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'agent';",
             )?;
         }
-        if !self.table_has_column("activities", "principal")? {
-            self.connection.execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
+        if self.table_exists("activities")? {
+            if !self.table_has_column("activities", "principal")? {
+                self.connection.execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
+            }
+            if !self.table_has_column("activities", "role")? {
+                self.connection.execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
+            }
         }
-        if !self.table_has_column("activities", "role")? {
-            self.connection.execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
-        }
-        if !self.table_has_column("card_events", "role")? {
+        if self.table_exists("card_events")? && !self.table_has_column("card_events", "role")? {
             self.connection.execute_batch("ALTER TABLE card_events ADD COLUMN role TEXT;")?;
         }
         Ok(())
@@ -4194,9 +4196,9 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
 fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     connection.execute(
         "INSERT INTO runs (
-            id, card_id, state, principal, agent, claim_expires_at, proof,
+            id, card_id, state, principal, role, agent, claim_expires_at, proof,
             created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
            card_id = excluded.card_id,
            state = excluded.state,
@@ -4221,16 +4223,6 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
         ],
     )?;
     Ok(())
-}
-
-fn append_activity(
-    connection: &Connection,
-    run_id: &RunId,
-    activity_type: ActivityType,
-    payload: &str,
-    now: i64,
-) -> Result<Activity> {
-    append_activity_attributed(connection, run_id, activity_type, payload, None, None, now)
 }
 
 fn append_activity_attributed(
@@ -4349,7 +4341,7 @@ fn append_attributed_card_event(
         "INSERT INTO card_events (
            id, card_id, event_type, actor, payload, principal, role,
            subject_kind, subject_id, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
