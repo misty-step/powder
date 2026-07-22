@@ -2400,83 +2400,32 @@ impl Store {
         authority: &Authority,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authorize_card_operation(authority, Operation::PatchCard, &card, None, None, now)?;
-        let mut patched_fields = Vec::new();
-
-        if let Some(title) = patch.title {
-            card.title = non_empty_scrubbed("title", &title)?;
-            patched_fields.push("title");
-        }
-        if let Some(body) = patch.body {
-            card.body = secrets::scrub_secrets(&body);
-            patched_fields.push("body");
-        }
-        if let Some(acceptance) = patch.acceptance {
-            card = card.with_acceptance(scrub_string_list(acceptance));
-            patched_fields.push("acceptance");
-        }
-        if let Some(proof_plan) = patch.proof_plan {
-            card = card.with_proof_plan(scrub_string_list(proof_plan));
-            patched_fields.push("proof_plan");
-        }
-        if let Some(priority) = patch.priority {
-            card.priority = priority;
-            patched_fields.push("priority");
-        }
-        if let Some(estimate) = patch.estimate {
-            card.estimate = Some(estimate);
-            patched_fields.push("estimate");
-        }
-        if let Some(risk) = patch.risk {
-            card.risk = Some(risk);
-            patched_fields.push("risk");
-        }
-        if let Some(labels) = patch.labels {
-            card.labels = clean_string_list(labels);
-            patched_fields.push("labels");
-        }
-        if let Some(status) = patch.status {
-            card.status = status;
-            patched_fields.push("status");
-        }
-        if let Some(repo) = patch.repo {
-            card.repo = repo;
-            patched_fields.push("repo");
-        }
-
-        if patched_fields.is_empty() {
-            transaction.commit()?;
-            return Ok(card);
-        }
-
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        append_card_event_with_authority(
-            &transaction,
-            card_id,
-            "patch",
-            &actor,
-            &format!("patched {}", patched_fields.join(", ")),
-            now,
-            authority,
-        )?;
-        // `persist_card` canonicalizes `repo` at write time via
-        // `resolve_registered_repository_name` (an alias like
-        // "misty-step/canary" becomes "canary" in the DB row) but only
-        // borrows `card`, so the
-        // in-memory value above is still whatever the caller passed. Reload
-        // so the returned `Card` matches the row exactly -- same reason
-        // `create_card_with_events` reloads after its own `persist_card`
-        // call instead of returning its own `card` binding.
-        let saved = load_card(&transaction, card_id)?;
-
+        let saved = patch_card_in_transaction(&transaction, card_id, patch, authority, now)?;
         transaction.commit()?;
         Ok(saved)
+    }
+
+    pub fn patch_card_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        patch: CardPatch,
+        idempotency_key: &str,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({"patch": format!("{patch:?}")});
+        self.with_keyed_operation(
+            Operation::PatchCard,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| patch_card_in_transaction(transaction, card_id, patch, authority, now),
+        )
     }
 
     pub fn check_criterion(
@@ -2506,55 +2455,54 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authorize_card_operation(authority, Operation::CheckCriterion, &card, None, None, now)?;
-        let criterion_state = criterion_mut(&mut card, criterion)?;
-        if checked {
-            criterion_state.checked_by = Some(actor.clone());
-            criterion_state.checked_at = Some(now);
-        } else {
-            criterion_state.checked_by = None;
-            criterion_state.checked_at = None;
-        }
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        let subject_id = criterion.to_string();
-        append_attributed_card_event(
+        let card = check_criterion_in_transaction(
             &transaction,
             card_id,
-            MutationAudit {
-                operation: Operation::CheckCriterion,
-                resource: card_id.as_str(),
-                semantic_identity: Some(actor.as_str()),
-                run_id: None,
-                reason: Some("criterion correction"),
-                event_type: "criterion",
-                actor: &actor,
-                payload: &format!(
-                    "criterion {} {}",
-                    criterion,
-                    if checked { "checked" } else { "unchecked" }
-                ),
-                subject_kind: "criterion",
-                subject_id: &subject_id,
-                authority,
-            },
+            criterion,
+            actor,
+            checked,
             now,
+            authority,
         )?;
         transaction.commit()?;
         Ok(card)
     }
 
-    /// Repair a card's acceptance criteria by re-parsing the oracle source
-    /// and applying the result while preserving checked/proof state for any
-    /// criterion whose identity survives (same position and unchanged text,
-    /// or stored text is a truncation-prefix of the new text). Status,
-    /// claim, relations, comments, and source provenance are left untouched
-    /// -- only the criteria text and the structured criteria columns change.
+    pub fn check_criterion_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        criterion: usize,
+        actor: &str,
+        checked: bool,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({"criterion": criterion, "actor": actor, "checked": checked});
+        self.with_keyed_operation(
+            Operation::CheckCriterion,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                check_criterion_in_transaction(
+                    transaction,
+                    card_id,
+                    criterion,
+                    actor,
+                    checked,
+                    now,
+                    authority,
+                )
+            },
+        )
+    }
+
     pub fn repair_criteria(
         &mut self,
         card_id: &CardId,
@@ -3512,56 +3460,31 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authorize_card_operation(authority, Operation::UpdateStatus, &card, None, None, now)?;
-        let previous = card.status;
-        let released_claim = card.apply_status(status, now);
-        persist_card(&transaction, &card)?;
-        if let Some(claim) = released_claim {
-            close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
-            append_activity_attributed(
-                &transaction,
-                &claim.run_id,
-                ActivityType::Action,
-                &format!("status set {card_id} to {}", status.as_str()),
-                authority.principal_name(),
-                Some(authority.role_label()),
-                now,
-            )?;
-        }
-        append_card_event_with_authority(
-            &transaction,
-            card_id,
-            "status",
-            &authority.actor_label(),
-            &format!("{} -> {}", previous.as_str(), status.as_str()),
-            now,
-            authority,
-        )?;
-        if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
-            events::append_outbound_card_event_with_authority(
-                &transaction,
-                &card,
-                event_type,
-                authority,
-                json!({
-                    "previous_status": previous.as_str(),
-                    "status": status.as_str()
-                }),
-                now,
-            )?;
-        }
-        if status.is_terminal() && !previous.is_terminal() {
-            append_parent_rollup_event_with_authority(
-                &transaction,
-                &card,
-                authority,
-                &format!("child {card_id} reached {}", status.as_str()),
-                now,
-            )?;
-        }
+        let card = update_status_in_transaction(&transaction, card_id, status, now, authority)?;
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn update_status_keyed(
+        &mut self,
+        card_id: &CardId,
+        status: CardStatus,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({"status": status.as_str()});
+        self.with_keyed_operation(
+            Operation::UpdateStatus,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                update_status_in_transaction(transaction, card_id, status, now, authority)
+            },
+        )
     }
 
     /// Replace a card's `related`/`blocks`/`blocked_by` lists and mirror
@@ -3587,63 +3510,53 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authorize_card_operation(
-            authority,
-            Operation::UpdateRelations,
-            &card,
-            None,
-            None,
-            now,
-        )?;
-        let actor = authority.actor_label();
-
-        let related_delta = list_delta(&card.related, &related);
-        let blocks_delta = list_delta(&card.blocks, &blocks);
-        let blocked_by_delta = list_delta(&card.blocked_by, &blocked_by);
-
-        card.apply_relations(related, blocks, blocked_by, now);
-        persist_card(&transaction, &card)?;
-        append_card_event_with_authority(
+        let card = update_relations_in_transaction(
             &transaction,
             card_id,
-            "relations",
-            &actor,
-            &format!(
-                "related={:?} blocks={:?} blocked_by={:?}",
-                card.related, card.blocks, card.blocked_by
-            ),
+            related,
+            blocks,
+            blocked_by,
             now,
             authority,
         )?;
-
-        mirror_delta_with_authority(
-            &transaction,
-            card_id,
-            RelationField::Related,
-            &related_delta,
-            authority,
-            now,
-        )?;
-        mirror_delta_with_authority(
-            &transaction,
-            card_id,
-            RelationField::Blocks,
-            &blocks_delta,
-            authority,
-            now,
-        )?;
-        mirror_delta_with_authority(
-            &transaction,
-            card_id,
-            RelationField::BlockedBy,
-            &blocked_by_delta,
-            authority,
-            now,
-        )?;
-
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn update_relations_keyed(
+        &mut self,
+        card_id: &CardId,
+        related: Vec<CardId>,
+        blocks: Vec<CardId>,
+        blocked_by: Vec<CardId>,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({
+            "related": related,
+            "blocks": blocks,
+            "blocked_by": blocked_by,
+        });
+        self.with_keyed_operation(
+            Operation::UpdateRelations,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                update_relations_in_transaction(
+                    transaction,
+                    card_id,
+                    related,
+                    blocks,
+                    blocked_by,
+                    now,
+                    authority,
+                )
+            },
+        )
     }
 
     /// Set or clear a card's explicit parent edge. Validates that the parent
@@ -3661,61 +3574,29 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authorize_card_operation(authority, Operation::SetParent, &card, None, None, now)?;
-        let previous = card.parent.clone();
-        if previous == parent {
-            transaction.commit()?;
-            return Ok(card);
-        }
-        if let Some(new_parent) = parent.as_ref() {
-            ensure_parent_linkable(&transaction, card_id, new_parent)?;
-        }
-        card.parent = parent.clone();
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        let actor = authority.actor_label();
-        let label = |value: &Option<CardId>| {
-            value
-                .as_ref()
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        };
-        append_card_event_with_authority(
-            &transaction,
-            card_id,
-            "hierarchy",
-            &actor,
-            &format!("parent {} -> {}", label(&previous), label(&parent)),
-            now,
-            authority,
-        )?;
-        if let Some(old_parent) = previous.as_ref() {
-            if load_card_optional(&transaction, old_parent)?.is_some() {
-                append_card_event_with_authority(
-                    &transaction,
-                    old_parent,
-                    "hierarchy",
-                    &actor,
-                    &format!("child {card_id} unlinked"),
-                    now,
-                    authority,
-                )?;
-            }
-        }
-        if let Some(new_parent) = parent.as_ref() {
-            append_card_event_with_authority(
-                &transaction,
-                new_parent,
-                "decompose",
-                &actor,
-                &format!("child {card_id} linked"),
-                now,
-                authority,
-            )?;
-        }
+        let card = set_parent_in_transaction(&transaction, card_id, parent, now, authority)?;
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn set_parent_keyed(
+        &mut self,
+        card_id: &CardId,
+        parent: Option<CardId>,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let payload = json!({"parent": parent});
+        self.with_keyed_operation(
+            Operation::SetParent,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| set_parent_in_transaction(transaction, card_id, parent, now, authority),
+        )
     }
 
     pub fn release_claim(
@@ -4351,90 +4232,59 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut card = load_card(&transaction, card_id)?;
-        authorize_card_operation(authority, Operation::CompleteCard, &card, None, None, now)?;
-
-        let previous = card.status;
-        let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
-
-        card.status = CardStatus::Done;
-        card.claim = None;
-        for criterion_proof in criterion_proofs {
-            let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
-            criterion.proof_links.push(CriterionProof {
-                url: criterion_proof.url,
-                actor: authority.actor_label(),
-                created_at: now,
-            });
-        }
-        card.updated_at = now;
-        persist_card(&transaction, &card)?;
-        if let Some(run_id) = run_id {
-            close_run_for_status(
-                &transaction,
-                &run_id,
-                CardStatus::Done,
-                now,
-                proof.as_deref(),
-            )?;
-            append_activity_attributed(
-                &transaction,
-                &run_id,
-                ActivityType::Response,
-                proof
-                    .as_deref()
-                    .map(|proof| format!("completed: {proof}"))
-                    .unwrap_or_else(|| "completed without proof".to_string())
-                    .as_str(),
-                authority.principal_name(),
-                Some(authority.role_label()),
-                now,
-            )?;
-        }
-        append_card_event_with_authority(
+        let card = complete_card_in_transaction(
             &transaction,
             card_id,
-            "status",
-            &authority.actor_label(),
-            &format!("{} -> done", previous.as_str()),
+            proof,
+            criterion_proofs,
+            field_note_config,
             now,
             authority,
         )?;
-        if !previous.is_terminal() {
-            events::append_outbound_card_event_with_authority(
-                &transaction,
-                &card,
-                "completed",
-                authority,
-                json!({
-                    "previous_status": previous.as_str(),
-                    "status": card.status.as_str(),
-                    "proof": proof,
-                    "criteria": card.criteria
-                }),
-                now,
-            )?;
-            append_parent_rollup_event_with_authority(
-                &transaction,
-                &card,
-                authority,
-                &proof
-                    .as_deref()
-                    .map(|proof| {
-                        format!(
-                            "child {card_id} completed with proof: {}",
-                            EpicState::proof_snippet(proof)
-                        )
-                    })
-                    .unwrap_or_else(|| format!("child {card_id} completed without proof")),
-                now,
-            )?;
-            if let Some(config) = &field_note_config {
-                maybe_spawn_field_note_draft(&transaction, &card, proof.as_deref(), config, now)?;
-            }
-        }
         transaction.commit()?;
         Ok(card)
+    }
+
+    pub fn complete_card_keyed(
+        &mut self,
+        card_id: &CardId,
+        proof: Option<&str>,
+        criterion_proofs: Vec<CriterionProofInput>,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let proof = proof
+            .map(|value| non_empty_scrubbed("proof", value))
+            .transpose()?;
+        let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
+        let field_note_config = self.field_note_config.clone();
+        let payload = json!({
+            "proof": proof,
+            "criterion_proofs": criterion_proofs
+                .iter()
+                .map(|item| json!({"criterion": item.criterion, "url": item.url}))
+                .collect::<Vec<_>>(),
+        });
+        self.with_keyed_operation(
+            Operation::CompleteCard,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                complete_card_in_transaction(
+                    transaction,
+                    card_id,
+                    proof,
+                    criterion_proofs,
+                    field_note_config,
+                    now,
+                    authority,
+                )
+            },
+        )
     }
 }
 
@@ -4764,6 +4614,389 @@ fn append_card_event(
         now,
         &Authority::unchecked(),
     )
+}
+
+fn complete_card_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    proof: Option<String>,
+    criterion_proofs: Vec<CriterionProofInput>,
+    field_note_config: Option<FieldNoteConfig>,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::CompleteCard, &card, None, None, now)?;
+    let previous = card.status;
+    let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
+    card.status = CardStatus::Done;
+    card.claim = None;
+    for criterion_proof in criterion_proofs {
+        let criterion = criterion_mut(&mut card, criterion_proof.criterion)?;
+        criterion.proof_links.push(CriterionProof {
+            url: criterion_proof.url,
+            actor: authority.actor_label(),
+            created_at: now,
+        });
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    if let Some(run_id) = run_id {
+        close_run_for_status(
+            transaction,
+            &run_id,
+            CardStatus::Done,
+            now,
+            proof.as_deref(),
+        )?;
+        append_activity_attributed(
+            transaction,
+            &run_id,
+            ActivityType::Response,
+            proof
+                .as_deref()
+                .map(|value| format!("completed: {value}"))
+                .unwrap_or_else(|| "completed without proof".to_string())
+                .as_str(),
+            authority.principal_name(),
+            Some(authority.role_label()),
+            now,
+        )?;
+    }
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "status",
+        &authority.actor_label(),
+        &format!("{} -> done", previous.as_str()),
+        now,
+        authority,
+    )?;
+    if !previous.is_terminal() {
+        events::append_outbound_card_event_with_authority(
+            transaction,
+            &card,
+            "completed",
+            authority,
+            json!({"previous_status": previous.as_str(), "status": card.status.as_str(), "proof": proof, "criteria": card.criteria}),
+            now,
+        )?;
+        append_parent_rollup_event_with_authority(
+            transaction,
+            &card,
+            authority,
+            &proof
+                .as_deref()
+                .map(|value| {
+                    format!(
+                        "child {card_id} completed with proof: {}",
+                        EpicState::proof_snippet(value)
+                    )
+                })
+                .unwrap_or_else(|| format!("child {card_id} completed without proof")),
+            now,
+        )?;
+        if let Some(config) = &field_note_config {
+            maybe_spawn_field_note_draft(transaction, &card, proof.as_deref(), config, now)?;
+        }
+    }
+    Ok(card)
+}
+
+fn set_parent_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    parent: Option<CardId>,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::SetParent, &card, None, None, now)?;
+    let previous = card.parent.clone();
+    if previous == parent {
+        return Ok(card);
+    }
+    if let Some(new_parent) = parent.as_ref() {
+        ensure_parent_linkable(transaction, card_id, new_parent)?;
+    }
+    card.parent = parent.clone();
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    let actor = authority.actor_label();
+    let label = |value: &Option<CardId>| {
+        value
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "none".to_string())
+    };
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "hierarchy",
+        &actor,
+        &format!("parent {} -> {}", label(&previous), label(&parent)),
+        now,
+        authority,
+    )?;
+    if let Some(old_parent) = previous.as_ref() {
+        if load_card_optional(transaction, old_parent)?.is_some() {
+            append_card_event_with_authority(
+                transaction,
+                old_parent,
+                "hierarchy",
+                &actor,
+                &format!("child {card_id} unlinked"),
+                now,
+                authority,
+            )?;
+        }
+    }
+    if let Some(new_parent) = parent.as_ref() {
+        append_card_event_with_authority(
+            transaction,
+            new_parent,
+            "decompose",
+            &actor,
+            &format!("child {card_id} linked"),
+            now,
+            authority,
+        )?;
+    }
+    Ok(card)
+}
+
+fn update_relations_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    related: Vec<CardId>,
+    blocks: Vec<CardId>,
+    blocked_by: Vec<CardId>,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(
+        authority,
+        Operation::UpdateRelations,
+        &card,
+        None,
+        None,
+        now,
+    )?;
+    let actor = authority.actor_label();
+    let related_delta = list_delta(&card.related, &related);
+    let blocks_delta = list_delta(&card.blocks, &blocks);
+    let blocked_by_delta = list_delta(&card.blocked_by, &blocked_by);
+    card.apply_relations(related, blocks, blocked_by, now);
+    persist_card(transaction, &card)?;
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "relations",
+        &actor,
+        &format!(
+            "related={:?} blocks={:?} blocked_by={:?}",
+            card.related, card.blocks, card.blocked_by
+        ),
+        now,
+        authority,
+    )?;
+    mirror_delta_with_authority(
+        transaction,
+        card_id,
+        RelationField::Related,
+        &related_delta,
+        authority,
+        now,
+    )?;
+    mirror_delta_with_authority(
+        transaction,
+        card_id,
+        RelationField::Blocks,
+        &blocks_delta,
+        authority,
+        now,
+    )?;
+    mirror_delta_with_authority(
+        transaction,
+        card_id,
+        RelationField::BlockedBy,
+        &blocked_by_delta,
+        authority,
+        now,
+    )?;
+    Ok(card)
+}
+
+fn update_status_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    status: CardStatus,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::UpdateStatus, &card, None, None, now)?;
+    let previous = card.status;
+    let released_claim = card.apply_status(status, now);
+    persist_card(transaction, &card)?;
+    if let Some(claim) = released_claim {
+        close_run_for_status(transaction, &claim.run_id, status, now, None)?;
+        append_activity_attributed(
+            transaction,
+            &claim.run_id,
+            ActivityType::Action,
+            &format!("status set {card_id} to {}", status.as_str()),
+            authority.principal_name(),
+            Some(authority.role_label()),
+            now,
+        )?;
+    }
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "status",
+        &authority.actor_label(),
+        &format!("{} -> {}", previous.as_str(), status.as_str()),
+        now,
+        authority,
+    )?;
+    if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
+        events::append_outbound_card_event_with_authority(
+            transaction,
+            &card,
+            event_type,
+            authority,
+            json!({"previous_status": previous.as_str(), "status": status.as_str()}),
+            now,
+        )?;
+    }
+    if status.is_terminal() && !previous.is_terminal() {
+        append_parent_rollup_event_with_authority(
+            transaction,
+            &card,
+            authority,
+            &format!("child {card_id} reached {}", status.as_str()),
+            now,
+        )?;
+    }
+    Ok(card)
+}
+
+fn check_criterion_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    criterion: usize,
+    actor: &str,
+    checked: bool,
+    now: i64,
+    authority: &Authority,
+) -> Result<Card> {
+    let actor = non_empty("actor", actor)?;
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::CheckCriterion, &card, None, None, now)?;
+    let criterion_state = criterion_mut(&mut card, criterion)?;
+    if checked {
+        criterion_state.checked_by = Some(actor.clone());
+        criterion_state.checked_at = Some(now);
+    } else {
+        criterion_state.checked_by = None;
+        criterion_state.checked_at = None;
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    let subject_id = criterion.to_string();
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::CheckCriterion,
+            resource: card_id.as_str(),
+            semantic_identity: Some(actor.as_str()),
+            run_id: None,
+            reason: Some("criterion correction"),
+            event_type: "criterion",
+            actor: &actor,
+            payload: &format!(
+                "criterion {} {}",
+                criterion,
+                if checked { "checked" } else { "unchecked" }
+            ),
+            subject_kind: "criterion",
+            subject_id: &subject_id,
+            authority,
+        },
+        now,
+    )?;
+    Ok(card)
+}
+
+fn patch_card_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    patch: CardPatch,
+    authority: &Authority,
+    now: i64,
+) -> Result<Card> {
+    let actor = non_empty("actor", &authority.actor_label())?;
+    let mut card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::PatchCard, &card, None, None, now)?;
+    let mut patched_fields = Vec::new();
+    if let Some(title) = patch.title {
+        card.title = non_empty_scrubbed("title", &title)?;
+        patched_fields.push("title");
+    }
+    if let Some(body) = patch.body {
+        card.body = secrets::scrub_secrets(&body);
+        patched_fields.push("body");
+    }
+    if let Some(acceptance) = patch.acceptance {
+        card = card.with_acceptance(scrub_string_list(acceptance));
+        patched_fields.push("acceptance");
+    }
+    if let Some(proof_plan) = patch.proof_plan {
+        card = card.with_proof_plan(scrub_string_list(proof_plan));
+        patched_fields.push("proof_plan");
+    }
+    if let Some(priority) = patch.priority {
+        card.priority = priority;
+        patched_fields.push("priority");
+    }
+    if let Some(estimate) = patch.estimate {
+        card.estimate = Some(estimate);
+        patched_fields.push("estimate");
+    }
+    if let Some(risk) = patch.risk {
+        card.risk = Some(risk);
+        patched_fields.push("risk");
+    }
+    if let Some(labels) = patch.labels {
+        card.labels = clean_string_list(labels);
+        patched_fields.push("labels");
+    }
+    if let Some(status) = patch.status {
+        card.status = status;
+        patched_fields.push("status");
+    }
+    if let Some(repo) = patch.repo {
+        card.repo = repo;
+        patched_fields.push("repo");
+    }
+    if patched_fields.is_empty() {
+        return Ok(card);
+    }
+    card.updated_at = now;
+    persist_card(transaction, &card)?;
+    append_card_event_with_authority(
+        transaction,
+        card_id,
+        "patch",
+        &actor,
+        &format!("patched {}", patched_fields.join(", ")),
+        now,
+        authority,
+    )?;
+    load_card(transaction, card_id)
 }
 
 fn create_card_in_transaction(

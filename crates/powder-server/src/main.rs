@@ -1564,8 +1564,16 @@ async fn patch_card(
     if patch.repo.is_some() {
         require_admin(&state, &headers)?;
     }
-    let card =
-        lock_store(&state)?.patch_card_as(&card_id, patch, &actor.authority(), unix_now())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let card = lock_store(&state)?
+        .patch_card_as_keyed(
+            &card_id,
+            patch,
+            idempotency_key,
+            &actor.authority(),
+            unix_now(),
+        )?
+        .value;
     Ok(Json(card))
 }
 
@@ -1656,64 +1664,96 @@ async fn transfer_claim(
 async fn update_status(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<StatusRequest>,
 ) -> Result<Json<Card>, ApiError> {
     let card_id = CardId::new(id)?;
     let status = parse_status(&request.status)?;
-    let card =
-        lock_store(&state)?.update_status(&card_id, status, unix_now(), &actor.authority())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let card = lock_store(&state)?
+        .update_status_keyed(
+            &card_id,
+            status,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(card))
 }
 
 async fn update_relations(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<RelationsRequest>,
 ) -> Result<Json<Card>, ApiError> {
     let card_id = CardId::new(id)?;
-    let card = lock_store(&state)?.update_relations(
-        &card_id,
-        card_ids(request.related, CardField::Related)?,
-        card_ids(request.blocks, CardField::Blocks)?,
-        card_ids(request.blocked_by, CardField::BlockedBy)?,
-        unix_now(),
-        &actor.authority(),
-    )?;
+    let related = card_ids(request.related, CardField::Related)?;
+    let blocks = card_ids(request.blocks, CardField::Blocks)?;
+    let blocked_by = card_ids(request.blocked_by, CardField::BlockedBy)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let card = lock_store(&state)?
+        .update_relations_keyed(
+            &card_id,
+            related,
+            blocks,
+            blocked_by,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(card))
 }
 
 async fn set_parent(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<ParentRequest>,
 ) -> Result<Json<Card>, ApiError> {
     let card_id = CardId::new(id)?;
     let parent = request.parent.map(CardId::new).transpose()?;
-    let card = lock_store(&state)?.set_parent(&card_id, parent, unix_now(), &actor.authority())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let card = lock_store(&state)?
+        .set_parent_keyed(
+            &card_id,
+            parent,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(card))
 }
 
 async fn check_criterion(
     State(state): State<AppState>,
     AuthActor(authenticated): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<CriterionRequest>,
 ) -> Result<Json<Card>, ApiError> {
     let card_id = CardId::new(id)?;
     // The request's actor is semantic payload only; audit actor identity comes
     // from the authenticated transport and cannot be forged in JSON.
-    let _requested_actor = request.actor;
-    let card = lock_store(&state)?.check_criterion_as(
-        &card_id,
-        request.criterion,
-        &authenticated.principal,
-        request.checked.unwrap_or(true),
-        unix_now(),
-        &authenticated.authority(),
-    )?;
+    let _requested_actor = request.actor.clone();
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let card = lock_store(&state)?
+        .check_criterion_as_keyed(
+            &card_id,
+            request.criterion,
+            &request.actor,
+            request.checked.unwrap_or(true),
+            unix_now(),
+            idempotency_key,
+            &authenticated.authority(),
+        )?
+        .value;
     Ok(Json(card))
 }
 
@@ -1917,25 +1957,30 @@ async fn list_awaiting_input(
 async fn complete_card(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<CompleteRequest>,
 ) -> Result<Json<Card>, ApiError> {
     let card_id = CardId::new(id)?;
-    let card = lock_store(&state)?.complete_card(
-        &card_id,
-        request.proof.as_deref(),
-        request
-            .criterion_proofs
-            .unwrap_or_default()
-            .into_iter()
-            .map(|proof| CriterionProofInput {
-                criterion: proof.criterion,
-                url: proof.url,
-            })
-            .collect(),
-        unix_now(),
-        &actor.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let card = lock_store(&state)?
+        .complete_card_keyed(
+            &card_id,
+            request.proof.as_deref(),
+            request
+                .criterion_proofs
+                .unwrap_or_default()
+                .into_iter()
+                .map(|proof| CriterionProofInput {
+                    criterion: proof.criterion,
+                    url: proof.url,
+                })
+                .collect(),
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(card))
 }
 
