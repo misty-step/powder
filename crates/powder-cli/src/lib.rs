@@ -110,6 +110,7 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
 }
 
 fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    reject_admin_flag(args)?;
     match args {
         [] => Ok(help()),
         [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
@@ -314,7 +315,7 @@ pub fn help() -> String {
         "  powder relations-doctor --db ./data/powder.db  (report-only: relation asymmetry, malformed relation values, plus dangling/self/cycle/invalid parent edges; nested parents remain valid)\n",
     );
     help.push_str(
-        "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (audited relation mirror repair; malformed relation values stay unchanged; parent repair refuses with evidence)\n",
+        "  powder relations-doctor --db ./data/powder.db --repair  (audited relation mirror repair; malformed relation values stay unchanged; parent repair refuses with evidence)\n",
     );
     help.push_str(
         "    (--repair always ADDS missing relation mirrors, never invents parents; parent findings are refused with evidence because raw state has no unambiguous audited correction.)\n",
@@ -353,16 +354,15 @@ pub fn help() -> String {
     help.push_str("  powder subscription-list --db ./data/powder.db\n");
     help.push_str("  powder subscription-disable sub-id --db ./data/powder.db\n");
     help.push_str("  powder dead-letter-list --db ./data/powder.db\n");
-    help.push_str("  powder dead-letter-replay --db ./data/powder.db [--subscription sub-id]\n");
+    help.push_str("  powder dead-letter-replay --db ./data/powder.db --idempotency-key replay-001 [--subscription sub-id]\n");
     help.push_str("  powder event-tail --db ./data/powder.db --after 0 --limit 20\n");
     help.push_str(
         "  powder update-status 001 --db ./data/powder.db --status in_progress --actor codex\n\n",
     );
     help.push_str(
-        "authority:\n  add --actor <name> to audit status, relation, and completion changes. \
-         Claim impersonation and lease mutations (release/renew/heartbeat/request-input) still \
-         check the caller against the claim holder unless --admin is supplied. Omitting --actor \
-         keeps direct-DB-access trust and records unchecked audit events.\n\n",
+        "authority:\n  local mutations use POWDER_PRINCIPAL (or the fixed trusted local-cli admin principal). \
+         --actor, --author, and --agent are semantic audit labels only; they never grant authority. \
+         --admin is not accepted.\n\n",
     );
     help.push_str("api contract:\n");
     help.push_str(&powder_api::route_summary());
@@ -425,7 +425,9 @@ fn key_create(args: &[String]) -> Result<String, ShellError> {
         .unwrap_or(ApiKeyScope::Agent);
     let now = unix_now();
     let mut store = open_store(required_flag(args, "--db")?)?;
-    let key = store.create_api_key(name, scope, now).map_err(store_err)?;
+    let key = store
+        .create_api_key_with_authority(name, scope, now, &admin_authority(args))
+        .map_err(store_err)?;
 
     if show_secret {
         // The warning is for the human; stdout stays machine-readable so
@@ -480,7 +482,9 @@ fn key_revoke(args: &[String]) -> Result<String, ShellError> {
         .copied()
         .ok_or_else(|| ShellError::Invalid("key-revoke requires a key id".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    store.revoke_api_key(key_id, now).map_err(store_err)?;
+    store
+        .revoke_api_key_with_authority(key_id, now, &admin_authority(args))
+        .map_err(store_err)?;
     Ok(format!("revoked\t{key_id}\n"))
 }
 
@@ -828,11 +832,10 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
 /// the report before repairing.
 fn relations_doctor(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
-    let actor = flag_value(args, "--actor").unwrap_or("operator");
     let repair = has_flag(args, "--repair");
     let mut store = open_store(required_flag(args, "--db")?)?;
     let report = store
-        .relations_doctor(actor, now, repair)
+        .relations_doctor_with_authority(&admin_authority(args), now, repair)
         .map_err(store_err)?;
     to_pretty_json(&report)
 }
@@ -1854,7 +1857,12 @@ fn subscription_create(args: &[String]) -> Result<String, ShellError> {
     let url = required_flag(args, "--url")?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let created = store
-        .create_event_subscription(url, event_filter_flag(args)?, now)
+        .create_event_subscription_with_authority(
+            url,
+            event_filter_flag(args)?,
+            now,
+            &admin_authority(args),
+        )
         .map_err(store_err)?;
     if has_flag(args, "--show-secret") {
         Ok(format!(
@@ -1884,7 +1892,7 @@ fn subscription_disable(args: &[String]) -> Result<String, ShellError> {
         .ok_or_else(|| ShellError::Invalid("subscription-disable requires an id".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let subscription = store
-        .disable_event_subscription(subscription_id, now)
+        .disable_event_subscription_with_authority(subscription_id, now, &admin_authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "disabled\t{}\t{}\n",
@@ -1914,10 +1922,19 @@ fn dead_letter_list(args: &[String]) -> Result<String, ShellError> {
 fn dead_letter_replay(args: &[String]) -> Result<String, ShellError> {
     let mut store = open_store(required_flag(args, "--db")?)?;
     let subscription_id = flag_value(args, "--subscription");
+    let idempotency_key = required_flag(args, "--idempotency-key")?;
     let replayed = store
-        .replay_dead_letters(subscription_id, unix_now())
+        .replay_dead_letters_with_authority_keyed(
+            subscription_id,
+            unix_now(),
+            idempotency_key,
+            &admin_authority(args),
+        )
         .map_err(store_err)?;
-    to_pretty_json(&serde_json::json!({ "replayed": replayed }))
+    to_pretty_json(&serde_json::json!({
+        "replayed": replayed.value,
+        "replayed_delivery": replayed.replayed,
+    }))
 }
 
 fn event_tail(args: &[String]) -> Result<String, ShellError> {
@@ -2065,24 +2082,39 @@ fn criterion_flag(args: &[String]) -> Result<usize, ShellError> {
         .map_err(|err| ShellError::Invalid(format!("invalid --criterion {raw}: {err}")))
 }
 
-/// Build the `Authority` a mutation is checked against from `--actor` (and
-/// `--admin`). Omitting `--actor` preserves prior CLI behavior exactly: a
-/// direct-DB-access operator is trusted and no ownership check runs.
-fn authority(args: &[String]) -> Authority {
-    match flag_value(args, "--actor") {
-        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
-        None => Authority::actor("operator", true),
-    }
+/// Build the trusted process authority for a local SQLite mutation.
+///
+/// `--actor`, `--author`, and `--agent` are semantic audit inputs only; they
+/// never construct or elevate the authenticated principal. A deployment may set
+/// `POWDER_PRINCIPAL` in the trusted process environment. Otherwise the
+/// single-operator local CLI uses its fixed `local-cli` admin principal.
+fn local_authority() -> Authority {
+    let principal = std::env::var("POWDER_PRINCIPAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "local-cli".to_string());
+    Authority::principal(principal, true)
 }
 
-/// Repository registry writes are operator/admin mutations. Direct SQLite
-/// callers retain the local operator default, while an explicit actor must
-/// carry the admin capability rather than being inferred from its label.
-fn admin_authority(args: &[String]) -> Authority {
-    match flag_value(args, "--actor") {
-        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
-        None => Authority::actor("operator", true),
+fn authority(_args: &[String]) -> Authority {
+    local_authority()
+}
+
+fn admin_authority(_args: &[String]) -> Authority {
+    local_authority()
+}
+
+fn reject_admin_flag(args: &[String]) -> Result<(), ShellError> {
+    if args
+        .iter()
+        .any(|arg| arg == "--admin" || arg.starts_with("--admin="))
+    {
+        return Err(ShellError::Invalid(
+            "--admin is not accepted; authority comes from trusted process configuration"
+                .to_string(),
+        ));
     }
+    Ok(())
 }
 
 fn reject_principal_flag(args: &[String]) -> Result<(), ShellError> {
@@ -2205,7 +2237,6 @@ fn flag_takes_value(flag: &str) -> bool {
         "--dry-run"
             | "--show-secret"
             | "--redacted"
-            | "--admin"
             | "--include-hidden"
             | "--unchecked"
             | "--repair"
@@ -2896,7 +2927,6 @@ mod tests {
             "0",
             "--actor",
             "operator",
-            "--admin",
         ]))
         .unwrap();
         assert_eq!(checked, "criterion\tproof-plan\t0\tchecked\n");
@@ -3101,7 +3131,6 @@ mod tests {
             "canary",
             "--actor",
             "operator",
-            "--admin",
         ]))
         .unwrap();
         assert!(merged.contains("\"rehomed_cards\": 1"));
@@ -3159,7 +3188,6 @@ mod tests {
             &db,
             "--actor",
             "operator",
-            "--admin",
         ]))
         .unwrap();
         assert!(output.contains("\"scanned\": 1"), "output was: {output}");
@@ -3287,15 +3315,7 @@ mod tests {
             "report was: {report}"
         );
 
-        let repaired = run(&args([
-            "relations-doctor",
-            "--db",
-            &db,
-            "--repair",
-            "--actor",
-            "operator",
-        ]))
-        .unwrap();
+        let repaired = run(&args(["relations-doctor", "--db", &db, "--repair"])).unwrap();
         assert!(
             repaired.contains("\"issues\": []"),
             "report was: {repaired}"
@@ -3398,6 +3418,23 @@ mod tests {
         assert!(card.contains("\"agent\": \"codex\""));
         assert!(card.contains("\"model\": \"claude-sonnet-5\""));
         assert!(card.contains("\"body\": \"tracing the claim expiry bug\""));
+    }
+
+    #[test]
+    fn cli_rejects_removed_admin_flag_before_mutation() {
+        let err = run(&args([
+            "update-status",
+            "card",
+            "--status",
+            "ready",
+            "--admin",
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ShellError::Invalid(message)
+                if message == "--admin is not accepted; authority comes from trusted process configuration"
+        ));
     }
 
     #[test]
@@ -3583,7 +3620,14 @@ mod tests {
         let listed = run(&args(["dead-letter-list", "--db", &db])).unwrap();
         assert!(listed.contains("\"event_type\": \"completed\""));
 
-        let replayed = run(&args(["dead-letter-replay", "--db", &db])).unwrap();
+        let replayed = run(&args([
+            "dead-letter-replay",
+            "--db",
+            &db,
+            "--idempotency-key",
+            "replay-001",
+        ]))
+        .unwrap();
         assert!(replayed.contains("\"replayed\": 1"));
 
         let listed_after = run(&args(["dead-letter-list", "--db", &db])).unwrap();
@@ -3591,7 +3635,14 @@ mod tests {
 
         // A second replay with nothing left dead-lettered is a legitimate
         // no-op, not an error.
-        let replayed_again = run(&args(["dead-letter-replay", "--db", &db])).unwrap();
+        let replayed_again = run(&args([
+            "dead-letter-replay",
+            "--db",
+            &db,
+            "--idempotency-key",
+            "replay-002",
+        ]))
+        .unwrap();
         assert!(replayed_again.contains("\"replayed\": 0"));
     }
 
@@ -4006,7 +4057,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_actor_flag_enforces_claim_holder_like_http_and_mcp() {
+    fn cli_actor_flag_is_semantic_for_local_admin_corrections() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-holder-{}.db",
             std::time::SystemTime::now()
@@ -4067,7 +4118,7 @@ mod tests {
         .unwrap();
         assert!(completed.contains("completed\tholder-test\tdone"));
         let card = run(&args(["get-card", "holder-test", "--db", &db])).unwrap();
-        assert!(card.contains("\"actor\": \"intruder\""));
+        assert!(card.contains("\"actor\": \"local-cli\""));
         assert!(card.contains("in_progress -> done"));
     }
 
@@ -4123,7 +4174,7 @@ mod tests {
         let card = run(&args(["get-card", "relation-test", "--db", &db])).unwrap();
         assert!(card.contains("\"related\": [\n      \"peer-c\""));
         assert!(card.contains("\"blocked_by\": [\n      \"parent-a\""));
-        assert!(card.contains("\"actor\": \"operator\""));
+        assert!(card.contains("\"actor\": \"local-cli\""));
     }
 
     #[test]

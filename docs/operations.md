@@ -102,6 +102,8 @@ never an error.
 
 Rollup `coverage` is the full visibility-scoped parent-graph classification/reachability envelope. A row's `status_counts` covers only its root epic's direct children or its parentless leaf itself (parentless leaves are grouped into repository `Unsorted` rows), so nested-epic row sums do not have to equal `coverage.accounted_cards`.
 
+Local SQLite CLI mutations authenticate as the trusted process principal from `POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin process principal is used. `--actor`, `--author`, and `--agent` are semantic audit labels only, and `--admin` is rejected.
+
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
 falling back to ephemeral state. `update-relations`, `set-parent`, `get-run`,

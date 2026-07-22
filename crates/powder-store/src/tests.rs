@@ -3010,7 +3010,8 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
         [],
     )?;
 
-    let report = store.relations_doctor("operator", 50, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 50, false)?;
     assert_eq!(report.scanned, 2);
     assert_eq!(report.issue_count(), 1);
     let issue = &report.issues[0];
@@ -3026,7 +3027,8 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
         .expect("x detail");
     assert!(x_detail.card.blocked_by.is_empty());
 
-    let repaired = store.relations_doctor("operator", 60, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 60, true)?;
     assert_eq!(repaired.issue_count(), 1);
     assert!(repaired.issues[0].repaired);
 
@@ -3041,7 +3043,8 @@ fn relations_doctor_reports_seeded_asymmetry_and_repair_fixes_it() -> Result<()>
     }));
 
     // Idempotent: nothing left to repair.
-    let second = store.relations_doctor("operator", 70, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 70, true)?;
     assert_eq!(second.issue_count(), 0);
     Ok(())
 }
@@ -3132,13 +3135,15 @@ fn parent_graph_doctor_classifies_corruption_and_refuses_ambiguous_repair() -> R
     assert_eq!(assignment("middle").ancestor_id.as_deref(), Some("epic"));
     assert_eq!(assignment("leaf").ancestor_id.as_deref(), Some("epic"));
 
-    let report = store.relations_doctor("operator", 30, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 30, false)?;
     assert_eq!(report.scanned, 10);
     assert_eq!(report.parent_issues, graph.issues);
     assert!(report.parent_repair_refusal.is_none());
     assert!(!report.repaired);
 
-    let repaired = store.relations_doctor("operator", 31, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 31, true)?;
     assert_eq!(repaired.parent_issues, graph.issues);
     assert!(repaired.parent_issues.iter().all(|issue| !issue.repaired));
     assert!(repaired
@@ -3218,14 +3223,16 @@ fn relations_doctor_repairs_mirrors_when_parent_repair_is_refused() -> Result<()
          UPDATE cards SET blocks_json = '[\"target\"]' WHERE id = 'source';",
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.issues.len(), 1);
     assert_eq!(report.issues[0].card_id.as_deref(), Some("source"));
     assert_eq!(report.issues[0].target_id.as_deref(), Some("target"));
     assert_eq!(report.parent_issues.len(), 1);
     assert!(report.parent_repair_refusal.is_none());
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert_eq!(repaired.issues.len(), 1);
     assert!(repaired.issues[0].repaired);
     assert!(repaired
@@ -3239,7 +3246,8 @@ fn relations_doctor_repairs_mirrors_when_parent_repair_is_refused() -> Result<()
     )?;
     assert_eq!(target_blocked_by, "[\"source\"]");
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert!(second.issues.is_empty());
     assert_eq!(second.parent_issues.len(), 1);
     assert!(second.parent_repair_refusal.is_some());
@@ -3323,7 +3331,8 @@ fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<
         |row| row.get(0),
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.parent_issues.len(), 2);
     assert_eq!(report.issues.len(), 3);
     assert!(report.issues.iter().any(|issue| {
@@ -3342,7 +3351,8 @@ fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<
             && issue.target_id.as_deref() == Some("target")
     }));
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert!(repaired.parent_repair_refusal.is_some());
     assert!(repaired
         .issues
@@ -3372,7 +3382,8 @@ fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<
     assert_eq!(after_malformed, before_malformed);
     assert_eq!(after_invalid, before_invalid);
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert_eq!(second.issues.len(), 2);
     assert!(second
         .issues
@@ -3402,7 +3413,8 @@ fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
         |row| row.get(0),
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.issues.len(), 1);
     assert_eq!(
         report.issues[0].kind,
@@ -3411,7 +3423,8 @@ fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
     assert_eq!(report.issues[0].field, RelationField::Blocks);
     assert!(report.issues[0].evidence.contains("not a text id"));
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert_eq!(repaired.issues.len(), 1);
     assert!(!repaired.issues[0].repaired);
     let source_after: String = store.connection.query_row(
@@ -3427,7 +3440,8 @@ fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
     assert_eq!(source_after, source_before);
     assert_eq!(target_after, target_before);
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert_eq!(second.issues.len(), 1);
     assert!(!second.issues[0].repaired);
     Ok(())
@@ -3453,7 +3467,8 @@ fn reciprocal_mixed_field_stays_indeterminate() -> Result<()> {
         |row| row.get(0),
     )?;
 
-    let report = store.relations_doctor("operator", 20, false)?;
+    let report =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 20, false)?;
     assert_eq!(report.issues.len(), 1);
     assert_eq!(
         report.issues[0].kind,
@@ -3462,7 +3477,8 @@ fn reciprocal_mixed_field_stays_indeterminate() -> Result<()> {
     assert_eq!(report.issues[0].card_id.as_deref(), Some("alpha"));
     assert_eq!(report.issues[0].field, RelationField::Blocks);
 
-    let repaired = store.relations_doctor("operator", 21, true)?;
+    let repaired =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 21, true)?;
     assert_eq!(repaired.issues.len(), 1);
     assert!(!repaired.issues[0].repaired);
     let after_alpha: String = store.connection.query_row(
@@ -3478,7 +3494,8 @@ fn reciprocal_mixed_field_stays_indeterminate() -> Result<()> {
     assert_eq!(after_alpha, before_alpha);
     assert_eq!(after_beta, before_beta);
 
-    let second = store.relations_doctor("operator", 22, true)?;
+    let second =
+        store.relations_doctor_with_authority(&Authority::actor("operator", true), 22, true)?;
     assert_eq!(second.issues.len(), 1);
     assert_eq!(
         second.issues[0].kind,

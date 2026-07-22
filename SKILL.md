@@ -321,6 +321,8 @@ cargo test --workspace
 - Do not treat exit zero as completion without a status update and audit trail.
 
 
+Local CLI mutations use the trusted process principal from `POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin process principal is used. `--actor`, `--author`, and `--agent` are semantic labels only, and `--admin` is rejected.
+
 Local MCP also requires trusted launch identity before it can mutate a local
 SQLite instance. Set `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent|admin` in the MCP process environment. A missing or invalid
 identity returns an unauthenticated error; MCP never defaults to operator or

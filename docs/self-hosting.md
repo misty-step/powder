@@ -436,6 +436,10 @@ and key-rotation lore live in
 [`docs/operations.md`](operations.md#cli-remote-mode-transport).
 
 
+### Local CLI and MCP authority
+
+A local `powder` mutation uses the trusted process principal from `POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin principal is used. `--actor`, `--author`, and `--agent` are semantic labels only. The CLI rejects `--admin`; authority cannot be selected through command arguments.
+
 ### Local MCP authority
 
 A local `powder-mcp` process must receive identity from its trusted launch/session,
