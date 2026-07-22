@@ -864,10 +864,7 @@ fn ready_page_payload(page: &powder_store::CardListPage) -> Value {
         "has_more": page.ready_cursor.is_some(),
     });
     if page.ready_cursor.is_some() {
-        payload["hint"] = json!(format!(
-            "{} more cards; continue with next_after",
-            page.total_count.saturating_sub(page.cards.len())
-        ));
+        payload["hint"] = json!("more cards; continue with next_after");
     }
     if !page.cycle_card_ids.is_empty() {
         payload["cycle_card_ids"] = json!(page.cycle_card_ids);
@@ -2590,7 +2587,7 @@ mod tests {
         assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
         assert_eq!(payload["total_count"], 3);
         assert_eq!(payload["has_more"], true);
-        assert_eq!(payload["hint"], "2 more cards; continue with next_after");
+        assert_eq!(payload["hint"], "more cards; continue with next_after");
     }
 
     #[test]

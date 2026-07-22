@@ -81,8 +81,8 @@ curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
 Production runs one Rust service (`powder-server`) on a DigitalOcean droplet.
 SQLite lives at `/data` on a host volume with WAL enabled. Litestream
 replication is optional, and ingress is through the tailnet. In `api-key` mode,
-read routes require a valid bearer key by default; set `POWDER_PUBLIC_READS=true`
-only on a genuinely private tailnet perimeter. See
+read routes require a valid bearer key by default; `POWDER_PUBLIC_READS=true` is
+loopback-only and is rejected on non-loopback binds. See
 [`docs/operations.md`](docs/operations.md) for the full read-auth posture and
 rollout runbook.
 

@@ -97,6 +97,20 @@ for (const mode of MODES) {
     await assertLaw(page, { consoleErrors: errors });
   });
 
+
+  test(`board filters · ${mode} · estimate and risk apply to every lane`, async ({ page }) => {
+    const errors = await boot(page, mode);
+    await page.locator("#filter-btn").click();
+    await page.locator("#fg-estimate [data-estimates='s']").click();
+    await expect(page.locator("#lane-ready [data-id='001']")).toBeVisible();
+    await expect(page.locator("#lane-done [data-id='done-card']")).toHaveCount(0);
+    await page.locator("#fg-risk [data-risks='high']").click();
+    await expect(page.locator("#lane-ready [data-id='blocked-card']")).toBeVisible();
+    await expect(page.locator("#lane-ready [data-id='001']")).toHaveCount(0);
+    await expect(page.locator("#lane-done")).not.toContainText("done-card");
+    await assertLaw(page, { consoleErrors: errors });
+  });
+
   test(`board settings page · ${mode} · the law holds`, async ({ page }) => {
     const errors = await boot(page, mode);
     await page.locator("#settings-toggle").click();

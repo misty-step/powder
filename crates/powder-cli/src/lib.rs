@@ -905,7 +905,6 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let raw_after = flag_value(args, "--after");
     let payload = if let Some(db) = flag_value(args, "--db") {
         let after = raw_after
-            .as_deref()
             .map(|raw| ReadyCursor::decode_for_query(raw, &query))
             .transpose()
             .map_err(|err| ShellError::Invalid(err.to_string()))?;

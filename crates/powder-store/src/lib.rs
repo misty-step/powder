@@ -323,8 +323,8 @@ pub struct CardListPage {
     /// last page, or whenever the eligible set already fits within
     /// `limit`.
     pub next_after: Option<CardId>,
-    /// Encoded Ready continuation when the page needs a stable snapshot.
-    /// List-cards callers continue to use `next_after` unchanged.
+    /// Encoded durable Ready continuation when the page needs another page.
+    /// The v3 token is opaque and store-backed; it contains no card IDs.
     pub ready_cursor: Option<String>,
 }
 
@@ -2418,25 +2418,11 @@ impl Store {
         self.list_ready_page_after(query, None)
     }
 
-    /// Continuation-aware variant of [`Store::list_ready_page`] --
-    /// unchanged when `after` is `None` (delegated to by `list_ready_page`
-    /// itself), used directly by the HTTP `/api/v1/cards/ready` route to
-    /// resume past a prior page (powder-cards-api-paged-continuation).
-    ///
-    /// `after`, when set, must be the id of a card present in the *same*
-    /// eligibility-filtered, topologically-ordered list this call
-    /// recomputes from scratch (typically the opaque cursor anchor from a
-    /// prior call on this store returned); an id absent from that list --
-    /// never existed, no longer ready-eligible, or filtered by different
-    /// `query` parameters than the prior call used -- is rejected with a
-    /// validation error rather than silently resuming from the start or
-    /// skipping cards. This is an *interim* continuation over an
-    /// already-materialized in-memory list this call still fully
-    /// recomputes (full table scan, then eligibility filter, then
-    /// topological order) every time -- it bounds response payload size,
-    /// not per-request DB/CPU cost; see [`CardListPage::next_after`] and
-    /// the separate `powder-store-sql-pushed-list-filtering` follow-up for
-    /// what actually fixes that cost.
+    /// Continuation-aware Ready listing. A first page materializes a durable
+    /// SQLite snapshot when more cards remain; follow-up pages use the opaque
+    /// v3 cursor position, skip departed cards, and append new arrivals after
+    /// captured positions. The HTTP bare-card-id fallback is the only legacy
+    /// path and is never emitted by this Store.
     pub fn list_ready_page_after(
         &self,
         query: ReadyQuery,

@@ -253,11 +253,7 @@ profiles:
 
 ## Paging `/api/v1/cards` and `/api/v1/cards/ready` beyond `limit` (powder-cards-api-paged-continuation)
 
-Both list routes cap a single response to `limit` cards (default 20).
-Historically that was a hard wall: a caller could only ever see the first
-`limit` cards of the response's own order, with no way to reach the rest
-short of raising `limit` arbitrarily high. An optional `after` query param
-now lets a caller resume past a prior response instead:
+Both list routes cap one response to `limit` cards (default 20). Callers may pass the response's opaque `next_after` value to reach later pages:
 
 ```
 GET /api/v1/cards?limit=20
@@ -265,41 +261,13 @@ GET /api/v1/cards?limit=20&after=<next_after-from-the-previous-response>
 GET /api/v1/cards/ready?limit=20&after=<next_after-from-the-previous-response>
 ```
 
-Each response includes `next_after` -- an opaque continuation cursor to pass as
-`after` on the following request -- whenever more cards remain beyond the page
-just returned; it is omitted once a caller has reached the end. Ready cursors
-bind the query filters and preserve the prior order snapshot, so callers must
-treat the value as an opaque string. Omitting `after`
-entirely reproduces the historical first-page response byte-for-byte (same
-cards, same order, same `has_more`) -- `after`/`next_after` are purely
-additive, so every existing caller (the CLI's `list-cards`/`list-ready`,
-`powder-mcp`'s `list_cards`/`list_ready` tools, and any script that never
-sends `after`) is unaffected.
+Ready pages use a durable, store-backed v3 snapshot cursor. Its URL token contains only the query-filter fingerprint, an opaque snapshot identifier, and a bounded position; it never contains card IDs or the eligible set. The snapshot is persisted in SQLite, survives process restart, binds repository/estimate/risk/priority filters, and expires after a bounded retention window. Expired, unknown, malformed, or query-mismatched cursors return `400 Bad Request`.
 
-**Read this as an interim continuation, not scale-proof pagination.** Both
-routes still do a full, unfiltered table scan and rebuild the entire
-filtered/sorted (or, for `/ready`, topologically-ordered) list in memory on
-*every* call, `after` or not -- `after` only tells that freshly-recomputed
-list where to resume slicing, so it bounds response *payload size*, not
-per-request DB/CPU cost. `after` also has no special resilience to
-concurrent writes between page fetches: it names a specific card id and
-resumes strictly after that id's position in whatever the list looks like
-*at the moment of the follow-up call*. If that id is no longer part of the
-eligible set -- deleted, filtered out by different query params than the
-prior call used, or (for `/ready`) gone ineligible since -- the request
-fails with `400 Bad Request` naming the stale token, rather than silently
-resuming from the start or skipping cards. The separate,
-deliberately-deferred `powder-store-sql-pushed-list-filtering` card is what
-pushes the filtering and ordering into SQL and actually bounds the
-per-request cost on a large board; until that lands, `after` only helps you
-reach cards beyond `limit`, it does not make a large board cheaper to page
-through.
+The captured Ready order is immutable. A card claimed, deleted, or otherwise no longer eligible before a later page is skipped without moving the cursor backwards or requiring the departed anchor. Cards that become eligible after page one are appended after the captured positions in the current dependency order. This gives a lossless walk: no duplicate or omission from departures, cycles remain reported, and mid-walk arrivals do not reorder already captured work. Retrying the same cursor is deterministic because the position is carried in the token, not mutable shared state.
 
-`has_more` keeps its historical meaning (it compares `total_count` against
-*this* page's size) and was never position-aware across pages -- it only
-ever gives a correct "more exists" answer on a request with no `after`.
-Once you're walking pages with `after`, use `next_after`'s presence or
-absence to decide whether to keep going.
+The documented HTTP bare-card-id `after` form remains a narrow compatibility fallback. New Ready responses always return v3 cursors. CLI remote calls forward `after` unchanged; only local SQLite calls decode it before entering Store. MCP local and remote calls use the same opaque value.
+
+Ready `has_more` and `next_after` are position-aware. Continue while `next_after` is present; `total_count` reports the current eligible count and may change as claims or arrivals occur. Plain `/api/v1/cards` continuation retains its existing card-id behavior and does not receive Ready snapshot semantics.
 
 ## Self-Hosting
 
@@ -332,9 +300,9 @@ POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
 ```
 
 Board read routes require `Authorization: Bearer <key>` in `api-key` mode
-unless `POWDER_PUBLIC_READS=true` is explicitly set. Set that flag only when
-the deployment's listener is genuinely private (e.g. Flycast/Tailscale internal
-ingress with no public path). Mutations, card status and relation changes,
+unless `POWDER_PUBLIC_READS=true` is explicitly set on a loopback bind.
+Non-loopback listeners reject that combination before listen, regardless of an
+upstream private perimeter. Mutations, card status and relation changes,
 claim lifecycle, card authoring, comments, links, answer-loop writes, and key
 management always require a bearer key in `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
@@ -392,16 +360,15 @@ use a valid bearer key as the explicit same-box fallback.
 
 **Fail-closed read posture (powder-public-read-posture, 2026-07-15):**
 `api-key` mode now requires a valid bearer key for every read route by
-default. The legacy private-perimeter behavior — where board reads were
-reachable without a key — is preserved only under the explicit escape hatch
-`POWDER_PUBLIC_READS=true`. Use that flag only when the listener is genuinely
-private (e.g. Flycast/Tailscale internal ingress with no public path). New
-deployments should leave it unset.
+default. The legacy keyless-read behavior is preserved only under the explicit escape
+hatch `POWDER_PUBLIC_READS=true` on a loopback bind. Non-loopback listeners
+reject that combination before listen; a private upstream perimeter does not
+change Powder's direct trust boundary. New deployments should leave it unset.
 
 **Rollout runbook for an existing private-perimeter instance:**
 
-1. Deploy the new binary with `POWDER_PUBLIC_READS=true` and confirm reads
-   still work for existing keyless readers.
+1. Keep non-loopback ingress authenticated; do not set `POWDER_PUBLIC_READS=true`
+   on a private perimeter.
 2. Inventory every keyless reader (board UI phone clients, Glass, dashboard
    panels, automation cron jobs) and mint a scoped key for each over
    `POST /api/v1/keys` (admin scope required). The raw secret prints once.

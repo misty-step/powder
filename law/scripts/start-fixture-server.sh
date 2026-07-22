@@ -18,15 +18,15 @@ export PORT="${PORT:-4100}"
 export POWDER_HOME_URL="https://sanctum.example.test"
 
 cargo run -q -p powder-cli -- init-db --db "$DB" >/dev/null
-cargo run -q -p powder-cli -- create-card --db "$DB" --id 001 --title "Lifecycle example card" --acceptance "proof exists" --status ready >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id 001 --title "Lifecycle example card" --acceptance "proof exists" --status ready --estimate s --risk low >/dev/null
 # powder-status-vocabulary: `blocked` is not a status -- a blocked card is a
 # ready card with an unresolved blocked_by relation. The blocker card stays
 # non-terminal (ready, NOT backlog: a backlog blocker would land first in the
 # rail and break board-card-link's "first card is 001" assumption) so the
 # board's derived BLOCKED strip has a real row.
-cargo run -q -p powder-cli -- create-card --db "$DB" --id blocked-card --title "Blocked card" --acceptance "dependency clears" --status ready --blocked-by blocker-dep >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id blocked-card --title "Blocked card" --acceptance "dependency clears" --status ready --estimate s --risk high --blocked-by blocker-dep >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id blocker-dep --title "Dependency the blocked card waits on" --acceptance "dependency work completes" --status ready >/dev/null
-cargo run -q -p powder-cli -- create-card --db "$DB" --id done-card --title "Done card" --acceptance "proof exists" --status done >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id done-card --title "Done card" --acceptance "proof exists" --status done --estimate l --risk high >/dev/null
 
 # powder-915: init-db seeds ~24 "ratified tier" repository entities
 # (powder-916), every one of them at card_count 0 until something is filed

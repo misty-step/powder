@@ -1747,6 +1747,8 @@ function passes(card) {
   if (card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
   if (state.filters.repos.size && !state.filters.repos.has(card.repoKey)) return false;
   if (state.filters.prios.size && !state.filters.prios.has(cleanPriority(card.priority))) return false;
+  if (state.filters.estimates.size && !state.filters.estimates.has(String(card.estimate || "").toLowerCase())) return false;
+  if (state.filters.risks.size && !state.filters.risks.has(String(card.risk || "").toLowerCase())) return false;
   const query = state.filters.search.trim();
   if (!query) return true;
   return groupedSearchMatches(state.searchMatches).some((match) => match.card.id === card.id);
@@ -1794,10 +1796,7 @@ function hasUnresolvedBlocker(card, cardsById) {
 }
 
 function passesReady(card) {
-  if (!passes(card)) return false;
-  if (state.filters.estimates.size && !state.filters.estimates.has(String(card.estimate || "").toLowerCase())) return false;
-  if (state.filters.risks.size && !state.filters.risks.has(String(card.risk || "").toLowerCase())) return false;
-  return true;
+  return passes(card);
 }
 
 function bucket() {
