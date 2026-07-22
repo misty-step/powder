@@ -14,9 +14,11 @@ pub use card_fields::{
 pub use model::{
     clean_list, AcceptanceCriterion, Activity, ActivityId, ActivityType, ApprovalQueueRow,
     AttachmentMeta, Authority, AwaitingInput, Card, CardDetail, CardEvent, CardEventId, CardId,
-    CardSource, CardStatus, CardSummary, Claim, ClaimSummary, Comment, CriterionProof, DetailLevel,
-    DomainError, EpicEvidence, EpicFreshness, EpicState, Estimate, EvidenceKind, Link, LinkId,
-    Priority, Risk, Run, RunDetail, RunId, RunState, WorkLogEntry,
+    CardSource, CardStatus, CardSummary, Claim, ClaimRequirement, ClaimSummary, Comment,
+    CriterionProof, DenialClass, DetailLevel, DomainError, EpicEvidence, EpicFreshness, EpicState,
+    Estimate, EvidenceKind, IdempotencyMode, IdentityRequirement, Link, LinkId, Operation,
+    OperationCapability, OperationRule, Priority, Risk, Run, RunDetail, RunId, RunState,
+    WorkLogEntry,
 };
 pub use queries::{ClaimReceipt, ReadyCursor, ReadyQuery};
 pub use ready_order::{

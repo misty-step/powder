@@ -2682,7 +2682,8 @@ impl From<powder_core::DomainError> for ApiError {
                     message: value.to_string(),
                 }
             }
-            powder_core::DomainError::Forbidden(_) => Self {
+            powder_core::DomainError::Forbidden(_)
+            | powder_core::DomainError::AuthorityDenied { .. } => Self {
                 status: StatusCode::FORBIDDEN,
                 message: value.to_string(),
             },
