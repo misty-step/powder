@@ -2501,14 +2501,9 @@ impl Store {
                     replayed.push(card);
                 }
             }
-            replayed.extend(by_id.into_values());
-            replayed.sort_by(|left, right| {
-                let left_pos = cursor.snapshot.iter().position(|id| id == &left.id);
-                let right_pos = cursor.snapshot.iter().position(|id| id == &right.id);
-                left_pos
-                    .cmp(&right_pos)
-                    .then_with(|| powder_core::ready_sort_cmp(left, right))
-            });
+            let mut arrivals = by_id.into_values().collect::<Vec<_>>();
+            arrivals.sort_by(powder_core::ready_sort_cmp);
+            replayed.extend(arrivals);
             ordered_cards = replayed;
         }
         let snapshot = ordered_cards

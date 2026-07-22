@@ -1270,7 +1270,10 @@ fn card_list_page_json(
     next_after: Option<CardId>,
     ready_cursor: Option<String>,
 ) -> serde_json::Value {
-    let has_more = total_count > cards.len();
+    // `next_after` is the continuation authority. The page length alone
+    // cannot answer whether this cursor walk has another page because
+    // `total_count` remains the full match count on every page.
+    let has_more = next_after.is_some();
     let mut payload = json!({
         "cards": cards,
         "total_count": total_count,
@@ -1294,13 +1297,7 @@ fn card_list_page_json(
     // powder-cards-api-paged-continuation: present only when the
     // already-computed, already-ordered list this call built has more
     // cards beyond this page -- pass it back as `after` on the next
-    // request to fetch the next slice of that SAME order. `has_more`
-    // above keeps its historical meaning (it compares `total_count`
-    // against *this* page's length and was never position-aware across
-    // pages, by construction -- it only ever gave a correct "more exists"
-    // answer for a request with no `after`); `next_after`'s
-    // presence/absence is the authoritative "is there another page"
-    // answer once a caller is walking pages with `after`.
+    // request to fetch the next slice of that SAME order.
     if let Some(next_after) = next_after {
         payload["next_after"] = json!(ready_cursor.unwrap_or_else(|| next_after.to_string()));
     }

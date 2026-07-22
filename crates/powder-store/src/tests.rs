@@ -1,6 +1,6 @@
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, Risk, RunId, RunState,
+    DetailLevel, DomainError, Estimate, Priority, ReadyCursor, ReadyQuery, Risk, RunId, RunState,
 };
 
 use crate::schema::SCHEMA;
@@ -1286,6 +1286,58 @@ fn list_ready_orders_by_priority_then_age_then_id() -> Result<()> {
         vec!["p0-early", "p0-mid", "p0-mid-b", "p0-late", "p1-early"],
         "expected priority asc, then created_at asc, then id asc"
     );
+    Ok(())
+}
+
+#[test]
+fn list_ready_continuation_keeps_mid_walk_arrivals_after_snapshot() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("old-1", 1),
+        ready_card("old-2", 2),
+        ready_card("old-3", 3),
+        ready_card("old-4", 4),
+    ])?;
+
+    let query = ReadyQuery::new(100, 2);
+    let first = store.list_ready_page(query.clone())?;
+    let first_ids = first
+        .cards
+        .iter()
+        .map(|card| card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(first_ids, vec!["old-1", "old-2"]);
+    let first_cursor = ReadyCursor::decode_for_query(
+        first.ready_cursor.as_deref().expect("first page cursor"),
+        &query,
+    )?;
+
+    // This card would sort before the anchor in a freshly rebuilt list. It
+    // must be placed after the prior snapshot so the continuation cannot
+    // skip it permanently.
+    store.import_cards(vec![ready_card("arrived-before-anchor", 0)])?;
+
+    let second = store.list_ready_page_after(query.clone(), Some(&first_cursor))?;
+    let second_ids = second
+        .cards
+        .iter()
+        .map(|card| card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(second_ids, vec!["old-3", "old-4"]);
+    let second_cursor = ReadyCursor::decode_for_query(
+        second.ready_cursor.as_deref().expect("second page cursor"),
+        &query,
+    )?;
+
+    let third = store.list_ready_page_after(query, Some(&second_cursor))?;
+    let third_ids = third
+        .cards
+        .iter()
+        .map(|card| card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(third_ids, vec!["arrived-before-anchor"]);
+    assert!(third.ready_cursor.is_none());
     Ok(())
 }
 
