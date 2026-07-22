@@ -100,6 +100,62 @@ pub struct Store {
     field_note_config: Option<FieldNoteConfig>,
 }
 
+/// Durable request identity for a keyed mutation. The digest is computed from
+/// the complete semantic payload before the mutation enters a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRequest {
+    pub operation: Operation,
+    pub resource: String,
+    pub principal: String,
+    pub key: String,
+    pub payload_digest: String,
+    pub now: i64,
+    pub expires_at: i64,
+}
+
+impl IdempotencyRequest {
+    pub fn from_payload<P: Serialize>(
+        operation: Operation,
+        resource: impl Into<String>,
+        authority: &Authority,
+        key: impl Into<String>,
+        payload: &P,
+        now: i64,
+        ttl_seconds: i64,
+    ) -> Result<Self> {
+        let payload = serde_json::to_vec(payload)?;
+        let resource = non_empty("resource", &resource.into())?;
+        let principal = authority
+            .principal_name()
+            .ok_or_else(|| {
+                DomainError::authority_denied(
+                    DenialClass::Unauthenticated,
+                    "keyed mutations require an authenticated principal",
+                )
+            })?
+            .to_string();
+        let key = non_empty("idempotency_key", &key.into())?;
+        if ttl_seconds <= 0 {
+            return Err(DomainError::validation("ttl_seconds", "must be positive").into());
+        }
+        Ok(Self {
+            operation,
+            resource,
+            principal,
+            key,
+            payload_digest: format!("sha256:{:x}", Sha256::digest(payload)),
+            now,
+            expires_at: now.saturating_add(ttl_seconds),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyOutcome<T> {
+    pub value: T,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     pub q: String,
@@ -530,9 +586,14 @@ pub struct WorkLogAttribution<'a> {
 }
 
 struct MutationAudit<'a> {
+    operation: Operation,
     event_type: &'a str,
     actor: &'a str,
     payload: &'a str,
+    resource: &'a str,
+    semantic_identity: Option<&'a str>,
+    run_id: Option<&'a RunId>,
+    reason: Option<&'a str>,
     subject_kind: &'a str,
     subject_id: &'a str,
     authority: &'a Authority,
@@ -749,11 +810,124 @@ impl Store {
                     self.migrate_25_to_26()?;
                     26
                 }
+                26 => {
+                    self.migrate_26_to_27()?;
+                    27
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
                 .execute_batch(&format!("PRAGMA user_version = {next}"))?;
         }
+    }
+
+    /// Execute one keyed mutation and persist its receipt in the same
+    /// transaction as the mutation. Immediate locking serializes duplicate
+    /// deliveries, so a replay returns the original value without running the
+    /// mutation closure again; a different payload under the same key returns a
+    /// stable structured idempotency_conflict denial.
+    pub fn with_idempotency<T, F>(
+        &mut self,
+        request: &IdempotencyRequest,
+        mutation: F,
+    ) -> Result<IdempotencyOutcome<T>>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce(&Transaction<'_>) -> Result<T>,
+    {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM operation_idempotency
+             WHERE operation = ?1 AND resource = ?2 AND principal = ?3
+               AND idempotency_key = ?4 AND expires_at <= ?5",
+            params![
+                request.operation.as_str(),
+                request.resource,
+                request.principal,
+                request.key,
+                request.now,
+            ],
+        )?;
+        let existing = transaction
+            .query_row(
+                "SELECT payload_digest, receipt_json
+                 FROM operation_idempotency
+                 WHERE operation = ?1 AND resource = ?2 AND principal = ?3
+                   AND idempotency_key = ?4",
+                params![
+                    request.operation.as_str(),
+                    request.resource,
+                    request.principal,
+                    request.key,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((digest, receipt_json)) = existing {
+            if digest != request.payload_digest {
+                return Err(DomainError::authority_denied(
+                    DenialClass::IdempotencyConflict,
+                    format!(
+                        "idempotency key already records a different payload for {} {}",
+                        request.operation.as_str(),
+                        request.resource
+                    ),
+                )
+                .into());
+            }
+            let value = serde_json::from_str(&receipt_json)?;
+            transaction.commit()?;
+            return Ok(IdempotencyOutcome {
+                value,
+                replayed: true,
+            });
+        }
+        let value = mutation(&transaction)?;
+        let receipt_json = serde_json::to_string(&value)?;
+        transaction.execute(
+            "INSERT INTO operation_idempotency
+             (operation, resource, principal, idempotency_key, payload_digest,
+              receipt_json, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                request.operation.as_str(),
+                request.resource,
+                request.principal,
+                request.key,
+                request.payload_digest,
+                receipt_json,
+                request.now,
+                request.expires_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(IdempotencyOutcome {
+            value,
+            replayed: false,
+        })
+    }
+
+    /// Remove expired request receipts. This is bounded so an operator can run
+    /// it safely from a maintenance loop without monopolizing the store.
+    pub fn gc_idempotency(&mut self, now: i64, limit: usize) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM operation_idempotency
+             WHERE rowid IN (
+                 SELECT rowid FROM operation_idempotency
+                 WHERE expires_at <= ?1 ORDER BY expires_at ASC, rowid ASC LIMIT ?2
+             )",
+            params![now, limit as i64],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Searches through the FTS spine with SQL-side ranking, filtering, and
@@ -1705,6 +1879,54 @@ impl Store {
         self.ensure_principal_role_columns()
     }
 
+    fn migrate_26_to_27(&mut self) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (column, sql) in [
+            (
+                "operation",
+                "ALTER TABLE card_events ADD COLUMN operation TEXT;",
+            ),
+            (
+                "resource",
+                "ALTER TABLE card_events ADD COLUMN resource TEXT;",
+            ),
+            (
+                "semantic_identity",
+                "ALTER TABLE card_events ADD COLUMN semantic_identity TEXT;",
+            ),
+            ("run_id", "ALTER TABLE card_events ADD COLUMN run_id TEXT;"),
+            ("reason", "ALTER TABLE card_events ADD COLUMN reason TEXT;"),
+        ] {
+            let present: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('card_events') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                transaction.execute_batch(sql)?;
+            }
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS operation_idempotency (
+               operation TEXT NOT NULL,
+               resource TEXT NOT NULL,
+               principal TEXT NOT NULL,
+               idempotency_key TEXT NOT NULL,
+               payload_digest TEXT NOT NULL,
+               receipt_json TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL,
+               PRIMARY KEY(operation, resource, principal, idempotency_key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_operation_idempotency_expires
+               ON operation_idempotency(expires_at);",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn migrate_25_to_26(&self) -> Result<()> {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS ready_snapshots (
@@ -2037,86 +2259,41 @@ impl Store {
 
     pub fn create_card_with_events_as(
         &mut self,
-        mut card: Card,
+        card: Card,
         authority: &Authority,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", &authority.actor_label())?;
-        let card_id = card.id.clone();
-        card.title = secrets::scrub_secrets(&card.title);
-        card.body = secrets::scrub_secrets(&card.body);
-        // `acceptance` and `criteria` carry the same author-supplied text
-        // (with_acceptance derives one from the other); scrub both with the
-        // same deterministic function so they stay consistent.
-        card.acceptance = scrub_string_list(std::mem::take(&mut card.acceptance));
-        for criterion in &mut card.criteria {
-            criterion.text = secrets::scrub_secrets(&criterion.text);
-        }
-        card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
-        // Numeric-id repo inference is explicit-conflict-detection only: a
-        // card id like `foo-123` never silently *attaches* repo "foo" (that
-        // was the powder-repo-registry-tightness bug -- see the "why" in the
-        // card). It still rejects an explicit `repo` that contradicts the
-        // id's numeric-suffix prefix, so a card can't be mis-filed under a
-        // conflicting repo by typo.
-        if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
-            if let Some(repo) = card.repo.as_deref() {
-                if !canonical_repo_matches(repo, &derived_repo) {
-                    return Err(DomainError::validation(
-                        "repo",
-                        format!("repo {repo} does not match numeric card id prefix {derived_repo}"),
-                    )
-                    .into());
-                }
-            }
-        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if load_card_optional(&transaction, &card_id)?.is_some() {
-            return Err(DomainError::conflict(format!("card already exists: {card_id}")).into());
-        }
-        if let Some(parent_id) = card.parent.clone() {
-            ensure_parent_linkable(&transaction, &card_id, &parent_id)?;
-        }
-        persist_card(&transaction, &card)?;
-        let saved = load_card(&transaction, &card_id)?;
-        append_card_event_with_authority(
-            &transaction,
-            &saved.id,
-            "create",
-            &actor,
-            "created card",
-            now,
-            authority,
-        )?;
-        if let Some(parent_id) = saved.parent.as_ref() {
-            append_card_event_with_authority(
-                &transaction,
-                parent_id,
-                "decompose",
-                &actor,
-                &format!("child {card_id} created"),
-                now,
-                authority,
-            )?;
-        }
-        // A card born with related/blocks/blocked_by already set mirrors
-        // those edges onto the named peers in the same transaction --
-        // reciprocity is a birth-time guarantee, not something the caller
-        // has to establish with follow-up update_relations calls
-        // (powder-dogfood-2026-07-14-nonreciprocal-relations).
-        mirror_initial_relations_with_authority(&transaction, &saved, authority, now)?;
-        events::append_outbound_card_event_with_authority(
-            &transaction,
-            &saved,
-            "card-created",
-            authority,
-            json!({"source": "create-card"}),
-            now,
-        )?;
+        let saved = create_card_in_transaction(&transaction, card, authority, now)?;
         transaction.commit()?;
         Ok(saved)
+    }
+
+    /// Keyed card creation commits the card, audit event, outbound event, and
+    /// receipt atomically. A duplicate delivery returns the original card.
+    pub fn create_card_with_events_as_keyed(
+        &mut self,
+        card: Card,
+        idempotency_key: &str,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<IdempotencyOutcome<Card>> {
+        let resource = format!("card:{}", card.id.as_str());
+        let payload = serde_json::json!({"card": card, "reason": "create"});
+        let request = IdempotencyRequest::from_payload(
+            Operation::CreateCard,
+            resource,
+            authority,
+            idempotency_key,
+            &payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, |transaction| {
+            create_card_in_transaction(transaction, card, authority, now)
+        })
     }
 
     /// File a one-call papercut. The report maps deterministically to a
@@ -2294,7 +2471,6 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
         authorize_card_operation(authority, Operation::CheckCriterion, &card, None, None, now)?;
-        authority.require_identity(&actor)?;
         let criterion_state = criterion_mut(&mut card, criterion)?;
         if checked {
             criterion_state.checked_by = Some(actor.clone());
@@ -2310,6 +2486,11 @@ impl Store {
             &transaction,
             card_id,
             MutationAudit {
+                operation: Operation::CheckCriterion,
+                resource: card_id.as_str(),
+                semantic_identity: Some(actor.as_str()),
+                run_id: None,
+                reason: Some("criterion correction"),
                 event_type: "criterion",
                 actor: &actor,
                 payload: &format!(
@@ -3715,6 +3896,11 @@ impl Store {
             &transaction,
             card_id,
             MutationAudit {
+                operation: Operation::AttachImage,
+                resource: card_id.as_str(),
+                semantic_identity: Some(principal.as_str()),
+                run_id: None,
+                reason: Some("attachment correction"),
                 event_type: "attachment",
                 actor: &principal,
                 payload: "attached image",
@@ -3789,6 +3975,11 @@ impl Store {
             &transaction,
             card_id,
             MutationAudit {
+                operation: Operation::DetachImage,
+                resource: card_id.as_str(),
+                semantic_identity: Some(principal.as_str()),
+                run_id: None,
+                reason: Some("attachment correction"),
                 event_type: "attachment",
                 actor: &principal,
                 payload: "detached image",
@@ -3858,6 +4049,11 @@ impl Store {
             &transaction,
             card_id,
             MutationAudit {
+                operation: Operation::AddLink,
+                resource: card_id.as_str(),
+                semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+                run_id: card.claim.as_ref().map(|claim| &claim.run_id),
+                reason: None,
                 event_type: "link",
                 actor: authority.principal_name().unwrap_or("unchecked"),
                 payload: "added link",
@@ -3895,58 +4091,44 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let card = load_card(&transaction, card_id)?;
-        authorize_card_operation(authority, Operation::AddComment, &card, None, None, now)?;
-        let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
-        let comment = Comment {
-            id: id.clone(),
-            card_id: card_id.clone(),
-            author: non_empty_scrubbed("author", author)?,
-            body: non_empty_scrubbed("body", body)?,
-            created_at: now,
-        };
-        transaction.execute(
-            "INSERT INTO comments (id, card_id, author, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id,
-                comment.card_id.as_str(),
-                comment.author,
-                comment.body,
-                comment.created_at
-            ],
-        )?;
-        let audit_event = append_attributed_card_event(
-            &transaction,
-            card_id,
-            MutationAudit {
-                event_type: "comment",
-                actor: &comment.author,
-                payload: "added comment",
-                subject_kind: "comment",
-                subject_id: &comment.id,
-                authority,
-            },
-            now,
-        )?;
-        events::append_outbound_card_event_for_audit(
-            &transaction,
-            &card,
-            "comment-added",
-            &comment.author,
-            json!({"author": comment.author.as_str(), "body": comment.body.as_str()}),
-            now,
-            &audit_event,
-        )?;
+        let comment =
+            add_comment_in_transaction(&transaction, card_id, author, body, now, authority)?;
         transaction.commit()?;
         Ok(comment)
     }
 
-    /// Not claim-holder-gated, matching `add_comment`/`add_link`: appending
-    /// work_log context is additive, not an exclusive mutation of the
-    /// card's own state -- any authenticated caller may narrate their own
-    /// work. Only `agent` is required attribution; every field on
-    /// `attribution` is whatever the calling surface can supply.
+    /// Keyed comment delivery uses the durable operation receipt ledger. The
+    /// receipt is committed with the comment and outbound event, so retries
+    /// cannot append a second comment or webhook.
+    pub fn add_comment_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        author: &str,
+        body: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Comment>> {
+        let payload = json!({"author": author, "body": body});
+        let request = IdempotencyRequest::from_payload(
+            Operation::AddComment,
+            format!("card:{}", card_id.as_str()),
+            authority,
+            idempotency_key,
+            &payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, |transaction| {
+            add_comment_in_transaction(transaction, card_id, author, body, now, authority)
+        })
+    }
+
+    /// Worker work-log delivery requires the current unexpired card claim for
+    /// authenticated principals, and the semantic agent/run labels must match
+    /// that claim. The labels remain attribution, never capability; trusted
+    /// unchecked callers are retained only for direct local compatibility.
+    /// Every field on `attribution` is whatever the calling surface can supply.
     /// `body` is scrubbed for known secret shapes before it is ever
     /// persisted (powder-943 governance ruling: this becomes fleet-retro
     /// synthesis input, so it gets the same scrub discipline as any other
@@ -3981,75 +4163,59 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let card = load_card(&transaction, card_id)?;
-        let run_id = attribution.run_id.map(RunId::new).transpose()?;
-        let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
-        let entry = WorkLogEntry {
-            id: id.clone(),
-            card_id: card_id.clone(),
-            agent: non_empty("agent", agent)?,
-            // Attribution fields are caller-supplied free text too --
-            // `reasoning` especially is documented chain-of-thought, the
-            // highest-risk leak class this module's scrub exists for.
-            model: attribution.model.map(secrets::scrub_secrets),
-            reasoning: attribution.reasoning.map(secrets::scrub_secrets),
-            harness: attribution.harness.map(secrets::scrub_secrets),
-            run_id,
-            body: non_empty_scrubbed("body", body)?,
-            created_at: now,
-        };
-        authorize_card_operation(
-            authority,
-            Operation::WorkLog,
-            &card,
-            entry.run_id.as_ref(),
-            Some(entry.agent.as_str()),
-            now,
-        )?;
-        transaction.execute(
-            "INSERT INTO work_log_entries
-             (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                entry.card_id.as_str(),
-                entry.agent,
-                entry.model,
-                entry.reasoning,
-                entry.harness,
-                entry.run_id.as_ref().map(RunId::as_str),
-                entry.body,
-                entry.created_at,
-            ],
-        )?;
-        let audit_event = append_attributed_card_event(
+        let entry = append_work_log_in_transaction(
             &transaction,
             card_id,
-            MutationAudit {
-                event_type: "work-log",
-                actor: &entry.agent,
-                payload: "appended work log",
-                subject_kind: "work_log",
-                subject_id: &entry.id,
-                authority,
-            },
+            agent,
+            attribution,
+            body,
             now,
-        )?;
-        events::append_outbound_card_event_for_audit(
-            &transaction,
-            &card,
-            "work-log-appended",
-            &entry.agent,
-            json!({
-                "agent": entry.agent.as_str(),
-                "model": entry.model,
-                "harness": entry.harness,
-            }),
-            now,
-            &audit_event,
+            authority,
         )?;
         transaction.commit()?;
         Ok(entry)
+    }
+
+    /// Keyed work-log delivery stores the receipt with the work-log row and
+    /// outbound event, making duplicate agent delivery harmless.
+    pub fn append_work_log_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        agent: &str,
+        attribution: WorkLogAttribution<'_>,
+        body: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<WorkLogEntry>> {
+        let payload = json!({
+            "agent": agent,
+            "model": attribution.model,
+            "reasoning": attribution.reasoning,
+            "harness": attribution.harness,
+            "run_id": attribution.run_id,
+            "body": body,
+        });
+        let request = IdempotencyRequest::from_payload(
+            Operation::WorkLog,
+            format!("card:{}", card_id.as_str()),
+            authority,
+            idempotency_key,
+            &payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, |transaction| {
+            append_work_log_in_transaction(
+                transaction,
+                card_id,
+                agent,
+                attribution,
+                body,
+                now,
+                authority,
+            )
+        })
     }
 
     pub fn request_input(
@@ -4550,6 +4716,234 @@ fn append_card_event(
     )
 }
 
+fn create_card_in_transaction(
+    transaction: &Transaction<'_>,
+    mut card: Card,
+    authority: &Authority,
+    now: i64,
+) -> Result<Card> {
+    let actor = non_empty("actor", &authority.actor_label())?;
+    let card_id = card.id.clone();
+    card.title = secrets::scrub_secrets(&card.title);
+    card.body = secrets::scrub_secrets(&card.body);
+    card.acceptance = scrub_string_list(std::mem::take(&mut card.acceptance));
+    for criterion in &mut card.criteria {
+        criterion.text = secrets::scrub_secrets(&criterion.text);
+    }
+    card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
+    if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
+        if let Some(repo) = card.repo.as_deref() {
+            if !canonical_repo_matches(repo, &derived_repo) {
+                return Err(DomainError::validation(
+                    "repo",
+                    format!("repo {repo} does not match numeric card id prefix {derived_repo}"),
+                )
+                .into());
+            }
+        }
+    }
+    if load_card_optional(transaction, &card_id)?.is_some() {
+        return Err(DomainError::conflict(format!("card already exists: {card_id}")).into());
+    }
+    if let Some(parent_id) = card.parent.clone() {
+        ensure_parent_linkable(transaction, &card_id, &parent_id)?;
+    }
+    persist_card(transaction, &card)?;
+    let saved = load_card(transaction, &card_id)?;
+    append_card_event_with_authority(
+        transaction,
+        &saved.id,
+        "create",
+        &actor,
+        "created card",
+        now,
+        authority,
+    )?;
+    if let Some(parent_id) = saved.parent.as_ref() {
+        append_card_event_with_authority(
+            transaction,
+            parent_id,
+            "decompose",
+            &actor,
+            &format!("child {card_id} created"),
+            now,
+            authority,
+        )?;
+    }
+    mirror_initial_relations_with_authority(transaction, &saved, authority, now)?;
+    events::append_outbound_card_event_with_authority(
+        transaction,
+        &saved,
+        "card-created",
+        authority,
+        json!({"source": "create-card"}),
+        now,
+    )?;
+    Ok(saved)
+}
+
+fn append_work_log_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    agent: &str,
+    attribution: WorkLogAttribution<'_>,
+    body: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<WorkLogEntry> {
+    let card = load_card(transaction, card_id)?;
+    let run_id = attribution.run_id.map(RunId::new).transpose()?;
+    let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+    let entry = WorkLogEntry {
+        id: id.clone(),
+        card_id: card_id.clone(),
+        agent: non_empty("agent", agent)?,
+        model: attribution.model.map(secrets::scrub_secrets),
+        reasoning: attribution.reasoning.map(secrets::scrub_secrets),
+        harness: attribution.harness.map(secrets::scrub_secrets),
+        run_id,
+        body: non_empty_scrubbed("body", body)?,
+        created_at: now,
+    };
+    authorize_card_operation(
+        authority,
+        Operation::WorkLog,
+        &card,
+        entry.run_id.as_ref(),
+        Some(entry.agent.as_str()),
+        now,
+    )?;
+    transaction.execute(
+        "INSERT INTO work_log_entries
+         (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            entry.card_id.as_str(),
+            entry.agent,
+            entry.model,
+            entry.reasoning,
+            entry.harness,
+            entry.run_id.as_ref().map(RunId::as_str),
+            entry.body,
+            entry.created_at,
+        ],
+    )?;
+    let audit_event = append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::WorkLog,
+            resource: card_id.as_str(),
+            semantic_identity: Some(entry.agent.as_str()),
+            run_id: entry.run_id.as_ref(),
+            reason: None,
+            event_type: "work-log",
+            actor: &entry.agent,
+            payload: "appended work log",
+            subject_kind: "work_log",
+            subject_id: &entry.id,
+            authority,
+        },
+        now,
+    )?;
+    events::append_outbound_card_event_for_audit(
+        transaction,
+        &card,
+        "work-log-appended",
+        &entry.agent,
+        json!({
+            "agent": entry.agent.as_str(),
+            "model": entry.model,
+            "harness": entry.harness,
+        }),
+        now,
+        &audit_event,
+    )?;
+    Ok(entry)
+}
+
+fn add_comment_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    author: &str,
+    body: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<Comment> {
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::AddComment, &card, None, None, now)?;
+    let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
+    let comment = Comment {
+        id: id.clone(),
+        card_id: card_id.clone(),
+        author: non_empty_scrubbed("author", author)?,
+        body: non_empty_scrubbed("body", body)?,
+        created_at: now,
+    };
+    transaction.execute(
+        "INSERT INTO comments (id, card_id, author, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            id,
+            comment.card_id.as_str(),
+            comment.author,
+            comment.body,
+            comment.created_at
+        ],
+    )?;
+    let audit_event = append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::AddComment,
+            resource: card_id.as_str(),
+            semantic_identity: Some(comment.author.as_str()),
+            run_id: None,
+            reason: None,
+            event_type: "comment",
+            actor: &comment.author,
+            payload: "added comment",
+            subject_kind: "comment",
+            subject_id: &comment.id,
+            authority,
+        },
+        now,
+    )?;
+    events::append_outbound_card_event_for_audit(
+        transaction,
+        &card,
+        "comment-added",
+        &comment.author,
+        json!({"author": comment.author.as_str(), "body": comment.body.as_str()}),
+        now,
+        &audit_event,
+    )?;
+    Ok(comment)
+}
+
+fn operation_for_event(event_type: &str, payload: &str) -> Option<Operation> {
+    match event_type {
+        "create" => Some(Operation::CreateCard),
+        "patch" | "repair" => Some(Operation::PatchCard),
+        "status" | "rollup" => Some(Operation::UpdateStatus),
+        "relations" => Some(Operation::UpdateRelations),
+        "hierarchy" | "decompose" => Some(Operation::SetParent),
+        "claim" => Some(Operation::ClaimCard),
+        "release" => Some(Operation::ReleaseClaim),
+        "renew" => Some(Operation::RenewClaim),
+        "heartbeat" => Some(Operation::HeartbeatClaim),
+        "transfer" => Some(Operation::TransferClaim),
+        "attachment" if payload.contains("detach") => Some(Operation::DetachImage),
+        "attachment" => Some(Operation::AttachImage),
+        "link" => Some(Operation::AddLink),
+        "comment" => Some(Operation::AddComment),
+        "work-log" => Some(Operation::WorkLog),
+        "complete" => Some(Operation::CompleteCard),
+        _ => None,
+    }
+}
+
 fn append_card_event_with_authority(
     connection: &Connection,
     card_id: &CardId,
@@ -4569,11 +4963,21 @@ fn append_card_event_with_authority(
         role: Some(authority.role_label().to_string()),
         subject_kind: None,
         subject_id: None,
+        operation: operation_for_event(event_type, payload)
+            .map(|operation| operation.as_str().to_string()),
+        resource: Some(format!("card:{}", card_id.as_str())),
+        semantic_identity: Some(actor.to_string()),
+        run_id: None,
+        reason: operation_for_event(event_type, payload)
+            .filter(|operation| operation.rule().audit.reason)
+            .map(|_| payload.to_string()),
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO card_events (id, card_id, event_type, actor, payload, principal, role, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO card_events (
+           id, card_id, event_type, actor, payload, principal, role,
+           operation, resource, semantic_identity, run_id, reason, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
@@ -4582,6 +4986,11 @@ fn append_card_event_with_authority(
             event.payload.as_str(),
             event.principal.as_deref(),
             event.role.as_deref(),
+            event.operation.as_deref(),
+            event.resource.as_deref(),
+            event.semantic_identity.as_deref(),
+            event.run_id.as_deref(),
+            event.reason.as_deref(),
             event.created_at
         ],
     )?;
@@ -4604,13 +5013,18 @@ fn append_attributed_card_event(
         role: Some(audit.authority.role_label().to_string()),
         subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
         subject_id: Some(non_empty("subject_id", audit.subject_id)?),
+        operation: Some(audit.operation.as_str().to_string()),
+        resource: Some(non_empty("resource", audit.resource)?),
+        semantic_identity: audit.semantic_identity.map(str::to_string),
+        run_id: audit.run_id.map(ToString::to_string),
+        reason: audit.reason.map(str::to_string),
         created_at: now,
     };
     connection.execute(
         "INSERT INTO card_events (
            id, card_id, event_type, actor, payload, principal, role,
-           subject_kind, subject_id, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+           subject_kind, subject_id, operation, resource, semantic_identity, run_id, reason, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
@@ -4621,6 +5035,11 @@ fn append_attributed_card_event(
             event.role.as_deref(),
             event.subject_kind.as_deref(),
             event.subject_id.as_deref(),
+            event.operation.as_deref(),
+            event.resource.as_deref(),
+            event.semantic_identity.as_deref(),
+            event.run_id.as_deref(),
+            event.reason.as_deref(),
             event.created_at,
         ],
     )?;

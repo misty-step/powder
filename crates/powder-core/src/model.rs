@@ -1643,6 +1643,21 @@ pub struct CardEvent {
     pub subject_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
+    /// Canonical operation selected from the shared authority matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Stable resource identifier targeted by the operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// Semantic worker/actor label supplied by the caller, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_identity: Option<String>,
+    /// Current worker run when the operation is run-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Explicit operator/admin correction or destructive-operation reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub created_at: i64,
 }
 

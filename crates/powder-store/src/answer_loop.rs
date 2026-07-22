@@ -604,7 +604,8 @@ fn load_events_for_card(
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, event_type, actor, payload,
-                        principal, role, subject_kind, subject_id, created_at
+                        principal, role, subject_kind, subject_id,
+                        operation, resource, semantic_identity, run_id, reason, created_at
                  FROM card_events
                  WHERE card_id = ?1
                  ORDER BY created_at ASC, rowid ASC",
@@ -617,7 +618,8 @@ fn load_events_for_card(
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, event_type, actor, payload,
-                        principal, role, subject_kind, subject_id, created_at
+                        principal, role, subject_kind, subject_id,
+                        operation, resource, semantic_identity, run_id, reason, created_at
                  FROM card_events
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, rowid DESC
@@ -818,6 +820,11 @@ struct CardEventRecord {
     role: Option<String>,
     subject_kind: Option<String>,
     subject_id: Option<String>,
+    operation: Option<String>,
+    resource: Option<String>,
+    semantic_identity: Option<String>,
+    run_id: Option<String>,
+    reason: Option<String>,
     created_at: i64,
 }
 
@@ -833,7 +840,12 @@ impl CardEventRecord {
             role: row.get(6)?,
             subject_kind: row.get(7)?,
             subject_id: row.get(8)?,
-            created_at: row.get(9)?,
+            operation: row.get(9)?,
+            resource: row.get(10)?,
+            semantic_identity: row.get(11)?,
+            run_id: row.get(12)?,
+            reason: row.get(13)?,
+            created_at: row.get(14)?,
         })
     }
 
@@ -848,6 +860,11 @@ impl CardEventRecord {
             role: self.role,
             subject_kind: self.subject_kind,
             subject_id: self.subject_id,
+            operation: self.operation,
+            resource: self.resource,
+            semantic_identity: self.semantic_identity,
+            run_id: self.run_id,
+            reason: self.reason,
             created_at: self.created_at,
         })
     }

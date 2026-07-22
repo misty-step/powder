@@ -1,13 +1,16 @@
+use serde::{Deserialize, Serialize};
+
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DetailLevel, DomainError, Estimate, Priority, ReadyCursor, ReadyQuery, Risk, RunId, RunState,
+    DetailLevel, DomainError, Estimate, Operation, Priority, ReadyCursor, ReadyQuery, Risk, RunId,
+    RunState,
 };
 
 use crate::schema::SCHEMA;
 use crate::{
     ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig,
-    ImportOutcome, ParentCoverageBucket, ParentIssueKind, RelationField, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Result, SearchQuery, Store, StoreError,
+    IdempotencyRequest, ImportOutcome, ParentCoverageBucket, ParentIssueKind, RelationField,
+    RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result, SearchQuery, Store, StoreError,
     WorkLogAttribution, API_KEY_ALPHABET,
 };
 
@@ -1538,7 +1541,7 @@ fn schema_v25_database_migrates_ready_snapshot_tables() -> Result<()> {
         "DROP TABLE ready_snapshot_items; DROP TABLE ready_snapshots; PRAGMA user_version = 25;",
     )?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 26);
+    assert_eq!(store.schema_version()?, 27);
     assert!(store.table_exists("ready_snapshots")?);
     assert!(store.table_exists("ready_snapshot_items")?);
     store.migrate()?;
@@ -6853,7 +6856,7 @@ fn fts_v24_rebuild_makes_card_ids_exact_metadata() -> Result<()> {
         limit: 10,
         ..SearchQuery::default()
     })?;
-    assert_eq!(store.schema_version()?, 26);
+    assert_eq!(store.schema_version()?, 27);
     assert_eq!(page.total_count, 1);
     assert_eq!(page.matches.len(), 1);
     assert_eq!(page.matches[0].source_kind, "cards");
@@ -7768,4 +7771,187 @@ fn search_page_shapes_recall_filters_cursor_and_safe_snippets() -> Result<()> {
     });
     assert!(matches!(malformed, Err(StoreError::InvalidSearchCursor(_))));
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IdempotencyTestReceipt {
+    value: String,
+}
+
+#[test]
+fn keyed_idempotency_replays_conflicts_and_gc_is_durable() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.migrate().unwrap();
+    let payload = serde_json::json!({"title": "same"});
+    let authority = Authority::principal("principal-a", false);
+    let request = IdempotencyRequest::from_payload(
+        Operation::PatchCard,
+        "card:powder-1",
+        &authority,
+        "request-1",
+        &payload,
+        100,
+        60,
+    )
+    .unwrap();
+    let mut executions = 0;
+    let first = store
+        .with_idempotency(&request, |_| {
+            executions += 1;
+            Ok(IdempotencyTestReceipt {
+                value: "receipt-1".to_string(),
+            })
+        })
+        .unwrap();
+    assert!(!first.replayed);
+    assert_eq!(first.value.value, "receipt-1");
+    let replay = store
+        .with_idempotency(&request, |_| {
+            executions += 1;
+            Ok(IdempotencyTestReceipt {
+                value: "wrong".to_string(),
+            })
+        })
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.value.value, "receipt-1");
+    assert_eq!(executions, 1);
+
+    let mismatch = IdempotencyRequest::from_payload(
+        Operation::PatchCard,
+        "card:powder-1",
+        &authority,
+        "request-1",
+        &serde_json::json!({"title": "different"}),
+        100,
+        60,
+    )
+    .unwrap();
+    let error = store
+        .with_idempotency::<IdempotencyTestReceipt, _>(&mismatch, |_| unreachable!())
+        .unwrap_err();
+    assert_eq!(error.to_string().contains("different payload"), true);
+    assert_eq!(
+        match error {
+            StoreError::Domain(ref domain) => domain.denial_class(),
+            _ => None,
+        },
+        Some(powder_core::DenialClass::IdempotencyConflict)
+    );
+
+    assert_eq!(store.gc_idempotency(200, 10).unwrap(), 1);
+    let after_gc = IdempotencyRequest::from_payload(
+        Operation::PatchCard,
+        "card:powder-1",
+        &authority,
+        "request-1",
+        &payload,
+        200,
+        60,
+    )
+    .unwrap();
+    let fresh = store
+        .with_idempotency(&after_gc, |_| {
+            executions += 1;
+            Ok(IdempotencyTestReceipt {
+                value: "receipt-2".to_string(),
+            })
+        })
+        .unwrap();
+    assert!(!fresh.replayed);
+    assert_eq!(executions, 2);
+}
+
+#[test]
+fn keyed_store_mutations_do_not_duplicate_real_rows() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.migrate().unwrap();
+    let authority = Authority::principal("principal-a", false);
+    let card_id = CardId::new("keyed-card").unwrap();
+    let card = Card::new(card_id.clone(), "Keyed", "body")
+        .unwrap()
+        .with_status(CardStatus::Ready)
+        .with_acceptance(["proof".to_string()]);
+    let created = store
+        .create_card_with_events_as_keyed(card.clone(), "create-1", &authority, 10)
+        .unwrap();
+    assert!(!created.replayed);
+    let replay = store
+        .create_card_with_events_as_keyed(card, "create-1", &authority, 10)
+        .unwrap();
+    assert!(replay.replayed);
+
+    let comment = store
+        .add_comment_as_keyed(
+            &card_id,
+            "semantic-author",
+            "hello",
+            11,
+            "comment-1",
+            &authority,
+        )
+        .unwrap();
+    assert!(!comment.replayed);
+    let comment_replay = store
+        .add_comment_as_keyed(
+            &card_id,
+            "semantic-author",
+            "hello",
+            11,
+            "comment-1",
+            &authority,
+        )
+        .unwrap();
+    assert!(comment_replay.replayed);
+
+    let claim = store
+        .claim_card(&card_id, "worker-a", 12, 100, &authority)
+        .unwrap();
+    let attribution = WorkLogAttribution {
+        run_id: Some(claim.run_id.as_str()),
+        ..WorkLogAttribution::default()
+    };
+    let log = store
+        .append_work_log_as_keyed(
+            &card_id,
+            "worker-a",
+            attribution,
+            "doing",
+            13,
+            "log-1",
+            &authority,
+        )
+        .unwrap();
+    assert!(!log.replayed);
+    let log_replay = store
+        .append_work_log_as_keyed(
+            &card_id,
+            "worker-a",
+            attribution,
+            "doing",
+            13,
+            "log-1",
+            &authority,
+        )
+        .unwrap();
+    assert!(log_replay.replayed);
+
+    let detail = store
+        .get_card_detail(&card_id, DetailLevel::Detailed, 13)
+        .unwrap()
+        .unwrap();
+    assert_eq!(detail.comments.len(), 1);
+    assert_eq!(detail.work_log.len(), 1);
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.operation.as_deref() == Some("create_card")));
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.operation.as_deref() == Some("add_comment")));
+    assert!(detail
+        .events
+        .iter()
+        .any(|event| event.operation.as_deref() == Some("work_log")));
 }
