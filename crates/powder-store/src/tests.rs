@@ -2655,6 +2655,61 @@ fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
 }
 
 #[test]
+fn reciprocal_mixed_field_stays_indeterminate() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("alpha", 10), ready_card("beta", 11)])?;
+    store.connection.execute_batch(
+        "UPDATE cards SET blocks_json = '[\"beta\", 7]' WHERE id = 'alpha';
+         UPDATE cards SET blocked_by_json = '[\"alpha\"]' WHERE id = 'beta';",
+    )?;
+    let before_alpha: String = store.connection.query_row(
+        "SELECT blocks_json FROM cards WHERE id = 'alpha'",
+        [],
+        |row| row.get(0),
+    )?;
+    let before_beta: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'beta'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let report = store.relations_doctor("operator", 20, false)?;
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(
+        report.issues[0].kind,
+        crate::RelationIssueKind::InvalidStoredValue
+    );
+    assert_eq!(report.issues[0].card_id.as_deref(), Some("alpha"));
+    assert_eq!(report.issues[0].field, RelationField::Blocks);
+
+    let repaired = store.relations_doctor("operator", 21, true)?;
+    assert_eq!(repaired.issues.len(), 1);
+    assert!(!repaired.issues[0].repaired);
+    let after_alpha: String = store.connection.query_row(
+        "SELECT blocks_json FROM cards WHERE id = 'alpha'",
+        [],
+        |row| row.get(0),
+    )?;
+    let after_beta: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'beta'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(after_alpha, before_alpha);
+    assert_eq!(after_beta, before_beta);
+
+    let second = store.relations_doctor("operator", 22, true)?;
+    assert_eq!(second.issues.len(), 1);
+    assert_eq!(
+        second.issues[0].kind,
+        crate::RelationIssueKind::InvalidStoredValue
+    );
+    assert!(!second.issues[0].repaired);
+    Ok(())
+}
+
+#[test]
 fn parent_graph_doctor_rejects_noncanonical_parent_and_card_ids() -> Result<()> {
     let mut parent_store = Store::open_in_memory()?;
     parent_store.migrate()?;

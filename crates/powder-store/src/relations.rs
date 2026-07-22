@@ -683,6 +683,9 @@ fn find_relation_issues(rows: &[RawRelationRow]) -> Vec<RelationsDoctorIssue> {
                     continue;
                 };
                 let mirror_field = field.mirror();
+                if !target.field(mirror_field).invalid.is_empty() {
+                    continue;
+                }
                 if !target.field(mirror_field).ids.contains(card_id) {
                     issues.push(RelationsDoctorIssue {
                         card_id: Some(card_id.to_string()),
