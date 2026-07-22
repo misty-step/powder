@@ -863,6 +863,11 @@ html:not([data-pw-route='card']) .pw-detail-app {
   outline-offset: var(--pw-focus-offset);
 }
 
+.pw-quick-add-remove:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .pw-status-change {
   width: auto;
 }

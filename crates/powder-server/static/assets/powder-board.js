@@ -1595,6 +1595,8 @@ function showQuickAdd() {
   renderQuickAddRepoOptions();
   els.quickAddPanel.hidden = false;
   els.quickAddToggle.setAttribute("aria-expanded", "true");
+  // A freshly opened panel never carries a stale error from a prior attempt.
+  els.quickAddMessage.textContent = "";
   els.quickAddTitle.focus();
 }
 
@@ -1724,15 +1726,17 @@ function renderPendingRetries() {
   banner.hidden = false;
   banner.innerHTML = [...pendingAttachmentRetries.entries()].map(([cardId, entry]) => {
     const title = escapeHtml(entry.title || cardId);
+    const busy = entry.retrying;
     const fileList = entry.files.map((f, i) => {
       const name = escapeHtml(f.file.name || ("image-" + (i + 1)));
       const size = Math.ceil(f.file.size / 1024) + " KB";
       return '<li><span>' + name + '</span><span class="pw-chrome">' + size + '</span>' +
-        '<button type="button" class="pw-quick-add-remove pw-retry-remove" data-retry-card="' + escapeHtml(cardId) + '" data-retry-index="' + i + '" aria-label="Remove ' + name + '">&times;</button></li>';
+        '<button type="button" class="pw-quick-add-remove pw-retry-remove" data-retry-card="' + escapeHtml(cardId) + '" data-retry-index="' + i + '" aria-label="Remove ' + name + '"' + (busy ? " disabled" : "") + '>&times;</button></li>';
     }).join("");
-    const busy = entry.retrying;
+    // Truthful headline: an in-flight upload is not a failure; only the
+    // terminal state may say FAILED (the banner is aria-live).
     return '<div class="pw-retry-entry" data-retry-card="' + escapeHtml(cardId) + '">' +
-      '<p class="pw-retry-label"><span class="pw-chrome">UPLOAD FAILED</span> ' + title + '</p>' +
+      '<p class="pw-retry-label"><span class="pw-chrome">' + (busy ? "UPLOADING IMAGES" : "UPLOAD FAILED") + '</span> ' + title + '</p>' +
       '<ul class="pw-retry-files">' + fileList + '</ul>' +
       '<div class="pw-retry-actions">' +
       '<button type="button" class="pw-button pw-button-compact pw-retry-upload" data-retry-card="' + escapeHtml(cardId) + '"' + (busy ? " disabled" : "") + '>' + (busy ? "Uploading…" : "Retry upload") + '</button>' +
@@ -1774,7 +1778,9 @@ function dismissCardAttachmentRetry(cardId) {
 
 function removeRetryFile(cardId, index) {
   const entry = pendingAttachmentRetries.get(cardId);
-  if (!entry) return;
+  // Locked while an upload is in flight: removing a file mid-flight would
+  // let the failure rewrite resurrect it when the entry is rebuilt.
+  if (!entry || entry.retrying) return;
   entry.files.splice(index, 1);
   if (!entry.files.length) {
     pendingAttachmentRetries.delete(cardId);
@@ -1791,6 +1797,25 @@ function showToast(message, kind = "info") {
   toastTimer = setTimeout(() => {
     els.toast.hidden = true;
   }, 6500);
+}
+
+// Roll an unconfirmed optimistic quick-add card back out of client state.
+// State cleanup is unconditional; the board re-render is best-effort so a
+// faulting render() cannot strand the draft restore that follows --
+// state.cards is already clean, so the next successful render cannot
+// resurrect the card.
+function rollbackQuickAddOptimistic(cardId) {
+  pendingOptimisticIds.delete(cardId);
+  state.cards = state.cards.filter((card) => card.id !== cardId);
+  pendingAttachmentRetries.delete(cardId);
+  renderPendingRetries();
+  try {
+    buildFilters();
+    render();
+  } catch (err) {
+    // State is already clean; a persistently broken render surfaces through
+    // the outer error handlers, never as a ghost card.
+  }
 }
 
 async function createCardFromQuickAdd(form) {
@@ -1834,23 +1859,26 @@ async function createCardFromQuickAdd(form) {
       ...(repo ? { repo } : {}),
     };
     // Optimistic: the card lands on the board instantly; the POST confirms in
-    // the background and a failure rolls it back with the draft restored.
-    pendingOptimisticIds.add(payload.id);
-    state.cards = [
-      normalizeCard({ ...payload, priority: "p2", created_at: now, updated_at: now }),
-      ...state.cards,
-    ];
-    form.reset();
-    clearQuickAddFiles();
-    hideQuickAdd();
-    els.quickAddMessage.textContent = "";
-    if (attachments.length) {
-      pendingAttachmentRetries.set(payload.id, { files: attachments.map((f) => ({ file: f })), title, retrying: true });
-      renderPendingRetries();
-    }
-    buildFilters();
-    render();
+    // the background. One transaction-like sequence owns the insert through
+    // the POST: any exception before confirmation -- in buildFilters/render
+    // or in apiJson -- rolls the card back out of client state and restores
+    // the draft, so a fault can never leave a ghost card behind.
     try {
+      pendingOptimisticIds.add(payload.id);
+      state.cards = [
+        normalizeCard({ ...payload, priority: "p2", created_at: now, updated_at: now }),
+        ...state.cards,
+      ];
+      form.reset();
+      clearQuickAddFiles();
+      hideQuickAdd();
+      els.quickAddMessage.textContent = "";
+      if (attachments.length) {
+        pendingAttachmentRetries.set(payload.id, { files: attachments.map((f) => ({ file: f })), title, retrying: true });
+        renderPendingRetries();
+      }
+      buildFilters();
+      render();
       await apiJson("/api/v1/cards", {
         method: "POST",
         idempotencyKey: createMutationReceipt(),
@@ -1858,12 +1886,7 @@ async function createCardFromQuickAdd(form) {
         body: JSON.stringify(payload),
       });
     } catch (err) {
-      pendingOptimisticIds.delete(payload.id);
-      state.cards = state.cards.filter((card) => card.id !== payload.id);
-      pendingAttachmentRetries.delete(payload.id);
-      renderPendingRetries();
-      buildFilters();
-      render();
+      rollbackQuickAddOptimistic(payload.id);
       showQuickAdd();
       els.quickAddTitle.value = enteredTitle;
       els.quickAddBody.value = body;
