@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::Path,
 };
@@ -65,6 +65,8 @@ use schema::{
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+const READY_SNAPSHOT_TTL_SECONDS: i64 = 60 * 60;
 
 const API_KEY_ALPHABET: [char; 64] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
@@ -702,6 +704,10 @@ impl Store {
                 24 => {
                     self.migrate_24_to_25()?;
                     25
+                }
+                25 => {
+                    self.migrate_25_to_26()?;
+                    26
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1659,6 +1665,27 @@ impl Store {
         self.ensure_principal_role_columns()
     }
 
+    fn migrate_25_to_26(&self) -> Result<()> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ready_snapshots (
+               id TEXT PRIMARY KEY,
+               query_fingerprint TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_ready_snapshots_expires ON ready_snapshots(expires_at);
+             CREATE TABLE IF NOT EXISTS ready_snapshot_items (
+               snapshot_id TEXT NOT NULL REFERENCES ready_snapshots(id) ON DELETE CASCADE,
+               position INTEGER NOT NULL,
+               card_id TEXT NOT NULL,
+               PRIMARY KEY(snapshot_id, position),
+               UNIQUE(snapshot_id, card_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_ready_snapshot_items_card ON ready_snapshot_items(snapshot_id, card_id);",
+        )?;
+        Ok(())
+    }
+
     fn migrate_19_to_20(&mut self) -> Result<()> {
         let needs_principal = !self.table_has_column("card_events", "principal")?;
         let needs_subject_kind = !self.table_has_column("card_events", "subject_kind")?;
@@ -2425,8 +2452,6 @@ impl Store {
             }
         }
         // Resolve caller-supplied repository aliases once at the Store seam.
-        // The original typed query remains bound into ReadyCursor, while
-        // matching uses the registered canonical repository name.
         let repository_filters = query
             .repo
             .as_ref()
@@ -2438,11 +2463,8 @@ impl Store {
             })
             .transpose()?;
         let all_cards = load_all_cards(&self.connection)?;
-        // reuses the same full scan already loaded above, rather than a
-        // second query per blocker: a blocker missing from this map is
-        // treated as still blocking (fail closed).
         let statuses: HashMap<_, _> = all_cards.iter().map(|c| (c.id.clone(), c.status)).collect();
-        let mut cards = Vec::new();
+        let mut eligible = Vec::new();
         for card in all_cards {
             if !card.is_ready_at(query.now, |id| {
                 statuses.get(id).is_some_and(|status| status.is_terminal())
@@ -2478,48 +2500,205 @@ impl Store {
             {
                 continue;
             }
-            cards.push(card);
+            eligible.push(card);
         }
-        let total_count = cards.len();
-
-        let order = powder_core::order_ready_cards(cards);
+        let total_count = eligible.len();
+        let order = powder_core::order_ready_cards(eligible);
         let cycle_card_ids = order.cycle_card_ids;
-        let mut ordered_cards = order.cards;
-        // A cycle is emitted in a stable tie-break group. If a non-anchor
-        // member departs between pages, recomputing the graph can move cards
-        // before the anchor. Replay the prior ordered snapshot first so the
-        // continuation cannot silently skip those cards. New cards retain
-        // their current order after the snapshot intersection.
-        if let Some(cursor) = after.filter(|cursor| !cursor.snapshot.is_empty()) {
-            let mut by_id = ordered_cards
-                .into_iter()
-                .map(|card| (card.id.clone(), card))
-                .collect::<HashMap<_, _>>();
-            let mut replayed = Vec::with_capacity(by_id.len());
-            for id in &cursor.snapshot {
-                if let Some(card) = by_id.remove(id) {
-                    replayed.push(card);
-                }
-            }
-            let mut arrivals = by_id.into_values().collect::<Vec<_>>();
-            arrivals.sort_by(powder_core::ready_sort_cmp);
-            replayed.extend(arrivals);
-            ordered_cards = replayed;
+        let ordered_cards = order.cards;
+
+        if let Some(cursor) = after.filter(|cursor| cursor.is_durable()) {
+            return self.list_ready_snapshot_page(
+                &query,
+                cursor,
+                ordered_cards,
+                total_count,
+                cycle_card_ids,
+            );
         }
-        let snapshot = ordered_cards
-            .iter()
-            .map(|card| card.id.clone())
-            .collect::<Vec<_>>();
+
+        if after.is_none() && ordered_cards.len() > query.limit {
+            let snapshot_id = loop {
+                let candidate =
+                    format!("ready-snapshot-{}", nanoid::nanoid!(20, &API_KEY_ALPHABET));
+                let transaction = self.connection.unchecked_transaction()?;
+                transaction.execute(
+                    "DELETE FROM ready_snapshots WHERE expires_at <= ?1",
+                    [query.now],
+                )?;
+                let inserted = transaction.execute(
+                    "INSERT OR IGNORE INTO ready_snapshots(id, query_fingerprint, created_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        candidate,
+                        query.fingerprint(),
+                        query.now,
+                        query.now.saturating_add(READY_SNAPSHOT_TTL_SECONDS),
+                    ],
+                )?;
+                if inserted == 0 {
+                    transaction.rollback()?;
+                    continue;
+                }
+                for (position, card) in ordered_cards.iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO ready_snapshot_items(snapshot_id, position, card_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![candidate, i64::try_from(position).unwrap_or(i64::MAX), card.id.as_str()],
+                    )?;
+                }
+                transaction.commit()?;
+                break candidate;
+            };
+            let end = query.limit.max(1).min(ordered_cards.len());
+            let cards = ordered_cards.into_iter().take(end).collect::<Vec<_>>();
+            let next_after = cards.last().map(|card| card.id.clone());
+            let ready_cursor = ReadyCursor::for_snapshot(&query, snapshot_id, end).encode();
+            return Ok(CardListPage {
+                cards,
+                total_count,
+                excluded_terminal_count: 0,
+                cycle_card_ids,
+                next_after,
+                ready_cursor: Some(ready_cursor),
+            });
+        }
+
+        // Preserve the documented HTTP bare-card-id fallback. It is not
+        // emitted by this Store and retains the historical stale-anchor error.
         let (cards, next_after) = paginate_ordered_cards(
             ordered_cards,
             query.limit,
             after.map(|cursor| &cursor.anchor),
         )?;
-        let ready_cursor = next_after
-            .as_ref()
-            .map(|anchor| ReadyCursor::for_query(&query, anchor.clone(), snapshot).encode());
         Ok(CardListPage {
             cards,
+            total_count,
+            excluded_terminal_count: 0,
+            cycle_card_ids,
+            next_after,
+            ready_cursor: None,
+        })
+    }
+
+    fn list_ready_snapshot_page(
+        &self,
+        query: &ReadyQuery,
+        cursor: &ReadyCursor,
+        ordered_cards: Vec<Card>,
+        total_count: usize,
+        cycle_card_ids: Vec<CardId>,
+    ) -> Result<CardListPage> {
+        let snapshot_id = cursor
+            .snapshot_id()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
+        let current_by_id = ordered_cards
+            .iter()
+            .cloned()
+            .map(|card| (card.id.as_str().to_owned(), card))
+            .collect::<HashMap<_, _>>();
+        let current_order_ids = ordered_cards
+            .iter()
+            .map(|card| card.id.clone())
+            .collect::<Vec<_>>();
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM ready_snapshots WHERE expires_at <= ?1",
+            [query.now],
+        )?;
+        let metadata = transaction
+            .query_row(
+                "SELECT query_fingerprint, expires_at FROM ready_snapshots WHERE id = ?1",
+                [snapshot_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((fingerprint, expires_at)) = metadata else {
+            transaction.commit()?;
+            return Err(
+                DomainError::validation("after", "unknown or expired continuation cursor").into(),
+            );
+        };
+        if fingerprint != query.fingerprint() {
+            transaction.commit()?;
+            return Err(DomainError::validation(
+                "after",
+                "stale continuation cursor: query filters do not match",
+            )
+            .into());
+        }
+        if query.now >= expires_at {
+            transaction.commit()?;
+            return Err(DomainError::validation("after", "expired continuation cursor").into());
+        }
+        let snapshot_ids = {
+            let mut statement = transaction
+                .prepare("SELECT card_id FROM ready_snapshot_items WHERE snapshot_id = ?1")?;
+            let rows = statement
+                .query_map([snapshot_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            rows
+        };
+        let mut next_position = transaction.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM ready_snapshot_items WHERE snapshot_id = ?1",
+            [snapshot_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        // Newly eligible arrivals are appended in the current topological order;
+        // captured positions never move, even when graph changes or cards depart.
+        for card_id in &current_order_ids {
+            if snapshot_ids.contains(card_id.as_str()) {
+                continue;
+            }
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO ready_snapshot_items(snapshot_id, position, card_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![snapshot_id, next_position, card_id.as_str()],
+            )?;
+            if inserted > 0 {
+                next_position += 1;
+            }
+        }
+        let start_position = i64::try_from(cursor.position()).map_err(|_| {
+            DomainError::validation("after", "invalid continuation cursor position")
+        })?;
+        let limit = query.limit.max(1);
+        let mut page = Vec::with_capacity(limit);
+        let mut extra_position = None;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT position, card_id FROM ready_snapshot_items
+                 WHERE snapshot_id = ?1 AND position >= ?2 ORDER BY position",
+            )?;
+            let mut rows = statement.query(rusqlite::params![snapshot_id, start_position])?;
+            while let Some(row) = rows.next()? {
+                let position: i64 = row.get(0)?;
+                let card_id: String = row.get(1)?;
+                if let Some(card) = current_by_id.get(&card_id) {
+                    if page.len() < limit {
+                        page.push(card.clone());
+                    } else {
+                        extra_position = Some(position);
+                        break;
+                    }
+                }
+            }
+        }
+        let (next_after, ready_cursor) = if let Some(position) = extra_position {
+            let last = page.last().map(|card| card.id.clone());
+            let cursor = ReadyCursor::for_snapshot(
+                query,
+                snapshot_id.to_owned(),
+                usize::try_from(position).map_err(|_| {
+                    DomainError::validation("after", "invalid continuation cursor position")
+                })?,
+            )
+            .encode();
+            (last, Some(cursor))
+        } else {
+            (None, None)
+        };
+        transaction.commit()?;
+        Ok(CardListPage {
+            cards: page,
             total_count,
             excluded_terminal_count: 0,
             cycle_card_ids,

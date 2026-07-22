@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 25;
+pub const SCHEMA_VERSION: u32 = 26;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -49,6 +49,23 @@ CREATE TABLE IF NOT EXISTS cards (
   risk TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, created_at, id);
+
+CREATE TABLE IF NOT EXISTS ready_snapshots (
+  id TEXT PRIMARY KEY,
+  query_fingerprint TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ready_snapshots_expires ON ready_snapshots(expires_at);
+
+CREATE TABLE IF NOT EXISTS ready_snapshot_items (
+  snapshot_id TEXT NOT NULL REFERENCES ready_snapshots(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  card_id TEXT NOT NULL,
+  PRIMARY KEY(snapshot_id, position),
+  UNIQUE(snapshot_id, card_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ready_snapshot_items_card ON ready_snapshot_items(snapshot_id, card_id);
 
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,

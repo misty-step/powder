@@ -60,33 +60,52 @@ impl ReadyQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyCursor {
     fingerprint: String,
+    /// Only used by the documented HTTP bare-card-id fallback. Durable v3
+    /// cursors carry an opaque snapshot id and stable position instead.
     pub anchor: CardId,
-    /// Prior ordered ids keep non-anchor departures from skipping cards.
-    pub snapshot: Vec<CardId>,
+    snapshot_id: Option<String>,
+    position: usize,
 }
 
 impl ReadyCursor {
-    pub fn for_query(query: &ReadyQuery, anchor: CardId, snapshot: Vec<CardId>) -> Self {
+    pub fn for_bare_anchor(query: &ReadyQuery, anchor: CardId) -> Self {
         Self {
             fingerprint: query.fingerprint(),
             anchor,
-            snapshot,
+            snapshot_id: None,
+            position: 0,
         }
     }
 
+    /// Construct the bounded, durable cursor returned by Store-backed Ready
+    /// pagination. The token contains no card IDs or eligible-set data.
+    pub fn for_snapshot(query: &ReadyQuery, snapshot_id: String, position: usize) -> Self {
+        Self {
+            fingerprint: query.fingerprint(),
+            anchor: CardId::new("cursor-anchor").expect("static cursor anchor is canonical"),
+            snapshot_id: Some(snapshot_id),
+            position,
+        }
+    }
+
+    pub fn snapshot_id(&self) -> Option<&str> {
+        self.snapshot_id.as_deref()
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.snapshot_id.is_some()
+    }
+
     pub fn encode(&self) -> String {
-        let snapshot = self
-            .snapshot
-            .iter()
-            .map(|id| hex_encode(id.as_str().as_bytes()))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "v2.{}.{}.{}",
-            self.fingerprint,
-            hex_encode(self.anchor.as_str().as_bytes()),
-            snapshot
-        )
+        let snapshot_id = self
+            .snapshot_id
+            .as_deref()
+            .expect("bare-card-id cursors are not encoded");
+        format!("v3.{}.{}.{}", self.fingerprint, snapshot_id, self.position)
     }
 
     pub fn matches_query(&self, query: &ReadyQuery) -> bool {
@@ -95,61 +114,42 @@ impl ReadyCursor {
 
     pub fn decode_for_query(raw: &str, query: &ReadyQuery) -> Result<Self, DomainError> {
         let mut parts = raw.split('.');
-        let version = parts.next();
+        if parts.next() != Some("v3") {
+            return Err(DomainError::validation(
+                "after",
+                "invalid continuation cursor",
+            ));
+        }
         let fingerprint = parts
             .next()
             .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
-        let anchor_hex = parts
-            .next()
-            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
-        let snapshot_raw = match version {
-            Some("v1") => "",
-            Some("v2") => parts
-                .next()
-                .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?,
-            _ => {
-                return Err(DomainError::validation(
-                    "after",
-                    "invalid continuation cursor",
-                ))
-            }
-        };
-        if parts.next().is_some() || fingerprint != query.fingerprint() {
+        if fingerprint != query.fingerprint() {
             return Err(DomainError::validation(
                 "after",
                 "stale continuation cursor: query filters do not match",
             ));
         }
-        let bytes = hex_decode(anchor_hex)
+        let snapshot_id = parts
+            .next()
             .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
-        let anchor = CardId::new(
-            String::from_utf8(bytes)
-                .map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?,
-        )
-        .map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?;
-        let snapshot = if snapshot_raw.is_empty() {
-            Vec::new()
-        } else {
-            snapshot_raw
-                .split(',')
-                .map(|raw| {
-                    let bytes = hex_decode(raw).ok_or_else(|| {
-                        DomainError::validation("after", "invalid continuation cursor")
-                    })?;
-                    let value = String::from_utf8(bytes).map_err(|_| {
-                        DomainError::validation("after", "invalid continuation cursor")
-                    })?;
-                    CardId::new(value).map_err(|_| {
-                        DomainError::validation("after", "invalid continuation cursor")
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(Self {
-            fingerprint: fingerprint.to_owned(),
-            anchor,
-            snapshot,
-        })
+        let position = parts
+            .next()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?
+            .parse::<usize>()
+            .map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?;
+        if parts.next().is_some()
+            || snapshot_id.is_empty()
+            || snapshot_id.len() > 96
+            || !snapshot_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(DomainError::validation(
+                "after",
+                "invalid continuation cursor",
+            ));
+        }
+        Ok(Self::for_snapshot(query, snapshot_id.to_owned(), position))
     }
 }
 
@@ -190,20 +190,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
-}
-
-fn hex_decode(raw: &str) -> Option<Vec<u8>> {
-    if raw.is_empty() || !raw.len().is_multiple_of(2) {
-        return None;
-    }
-    raw.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)? as u8;
-            let low = (pair[1] as char).to_digit(16)? as u8;
-            Some((high << 4) | low)
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,24 +235,21 @@ mod tests {
     }
 
     #[test]
-    fn ready_cursor_is_opaque_and_binds_query_filters() {
+    fn ready_cursor_is_bounded_and_binds_query_filters() {
         let query = ReadyQuery::new(100, 2)
             .with_repositories(["repo-a".to_string()])
             .with_priority(Some(Priority::P1));
-        let anchor = CardId::new("ready-2").unwrap();
-        let cursor = ReadyCursor::for_query(&query, anchor.clone(), Vec::new());
-        let encoded = cursor.encode();
-        assert!(encoded.starts_with("v2."));
-        assert!(!encoded.contains(anchor.as_str()));
-        assert_eq!(
-            ReadyCursor::decode_for_query(&encoded, &query)
-                .unwrap()
-                .anchor,
-            anchor
-        );
+        let encoded =
+            ReadyCursor::for_snapshot(&query, "ready-snapshot-abc".to_string(), 17).encode();
+        assert!(encoded.starts_with("v3."));
+        assert!(encoded.len() < 128);
+        let decoded = ReadyCursor::decode_for_query(&encoded, &query).unwrap();
+        assert_eq!(decoded.position(), 17);
+        assert_eq!(decoded.snapshot_id(), Some("ready-snapshot-abc"));
         let other = query.clone().with_priority(Some(Priority::P2));
         let error = ReadyCursor::decode_for_query(&encoded, &other).unwrap_err();
         assert!(error.to_string().contains("stale continuation cursor"));
+        assert!(ReadyCursor::decode_for_query("v2.foo.bar", &query).is_err());
     }
 
     #[test]

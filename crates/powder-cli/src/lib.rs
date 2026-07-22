@@ -903,11 +903,12 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         .with_risk(risk)
         .with_priority(priority);
     let raw_after = flag_value(args, "--after");
-    let after = raw_after
-        .map(|raw| ReadyCursor::decode_for_query(raw, &query))
-        .transpose()
-        .map_err(|err| ShellError::Invalid(err.to_string()))?;
     let payload = if let Some(db) = flag_value(args, "--db") {
+        let after = raw_after
+            .as_deref()
+            .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+            .transpose()
+            .map_err(|err| ShellError::Invalid(err.to_string()))?;
         let store = open_store(db)?;
         let page = store
             .list_ready_page_after(query.clone(), after.as_ref())

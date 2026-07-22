@@ -1164,7 +1164,7 @@ async fn list_ready(
                 ReadyCursor::decode_for_query(raw, &query)
             } else {
                 CardId::new(raw.to_string())
-                    .map(|anchor| ReadyCursor::for_query(&query, anchor, Vec::new()))
+                    .map(|anchor| ReadyCursor::for_bare_anchor(&query, anchor))
                     .map_err(|err| powder_core::DomainError::validation("after", err.to_string()))
             }
         })

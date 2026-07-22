@@ -1342,6 +1342,118 @@ fn list_ready_continuation_keeps_mid_walk_arrivals_after_snapshot() -> Result<()
 }
 
 #[test]
+fn durable_ready_cursor_is_bounded_and_skips_claimed_anchor() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let cards = (0..10_001)
+        .map(|index| ready_card(&format!("ready-{index:05}"), index as i64))
+        .collect::<Vec<_>>();
+    store.import_cards(cards)?;
+    let query = ReadyQuery::new(20_000, 1);
+    let first = store.list_ready_page(query.clone())?;
+    let raw = first
+        .ready_cursor
+        .clone()
+        .expect("large result has durable cursor");
+    assert!(raw.starts_with("v3."));
+    assert!(
+        raw.len() < 160,
+        "cursor grew with board size: {}",
+        raw.len()
+    );
+    assert!(!raw.contains("ready-00000"));
+    let cursor = ReadyCursor::decode_for_query(&raw, &query)?;
+    let anchor = first.cards.first().expect("first card").id.clone();
+    store.claim_card(
+        &anchor,
+        "cursor-test-agent",
+        20_001,
+        60,
+        &Authority::unchecked(),
+    )?;
+    let second = store.list_ready_page_after(query, Some(&cursor))?;
+    assert_eq!(second.cards.len(), 1);
+    assert_ne!(second.cards[0].id, anchor);
+    Ok(())
+}
+
+#[test]
+fn durable_ready_cursor_survives_reopen_and_expires_with_gc() -> Result<()> {
+    let path = temp_db("ready-snapshot-reopen");
+    let query = ReadyQuery::new(100, 1);
+    let raw = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("reopen-a", 1), ready_card("reopen-b", 2)])?;
+        store
+            .list_ready_page(query.clone())?
+            .ready_cursor
+            .expect("cursor")
+    };
+    let cursor = ReadyCursor::decode_for_query(&raw, &query)?;
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    let second = store.list_ready_page_after(query.clone(), Some(&cursor))?;
+    assert_eq!(
+        second
+            .cards
+            .iter()
+            .map(|card| card.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reopen-b"]
+    );
+    let expired_query = ReadyQuery::new(3_701, 1);
+    let expired = store
+        .list_ready_page_after(expired_query, Some(&cursor))
+        .unwrap_err();
+    assert!(expired.to_string().contains("expired") || expired.to_string().contains("unknown"));
+    let remaining: i64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM ready_snapshots", [], |row| row.get(0))?;
+    assert_eq!(remaining, 0);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn schema_v25_database_migrates_ready_snapshot_tables() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.connection.execute_batch(crate::schema::SCHEMA)?;
+    store.connection.execute_batch(
+        "DROP TABLE ready_snapshot_items; DROP TABLE ready_snapshots; PRAGMA user_version = 25;",
+    )?;
+    store.migrate()?;
+    assert_eq!(store.schema_version()?, 26);
+    assert!(store.table_exists("ready_snapshots")?);
+    assert!(store.table_exists("ready_snapshot_items")?);
+    store.migrate()?;
+    Ok(())
+}
+
+#[test]
+fn durable_ready_cursor_rejects_tamper_and_query_mismatch() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("tamper-a", 1), ready_card("tamper-b", 2)])?;
+    let query = ReadyQuery::new(100, 1);
+    let raw = store
+        .list_ready_page(query.clone())?
+        .ready_cursor
+        .expect("cursor");
+    let other = query.clone().with_priority(Some(Priority::P1));
+    let mismatch = ReadyCursor::decode_for_query(&raw, &other).unwrap_err();
+    assert!(mismatch.to_string().contains("filters do not match"));
+    let unknown = format!("v3.{}.ready-snapshot-unknown.1", query.fingerprint());
+    let unknown_cursor = ReadyCursor::decode_for_query(&unknown, &query)?;
+    let error = store
+        .list_ready_page_after(query, Some(&unknown_cursor))
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown") || error.to_string().contains("expired"));
+    Ok(())
+}
+
+#[test]
 fn list_ready_includes_ready_cards_from_every_repository_tier() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -6548,7 +6660,7 @@ fn fts_v24_rebuild_makes_card_ids_exact_metadata() -> Result<()> {
         limit: 10,
         ..SearchQuery::default()
     })?;
-    assert_eq!(store.schema_version()?, 25);
+    assert_eq!(store.schema_version()?, 26);
     assert_eq!(page.total_count, 1);
     assert_eq!(page.matches.len(), 1);
     assert_eq!(page.matches[0].source_kind, "cards");
