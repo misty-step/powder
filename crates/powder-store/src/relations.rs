@@ -265,30 +265,6 @@ fn mirror_relation_change_inner(
     Ok(true)
 }
 
-pub(crate) fn mirror_relation_change(
-    connection: &Connection,
-    other_id: &CardId,
-    field: RelationField,
-    self_id: &CardId,
-    add: bool,
-    actor: &str,
-    now: i64,
-) -> Result<bool> {
-    mirror_relation_change_inner(
-        connection,
-        other_id,
-        field,
-        self_id,
-        add,
-        MirrorChangeOptions {
-            reject_corrupt: true,
-            actor,
-            authority: None,
-            now,
-        },
-    )
-}
-
 pub(crate) fn mirror_relation_change_with_authority(
     connection: &Connection,
     other_id: &CardId,
@@ -337,27 +313,6 @@ fn mirror_relation_change_for_doctor(
     )
 }
 
-/// Mirror every added/removed id in `delta` onto the peer named by each id,
-/// into `field.mirror()` on that peer (see [`RelationField::mirror`]).
-/// `self_id` is the card whose own `field` list just changed.
-pub(crate) fn mirror_delta(
-    connection: &Connection,
-    self_id: &CardId,
-    field: RelationField,
-    delta: &ListDelta,
-    actor: &str,
-    now: i64,
-) -> Result<()> {
-    let mirror_field = field.mirror();
-    for id in &delta.added {
-        mirror_relation_change(connection, id, mirror_field, self_id, true, actor, now)?;
-    }
-    for id in &delta.removed {
-        mirror_relation_change(connection, id, mirror_field, self_id, false, actor, now)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn mirror_delta_with_authority(
     connection: &Connection,
     self_id: &CardId,
@@ -386,52 +341,6 @@ pub(crate) fn mirror_delta_with_authority(
             self_id,
             false,
             authority,
-            now,
-        )?;
-    }
-    Ok(())
-}
-
-/// Mirror a brand-new card's initial relation lists (all-additions against
-/// empty old lists) -- used by `create_card_with_events` so a card born
-/// with `blocked_by: ["x"]` doesn't need a follow-up `update_relations`
-/// call on `x` just to make `x.blocks` agree.
-pub(crate) fn mirror_initial_relations(
-    connection: &Connection,
-    card: &Card,
-    actor: &str,
-    now: i64,
-) -> Result<()> {
-    for id in &card.related {
-        mirror_relation_change(
-            connection,
-            id,
-            RelationField::Related,
-            &card.id,
-            true,
-            actor,
-            now,
-        )?;
-    }
-    for id in &card.blocks {
-        mirror_relation_change(
-            connection,
-            id,
-            RelationField::BlockedBy,
-            &card.id,
-            true,
-            actor,
-            now,
-        )?;
-    }
-    for id in &card.blocked_by {
-        mirror_relation_change(
-            connection,
-            id,
-            RelationField::Blocks,
-            &card.id,
-            true,
-            actor,
             now,
         )?;
     }

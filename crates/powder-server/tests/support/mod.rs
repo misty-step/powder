@@ -4,7 +4,7 @@
 //! (per its own instruction) when `sse_live.rs` became the second such test.
 use std::io::Read;
 use std::net::TcpListener;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -78,7 +78,7 @@ pub struct RunningServer {
     pub db_path: std::path::PathBuf,
     pub bootstrap_key_file: std::path::PathBuf,
     /// Bounded raw stdout/stderr from the real process, for no-secret assertions.
-    pub output: Arc<Mutex<Vec<u8>>>,
+    pub(crate) output: Arc<Mutex<Vec<u8>>>,
     /// Readers are joined after _guard kills the child, so pipes cannot leak.
     _readers: Vec<std::thread::JoinHandle<()>>,
 }
@@ -89,7 +89,7 @@ pub struct RunningServer {
 /// `/healthz` before returning.
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 
-fn capture_raw<R: Read + Send + 'static>(mut reader: R, output: Arc<Mutex<Vec<u8>>>) {
+pub(crate) fn capture_raw<R: Read + Send + 'static>(mut reader: R, output: Arc<Mutex<Vec<u8>>>) {
     let mut chunk = [0_u8; 4096];
     loop {
         let read = match reader.read(&mut chunk) {
@@ -105,7 +105,7 @@ fn capture_raw<R: Read + Send + 'static>(mut reader: R, output: Arc<Mutex<Vec<u8
     }
 }
 
-fn output_text(output: &Arc<Mutex<Vec<u8>>>) -> String {
+pub(crate) fn output_text(output: &Arc<Mutex<Vec<u8>>>) -> String {
     String::from_utf8_lossy(&output.lock().expect("capture lock")).into_owned()
 }
 
@@ -118,76 +118,8 @@ impl Drop for RunningServer {
         for reader in self._readers.drain(..) {
             let _ = reader.join();
         }
-    }
-}
-
-fn reap_with_deadline(child: &mut Child, timeout: Duration) -> ExitStatus {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let kill_deadline = Instant::now() + Duration::from_secs(2);
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => return status,
-                        Ok(None) if Instant::now() < kill_deadline => {
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Ok(None) => panic!("powder-server did not exit after kill"),
-                        Err(error) => panic!("failed to reap powder-server: {error}"),
-                    }
-                }
-            }
-            Err(error) => panic!("failed to poll powder-server: {error}"),
-        }
-    }
-}
-
-pub struct FailedServerAttempt {
-    pub status: ExitStatus,
-    pub output: String,
-    pub db_path: std::path::PathBuf,
-    pub bootstrap_key_file: std::path::PathBuf,
-}
-
-pub fn run_server_attempt(label: &str, bind_addr: &str, public_reads: bool) -> FailedServerAttempt {
-    let db_path = unique_db_path(label);
-    let bootstrap_key_file = db_path.with_extension("bootstrap.key");
-    let _ = std::fs::remove_file(&db_path);
-    let _ = std::fs::remove_file(&bootstrap_key_file);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_powder-server"));
-    command
-        .env("POWDER_DB_PATH", &db_path)
-        .env("POWDER_BOOTSTRAP_KEY_FILE", &bootstrap_key_file)
-        .env("POWDER_BIND_ADDR", bind_addr)
-        .env("POWDER_AUTH_MODE", "api-key")
-        .env(
-            "POWDER_PUBLIC_READS",
-            if public_reads { "true" } else { "false" },
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn config-attempt server");
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let stdout = child.stdout.take().expect("attempt stdout");
-    let stderr = child.stderr.take().expect("attempt stderr");
-    let out_capture = Arc::clone(&output);
-    let err_capture = Arc::clone(&output);
-    let out_reader = std::thread::spawn(move || capture_raw(stdout, out_capture));
-    let err_reader = std::thread::spawn(move || capture_raw(stderr, err_capture));
-    let status = reap_with_deadline(&mut child, Duration::from_secs(10));
-    out_reader.join().expect("join attempt stdout reader");
-    err_reader.join().expect("join attempt stderr reader");
-    FailedServerAttempt {
-        status,
-        output: output_text(&output),
-        db_path,
-        bootstrap_key_file,
+        // Keep the bounded capture synchronized before callers inspect a cloned Arc.
+        let _ = output_text(&self.output);
     }
 }
 

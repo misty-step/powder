@@ -193,7 +193,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(raw: &str) -> Option<Vec<u8>> {
-    if raw.is_empty() || raw.len() % 2 != 0 {
+    if raw.is_empty() || !raw.len().is_multiple_of(2) {
         return None;
     }
     raw.as_bytes()

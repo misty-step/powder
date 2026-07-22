@@ -4669,26 +4669,6 @@ fn ensure_parent_linkable(
     }
 }
 
-/// Child outcomes roll up as audit events on the parent: any child
-/// transition into a terminal status appends a `rollup` event naming the
-/// child and, for completions, a bounded proof snippet. Nothing here changes
-/// the parent's own status -- parent acceptance stays authoritative.
-fn append_parent_rollup_event(
-    connection: &Connection,
-    child: &Card,
-    actor: &str,
-    detail: &str,
-    now: i64,
-) -> Result<()> {
-    append_parent_rollup_event_with_authority(
-        connection,
-        child,
-        &Authority::actor(actor.to_owned(), false),
-        detail,
-        now,
-    )
-}
-
 fn append_parent_rollup_event_with_authority(
     connection: &Connection,
     child: &Card,

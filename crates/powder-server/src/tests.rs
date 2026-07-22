@@ -217,8 +217,7 @@ fn bootstrap_prepare_failure_preserves_a_preexisting_key_file() {
             write_one_shot_bootstrap_key(&key_path, &key.raw_key)
                 .map_err(StoreError::from)
                 .map(|()| created.set(true))?;
-            Err(StoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(StoreError::Io(std::io::Error::other(
                 "simulated preparation failure",
             )))
         },
@@ -2523,6 +2522,8 @@ async fn hidden_read_queries_require_admin_across_stats_and_repositories() {
         );
     }
 }
+
+#[tokio::test]
 async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
