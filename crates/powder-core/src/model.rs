@@ -115,6 +115,20 @@ impl Authority {
         }
     }
 
+    /// Administrative mutations (repository, key, and subscription policy)
+    /// require an explicit admin capability. Unchecked is retained only for
+    /// trusted fixture/none-mode callers; authenticated principals never
+    /// inherit admin from a semantic actor label.
+    pub fn require_admin(&self) -> Result<(), DomainError> {
+        match self {
+            Self::Unchecked => Ok(()),
+            Self::Principal { is_admin: true, .. } => Ok(()),
+            Self::Principal { name, .. } => Err(DomainError::forbidden(format!(
+                "principal {name} requires admin authority"
+            ))),
+        }
+    }
+
     /// A non-admin actor may only mutate a card that they hold the active
     /// claim on. `holder` is `None` when the card has no active claim.
     pub fn require_holder(&self, holder: Option<&str>) -> Result<(), DomainError> {
