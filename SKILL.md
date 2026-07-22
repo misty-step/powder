@@ -81,6 +81,7 @@ Default agent persona (22 tools):
   hidden (include_terminal:true)"; a filtered query that matches nothing
   names the active filter and the board's total (e.g. `0 matches for
   {status:done, repo:mint}; board has 214 cards`).
+- `search_cards`: search card summaries and indexed card title/body/criteria, comments, and work logs with required `q`, optional source/status/repo/label/priority/estimate/risk/time filters, `limit`, and opaque `after`; returns `{matches,total_count,has_more,next_after?}`. Each match has a nested `card` summary plus `source_kind`, `source_field`, `source_created_at`, plain untrusted `snippet`, and lower-is-better `rank`. Single terms are exact-or-prefix; multi-term queries are unordered within an FTS window. Hyphen/underscore compounds are exact tokens, so use the full identifier or a prefix rather than a sub-token. Local `POWDER_DB_PATH` and remote `POWDER_API_BASE_URL` modes are identical.
 - `board_stats`: return board-shape counts (by status and repo), not card
   contents; call this before `list_cards` when you only need the shape of
   the board.

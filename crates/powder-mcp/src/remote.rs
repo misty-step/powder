@@ -10,10 +10,10 @@ use powder_core::{normalize_acceptance, normalize_labels, DetailLevel};
 use serde_json::{json, Value};
 
 use super::{
-    card_id, card_ids_array, claim_action, missing_required, optional_repository_tier,
-    optional_repository_visibility, optional_str, parse_estimate, parse_priority, parse_risk,
-    parse_status, required_claim_arg, required_str, run_id, run_id_for_claim, string_array,
-    to_string, ClaimAction,
+    card_id, card_ids_array, claim_action, missing_required, optional_i64,
+    optional_repository_tier, optional_repository_visibility, optional_str, parse_estimate,
+    parse_priority, parse_risk, parse_status, required_claim_arg, required_str, run_id,
+    run_id_for_claim, string_array, to_string, ClaimAction,
 };
 
 fn normalize_relation_wire(args: &Value, key: &'static str) -> Result<Value, String> {
@@ -66,6 +66,56 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             query.push_str(&format!("&include_terminal={include_terminal}"));
             let response = client.get(&format!("/api/v1/cards?{query}"))?;
             remote_card_summary_page_payload(response)?
+        }
+        "search_cards" => {
+            let q = required_str(args, "q")?;
+            let limit = args["limit"].as_u64().unwrap_or(20).max(1);
+            let mut query = format!("q={}&limit={limit}", urlencode(q));
+            let mut add = |key: &str, value: Option<String>| {
+                if let Some(value) = value {
+                    query.push_str(&format!("&{key}={}", urlencode(&value)));
+                }
+            };
+            add(
+                "source_kind",
+                optional_str(args, "source_kind")
+                    .or_else(|| optional_str(args, "source"))
+                    .map(str::to_string),
+            );
+            add(
+                "source_field",
+                optional_str(args, "source_field").map(str::to_string),
+            );
+            if let Some(status) = optional_str(args, "status") {
+                parse_status(status)?;
+                add("status", Some(status.to_string()));
+            }
+            add("repo", optional_str(args, "repo").map(str::to_string));
+            add("label", optional_str(args, "label").map(str::to_string));
+            if let Some(priority) = optional_str(args, "priority") {
+                parse_priority(priority)?;
+                add("priority", Some(priority.to_string()));
+            }
+            if let Some(estimate) = optional_str(args, "estimate") {
+                parse_estimate(estimate)?;
+                add("estimate", Some(estimate.to_string()));
+            }
+            if let Some(risk) = optional_str(args, "risk") {
+                parse_risk(risk)?;
+                add("risk", Some(risk.to_string()));
+            }
+            for key in [
+                "source_created_after",
+                "source_created_before",
+                "created_after",
+                "created_before",
+                "updated_after",
+                "updated_before",
+            ] {
+                add(key, optional_i64(args, key)?.map(|value| value.to_string()));
+            }
+            add("after", optional_str(args, "after").map(str::to_string));
+            client.get(&format!("/api/v1/cards/search?{query}"))?
         }
         "board_stats" => {
             let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
@@ -902,6 +952,37 @@ mod tests {
         assert_eq!(
             requests[0].body,
             Some(json!({"author": "operator", "body": "looks good"}))
+        );
+    }
+
+    #[test]
+    fn remote_search_forwards_numeric_time_filters_and_bearer_auth() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "matches": [], "total_count": 0, "has_more": false
+            }),
+        )]);
+        let client = RemoteClient::new(base_url, Some("sk_powder_search".to_string()));
+        let result = call_tool_remote(
+            &client,
+            "search_cards",
+            &json!({
+                "q": "needle", "source": "cards", "status": "backlog",
+                "created_after": 10_i64, "limit": 5
+            }),
+        )
+        .unwrap();
+        assert_eq!(tool_payload(&result)["total_count"], 0);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].path.contains("/api/v1/cards/search?"));
+        assert!(requests[0].path.contains("q=needle"));
+        assert!(requests[0].path.contains("source_kind=cards"));
+        assert!(requests[0].path.contains("created_after=10"));
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_search")
         );
     }
 

@@ -1,13 +1,13 @@
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
+    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, Risk, RunId, RunState,
 };
 
 use crate::schema::SCHEMA;
 use crate::{
     ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig,
     ImportOutcome, ParentCoverageBucket, ParentIssueKind, RelationField, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, Result, Store, StoreError, WorkLogAttribution,
+    RepositoryUpsert, RepositoryVisibility, Result, SearchQuery, Store, StoreError, WorkLogAttribution,
     API_KEY_ALPHABET,
 };
 
@@ -6899,5 +6899,77 @@ fn fts_search_times_10k_synthetic_cards() -> Result<()> {
     println!("FTS5 search over 10,000 synthetic cards: {elapsed:?}");
     assert_eq!(hits.len(), 10);
     assert!(hits.iter().all(|hit| hit.source_field == "title"));
+    Ok(())
+}
+
+#[test]
+fn search_page_shapes_recall_filters_cursor_and_safe_snippets() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut first = ready_card("powder-query-fts-store", 10);
+    first.title = "needle Alpha exact identifier".to_string();
+    first.body = "needle first then second, with <script>alert(1)</script>".to_string();
+    first.labels = vec!["search".to_string()];
+    first.risk = Some(Risk::High);
+    let mut second = ready_card("search-other", 20);
+    second.title = "Second needle".to_string();
+    second.body = "first text and second text in reverse order".to_string();
+    second.labels = vec!["other".to_string()];
+    store.import_cards(vec![first.clone(), second.clone()])?;
+
+    let exact = store.search_page(&SearchQuery {
+        q: first.id.to_string(),
+        limit: 20,
+        ..SearchQuery::default()
+    })?;
+    assert!(exact.matches.iter().any(|item| item.card.id == first.id));
+    let prefix = store.search_page(&SearchQuery {
+        q: "powder-query".to_string(),
+        limit: 20,
+        ..SearchQuery::default()
+    })?;
+    assert!(prefix.matches.iter().any(|item| item.card.id == first.id));
+    let unordered = store.search_page(&SearchQuery {
+        q: "second first".to_string(),
+        limit: 20,
+        ..SearchQuery::default()
+    })?;
+    assert!(unordered
+        .matches
+        .iter()
+        .any(|item| item.card.id == second.id));
+    assert!(unordered
+        .matches
+        .iter()
+        .all(|item| !item.snippet.contains("<b>")));
+
+    let filtered = store.search_page(&SearchQuery {
+        q: "needle".to_string(),
+        label: Some("search".to_string()),
+        risk: Some(Risk::High),
+        limit: 1,
+        ..SearchQuery::default()
+    })?;
+    assert_eq!(filtered.total_count, 2);
+    assert!(filtered.has_more);
+    let next = store.search_page(&SearchQuery {
+        q: "needle".to_string(),
+        label: Some("search".to_string()),
+        risk: Some(Risk::High),
+        limit: 1,
+        after: filtered.next_after.clone(),
+        ..SearchQuery::default()
+    })?;
+    assert_eq!(next.matches.len(), 1);
+    assert!(!next.has_more);
+    let mismatch = store.search_page(&SearchQuery {
+        q: "other".to_string(),
+        after: filtered.next_after,
+        limit: 1,
+        ..SearchQuery::default()
+    });
+    assert!(
+        matches!(mismatch, Err(StoreError::InvalidSearchCursor(message)) if message.contains("does not match"))
+    );
     Ok(())
 }

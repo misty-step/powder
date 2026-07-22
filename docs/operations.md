@@ -82,8 +82,7 @@ never an error.
 | `list-ready` | SQLite query | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
 | `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\ttitle` or `no-cards` |
 | `board-rollups --json` | SQLite aggregate query | `GET /api/v1/board/rollups` | Pretty JSON `{rollups,total_count,has_more,next_after?,coverage}` |
-
-
+| `search --json` | SQLite FTS query | `GET /api/v1/cards/search` | `{matches,total_count,has_more,next_after?}` JSON |
 | `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
 | `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus` |
 | `update-card` | SQLite patch write | `PATCH /api/v1/cards/{id}` | `updated\tid\tpriority\tstatus` |
@@ -537,3 +536,7 @@ and never appears in the URL or a QR code. Because it's a distinct key
 (not the admin key), losing the phone or leaking the key only costs a
 `powder key-revoke <id>` against that one key, not against everything the
 admin key can touch.
+
+## Search contract
+
+`GET /api/v1/cards/search` and `powder search --json` use the same store-backed query. Pass `q` plus optional `source_kind`/`source_field`, status, repo, label, priority, estimate, risk, `created_after`/`created_before`, `updated_after`/`updated_before`, `limit`, and opaque `after`. Search includes card title/body/criteria, comments, and work logs. A single term is exact-or-prefix; multiple terms are unordered within an FTS window. Hyphen and underscore compounds are exact tokens, so sub-token searches are intentionally limited; snippets are plain untrusted text and clients must escape them before HTML. Cursors are bound to the query and filter fingerprint; reusing one with changed filters returns an invalid-cursor error. A valid cursor is an offset into the deterministic result ordering, so concurrent inserts, edits, or deletes can shift later pages; restart the search when a live board changes.

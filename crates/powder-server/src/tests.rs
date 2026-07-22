@@ -5669,6 +5669,64 @@ async fn every_request_triggers_the_trace_layer_without_leaking_the_bearer_token
     );
 }
 
+#[tokio::test]
+async fn search_http_requires_auth_and_matches_cli_contract() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+
+    let unauthorized = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/search?q=needle",
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&raw_key),
+            r#"{"id":"http-search","title":"Needle card","acceptance":[],"status":"backlog"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let missing_q = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/search",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_q.status(), StatusCode::BAD_REQUEST);
+
+    let found = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards/search?q=needle&source_kind=cards&status=backlog&limit=1",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(found.status(), StatusCode::OK);
+    let payload = response_json(found).await;
+    assert_eq!(payload["matches"][0]["card"]["id"], "http-search");
+    assert_eq!(payload["matches"][0]["source_kind"], "cards");
+    assert_eq!(payload["matches"][0]["source_field"], "title");
+    assert_eq!(payload["has_more"], false);
+}
+
 fn test_state(auth_mode: AuthMode) -> (AppState, String) {
     test_state_with_public_reads(auth_mode, false)
 }

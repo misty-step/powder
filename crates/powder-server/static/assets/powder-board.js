@@ -129,6 +129,7 @@ const els = {
   cmdkInput: document.getElementById("cmdk-input"),
   cmdkList: document.getElementById("cmdk-list"),
   cmdkEmpty: document.getElementById("cmdk-empty"),
+  searchStatus: document.getElementById("text-search-status"),
   toast: document.getElementById("pw-toast"),
 };
 
@@ -154,6 +155,9 @@ const state = {
   loading: true,
   error: "",
   errorKind: "",
+  searchMatches: [],
+  searchLoading: false,
+  searchError: "",
   filters: {
     repos: new Set(),
     prios: new Set(),
@@ -230,6 +234,140 @@ function listPageCards(data, label) {
     throw new Error(`${label} list truncated at ${cards.length} of ${total}`);
   }
   return cards;
+}
+
+function groupedSearchMatches(matches) {
+  const groups = new Map();
+  for (const match of Array.isArray(matches) ? matches : []) {
+    const card = match && match.card;
+    if (!card || !card.id) continue;
+    const rank = Number(match.rank);
+    const candidate = {
+      card: normalizeCard(card),
+      rank: Number.isFinite(rank) ? rank : Number.POSITIVE_INFINITY,
+      source_kind: String(match.source_kind || "cards"),
+      source_field: String(match.source_field || ""),
+      source_created_at: Number(match.source_created_at || 0),
+      snippet: String(match.snippet || ""),
+    };
+    const previous = groups.get(String(card.id));
+    if (!previous || candidate.rank < previous.rank) groups.set(String(card.id), candidate);
+  }
+  return [...groups.values()].sort((left, right) => left.rank - right.rank || left.card.id.localeCompare(right.card.id));
+}
+
+function renderSearchStatus() {
+  if (!els.searchStatus) return;
+  const query = state.filters.search.trim();
+  const count = groupedSearchMatches(state.searchMatches).length;
+  els.searchStatus.textContent = !query
+    ? ""
+    : state.searchLoading
+      ? "Searching…"
+      : state.searchError
+        ? "Search error: " + state.searchError
+        : count + " result" + (count === 1 ? "" : "s");
+  els.searchStatus.dataset.state = state.searchError ? "error" : state.searchLoading ? "loading" : "ready";
+}
+
+async function requestTextSearch(query) {
+  const normalized = query.trim();
+  const seq = ++searchRequestSeq;
+  state.searchError = "";
+  if (!normalized) {
+    state.searchLoading = false;
+    state.searchMatches = [];
+    renderSearchStatus();
+    render();
+    return;
+  }
+  state.searchLoading = true;
+  renderSearchStatus();
+  render();
+  try {
+    const params = new URLSearchParams({ q: normalized, limit: "100" });
+    const data = await apiJson("/api/v1/cards/search?" + params.toString());
+    if (seq !== searchRequestSeq) return;
+    state.searchMatches = Array.isArray(data.matches) ? data.matches : [];
+    state.searchLoading = false;
+    state.searchError = "";
+    renderSearchStatus();
+    render();
+  } catch (err) {
+    if (seq !== searchRequestSeq) return;
+    state.searchLoading = false;
+    state.searchMatches = [];
+    state.searchError = err?.message || String(err);
+    renderSearchStatus();
+    render();
+  }
+}
+
+function scheduleTextSearch(query) {
+  state.filters.search = query;
+  clearTimeout(searchDebounceTimer);
+  const seq = ++searchRequestSeq;
+  if (!query.trim()) {
+    state.searchLoading = false;
+    state.searchError = "";
+    state.searchMatches = [];
+    renderSearchStatus();
+    render();
+    return;
+  }
+  state.searchLoading = true;
+  state.searchError = "";
+  state.searchMatches = [];
+  renderSearchStatus();
+  render();
+  searchDebounceTimer = setTimeout(() => {
+    if (seq === searchRequestSeq) requestTextSearch(query);
+  }, 180);
+}
+
+function schedulePaletteSearch(query) {
+  const normalized = query.trim();
+  clearTimeout(paletteSearchTimer);
+  const seq = ++paletteSearchSeq;
+  paletteError = "";
+  paletteMatches = [];
+  paletteLoading = Boolean(normalized);
+  paletteActiveIndex = -1;
+  renderPaletteList();
+  if (!normalized) return;
+  paletteSearchTimer = setTimeout(() => {
+    if (seq === paletteSearchSeq) requestPaletteSearch(normalized);
+  }, 180);
+}
+
+async function requestPaletteSearch(query) {
+  const normalized = query.trim();
+  const seq = ++paletteSearchSeq;
+  paletteLoading = Boolean(normalized);
+  paletteError = "";
+  renderPaletteList();
+  if (!normalized) return;
+  try {
+    const params = new URLSearchParams({ q: normalized, limit: String(CMDK_MATCH_LIMIT) });
+    const data = await apiJson("/api/v1/cards/search?" + params.toString());
+    if (seq !== paletteSearchSeq) return;
+    paletteLoading = false;
+    paletteMatches = groupedSearchMatches(data.matches);
+    paletteActiveIndex = paletteMatches.length ? 0 : -1;
+    renderPaletteList();
+  } catch (err) {
+    if (seq !== paletteSearchSeq) return;
+    paletteLoading = false;
+    paletteError = err?.message || String(err);
+    paletteMatches = [];
+    paletteActiveIndex = -1;
+    renderPaletteList();
+  }
+}
+
+function refreshActiveSearches() {
+  if (state.filters.search.trim()) requestTextSearch(state.filters.search);
+  if (isPaletteOpen() && els.cmdkInput?.value.trim()) schedulePaletteSearch(els.cmdkInput.value);
 }
 
 async function loadOnboarding() {
@@ -360,6 +498,7 @@ async function loadBoard(options = {}) {
     buildFilters();
     renderRepositorySettings();
     render();
+    refreshActiveSearches();
   } catch (err) {
     // A silent reconcile keeps the cached render up (never repaints the
     // board into an error shell), but it must not swallow failures: auth
@@ -459,6 +598,7 @@ async function refreshLive() {
     buildFilters();
     renderRepositorySettings();
     render();
+    refreshActiveSearches();
     highlightChangedCards(changed);
   } catch (_err) {
     // keep showing the last good board
@@ -1400,25 +1540,9 @@ function passes(card) {
   if (card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
   if (state.filters.repos.size && !state.filters.repos.has(card.repoKey)) return false;
   if (state.filters.prios.size && !state.filters.prios.has(cleanPriority(card.priority))) return false;
-  const query = state.filters.search.trim().toLowerCase();
+  const query = state.filters.search.trim();
   if (!query) return true;
-  const haystack = [
-    card.id,
-    card.title,
-    card.body,
-    card.priority,
-    card.status,
-    card.repo,
-    card.source?.path,
-    ...(card.related || []),
-    ...(card.blocks || []),
-    ...(card.blocked_by || []),
-    ...(card.labels || []),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  return haystack.includes(query);
+  return groupedSearchMatches(state.searchMatches).some((match) => match.card.id === card.id);
 }
 
 function sorted(list) {
@@ -1459,8 +1583,18 @@ function hasUnresolvedBlocker(card, cardsById) {
 }
 
 function bucket() {
-  const visible = state.cards.filter(passes);
-  const cardsById = new Map(state.cards.map((card) => [card.id, card]));
+  const loadedCards = new Map(state.cards.map((card) => [card.id, card]));
+  const sourceCards = state.filters.search.trim()
+    ? groupedSearchMatches(state.searchMatches).map((match) => {
+        // Search summaries are intentionally small, but an already-loaded card
+        // carries blocker/relationship fields the lane renderer must preserve.
+        // Use the server result for genuinely unloaded cards so search never
+        // narrows back to the loaded cache.
+        return loadedCards.get(match.card.id) || match.card;
+      })
+    : state.cards;
+  const visible = sourceCards.filter(passes);
+  const cardsById = new Map(sourceCards.map((card) => [card.id, card]));
   return {
     backlog: sorted(visible.filter((card) => card.displayStatus === "backlog")),
     ready: sorted(
@@ -1575,6 +1709,7 @@ function render() {
     return;
   }
 
+  renderSearchStatus();
   const buckets = bucket();
   const failedLanes = failedDisplayLanes();
   els.laneReady.innerHTML = failedLanes.has("ready")
@@ -1589,7 +1724,7 @@ function render() {
   els.laneDone.innerHTML = failedLanes.has("done")
     ? laneFailureHTML("done")
     : buckets.done.map(doneRowHTML).join("") || boardEmptyCopy("shipped");
-  if (failedLanes.has("backlog")) {
+  if (failedLanes.has("backlog") && !state.filters.search.trim()) {
     els.railList.innerHTML = laneFailureHTML("backlog");
   } else {
     renderRail(buckets.backlog);
@@ -1609,6 +1744,7 @@ function renderLoading() {
     el.textContent = "";
   }
   els.filterN.textContent = "";
+  renderSearchStatus();
 }
 
 function renderFailure() {
@@ -2346,15 +2482,20 @@ function moveCardFocus(direction) {
 
 // --- command palette (powder-ui-keyboard-firstrun) ----------------------
 //
-// Simplest honest design: a modal listbox filtering the board's own
-// already-loaded `state.cards` (the same data the text-search filter reads),
-// not a second index or a server round-trip. Complements the existing
-// `/`-focuses-search shortcut rather than fighting it -- search narrows the
-// board in place, the palette jumps straight to one card's detail route.
+// Simplest honest design: a modal listbox over the authenticated server search
+// contract, so it can find cards outside the currently loaded display pages. It
+// complements the `/` shortcut: the board filter narrows in place, while the
+// palette jumps straight to a card detail route.
 const CMDK_MATCH_LIMIT = 50;
 let paletteMatches = [];
 let paletteActiveIndex = -1;
 let paletteInvoker = null;
+let paletteLoading = false;
+let paletteError = "";
+let paletteSearchSeq = 0;
+let paletteSearchTimer = null;
+let searchDebounceTimer = null;
+let searchRequestSeq = 0;
 
 function isPaletteOpen() {
   return Boolean(els.cmdk && !els.cmdk.hidden);
@@ -2373,6 +2514,10 @@ function openCommandPalette() {
 function closeCommandPalette() {
   if (!els.cmdk) return;
   els.cmdk.hidden = true;
+  clearTimeout(paletteSearchTimer);
+  paletteSearchSeq += 1;
+  paletteLoading = false;
+  paletteError = "";
   paletteMatches = [];
   paletteActiveIndex = -1;
   // aria-modal promises focus containment AND that closing hands focus back
@@ -2424,36 +2569,51 @@ function toggleCommandPalette() {
 }
 
 function filterPalette(query) {
-  const q = query.trim().toLowerCase();
-  const pool = q
-    ? state.cards.filter(
-        (card) => card.id.toLowerCase().includes(q) || card.title.toLowerCase().includes(q),
-      )
-    : state.cards;
-  paletteMatches = pool.slice(0, CMDK_MATCH_LIMIT);
-  paletteActiveIndex = paletteMatches.length ? 0 : -1;
-  renderPaletteList();
+  const q = query.trim();
+  if (!q) {
+    paletteSearchSeq += 1;
+    paletteLoading = false;
+    paletteError = "";
+    paletteMatches = state.cards.slice(0, CMDK_MATCH_LIMIT).map((card) => ({
+      card,
+      rank: Number.POSITIVE_INFINITY,
+      source_kind: "loaded",
+      source_field: "",
+      snippet: "",
+    }));
+    paletteActiveIndex = paletteMatches.length ? 0 : -1;
+    renderPaletteList();
+    return;
+  }
+  schedulePaletteSearch(q);
 }
-
 function renderPaletteList() {
   if (!els.cmdkList) return;
-  els.cmdkEmpty.hidden = paletteMatches.length > 0;
-  els.cmdkList.innerHTML = paletteMatches
-    .map(
-      (card, index) => `
-        <li id="cmdk-opt-${index}" role="option" aria-selected="${index === paletteActiveIndex}" class="pw-cmdk-item${index === paletteActiveIndex ? " is-active" : ""}" data-index="${index}">
-          <span class="pw-cmdk-item-id ae-num">${escapeHtml(card.id)}</span>
-          <span class="pw-cmdk-item-title">${escapeHtml(card.title)}</span>
-        </li>
-      `,
-    )
-    .join("");
-  els.cmdkInput.setAttribute(
-    "aria-activedescendant",
-    paletteActiveIndex >= 0 ? `cmdk-opt-${paletteActiveIndex}` : "",
-  );
+  els.cmdkInput.setAttribute("aria-busy", paletteLoading ? "true" : "false");
+  if (paletteLoading) {
+    els.cmdkEmpty.hidden = true;
+    els.cmdkList.innerHTML = '<li role="status" class="pw-cmdk-item">Searching…</li>';
+  } else if (paletteError) {
+    els.cmdkEmpty.hidden = true;
+    els.cmdkList.innerHTML = '<li role="alert" class="pw-cmdk-item">' + escapeHtml(paletteError) + '</li>';
+  } else {
+    els.cmdkEmpty.hidden = paletteMatches.length > 0;
+    els.cmdkList.innerHTML = paletteMatches.map((entry, index) => {
+      const card = entry.card || entry;
+      const provenance = entry.source_kind && entry.source_field
+        ? entry.source_kind + " / " + entry.source_field
+        : "loaded card";
+      const snippet = entry.snippet
+        ? '<span class="pw-cmdk-item-snippet">' + escapeHtml(entry.snippet) + '</span>'
+        : "";
+      return '<li id="cmdk-opt-' + index + '" role="option" aria-selected="' + (index === paletteActiveIndex) + '" class="pw-cmdk-item' + (index === paletteActiveIndex ? ' is-active' : '') + '" data-index="' + index + '">' +
+        '<span class="pw-cmdk-item-id ae-num">' + escapeHtml(card.id) + '</span>' +
+        '<span class="pw-cmdk-item-title">' + escapeHtml(card.title) + '</span>' +
+        '<span class="pw-cmdk-item-source">' + escapeHtml(provenance) + '</span>' + snippet + '</li>';
+    }).join("");
+  }
+  els.cmdkInput.setAttribute("aria-activedescendant", paletteActiveIndex >= 0 ? "cmdk-opt-" + paletteActiveIndex : "");
 }
-
 function movePaletteActive(direction) {
   if (!paletteMatches.length) return;
   paletteActiveIndex = (paletteActiveIndex + direction + paletteMatches.length) % paletteMatches.length;
@@ -2464,7 +2624,8 @@ function movePaletteActive(direction) {
 }
 
 function activatePaletteSelection(index = paletteActiveIndex) {
-  const card = paletteMatches[index];
+  const entry = paletteMatches[index];
+  const card = entry?.card || entry;
   if (!card) return;
   saveBoardState();
   window.location.href = cardHref(card.id);
@@ -2480,10 +2641,13 @@ els.filterClear.addEventListener("click", () => {
   state.filters.repos.clear();
   state.filters.prios.clear();
   state.filters.search = "";
+  state.searchMatches = [];
+  state.searchError = "";
+  state.searchLoading = false;
   state.showAllTiers = false;
   els.textFilter.value = "";
   buildFilters();
-  render();
+  scheduleTextSearch("");
 });
 els.tierToggle.addEventListener("click", () => {
   state.showAllTiers = !state.showAllTiers;
@@ -2495,8 +2659,7 @@ els.repoEmptyToggle?.addEventListener("click", () => {
   renderRepositorySettings();
 });
 els.textFilter.addEventListener("input", (event) => {
-  state.filters.search = event.target.value;
-  render();
+  scheduleTextSearch(event.target.value);
 });
 els.sort.addEventListener("change", (event) => {
   state.filters.sort = event.target.value;
@@ -2711,8 +2874,7 @@ document.addEventListener("click", (event) => {
 });
 document.addEventListener("keydown", (event) => {
   // ⌘K/Ctrl-K opens the command palette from the board (not the card
-  // detail route -- state.cards, the palette's search pool, is only
-  // populated there). Checked first because it needs the modifier keys
+  // detail route. Checked first because it needs the modifier keys
   // the generic bail-out below rejects.
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k" && !cardRouteId()) {
     event.preventDefault();
