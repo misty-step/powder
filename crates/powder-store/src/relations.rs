@@ -172,17 +172,23 @@ fn decode_relation_ids_strict(value: &Value) -> Option<Vec<CardId>> {
         .collect()
 }
 
-/// Add or remove self_id from other_id's relation JSON list with a targeted
-/// update. This deliberately never decodes or persists the full card row, so
-/// corrupt parent/title/status fields remain byte-for-byte untouched.
-pub(crate) fn mirror_relation_change(
+/// Add or remove self_id from other_id's relation JSON list. Normal relation
+/// writes reject a corrupt peer so the enclosing transaction rolls back instead
+/// of silently creating an asymmetric graph.
+#[derive(Clone, Copy)]
+struct MirrorChangeOptions<'a> {
+    reject_corrupt: bool,
+    actor: &'a str,
+    now: i64,
+}
+
+fn mirror_relation_change_inner(
     connection: &Connection,
     other_id: &CardId,
     field: RelationField,
     self_id: &CardId,
     add: bool,
-    actor: &str,
-    now: i64,
+    options: MirrorChangeOptions<'_>,
 ) -> Result<bool> {
     if other_id == self_id {
         return Ok(false);
@@ -199,6 +205,12 @@ pub(crate) fn mirror_relation_change(
         return Ok(false);
     };
     let Some(mut ids) = decode_relation_ids_strict(&raw) else {
+        if options.reject_corrupt {
+            return Err(crate::StoreError::InvalidStoredValue {
+                field: column,
+                value: value_description(&raw),
+            });
+        }
         return Ok(false);
     };
     let changed = if add {
@@ -219,7 +231,7 @@ pub(crate) fn mirror_relation_change(
     let serialized = serde_json::to_string(&ids)?;
     let updated = connection.execute(
         &format!("UPDATE cards SET {column} = ?1, updated_at = ?2 WHERE id = ?3"),
-        rusqlite::params![serialized, now, other_id.as_str()],
+        rusqlite::params![serialized, options.now, other_id.as_str()],
     )?;
     if updated == 0 {
         return Ok(false);
@@ -228,15 +240,61 @@ pub(crate) fn mirror_relation_change(
         connection,
         other_id,
         "relations",
-        actor,
+        options.actor,
         &format!(
             "mirrored {} {} {self_id}",
             if add { "add" } else { "remove" },
             field.as_str()
         ),
-        now,
+        options.now,
     )?;
     Ok(true)
+}
+
+pub(crate) fn mirror_relation_change(
+    connection: &Connection,
+    other_id: &CardId,
+    field: RelationField,
+    self_id: &CardId,
+    add: bool,
+    actor: &str,
+    now: i64,
+) -> Result<bool> {
+    mirror_relation_change_inner(
+        connection,
+        other_id,
+        field,
+        self_id,
+        add,
+        MirrorChangeOptions {
+            reject_corrupt: true,
+            actor,
+            now,
+        },
+    )
+}
+
+fn mirror_relation_change_for_doctor(
+    connection: &Connection,
+    other_id: &CardId,
+    field: RelationField,
+    self_id: &CardId,
+    add: bool,
+    actor: &str,
+    now: i64,
+) -> Result<bool> {
+    mirror_relation_change_inner(
+        connection,
+        other_id,
+        field,
+        self_id,
+        add,
+        MirrorChangeOptions {
+            reject_corrupt: false,
+            actor,
+            now,
+        },
+    )
 }
 
 /// Mirror every added/removed id in `delta` onto the peer named by each id,
@@ -1013,7 +1071,7 @@ impl Store {
                 ) else {
                     continue;
                 };
-                if mirror_relation_change(
+                if mirror_relation_change_for_doctor(
                     &transaction,
                     &target_id,
                     field,
