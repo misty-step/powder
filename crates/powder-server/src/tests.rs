@@ -2873,10 +2873,26 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
             StatusCode::OK,
             "POWDER_PUBLIC_READS=true board read route {route} should not need a bearer token"
         );
-        let body = response_text(response).await;
         if route == "/api/v1/approvals" {
+            let body = response_text(response).await;
             assert!(body.contains("\"approvals\":[]") || body.contains("\"approvals\": []"));
+        } else if route == "/api/v1/board/rollups" {
+            // Parentless cards intentionally aggregate into a General row with
+            // no card id; prove this seeded card is accounted for semantically.
+            let page = response_json(response).await;
+            assert_eq!(page["total_count"], 1);
+            assert_eq!(page["coverage"]["total_cards"], 1);
+            assert_eq!(page["coverage"]["accounted_cards"], 1);
+            assert_eq!(page["coverage"]["unsorted_cards"], 1);
+            let ready_cards: u64 = page["rollups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["status_counts"]["ready"].as_u64().unwrap_or_default())
+                .sum();
+            assert_eq!(ready_cards, 1);
         } else {
+            let body = response_text(response).await;
             assert!(
                 body.contains("board-readable"),
                 "read route {route} should expose the seeded card"
