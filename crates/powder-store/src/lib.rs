@@ -1935,7 +1935,20 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<ImportOutcome> {
-        let actor = non_empty("actor", actor)?;
+        self.import_cards_with_events_with_authority(
+            cards,
+            &Authority::actor(actor.to_owned(), false),
+            now,
+        )
+    }
+
+    pub fn import_cards_with_events_with_authority(
+        &mut self,
+        cards: Vec<Card>,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<ImportOutcome> {
+        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

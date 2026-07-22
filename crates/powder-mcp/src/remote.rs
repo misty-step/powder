@@ -241,15 +241,22 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let name = required_str(args, "name")?;
             optional_repository_visibility(args)?;
             optional_repository_tier(args)?;
+            let mut body = json!({
+                "name": name,
+                "aliases": args["aliases"].as_array().cloned(),
+                "visibility": optional_str(args, "visibility"),
+                "tier": optional_str(args, "tier"),
+                "import_provenance": optional_str(args, "import_provenance"),
+            });
+            if let Some(actor) = args["actor"].as_str() {
+                body["actor"] = json!(actor);
+            }
+            if let Some(admin) = args["admin"].as_bool() {
+                body["admin"] = json!(admin);
+            }
             client.post(
                 "/api/v1/repositories",
-                json!({
-                    "name": name,
-                    "aliases": args["aliases"].as_array().cloned(),
-                    "visibility": optional_str(args, "visibility"),
-                    "tier": optional_str(args, "tier"),
-                    "import_provenance": optional_str(args, "import_provenance"),
-                }),
+                body,
             )?
         }
         "merge_repository_alias" => {
@@ -259,6 +266,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(actor) = args["actor"].as_str() {
                 body["actor"] = json!(actor);
             }
+            if let Some(admin) = args["admin"].as_bool() {
+                body["admin"] = json!(admin);
+            }
             client.post(
                 &format!("/api/v1/repositories/{}/merge-alias", urlencode(target)),
                 body,
@@ -266,7 +276,14 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "delete_repository" => {
             let name = required_str(args, "name")?;
-            client.delete(&format!("/api/v1/repositories/{}", urlencode(name)))?
+            let path = format!("/api/v1/repositories/{}", urlencode(name));
+            client.delete_with_body(
+                &path,
+                json!({
+                    "actor": optional_str(args, "actor"),
+                    "admin": args["admin"].as_bool(),
+                }),
+            )?
         }
         "manage_claim" => manage_claim_remote(client, args)?,
         "get_card" => {

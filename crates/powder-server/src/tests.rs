@@ -845,7 +845,7 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
     let detail = response_json(detail).await;
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["event_type"] == "criterion"
-            && event["actor"] == "operator"
+            && event["actor"] == "admin"
             && event["payload"].as_str().unwrap().contains("checked")
     }));
 }
@@ -2635,7 +2635,7 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     assert_eq!(detail["card"]["repo"], "canary");
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["event_type"] == "repository"
-            && event["actor"] == "operator"
+            && event["actor"] == "bootstrap"
             && event["payload"]
                 .as_str()
                 .unwrap()

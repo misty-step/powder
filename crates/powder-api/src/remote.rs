@@ -134,6 +134,10 @@ impl RemoteClient {
         self.dispatch("DELETE", path, None)
     }
 
+    pub fn delete_with_body(&self, path: &str, body: Value) -> Result<Value, String> {
+        self.dispatch("DELETE", path, Some(body))
+    }
+
     /// Send `method path` with the key active at call time; on a `401`,
     /// re-resolve `key_cmd` (if configured) and retry exactly once with
     /// whatever key that produces. This runs on every call that 401s, not

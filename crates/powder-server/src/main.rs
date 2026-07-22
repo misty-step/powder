@@ -1324,7 +1324,7 @@ async fn get_repository(
 
 async fn upsert_repository(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
     Json(request): Json<RepositoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = request
@@ -1332,28 +1332,36 @@ async fn upsert_repository(
         .clone()
         .ok_or_else(|| ApiError::bad_request("repository name is required"))?;
     let repository =
-        lock_store(&state)?.upsert_repository(repository_upsert(name, request)?, unix_now())?;
+        lock_store(&state)?.upsert_repository_with_authority(
+            repository_upsert(name, request)?,
+            unix_now(),
+            &actor.authority(),
+        )?;
     Ok(Json(json!(repository)))
 }
 
 async fn update_repository(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
     Path(name): Path<String>,
     Json(request): Json<RepositoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let repository_name = request.name.clone().unwrap_or(name);
     let repository = lock_store(&state)?
-        .upsert_repository(repository_upsert(repository_name, request)?, unix_now())?;
+        .upsert_repository_with_authority(
+            repository_upsert(repository_name, request)?,
+            unix_now(),
+            &actor.authority(),
+        )?;
     Ok(Json(json!(repository)))
 }
 
 async fn delete_repository(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    lock_store(&state)?.delete_repository(&name)?;
+    lock_store(&state)?.delete_repository_with_authority(&name, &actor.authority())?;
     Ok(Json(json!({ "deleted": true, "repository": name })))
 }
 
@@ -1363,11 +1371,13 @@ async fn merge_repository_alias(
     Path(name): Path<String>,
     Json(request): Json<RepositoryMergeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let merge_actor = request.actor.unwrap_or(actor.principal);
-    let outcome = lock_store(&state)?.merge_repository_alias(
+    if let Some(requested_actor) = request.actor.as_deref() {
+        actor.authority().require_identity(requested_actor)?;
+    }
+    let outcome = lock_store(&state)?.merge_repository_alias_with_authority(
         &request.alias,
         &name,
-        &merge_actor,
+        &actor.authority(),
         unix_now(),
     )?;
     Ok(Json(json!(outcome)))

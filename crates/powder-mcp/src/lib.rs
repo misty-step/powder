@@ -85,17 +85,17 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "upsert_repository",
         description: "Create or update one repository entity with canonical name, aliases, visibility, tier, and import provenance.",
-        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"tier":{"type":"string","enum":["active","backburner","archived"]},"import_provenance":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"tier":{"type":"string","enum":["active","backburner","archived"]},"import_provenance":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "merge_repository_alias",
         description: "Merge an alias or duplicate repository string into a canonical repository and audit every re-homed card.",
-        input_schema: r#"{"type":"object","required":["alias","into"],"properties":{"alias":{"type":"string"},"into":{"type":"string"},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["alias","into"],"properties":{"alias":{"type":"string"},"into":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "delete_repository",
         description: "Delete an unused repository entity and its aliases.",
-        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "manage_claim",
@@ -575,7 +575,7 @@ pub fn call_tool_store(
         "upsert_repository" => {
             let name = required_str(args, "name")?.to_string();
             json!(store
-                .upsert_repository(
+                .upsert_repository_with_authority(
                     RepositoryUpsert {
                         name,
                         aliases: optional_string_array(args, "aliases")?,
@@ -585,20 +585,26 @@ pub fn call_tool_store(
                             .map(str::to_string),
                     },
                     now,
+                    &admin_authority_arg(args),
                 )
                 .map_err(to_string)?)
         }
         "merge_repository_alias" => {
             let alias = required_str(args, "alias")?;
             let target = required_str(args, "into")?;
-            let actor = optional_str(args, "actor").unwrap_or("operator");
+            let authority = admin_authority_arg(args);
+            if let Some(actor) = optional_str(args, "actor") {
+                authority.require_identity(actor).map_err(to_string)?;
+            }
             json!(store
-                .merge_repository_alias(alias, target, actor, now)
+                .merge_repository_alias_with_authority(alias, target, &authority, now)
                 .map_err(to_string)?)
         }
         "delete_repository" => {
             let name = required_str(args, "name")?;
-            store.delete_repository(name).map_err(to_string)?;
+            store
+                .delete_repository_with_authority(name, &admin_authority_arg(args))
+                .map_err(to_string)?;
             json!({"deleted": true, "repository": name})
         }
         "manage_claim" => manage_claim_store(store, args, now)?,
@@ -1327,6 +1333,17 @@ fn authority_arg(args: &Value) -> Authority {
     {
         Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
         None => Authority::unchecked(),
+    }
+}
+
+fn admin_authority_arg(args: &Value) -> Authority {
+    match args["actor"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
+        None => Authority::actor("operator", true),
     }
 }
 
@@ -2998,7 +3015,7 @@ mod tests {
         let merged = call_tool_store(
             &mut store,
             "merge_repository_alias",
-            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator"}),
+            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator", "admin": true}),
             12,
         )
         .unwrap();

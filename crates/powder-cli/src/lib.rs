@@ -515,7 +515,7 @@ fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
     } else {
         let mut store = open_store(required_flag(args, "--db")?)?;
         let outcome = store
-            .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
+            .import_cards_with_events_with_authority(cards.clone(), &authority(args), now)
             .map_err(store_err)?;
         out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
     }
@@ -1249,7 +1249,7 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
         .transpose()?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let repository = store
-        .upsert_repository(
+        .upsert_repository_with_authority(
             RepositoryUpsert {
                 name,
                 aliases: aliases_flag(args),
@@ -1258,6 +1258,7 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
                 import_provenance: flag_value(args, "--import-provenance").map(str::to_string),
             },
             now,
+            &admin_authority(args),
         )
         .map_err(store_err)?;
     to_pretty_json(&repository)
@@ -1267,10 +1268,15 @@ fn repository_merge_alias(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let alias = required_flag(args, "--alias")?;
     let target = required_flag(args, "--into")?;
-    let actor = flag_value(args, "--actor").unwrap_or("operator");
+    let auth = admin_authority(args);
+    if let Some(actor) = flag_value(args, "--actor") {
+        auth
+            .require_identity(actor)
+            .map_err(|err| ShellError::Store(err.to_string()))?;
+    }
     let mut store = open_store(required_flag(args, "--db")?)?;
     let outcome = store
-        .merge_repository_alias(alias, target, actor, now)
+        .merge_repository_alias_with_authority(alias, target, &auth, now)
         .map_err(store_err)?;
     to_pretty_json(&outcome)
 }
@@ -1281,7 +1287,9 @@ fn repository_delete(args: &[String]) -> Result<String, ShellError> {
         .copied()
         .ok_or_else(|| ShellError::Invalid("repository-delete requires a name".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    store.delete_repository(name).map_err(store_err)?;
+    store
+        .delete_repository_with_authority(name, &admin_authority(args))
+        .map_err(store_err)?;
     Ok(format!("deleted\t{name}\n"))
 }
 
@@ -1293,11 +1301,13 @@ fn repository_delete(args: &[String]) -> Result<String, ShellError> {
 /// file, the same shape as `key-create`/`key-list`/`key-revoke`.
 fn repository_normalize(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
-    let actor = flag_value(args, "--actor").unwrap_or("operator");
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let outcome = store
-        .normalize_repository_strings(actor, now)
-        .map_err(store_err)?;
+    let outcome = {
+        let auth = admin_authority(args);
+        let mut store = open_store(required_flag(args, "--db")?)?;
+        store
+            .normalize_repository_strings_with_authority(&auth, now)
+            .map_err(store_err)?
+    };
     to_pretty_json(&outcome)
 }
 
@@ -2011,6 +2021,16 @@ fn authority(args: &[String]) -> Authority {
     match flag_value(args, "--actor") {
         Some(name) => Authority::actor(name, has_flag(args, "--admin")),
         None => Authority::unchecked(),
+    }
+}
+
+/// Repository registry writes are operator/admin mutations. Direct SQLite
+/// callers retain the local operator default, while an explicit actor must
+/// carry the admin capability rather than being inferred from its label.
+fn admin_authority(args: &[String]) -> Authority {
+    match flag_value(args, "--actor") {
+        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
+        None => Authority::actor("operator", true),
     }
 }
 
@@ -2825,6 +2845,7 @@ mod tests {
             "0",
             "--actor",
             "operator",
+            "--admin",
         ]))
         .unwrap();
         assert_eq!(checked, "criterion\tproof-plan\t0\tchecked\n");
@@ -3029,6 +3050,7 @@ mod tests {
             "canary",
             "--actor",
             "operator",
+            "--admin",
         ]))
         .unwrap();
         assert!(merged.contains("\"rehomed_cards\": 1"));
@@ -3086,6 +3108,7 @@ mod tests {
             &db,
             "--actor",
             "operator",
+            "--admin",
         ]))
         .unwrap();
         assert!(output.contains("\"scanned\": 1"), "output was: {output}");
