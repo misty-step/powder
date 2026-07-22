@@ -6944,6 +6944,7 @@ fn board_rollups_reject_noncanonical_text_parents_in_both_scopes() -> Result<()>
         ready_card("invalid-child", 8),
         ready_card("join-root", 9),
         ready_card("join-child", 10),
+        ready_card("invalid-id-child", 11),
     ])?;
     for (id, parent) in [
         ("canonical-dangling", "missing-parent"),
@@ -6954,6 +6955,7 @@ fn board_rollups_reject_noncanonical_text_parents_in_both_scopes() -> Result<()>
         ("valid-child", "epic-root"),
         ("invalid-child", "\t\n"),
         ("join-child", "join-root "),
+        ("invalid-id-child", "epic-root"),
     ] {
         store.connection.execute(
             "UPDATE cards SET parent = ?1 WHERE id = ?2",
@@ -6962,6 +6964,10 @@ fn board_rollups_reject_noncanonical_text_parents_in_both_scopes() -> Result<()>
     }
     store.connection.execute(
         "UPDATE cards SET id = 'join-root ' WHERE id = 'join-root'",
+        [],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET id = 'invalid-id-child ' WHERE id = 'invalid-id-child'",
         [],
     )?;
 
@@ -6978,11 +6984,11 @@ fn board_rollups_reject_noncanonical_text_parents_in_both_scopes() -> Result<()>
         Some("epic-root")
     );
     assert_eq!(global.rollups[0].status_counts.get("ready"), Some(&1));
-    assert_eq!(global.coverage.total_cards, 10);
+    assert_eq!(global.coverage.total_cards, 11);
     assert_eq!(global.coverage.accounted_cards, 2);
     assert_eq!(global.coverage.root_epics, 1);
     assert_eq!(global.coverage.unsorted_cards, 0);
-    assert_eq!(global.coverage.parent_issue_count, 8);
+    assert_eq!(global.coverage.parent_issue_count, 9);
     assert!(!global.coverage.complete);
 
     let scoped = store.board_rollups(BoardRollupsQuery {
@@ -7009,11 +7015,15 @@ fn board_rollups_reject_noncanonical_text_parents_in_both_scopes() -> Result<()>
         .rollups
         .iter()
         .any(|row| row.card_id.as_ref().map(CardId::as_str) == Some("join-root")));
-    assert_eq!(scoped.coverage.total_cards, 10);
+    assert!(!scoped
+        .rollups
+        .iter()
+        .any(|row| row.card_id.as_ref().map(CardId::as_str) == Some("invalid-id-child")));
+    assert_eq!(scoped.coverage.total_cards, 11);
     assert_eq!(scoped.coverage.accounted_cards, 3);
     assert_eq!(scoped.coverage.root_epics, 1);
     assert_eq!(scoped.coverage.unsorted_cards, 1);
-    assert_eq!(scoped.coverage.parent_issue_count, 7);
+    assert_eq!(scoped.coverage.parent_issue_count, 8);
     let scoped_status_sum: usize = scoped
         .rollups
         .iter()

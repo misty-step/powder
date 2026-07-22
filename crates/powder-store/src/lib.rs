@@ -2534,7 +2534,8 @@ impl Store {
                 MAX(c.updated_at) AS newest_update
             FROM scoped_roots p
             JOIN visible_cards c
-              ON typeof(c.parent) = 'text'
+              ON powder_card_id_is_canonical(c.id)
+             AND typeof(c.parent) = 'text'
              AND powder_card_id_is_canonical(c.parent)
              AND c.parent = p.id
             GROUP BY p.id, p.title, p.repo, c.status
@@ -2560,7 +2561,8 @@ impl Store {
             FROM scoped_roots c
             WHERE NOT EXISTS (
                   SELECT 1 FROM visible_cards child
-                  WHERE typeof(child.parent) = 'text'
+                  WHERE powder_card_id_is_canonical(child.id)
+                    AND typeof(child.parent) = 'text'
                     AND powder_card_id_is_canonical(child.parent)
                     AND child.parent = c.id
               )
