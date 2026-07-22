@@ -417,7 +417,7 @@ pub fn call_tool_store(
                 .transpose()
                 .map_err(to_string)?;
             let page = store.list_ready_page_after(query, after.as_ref()).map_err(to_string)?;
-            card_summary_page_payload(&page.cards, page.total_count, &page.cycle_card_ids, page.next_after.as_ref(), page.ready_cursor.as_deref())
+            ready_page_payload(&page)
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -850,35 +850,24 @@ fn is_admin_tool(name: &str) -> bool {
     ADMIN_TOOL_NAMES.contains(&name)
 }
 
-fn card_summary_page_payload(
-    cards: &[Card],
-    total_count: usize,
-    cycle_card_ids: &[CardId],
-    next_after: Option<&CardId>,
-    ready_cursor: Option<&str>,
-) -> Value {
-    let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
-    let has_more = total_count > summaries.len();
+fn ready_page_payload(page: &powder_store::CardListPage) -> Value {
+    let summaries = page.cards.iter().map(CardSummary::from).collect::<Vec<_>>();
     let mut payload = json!({
         "cards": summaries,
-        "total_count": total_count,
-        "has_more": has_more,
+        "total_count": page.total_count,
+        "has_more": page.ready_cursor.is_some(),
     });
-    if has_more {
+    if page.ready_cursor.is_some() {
         payload["hint"] = json!(format!(
-            "{} more cards; filter by status/repo or raise limit",
-            total_count - summaries.len()
+            "{} more cards; continue with next_after",
+            page.total_count.saturating_sub(page.cards.len())
         ));
     }
-    // powder-epic-ready-plan: only ever nonzero for `list_ready` (a
-    // `blocks`/`blocked_by` cycle among the eligible set) -- additive and
-    // omitted whenever empty, so every existing caller's response shape is
-    // unchanged.
-    if !cycle_card_ids.is_empty() {
-        payload["cycle_card_ids"] = json!(cycle_card_ids);
+    if !page.cycle_card_ids.is_empty() {
+        payload["cycle_card_ids"] = json!(page.cycle_card_ids);
     }
-    if let Some(next_after) = next_after {
-        payload["next_after"] = json!(ready_cursor.unwrap_or_else(|| next_after.as_str()));
+    if let Some(cursor) = page.ready_cursor.as_deref() {
+        payload["next_after"] = json!(cursor);
     }
     payload
 }

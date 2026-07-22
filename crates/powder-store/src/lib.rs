@@ -2398,7 +2398,7 @@ impl Store {
     ///
     /// `after`, when set, must be the id of a card present in the *same*
     /// eligibility-filtered, topologically-ordered list this call
-    /// recomputes from scratch (typically the `next_after`/last card id a
+    /// recomputes from scratch (typically the opaque cursor anchor from a
     /// prior call on this store returned); an id absent from that list --
     /// never existed, no longer ready-eligible, or filtered by different
     /// `query` parameters than the prior call used -- is rejected with a
@@ -2513,7 +2513,7 @@ impl Store {
             query.limit,
             after.map(|cursor| &cursor.anchor),
         )?;
-        let ready_cursor = next_after.as_ref().filter(|_| !cycle_card_ids.is_empty()).map(|anchor| {
+        let ready_cursor = next_after.as_ref().map(|anchor| {
             ReadyCursor::for_query(&query, anchor.clone(), snapshot).encode()
         });
         Ok(CardListPage {

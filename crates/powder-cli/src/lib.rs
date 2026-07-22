@@ -3,6 +3,7 @@
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
     normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
+    ReadyCursor,
     parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
     CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyQuery, Risk, RunId,
 };
@@ -868,41 +869,89 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
 
 fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
+    let json_output = has_flag(args, "--json");
     let now = unix_now();
-    let repo = flag_value(args, "--repo").map(|raw| {
-        raw.split(',').map(str::trim).map(|value| {
-            if value.is_empty() { Err(ShellError::Invalid("--repo must not contain a blank repository".to_string())) } else { Ok(value.to_string()) }
-        }).collect::<Result<Vec<_>, _>>()
-    }).transpose()?.unwrap_or_default();
-    let estimate = flag_value(args, "--estimate").map(parse_estimate_flag).transpose()?;
+    let repo = flag_value(args, "--repo")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .map(|value| {
+                    if value.is_empty() {
+                        Err(ShellError::Invalid(
+                            "--repo must not contain a blank repository".to_string(),
+                        ))
+                    } else {
+                        Ok(value.to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let estimate = flag_value(args, "--estimate")
+        .map(parse_estimate_flag)
+        .transpose()?;
     let risk = flag_value(args, "--risk").map(parse_risk_flag).transpose()?;
-    let priority = flag_value(args, "--priority").map(parse_priority_flag).transpose()?;
+    let priority = flag_value(args, "--priority")
+        .map(parse_priority_flag)
+        .transpose()?;
     let query = ReadyQuery::new(now, limit)
         .with_repositories(repo.clone())
         .with_estimate(estimate)
         .with_risk(risk)
         .with_priority(priority);
-    let ready = if let Some(db) = flag_value(args, "--db") {
+    let raw_after = flag_value(args, "--after");
+    let after = raw_after
+        .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+        .transpose()
+        .map_err(|err| ShellError::Invalid(err.to_string()))?;
+    let payload = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
-        json!(store.list_ready(query).map_err(store_err)?)
+        let page = store
+            .list_ready_page_after(query.clone(), after.as_ref())
+            .map_err(store_err)?;
+        ready_page_json(&page)
     } else if let Some(client) = remote_env.client() {
         let mut url = format!("/api/v1/cards/ready?limit={limit}");
-        if !repo.is_empty() { url.push_str(&format!("&repo={}", urlencode(&repo.join(",")))); }
-        if let Some(estimate) = estimate { url.push_str(&format!("&estimate={}", estimate.as_str())); }
-        if let Some(risk) = risk { url.push_str(&format!("&risk={}", risk.as_str())); }
-        if let Some(priority) = priority { url.push_str(&format!("&priority={}", priority.as_str())); }
-        let page = client.get(&url).map_err(remote_err)?;
-        list_page_cards(page)?
+        if !repo.is_empty() {
+            url.push_str(&format!("&repo={}", urlencode(&repo.join(","))));
+        }
+        if let Some(estimate) = estimate {
+            url.push_str(&format!("&estimate={}", estimate.as_str()));
+        }
+        if let Some(risk) = risk {
+            url.push_str(&format!("&risk={}", risk.as_str()));
+        }
+        if let Some(priority) = priority {
+            url.push_str(&format!("&priority={}", priority.as_str()));
+        }
+        if let Some(after) = raw_after {
+            url.push_str(&format!("&after={}", urlencode(after)));
+        }
+        client.get(&url).map_err(remote_err)?
     } else {
         return Err(ShellError::Invalid(
             "list-ready requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments".to_string(),
         ));
     };
-    let mut out = String::new();
-    for card in json_array(&ready)? {
-        out.push_str(&format!("{}\t{}\t{}\n", json_string(card, "id")?, json_priority(card)?, json_string(card, "title")?));
+    if json_output {
+        return serde_json::to_string(&payload)
+            .map_err(|err| ShellError::Store(err.to_string()));
     }
-    if out.is_empty() { out.push_str("no-ready-cards\n"); }
+    let mut out = String::new();
+    for card in json_array(payload.get("cards").ok_or_else(|| {
+        ShellError::Store("ready response missing cards array".to_string())
+    })?)? {
+        out.push_str(&format!(
+            "{}\t{}\t{}\n",
+            json_string(card, "id")?,
+            json_priority(card)?,
+            json_string(card, "title")?
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("no-ready-cards\n");
+    }
     Ok(out)
 }
 
@@ -1039,7 +1088,9 @@ fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError>
         return Err(missing_transport("search"));
     };
     serde_json::to_string(&payload).map_err(|err| ShellError::Store(err.to_string()))
-fn ready_page_json(page: &powder_store::CardListPage, query: &ReadyQuery) -> Value {
+}
+
+fn ready_page_json(page: &powder_store::CardListPage) -> Value {
     let mut payload = json!({
         "cards": page.cards,
         "total_count": page.total_count,
@@ -1048,12 +1099,8 @@ fn ready_page_json(page: &powder_store::CardListPage, query: &ReadyQuery) -> Val
     if !page.cycle_card_ids.is_empty() {
         payload["cycle_card_ids"] = json!(page.cycle_card_ids);
     }
-    if let Some(next_after) = page.next_after.as_ref() {
-        payload["next_after"] = json!(ReadyCursor::for_query_with_snapshot(
-            query,
-            next_after.clone(),
-            page.continuation_snapshot.as_deref().unwrap_or(""),
-        ).encode());
+    if let Some(next_after) = page.ready_cursor.as_ref() {
+        payload["next_after"] = json!(next_after);
     }
     payload
 }

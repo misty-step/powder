@@ -1427,7 +1427,8 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
         .as_str()
         .expect("first page must carry next_after when more cards remain")
         .to_string();
-    assert_eq!(next_after, "ready-cont-2");
+    assert!(next_after.starts_with("v2."));
+    assert_ne!(next_after, "ready-cont-2");
 
     // (b) walk the rest of the pages with `after`.
     let second = app
@@ -1447,7 +1448,8 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
         .as_str()
         .expect("second page must still carry next_after")
         .to_string();
-    assert_eq!(next_after_2, "ready-cont-4");
+    assert!(next_after_2.starts_with("v2."));
+    assert_ne!(next_after_2, "ready-cont-4");
 
     let third = app
         .clone()

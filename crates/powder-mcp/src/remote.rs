@@ -12,9 +12,7 @@ use serde_json::{json, Value};
 use super::{
     card_id, card_ids_array, claim_action, missing_required, optional_i64,
     optional_repository_tier, optional_repository_visibility, optional_str, parse_estimate,
-    card_id, card_ids_array, claim_action, missing_required, optional_i64,
-    optional_repository_tier, optional_repository_visibility, optional_str, parse_estimate,
-    parse_priority, parse_repository_filter, parse_risk, parse_status, required_claim_arg, required_str, run_id,
+    parse_priority, parse_risk, parse_status, required_claim_arg, required_str, run_id,
     run_id_for_claim, string_array, to_string, ClaimAction,
 };
 

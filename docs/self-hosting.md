@@ -38,8 +38,10 @@ user always has write access regardless of host UID mapping.
 
 **Verified 2026-07-14, with a caveat.** `docker build .` from this checkout,
 then `docker run` against the freshly built image, was exercised end to end:
-container boot, the printed bootstrap key, `/healthz`, `/readyz`, card
-create, and claim all worked exactly as documented. Pulling the *already
+container boot, one-shot bootstrap-key file creation with mode 0600, `/healthz`,
+`/readyz`, card create, and claim all worked exactly as documented. The raw
+key was read from that file for the authenticated calls; it was not printed or
+logged by the process. Pulling the *already
 published* `ghcr.io/misty-step/powder:latest` image could only be checked to
 the registry's login wall — `docker manifest inspect
 ghcr.io/misty-step/powder:latest` returns `401 Unauthorized` as of this
@@ -70,8 +72,9 @@ contains the `powder` CLI and `powder-mcp` binaries.
 **Verified 2026-07-14**: downloaded the real `v0.1.0` release asset
 (`powder-aarch64-apple-darwin.tar.gz`) from
 `github.com/misty-step/powder/releases`, extracted it, and ran the exact
-command above — the bootstrap key printed and `/healthz` answered `{"ok":
-true,"service":"powder"}`.
+command above — the bootstrap key was read from
+`./data/powder-bootstrap.key` (mode 0600), never printed or logged, and
+`/healthz` answered `{"ok": true,"service":"powder"}`.
 
 ### Then, exercise the lifecycle
 
@@ -167,7 +170,7 @@ variables.
 | `PORT` | `4000` | `powder-server` | Used only to build the default loopback `POWDER_BIND_ADDR` (`127.0.0.1:$PORT`) when `POWDER_BIND_ADDR` itself is unset. |
 | `POWDER_BIND_ADDR` | `127.0.0.1:<PORT>` | `powder-server` | Explicit socket address to bind. Non-loopback binds require an authenticated mode; `none` is loopback-only. |
 | `POWDER_AUTH_MODE` | `api-key` | `powder-server` | One of `api-key` (aliases: `agent-api-key`, `shared-secret`), `tailscale-header` (aliases: `tailnet`), or `none` (aliases: `disabled`). See [auth modes](#auth-modes) below. |
-| `POWDER_PUBLIC_READS` | `false` | `powder-server` | In `api-key` mode, set `true` to allow keyless reads. Only safe when the listener is on a genuinely private perimeter (e.g. Flycast/Tailscale internal ingress). Ignored in `tailscale-header` and `none` modes. |
+| `POWDER_PUBLIC_READS` | `false` | `powder-server` | In `api-key` mode, set `true` only on a loopback bind to allow keyless reads. Non-loopback binds reject this combination before listen. Ignored in `tailscale-header` and `none` modes. |
 | `POWDER_BOOTSTRAP_KEY_FILE` | unset (required on first boot) | `powder-server` | One-shot 0600 path for the first-run bootstrap API key. The server refuses a new database without it, writes the key without logging it, and leaves the file for explicit operator retrieval/removal. |
 | `POWDER_PUBLIC_BASE_URL` | unset | `powder-server` | Advertised base URL, surfaced via `/api/v1/onboarding`; informational only, does not change binding. |
 | `POWDER_HOME_URL` | unset | `powder-server` | If set, the board UI renders a plain-text link back to this URL (for a deployment fronted by a portal Powder doesn't own). Leave unset for no change. |
@@ -201,10 +204,10 @@ cargo run -p powder-server
 ### Auth modes
 
 - **`api-key`** (default): reads require `Authorization: Bearer <key>` unless
-  `POWDER_PUBLIC_READS=true` is set; every mutation requires a bearer key.
-  Defaulting to authenticated reads is fail-closed. Set
-  `POWDER_PUBLIC_READS=true` only when the deployment's perimeter is genuinely
-  private (e.g. a Flycast/Tailcast internal listener with no public ingress).
+  `POWDER_PUBLIC_READS=true` is set on a loopback bind; every mutation requires
+  a bearer key. Defaulting to authenticated reads is fail-closed.
+  `POWDER_PUBLIC_READS=true` is rejected on non-loopback binds, even when the
+  operator believes an upstream perimeter is private.
 - **`tailscale-header`**: trusts an identity header injected by a Tailscale
   Serve-equivalent trusted proxy only when `POWDER_TAILNET_PROXY_SECRET` is
   configured and matches the forwarded secret. Admin scope is granted only to

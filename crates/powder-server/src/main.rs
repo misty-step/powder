@@ -416,9 +416,10 @@ struct ReadyParams {
     risk: Option<String>,
     priority: Option<String>,
     /// powder-cards-api-paged-continuation: resume past a prior response's
-    /// `next_after` instead of only ever seeing the first `limit` cards of
-    /// the same order. See `ListCardsParams::after` for the full
-    /// interim-vs-scale-proof-pagination distinction, which applies
+    /// opaque `next_after` cursor instead of only ever seeing the first
+    /// `limit` cards of the same order. Ready cursors bind query filters and
+    /// preserve the prior order snapshot. See `ListCardsParams::after` for
+    /// the full interim-vs-scale-proof-pagination distinction, which applies
     /// identically here.
     after: Option<String>,
 }

@@ -265,9 +265,11 @@ GET /api/v1/cards?limit=20&after=<next_after-from-the-previous-response>
 GET /api/v1/cards/ready?limit=20&after=<next_after-from-the-previous-response>
 ```
 
-Each response includes `next_after` -- the card id to pass as `after` on
-the following request -- whenever more cards remain beyond the page just
-returned; it is omitted once a caller has reached the end. Omitting `after`
+Each response includes `next_after` -- an opaque continuation cursor to pass as
+`after` on the following request -- whenever more cards remain beyond the page
+just returned; it is omitted once a caller has reached the end. Ready cursors
+bind the query filters and preserve the prior order snapshot, so callers must
+treat the value as an opaque string. Omitting `after`
 entirely reproduces the historical first-page response byte-for-byte (same
 cards, same order, same `has_more`) -- `after`/`next_after` are purely
 additive, so every existing caller (the CLI's `list-cards`/`list-ready`,

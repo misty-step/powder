@@ -65,7 +65,67 @@ fn server_lifecycle_over_real_http() {
 
     let db_path = server.db_path.clone();
     let bootstrap_key_file = server.bootstrap_key_file.clone();
+    let captured_output = std::sync::Arc::clone(&server.output);
+    let bootstrap_key = server.bootstrap_key.clone();
     drop(server);
+    let captured = captured_output.lock().expect("capture lock");
+    let output = String::from_utf8_lossy(&captured);
+    assert!(
+        !output.contains(&bootstrap_key),
+        "real server stdout/stderr must never contain the raw bootstrap key"
+    );
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(&bootstrap_key_file);
+}
+
+
+#[test]
+fn public_reads_is_live_only_on_loopback() {
+    let server = support::spawn_server_with_public_reads("public-reads-loopback", true);
+    let base = &server.base;
+    let ready = ureq::get(&format!("{base}/api/v1/cards/ready?limit=1"))
+        .call()
+        .expect("loopback public reads should allow keyless Ready reads");
+    assert_eq!(ready.status(), 200);
+
+    let body = json!({
+        "id": "public-reads-loopback-denied",
+        "title": "writes still require a key",
+        "acceptance": ["key required"],
+    });
+    match ureq::post(&format!("{base}/api/v1/cards")).send_json(body) {
+        Err(ureq::Error::Status(status, _)) => assert_eq!(status, 401),
+        other => panic!("expected keyless write rejection, got {other:?}"),
+    }
+
+    let db_path = server.db_path.clone();
+    let bootstrap_key_file = server.bootstrap_key_file.clone();
+    let captured_output = std::sync::Arc::clone(&server.output);
+    let bootstrap_key = server.bootstrap_key.clone();
+    drop(server);
+    let captured = captured_output.lock().expect("capture lock");
+    let output = String::from_utf8_lossy(&captured);
+    assert!(!output.contains(&bootstrap_key));
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&bootstrap_key_file);
+}
+
+#[test]
+fn public_reads_non_loopback_startup_fails_closed_before_listen() {
+    let port = support::free_port();
+    let attempt = support::run_server_attempt(
+        "public-reads-non-loopback",
+        &format!("0.0.0.0:{port}"),
+        true,
+    );
+    assert!(!attempt.status.success(), "unsafe public-read startup must fail");
+    assert!(attempt.output.contains(
+        "public reads are only allowed on a loopback bind in api-key mode"
+    ));
+    assert!(
+        !attempt.bootstrap_key_file.exists(),
+        "failed config validation must not create a bootstrap key file"
+    );
+    let _ = std::fs::remove_file(&attempt.db_path);
+    let _ = std::fs::remove_file(&attempt.bootstrap_key_file);
 }
