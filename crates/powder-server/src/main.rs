@@ -879,7 +879,6 @@ fn app(state: AppState) -> Router {
         .route("/", get(board_index))
         .route("/board", get(board_index))
         .route("/c/{id}", get(board_index))
-        .route("/assets/aesthetic.css", get(aesthetic_css))
         .route("/assets/powder-board.css", get(board_css))
         .route("/assets/powder-board.js", get(board_js))
         .route("/healthz", get(healthz))
@@ -1002,14 +1001,6 @@ async fn board_index(headers: HeaderMap) -> Response {
         &headers,
         "text/html; charset=utf-8",
         include_str!("../static/index.html"),
-    )
-}
-
-async fn aesthetic_css(headers: HeaderMap) -> Response {
-    static_asset(
-        &headers,
-        "text/css; charset=utf-8",
-        include_str!("../static/assets/aesthetic.css"),
     )
 }
 

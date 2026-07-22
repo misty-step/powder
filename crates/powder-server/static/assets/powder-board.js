@@ -1243,32 +1243,32 @@ function repositoryRowHTML(summary) {
     <div class="pw-repo-row" data-repo-name="${escapeHtml(summary.repo)}">
       <div class="pw-repo-main">
         <span class="pw-repo-main-left">
-          <span class="pw-repo-name">${repoIcon(summary.repo, `ae-cat-${meta.cat}`)}${escapeHtml(summary.repo)}</span>
-          <span class="ae-tag pw-repo-tier-badge" data-tier="${escapeHtml(summary.tier)}">${escapeHtml(summary.tier)}</span>
+          <span class="pw-repo-name">${repoIcon(summary.repo, `pw-cat-${meta.cat}`)}${escapeHtml(summary.repo)}</span>
+          <span class="pw-tag pw-repo-tier-badge" data-tier="${escapeHtml(summary.tier)}">${escapeHtml(summary.tier)}</span>
         </span>
-        <span class="ae-num">${summary.card_count}</span>
+        <span class="pw-num">${summary.card_count}</span>
       </div>
       ${counts}
       <form class="pw-repo-edit" data-repo-action="save">
         <input type="hidden" name="name" value="${escapeHtml(summary.repo)}">
-        <label><span class="ae-chrome">Aliases</span><input class="ae-input" name="aliases" type="text" value="${escapeHtml(aliases)}" autocomplete="off"></label>
-        <label><span class="ae-chrome">Provenance</span><input class="ae-input" name="import_provenance" type="text" value="${escapeHtml(provenance)}" autocomplete="off"></label>
-        <label><span class="ae-chrome">Visibility</span><select class="pw-sort" name="visibility">
+        <label><span class="pw-chrome">Aliases</span><input class="pw-input" name="aliases" type="text" value="${escapeHtml(aliases)}" autocomplete="off"></label>
+        <label><span class="pw-chrome">Provenance</span><input class="pw-input" name="import_provenance" type="text" value="${escapeHtml(provenance)}" autocomplete="off"></label>
+        <label><span class="pw-chrome">Visibility</span><select class="pw-sort" name="visibility">
           <option value="visible"${summary.visibility === "visible" ? " selected" : ""}>visible</option>
           <option value="hidden"${summary.visibility === "hidden" ? " selected" : ""}>hidden</option>
         </select></label>
-        <label><span class="ae-chrome">Tier</span><select class="pw-sort" name="tier">
+        <label><span class="pw-chrome">Tier</span><select class="pw-sort" name="tier">
           <option value="active"${summary.tier === "active" ? " selected" : ""}>active</option>
           <option value="backburner"${summary.tier === "backburner" ? " selected" : ""}>backburner</option>
           <option value="archived"${summary.tier === "archived" ? " selected" : ""}>archived</option>
         </select></label>
-        <button class="ae-button ae-button-compact" type="submit">save</button>
-        <button class="ae-button ae-button-quiet ae-button-compact" type="button" data-repo-delete="${escapeHtml(summary.repo)}">delete</button>
+        <button class="pw-button pw-button-compact" type="submit">save</button>
+        <button class="pw-button pw-button-quiet pw-button-compact" type="button" data-repo-delete="${escapeHtml(summary.repo)}">delete</button>
       </form>
       <form class="pw-repo-merge" data-repo-action="merge">
         <input type="hidden" name="target" value="${escapeHtml(summary.repo)}">
-        <label><span class="ae-chrome">Merge alias</span><input class="ae-input" name="alias" type="text" autocomplete="off" placeholder="owner/repo"></label>
-        <button class="ae-button ae-button-quiet ae-button-compact" type="submit">merge</button>
+        <label><span class="pw-chrome">Merge alias</span><input class="pw-input" name="alias" type="text" autocomplete="off" placeholder="owner/repo"></label>
+        <button class="pw-button pw-button-quiet pw-button-compact" type="submit">merge</button>
       </form>
     </div>
   `;
@@ -1278,7 +1278,7 @@ function statusCountsHTML(counts) {
   const order = RAW_STATUSES;
   const chips = order
     .filter((status) => counts[status])
-    .map((status) => `<span class="ae-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`);
+    .map((status) => `<span class="pw-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`);
   return chips.length ? `<p class="pw-repo-counts">${chips.join("")}</p>` : "";
 }
 
@@ -1290,7 +1290,7 @@ function repoMeta(repo) {
 
 function repoIcon(repo, extraClass = "") {
   const meta = repoMeta(repo);
-  const className = ["ae-icon", extraClass].filter(Boolean).join(" ");
+  const className = ["pw-icon", extraClass].filter(Boolean).join(" ");
   return `<svg class="${className}" aria-hidden="true"><use href="#${meta.icon}"></use></svg>`;
 }
 
@@ -1353,7 +1353,7 @@ function buildFilters() {
   allChip.type = "button";
   allChip.dataset.repoAllChip = "true";
   allChip.setAttribute("aria-pressed", String(state.filters.repos.size === 0));
-  allChip.innerHTML = `<span class="ae-chip">${repoIcon("all")}All</span>`;
+  allChip.innerHTML = `<span class="pw-chip">${repoIcon("all")}All</span>`;
   allChip.addEventListener("click", () => {
     state.filters.repos.clear();
     saveBoardState();
@@ -1370,7 +1370,7 @@ function buildFilters() {
     button.type = "button";
     button.dataset.repo = repo;
     button.setAttribute("aria-pressed", String(state.filters.repos.has(repo)));
-    button.innerHTML = `<span class="ae-chip ae-cat-${meta.cat}">${repoIcon(repo)}${escapeHtml(repo)}</span>`;
+    button.innerHTML = `<span class="pw-chip pw-cat-${meta.cat}">${repoIcon(repo)}${escapeHtml(repo)}</span>`;
     button.addEventListener("click", () => {
       if (state.filters.repos.has(repo)) state.filters.repos.delete(repo);
       else state.filters.repos.add(repo);
@@ -1389,7 +1389,7 @@ function buildFilters() {
     button.type = "button";
     button.dataset.prio = prio;
     button.setAttribute("aria-pressed", String(state.filters.prios.has(prio)));
-    button.innerHTML = `<span class="ae-chip">${escapeHtml(prio)}</span>`;
+    button.innerHTML = `<span class="pw-chip">${escapeHtml(prio)}</span>`;
     button.addEventListener("click", () => {
       if (state.filters.prios.has(prio)) state.filters.prios.delete(prio);
       else state.filters.prios.add(prio);
@@ -1587,7 +1587,7 @@ function mergeQuickAddFiles(files) {
 function renderQuickAddAttachments() {
   if (!els.quickAddAttachmentList) return;
   els.quickAddAttachmentList.innerHTML = quickAddFiles
-    .map((file, index) => '<li><span>' + escapeHtml(file.name || ("image-" + (index + 1))) + '</span><span class="ae-chrome">' + Math.ceil(file.size / 1024) + ' KB</span></li>')
+    .map((file, index) => '<li><span>' + escapeHtml(file.name || ("image-" + (index + 1))) + '</span><span class="pw-chrome">' + Math.ceil(file.size / 1024) + ' KB</span></li>')
     .join("");
 }
 
@@ -1846,10 +1846,10 @@ function firstRunEmptyHTML(rich) {
   }
   return `
     <div class="pw-empty pw-empty-firstrun">
-      <p class="ae-h">Welcome -- this board is empty.</p>
+      <p class="pw-section-head">Welcome -- this board is empty.</p>
       <p>File your first card with the <strong>file card</strong> button above, or mint a write key and use the CLI:</p>
       <code>${escapeHtml(KEY_MINT_COMMAND)}</code>
-      <p><button type="button" class="ae-button ae-button-compact" data-firstrun-file-card>file the first card</button></p>
+      <p><button type="button" class="pw-button pw-button-compact" data-firstrun-file-card>file the first card</button></p>
     </div>
   `;
 }
@@ -1887,7 +1887,7 @@ function laneFailureHTML(displayLaneName) {
   const messages = laneErrorsFor(displayLaneName);
   return `
     <div class="pw-empty">
-      <p><svg class="ae-icon ae-err" aria-hidden="true"><use href="#i-alert"></use></svg> lane unavailable</p>
+      <p><svg class="pw-icon pw-err" aria-hidden="true"><use href="#i-alert"></use></svg> lane unavailable</p>
       ${messages.map((message) => `<p>${escapeHtml(message)}</p>`).join("")}
     </div>
   `;
@@ -1927,7 +1927,7 @@ function render() {
     ? laneFailureHTML("ready")
     : (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true)) +
       (buckets.blocked.length
-        ? `<p class="ae-plate-cap pw-blocked-cap">BLOCKED · ${buckets.blocked.length}</p>${buckets.blocked.map(cardHTML).join("")}`
+        ? `<p class="pw-caption pw-blocked-cap">BLOCKED · ${buckets.blocked.length}</p>${buckets.blocked.map(cardHTML).join("")}`
         : "");
   els.laneInProgress.innerHTML = failedLanes.has("in_progress")
     ? laneFailureHTML("in_progress")
@@ -1961,7 +1961,7 @@ function renderLoading() {
 function renderFailure() {
   const message = `
     <div class="pw-empty">
-      <p><svg class="ae-icon ae-err" aria-hidden="true"><use href="#i-alert"></use></svg> ${escapeHtml(state.errorKind || "error")}</p>
+      <p><svg class="pw-icon pw-err" aria-hidden="true"><use href="#i-alert"></use></svg> ${escapeHtml(state.errorKind || "error")}</p>
       <p>${escapeHtml(state.error)}</p>
     </div>
   `;
@@ -1979,7 +1979,7 @@ function renderRail(cards) {
     if (card.repoKey !== last) {
       const meta = repoMeta(card.repoKey);
       groups.push(
-        `<p class="ae-plate-cap pw-rail-cap">${repoIcon(card.repoKey, `ae-cat-${meta.cat}`)}${escapeHtml(card.repoKey.toUpperCase())}</p>`,
+        `<p class="pw-caption pw-rail-cap">${repoIcon(card.repoKey, `pw-cat-${meta.cat}`)}${escapeHtml(card.repoKey.toUpperCase())}</p>`,
       );
       last = card.repoKey;
     }
@@ -2079,11 +2079,12 @@ function cardHTML(card) {
   const relations = relationBadges(card);
   return `
     <a id="${escapeHtml(anchorId(card.id))}" class="pw-card" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
-      <span class="pw-card-top">${repoIcon(card.repoKey, `ae-cat-${meta.cat}`)}
+      <span class="pw-card-top">${repoIcon(card.repoKey, `pw-cat-${meta.cat}`)}
         <span class="pw-id">${escapeHtml(card.id)}</span><span>${escapeHtml(cleanPriority(card.priority))}</span>
       </span>
       <span class="pw-card-t">${escapeHtml(card.title)}</span>
       <p class="pw-card-meta">${statusGlyph(card.status)}${claim}</p>
+      ${card.estimate || card.risk ? `<p class="pw-card-chips">${card.estimate ? `<span class="pw-chip-estimate">${escapeHtml(card.estimate)}</span>` : ""}${card.risk ? `<span class="pw-chip-risk" data-risk="${escapeHtml(card.risk)}">${escapeHtml(card.risk)}</span>` : ""}</p>` : ""}
       ${relations ? `<p class="pw-rel-badges">${relations}</p>` : ""}
     </a>
   `;
@@ -2108,9 +2109,9 @@ function relationBadges(card) {
 function doneRowHTML(card) {
   return `
     <a id="${escapeHtml(anchorId(card.id))}" class="pw-done-row" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
-      <span class="pw-g"><svg class="ae-icon ae-ok" aria-hidden="true"><use href="#i-check"></use></svg></span>
+      <span class="pw-g"><svg class="pw-icon pw-ok" aria-hidden="true"><use href="#i-check"></use></svg></span>
       <span class="pw-done-t">${escapeHtml(card.title)}</span>
-      <span class="pw-done-id ae-num">${escapeHtml(card.id)}</span>
+      <span class="pw-done-id pw-num">${escapeHtml(card.id)}</span>
     </a>
   `;
 }
@@ -2124,16 +2125,16 @@ function statusText(status) {
 
 function statusGlyph(status) {
   const glyph = (id, tone = "") =>
-    `<span class="pw-g"><svg class="ae-icon ${tone}" aria-hidden="true"><use href="#${id}"></use></svg></span>`;
-  if (status === "done" || status === "shipped") return glyph("i-check", "ae-ok");
-  if (status === "awaiting_input") return glyph("i-ask", "ae-warn");
-  if (status === "abandoned") return glyph("i-block", "ae-warn");
+    `<span class="pw-g"><svg class="pw-icon ${tone}" aria-hidden="true"><use href="#${id}"></use></svg></span>`;
+  if (status === "done" || status === "shipped") return glyph("i-check", "pw-ok");
+  if (status === "awaiting_input") return glyph("i-ask", "pw-warn");
+  if (status === "abandoned") return glyph("i-block", "pw-warn");
   if (status === "in_progress") return glyph("i-play");
   return "";
 }
 
 function chip(text) {
-  return `<span class="ae-trail-who">${escapeHtml(text)}</span>`;
+  return `<span class="pw-trail-who">${escapeHtml(text)}</span>`;
 }
 
 async function changeCardStatus(cardId, status) {
@@ -2180,11 +2181,11 @@ async function loadCardRoute(options = {}) {
 }
 
 function detailLoading(cardId) {
-  return `<section class="pw-detail-hero"><p class="ae-chrome">CARD</p><p class="pw-detail-title ae-strong">${escapeHtml(cardId)}</p><p class="pw-empty">Loading card detail.</p></section>`;
+  return `<section class="pw-detail-hero"><p class="pw-chrome">CARD</p><p class="pw-detail-title pw-strong">${escapeHtml(cardId)}</p><p class="pw-empty">Loading card detail.</p></section>`;
 }
 
 function detailError(cardId, message) {
-  return `<section class="pw-detail-hero"><p class="ae-chrome">CARD</p><p class="pw-detail-title ae-strong">${escapeHtml(cardId)}</p><p class="pw-empty">${escapeHtml(message)}</p></section>`;
+  return `<section class="pw-detail-hero"><p class="pw-chrome">CARD</p><p class="pw-detail-title pw-strong">${escapeHtml(cardId)}</p><p class="pw-empty">${escapeHtml(message)}</p></section>`;
 }
 
 function attachmentPath(id) {
@@ -2255,22 +2256,22 @@ function detailHTML(card, detail = {}) {
     : "";
   parts.push(`
     <section class="pw-detail-hero">
-      <nav class="ae-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `ae-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li>${parentBadge}</ol></nav>
-      <p class="pw-detail-title ae-strong">${escapeHtml(normalized.title)}</p>
+      <nav class="pw-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `pw-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li>${parentBadge}</ol></nav>
+      <p class="pw-detail-title pw-strong">${escapeHtml(normalized.title)}</p>
       <p class="pw-detail-meta">
         <span class="pw-st">${statusGlyph(normalized.status)}${escapeHtml(statusText(normalized.status))}</span>
         <select class="pw-sort pw-status-change" id="detail-status-change" data-card-id="${escapeHtml(normalized.id)}" aria-label="change status">
           ${RAW_STATUSES.map((status) => `<option value="${status}"${status === normalized.status ? " selected" : ""}>${escapeHtml(statusText(status))}</option>`).join("")}
         </select>
-        <span class="ae-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}
+        <span class="pw-tag">${escapeHtml(cleanPriority(normalized.priority))}</span>${normalized.claim?.agent ? chip(normalized.claim.agent) : ""}
       </p>
-      <p id="detail-status-message" class="ae-chrome" aria-live="polite"></p>
+      <p id="detail-status-message" class="pw-chrome" aria-live="polite"></p>
     </section>
   `);
   const awaiting = (detail.activities || []).filter((activity) => activity.activity_type === "elicitation");
   if (normalized.status === "awaiting_input" && awaiting[0]) {
     const approvalLinks = approvalPacketLinksHTML(detail.links || []);
-    parts.push(`<div class="pw-ask"><p class="pw-ask-cap"><svg class="ae-icon ae-warn" aria-hidden="true"><use href="#i-ask"></use></svg>INPUT REQUESTED</p><p>${escapeHtml(awaiting[0].payload)}</p>${approvalLinks}</div>`);
+    parts.push(`<div class="pw-ask"><p class="pw-ask-cap"><svg class="pw-icon pw-warn" aria-hidden="true"><use href="#i-ask"></use></svg>INPUT REQUESTED</p><p>${escapeHtml(awaiting[0].payload)}</p>${approvalLinks}</div>`);
   }
   parts.push(`
     <div class="pw-detail-grid">
@@ -2304,7 +2305,7 @@ function detailHTML(card, detail = {}) {
 }
 
 function section(title, body) {
-  return `<section class="pw-sec"><p class="ae-h">${title}</p>${body}</section>`;
+  return `<section class="pw-sec"><p class="pw-section-head">${title}</p>${body}</section>`;
 }
 
 function acceptanceHTML(card) {
@@ -2313,7 +2314,7 @@ function acceptanceHTML(card) {
   return `<ul class="pw-acc-list">${criteria.map((criterion) => {
     const checked = Boolean(criterion.checked_at);
     const proofLinks = Array.isArray(criterion.proof_links) ? criterion.proof_links : [];
-    return `<li class="pw-acc-item${checked ? " is-checked" : ""}"><span class="pw-g"><svg class="ae-icon" aria-hidden="true"><use href="#${checked ? "i-check" : "i-dot"}"></use></svg></span><span>${escapeHtml(criterion.text)}${checked ? `<br><span class="ae-muted">checked by ${escapeHtml(criterion.checked_by || "unknown")} · ${formatDate(criterion.checked_at)}</span>` : ""}${proofLinks.length ? `<br>${proofLinks.map((proof) => linkOrText(proof.url)).join(" ")}` : ""}</span></li>`;
+    return `<li class="pw-acc-item${checked ? " is-checked" : ""}"><span class="pw-g"><svg class="pw-icon" aria-hidden="true"><use href="#${checked ? "i-check" : "i-dot"}"></use></svg></span><span>${escapeHtml(criterion.text)}${checked ? `<br><span class="pw-muted">checked by ${escapeHtml(criterion.checked_by || "unknown")} · ${formatDate(criterion.checked_at)}</span>` : ""}${proofLinks.length ? `<br>${proofLinks.map((proof) => linkOrText(proof.url)).join(" ")}` : ""}</span></li>`;
   }).join("")}</ul>`;
 }
 
@@ -2336,29 +2337,29 @@ function epicStateHTML(epicState) {
   const counts = epicState.status_counts || {};
   const countChips = order
     .filter((status) => counts[status])
-    .map((status) => `<span class="ae-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`)
+    .map((status) => `<span class="pw-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`)
     .join("");
   const mismatches = (epicState.mismatches || [])
     .map(
       (text) =>
-        `<p class="pw-epic-warn"><svg class="ae-icon" aria-hidden="true"><use href="#i-alert"></use></svg>${escapeHtml(text)}</p>`,
+        `<p class="pw-epic-warn"><svg class="pw-icon" aria-hidden="true"><use href="#i-alert"></use></svg>${escapeHtml(text)}</p>`,
     )
     .join("");
   const freshness = epicState.freshness
-    ? `<p class="ae-chrome">Freshness: ${escapeHtml(formatDate(epicState.freshness.oldest_update))} through ${escapeHtml(formatDate(epicState.freshness.newest_update))}</p>`
+    ? `<p class="pw-chrome">Freshness: ${escapeHtml(formatDate(epicState.freshness.oldest_update))} through ${escapeHtml(formatDate(epicState.freshness.newest_update))}</p>`
     : "";
   const evidence = Array.isArray(epicState.evidence) ? epicState.evidence : [];
   const evidenceRows = evidence
     .map((item) => {
       const target = item.kind === "link" ? linkOrText(item.reference) : `<span>${escapeHtml(item.reference)}</span>`;
       const label = item.label ? ` · ${escapeHtml(item.label)}` : "";
-      return `<p class="pw-link-row"><svg class="ae-icon" aria-hidden="true"><use href="#i-proof"></use></svg><span><span class="ae-item">${escapeHtml(item.child_id)}${label}</span><br>${target}</span></p>`;
+      return `<p class="pw-link-row"><svg class="pw-icon" aria-hidden="true"><use href="#i-proof"></use></svg><span><span class="pw-item">${escapeHtml(item.child_id)}${label}</span><br>${target}</span></p>`;
     })
     .join("");
   const evidenceRemaining = (epicState.evidence_total || evidence.length) - evidence.length;
   const evidenceMore =
     evidenceRemaining > 0
-      ? `<p class="ae-chrome">+${evidenceRemaining} more evidence item${evidenceRemaining === 1 ? "" : "s"} not shown.</p>`
+      ? `<p class="pw-chrome">+${evidenceRemaining} more evidence item${evidenceRemaining === 1 ? "" : "s"} not shown.</p>`
       : "";
   return `
     <p class="pw-epic-progress">${epicState.criteria_checked}/${epicState.criteria_total} criteria checked across ${epicState.children_total} ${epicState.children_total === 1 ? "child" : "children"} · ${epicState.active_claims} active claim${epicState.active_claims === 1 ? "" : "s"}</p>
@@ -2383,14 +2384,14 @@ function childrenHTML(children, childrenTotal) {
           ${glyph || `<span class="pw-g"></span>`}
           <span>
             <a class="pw-rel-id" href="${escapeHtml(cardHref(child.id))}">${escapeHtml(child.id)}</a> ${escapeHtml(child.title)}
-            <br><span class="ae-muted">${escapeHtml(statusText(child.status))} · ${child.criteria_checked}/${child.criteria_total} criteria${child.claim?.agent ? ` · ${escapeHtml(child.claim.agent)}` : ""}</span>
+            <br><span class="pw-muted">${escapeHtml(statusText(child.status))} · ${child.criteria_checked}/${child.criteria_total} criteria${child.claim?.agent ? ` · ${escapeHtml(child.claim.agent)}` : ""}</span>
           </span>
         </li>
       `;
     })
     .join("");
   const truncated = typeof childrenTotal === "number" && childrenTotal > children.length;
-  const more = truncated ? `<p class="ae-chrome">+${childrenTotal - children.length} more not shown.</p>` : "";
+  const more = truncated ? `<p class="pw-chrome">+${childrenTotal - children.length} more not shown.</p>` : "";
   return `<ul class="pw-acc-list">${rows}</ul>${more}`;
 }
 
@@ -2421,7 +2422,7 @@ function proofEvidenceHTML(card, links, runs) {
   const plan = Array.isArray(card.proof_plan) ? card.proof_plan : [];
   const proofLinks = linksHTML(links, runs);
   const planHTML = plan.length
-    ? `<ul class="pw-acc-list">${plan.map((item) => `<li class="pw-acc-item"><span class="pw-g"><svg class="ae-icon" aria-hidden="true"><use href="#i-proof"></use></svg></span><span>${escapeHtml(item)}</span></li>`).join("")}</ul>`
+    ? `<ul class="pw-acc-list">${plan.map((item) => `<li class="pw-acc-item"><span class="pw-g"><svg class="pw-icon" aria-hidden="true"><use href="#i-proof"></use></svg></span><span>${escapeHtml(item)}</span></li>`).join("")}</ul>`
     : "";
   if (!planHTML && !proofLinks) return empty("No proof plan or proof links.");
   return `${planHTML}${proofLinks}`;
@@ -2438,7 +2439,7 @@ function linksHTML(links, runs) {
     const target = safe
       ? `<a href="${escapeHtml(safe)}" target="_blank" rel="noreferrer">${escapeHtml(link.url)}</a>`
       : `<span>${escapeHtml(link.url)}</span>`;
-    return `<p class="pw-link-row"><svg class="ae-icon" aria-hidden="true"><use href="#i-link"></use></svg><span><span class="ae-item">${escapeHtml(link.label)}</span><br>${target}</span></p>`;
+    return `<p class="pw-link-row"><svg class="pw-icon" aria-hidden="true"><use href="#i-link"></use></svg><span><span class="pw-item">${escapeHtml(link.label)}</span><br>${target}</span></p>`;
   }).join("");
 }
 
@@ -2533,7 +2534,7 @@ function markdownHTML(text) {
     if (heading) {
       flushParagraph();
       flushList();
-      html.push(`<p class="pw-md-head ae-h">${inlineMarkdown(heading[1])}</p>`);
+      html.push(`<p class="pw-md-head pw-section-head">${inlineMarkdown(heading[1])}</p>`);
       continue;
     }
     const bullet = line.match(/^[-*]\s+(?:\[[ xX]\]\s*)?(.+)$/);
@@ -2831,7 +2832,7 @@ function renderPaletteList() {
         ? '<span class="pw-cmdk-item-snippet">' + escapeHtml(entry.snippet) + '</span>'
         : "";
       return '<li id="cmdk-opt-' + index + '" role="option" aria-selected="' + (index === paletteActiveIndex) + '" class="pw-cmdk-item' + (index === paletteActiveIndex ? ' is-active' : '') + '" data-index="' + index + '">' +
-        '<span class="pw-cmdk-item-id ae-num">' + escapeHtml(card.id) + '</span>' +
+        '<span class="pw-cmdk-item-id pw-num">' + escapeHtml(card.id) + '</span>' +
         '<span class="pw-cmdk-item-title">' + escapeHtml(card.title) + '</span>' +
         '<span class="pw-cmdk-item-source">' + escapeHtml(provenance) + '</span>' + snippet + '</li>';
     }).join("");

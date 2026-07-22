@@ -3190,27 +3190,6 @@ async fn board_assets_are_served_with_specific_content_types() {
     let (state, _) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
-    let aesthetic = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/assets/aesthetic.css")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(aesthetic.status(), StatusCode::OK);
-    assert!(aesthetic
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .starts_with("text/css"));
-    assert!(response_text(aesthetic).await.contains("aesthetic v0.25.0"));
-
     // powder-static-asset-cache-headers: every asset carries a
     // deploy-scoped ETag with `no-cache` revalidation, and a matching
     // If-None-Match comes back 304 with no body re-download. NEVER a long

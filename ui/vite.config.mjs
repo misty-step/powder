@@ -3,8 +3,8 @@ import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
 
 // powder-ui-toolchain-foundation: this build has exactly one job -- turn
-// ui/src into the four files crates/powder-server/src/main.rs embeds with
-// include_str! (index.html, assets/aesthetic.css, assets/powder-board.css,
+// ui/src into the three files crates/powder-server/src/main.rs embeds with
+// include_str! (index.html, assets/powder-board.css,
 // assets/powder-board.js). Filenames MUST stay stable: the deploy-SHA ETag
 // in main.rs::static_asset already busts caches on every deploy, so a
 // content hash in the filename would be redundant *and* would break the
@@ -12,8 +12,7 @@ import { fileURLToPath } from "node:url";
 //
 // Only powder-board.css runs through Vite's real bundler, because it's the
 // only file that needs transformation (Tailwind's CSS-first pipeline via
-// @tailwindcss/vite). index.html, aesthetic.css (a vendored kit file
-// scripts/check-aesthetic-currency.sh expects byte-for-byte), and
+// @tailwindcss/vite). index.html and
 // powder-board.js (plain script, zero imports, nothing to resolve) are
 // copied verbatim by build.mjs instead of round-tripped through the
 // bundler's module graph: bundling a single-module JS entry still forces

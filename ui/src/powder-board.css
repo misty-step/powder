@@ -1,8 +1,6 @@
 @import "./tailwind.css";
 
 :root {
-  --ae-accent: #2643d0;
-  --ae-accent-dark: #8c9eff;
   /* powder-903: the one duration/easing the board <-> backlog <-> both view
      switch uses everywhere -- the rail/board grid split, the rail's own
      fade+slide, and the board's fade+slide all reference this so the three
@@ -36,12 +34,340 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--ae-surface);
+  background: var(--color-surface);
 }
 
 html[data-pw-route='card'] .pw-app {
   display: none;
 }
+
+/* ── base component primitives (migrated from aesthetic.css, token-backed) ──
+   These definitions replace the base styles aesthetic.css provided. Every
+   value is a token reference; no raw hex or px literals. The scoped
+   overrides below (e.g. .pw-quick-add-form .pw-chrome) layer on top. */
+
+body {
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: 1.6;
+  cursor: default;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, h4, h5, h6, p, li, dt, dd, blockquote, figcaption, label,
+input, textarea, button, table {
+  font-size: 1em;
+  font-family: inherit;
+  line-height: inherit;
+  margin: 0;
+}
+
+code, kbd, pre, samp {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+::selection {
+  background: var(--color-surface-sunken);
+  color: var(--color-ink);
+}
+
+:focus-visible {
+  outline: var(--pw-focus-width) solid var(--pw-focus-color);
+  outline-offset: var(--pw-focus-offset);
+}
+
+a {
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+  text-decoration-color: var(--color-faint);
+  padding-block: 0.35em;
+  margin-block: -0.35em;
+  transition:
+    color var(--pw-quick) var(--pw-ease),
+    text-decoration-color var(--pw-quick) var(--pw-ease);
+}
+
+a:hover {
+  color: var(--color-accent);
+  text-decoration-color: currentColor;
+}
+
+/* ── component classes ── */
+
+.pw-icon {
+  width: 1.2em;
+  height: 1.2em;
+  stroke: currentColor;
+  fill: none;
+  flex: none;
+}
+
+.pw-chrome {
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+}
+
+.pw-name {
+  font-weight: var(--pw-weight-semibold);
+  letter-spacing: 0.38em;
+}
+
+.pw-tabs {
+  position: relative;
+  display: flex;
+  gap: var(--pw-space-6);
+}
+
+.pw-tabs button {
+  background: transparent;
+  border: 0;
+  padding: 0 0 0.6em;
+  margin: 0;
+  font: inherit;
+  color: var(--color-muted);
+  cursor: pointer;
+  transition: color var(--pw-quick) var(--pw-ease);
+}
+
+.pw-tabs button:hover,
+.pw-tabs [aria-selected='true'] {
+  color: var(--color-ink);
+}
+
+.pw-nav-ind {
+  position: absolute;
+  bottom: 0;
+  height: 2px;
+}
+
+.pw-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background: transparent;
+  color: var(--color-ink);
+  cursor: text;
+  border: 0;
+  border-bottom: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  padding: 0.4em 0 calc(0.4em - 1px);
+  transition: border-color var(--pw-quick) var(--pw-ease);
+}
+
+.pw-input::placeholder {
+  color: var(--color-faint);
+}
+
+.pw-input:focus-visible {
+  outline: none;
+  border-bottom-width: 2px;
+  border-bottom-color: var(--color-ink);
+}
+
+textarea.pw-input {
+  resize: none;
+  min-height: 5.5em;
+}
+
+.pw-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--pw-space-2);
+  background: var(--color-ink);
+  border: var(--pw-line-width) solid var(--color-ink);
+  border-radius: var(--radius-0);
+  color: var(--color-surface);
+  font-weight: var(--pw-weight-medium);
+  padding: 0.55em 1.5em;
+  min-height: var(--pw-touch-target);
+  cursor: pointer;
+  transition:
+    opacity var(--pw-quick) var(--pw-ease),
+    background-color var(--pw-quick) var(--pw-ease),
+    transform var(--pw-quick) var(--pw-ease);
+}
+
+.pw-button:hover {
+  opacity: 0.9;
+}
+
+.pw-button:active {
+  transform: translateY(1px) scale(0.99);
+}
+
+.pw-button:disabled {
+  cursor: default;
+  opacity: 0.7;
+  transform: none;
+}
+
+.pw-button-quiet {
+  background: transparent;
+  color: var(--color-ink);
+}
+
+.pw-button-quiet:hover {
+  background: var(--color-surface-sunken);
+  opacity: 1;
+}
+
+.pw-button-compact {
+  font-size: var(--text-sm);
+  padding: 0.35em 1em;
+  min-height: 32px;
+}
+
+.pw-section-head {
+  font-weight: var(--pw-weight-medium);
+  color: var(--color-muted);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-size: var(--text-sm);
+  margin: 0;
+}
+
+.pw-caption {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.14em;
+  color: var(--color-faint);
+  text-transform: uppercase;
+}
+
+.pw-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.pw-tag {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  letter-spacing: 0.14em;
+  color: var(--color-muted);
+  border: var(--pw-line-width) solid var(--color-line);
+  padding: 0.1em 0.6em;
+  vertical-align: 0.1em;
+}
+
+.pw-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5em;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  letter-spacing: 0.06em;
+  border: var(--pw-line-width) solid currentColor;
+  padding: 0.12em 0.55em;
+  color: var(--color-muted);
+}
+
+.pw-cat-0 { color: var(--color-cat-0); }
+.pw-cat-1 { color: var(--color-cat-1); }
+.pw-cat-2 { color: var(--color-cat-2); }
+.pw-cat-3 { color: var(--color-cat-3); }
+.pw-cat-4 { color: var(--color-cat-4); }
+.pw-cat-5 { color: var(--color-cat-5); }
+.pw-cat-6 { color: var(--color-cat-6); }
+.pw-cat-7 { color: var(--color-cat-7); }
+
+.pw-ok { color: var(--color-ok); }
+.pw-warn { color: var(--color-warn); }
+.pw-err { color: var(--color-danger); }
+
+.pw-strong { font-weight: var(--pw-weight-semibold); }
+.pw-muted { color: var(--color-muted); font-size: var(--text-sm); }
+.pw-item { font-weight: var(--pw-weight-medium); }
+
+.pw-crumbs {
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+}
+
+.pw-crumbs ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.pw-crumbs li {
+  display: flex;
+  gap: 0.6em;
+}
+
+.pw-crumbs li + li::before {
+  content: '/';
+  color: var(--color-faint);
+}
+
+.pw-crumbs a {
+  color: var(--color-muted);
+  text-decoration: none;
+}
+
+.pw-crumbs a:hover {
+  color: var(--color-ink);
+}
+
+.pw-crumbs [aria-current] {
+  color: var(--color-ink);
+  font-weight: var(--pw-weight-medium);
+}
+
+.pw-trail-who {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.04em;
+  color: var(--color-muted);
+}
+
+.pw-vt-mode::view-transition-old(root),
+.pw-vt-mode::view-transition-new(root) {
+  animation-duration: var(--pw-quick);
+  animation-timing-function: var(--pw-ease);
+}
+
+@keyframes pw-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* estimate/risk chips on card rows */
+.pw-chip-estimate {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-sm);
+  padding: 0 0.35em;
+  line-height: 1.5;
+}
+
+.pw-chip-risk {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  border: var(--pw-line-width) solid var(--color-warn);
+  border-radius: var(--radius-sm);
+  padding: 0 0.35em;
+  line-height: 1.5;
+  color: var(--color-warn);
+}
+
+.pw-chip-risk[data-risk='high'] {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
 
 html:not([data-pw-route='card']) .pw-detail-app {
   display: none;
@@ -52,11 +378,11 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--ae-surface);
+  background: var(--color-surface);
 }
 
-.ae-vt-mode::view-transition-old(root),
-.ae-vt-mode::view-transition-new(root) {
+.pw-vt-mode::view-transition-old(root),
+.pw-vt-mode::view-transition-new(root) {
   animation-duration: 240ms;
 }
 
@@ -65,10 +391,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--ae-space-3) var(--ae-space-6);
+  gap: var(--pw-space-3) var(--pw-space-6);
   flex-wrap: wrap;
   padding: 0.9em 2em 0;
-  border-bottom: 1px solid var(--ae-line);
+  border-bottom: 1px solid var(--color-line);
 }
 
 .pw-brand {
@@ -84,34 +410,34 @@ html:not([data-pw-route='card']) .pw-detail-app {
   justify-content: center;
   width: 1.9em;
   height: 1.9em;
-  border: 1px solid var(--ae-line);
-  color: var(--ae-ink);
+  border: 1px solid var(--color-line);
+  color: var(--color-ink);
 }
 
-.pw-mark .ae-icon {
+.pw-mark .pw-icon {
   width: 1.15em;
   height: 1.15em;
 }
 
 .pw-connection[data-kind='ok'] {
-  color: var(--ae-ok);
+  color: var(--color-ok);
 }
 
 .pw-connection[data-kind='readonly'],
 .pw-connection[data-kind='auth'] {
-  color: var(--ae-accent);
+  color: var(--color-accent);
 }
 
 .pw-connection[data-kind='error'] {
-  color: var(--ae-err);
+  color: var(--color-danger);
 }
 
-.pw-top .ae-tabs {
-  gap: var(--ae-space-5);
+.pw-top .pw-tabs {
+  gap: var(--pw-space-5);
   align-self: flex-end;
 }
 
-.pw-top .ae-tabs button {
+.pw-top .pw-tabs button {
   font-size: 13px;
   padding-bottom: 0.75em;
 }
@@ -127,7 +453,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   align-items: center;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: var(--ae-space-2) var(--ae-space-4);
+  gap: var(--pw-space-2) var(--pw-space-4);
   padding-bottom: 0.65em;
 }
 
@@ -141,31 +467,31 @@ html:not([data-pw-route='card']) .pw-detail-app {
   height: 2.1em;
   background: transparent;
   border: 0;
-  border-radius: var(--ae-radius);
+  border-radius: var(--radius-0);
   padding: 0.3em 0.5em;
   margin: 0;
   font: inherit;
   font-size: 13px;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   cursor: pointer;
-  transition: color var(--ae-quick) var(--ae-ease);
+  transition: color var(--pw-quick) var(--pw-ease);
 }
 
 .pw-filter-btn:hover,
 .pw-filter-btn[aria-expanded='true'],
 .pw-icon-btn:hover,
 .pw-icon-btn[aria-expanded='true'] {
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
-.pw-filter-btn .ae-icon,
-.pw-icon-btn .ae-icon {
+.pw-filter-btn .pw-icon,
+.pw-icon-btn .pw-icon {
   width: 1em;
   height: 1em;
 }
 
 .pw-filter-n {
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
 }
 
@@ -176,8 +502,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: 1em;
   align-items: start;
   padding: 0.8em 2em;
-  border-bottom: 1px solid var(--ae-line);
-  background: var(--ae-wash);
+  border-bottom: 1px solid var(--color-line);
+  background: var(--color-surface-sunken);
 }
 
 .pw-auth[hidden] {
@@ -196,8 +522,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   flex: 1 1 auto;
   min-width: 0;
   padding: 0.35em 0.5em;
-  border: 1px solid var(--ae-line);
-  background: var(--ae-surface);
+  border: 1px solid var(--color-line);
+  background: var(--color-surface);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
@@ -216,7 +542,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   min-width: 18rem;
 }
 
-.pw-auth-form .ae-chrome {
+.pw-auth-form .pw-chrome {
   display: block;
 }
 
@@ -227,7 +553,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: 1em;
 }
 
-.pw-settings-head .ae-h {
+.pw-settings-head .pw-section-head {
   margin: 0 0 0.45em;
 }
 
@@ -258,19 +584,19 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: 0.6em;
 }
 
-/* The three tiers read differently at a glance, within the .ae-tag grammar
+/* The three tiers read differently at a glance, within the .pw-tag grammar
    (mono, hairline, no fill, no hue -- tier is a lifecycle stage, not a
    category, so it earns ink weight rather than a categorical hue): active
-   is full ink with a firmer hairline, backburner keeps the .ae-tag default
+   is full ink with a firmer hairline, backburner keeps the .pw-tag default
    muted treatment, archived recedes to faint ink with a strike. All tokens,
    so both themes get the same relative ordering for free. */
 .pw-repo-tier-badge[data-tier='active'] {
-  color: var(--ae-ink);
-  border-color: var(--ae-ink-muted);
+  color: var(--color-ink);
+  border-color: var(--color-muted);
 }
 
 .pw-repo-tier-badge[data-tier='archived'] {
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   text-decoration: line-through;
 }
 
@@ -286,7 +612,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-repo-create {
   margin-bottom: 0.6em;
   padding-bottom: 0.6em;
-  border-bottom: 1px solid var(--ae-line);
+  border-bottom: 1px solid var(--color-line);
 }
 
 .pw-repo-edit {
@@ -305,15 +631,15 @@ html:not([data-pw-route='card']) .pw-detail-app {
   min-width: 0;
 }
 
-.pw-repo-create .ae-chrome,
-.pw-repo-edit .ae-chrome,
-.pw-repo-merge .ae-chrome {
+.pw-repo-create .pw-chrome,
+.pw-repo-edit .pw-chrome,
+.pw-repo-merge .pw-chrome {
   display: block;
 }
 
-.pw-repo-create .ae-input,
-.pw-repo-edit .ae-input,
-.pw-repo-merge .ae-input,
+.pw-repo-create .pw-input,
+.pw-repo-edit .pw-input,
+.pw-repo-merge .pw-input,
 .pw-repo-edit .pw-sort,
 .pw-repo-create .pw-sort {
   width: 100%;
@@ -322,7 +648,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-repo-row {
-  border-top: 1px solid var(--ae-line);
+  border-top: 1px solid var(--color-line);
   padding: 0.5em 0;
   font-size: 13px;
 }
@@ -343,12 +669,12 @@ html:not([data-pw-route='card']) .pw-detail-app {
   min-width: 0;
   align-items: center;
   gap: 0.45em;
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 12px;
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
-.pw-repo-name .ae-icon {
+.pw-repo-name .pw-icon {
   width: 1em;
   height: 1em;
   flex: none;
@@ -361,16 +687,16 @@ html:not([data-pw-route='card']) .pw-detail-app {
   margin: 0.35em 0 0;
 }
 
-.pw-repo-counts .ae-chip {
+.pw-repo-counts .pw-chip {
   font-size: 11px;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
 }
 
 .pw-repo-alias {
   margin: 0.35em 0 0;
   overflow-wrap: anywhere;
   font-size: 12px;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
 }
 
 /* powder-925: the operator's mobile write path -- a single-purpose panel,
@@ -410,10 +736,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: block;
 }
 
-/* scoped re-theme of the shared .ae-chrome label and .ae-input control so
-   the panel reads from the new role tokens, not the comic-ops --ae-* kit.
+/* scoped re-theme of the shared .pw-chrome label and .pw-input control so
+   the panel reads from the new role tokens, not the old aesthetic kit.
    Every value below is a token reference; the literals live in tokens.css. */
-.pw-quick-add-form .ae-chrome {
+.pw-quick-add-form .pw-chrome {
   display: block;
   margin-bottom: var(--pw-space-1);
   color: var(--color-muted);
@@ -431,7 +757,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   letter-spacing: 0;
 }
 
-.pw-quick-add-form .ae-input {
+.pw-quick-add-form .pw-input {
   width: 100%;
   box-sizing: border-box;
   padding: var(--pw-space-2) var(--pw-space-3);
@@ -444,11 +770,11 @@ html:not([data-pw-route='card']) .pw-detail-app {
   transition: border-color var(--pw-quick) var(--pw-ease);
 }
 
-.pw-quick-add-form .ae-input::placeholder {
+.pw-quick-add-form .pw-input::placeholder {
   color: var(--color-faint);
 }
 
-.pw-quick-add-form .ae-input:focus-visible {
+.pw-quick-add-form .pw-input:focus-visible {
   outline: none;
   border-color: var(--color-ink);
   box-shadow: 0 0 0 var(--pw-focus-width) var(--color-line);
@@ -460,29 +786,29 @@ html:not([data-pw-route='card']) .pw-detail-app {
   margin-top: var(--pw-space-1);
 }
 
-/* scoped re-theme of the shared .ae-button pair so the action row reads
-   from the new role tokens. min-height is left to the base .ae-button so no
+/* scoped re-theme of the shared .pw-button pair so the action row reads
+   from the new role tokens. min-height is left to the base .pw-button so no
    px literal enters the migrated view code. */
-.pw-quick-add-actions .ae-button {
+.pw-quick-add-actions .pw-button {
   border-radius: var(--radius-0);
   font-size: var(--text-sm);
   font-weight: var(--pw-weight-medium);
   padding: var(--pw-space-2) var(--pw-space-5);
 }
 
-.pw-quick-add-actions .ae-button:not(.ae-button-quiet) {
+.pw-quick-add-actions .pw-button:not(.pw-button-quiet) {
   background: var(--color-ink);
   color: var(--color-accent-ink);
   border-color: var(--color-ink);
 }
 
-.pw-quick-add-actions .ae-button-quiet {
+.pw-quick-add-actions .pw-button-quiet {
   background: transparent;
   color: var(--color-ink);
   border-color: var(--color-line);
 }
 
-.pw-quick-add-actions .ae-button-quiet:hover {
+.pw-quick-add-actions .pw-button-quiet:hover {
   background: var(--color-surface-sunken);
 }
 
@@ -497,10 +823,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
   flex-wrap: wrap;
   gap: 0.6em 1.2em;
   padding: 0.8em 2em;
-  border-bottom: 1px solid var(--ae-line);
+  border-bottom: 1px solid var(--color-line);
   font-size: 13px;
-  color: var(--ae-ink-muted);
-  animation: ae-enter var(--ae-quick) var(--ae-ease) both;
+  color: var(--color-muted);
+  animation: pw-enter var(--pw-quick) var(--pw-ease) both;
 }
 
 .pw-filters.is-open {
@@ -514,7 +840,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: 0.45em;
 }
 
-.pw-filter-group > .ae-plate-cap {
+.pw-filter-group > .pw-caption {
   margin: 0 0.4em 0 0;
 }
 
@@ -527,27 +853,27 @@ html:not([data-pw-route='card']) .pw-detail-app {
   cursor: pointer;
 }
 
-.pw-chip-btn .ae-chip {
+.pw-chip-btn .pw-chip {
   display: inline-flex;
   min-height: 1.85em;
   box-sizing: border-box;
   align-items: center;
   gap: 0.4em;
   padding: 0.18em 0.6em;
-  transition: color var(--ae-quick) var(--ae-ease), opacity var(--ae-quick) var(--ae-ease);
+  transition: color var(--pw-quick) var(--pw-ease), opacity var(--pw-quick) var(--pw-ease);
 }
 
-.pw-chip-btn .ae-chip .ae-icon {
+.pw-chip-btn .pw-chip .pw-icon {
   width: 1em;
   height: 1em;
 }
 
-.pw-chip-btn[aria-pressed='false'] .ae-chip {
-  color: var(--ae-ink-faint);
-  border-color: var(--ae-line);
+.pw-chip-btn[aria-pressed='false'] .pw-chip {
+  color: var(--color-faint);
+  border-color: var(--color-line);
 }
 
-.pw-chip-btn:hover .ae-chip {
+.pw-chip-btn:hover .pw-chip {
   opacity: 0.8;
 }
 
@@ -555,47 +881,47 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: inline-flex;
   align-items: center;
   gap: 0.45em;
-  border-bottom: 1px solid var(--ae-line);
-  color: var(--ae-ink);
+  border-bottom: 1px solid var(--color-line);
+  color: var(--color-ink);
 }
 
-.pw-search .ae-icon {
+.pw-search .pw-icon {
   width: 1em;
   height: 1em;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
 }
 
 .pw-search-status {
   min-width: 4.5em;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   font-size: 11px;
 }
 
 .pw-search-status[data-state="error"] {
-  color: var(--ae-danger, #a33);
+  color: var(--color-danger, #a33);
 }
 
 .pw-search input {
   width: 13rem;
   background: transparent;
   border: 0;
-  border-radius: var(--ae-radius);
+  border-radius: var(--radius-0);
   padding: 0.1em 0.2em;
   font: inherit;
   font-size: 13px;
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
 .pw-sort {
   background: transparent;
   border: 0;
-  border-bottom: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
+  border-bottom: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
   padding: 0.1em 0.2em;
   margin: 0;
   font: inherit;
   font-size: 13px;
-  color: var(--ae-ink);
+  color: var(--color-ink);
   cursor: pointer;
 }
 
@@ -606,13 +932,13 @@ html:not([data-pw-route='card']) .pw-detail-app {
   margin-left: auto;
   font: inherit;
   font-size: 13px;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   cursor: pointer;
-  transition: color var(--ae-quick) var(--ae-ease);
+  transition: color var(--pw-quick) var(--pw-ease);
 }
 
 .pw-filter-clear:hover {
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
 .pw-main {
@@ -629,15 +955,15 @@ html:not([data-pw-route='card']) .pw-detail-app {
      controls stay responsive to clicks throughout (see the law spec), and
      it is symmetric for free since both directions play the exact same
      transition. */
-  transition: grid-template-columns var(--pw-view-duration) var(--ae-ease);
+  transition: grid-template-columns var(--pw-view-duration) var(--pw-ease);
 }
 
 .pw-rail-wrap {
   min-width: 0;
   min-height: 0;
-  border-right: 1px solid var(--ae-line);
+  border-right: 1px solid var(--color-line);
   overflow: hidden;
-  transition: border-color var(--pw-view-duration) var(--ae-ease);
+  transition: border-color var(--pw-view-duration) var(--pw-ease);
 }
 
 .pw-main[data-view='board'] .pw-rail-wrap,
@@ -656,10 +982,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
   opacity: 1;
   transform: translateX(0);
   transition:
-    opacity var(--pw-view-duration) var(--ae-ease),
-    transform var(--pw-view-duration) var(--ae-ease),
-    padding var(--pw-view-duration) var(--ae-ease),
-    width var(--pw-view-duration) var(--ae-ease);
+    opacity var(--pw-view-duration) var(--pw-ease),
+    transform var(--pw-view-duration) var(--pw-ease),
+    padding var(--pw-view-duration) var(--pw-ease),
+    width var(--pw-view-duration) var(--pw-ease);
 }
 
 .pw-main[data-view='board'] .pw-rail-inner {
@@ -695,7 +1021,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   margin: 1.4em 0 0.2em;
 }
 
-.pw-rail-cap .ae-icon {
+.pw-rail-cap .pw-icon {
   width: 1em;
   height: 1em;
 }
@@ -708,29 +1034,29 @@ html:not([data-pw-route='card']) .pw-detail-app {
   text-align: left;
   background: transparent;
   border: 0;
-  border-top: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
+  border-top: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
   padding: 0.5em 0;
   margin: 0;
   font: inherit;
   font-size: 13px;
   line-height: 1.55;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   cursor: pointer;
-  transition: color var(--ae-quick) var(--ae-ease);
+  transition: color var(--pw-quick) var(--pw-ease);
 }
 
 .pw-rail-row:hover,
 .pw-rail-row:focus-visible {
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
 .pw-rail-id {
   display: block;
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.06em;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
 }
 
 .pw-board {
@@ -745,9 +1071,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
   opacity: 1;
   transform: translateX(0);
   transition:
-    padding var(--pw-view-duration) var(--ae-ease),
-    opacity var(--pw-view-duration) var(--ae-ease),
-    transform var(--pw-view-duration) var(--ae-ease);
+    padding var(--pw-view-duration) var(--pw-ease),
+    opacity var(--pw-view-duration) var(--pw-ease),
+    transform var(--pw-view-duration) var(--pw-ease);
 }
 
 .pw-main[data-view='backlog'] .pw-board {
@@ -758,7 +1084,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 /* column switcher for the stacked mobile board (below 640px) — a plain
-   .ae-tabs instrument, hidden here because the 3-column grid has room for
+   .pw-tabs instrument, hidden here because the 3-column grid has room for
    every lane at this width already. */
 .pw-lane-switch {
   display: none;
@@ -778,27 +1104,27 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  gap: var(--ae-space-4);
-  border-bottom: 1px solid var(--ae-line);
+  gap: var(--pw-space-4);
+  border-bottom: 1px solid var(--color-line);
   padding-bottom: 0.5em;
   margin-bottom: 0.9em;
 }
 
-.pw-lane-h .ae-h {
+.pw-lane-h .pw-section-head {
   margin-bottom: 0;
   display: inline-flex;
   align-items: center;
   gap: 0.5em;
 }
 
-.pw-lane-h .ae-icon {
+.pw-lane-h .pw-icon {
   width: 1em;
   height: 1em;
 }
 
 .pw-lane-n {
   font-size: 13px;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
 }
 
 .pw-lane-scroll {
@@ -815,33 +1141,33 @@ html:not([data-pw-route='card']) .pw-detail-app {
   text-decoration: none;
   text-align: left;
   background: transparent;
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
   padding: 0.65em 0.9em 0.7em;
   margin: 0 0 0.7em;
   font: inherit;
-  color: var(--ae-ink);
+  color: var(--color-ink);
   cursor: pointer;
-  transition: border-color var(--ae-quick) var(--ae-ease);
+  transition: border-color var(--pw-quick) var(--pw-ease);
 }
 
 .pw-card:hover,
 .pw-card:focus-visible {
-  border-color: var(--ae-ink-muted);
+  border-color: var(--color-muted);
 }
 
 .pw-card-top {
   display: flex;
   align-items: center;
   gap: 0.5em;
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.08em;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   margin-bottom: 0.15em;
 }
 
-.pw-card-top .ae-icon {
+.pw-card-top .pw-icon {
   width: 1em;
   height: 1em;
   flex: none;
@@ -854,7 +1180,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-card-t {
   display: block;
-  font-weight: var(--ae-w-medium);
+  font-weight: var(--pw-weight-medium);
   line-height: 1.45;
 }
 
@@ -864,7 +1190,14 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: 0.55em;
   margin-top: 0.45em;
   font-size: 13px;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
+}
+
+.pw-card-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pw-space-2);
+  margin: 0.15em 0 0;
 }
 
 .pw-rel-badges {
@@ -879,12 +1212,12 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: inline-flex;
   align-items: center;
   min-height: 1.55em;
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
   padding: 0.05em 0.45em;
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
 }
 
 .pw-rel-id {
@@ -896,7 +1229,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   flex: none;
 }
 
-.pw-g .ae-icon {
+.pw-g .pw-icon {
   width: 1.05em;
   height: 1.05em;
 }
@@ -911,16 +1244,16 @@ html:not([data-pw-route='card']) .pw-detail-app {
   text-align: left;
   background: transparent;
   border: 0;
-  border-top: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
+  border-top: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
   padding: 0.45em 0;
   margin: 0;
   font: inherit;
   font-size: 13px;
   line-height: 1.6;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   cursor: pointer;
-  transition: color var(--ae-quick) var(--ae-ease);
+  transition: color var(--pw-quick) var(--pw-ease);
 }
 
 .pw-done-row:first-child {
@@ -929,7 +1262,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-done-row:hover,
 .pw-done-row:focus-visible {
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
 .pw-done-t {
@@ -939,7 +1272,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-done-id {
   font-size: 11px;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   white-space: nowrap;
 }
 
@@ -949,7 +1282,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-empty {
   font-size: 13px;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   padding: 0.4em 0;
 }
 
@@ -957,12 +1290,12 @@ html:not([data-pw-route='card']) .pw-detail-app {
    distinct from the plain "nothing under this filter" .pw-empty text so a
    genuinely empty board reads as an onboarding moment, not a dead end. */
 .pw-empty-firstrun {
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   max-width: 32rem;
 }
 
-.pw-empty-firstrun .ae-h {
-  color: var(--ae-ink);
+.pw-empty-firstrun .pw-section-head {
+  color: var(--color-ink);
   margin-bottom: 0.5em;
 }
 
@@ -976,8 +1309,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   margin-top: 0.35em;
   padding: 0.35em 0.5em;
   overflow-x: auto;
-  border: 1px solid var(--ae-line);
-  background: var(--ae-wash);
+  border: 1px solid var(--color-line);
+  background: var(--color-surface-sunken);
   white-space: nowrap;
 }
 
@@ -988,7 +1321,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   align-items: center;
   gap: 1em;
   padding: 0.9em 2em;
-  border-bottom: 1px solid var(--ae-line);
+  border-bottom: 1px solid var(--color-line);
 }
 
 .pw-detail-top .pw-brand {
@@ -1004,18 +1337,18 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-board-link {
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   text-decoration: none;
 }
 
 .pw-board-link:hover {
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
 .pw-detail-connection {
   justify-self: end;
   margin: 0;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
 }
 
 .pw-detail-scroll {
@@ -1032,7 +1365,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-detail-hero {
   padding-bottom: 1.35em;
-  border-bottom: 1px solid var(--ae-line);
+  border-bottom: 1px solid var(--color-line);
 }
 
 .pw-detail-title {
@@ -1063,7 +1396,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-detail-side {
-  border-left: 1px solid var(--ae-line);
+  border-left: 1px solid var(--color-line);
   padding-left: 1.6em;
 }
 
@@ -1083,19 +1416,19 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-md code,
 .pw-md pre {
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 13px;
 }
 
 .pw-md code {
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
 .pw-md pre {
   overflow-x: auto;
-  border: 1px solid var(--ae-line);
+  border: 1px solid var(--color-line);
   padding: 0.8em;
-  background: var(--ae-wash);
+  background: var(--color-surface-sunken);
 }
 
 .pw-md-head {
@@ -1113,7 +1446,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-sec h3,
-.pw-sec .ae-h {
+.pw-sec .pw-section-head {
   margin-bottom: 0.8em;
 }
 
@@ -1131,7 +1464,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-def-row,
 .pw-link-row,
 .pw-acc-item {
-  border-top: 1px solid var(--ae-line);
+  border-top: 1px solid var(--color-line);
   padding: 0.55em 0;
 }
 
@@ -1153,10 +1486,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-trail-head,
 .pw-def-row dt {
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.06em;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
 }
 
 .pw-def-row dt {
@@ -1176,7 +1509,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-worklog-item {
-  border-top: 1px solid var(--ae-line);
+  border-top: 1px solid var(--color-line);
   padding: 0.55em 0;
 }
 
@@ -1186,10 +1519,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-worklog-item summary {
   cursor: pointer;
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.06em;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
 }
 
 .pw-worklog-item p {
@@ -1197,14 +1530,14 @@ html:not([data-pw-route='card']) .pw-detail-app {
   overflow-wrap: anywhere;
 }
 
-.pw-link-row .ae-icon {
+.pw-link-row .pw-icon {
   width: 1em;
   height: 1em;
   flex: none;
 }
 
 .pw-ask {
-  border: 1px solid var(--ae-line);
+  border: 1px solid var(--color-line);
   padding: 0.9em 1.1em;
   margin-top: 1.4em;
   font-size: 13px;
@@ -1214,10 +1547,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: flex;
   align-items: center;
   gap: 0.5em;
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.14em;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
   margin-bottom: 0.45em;
 }
 
@@ -1232,13 +1565,13 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  gap: var(--ae-space-4) var(--ae-space-6);
+  gap: var(--pw-space-4) var(--pw-space-6);
   flex-wrap: wrap;
-  border-top: 1px solid var(--ae-line);
+  border-top: 1px solid var(--color-line);
   padding: 0.3em 2em;
   font-size: 11px;
   line-height: 1.4;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
 }
 
 .pw-foot kbd {
@@ -1250,23 +1583,23 @@ html:not([data-pw-route='card']) .pw-detail-app {
    conveyed by data-state and event recency by the title tooltip. Transient
    reconnects stay in the last stable state (see LIVE_TROUBLE_GRACE_MS). */
 .pw-live {
-  font-family: var(--ae-font-mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.04em;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   white-space: nowrap;
 }
 
 .pw-live[data-state='live'] {
-  color: var(--ae-ok);
+  color: var(--color-ok);
 }
 
 .pw-live[data-state='offline'] {
-  color: var(--ae-warn);
+  color: var(--color-warn);
 }
 
 .pw-live[data-state='idle'] {
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
 }
 
 /* type-to-search repo combobox (quick-add) */
@@ -1320,7 +1653,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   color: var(--color-ink);
 }
 
-.pw-quick-add-form .pw-combo-field .ae-icon {
+.pw-quick-add-form .pw-combo-field .pw-icon {
   color: var(--color-faint);
 }
 
@@ -1357,9 +1690,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-skel i {
   height: 5em;
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius, 4px);
-  background: var(--ae-wash);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-0, 4px);
+  background: var(--color-surface-sunken);
   opacity: 0.55;
   animation: pw-skel-pulse 1.2s ease-in-out infinite alternate;
 }
@@ -1390,7 +1723,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 /* epic hierarchy (powder-ui-hierarchy-render) */
 .pw-epic-progress {
   font-size: 13px;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
 }
 
 .pw-epic-warn {
@@ -1398,11 +1731,11 @@ html:not([data-pw-route='card']) .pw-detail-app {
   align-items: center;
   gap: 0.5em;
   margin-top: 0.6em;
-  color: var(--ae-warn);
+  color: var(--color-warn);
   font-size: 13px;
 }
 
-.pw-epic-warn .ae-icon {
+.pw-epic-warn .pw-icon {
   width: 1em;
   height: 1em;
   flex: none;
@@ -1421,7 +1754,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
    so it is reduced-motion-safe by construction rather than by a media-query
    opt-out. */
 .pw-card-live-changed {
-  outline: 2px solid var(--ae-accent);
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
 }
 
@@ -1456,9 +1789,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--ae-surface);
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
   box-shadow: 0 1.2em 3em rgba(0, 0, 0, 0.28);
 }
 
@@ -1468,14 +1801,14 @@ html:not([data-pw-route='card']) .pw-detail-app {
   align-items: center;
   gap: 0.6em;
   padding: 0.9em 1.1em;
-  border-bottom: 1px solid var(--ae-line);
+  border-bottom: 1px solid var(--color-line);
 }
 
-.pw-cmdk-combobox .ae-icon {
+.pw-cmdk-combobox .pw-icon {
   width: 1em;
   height: 1em;
   flex: none;
-  color: var(--ae-ink-muted);
+  color: var(--color-muted);
 }
 
 .pw-cmdk-input {
@@ -1485,7 +1818,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   border: 0;
   font: inherit;
   font-size: 14px;
-  color: var(--ae-ink);
+  color: var(--color-ink);
 }
 
 .pw-cmdk-input:focus-visible {
@@ -1503,7 +1836,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-cmdk-status {
   padding: 0.55em 0.7em;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   font-size: 13px;
 }
 
@@ -1512,19 +1845,19 @@ html:not([data-pw-route='card']) .pw-detail-app {
   align-items: baseline;
   gap: 0.7em;
   padding: 0.55em 0.7em;
-  border-radius: var(--ae-radius);
+  border-radius: var(--radius-0);
   font-size: 13px;
   cursor: pointer;
 }
 
 .pw-cmdk-item.is-active {
-  background: var(--ae-wash);
-  color: var(--ae-ink);
+  background: var(--color-surface-sunken);
+  color: var(--color-ink);
 }
 
 .pw-cmdk-item-id {
   flex: none;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
 }
 
 .pw-cmdk-item-source,
@@ -1533,7 +1866,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--ae-ink-faint);
+  color: var(--color-faint);
   font-size: 11px;
 }
 
@@ -1550,238 +1883,6 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-cmdk-empty {
   padding: 0.7em 1.1em;
-}
-
-.ae-cat-0 { color: var(--ae-cat-0); }
-.ae-cat-1 { color: var(--ae-cat-1); }
-.ae-cat-2 { color: var(--ae-cat-2); }
-.ae-cat-3 { color: var(--ae-cat-3); }
-.ae-cat-4 { color: var(--ae-cat-4); }
-.ae-cat-5 { color: var(--ae-cat-5); }
-.ae-cat-6 { color: var(--ae-cat-6); }
-.ae-cat-7 { color: var(--ae-cat-7); }
-
-@media (max-width: 760px) {
-  .pw-top,
-  .pw-foot,
-  .pw-filters {
-    padding-inline: 1.2rem;
-  }
-
-  .pw-main,
-  .pw-main[data-view='board'],
-  .pw-main[data-view='backlog'] {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .pw-main:not([data-view='backlog']) .pw-rail-wrap {
-    display: none;
-  }
-
-  .pw-main[data-view='backlog'] .pw-board {
-    display: none;
-  }
-
-  .pw-board {
-    grid-template-columns: repeat(3, minmax(14rem, 1fr));
-    padding-inline: 1.2rem;
-  }
-
-  .pw-auth {
-    grid-template-columns: minmax(0, 1fr);
-    padding-inline: 1.2rem;
-  }
-
-  .pw-auth-form {
-    flex-wrap: wrap;
-  }
-
-  .pw-repo-create,
-  .pw-repo-edit,
-  .pw-repo-merge {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .pw-detail-top {
-    grid-template-columns: 1fr;
-    align-items: start;
-    padding-inline: 1.2rem;
-  }
-
-  .pw-detail-top .pw-brand,
-  .pw-detail-connection {
-    justify-self: start;
-  }
-
-  .pw-detail-body {
-    width: min(100% - 2.4rem, 74rem);
-    padding-top: 1.5em;
-  }
-
-  .pw-detail-grid {
-    grid-template-columns: 1fr;
-    gap: 0;
-  }
-
-  .pw-detail-side {
-    border-left: 0;
-    padding-left: 0;
-  }
-}
-
-/* below 640px the 3-column kanban no longer has room for even two lanes
-   at a legible width (powder-930) — stack to one column and swap the
-   lane in view with an explicit switcher instead of letting the grid
-   crop columns and force horizontal panning. */
-@media (max-width: 640px) {
-  .pw-board {
-    grid-template-columns: minmax(0, 1fr);
-    overflow-x: hidden;
-  }
-
-  .pw-lane-switch {
-    display: flex;
-  }
-
-  .pw-lane {
-    display: none;
-  }
-
-  .pw-board[data-lane='ready'] .pw-lane[data-lane='ready'],
-  .pw-board[data-lane='inprogress'] .pw-lane[data-lane='inprogress'],
-  .pw-board[data-lane='done'] .pw-lane[data-lane='done'] {
-    display: flex;
-  }
-}
-
-/* the keyboard-shortcut hint is dead weight with no keyboard (powder-930):
-   coarse pointer is the touch signal, not viewport width, since a tablet
-   or a narrowed desktop window should keep the hint. Only the hint itself
-   hides -- the footer bar stays up so its home-affordance link (powder-942)
-   remains reachable on touch devices, which is exactly where it matters
-   most. */
-@media (pointer: coarse) {
-  .pw-foot-hint {
-    display: none;
-  }
-}
-
-
-/* powder-mobile-responsive-board: attachment presentation follows the existing
-   hairline/ink grammar; the thumbnail is a lazy image, while the surrounding
-   link is the full-size tap target. */
-.pw-attachments {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
-  gap: 0.8rem;
-}
-
-.pw-attachment {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 0.4rem;
-  padding: 0.45rem;
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
-  color: var(--ae-ink-muted);
-  text-decoration: none;
-}
-
-.pw-attachment:hover,
-.pw-attachment:focus-visible {
-  border-color: var(--ae-ink-muted);
-  color: var(--ae-ink);
-}
-
-.pw-attachment-img {
-  display: block;
-  width: 100%;
-  aspect-ratio: 4 / 3;
-  object-fit: cover;
-  background: var(--ae-wash);
-}
-
-.pw-attachment-img.is-unavailable {
-  opacity: 0.35;
-}
-
-.pw-attachment-caption {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--ae-font-mono);
-  font-size: 11px;
-}
-
-.pw-optional {
-  color: var(--ae-ink-faint);
-  font-size: 0.9em;
-}
-
-.pw-quick-add-attach {
-  display: flex;
-  flex-direction: column;
-  gap: var(--pw-space-1);
-}
-
-.pw-quick-add-attach input {
-  width: 100%;
-  box-sizing: border-box;
-  padding: var(--pw-space-2) var(--pw-space-3);
-  border: var(--pw-line-width) solid var(--color-line);
-  border-radius: var(--radius-0);
-  background: var(--color-surface-sunken);
-  color: var(--color-ink);
-  font: inherit;
-  font-size: var(--text-base);
-}
-
-.pw-quick-add-attachment-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--pw-space-1) var(--pw-space-3);
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  color: var(--color-muted);
-  font-size: var(--text-xs);
-}
-
-.pw-quick-add-attachment-list li {
-  display: inline-flex;
-  align-items: baseline;
-  gap: var(--pw-space-1);
-  max-width: 100%;
-  overflow-wrap: anywhere;
-}
-
-.pw-toast {
-  position: fixed;
-  z-index: 100;
-  right: max(1.2rem, env(safe-area-inset-right));
-  bottom: max(1.2rem, env(safe-area-inset-bottom));
-  max-width: min(32rem, calc(100vw - 2.4rem));
-  padding: 0.8rem 1rem;
-  border: 1px solid var(--ae-line);
-  border-radius: var(--ae-radius);
-  background: var(--ae-surface);
-  color: var(--ae-ink);
-  box-shadow: 0 0.8rem 2rem rgba(0, 0, 0, 0.18);
-  font-size: 13px;
-}
-
-.pw-toast[data-kind='warn'] {
-  border-color: var(--ae-warn);
-}
-
-.pw-toast[data-kind='ok'] {
-  border-color: var(--ae-ok);
-}
-
-.pw-toast[hidden] {
-  display: none;
 }
 
 @media (max-width: 760px) {
@@ -1848,7 +1949,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   }
 
   .pw-chip-btn,
-  .pw-chip-btn .ae-chip {
+  .pw-chip-btn .pw-chip {
     min-height: 44px;
   }
 
@@ -1862,7 +1963,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
     flex-wrap: wrap;
   }
 
-  .pw-quick-add-form .ae-input {
+  .pw-quick-add-form .pw-input {
     min-height: var(--pw-touch-target);
   }
 
@@ -1873,6 +1974,50 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
   .pw-board {
     overflow-x: hidden;
+  }
+
+  .pw-main,
+  .pw-main[data-view='board'],
+  .pw-main[data-view='backlog'] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pw-main:not([data-view='backlog']) .pw-rail-wrap {
+    display: none;
+  }
+
+  .pw-main[data-view='backlog'] .pw-board {
+    display: none;
+  }
+
+  .pw-board {
+    grid-template-columns: repeat(3, minmax(14rem, 1fr));
+    padding-inline: 1.2rem;
+  }
+
+  .pw-auth {
+    grid-template-columns: minmax(0, 1fr);
+    padding-inline: 1.2rem;
+  }
+
+  .pw-auth-form {
+    flex-wrap: wrap;
+  }
+
+  .pw-repo-create,
+  .pw-repo-edit,
+  .pw-repo-merge {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pw-detail-top {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .pw-detail-top .pw-brand,
+  .pw-detail-connection {
+    justify-self: start;
   }
 
   .pw-detail-app {
@@ -1888,13 +2033,26 @@ html:not([data-pw-route='card']) .pw-detail-app {
     width: min(100% - 2.4rem, 74rem);
     max-width: calc(100% - 2.4rem);
     overflow-wrap: anywhere;
+    padding-top: 1.5em;
+  }
+
+  .pw-detail-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .pw-detail-side {
+    border-left: 0;
+    padding-left: 0;
   }
 }
 
+/* below 640px the 3-column kanban no longer has room for even two lanes
+   at a legible width (powder-930) — stack to one column and show every
+   lane in a vertical scroll so no work is hidden behind a second
+   horizontal scroll surface. The lane switcher stays as a sticky
+   quick-jump control. */
 @media (max-width: 640px) {
-  /* Keep the existing lane tabs as a useful announcement/quick-jump control,
-     but show every lane in one vertical scroll so no work is hidden behind a
-     second horizontal scroll surface. */
   .pw-board {
     display: flex;
     flex-direction: column;
@@ -1913,7 +2071,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
     flex: none;
     margin: -0.35rem -0.2rem 0;
     padding: 0.35rem 0.2rem;
-    background: var(--ae-surface);
+    background: var(--color-surface);
   }
 
   .pw-lane {
@@ -1928,3 +2086,128 @@ html:not([data-pw-route='card']) .pw-detail-app {
     padding-bottom: 0.4rem;
   }
 }
+
+@media (pointer: coarse) {
+  .pw-foot-hint {
+    display: none;
+  }
+}
+
+
+/* powder-mobile-responsive-board: attachment presentation follows the existing
+   hairline/ink grammar; the thumbnail is a lazy image, while the surrounding
+   link is the full-size tap target. */
+.pw-attachments {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+  gap: 0.8rem;
+}
+
+.pw-attachment {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.45rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
+  color: var(--color-muted);
+  text-decoration: none;
+}
+
+.pw-attachment:hover,
+.pw-attachment:focus-visible {
+  border-color: var(--color-muted);
+  color: var(--color-ink);
+}
+
+.pw-attachment-img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  background: var(--color-surface-sunken);
+}
+
+.pw-attachment-img.is-unavailable {
+  opacity: 0.35;
+}
+
+.pw-attachment-caption {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.pw-optional {
+  color: var(--color-faint);
+  font-size: 0.9em;
+}
+
+.pw-quick-add-attach {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pw-space-1);
+}
+
+.pw-quick-add-attach input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--pw-space-2) var(--pw-space-3);
+  border: var(--pw-line-width) solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface-sunken);
+  color: var(--color-ink);
+  font: inherit;
+  font-size: var(--text-base);
+}
+
+.pw-quick-add-attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pw-space-1) var(--pw-space-3);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+}
+
+.pw-quick-add-attachment-list li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--pw-space-1);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.pw-toast {
+  position: fixed;
+  z-index: 100;
+  right: max(1.2rem, env(safe-area-inset-right));
+  bottom: max(1.2rem, env(safe-area-inset-bottom));
+  max-width: min(32rem, calc(100vw - 2.4rem));
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-0);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  box-shadow: 0 0.8rem 2rem rgba(0, 0, 0, 0.18);
+  font-size: 13px;
+}
+
+.pw-toast[data-kind='warn'] {
+  border-color: var(--color-warn);
+}
+
+.pw-toast[data-kind='ok'] {
+  border-color: var(--color-ok);
+}
+
+.pw-toast[hidden] {
+  display: none;
+}
+
