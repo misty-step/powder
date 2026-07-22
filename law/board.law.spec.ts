@@ -97,6 +97,71 @@ for (const mode of MODES) {
     await assertLaw(page, { consoleErrors: errors });
   });
 
+  test(`Ready query pagination and filter parity · ${mode}`, async ({ page }) => {
+    const readyRequests: string[] = [];
+    const firstPage = {
+      cards: [
+        { id: "ui-cycle-a", title: "Cycle A", status: "ready", priority: "p0", repo: "powder", estimate: "S", risk: "low", acceptance: ["proof"] },
+        { id: "ui-ready-middle", title: "Ready middle", status: "ready", priority: "p0", repo: "powder", estimate: "S", risk: "low", acceptance: ["proof"] },
+      ],
+      total_count: 4,
+      has_more: true,
+      next_after: "ui-cursor-1",
+      cycle_card_ids: ["ui-cycle-a"],
+    };
+    const secondPage = {
+      cards: [
+        { id: "ui-ready-last", title: "Ready last", status: "ready", priority: "p0", repo: "powder", estimate: "S", risk: "low", acceptance: ["proof"] },
+        { id: "ui-cycle-b", title: "Cycle B", status: "ready", priority: "p0", repo: "powder", estimate: "S", risk: "low", acceptance: ["proof"] },
+      ],
+      total_count: 4,
+      has_more: false,
+      next_after: null,
+      cycle_card_ids: ["ui-cycle-b"],
+    };
+    await page.route("**/api/v1/cards/ready*", async (route) => {
+      const url = new URL(route.request().url());
+      readyRequests.push(url.toString());
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(url.searchParams.has("after") ? secondPage : firstPage),
+      });
+    });
+    const created = await page.request.post("/api/v1/cards", {
+      data: {
+        id: `ui-noneligible-${mode}`,
+        title: `Noneligible status-ready ${mode}`,
+        acceptance: [],
+        status: "ready",
+        repo: "powder",
+      },
+    });
+    expect(created.ok()).toBe(true);
+    await page.addInitScript(() => {
+      sessionStorage.setItem(
+        "powder-board-state",
+        JSON.stringify({ filters: { repos: ["powder"], prios: ["p0"], estimates: ["s"], risks: ["low"] } }),
+      );
+    });
+    const errors = await boot(page, mode);
+    await expect.poll(() => readyRequests.length).toBe(2);
+    const firstUrl = new URL(readyRequests[0]);
+    expect(firstUrl.pathname).toBe("/api/v1/cards/ready");
+    expect(firstUrl.searchParams.get("repo")).toBe("powder");
+    expect(firstUrl.searchParams.get("priority")).toBe("p0");
+    expect(firstUrl.searchParams.get("estimate")).toBe("s");
+    expect(firstUrl.searchParams.get("risk")).toBe("low");
+    const secondUrl = new URL(readyRequests[1]);
+    expect(secondUrl.searchParams.get("after")).toBe("ui-cursor-1");
+    const renderedIds = async () => page.locator("#lane-ready [data-id]").evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-id")));
+    await expect.poll(renderedIds).toEqual(["ui-cycle-a", "ui-ready-middle", "ui-ready-last", "ui-cycle-b"]);
+    await expect(page.locator("#lane-ready")).toContainText("Cycle members: ui-cycle-a, ui-cycle-b");
+    await expect(page.locator("#lane-ready")).not.toContainText("Blocked card");
+    await expect(page.locator("#lane-ready")).not.toContainText(`Noneligible status-ready ${mode}`);
+    await assertLaw(page, { consoleErrors: errors });
+  });
+
   test(`board settings page · ${mode} · the law holds`, async ({ page }) => {
     const errors = await boot(page, mode);
     await page.locator("#settings-toggle").click();

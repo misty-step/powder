@@ -6,7 +6,7 @@ use powder_core::{
     parse_estimate as parse_card_estimate, parse_priority as parse_card_priority,
     parse_risk as parse_card_risk, parse_status as parse_card_status, Authority, Card, CardDetail,
     CardField, CardId, CardStatus, CardSummary, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyQuery, Risk, RunId,
+    ReadyCursor, ReadyQuery, RepositoryName, Risk, RunId,
 };
 use powder_store::{
     BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
@@ -45,7 +45,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
         description: "Scan claimable card summaries, dependency-ordered so no card appears after another card in the response it transitively blocks (ties broken by priority, age, identifier). Only true members of a blocks/blocked_by cycle lose topological ordering -- emitted as a group in tie-break order and named in cycle_card_ids (computed before limit truncation); cards downstream of a cycle stay dependency-ordered after it. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"estimate":{"type":"string","enum":["S","M","L","XL"]}}}"#,
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"repo":{"type":"string","description":"comma-separated repository allowlist"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"after":{"type":"string","description":"continuation cursor from next_after"}}}"#,
     },
     ToolDef {
         name: "list_cards",
@@ -403,13 +403,33 @@ pub fn call_tool_store(
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let repo = parse_repository_filter(args)?;
             let estimate = optional_str(args, "estimate")
                 .map(parse_estimate)
                 .transpose()?;
-            let page = store
-                .list_ready_page(ReadyQuery::new(now, limit).with_estimate(estimate))
+            let risk = optional_str(args, "risk").map(parse_risk).transpose()?;
+            let priority = optional_str(args, "priority")
+                .map(parse_priority)
+                .transpose()?;
+            let query = ReadyQuery::new(now, limit)
+                .with_repositories(repo.unwrap_or_default())
+                .with_estimate(estimate)
+                .with_risk(risk)
+                .with_priority(priority);
+            let after = optional_str(args, "after")
+                .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+                .transpose()
                 .map_err(to_string)?;
-            card_summary_page_payload(&page.cards, page.total_count, &page.cycle_card_ids)
+            let page = store
+                .list_ready_page_after(query.clone(), after.as_ref())
+                .map_err(to_string)?;
+            card_summary_page_payload(
+                &page.cards,
+                page.total_count,
+                &page.cycle_card_ids,
+                page.next_after.as_ref(),
+                Some(&query),
+            )
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -826,9 +846,11 @@ fn card_summary_page_payload(
     cards: &[Card],
     total_count: usize,
     cycle_card_ids: &[CardId],
+    next_after: Option<&CardId>,
+    cursor_query: Option<&ReadyQuery>,
 ) -> Value {
     let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
-    let has_more = total_count > summaries.len();
+    let has_more = next_after.is_some();
     let mut payload = json!({
         "cards": summaries,
         "total_count": total_count,
@@ -846,6 +868,12 @@ fn card_summary_page_payload(
     // unchanged.
     if !cycle_card_ids.is_empty() {
         payload["cycle_card_ids"] = json!(cycle_card_ids);
+    }
+    if let Some(next_after) = next_after {
+        payload["next_after"] = match cursor_query {
+            Some(query) => json!(ReadyCursor::for_query(query, next_after.clone()).encode()),
+            None => json!(next_after),
+        };
     }
     payload
 }
@@ -1155,6 +1183,21 @@ fn string_array(args: &Value, key: &'static str) -> Result<Vec<String>, String> 
                 .collect()
         })
         .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn parse_repository_filter(args: &Value) -> Result<Option<Vec<RepositoryName>>, String> {
+    optional_str(args, "repo")
+        .map(|raw| {
+            if raw.trim().is_empty() {
+                return Err("repo must contain at least one repository".to_string());
+            }
+            raw.split(',')
+                .map(str::trim)
+                .map(RepositoryName::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(to_string)
+        })
+        .transpose()
 }
 
 fn optional_string_array(args: &Value, key: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -3119,6 +3162,46 @@ mod tests {
             .collect::<Vec<_>>();
         cycle_ids.sort();
         assert_eq!(cycle_ids, vec!["cycle-x", "cycle-y"]);
+    }
+
+    #[test]
+    fn mcp_list_ready_filters_and_continues_with_lossless_metadata() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        for (id, repo, created_at) in [
+            ("mcp-filter-1", "repo-a", 1),
+            ("mcp-filter-2", "repo-a", 2),
+            ("mcp-filter-other", "repo-b", 3),
+        ] {
+            let mut card = seeded_card(id, id, CardStatus::Ready, created_at)
+                .with_priority(Priority::P0)
+                .with_estimate(Some(Estimate::S))
+                .with_risk(Some(Risk::Low));
+            card.repo = Some(repo.to_string());
+            store.import_cards(vec![card]).unwrap();
+        }
+        let first = call_tool_store(
+            &mut store,
+            "list_ready",
+            &json!({"limit": 1, "repo": "repo-a,repo-b", "estimate": "S", "risk": "low", "priority": "P0"}),
+            10,
+        )
+        .unwrap();
+        let first = tool_payload(&first);
+        assert_eq!(first["total_count"], 3);
+        assert_eq!(first["cards"][0]["id"], "mcp-filter-1");
+        assert_eq!(first["has_more"], true);
+        let after = first["next_after"].as_str().unwrap().to_string();
+        let second = call_tool_store(
+            &mut store,
+            "list_ready",
+            &json!({"limit": 1, "repo": "repo-a,repo-b", "estimate": "S", "risk": "low", "priority": "P0", "after": after}),
+            10,
+        )
+        .unwrap();
+        let second = tool_payload(&second);
+        assert_eq!(second["cards"][0]["id"], "mcp-filter-2");
+        assert!(second["next_after"].as_str().is_some());
     }
 
     #[test]

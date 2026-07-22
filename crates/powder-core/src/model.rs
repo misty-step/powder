@@ -93,6 +93,14 @@ impl Authority {
         }
     }
 
+    pub fn role(&self) -> &'static str {
+        match self {
+            Self::Unchecked => "unchecked",
+            Self::Principal { is_admin: true, .. } => "admin",
+            Self::Principal { is_admin: false, .. } => "agent",
+        }
+    }
+
     /// A non-admin actor may only act using their own identity string
     /// (guards fields like `claim.agent` or `answer.actor` that a caller
     /// supplies directly).

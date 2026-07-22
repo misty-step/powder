@@ -104,6 +104,8 @@ const els = {
   repoFilters: document.getElementById("fg-repo"),
   tierToggle: document.getElementById("tier-toggle"),
   prioFilters: document.getElementById("fg-prio"),
+  estimateFilters: null,
+  riskFilters: null,
   repoAll: document.getElementById("repo-all"),
   filterClear: document.getElementById("filter-clear"),
   textFilter: document.getElementById("text-filter"),
@@ -146,6 +148,8 @@ const state = {
   // statuses' card-list fetch failed so only that display lane renders an
   // inline notice instead of its cards -- see fetchBoardData/render.
   statsTotals: {},
+  readyCards: [],
+  readyMeta: { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null },
   cardFetchErrors: {},
   detailCache: new Map(),
   selectedId: null,
@@ -164,6 +168,8 @@ const state = {
   filters: {
     repos: new Set(),
     prios: new Set(),
+    estimates: new Set(),
+    risks: new Set(),
     search: "",
     sort: "repo",
   },
@@ -174,6 +180,7 @@ let quickAddFiles = [];
 let toastTimer = null;
 let silentRetryTimer = null;
 let statusChangeSeq = 0;
+let readyRequestSeq = 0;
 const pendingOptimisticIds = new Set();
 const BOARD_CACHE_VERSION = 1;
 const BOARD_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -229,14 +236,69 @@ async function apiJson(path, options = {}) {
   return response.json();
 }
 
-function listPageCards(data, label) {
-  const cards = Array.isArray(data.cards) ? data.cards : [];
-  if (data.has_more) {
-    const total =
-      typeof data.total_count === "number" ? data.total_count : "more than one page";
-    throw new Error(`${label} list truncated at ${cards.length} of ${total}`);
+async function drainListPages(path, label) {
+  const cardsById = new Map();
+  const cycleCardIds = new Set();
+  let after = null;
+  let first = null;
+  for (;;) {
+    const separator = path.includes("?") ? "&" : "?";
+    const data = await apiJson(after ? `${path}${separator}after=${encodeURIComponent(after)}` : path);
+    first ||= data;
+    if (Array.isArray(data.cards)) {
+      for (const card of data.cards) {
+        if (card && card.id && !cardsById.has(card.id)) cardsById.set(card.id, card);
+      }
+    }
+    for (const cardId of data.cycle_card_ids || []) cycleCardIds.add(cardId);
+    if (!data.has_more) {
+      return {
+        cards: [...cardsById.values()],
+        metadata: {
+          ...(first || {}),
+          total_count: Number(first?.total_count ?? cardsById.size),
+          cycle_card_ids: [...cycleCardIds],
+          has_more: false,
+          next_after: null,
+        },
+      };
+    }
+    if (typeof data.next_after !== "string" || !data.next_after) {
+      throw new Error(`${label} page says has_more without next_after`);
+    }
+    after = data.next_after;
   }
-  return cards;
+}
+
+async function drainReadyPages() {
+  const params = new URLSearchParams({ limit: String(PAGE_LIMIT) });
+  if (state.filters.repos.size) params.set("repo", [...state.filters.repos].join(","));
+  if (state.filters.prios.size === 1) params.set("priority", [...state.filters.prios][0]);
+  if (state.filters.estimates.size === 1) params.set("estimate", [...state.filters.estimates][0]);
+  if (state.filters.risks.size === 1) params.set("risk", [...state.filters.risks][0]);
+  const result = await drainListPages(`/api/v1/cards/ready?${params}`, "ready");
+  return { cards: result.cards, metadata: result.metadata };
+}
+
+
+async function refreshReadyForFilters() {
+  const request = ++readyRequestSeq;
+  try {
+    const result = await drainReadyPages();
+    if (request !== readyRequestSeq) return;
+    state.readyCards = dedupeCards(result.cards).map(normalizeCard);
+    state.readyMeta = result.metadata;
+    if (state.cardFetchErrors.ready) {
+      delete state.cardFetchErrors.ready;
+    }
+    render();
+  } catch (error) {
+    if (request !== readyRequestSeq) return;
+    state.cardFetchErrors.ready = error.message || String(error);
+    state.readyCards = [];
+    state.readyMeta = { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null };
+    render();
+  }
 }
 
 function groupedSearchMatches(matches) {
@@ -463,13 +525,14 @@ function renderHomeLink(homeUrl) {
 // lane header count unconditionally, decoupled from whether that lane's
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
-  const [results, repositoryData, statsTotals] = await Promise.all([
+  const [results, readyResult, repositoryData, statsTotals] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
-        const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
-        return listPageCards(data, status);
+        const result = await drainListPages(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`, status);
+        return result.cards;
       }),
     ),
+    drainReadyPages().catch((error) => ({ error })),
     apiJson("/api/v1/repositories?include_hidden=true"),
     fetchBoardStats(),
   ]);
@@ -484,9 +547,12 @@ async function fetchBoardData() {
       cardFetchErrors[status] = result.reason?.message || String(result.reason);
     }
   });
+  if (readyResult.error) cardFetchErrors.ready = readyResult.error.message || String(readyResult.error);
 
   return {
     cards: dedupeCards(cardGroups.flat()).map(normalizeCard),
+    readyCards: readyResult.error ? [] : readyResult.cards.map(normalizeCard),
+    readyMeta: readyResult.error ? { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null } : readyResult.metadata,
     repositories: normalizeRepositories(repositoryData.repositories || []),
     statsTotals,
     cardFetchErrors,
@@ -521,8 +587,11 @@ async function loadBoard(options = {}) {
   }
   try {
     await loadOnboarding();
+    const request = ++readyRequestSeq;
     const data = await fetchBoardData();
     state.cards = mergePendingOptimistic(data.cards);
+    if (request === readyRequestSeq) state.readyCards = data.readyCards || [];
+    if (request === readyRequestSeq) state.readyMeta = data.readyMeta || { total_count: 0, cycle_card_ids: [] };
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
@@ -625,9 +694,12 @@ function mergePendingOptimistic(cards) {
 // state already communicates connectivity trouble.
 async function refreshLive() {
   try {
+    const request = ++readyRequestSeq;
     const data = await fetchBoardData();
     const changed = changedCardIds(state.cards, data.cards);
     state.cards = mergePendingOptimistic(data.cards);
+    if (request === readyRequestSeq) state.readyCards = data.readyCards || [];
+    if (request === readyRequestSeq) state.readyMeta = data.readyMeta || { total_count: 0, cycle_card_ids: [] };
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
@@ -1157,7 +1229,70 @@ function repoIcon(repo, extraClass = "") {
   return `<svg class="${className}" aria-hidden="true"><use href="#${meta.icon}"></use></svg>`;
 }
 
+function ensureReadyFacetFilters() {
+  if (!els.prioFilters?.parentElement) return;
+  if (!els.estimateFilters) {
+    const group = document.createElement("span");
+    group.className = "pw-filter-group";
+    group.id = "fg-estimate";
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", "filter by estimate");
+    group.innerHTML = `<span class="ae-plate-cap">ESTIMATE</span>`;
+    els.prioFilters.parentElement.insertBefore(group, els.prioFilters.nextSibling);
+    els.estimateFilters = group;
+  }
+  if (!els.riskFilters) {
+    const group = document.createElement("span");
+    group.className = "pw-filter-group";
+    group.id = "fg-risk";
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", "filter by risk");
+    group.innerHTML = `<span class="ae-plate-cap">RISK</span>`;
+    els.estimateFilters.parentElement.insertBefore(group, els.estimateFilters.nextSibling);
+    els.riskFilters = group;
+  }
+}
+
+function renderReadyFacet(group, key, values, label) {
+  if (!group) return;
+  group.querySelectorAll(".pw-chip-btn").forEach((node) => node.remove());
+  const allChip = document.createElement("button");
+  allChip.className = "pw-chip-btn";
+  allChip.type = "button";
+  allChip.dataset[`${key}AllChip`] = "true";
+  allChip.setAttribute("aria-pressed", String(state.filters[key].size === 0));
+  allChip.innerHTML = `<span class="ae-chip">all ${escapeHtml(label)}</span>`;
+  allChip.addEventListener("click", () => {
+    state.filters[key].clear();
+    buildFilters();
+    render();
+    void refreshReadyForFilters();
+  });
+  group.appendChild(allChip);
+  for (const value of values) {
+    const button = document.createElement("button");
+    button.className = "pw-chip-btn";
+    button.type = "button";
+    button.dataset[key] = value;
+    button.setAttribute("aria-pressed", String(state.filters[key].has(value)));
+    button.innerHTML = `<span class="ae-chip">${escapeHtml(value)}</span>`;
+    button.addEventListener("click", () => {
+      if (state.filters[key].has(value)) state.filters[key].clear();
+      else {
+        state.filters[key].clear();
+        state.filters[key].add(value);
+      }
+      buildFilters();
+      render();
+    });
+    group.appendChild(button);
+  }
+}
+
+const READY_ESTIMATES = ["s", "m", "l", "xl"];
+const READY_RISKS = ["low", "medium", "high"];
 function buildFilters() {
+  ensureReadyFacetFilters();
   renderTierToggle();
   const repositories = state.repositories.length ? state.repositories : deriveRepositoriesFromCards();
   const visibleRepositorySet = new Set(
@@ -1168,7 +1303,7 @@ function buildFilters() {
   const hasRepositoryScope = repositories.length > 0;
   const repos = [
     ...new Set(
-      state.cards
+      [...state.cards, ...state.readyCards]
         .filter((card) => !card.explicitRepo || !hasRepositoryScope || visibleRepositorySet.has(card.repoKey))
         .map((card) => card.repoKey),
     ),
@@ -1180,6 +1315,12 @@ function buildFilters() {
   const existingRepos = new Set(repos);
   state.filters.repos = new Set(
     [...state.filters.repos].filter((repo) => existingRepos.has(repo)),
+  );
+  state.filters.estimates = new Set(
+    [...state.filters.estimates].filter((value) => READY_ESTIMATES.includes(value)),
+  );
+  state.filters.risks = new Set(
+    [...state.filters.risks].filter((value) => READY_RISKS.includes(value)),
   );
 
   els.repoFilters.querySelectorAll(".pw-chip-btn").forEach((node) => node.remove());
@@ -1193,6 +1334,7 @@ function buildFilters() {
     state.filters.repos.clear();
     buildFilters();
     render();
+    void refreshReadyForFilters();
   });
   els.repoFilters.appendChild(allChip);
 
@@ -1222,13 +1364,18 @@ function buildFilters() {
     button.setAttribute("aria-pressed", String(state.filters.prios.has(prio)));
     button.innerHTML = `<span class="ae-chip">${escapeHtml(prio)}</span>`;
     button.addEventListener("click", () => {
-      if (state.filters.prios.has(prio)) state.filters.prios.delete(prio);
-      else state.filters.prios.add(prio);
+      if (state.filters.prios.has(prio)) state.filters.prios.clear();
+      else {
+        state.filters.prios.clear();
+        state.filters.prios.add(prio);
+      }
       buildFilters();
       render();
     });
     els.prioFilters.appendChild(button);
   }
+  renderReadyFacet(els.estimateFilters, "estimates", READY_ESTIMATES, "estimates");
+  renderReadyFacet(els.riskFilters, "risks", READY_RISKS, "risks");
 }
 
 function repositoryPassesScope(summary) {
@@ -1247,7 +1394,7 @@ function repoPassesScope(repo) {
 }
 
 function renderTierToggle() {
-  els.tierToggle.textContent = state.showAllTiers ? "all tiers" : "active only";
+  els.tierToggle.textContent = state.showAllTiers ? "all repository tiers" : "active repository view";
   els.tierToggle.setAttribute("aria-pressed", String(state.showAllTiers));
 }
 
@@ -1573,11 +1720,39 @@ function cleanPriority(priority) {
   return String(priority || "p2").toLowerCase();
 }
 
+function passesReady(card) {
+  // /cards/ready is already filtered by repository, priority, estimate, and
+  // risk at the canonical query seam. Never apply display-tier or status
+  // rules here: expired-claim in_progress/awaiting_input cards remain valid
+  // Ready admissions, and repository tier is presentation metadata only.
+  const query = state.filters.search.trim().toLowerCase();
+  if (!query) return true;
+  const haystack = [
+    card.id,
+    card.title,
+    card.body,
+    card.priority,
+    card.status,
+    card.repo,
+    card.source?.path,
+    ...(card.related || []),
+    ...(card.blocks || []),
+    ...(card.blocked_by || []),
+    ...(card.labels || []),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(query);
+}
+
 function passes(card) {
-  if (card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
+  if (card.displayStatus !== "ready" && card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
   if (state.filters.repos.size && !state.filters.repos.has(card.repoKey)) return false;
   if (state.filters.prios.size && !state.filters.prios.has(cleanPriority(card.priority))) return false;
-  const query = state.filters.search.trim();
+  if (state.filters.estimates.size && !state.filters.estimates.has(String(card.estimate || "").toLowerCase())) return false;
+  if (state.filters.risks.size && !state.filters.risks.has(String(card.risk || "").toLowerCase())) return false;
+  const query = state.filters.search.trim().toLowerCase();
   if (!query) return true;
   return groupedSearchMatches(state.searchMatches).some((match) => match.card.id === card.id);
 }
@@ -1641,11 +1816,9 @@ function bucket() {
   for (const card of sourceCards) cardsById.set(card.id, card);
   return {
     backlog: sorted(visible.filter((card) => card.displayStatus === "backlog")),
-    ready: sorted(
-      visible.filter(
-        (card) => card.displayStatus === "ready" && !hasUnresolvedBlocker(card, cardsById),
-      ),
-    ),
+    // Ready admission comes from the server typed /cards/ready query. Keep
+    // its topological order; status=ready is used only for blocked presentation.
+    ready: state.readyCards.filter(passesReady),
     blocked: sorted(
       visible.filter(
         (card) => card.displayStatus === "ready" && hasUnresolvedBlocker(card, cardsById),
@@ -1668,6 +1841,8 @@ function activeFilterDescriptors() {
   const parts = [];
   for (const repo of [...state.filters.repos].sort()) parts.push(`repo:${repo}`);
   for (const prio of [...state.filters.prios].sort()) parts.push(prio);
+  for (const estimate of [...state.filters.estimates].sort()) parts.push(`estimate:${estimate}`);
+  for (const risk of [...state.filters.risks].sort()) parts.push(`risk:${risk}`);
   const search = state.filters.search.trim();
   if (search) parts.push(`"${search}"`);
   return parts;
@@ -1743,6 +1918,12 @@ function laneStatTotal(displayLaneName) {
   return 0;
 }
 
+function readyDiagnosticsHTML() {
+  const cycleIds = state.readyMeta?.cycle_card_ids || [];
+  if (!cycleIds.length) return "";
+  return "<p class=\"ae-chrome pw-ready-diagnostic\">Cycle members: " + cycleIds.map((id) => escapeHtml(id)).join(", ") + "</p>";
+}
+
 function render() {
   if (state.loading) {
     renderLoading();
@@ -1758,10 +1939,8 @@ function render() {
   const failedLanes = failedDisplayLanes();
   els.laneReady.innerHTML = failedLanes.has("ready")
     ? laneFailureHTML("ready")
-    : (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true)) +
-      (buckets.blocked.length
-        ? `<p class="ae-plate-cap pw-blocked-cap">BLOCKED · ${buckets.blocked.length}</p>${buckets.blocked.map(cardHTML).join("")}`
-        : "");
+    : readyDiagnosticsHTML() +
+      (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true));
   els.laneInProgress.innerHTML = failedLanes.has("in_progress")
     ? laneFailureHTML("in_progress")
     : buckets.inProgress.map(cardHTML).join("") || boardEmptyCopy("in flight");
@@ -1834,13 +2013,14 @@ function renderCounts(buckets) {
   // (it isn't a real status) and naturally reads 0 when the ready fetch
   // itself failed, since no ready-status cards would be present.
   els.backlogCount.textContent = laneStatTotal("backlog");
-  els.readyCount.textContent =
-    laneStatTotal("ready") + (buckets.blocked.length ? ` + ${buckets.blocked.length}` : "");
+  els.readyCount.textContent = laneStatTotal("ready");
   els.inProgressCount.textContent = laneStatTotal("in_progress");
   els.doneCount.textContent = laneStatTotal("done");
   const activeFilterCount =
     state.filters.repos.size +
     state.filters.prios.size +
+    state.filters.estimates.size +
+    state.filters.risks.size +
     (state.filters.search.trim() ? 1 : 0) +
     (state.showAllTiers ? 1 : 0);
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
@@ -1859,6 +2039,8 @@ function saveBoardState() {
         filters: {
           repos: [...state.filters.repos],
           prios: [...state.filters.prios],
+          estimates: [...state.filters.estimates],
+          risks: [...state.filters.risks],
           search: state.filters.search,
           sort: state.filters.sort,
         },
@@ -1883,6 +2065,8 @@ function restoreBoardState() {
     const filters = saved.filters || {};
     state.filters.repos = new Set(Array.isArray(filters.repos) ? filters.repos : []);
     state.filters.prios = new Set(Array.isArray(filters.prios) ? filters.prios : []);
+    state.filters.estimates = new Set(Array.isArray(filters.estimates) ? filters.estimates : []);
+    state.filters.risks = new Set(Array.isArray(filters.risks) ? filters.risks : []);
     state.filters.search = String(filters.search || "");
     state.filters.sort = ["repo", "prio", "id"].includes(filters.sort) ? filters.sort : "repo";
     els.textFilter.value = state.filters.search;
@@ -2683,10 +2867,13 @@ els.repoAll.addEventListener("click", () => {
   state.filters.repos.clear();
   buildFilters();
   render();
+  void refreshReadyForFilters();
 });
 els.filterClear.addEventListener("click", () => {
   state.filters.repos.clear();
   state.filters.prios.clear();
+  state.filters.estimates.clear();
+  state.filters.risks.clear();
   state.filters.search = "";
   state.searchMatches = [];
   state.searchError = "";
@@ -2698,6 +2885,8 @@ els.filterClear.addEventListener("click", () => {
   els.textFilter.value = "";
   buildFilters();
   scheduleTextSearch("");
+  render();
+  void refreshReadyForFilters();
 });
 els.tierToggle.addEventListener("click", () => {
   state.showAllTiers = !state.showAllTiers;

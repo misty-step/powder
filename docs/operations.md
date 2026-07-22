@@ -79,7 +79,7 @@ never an error.
 
 | Command | `--db` transport | Remote env transport | Output shape |
 | --- | --- | --- | --- |
-| `list-ready` | SQLite query | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
+| `list-ready` | SQLite query | `GET /api/v1/cards/ready` | TSV for humans; `--json` returns lossless `{cards,total_count,has_more,next_after?,cycle_card_ids?}` |
 | `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\ttitle` or `no-cards` |
 | `board-rollups --json` | SQLite aggregate query | `GET /api/v1/board/rollups` | Pretty JSON `{rollups,total_count,has_more,next_after?,coverage}` |
 | `search --json` | SQLite FTS query | `GET /api/v1/cards/search` | `{matches,total_count,has_more,next_after?}` JSON |
@@ -253,11 +253,7 @@ profiles:
 
 ## Paging `/api/v1/cards` and `/api/v1/cards/ready` beyond `limit` (powder-cards-api-paged-continuation)
 
-Both list routes cap a single response to `limit` cards (default 20).
-Historically that was a hard wall: a caller could only ever see the first
-`limit` cards of the response's own order, with no way to reach the rest
-short of raising `limit` arbitrarily high. An optional `after` query param
-now lets a caller resume past a prior response instead:
+Both list routes cap one response to `limit` cards (default 20). Repeat the request with the returned `next_after` until that field is absent:
 
 ```
 GET /api/v1/cards?limit=20
@@ -265,40 +261,11 @@ GET /api/v1/cards?limit=20&after=<next_after-from-the-previous-response>
 GET /api/v1/cards/ready?limit=20&after=<next_after-from-the-previous-response>
 ```
 
-Each response includes `next_after` -- the card id to pass as `after` on
-the following request -- whenever more cards remain beyond the page just
-returned; it is omitted once a caller has reached the end. Omitting `after`
-entirely reproduces the historical first-page response byte-for-byte (same
-cards, same order, same `has_more`) -- `after`/`next_after` are purely
-additive, so every existing caller (the CLI's `list-cards`/`list-ready`,
-`powder-mcp`'s `list_cards`/`list_ready` tools, and any script that never
-sends `after`) is unaffected.
+The plain `/api/v1/cards` route keeps its historical card-id continuation. The Ready route returns an opaque `v1` token containing a query-filter fingerprint and an encoded anchor; never manufacture or edit it. Ready `repo` is a comma-separated typed allowlist parsed at the HTTP face, while `estimate`, `risk`, and `priority` use canonical enum values. A token sent with different filters returns the same stable `400 Bad Request` validation error, so restart the query.
 
-**Read this as an interim continuation, not scale-proof pagination.** Both
-routes still do a full, unfiltered table scan and rebuild the entire
-filtered/sorted (or, for `/ready`, topologically-ordered) list in memory on
-*every* call, `after` or not -- `after` only tells that freshly-recomputed
-list where to resume slicing, so it bounds response *payload size*, not
-per-request DB/CPU cost. `after` also has no special resilience to
-concurrent writes between page fetches: it names a specific card id and
-resumes strictly after that id's position in whatever the list looks like
-*at the moment of the follow-up call*. If that id is no longer part of the
-eligible set -- deleted, filtered out by different query params than the
-prior call used, or (for `/ready`) gone ineligible since -- the request
-fails with `400 Bad Request` naming the stale token, rather than silently
-resuming from the start or skipping cards. The separate,
-deliberately-deferred `powder-store-sql-pushed-list-filtering` card is what
-pushes the filtering and ordering into SQL and actually bounds the
-per-request cost on a large board; until that lands, `after` only helps you
-reach cards beyond `limit`, it does not make a large board cheaper to page
-through.
+Every Ready page preserves server-owned eligibility, dependency order, and full-set `cycle_card_ids` metadata. `next_after` presence is authoritative while draining. A concurrent departure or insertion that is not the anchor does not duplicate or omit an already-ordered card; a missing or newly ineligible anchor returns the stable stale-cursor error instead of silently restarting. The server owns the eligibility clock; clients must not send `now`.
 
-`has_more` keeps its historical meaning (it compares `total_count` against
-*this* page's size) and was never position-aware across pages -- it only
-ever gives a correct "more exists" answer on a request with no `after`.
-Once you're walking pages with `after`, use `next_after`'s presence or
-absence to decide whether to keep going.
-
+Both routes still rebuild their filtered list in memory for each call. Continuation bounds response payload size, not per-request DB/CPU cost. The separate SQL-pushed filtering work remains deferred.
 ## Self-Hosting
 
 For the copy-pasteable quickstart (Docker, release binary, bare-host +
@@ -310,7 +277,7 @@ Powder follows the Canary-style deployment pattern:
 
 - one Rust service image
 - SQLite database at `POWDER_DB_PATH`
-- dual-stack/private-Fly listener at `POWDER_BIND_ADDR`
+- loopback listener by default; set `POWDER_BIND_ADDR` explicitly only when the perimeter and auth mode justify it
 - Fly volume mounted at `/data`
 - optional Litestream replication to Fly Tigris
 - `/healthz`, `/readyz`, and `/api/v1/onboarding`
@@ -318,8 +285,7 @@ Powder follows the Canary-style deployment pattern:
 - change webhooks configured at runtime via `POST /api/v1/events/subscriptions`
   (`powder subscription-create`), not an env var -- see
   [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks)
-- first-run bootstrap API key, printed once unless
-  `POWDER_DISCLOSE_BOOTSTRAP_KEY=false`
+- first-run bootstrap API key delivered only through the explicit 0600 `POWDER_BOOTSTRAP_KEY_FILE` channel or pre-start `powder init-db --show-secret`; it is never logged
 
 Local setup (there is no dotenv loader -- `cp .env.example .env` alone does
 nothing until the file is loaded into the process environment):
@@ -353,18 +319,7 @@ only as safe as the ingress in front of `powder-server`: the proxy must
   verified tailnet peer identity (e.g. Tailscale Serve's own
   `Tailscale-User-Login`), never copied from request-supplied data.
 
-`powder-server` cannot independently verify a header its process boundary
-receives came from that proxy rather than a client that reached it directly
-(a misrouted request, a bypassed ingress, a proxy misconfiguration). Set
-`POWDER_TAILNET_PROXY_SECRET` to add an in-code backstop for that gap: when
-set, every `tailscale-header`-mode request must also carry a matching
-`X-Powder-Proxy-Secret` header (compared in constant time), and requests
-missing it or carrying the wrong value are rejected with `401` before the
-identity header is even consulted. Configure the trusted proxy to set this
-header on every request it forwards, from a value only it and
-`powder-server` know. Leaving it unset preserves the original behavior
-(any request with a trusted identity header is authorized) -- exactly as
-before this backstop existed.
+The process cannot prove that an identity header came from a proxy unless the proxy also supplies `X-Powder-Proxy-Secret`. Configure `POWDER_TAILNET_PROXY_SECRET` for that shared secret. Every identity-header request then needs the matching value, compared in constant time; missing or wrong values receive `401`. A non-loopback `tailscale-header` bind refuses startup without this secret. A loopback bind may start without it, but identity headers still never authenticate; use the bearer-token fallback for explicit local recovery.
 
 **Bearer-token fallback for callers that never reach the identity header
 (powder-tailnet-bearer-fallback).** A request self-originated from the box
@@ -381,15 +336,7 @@ is on the request at all. `authorize_read` shares the same `authorize()`
 call for both modes' checks, so this fallback covers reads and writes
 identically.
 
-`POWDER_TAILNET_ADMIN` controls the scope granted to a `tailscale-header`
-identity. Default (unset, or explicit `true`): every authenticated tailnet
-identity gets `admin` scope, matching the mode's original all-admin
-behavior -- no config change means no behavior change. Set
-`POWDER_TAILNET_ADMIN=false` once a deployment fronts multiple tailnet users
-who should not all hold `admin` (repository management, key management,
-bulk import): tailnet-authenticated callers still authenticate and can use
-claim-scoped routes, but `require_admin`-gated routes reject them with
-`403`.
+Tailnet identities are ordinary non-admin actors by default. Set `POWDER_TAILNET_ADMIN_PRINCIPALS` to a comma-separated exact identity allowlist for admin routes; wildcard or global grants are rejected, so shared tailnets remain fail-closed.
 
 **Fail-closed read posture (powder-public-read-posture, 2026-07-15):**
 `api-key` mode now requires a valid bearer key for every read route by
@@ -481,11 +428,7 @@ than the checked-in `powder` Fly app; verify the active deployment with
 [`docs/production-deploy.md`](production-deploy.md) for exactly where
 that instance runs, how a merged PR here actually reaches it, and this app's
 disposition (destroyed 2026-07-07 -- `fly.toml`'s header explains why and
-prevents accidentally re-creating it as a decoy). The Fly profile redacts the
-first bootstrap key
-in logs; create an operator-held key over SSH with `powder key-create --db
-/data/powder.db --name operator --scope admin --show-secret` and store it in
-a secret manager.
+prevents accidentally re-creating it as a decoy). The server never logs the first bootstrap key. Use `POWDER_BOOTSTRAP_KEY_FILE` with a mode-0600 path or pre-seed with `powder init-db --db /data/powder.db --show-secret`; store the key immediately, remove the file, and rotate/revoke it after minting the operator-held key.
 
 Set `POWDER_HOME_URL` (unset by default) to render a plain text link back to
 that URL in the board's always-visible chrome -- for a deployment fronted by

@@ -76,7 +76,21 @@ pub struct ApiKeySummary {
 }
 
 impl Store {
-    pub fn apply_initial_seed(&mut self, now: i64) -> Result<Option<ApiKeyCreated>> {
+    /// Seed the first admin key while an external one-shot disclosure is prepared.
+    ///
+    /// The prepare callback runs after the key and seed marker are staged in the
+    /// open transaction but before commit. If preparation or commit fails,
+    /// cleanup is called so a file cannot outlive the database transaction.
+    pub fn apply_initial_seed_with<Prepare, Cleanup>(
+        &mut self,
+        now: i64,
+        prepare: Prepare,
+        cleanup: Cleanup,
+    ) -> Result<Option<ApiKeyCreated>>
+    where
+        Prepare: FnOnce(&ApiKeyCreated) -> Result<()>,
+        Cleanup: Fn(&ApiKeyCreated),
+    {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -100,8 +114,38 @@ impl Store {
             "INSERT INTO seed_runs (seed_name, applied_at) VALUES (?1, ?2)",
             params![BOOTSTRAP_SEED, now],
         )?;
-        transaction.commit()?;
+
+        if let Err(error) = prepare(&key) {
+            cleanup(&key);
+            return Err(error);
+        }
+
+        if let Err(error) = transaction.commit() {
+            cleanup(&key);
+            return Err(error.into());
+        }
         Ok(Some(key))
+    }
+
+    pub fn initial_seed_applied(&self) -> Result<bool> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT 1 FROM seed_runs WHERE seed_name = ?1 LIMIT 1",
+                [BOOTSTRAP_SEED],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Seed the first admin key without an external disclosure step.
+    ///
+    /// This is retained for explicit callers such as the CLI, which owns its
+    /// terminal disclosure policy. The server uses the prepare/commit seam
+    /// above so its file disclosure and database commit share one protocol.
+    pub fn apply_initial_seed(&mut self, now: i64) -> Result<Option<ApiKeyCreated>> {
+        self.apply_initial_seed_with(now, |_| Ok(()), |_| {})
     }
 
     pub fn create_api_key(

@@ -54,11 +54,11 @@ sweep with `list_cards label:papercut` (MCP) or
 
 Default agent persona (23 tools):
 
-- `list_ready`: return claimable cards from active repositories, ordered so
+- `list_ready`: return claimable cards from registered repositories, ordered so
   no card appears after another card in the response it transitively
   blocks (topological over `blocks`/`blocked_by` among the returned set),
   ties broken by priority, age, and identifier; optionally filtered by
-  `estimate` (`S`/`M`/`L`/`XL`). Eligibility itself stays direct-blocker-only
+  `repo` (comma-separated allowlist), `estimate` (`S`/`M`/`L`/`XL`), `risk` (`low`/`medium`/`high`), and `priority` (`P0`..`P3`). Each page returns `total_count`, position-aware `has_more`, `next_after`, and cycle diagnostics. A stale continuation token returns a stable validation error; restart the query. The optional repository allowlist is a loop-supplied policy input; tier and visibility remain metadata and do not gate Ready admission. The server owns the eligibility clock; do not send a client `now`. Eligibility itself stays direct-blocker-only
   (unchanged). Only the true members of a `blocks`/`blocked_by` cycle lose
   topological ordering: they are emitted as a group in the tie-break order
   at the cycle's own position and named in an additive `cycle_card_ids`

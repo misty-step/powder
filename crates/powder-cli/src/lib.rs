@@ -4,7 +4,8 @@ use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
     normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
     parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
-    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyQuery, Risk, RunId,
+    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyCursor, ReadyQuery,
+    RepositoryName, Risk, RunId,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
@@ -274,7 +275,7 @@ pub fn help() -> String {
     help.push_str(
         "  powder repair-criteria ./backlog.d --db ./data/powder.db --repo misty-step/sploot --apply --actor operator\n",
     );
-    help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
+    help.push_str("  powder list-ready --db ./data/powder.db --limit 10 [--repo repo-a,repo-b] [--estimate S] [--risk low] [--priority P0] [--after cursor] [--json]\n");
     help.push_str(
         "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary [--proof-plan \"CI + PR\"]\n",
     );
@@ -869,28 +870,72 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
 fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
     let now = unix_now();
+    let repo_raw = flag_value(args, "--repo").map(str::to_string);
+    let repo = repo_raw
+        .as_deref()
+        .map(parse_repository_filter)
+        .transpose()?;
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
-    let query = ReadyQuery::new(now, limit).with_estimate(estimate);
+    let risk = flag_value(args, "--risk")
+        .map(parse_risk_flag)
+        .transpose()?;
+    let priority = flag_value(args, "--priority")
+        .map(parse_priority_flag)
+        .transpose()?;
+    let after_raw = flag_value(args, "--after").map(str::to_string);
+    let query = ReadyQuery::new(now, limit)
+        .with_repositories(repo.unwrap_or_default())
+        .with_estimate(estimate)
+        .with_risk(risk)
+        .with_priority(priority);
+    let after = after_raw
+        .as_deref()
+        .map(|raw| {
+            ReadyCursor::decode_for_query(raw, &query)
+                .map_err(|err| ShellError::Invalid(err.to_string()))
+        })
+        .transpose()?;
     let ready = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
-        json!(store.list_ready(query).map_err(store_err)?)
+        let page = store
+            .list_ready_page_after(query.clone(), after.as_ref())
+            .map_err(store_err)?;
+        ready_page_json(&page, &query)
     } else if let Some(client) = remote_env.client() {
         let mut url = format!("/api/v1/cards/ready?limit={limit}");
+        if let Some(repo) = repo_raw {
+            url.push_str(&format!("&repo={}", urlencode(&repo)));
+        }
         if let Some(estimate) = estimate {
             url.push_str(&format!("&estimate={}", estimate.as_str()));
         }
-        let page = client.get(&url).map_err(remote_err)?;
-        list_page_cards(page)?
+        if let Some(risk) = risk {
+            url.push_str(&format!("&risk={}", risk.as_str()));
+        }
+        if let Some(priority) = priority {
+            url.push_str(&format!("&priority={}", priority.as_str()));
+        }
+        if let Some(after) = after_raw {
+            url.push_str(&format!("&after={}", urlencode(&after)));
+        }
+        client.get(&url).map_err(remote_err)?
     } else {
         return Err(ShellError::Invalid(
             "list-ready requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments".to_string(),
         ));
     };
+    if has_flag(args, "--json") {
+        return to_pretty_json(&ready);
+    }
 
     let mut out = String::new();
-    for card in json_array(&ready)? {
+    for card in ready
+        .get("cards")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ShellError::Store("ready response expected cards array".to_string()))?
+    {
         out.push_str(&format!(
             "{}\t{}\t{}\n",
             json_string(card, "id")?,
@@ -1037,6 +1082,19 @@ fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError>
         return Err(missing_transport("search"));
     };
     serde_json::to_string(&payload).map_err(|err| ShellError::Store(err.to_string()))
+fn ready_page_json(page: &powder_store::CardListPage, query: &ReadyQuery) -> Value {
+    let mut payload = json!({
+        "cards": page.cards,
+        "total_count": page.total_count,
+        "has_more": page.next_after.is_some(),
+    });
+    if !page.cycle_card_ids.is_empty() {
+        payload["cycle_card_ids"] = json!(page.cycle_card_ids);
+    }
+    if let Some(next_after) = page.next_after.as_ref() {
+        payload["next_after"] = json!(ReadyCursor::for_query(query, next_after.clone()).encode());
+    }
+    payload
 }
 
 /// Enumerate cards by status/repo, not just ready-eligible ones -- a card
@@ -1923,6 +1981,19 @@ fn parse_status_flag(raw: &str) -> Result<CardStatus, ShellError> {
     parse_status(raw).map_err(|error| cli_field_error(error, "status"))
 }
 
+fn parse_repository_filter(raw: &str) -> Result<Vec<RepositoryName>, ShellError> {
+    if raw.trim().is_empty() {
+        return Err(ShellError::Invalid(
+            "--repo must contain at least one repository".to_string(),
+        ));
+    }
+    raw.split(',')
+        .map(str::trim)
+        .map(RepositoryName::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ShellError::Invalid(error.to_string()))
+}
+
 fn parse_priority_flag(raw: &str) -> Result<Priority, ShellError> {
     parse_priority(raw).map_err(|error| cli_field_error(error, "priority"))
 }
@@ -2623,6 +2694,87 @@ mod tests {
         .unwrap();
 
         assert!(completed.contains("completed\tcli-test\tdone"));
+    }
+
+    #[test]
+    fn cli_list_ready_json_filters_and_returns_cursor_metadata() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-ready-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        run(&args(["init-db", "--db", &db])).unwrap();
+        for repo in ["repo-a", "repo-b"] {
+            run(&args(["repository-upsert", "--db", &db, "--name", repo])).unwrap();
+        }
+        for (id, repo, risk) in [
+            ("repo-a-1", "repo-a", "low"),
+            ("repo-a-2", "repo-a", "low"),
+            ("repo-a-missing-risk", "repo-a", "high"),
+            ("repo-b-other", "repo-b", "low"),
+        ] {
+            run(&args([
+                "create-card",
+                "--db",
+                &db,
+                "--id",
+                id,
+                "--title",
+                id,
+                "--acceptance",
+                "proof exists",
+                "--status",
+                "ready",
+                "--repo",
+                repo,
+                "--estimate",
+                "S",
+                "--priority",
+                "P0",
+                "--risk",
+                risk,
+            ]))
+            .unwrap();
+        }
+        let page = run(&args([
+            "list-ready",
+            "--db",
+            &db,
+            "--limit",
+            "1",
+            "--repo",
+            "repo-a",
+            "--estimate",
+            "S",
+            "--risk",
+            "low",
+            "--priority",
+            "P0",
+            "--json",
+        ]))
+        .unwrap();
+        let page: Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(page["total_count"], 2);
+        assert_eq!(page["cards"].as_array().unwrap().len(), 1);
+        assert_eq!(page["cards"][0]["id"], "repo-a-1");
+        assert_eq!(page["has_more"], true);
+        let after = page["next_after"].as_str().unwrap();
+        let second = run(&args([
+            "list-ready", "--db", &db, "--limit", "1", "--repo", "repo-a",
+            "--estimate", "S", "--risk", "low", "--priority", "P0", "--after", after, "--json",
+        ])).unwrap();
+        let second: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second["cards"][0]["id"], "repo-a-2");
+        assert_eq!(second["has_more"], false);
+        let changed = run(&args([
+            "list-ready", "--db", &db, "--limit", "1", "--repo", "repo-b",
+            "--estimate", "S", "--risk", "low", "--priority", "P0", "--after", after, "--json",
+        ])).unwrap_err();
+        assert!(changed.to_string().contains("stale continuation cursor"));
+        let _ = std::fs::remove_file(db);
     }
 
     #[test]

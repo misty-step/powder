@@ -74,17 +74,27 @@ cargo run -q -p powder-cli -- get-card 001 --db "$DB"
 cargo run -q -p powder-cli -- complete-card 001 --db "$DB" --proof https://example.test/proof
 ```
 
-HTTP server smoke (there is no dotenv loader in `powder-server` -- load
-`.env.example` into the shell, don't just copy it):
+HTTP server smoke uses a fresh data parent and the explicit one-shot bootstrap file; do not scrape service logs for credentials:
 
 ```sh
-set -a; source .env.example; set +a
-POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
+DB=/tmp/powder-qa-smoke/powder.db
+KEY_FILE=/tmp/powder-qa-smoke/bootstrap-key
+mkdir -p "$(dirname "$DB")"
+POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key \
+POWDER_BIND_ADDR=127.0.0.1:4000 POWDER_BOOTSTRAP_KEY_FILE="$KEY_FILE" \
+cargo run -p powder-server
 # separate shell:
+KEY=$(cat "$KEY_FILE")
 curl -s localhost:4000/healthz
 curl -s localhost:4000/readyz
+# verify the one-shot key was not written to the service log
 ```
 
+The lease-race smoke uses the same repaired recipe and file channel:
+
+```sh
+scripts/lease-race-demo.sh
+```
 ## Gotchas
 
 - **`init-db --show-secret` prints the bootstrap API key to stdout.** Harmless

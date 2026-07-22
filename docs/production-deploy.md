@@ -33,78 +33,23 @@ never a public URL:
   `powder-serve` is the launch wrapper that sets the env below.
 - **Data:** a SQLite path under the box's `/data` volume (WAL mode), streamed
   to DigitalOcean Spaces via Litestream
-- **Runtime env** (set in Sanctum's own supervisor config, in that `[[app]]`
-  block's env section) -- **`tailscale-header`, not `api-key`, since
-  2026-07-17.** The box is reachable only over Tailscale (see above); an
-  operator-facing self-hosted instance like this one should trust that
-  perimeter instead of asking every browser tab and service integration to
-  hold a pasted key:
+- **Runtime env** (set in Sanctum's own supervisor config, in that [[app]] block's env section):
 
-  ```
+  ~~~
   POWDER_DB_PATH=<path under Sanctum's /data volume>
   POWDER_BIND_ADDR=127.0.0.1:<port>
   POWDER_AUTH_MODE=tailscale-header
   POWDER_PUBLIC_BASE_URL=<the box's tailnet origin, see above>
-  POWDER_DISCLOSE_BOOTSTRAP_KEY=false
-  ```
+  POWDER_TAILNET_PROXY_SECRET=<secret shared only with the trusted ingress>
+  POWDER_TAILNET_ADMIN_PRINCIPALS=operator@example.com
+  POWDER_BOOTSTRAP_KEY_FILE=<0600 path under the private /data volume>
+  ~~~
 
-  `tailscale-header` mode trusts the `Tailscale-User-Login` (or equivalent)
-  identity header `tailscale serve` injects on proxied HTTPS requests, so
-  any tailnet peer -- a browser, the CLI, an MCP client -- reaches the
-  board with no key at all and still gets a real, attributed principal (an
-  actual tailnet login, not a static agent string). `POWDER_TAILNET_ADMIN`
-  (default `true`, unset) controls whether that identity is admin-scoped;
-  `POWDER_TAILNET_PROXY_SECRET` is an optional in-code backstop requiring a
-  matching `X-Powder-Proxy-Secret` header from a *further* trusted proxy in
-  front of `tailscale serve`, not something `tailscale serve` itself sends
-  -- leave it unset unless such a proxy exists.
+  Header identity is accepted only with the matching proxy secret; direct client-supplied identity headers never authenticate. Tailnet-derived admin scope is disabled by default. Same-box and off-mesh callers that do not receive an identity header use an explicitly minted bearer key instead.
 
-  **Same-box and off-mesh service callers never get that header.** A
-  request self-originated from the box to its own tailnet hostname (a
-  co-hosted app calling back through `tailscale serve`, e.g. Glass calling
-  Powder with its Mint-brokered `GLASS_POWDER_API_KEY`) does not traverse
-  the peer-identity handshake that populates it -- verified live
-  2026-07-17. `tailscale-header` mode's `authorize()` therefore falls back
-  to verifying a bearer token (the same check `api-key` mode uses) whenever
-  a request carries `Authorization: Bearer <key>` but no identity header,
-  so a minted API key still works for exactly that case. Reads and writes
-  share one `authorize()` call, so this fallback covers both.
+  The server never writes raw bootstrap credentials to stdout, stderr, or journald. Before first startup, either set POWDER_BOOTSTRAP_KEY_FILE to a new path, read and store the mode-0600 file, then remove it, or SSH to the box and run powder init-db --db <path> --show-secret. If the database is already seeded, mint a fresh admin key with powder key-create --db <path> --name operator --scope admin --show-secret, store it, and revoke the old key.
 
-  `POWDER_DISCLOSE_BOOTSTRAP_KEY=false` means the very first admin key
-  `powder-server` seeds on an empty database is created **redacted** --
-  nothing but `"Powder bootstrap API key created and redacted."` reaches
-  stderr, so the raw key never lands in `journald` for the box's lifetime.
-  This is a deliberate production-only posture; the code's own default
-  (`true`, unset) stays unchanged so a self-hoster running the binary with
-  zero config still sees their first key.
-
-  The seed only ever runs once (it's guarded by a `seed_runs` row) --
-  flipping the env var back to `true` and redeploying **after** the first
-  boot does nothing; the seed has already applied and there is no raw value
-  left to print. Get a usable admin key on a freshly bootstrapped production
-  box one of two ways, decided *before* or *at* that first boot:
-
-  - **`init-db --show-secret` on the box (preferred: never touches logs).**
-    SSH to the box and run `powder init-db --db <path> --show-secret`
-    yourself, once, before `powder-server` ever starts against that
-    database. This applies the one-time seed and prints the raw key
-    directly to your SSH session. Then start (or redeploy) `powder-server`
-    normally with `POWDER_DISCLOSE_BOOTSTRAP_KEY=false` already set --
-    its own call to the same seed finds it already applied and no-ops.
-  - **Disclose once, then rotate.** If `powder-server` already auto-seeded
-    the database (the common case), the raw bootstrap value is gone for
-    good -- there is no "re-disclose" path. Mint a fresh admin key instead
-    via the operator-key flow already documented in
-    [`docs/operations.md`](operations.md#self-hosting) (`powder key-create
-    --db <path> --name operator --scope admin --show-secret` over SSH),
-    confirm it authenticates, then `powder key-revoke <bootstrap-key-id>`
-    (its id is visible via `key-list`, which never needs the secret) to
-    retire the now-permanently-unrecoverable original.
-
-  Either way, store the captured key per the durable key-drop convention in
-  [`docs/operations.md`](operations.md#api-key-lifecycle-minting-storage-and-whats-recoverable-powder-918)
-  -- hand-out-at-mint-only, into the consumer's own secret store, never
-  parked on the box.
+  Store the captured key per the durable key-drop convention in docs/operations.md -- hand it directly to the consumer's secret store, then remove the one-shot file.
 
 **Verify before trusting this document over live state** -- Sanctum's own
 `README.md` "powder — the agent work board" section, in the Sanctum repo, is

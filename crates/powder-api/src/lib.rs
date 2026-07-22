@@ -38,7 +38,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
-        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more,cycle_card_ids?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional repo allowlist (comma-separated), estimate (S|M|L|XL), risk (low|medium|high), priority (P0|P1|P2|P3), limit, and after continuation cursor; response is {cards,total_count,has_more,next_after?,cycle_card_ids?} with full card eligibility metadata; stale after cursors return a stable 400 validation error; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         body_shape: None,
     },
     ApiRoute {

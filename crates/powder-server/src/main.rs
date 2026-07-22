@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     convert::Infallible,
     env,
+    fs::OpenOptions,
+    io::Write,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
@@ -34,7 +37,8 @@ use powder_core::Priority;
 use powder_core::{
     canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
     parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
-    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyQuery, RunId,
+    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyCursor, ReadyQuery,
+    RepositoryName, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -45,6 +49,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use tokio::net::TcpListener;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
@@ -102,22 +109,16 @@ struct Config {
     public_base_url: Option<String>,
     home_url: Option<String>,
     bind_addr: SocketAddr,
-    disclose_bootstrap_key: bool,
+    /// Optional one-shot file for the first-run admin key.
+    /// The file is created with mode 0600 and never logged.
+    bootstrap_key_file: Option<PathBuf>,
     field_note: FieldNoteConfig,
-    /// In-code backstop for `tailscale-header` auth (powder-tailnet-backstop):
-    /// when set, a header-auth request must also carry a matching
-    /// `X-Powder-Proxy-Secret` header, so a request that reaches
-    /// `powder-server` without passing through the trusted tailnet ingress
-    /// (a misrouted request, a bypassed proxy) is rejected instead of
-    /// silently trusted on the strength of a spoofable identity header
-    /// alone. `None` (unset) preserves the original behavior: any request
-    /// bearing a trusted identity header is authorized.
+    /// Secret shared only by the trusted ingress and this process. Without it,
+    /// identity headers are rejected and only bearer-token fallback remains.
     tailnet_proxy_secret: Option<String>,
-    /// Whether a `tailscale-header`-authenticated identity is granted admin
-    /// scope. Defaults to `true` (unset or explicit `true`) to preserve the
-    /// mode's original all-admin behavior; `POWDER_TAILNET_ADMIN=false` makes
-    /// tailnet-authenticated callers ordinary non-admin actors instead.
-    tailnet_admin: bool,
+    /// Exact forwarded identities allowed to use admin-only routes. An empty
+    /// list is fail-closed; there is no global "all tailnet users" switch.
+    tailnet_admin_principals: Vec<String>,
     /// `/readyz`'s dead-letter backlog gate. See
     /// `DEFAULT_READYZ_DEAD_LETTER_THRESHOLD`.
     dead_letter_ready_threshold: i64,
@@ -185,11 +186,12 @@ impl Config {
             })?,
             None => AuthMode::ApiKey,
         };
-        let disclose_bootstrap_key = parse_bool(
-            "POWDER_DISCLOSE_BOOTSTRAP_KEY",
-            env_value(&vars, "POWDER_DISCLOSE_BOOTSTRAP_KEY"),
-        )?
-        .unwrap_or(true);
+        if vars.contains_key("POWDER_DISCLOSE_BOOTSTRAP_KEY") {
+            return Err(ConfigError::new(
+                "POWDER_DISCLOSE_BOOTSTRAP_KEY",
+                "retired; use POWDER_BOOTSTRAP_KEY_FILE or powder init-db --show-secret before startup",
+            ));
+        }
         let bind_addr = match env_value(&vars, "POWDER_BIND_ADDR") {
             Some(value) => value.parse::<SocketAddr>().map_err(|err| {
                 ConfigError::new(
@@ -197,16 +199,41 @@ impl Config {
                     format!("expected socket address: {err}"),
                 )
             })?,
-            None => SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], port)),
+            None => SocketAddr::from(([127, 0, 0, 1], port)),
         };
         let field_note = field_note_config_from_env(&vars)?;
-        let tailnet_proxy_secret =
-            env_value(&vars, "POWDER_TAILNET_PROXY_SECRET").map(ToOwned::to_owned);
-        let tailnet_admin = parse_bool(
-            "POWDER_TAILNET_ADMIN",
-            env_value(&vars, "POWDER_TAILNET_ADMIN"),
-        )?
-        .unwrap_or(true);
+        let tailnet_proxy_secret = match vars.get("POWDER_TAILNET_PROXY_SECRET") {
+            Some(value) if value.trim().is_empty() => {
+                return Err(ConfigError::new(
+                    "POWDER_TAILNET_PROXY_SECRET",
+                    "must not be blank",
+                ));
+            }
+            Some(value) => Some(value.trim().to_owned()),
+            None => None,
+        };
+        if auth_mode == AuthMode::None && !bind_addr.ip().is_loopback() {
+            return Err(ConfigError::new(
+                "POWDER_AUTH_MODE",
+                "none auth is only allowed on a loopback bind",
+            ));
+        }
+        if auth_mode == AuthMode::TailscaleHeader
+            && !bind_addr.ip().is_loopback()
+            && tailnet_proxy_secret.is_none()
+        {
+            return Err(ConfigError::new(
+                "POWDER_TAILNET_PROXY_SECRET",
+                "required for tailscale-header auth on a non-loopback bind",
+            ));
+        }
+        if vars.contains_key("POWDER_TAILNET_ADMIN") {
+            return Err(ConfigError::new(
+                "POWDER_TAILNET_ADMIN",
+                "retired; use POWDER_TAILNET_ADMIN_PRINCIPALS with exact identities",
+            ));
+        }
+        let tailnet_admin_principals = parse_tailnet_admin_principals(&vars)?;
         let dead_letter_ready_threshold =
             match env_value(&vars, "POWDER_READYZ_DEAD_LETTER_THRESHOLD") {
                 Some(value) => value.parse::<i64>().map_err(|err| {
@@ -229,10 +256,10 @@ impl Config {
             public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
             home_url: env_value(&vars, "POWDER_HOME_URL").map(ToOwned::to_owned),
             bind_addr,
-            disclose_bootstrap_key,
+            bootstrap_key_file: env_value(&vars, "POWDER_BOOTSTRAP_KEY_FILE").map(PathBuf::from),
             field_note,
             tailnet_proxy_secret,
-            tailnet_admin,
+            tailnet_admin_principals,
             dead_letter_ready_threshold,
             public_reads,
         })
@@ -376,9 +403,13 @@ struct Onboarding {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadyParams {
     limit: Option<usize>,
+    repo: Option<String>,
     estimate: Option<String>,
+    risk: Option<String>,
+    priority: Option<String>,
     /// powder-cards-api-paged-continuation: resume past a prior response's
     /// `next_after` instead of only ever seeing the first `limit` cards of
     /// the same order. See `ListCardsParams::after` for the full
@@ -729,12 +760,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!("{msg}");
         canary::report_error("powder.store.migrate", &msg);
     })?;
-    if let Some(key) = store.apply_initial_seed(unix_now())? {
-        if config.disclose_bootstrap_key {
-            eprintln!("Powder bootstrap API key: {}", key.raw_key);
-            eprintln!("Store this key securely - it will not be shown again.");
-        } else {
-            eprintln!("Powder bootstrap API key created and redacted.");
+    let bootstrap_key_file = config.bootstrap_key_file.clone();
+    let bootstrap_file_created = Cell::new(false);
+    if let Some(path) = bootstrap_key_file.as_deref() {
+        if path.exists() && !store.initial_seed_applied()? {
+            std::fs::remove_file(path).map_err(StoreError::from)?;
+            tracing::warn!("removed stale bootstrap key file from an interrupted first seed");
+        }
+    }
+    if let Some(_key) = store.apply_initial_seed_with(
+        unix_now(),
+        |key| {
+            let path = bootstrap_key_file.as_deref().ok_or_else(|| {
+                StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "POWDER_BOOTSTRAP_KEY_FILE is required for a new database; use powder init-db --show-secret for explicit recovery",
+                ))
+            })?;
+            write_one_shot_bootstrap_key(path, &key.raw_key)
+                .map_err(StoreError::from)
+                .map(|()| {
+                    bootstrap_file_created.set(true);
+                })
+        },
+        |_| {
+            if bootstrap_file_created.get() {
+                if let Some(path) = bootstrap_key_file.as_deref() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        },
+    )? {
+        if let Some(path) = bootstrap_key_file.as_deref() {
+            tracing::info!(path = %path.display(), "Powder bootstrap API key written to a 0600 one-shot file; remove it after storing the key");
         }
     }
 
@@ -1054,6 +1112,19 @@ async fn routes() -> Json<serde_json::Value> {
     Json(powder_api::routes_json())
 }
 
+fn parse_repository_filter(raw: &str) -> Result<Vec<RepositoryName>, ApiError> {
+    if raw.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "repo must contain at least one repository",
+        ));
+    }
+    raw.split(',')
+        .map(str::trim)
+        .map(RepositoryName::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::from)
+}
+
 async fn list_ready(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1061,16 +1132,33 @@ async fn list_ready(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
+    let repo = params
+        .repo
+        .as_deref()
+        .map(parse_repository_filter)
+        .transpose()?;
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
-    let after = params.after.as_deref().map(CardId::new).transpose()?;
-    let query = ReadyQuery::new(unix_now(), limit).with_estimate(estimate);
-    let page = lock_store(&state)?.list_ready_page_after(query, after.as_ref())?;
+    let risk = params.risk.as_deref().map(parse_risk).transpose()?;
+    let priority = params.priority.as_deref().map(parse_priority).transpose()?;
+    let query = ReadyQuery::new(unix_now(), limit)
+        .with_repositories(repo.unwrap_or_default())
+        .with_estimate(estimate)
+        .with_risk(risk)
+        .with_priority(priority);
+    let after = params
+        .after
+        .as_deref()
+        .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+        .transpose()?;
+    let page = lock_store(&state)?
+        .list_ready_page_after(query.clone(), after.as_ref())?;
     Ok(Json(card_list_page_json(
         page.cards,
         page.total_count,
         page.excluded_terminal_count,
         &page.cycle_card_ids,
         page.next_after,
+        Some(&query),
     )))
 }
 
@@ -1152,6 +1240,7 @@ async fn list_cards(
         page.excluded_terminal_count,
         &page.cycle_card_ids,
         page.next_after,
+        None,
     )))
 }
 
@@ -1161,8 +1250,9 @@ fn card_list_page_json(
     excluded_terminal_count: usize,
     cycle_card_ids: &[CardId],
     next_after: Option<CardId>,
+    cursor_query: Option<&ReadyQuery>,
 ) -> serde_json::Value {
-    let has_more = total_count > cards.len();
+    let has_more = next_after.is_some() || excluded_terminal_count > 0;
     let mut payload = json!({
         "cards": cards,
         "total_count": total_count,
@@ -1194,7 +1284,10 @@ fn card_list_page_json(
     // presence/absence is the authoritative "is there another page"
     // answer once a caller is walking pages with `after`.
     if let Some(next_after) = next_after {
-        payload["next_after"] = json!(next_after);
+        payload["next_after"] = match cursor_query {
+            Some(query) => json!(ReadyCursor::for_query(query, next_after).encode()),
+            None => json!(next_after),
+        };
     }
     payload
 }
@@ -1215,7 +1308,7 @@ async fn board_stats(
     headers: HeaderMap,
     Query(params): Query<BoardStatsParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
+    authorize_hidden_read(&state, &headers, params.include_hidden.unwrap_or(false))?;
     let stats = lock_store(&state)?.board_stats(powder_store::BoardStatsQuery {
         repo: params.repo,
         include_hidden: params.include_hidden.unwrap_or(false),
@@ -1249,7 +1342,7 @@ async fn list_repositories(
     headers: HeaderMap,
     Query(params): Query<ListRepositoriesParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
+    authorize_hidden_read(&state, &headers, params.include_hidden.unwrap_or(false))?;
     let repositories = if params.include_hidden.unwrap_or(false) {
         lock_store(&state)?.list_repositories_with_hidden()?
     } else {
@@ -1391,7 +1484,7 @@ async fn create_card(
     card.repo = request.repo;
     let card = {
         let mut store = lock_store(&state)?;
-        store.create_card_with_events(card, &actor.principal, now)?
+        store.create_card_with_authority(card, &actor.authority(), now)?
     };
     let mut payload = json!(card);
     if card.acceptance.is_empty() {
@@ -1448,7 +1541,7 @@ async fn patch_card(
     if patch.repo.is_some() {
         require_admin(&state, &headers)?;
     }
-    let card = lock_store(&state)?.patch_card(&card_id, patch, &actor.principal, unix_now())?;
+    let card = lock_store(&state)?.patch_card_with_authority(&card_id, patch, &actor.authority(), unix_now())?;
     Ok(Json(card))
 }
 
@@ -2103,7 +2196,16 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
             key_prefix: None,
         }),
         AuthMode::TailscaleHeader => {
-            if let Some(expected) = state.config.tailnet_proxy_secret.as_deref() {
+            if let Some(identity) = trusted_tailnet_identity(headers) {
+                let expected = state
+                    .config
+                    .tailnet_proxy_secret
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ApiError::unauthorized(format!(
+                        "{PROXY_SECRET_HEADER} is not configured; identity headers are not trusted"
+                    ))
+                    })?;
                 let provided = headers
                     .get(PROXY_SECRET_HEADER)
                     .and_then(|value| value.to_str().ok());
@@ -2113,27 +2215,19 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, A
                         "missing or invalid {PROXY_SECRET_HEADER} header"
                     )));
                 }
-            }
-            if let Some(identity) = trusted_tailnet_identity(headers) {
                 return Ok(AuthorizedActor {
                     principal: identity.to_string(),
                     enforces_identity: true,
-                    is_admin: state.config.tailnet_admin,
+                    is_admin: state
+                        .config
+                        .tailnet_admin_principals
+                        .iter()
+                        .any(|principal| principal == identity),
                     key_prefix: None,
                 });
             }
-            // Self-originated calls to the box's own tailnet hostname (a
-            // co-hosted service calling back through `tailscale serve`,
-            // e.g. Glass -> Powder) never traverse the peer-identity
-            // handshake that populates the header above -- verified live
-            // 2026-07-17: a same-box curl to the tailnet HTTPS origin came
-            // back 401 with no header, even though a distinct tailnet peer
-            // gets one. Rather than lock every off-mesh or same-box service
-            // integration out of this mode, fall back to a bearer token
-            // (the same verification `api-key` mode uses) when one is
-            // present, so a minted API key keeps working here. Only report
-            // the identity-header error when no credential was offered at
-            // all.
+            // A bearer token is the explicit recovery path for callers that do
+            // not traverse the trusted identity proxy (including same-box calls).
             if bearer_token(headers).is_some() {
                 authorize_api_key(state, headers)
             } else {
@@ -2177,6 +2271,18 @@ fn authorize_api_key(state: &AppState, headers: &HeaderMap) -> Result<Authorized
 /// - `tailscale-header` mode: unchanged; trust the injected tailnet identity.
 /// - `api-key` mode: reads require a valid key unless `POWDER_PUBLIC_READS=true`
 ///   is set, which preserves the historical private-perimeter behavior.
+fn authorize_hidden_read(
+    state: &AppState,
+    headers: &HeaderMap,
+    include_hidden: bool,
+) -> Result<(), ApiError> {
+    if include_hidden {
+        require_admin(state, headers).map(|_| ())
+    } else {
+        authorize_read(state, headers)
+    }
+}
+
 fn authorize_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     match state.config.auth_mode {
         AuthMode::None => Ok(()),
@@ -2241,6 +2347,23 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         diff |= byte_left ^ byte_right;
     }
     diff == 0
+}
+
+fn write_one_shot_bootstrap_key(path: &FsPath, raw_key: &str) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    let result = (|| {
+        file.write_all(raw_key.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 fn trusted_tailnet_identity(headers: &HeaderMap) -> Option<&str> {
@@ -2544,6 +2667,27 @@ impl From<powder_core::DomainError> for ApiError {
             },
         }
     }
+}
+
+fn parse_tailnet_admin_principals(
+    vars: &BTreeMap<String, String>,
+) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = vars.get("POWDER_TAILNET_ADMIN_PRINCIPALS") else {
+        return Ok(Vec::new());
+    };
+    let principals = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|principal| !principal.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if principals.iter().any(|principal| principal == "*") {
+        return Err(ConfigError::new(
+            "POWDER_TAILNET_ADMIN_PRINCIPALS",
+            "wildcard is not allowed; list exact forwarded identities",
+        ));
+    }
+    Ok(principals)
 }
 
 fn env_value<'a>(vars: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {

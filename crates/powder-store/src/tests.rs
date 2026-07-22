@@ -1,6 +1,6 @@
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, Risk, RunId, RunState,
+    DetailLevel, DomainError, Estimate, Priority, ReadyCursor, ReadyQuery, RepositoryName, RunId, RunState,
 };
 
 use crate::schema::SCHEMA;
@@ -1290,6 +1290,43 @@ fn list_ready_orders_by_priority_then_age_then_id() -> Result<()> {
 }
 
 #[test]
+fn list_ready_store_cursor_rejects_changed_filters_when_anchor_remains_valid() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    for name in ["repo-a", "repo-b"] {
+        store.upsert_repository(
+            RepositoryUpsert {
+                name: name.to_string(),
+                aliases: None,
+                visibility: None,
+                tier: None,
+                import_provenance: None,
+            },
+            1,
+        )?;
+    }
+    let mut first = ready_card("repo-a-1", 10);
+    first.repo = Some("repo-a".to_string());
+    first.priority = Priority::P0;
+    let mut second = ready_card("repo-b-2", 11);
+    second.repo = Some("repo-b".to_string());
+    second.priority = Priority::P1;
+    store.import_cards(vec![first, second])?;
+
+    let query_a = ReadyQuery::new(20, 1).with_repositories([RepositoryName::new("repo-a")?]);
+    let page_a = store.list_ready_page(query_a.clone())?;
+    assert_eq!(page_a.cards.len(), 1);
+    let cursor = ReadyCursor::for_query(&query_a, page_a.cards[0].id.clone());
+
+    let broader = ReadyQuery::new(20, 1);
+    let error = store
+        .list_ready_page_after(broader, Some(&cursor))
+        .expect_err("Store must enforce the cursor filter fingerprint");
+    assert!(error.to_string().contains("query filters do not match"));
+    Ok(())
+}
+
+#[test]
 fn list_ready_includes_ready_cards_from_every_repository_tier() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -2001,7 +2038,10 @@ fn migration_15_to_16_drops_autonomy_from_existing_databases() -> Result<()> {
         .list_ready(ReadyQuery {
             now: 20,
             limit: 10,
+            repo: None,
             estimate: None,
+            risk: None,
+            priority: None,
         })?
         .into_iter()
         .map(|card| card.id.to_string())
