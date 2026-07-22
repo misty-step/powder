@@ -32,7 +32,7 @@ pub use events::{
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
 pub use identity::{ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
-use relations::{list_delta, mirror_delta, mirror_initial_relations};
+use relations::{list_delta, mirror_delta_with_authority, mirror_initial_relations_with_authority};
 pub use relations::{
     ParentCoverageAssignment, ParentCoverageBucket, ParentCoverageReport, ParentDoctorIssue,
     ParentGraphReport, ParentIssueKind, RelationField, RelationIssueKind, RelationsDoctorIssue,
@@ -1892,20 +1892,22 @@ impl Store {
 
     fn ensure_principal_role_columns(&self) -> Result<()> {
         if self.table_exists("runs")? && !self.table_has_column("runs", "role")? {
-            self.connection.execute_batch(
-                "ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'agent';",
-            )?;
+            self.connection
+                .execute_batch("ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'agent';")?;
         }
         if self.table_exists("activities")? {
             if !self.table_has_column("activities", "principal")? {
-                self.connection.execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
+                self.connection
+                    .execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
             }
             if !self.table_has_column("activities", "role")? {
-                self.connection.execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
+                self.connection
+                    .execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
             }
         }
         if self.table_exists("card_events")? && !self.table_has_column("card_events", "role")? {
-            self.connection.execute_batch("ALTER TABLE card_events ADD COLUMN role TEXT;")?;
+            self.connection
+                .execute_batch("ALTER TABLE card_events ADD COLUMN role TEXT;")?;
         }
         Ok(())
     }
@@ -2096,13 +2098,17 @@ impl Store {
         Ok(saved)
     }
 
-    pub fn create_card_with_events(
+    pub fn create_card_with_events(&mut self, card: Card, actor: &str, now: i64) -> Result<Card> {
+        self.create_card_with_events_as(card, &Authority::actor(actor.to_owned(), false), now)
+    }
+
+    pub fn create_card_with_events_as(
         &mut self,
         mut card: Card,
-        actor: &str,
+        authority: &Authority,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
+        let actor = non_empty("actor", &authority.actor_label())?;
         let card_id = card.id.clone();
         card.title = secrets::scrub_secrets(&card.title);
         card.body = secrets::scrub_secrets(&card.body);
@@ -2142,22 +2148,24 @@ impl Store {
         }
         persist_card(&transaction, &card)?;
         let saved = load_card(&transaction, &card_id)?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             &saved.id,
             "create",
             &actor,
             "created card",
             now,
+            authority,
         )?;
         if let Some(parent_id) = saved.parent.as_ref() {
-            append_card_event(
+            append_card_event_with_authority(
                 &transaction,
                 parent_id,
                 "decompose",
                 &actor,
                 &format!("child {card_id} created"),
                 now,
+                authority,
             )?;
         }
         // A card born with related/blocks/blocked_by already set mirrors
@@ -2165,12 +2173,12 @@ impl Store {
         // reciprocity is a birth-time guarantee, not something the caller
         // has to establish with follow-up update_relations calls
         // (powder-dogfood-2026-07-14-nonreciprocal-relations).
-        mirror_initial_relations(&transaction, &saved, &actor, now)?;
-        events::append_outbound_card_event(
+        mirror_initial_relations_with_authority(&transaction, &saved, authority, now)?;
+        events::append_outbound_card_event_with_authority(
             &transaction,
             &saved,
             "card-created",
-            &actor,
+            authority,
             json!({"source": "create-card"}),
             now,
         )?;
@@ -2190,7 +2198,15 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
+        self.file_papercut_as(report, &Authority::actor(actor.to_owned(), false), now)
+    }
+
+    pub fn file_papercut_as(
+        &mut self,
+        report: &powder_core::papercut::PapercutReport,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<Card> {
         let resolved_repo = report
             .service
             .as_deref()
@@ -2208,7 +2224,7 @@ impl Store {
             now,
             id,
         )?;
-        self.create_card_with_events(card, &actor, now)
+        self.create_card_with_events_as(card, authority, now)
     }
 
     pub fn patch_card(
@@ -2218,7 +2234,22 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
+        self.patch_card_as(
+            card_id,
+            patch,
+            &Authority::actor(actor.to_owned(), false),
+            now,
+        )
+    }
+
+    pub fn patch_card_as(
+        &mut self,
+        card_id: &CardId,
+        patch: CardPatch,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<Card> {
+        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2273,13 +2304,14 @@ impl Store {
 
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "patch",
             &actor,
             &format!("patched {}", patched_fields.join(", ")),
             now,
+            authority,
         )?;
         // `persist_card` canonicalizes `repo` at write time via
         // `resolve_registered_repository_name` (an alias like
@@ -2372,7 +2404,22 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<CriteriaRepair> {
-        let actor = non_empty("actor", actor)?;
+        self.repair_criteria_as(
+            card_id,
+            acceptance,
+            &Authority::actor(actor.to_owned(), false),
+            now,
+        )
+    }
+
+    pub fn repair_criteria_as(
+        &mut self,
+        card_id: &CardId,
+        acceptance: Vec<String>,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<CriteriaRepair> {
+        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2411,13 +2458,14 @@ impl Store {
 
         if !changes.is_empty() {
             persist_card(&transaction, &repaired)?;
-            append_card_event(
+            append_card_event_with_authority(
                 &transaction,
                 card_id,
                 "repair",
                 &actor,
                 &format!("repaired {} acceptance criterion(s)", changes.len()),
                 now,
+                authority,
             )?;
         }
 
@@ -2986,11 +3034,11 @@ impl Store {
             params![card_id.as_str(), now],
         )?;
         if let Some(expired) = card.claim.as_ref().filter(|claim| claim.is_expired(now)) {
-            events::append_outbound_card_event(
+            events::append_outbound_card_event_with_authority(
                 &transaction,
                 &card,
                 "claim-expired",
-                &expired.principal,
+                authority,
                 json!({
                     "principal": expired.principal.as_str(),
                     "run_id": expired.run_id.as_str(),
@@ -3080,20 +3128,21 @@ impl Store {
                 now,
             )?;
         }
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "status",
             &authority.actor_label(),
             &format!("{} -> {}", previous.as_str(), status.as_str()),
             now,
+            authority,
         )?;
         if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
-            events::append_outbound_card_event(
+            events::append_outbound_card_event_with_authority(
                 &transaction,
                 &card,
                 event_type,
-                &authority.actor_label(),
+                authority,
                 json!({
                     "previous_status": previous.as_str(),
                     "status": status.as_str()
@@ -3102,10 +3151,10 @@ impl Store {
             )?;
         }
         if status.is_terminal() && !previous.is_terminal() {
-            append_parent_rollup_event(
+            append_parent_rollup_event_with_authority(
                 &transaction,
                 &card,
-                &authority.actor_label(),
+                authority,
                 &format!("child {card_id} reached {}", status.as_str()),
                 now,
             )?;
@@ -3146,7 +3195,7 @@ impl Store {
 
         card.apply_relations(related, blocks, blocked_by, now);
         persist_card(&transaction, &card)?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "relations",
@@ -3156,30 +3205,31 @@ impl Store {
                 card.related, card.blocks, card.blocked_by
             ),
             now,
+            authority,
         )?;
 
-        mirror_delta(
+        mirror_delta_with_authority(
             &transaction,
             card_id,
             RelationField::Related,
             &related_delta,
-            &actor,
+            authority,
             now,
         )?;
-        mirror_delta(
+        mirror_delta_with_authority(
             &transaction,
             card_id,
             RelationField::Blocks,
             &blocks_delta,
-            &actor,
+            authority,
             now,
         )?;
-        mirror_delta(
+        mirror_delta_with_authority(
             &transaction,
             card_id,
             RelationField::BlockedBy,
             &blocked_by_delta,
-            &actor,
+            authority,
             now,
         )?;
 
@@ -3221,34 +3271,37 @@ impl Store {
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "none".to_string())
         };
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "hierarchy",
             &actor,
             &format!("parent {} -> {}", label(&previous), label(&parent)),
             now,
+            authority,
         )?;
         if let Some(old_parent) = previous.as_ref() {
             if load_card_optional(&transaction, old_parent)?.is_some() {
-                append_card_event(
+                append_card_event_with_authority(
                     &transaction,
                     old_parent,
                     "hierarchy",
                     &actor,
                     &format!("child {card_id} unlinked"),
                     now,
+                    authority,
                 )?;
             }
         }
         if let Some(new_parent) = parent.as_ref() {
-            append_card_event(
+            append_card_event_with_authority(
                 &transaction,
                 new_parent,
                 "decompose",
                 &actor,
                 &format!("child {card_id} linked"),
                 now,
+                authority,
             )?;
         }
         transaction.commit()?;
@@ -3279,11 +3332,11 @@ impl Store {
             Some(authority.role_label()),
             now,
         )?;
-        events::append_outbound_card_event(
+        events::append_outbound_card_event_with_authority(
             &transaction,
             &card,
             "moved-to-ready",
-            &authority.actor_label(),
+            authority,
             json!({"source": "release_claim", "run_id": run_id.as_str()}),
             now,
         )?;
@@ -3832,19 +3885,20 @@ impl Store {
             Some(authority.role_label()),
             now,
         )?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             &card.id,
             "status",
             &authority.actor_label(),
             "awaiting input",
             now,
+            authority,
         )?;
-        events::append_outbound_card_event(
+        events::append_outbound_card_event_with_authority(
             &transaction,
             &card,
             "awaiting-input",
-            &authority.actor_label(),
+            authority,
             json!({"run_id": run_id.as_str(), "question": question}),
             now,
         )?;
@@ -3907,20 +3961,21 @@ impl Store {
                 now,
             )?;
         }
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "status",
             &authority.actor_label(),
             &format!("{} -> done", previous.as_str()),
             now,
+            authority,
         )?;
         if !previous.is_terminal() {
-            events::append_outbound_card_event(
+            events::append_outbound_card_event_with_authority(
                 &transaction,
                 &card,
                 "completed",
-                &authority.actor_label(),
+                authority,
                 json!({
                     "previous_status": previous.as_str(),
                     "status": card.status.as_str(),
@@ -3929,10 +3984,10 @@ impl Store {
                 }),
                 now,
             )?;
-            append_parent_rollup_event(
+            append_parent_rollup_event_with_authority(
                 &transaction,
                 &card,
-                &authority.actor_label(),
+                authority,
                 &proof
                     .as_deref()
                     .map(|proof| {
@@ -4277,7 +4332,7 @@ fn append_card_event(
         actor,
         payload,
         now,
-        &Authority::actor(actor.to_owned(), false),
+        &Authority::unchecked(),
     )
 }
 
@@ -4677,13 +4732,37 @@ fn append_parent_rollup_event(
     detail: &str,
     now: i64,
 ) -> Result<()> {
+    append_parent_rollup_event_with_authority(
+        connection,
+        child,
+        &Authority::actor(actor.to_owned(), false),
+        detail,
+        now,
+    )
+}
+
+fn append_parent_rollup_event_with_authority(
+    connection: &Connection,
+    child: &Card,
+    authority: &Authority,
+    detail: &str,
+    now: i64,
+) -> Result<()> {
     let Some(parent_id) = child.parent.as_ref() else {
         return Ok(());
     };
     if load_card_optional(connection, parent_id)?.is_none() {
         return Ok(());
     }
-    append_card_event(connection, parent_id, "rollup", actor, detail, now)?;
+    append_card_event_with_authority(
+        connection,
+        parent_id,
+        "rollup",
+        &authority.actor_label(),
+        detail,
+        now,
+        authority,
+    )?;
     Ok(())
 }
 

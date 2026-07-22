@@ -254,10 +254,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(admin) = args["admin"].as_bool() {
                 body["admin"] = json!(admin);
             }
-            client.post(
-                "/api/v1/repositories",
-                body,
-            )?
+            client.post("/api/v1/repositories", body)?
         }
         "merge_repository_alias" => {
             let target = required_str(args, "into")?;

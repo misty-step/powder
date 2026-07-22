@@ -9,8 +9,8 @@ use powder_core::{
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    append_activity_attributed, load_all_cards, load_card, non_empty, non_empty_scrubbed, persist_card,
-    persist_run, schema::RUN_SELECT_SQL, Result, RunRecord, Store, StoreError,
+    append_activity_attributed, load_all_cards, load_card, non_empty, non_empty_scrubbed,
+    persist_card, persist_run, schema::RUN_SELECT_SQL, Result, RunRecord, Store, StoreError,
 };
 
 const CONCISE_DETAIL_LIMIT: i64 = 20;

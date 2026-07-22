@@ -496,8 +496,8 @@ pub(super) fn append_outbound_card_event(
         change,
         now,
         None,
-        Some(actor),
-        Some("agent"),
+        None,
+        Some("unchecked"),
     )
 }
 

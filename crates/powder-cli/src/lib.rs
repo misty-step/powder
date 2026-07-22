@@ -586,10 +586,10 @@ fn repair_criteria(args: &[String]) -> Result<String, ShellError> {
         let truncated = detect_truncated_criteria(&id, &stored.acceptance, &parsed.card.acceptance);
         if apply {
             let repair = store
-                .repair_criteria(
+                .repair_criteria_as(
                     &card_id,
                     parsed.card.acceptance.clone(),
-                    actor.unwrap(),
+                    &authority(args),
                     now,
                 )
                 .map_err(store_err)?;
@@ -680,7 +680,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         card.parent = parent;
         card.repo = repo;
         json!(store
-            .create_card_with_events(card, &authority(args).actor_label(), now)
+            .create_card_with_events_as(card, &authority(args), now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({
@@ -754,7 +754,7 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .patch_card(&card_id, patch, &authority(args).actor_label(), now)
+            .patch_card_as(&card_id, patch, &authority(args), now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({});
@@ -1270,8 +1270,7 @@ fn repository_merge_alias(args: &[String]) -> Result<String, ShellError> {
     let target = required_flag(args, "--into")?;
     let auth = admin_authority(args);
     if let Some(actor) = flag_value(args, "--actor") {
-        auth
-            .require_identity(actor)
+        auth.require_identity(actor)
             .map_err(|err| ShellError::Store(err.to_string()))?;
     }
     let mut store = open_store(required_flag(args, "--db")?)?;
@@ -1613,7 +1612,7 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .check_criterion(&card_id, criterion, actor, checked, now)
+            .check_criterion_as(&card_id, criterion, actor, checked, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1642,7 +1641,7 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     let (link_card_id, link_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let link = store
-            .add_link(&card_id, label, url, now)
+            .add_link_as(&card_id, label, url, now, &authority(args))
             .map_err(store_err)?;
         (link.card_id.to_string(), link.id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1668,7 +1667,7 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let comment = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .add_comment(&card_id, author, body, now)
+            .add_comment_as(&card_id, author, body, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1707,7 +1706,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .append_work_log(&card_id, agent, attribution, body, now)
+            .append_work_log_as(&card_id, agent, attribution, body, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -2020,7 +2019,7 @@ fn criterion_flag(args: &[String]) -> Result<usize, ShellError> {
 fn authority(args: &[String]) -> Authority {
     match flag_value(args, "--actor") {
         Some(name) => Authority::actor(name, has_flag(args, "--admin")),
-        None => Authority::unchecked(),
+        None => Authority::actor("operator", true),
     }
 }
 

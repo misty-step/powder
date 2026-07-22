@@ -532,7 +532,7 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             card.repo = optional_str(args, "repo").map(str::to_string);
             let card = store
-                .create_card_with_events(card, &authority_arg(args).actor_label(), now)
+                .create_card_with_events_as(card, &authority_arg(args), now)
                 .map_err(to_string)?;
             let mut payload = card_ack_payload(&card);
             if card.acceptance.is_empty() {
@@ -561,7 +561,7 @@ pub fn call_tool_store(
                 repo: None,
             };
             let card = store
-                .patch_card(&card_id, patch, &authority_arg(args).actor_label(), now)
+                .patch_card_as(&card_id, patch, &authority_arg(args), now)
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -659,7 +659,14 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
             let card = store
-                .check_criterion(&card_id, criterion, actor, checked, now)
+                .check_criterion_as(
+                    &card_id,
+                    criterion,
+                    actor,
+                    checked,
+                    now,
+                    &authority_arg(args),
+                )
                 .map_err(to_string)?;
             criterion_ack_payload(&card, criterion, checked)
         }
@@ -708,7 +715,7 @@ pub fn call_tool_store(
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
             json!(store
-                .add_link(&card_id, label, url, now)
+                .add_link_as(&card_id, label, url, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "add_comment" => {
@@ -717,7 +724,7 @@ pub fn call_tool_store(
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
             json!(store
-                .add_comment(&card_id, author, body, now)
+                .add_comment_as(&card_id, author, body, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "append_work_log" => {
@@ -732,7 +739,14 @@ pub fn call_tool_store(
                 run_id: optional_str(args, "run_id"),
             };
             json!(store
-                .append_work_log(&card_id, agent, attribution, body, now)
+                .append_work_log_as(
+                    &card_id,
+                    agent,
+                    attribution,
+                    body,
+                    now,
+                    &authority_arg(args)
+                )
                 .map_err(to_string)?)
         }
         "report_papercut" => {
@@ -744,7 +758,7 @@ pub fn call_tool_store(
                 harness: optional_str(args, "harness").map(str::to_string),
             };
             let card = store
-                .file_papercut(&report, &report.agent, now)
+                .file_papercut_as(&report, &authority_arg(args), now)
                 .map_err(to_string)?;
             json!({
                 "id": card.id.as_str(),
@@ -1332,7 +1346,7 @@ fn authority_arg(args: &Value) -> Authority {
         .filter(|value| !value.is_empty())
     {
         Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
-        None => Authority::unchecked(),
+        None => Authority::actor("operator", true),
     }
 }
 
@@ -3233,6 +3247,56 @@ mod tests {
                 .expect_err("principal argument rejected");
             assert!(error.contains("principal is not accepted"));
         }
+    }
+
+    #[test]
+    fn local_mutations_carry_operator_principal_and_role() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id":"mcp-attributed","title":"Attributed","acceptance":["proof"],"status":"ready"}),
+            1,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "add_comment",
+            &json!({"card_id":"mcp-attributed","author":"semantic-author","body":"note"}),
+            2,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"action":"claim","card_id":"mcp-attributed","agent":"worker-a","ttl_seconds":60}),
+            3,
+        )
+        .unwrap();
+        let detail = tool_payload(
+            &call_tool_store(
+                &mut store,
+                "get_card",
+                &json!({"card_id":"mcp-attributed","detail":"detailed"}),
+                3,
+            )
+            .unwrap(),
+        );
+        assert_eq!(detail["runs"][0]["principal"], "operator");
+        assert_eq!(detail["runs"][0]["role"], "admin");
+        assert!(detail["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|activity| {
+                activity["principal"] == "operator" && activity["role"] == "admin"
+            }));
+        assert!(detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| { event["principal"].is_string() && event["role"].is_string() }));
     }
 
     #[test]

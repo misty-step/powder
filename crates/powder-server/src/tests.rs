@@ -812,7 +812,7 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
         .unwrap();
     assert_eq!(checked.status(), StatusCode::OK);
     let checked = response_json(checked).await;
-    assert_eq!(checked["criteria"][0]["checked_by"], "operator");
+    assert_eq!(checked["criteria"][0]["checked_by"], "bootstrap");
     assert!(checked["criteria"][0]["checked_at"].as_i64().unwrap() > 0);
 
     let complete = app
@@ -845,7 +845,7 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
     let detail = response_json(detail).await;
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["event_type"] == "criterion"
-            && event["actor"] == "admin"
+            && event["actor"] == "bootstrap"
             && event["payload"].as_str().unwrap().contains("checked")
     }));
 }
@@ -3475,6 +3475,18 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/principal-http/claim",
+            Some(&roster_key),
+            r#"{"agent":"worker-a","ttl_seconds":60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim.status(), StatusCode::OK);
+
     let response = app
         .oneshot(
             Request::builder()
@@ -3490,9 +3502,20 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
     let detail = response_json(response).await;
     assert_eq!(detail["comments"][0]["author"], "operator");
     assert_eq!(detail["work_log"][0]["agent"], "worker-a");
+    assert_eq!(detail["runs"][0]["principal"], "roster");
+    assert_eq!(detail["runs"][0]["role"], "agent");
+    assert!(detail["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|activity| { activity["principal"] == "roster" && activity["role"] == "agent" }));
     let comment_id = detail["comments"][0]["id"].as_str().unwrap();
     let work_log_id = detail["work_log"][0]["id"].as_str().unwrap();
     let events = detail["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .filter(|event| event["principal"] == "roster")
+        .all(|event| event["role"] == "agent"));
     let attributed = events
         .iter()
         .filter(|event| event["principal"] == "roster")

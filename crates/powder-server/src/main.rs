@@ -1331,12 +1331,11 @@ async fn upsert_repository(
         .name
         .clone()
         .ok_or_else(|| ApiError::bad_request("repository name is required"))?;
-    let repository =
-        lock_store(&state)?.upsert_repository_with_authority(
-            repository_upsert(name, request)?,
-            unix_now(),
-            &actor.authority(),
-        )?;
+    let repository = lock_store(&state)?.upsert_repository_with_authority(
+        repository_upsert(name, request)?,
+        unix_now(),
+        &actor.authority(),
+    )?;
     Ok(Json(json!(repository)))
 }
 
@@ -1347,12 +1346,11 @@ async fn update_repository(
     Json(request): Json<RepositoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let repository_name = request.name.clone().unwrap_or(name);
-    let repository = lock_store(&state)?
-        .upsert_repository_with_authority(
-            repository_upsert(repository_name, request)?,
-            unix_now(),
-            &actor.authority(),
-        )?;
+    let repository = lock_store(&state)?.upsert_repository_with_authority(
+        repository_upsert(repository_name, request)?,
+        unix_now(),
+        &actor.authority(),
+    )?;
     Ok(Json(json!(repository)))
 }
 
@@ -1453,7 +1451,7 @@ async fn create_card(
     card.repo = request.repo;
     let card = {
         let mut store = lock_store(&state)?;
-        store.create_card_with_events(card, &actor.principal, now)?
+        store.create_card_with_events_as(card, &actor.authority(), now)?
     };
     let mut payload = json!(card);
     if card.acceptance.is_empty() {
@@ -1465,12 +1463,11 @@ async fn create_card(
 
 async fn file_papercut(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Json(request): Json<FilePapercutRequest>,
 ) -> Result<Json<Value>, ApiError> {
     // Same authorization posture as create_card: an agent-scoped key may
     // file friction without claiming it or holding admin.
-    authorize(&state, &headers)?;
     let now = unix_now();
     let report = PapercutReport {
         agent: request.agent,
@@ -1481,7 +1478,7 @@ async fn file_papercut(
     };
     let card = {
         let mut store = lock_store(&state)?;
-        store.file_papercut(&report, &report.agent, now)?
+        store.file_papercut_as(&report, &actor.authority(), now)?
     };
     Ok(Json(json!({
         "id": card.id.as_str(),
@@ -1510,7 +1507,8 @@ async fn patch_card(
     if patch.repo.is_some() {
         require_admin(&state, &headers)?;
     }
-    let card = lock_store(&state)?.patch_card(&card_id, patch, &actor.principal, unix_now())?;
+    let card =
+        lock_store(&state)?.patch_card_as(&card_id, patch, &actor.authority(), unix_now())?;
     Ok(Json(card))
 }
 
@@ -1648,10 +1646,13 @@ async fn check_criterion(
     Json(request): Json<CriterionRequest>,
 ) -> Result<Json<Card>, ApiError> {
     let card_id = CardId::new(id)?;
+    // The request's actor is semantic payload only; audit actor identity comes
+    // from the authenticated transport and cannot be forged in JSON.
+    let _requested_actor = request.actor;
     let card = lock_store(&state)?.check_criterion_as(
         &card_id,
         request.criterion,
-        &request.actor,
+        &authenticated.principal,
         request.checked.unwrap_or(true),
         unix_now(),
         &authenticated.authority(),
@@ -2114,11 +2115,12 @@ impl AuthorizedActor {
     /// Project this HTTP-layer identity into the domain-level `Authority`
     /// that `Store` mutation methods check claim ownership against.
     fn authority(&self) -> Authority {
-        if self.enforces_identity {
-            Authority::actor(self.principal.clone(), self.is_admin)
-        } else {
-            Authority::unchecked()
-        }
+        // Auth-disabled HTTP is an explicit trusted local perimeter. Keep the
+        // mutation auditable without inventing a caller-supplied identity.
+        Authority::actor(
+            self.principal.clone(),
+            self.is_admin || !self.enforces_identity,
+        )
     }
 }
 

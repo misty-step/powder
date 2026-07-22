@@ -88,12 +88,12 @@
 //! (which unmirrors atomically) instead of letting repair re-add them.
 use std::collections::{HashMap, HashSet};
 
-use powder_core::{Card, CardId};
+use powder_core::{Authority, Card, CardId};
 use rusqlite::{types::Value, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::from_str;
 
-use crate::{append_card_event, non_empty};
+use crate::{append_card_event, append_card_event_with_authority, non_empty};
 use crate::{Result, Store};
 
 /// Which pair of lists one edge connects. `Related` mirrors into the same
@@ -179,6 +179,7 @@ fn decode_relation_ids_strict(value: &Value) -> Option<Vec<CardId>> {
 struct MirrorChangeOptions<'a> {
     reject_corrupt: bool,
     actor: &'a str,
+    authority: Option<&'a Authority>,
     now: i64,
 }
 
@@ -236,18 +237,31 @@ fn mirror_relation_change_inner(
     if updated == 0 {
         return Ok(false);
     }
-    append_card_event(
-        connection,
-        other_id,
-        "relations",
-        options.actor,
-        &format!(
-            "mirrored {} {} {self_id}",
-            if add { "add" } else { "remove" },
-            field.as_str()
-        ),
-        options.now,
-    )?;
+    let detail = format!(
+        "mirrored {} {} {self_id}",
+        if add { "add" } else { "remove" },
+        field.as_str()
+    );
+    if let Some(authority) = options.authority {
+        append_card_event_with_authority(
+            connection,
+            other_id,
+            "relations",
+            options.actor,
+            &detail,
+            options.now,
+            authority,
+        )?;
+    } else {
+        append_card_event(
+            connection,
+            other_id,
+            "relations",
+            options.actor,
+            &detail,
+            options.now,
+        )?;
+    }
     Ok(true)
 }
 
@@ -269,6 +283,31 @@ pub(crate) fn mirror_relation_change(
         MirrorChangeOptions {
             reject_corrupt: true,
             actor,
+            authority: None,
+            now,
+        },
+    )
+}
+
+pub(crate) fn mirror_relation_change_with_authority(
+    connection: &Connection,
+    other_id: &CardId,
+    field: RelationField,
+    self_id: &CardId,
+    add: bool,
+    authority: &Authority,
+    now: i64,
+) -> Result<bool> {
+    mirror_relation_change_inner(
+        connection,
+        other_id,
+        field,
+        self_id,
+        add,
+        MirrorChangeOptions {
+            reject_corrupt: true,
+            actor: &authority.actor_label(),
+            authority: Some(authority),
             now,
         },
     )
@@ -292,6 +331,7 @@ fn mirror_relation_change_for_doctor(
         MirrorChangeOptions {
             reject_corrupt: false,
             actor,
+            authority: None,
             now,
         },
     )
@@ -314,6 +354,40 @@ pub(crate) fn mirror_delta(
     }
     for id in &delta.removed {
         mirror_relation_change(connection, id, mirror_field, self_id, false, actor, now)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn mirror_delta_with_authority(
+    connection: &Connection,
+    self_id: &CardId,
+    field: RelationField,
+    delta: &ListDelta,
+    authority: &Authority,
+    now: i64,
+) -> Result<()> {
+    let mirror_field = field.mirror();
+    for id in &delta.added {
+        mirror_relation_change_with_authority(
+            connection,
+            id,
+            mirror_field,
+            self_id,
+            true,
+            authority,
+            now,
+        )?;
+    }
+    for id in &delta.removed {
+        mirror_relation_change_with_authority(
+            connection,
+            id,
+            mirror_field,
+            self_id,
+            false,
+            authority,
+            now,
+        )?;
     }
     Ok(())
 }
@@ -358,6 +432,48 @@ pub(crate) fn mirror_initial_relations(
             &card.id,
             true,
             actor,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn mirror_initial_relations_with_authority(
+    connection: &Connection,
+    card: &Card,
+    authority: &Authority,
+    now: i64,
+) -> Result<()> {
+    for id in &card.related {
+        mirror_relation_change_with_authority(
+            connection,
+            id,
+            RelationField::Related,
+            &card.id,
+            true,
+            authority,
+            now,
+        )?;
+    }
+    for id in &card.blocks {
+        mirror_relation_change_with_authority(
+            connection,
+            id,
+            RelationField::BlockedBy,
+            &card.id,
+            true,
+            authority,
+            now,
+        )?;
+    }
+    for id in &card.blocked_by {
+        mirror_relation_change_with_authority(
+            connection,
+            id,
+            RelationField::Blocks,
+            &card.id,
+            true,
+            authority,
             now,
         )?;
     }
