@@ -2604,6 +2604,57 @@ fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<
 }
 
 #[test]
+fn mixed_relation_array_never_repairs_valid_subset() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("source", 10), ready_card("target", 11)])?;
+    store.connection.execute(
+        "UPDATE cards SET blocks_json = '[\"target\", 7]' WHERE id = 'source'",
+        [],
+    )?;
+    let source_before: String = store.connection.query_row(
+        "SELECT blocks_json FROM cards WHERE id = 'source'",
+        [],
+        |row| row.get(0),
+    )?;
+    let target_before: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'target'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let report = store.relations_doctor("operator", 20, false)?;
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(
+        report.issues[0].kind,
+        crate::RelationIssueKind::InvalidStoredValue
+    );
+    assert_eq!(report.issues[0].field, RelationField::Blocks);
+    assert!(report.issues[0].evidence.contains("not a text id"));
+
+    let repaired = store.relations_doctor("operator", 21, true)?;
+    assert_eq!(repaired.issues.len(), 1);
+    assert!(!repaired.issues[0].repaired);
+    let source_after: String = store.connection.query_row(
+        "SELECT blocks_json FROM cards WHERE id = 'source'",
+        [],
+        |row| row.get(0),
+    )?;
+    let target_after: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'target'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(source_after, source_before);
+    assert_eq!(target_after, target_before);
+
+    let second = store.relations_doctor("operator", 22, true)?;
+    assert_eq!(second.issues.len(), 1);
+    assert!(!second.issues[0].repaired);
+    Ok(())
+}
+
+#[test]
 fn parent_graph_doctor_rejects_noncanonical_parent_and_card_ids() -> Result<()> {
     let mut parent_store = Store::open_in_memory()?;
     parent_store.migrate()?;

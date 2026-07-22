@@ -564,7 +564,14 @@ fn decode_relation_list(value: &Value) -> RelationStoredList {
         }
         ids.push(id);
     }
-    RelationStoredList { ids, invalid }
+    if invalid.is_empty() {
+        RelationStoredList { ids, invalid }
+    } else {
+        RelationStoredList {
+            ids: Vec::new(),
+            invalid,
+        }
+    }
 }
 
 fn raw_relation_rows(connection: &Connection) -> Result<Vec<RawRelationRow>> {
