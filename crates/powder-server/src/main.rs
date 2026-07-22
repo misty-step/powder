@@ -38,13 +38,13 @@ use powder_core::{
     canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
     parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
     CardFieldError, CardId, CardStatus, DenialClass, DetailLevel, PapercutReport, ReadyCursor,
-    ReadyQuery, RunId, RunTelemetryAggregateQuery, RunTelemetryAttemptInput, RunTelemetrySummary, RunTelemetryWrite,
+    ReadyQuery, RunId, RunTelemetryAggregateQuery, RunTelemetryAttemptInput, RunTelemetryWrite,
 };
 use powder_shell::unix_now;
 use powder_store::{
     ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig,
-    KeyedOperationContext, RepositoryTier, RepositoryUpsert, RepositoryVisibility, SearchQuery,
-    Store, StoreError, PricingConfig,
+    KeyedOperationContext, PricingConfig, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
+    SearchQuery, Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -702,8 +702,6 @@ struct EventSubscriptionRequest {
 struct RunTelemetryRequest {
     #[serde(default)]
     attempts: Vec<RunTelemetryAttemptInput>,
-    #[serde(default)]
-    summary: Option<RunTelemetrySummary>,
 }
 #[derive(Debug, Deserialize, Default)]
 struct RunTelemetryAggregateParams {
@@ -951,7 +949,10 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/cards/{id}/work-log", post(append_work_log))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
         .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
-        .route("/api/v1/runs/telemetry/aggregate", get(run_telemetry_aggregate))
+        .route(
+            "/api/v1/runs/telemetry/aggregate",
+            get(run_telemetry_aggregate),
+        )
         .route("/api/v1/runs/{id}", get(get_run))
         .route("/api/v1/runs/{id}/telemetry", post(record_run_telemetry))
         .route("/api/v1/runs/{id}/input", post(request_input))
@@ -2044,23 +2045,45 @@ async fn answer_input(
 }
 
 async fn record_run_telemetry(
-    State(state): State<AppState>, AuthActor(actor): AuthActor, headers: HeaderMap,
-    Path(id): Path<String>, Json(request): Json<RunTelemetryRequest>,
+    State(state): State<AppState>,
+    AuthActor(actor): AuthActor,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<RunTelemetryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let run_id = RunId::new(id)?;
-    let write = RunTelemetryWrite { attempts: request.attempts, summary: request.summary };
+    let write = RunTelemetryWrite {
+        attempts: request.attempts,
+    };
     let key = required_idempotency_key(&headers)?;
-    let pricing = PricingConfig::from_env().map_err(|err| ApiError::internal(format!("pricing config: {err}")))?;
-    let receipt = lock_store(&state)?.record_run_telemetry_with_pricing(&run_id, &write, unix_now(), key, &actor.authority(), pricing.as_ref())?.value;
-    Ok(Json(json!(receipt)))
+    let pricing = PricingConfig::from_env()
+        .map_err(|err| ApiError::internal(format!("pricing config: {err}")))?;
+    let outcome = lock_store(&state)?.record_run_telemetry_with_pricing(
+        &run_id,
+        &write,
+        unix_now(),
+        key,
+        &actor.authority(),
+        pricing.as_ref(),
+    )?;
+    Ok(Json(json!(outcome.value.with_replayed(outcome.replayed))))
 }
 
 async fn run_telemetry_aggregate(
-    State(state): State<AppState>, headers: HeaderMap, Query(params): Query<RunTelemetryAggregateParams>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<RunTelemetryAggregateParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
-    let query = RunTelemetryAggregateQuery { agent: params.agent, model: params.model, provider: params.provider, limit: params.limit.unwrap_or(100) };
-    Ok(Json(json!(lock_store(&state)?.run_telemetry_aggregate(&query)?)))
+    let query = RunTelemetryAggregateQuery {
+        agent: params.agent,
+        model: params.model,
+        provider: params.provider,
+        limit: params.limit.unwrap_or(100),
+    };
+    Ok(Json(json!(
+        lock_store(&state)?.run_telemetry_aggregate(&query)?
+    )))
 }
 
 async fn get_run(
@@ -2914,6 +2937,14 @@ impl From<powder_core::DomainError> for ApiError {
                     denial_class,
                 }
             }
+            powder_core::DomainError::AuthorityDenied {
+                class: DenialClass::IdempotencyConflict,
+                ..
+            } => Self {
+                status: StatusCode::CONFLICT,
+                message: value.to_string(),
+                denial_class,
+            },
             powder_core::DomainError::Forbidden(_)
             | powder_core::DomainError::AuthorityDenied { .. } => Self {
                 status: StatusCode::FORBIDDEN,

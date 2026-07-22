@@ -8833,13 +8833,25 @@ fn every_keyed_matrix_operation_has_one_store_executor() {
 fn run_telemetry_is_keyed_normalized_priced_and_aggregated() -> Result<()> {
     let path = temp_db("telemetry");
     let card_id = CardId::new("telemetry-card")?;
-    let (run_id, authority) = {
+    let (run_id, bare_run_id, authority) = {
         let mut store = Store::open(&path)?;
         store.migrate()?;
-        store.import_cards(vec![ready_card("telemetry-card", 1)])?;
+        store.import_cards(vec![
+            ready_card("telemetry-card", 1),
+            ready_card("bare-telemetry-card", 1),
+        ])?;
         let authority = Authority::principal("telemetry-principal", false);
         let receipt = store.claim_card(&card_id, "agent-a", 2, 600, &authority)?;
-        (receipt.run_id, authority)
+        let bare_run_id = store
+            .claim_card(
+                &CardId::new("bare-telemetry-card")?,
+                "agent-a",
+                2,
+                600,
+                &authority,
+            )?
+            .run_id;
+        (receipt.run_id, bare_run_id, authority)
     };
     let pricing = PricingConfig::from_json_str(
         r#"{"version":"prices-2026-07","rates":[{"provider":"acme","model":"model-a","version":"rate-a","input_rate_usd_per_million_micros":1000000,"output_rate_usd_per_million_micros":2000000,"reasoning_rate_usd_per_million_micros":3000000}]}"#,
@@ -8859,6 +8871,15 @@ fn run_telemetry_is_keyed_normalized_priced_and_aggregated() -> Result<()> {
                 ..Default::default()
             },
             RunTelemetryAttemptInput {
+                provider: Some("acme".into()),
+                model: Some("model-a".into()),
+                harness: Some("codex".into()),
+                input_tokens: Some(5),
+                output_tokens: Some(2),
+                outcome: Some("error".into()),
+                ..Default::default()
+            },
+            RunTelemetryAttemptInput {
                 provider: None,
                 model: None,
                 harness: None,
@@ -8868,7 +8889,6 @@ fn run_telemetry_is_keyed_normalized_priced_and_aggregated() -> Result<()> {
                 ..Default::default()
             },
         ],
-        summary: None,
     };
     let first = {
         let mut store = Store::open(&path)?;
@@ -8901,14 +8921,207 @@ fn run_telemetry_is_keyed_normalized_priced_and_aggregated() -> Result<()> {
     let mut store = store;
     store.migrate()?;
     let run = store.get_run(&run_id)?.unwrap();
-    assert_eq!(run.telemetry.unwrap().estimated_cost_usd_micros, Some(230));
+    let telemetry = run.telemetry.as_ref().expect("telemetry summary");
+    assert_eq!(telemetry.estimated_cost_usd_micros, Some(239));
     let aggregate = store.run_telemetry_aggregate(&RunTelemetryAggregateQuery::default())?;
     assert_eq!(aggregate.rows.len(), 2);
+    assert_eq!(aggregate.total_rows, 2);
+    assert!(!aggregate.has_more);
     assert!(aggregate.rows.iter().any(|row| row.unattributed));
-    assert!(aggregate
+    let attributed = aggregate
         .rows
         .iter()
-        .any(|row| row.model == "model-a" && row.input_tokens == 100));
+        .find(|row| row.model == "model-a")
+        .expect("attributed telemetry group");
+    assert_eq!(attributed.runs, 1);
+    assert_eq!(attributed.attempts, 2);
+    assert_eq!(attributed.outcome_mix.get("success"), Some(&1));
+    assert_eq!(attributed.outcome_mix.get("error"), Some(&1));
+    assert_eq!(attributed.input_tokens, 105);
+    let limited = store.run_telemetry_aggregate(&RunTelemetryAggregateQuery {
+        limit: 1,
+        ..RunTelemetryAggregateQuery::default()
+    })?;
+    assert_eq!(limited.rows.len(), 1);
+    assert_eq!(limited.total_rows, 2);
+    assert!(limited.has_more);
+    let model_only = store.run_telemetry_aggregate(&RunTelemetryAggregateQuery {
+        model: Some("model-a".to_string()),
+        limit: 1,
+        ..RunTelemetryAggregateQuery::default()
+    })?;
+    assert_eq!(model_only.rows[0].attempts, 2);
+    assert_eq!(model_only.rows[0].runs, 1);
+    assert_eq!(model_only.rows[0].outcome_mix.len(), 2);
+    assert_eq!(telemetry.attempt_count, 3);
+    assert_eq!(telemetry.input_tokens, Some(112));
+    let bare_store = Store::open(&path)?;
+    assert!(bare_store
+        .get_run(&bare_run_id)?
+        .unwrap()
+        .telemetry
+        .is_none());
+    std::fs::remove_file(path).ok();
+    Ok(())
+}
+
+#[test]
+fn run_telemetry_rejects_negative_and_overflow_values() -> Result<()> {
+    let path = temp_db("telemetry-validation");
+    let card_id = CardId::new("telemetry-validation-card")?;
+    let (run_id, authority) = {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        store.import_cards(vec![ready_card("telemetry-validation-card", 1)])?;
+        let authority = Authority::principal("telemetry-validation-principal", false);
+        let run_id = store
+            .claim_card(&card_id, "agent-validation", 2, 600, &authority)?
+            .run_id;
+        (run_id, authority)
+    };
+
+    let cases = [
+        (
+            "telemetry.input_tokens",
+            RunTelemetryAttemptInput {
+                input_tokens: Some(-1),
+                ..Default::default()
+            },
+        ),
+        (
+            "telemetry.output_tokens",
+            RunTelemetryAttemptInput {
+                output_tokens: Some(-1),
+                ..Default::default()
+            },
+        ),
+        (
+            "telemetry.reasoning_tokens",
+            RunTelemetryAttemptInput {
+                reasoning_tokens: Some(-1),
+                ..Default::default()
+            },
+        ),
+        (
+            "telemetry.duration_ms",
+            RunTelemetryAttemptInput {
+                duration_ms: Some(-1),
+                ..Default::default()
+            },
+        ),
+        (
+            "telemetry.input_rate_usd_per_million_micros",
+            RunTelemetryAttemptInput {
+                input_rate_usd_per_million_micros: Some(-1),
+                ..Default::default()
+            },
+        ),
+        (
+            "telemetry.output_rate_usd_per_million_micros",
+            RunTelemetryAttemptInput {
+                output_rate_usd_per_million_micros: Some(-1),
+                ..Default::default()
+            },
+        ),
+        (
+            "telemetry.reasoning_rate_usd_per_million_micros",
+            RunTelemetryAttemptInput {
+                reasoning_rate_usd_per_million_micros: Some(-1),
+                ..Default::default()
+            },
+        ),
+        (
+            "telemetry.estimated_cost_usd_micros",
+            RunTelemetryAttemptInput {
+                estimated_cost_usd_micros: Some(-1),
+                ..Default::default()
+            },
+        ),
+    ];
+    for (key, (field, attempt)) in cases
+        .into_iter()
+        .enumerate()
+        .map(|(index, case)| (format!("negative-{index}"), case))
+    {
+        let mut store = Store::open(&path)?;
+        store.migrate()?;
+        let error = store.record_run_telemetry(
+            &run_id,
+            &RunTelemetryWrite {
+                attempts: vec![attempt],
+            },
+            3,
+            &key,
+            &authority,
+        );
+        match error {
+            Err(StoreError::Domain(DomainError::Validation { field: actual, .. })) => {
+                assert_eq!(actual, field)
+            }
+            other => panic!("expected validation error for {field}, got {other:?}"),
+        }
+    }
+
+    let overflow = RunTelemetryAttemptInput {
+        input_tokens: Some(i64::MAX),
+        input_rate_usd_per_million_micros: Some(i64::MAX),
+        ..Default::default()
+    };
+    let mut store = Store::open(&path)?;
+    store.migrate()?;
+    let error = store.record_run_telemetry(
+        &run_id,
+        &RunTelemetryWrite {
+            attempts: vec![overflow],
+        },
+        4,
+        "overflow",
+        &authority,
+    );
+    assert!(matches!(
+        error,
+        Err(StoreError::Domain(DomainError::Validation {
+            field: "telemetry.estimated_cost_usd_micros",
+            ..
+        }))
+    ));
+
+    let empty = store.record_run_telemetry(
+        &run_id,
+        &RunTelemetryWrite::default(),
+        5,
+        "empty",
+        &authority,
+    );
+    assert!(matches!(
+        empty,
+        Err(StoreError::Domain(DomainError::Validation {
+            field: "telemetry.attempts",
+            ..
+        }))
+    ));
+
+    let zero = store.record_run_telemetry(
+        &run_id,
+        &RunTelemetryWrite {
+            attempts: vec![RunTelemetryAttemptInput {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                reasoning_tokens: Some(0),
+                estimated_cost_usd_micros: Some(0),
+                duration_ms: Some(0),
+                input_rate_usd_per_million_micros: Some(0),
+                output_rate_usd_per_million_micros: Some(0),
+                reasoning_rate_usd_per_million_micros: Some(0),
+                ..Default::default()
+            }],
+        },
+        6,
+        "zero",
+        &authority,
+    )?;
+    assert_eq!(zero.value.telemetry.attempt_count, 1);
+    assert_eq!(zero.value.telemetry.input_tokens, Some(0));
     std::fs::remove_file(path).ok();
     Ok(())
 }

@@ -10,8 +10,8 @@ use powder_core::{
 };
 use powder_store::{
     BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput,
-    KeyedOperationContext, RepositoryTier, RepositoryUpsert, RepositoryVisibility, SearchQuery,
-    Store, PricingConfig,
+    KeyedOperationContext, PricingConfig, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
+    SearchQuery, Store,
 };
 use serde_json::{json, Value};
 
@@ -116,7 +116,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "record_run_telemetry",
         description: "Write nullable run-scoped telemetry attempts atomically with authenticated caller-keyed idempotency and audit evidence; repeated provider/model/harness attempts stay normalized and missing attribution is preserved.",
-        input_schema: r#"{"type":"object","required":["run_id","attempts","idempotency_key"],"properties":{"run_id":{"type":"string"},"attempts":{"type":"array","items":{"type":"object"}},"summary":{"type":"object"},"idempotency_key":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["run_id","attempts","idempotency_key"],"properties":{"run_id":{"type":"string"},"attempts":{"type":"array","items":{"type":"object"}},"idempotency_key":{"type":"string"}}}"#,
     },
     ToolDef {
         name: "run_telemetry_aggregate",
@@ -708,16 +708,31 @@ pub fn call_tool_store_with_authority(
         }
         "record_run_telemetry" => {
             let run_id = run_id(args, "run_id")?;
-            let write: RunTelemetryWrite = serde_json::from_value(json!({"attempts": args["attempts"], "summary": args["summary"]})).map_err(to_string)?;
+            let write: RunTelemetryWrite =
+                serde_json::from_value(json!({"attempts": args["attempts"]})).map_err(to_string)?;
             let pricing = PricingConfig::from_env().map_err(to_string)?;
-            let outcome = store.record_run_telemetry_with_pricing(&run_id, &write, now, required_idempotency_key(args)?, authority_arg(args, authority)?, pricing.as_ref()).map_err(to_string)?;
-            json!(outcome.value)
+            let outcome = store
+                .record_run_telemetry_with_pricing(
+                    &run_id,
+                    &write,
+                    now,
+                    required_idempotency_key(args)?,
+                    authority_arg(args, authority)?,
+                    pricing.as_ref(),
+                )
+                .map_err(to_string)?;
+            keyed_value(outcome)?
         }
         "run_telemetry_aggregate" => {
-            let query = RunTelemetryAggregateQuery { agent: optional_str(args, "agent").map(str::to_owned), model: optional_str(args, "model").map(str::to_owned), provider: optional_str(args, "provider").map(str::to_owned), limit: args["limit"].as_u64().unwrap_or(100) as usize };
+            let query = RunTelemetryAggregateQuery {
+                agent: optional_str(args, "agent").map(str::to_owned),
+                model: optional_str(args, "model").map(str::to_owned),
+                provider: optional_str(args, "provider").map(str::to_owned),
+                limit: args["limit"].as_u64().unwrap_or(100) as usize,
+            };
             json!(store.run_telemetry_aggregate(&query).map_err(to_string)?)
         }
-                "get_run" => {
+        "get_run" => {
             let run_id = run_id(args, "run_id")?;
             json!(store
                 .get_run_detail(&run_id, detail_arg(args)?)
@@ -1029,11 +1044,20 @@ fn local_mutation_authority_preflight(
         "upsert_repository" | "merge_repository_alias" | "delete_repository" => {
             admin_authority_arg(args, transport_authority).map(|_| ())
         }
-        "create_card" | "update_card" | "manage_claim" | "answer_input" | "update_status"
-        | "check_criterion" | "update_relations" | "add_link" | "add_comment"
-        | "append_work_log" | "report_papercut" | "request_input" | "complete_card" | "record_run_telemetry" => {
-            authority_arg(args, transport_authority).map(|_| ())
-        }
+        "create_card"
+        | "update_card"
+        | "manage_claim"
+        | "answer_input"
+        | "update_status"
+        | "check_criterion"
+        | "update_relations"
+        | "add_link"
+        | "add_comment"
+        | "append_work_log"
+        | "report_papercut"
+        | "request_input"
+        | "complete_card"
+        | "record_run_telemetry" => authority_arg(args, transport_authority).map(|_| ()),
         _ => Ok(()),
     }
 }

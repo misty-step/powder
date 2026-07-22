@@ -39,7 +39,6 @@ pub use events::{
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
 pub use identity::{ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
-pub use telemetry::{PricingConfig, PricingRate};
 use relations::{list_delta, mirror_delta_with_authority, mirror_initial_relations_with_authority};
 pub use relations::{
     ParentCoverageAssignment, ParentCoverageBucket, ParentCoverageReport, ParentDoctorIssue,
@@ -58,6 +57,7 @@ pub use repositories::{
 /// build of `powder-store` expects, rather than only being able to ask "did
 /// migration succeed" after the fact.
 pub use schema::SCHEMA_VERSION;
+pub use telemetry::{PricingConfig, PricingRate};
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
@@ -1996,23 +1996,59 @@ impl Store {
     }
 
     fn migrate_27_to_28(&mut self) -> Result<()> {
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (column, sql) in [
-            ("telemetry_attempt_count", "ALTER TABLE runs ADD COLUMN telemetry_attempt_count INTEGER;"),
-            ("telemetry_input_tokens", "ALTER TABLE runs ADD COLUMN telemetry_input_tokens INTEGER;"),
-            ("telemetry_output_tokens", "ALTER TABLE runs ADD COLUMN telemetry_output_tokens INTEGER;"),
-            ("telemetry_reasoning_tokens", "ALTER TABLE runs ADD COLUMN telemetry_reasoning_tokens INTEGER;"),
-            ("telemetry_estimated_cost_usd_micros", "ALTER TABLE runs ADD COLUMN telemetry_estimated_cost_usd_micros INTEGER;"),
-            ("telemetry_duration_ms", "ALTER TABLE runs ADD COLUMN telemetry_duration_ms INTEGER;"),
-            ("telemetry_pricing_version", "ALTER TABLE runs ADD COLUMN telemetry_pricing_version TEXT;"),
-            ("telemetry_outcome", "ALTER TABLE runs ADD COLUMN telemetry_outcome TEXT;"),
-            ("telemetry_unattributed_attempt_count", "ALTER TABLE runs ADD COLUMN telemetry_unattributed_attempt_count INTEGER;"),
+            (
+                "telemetry_attempt_count",
+                "ALTER TABLE runs ADD COLUMN telemetry_attempt_count INTEGER;",
+            ),
+            (
+                "telemetry_input_tokens",
+                "ALTER TABLE runs ADD COLUMN telemetry_input_tokens INTEGER;",
+            ),
+            (
+                "telemetry_output_tokens",
+                "ALTER TABLE runs ADD COLUMN telemetry_output_tokens INTEGER;",
+            ),
+            (
+                "telemetry_reasoning_tokens",
+                "ALTER TABLE runs ADD COLUMN telemetry_reasoning_tokens INTEGER;",
+            ),
+            (
+                "telemetry_estimated_cost_usd_micros",
+                "ALTER TABLE runs ADD COLUMN telemetry_estimated_cost_usd_micros INTEGER;",
+            ),
+            (
+                "telemetry_duration_ms",
+                "ALTER TABLE runs ADD COLUMN telemetry_duration_ms INTEGER;",
+            ),
+            (
+                "telemetry_pricing_version",
+                "ALTER TABLE runs ADD COLUMN telemetry_pricing_version TEXT;",
+            ),
+            (
+                "telemetry_outcome",
+                "ALTER TABLE runs ADD COLUMN telemetry_outcome TEXT;",
+            ),
+            (
+                "telemetry_unattributed_attempt_count",
+                "ALTER TABLE runs ADD COLUMN telemetry_unattributed_attempt_count INTEGER;",
+            ),
         ] {
-            let present: i64 = transaction.query_row("SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = ?1", [column], |row| row.get(0))?;
-            if present == 0 { transaction.execute_batch(sql)?; }
+            let present: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = ?1",
+                [column],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                transaction.execute_batch(sql)?;
+            }
         }
         transaction.execute_batch("CREATE TABLE IF NOT EXISTS run_telemetry_attempts (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, provider TEXT, model TEXT, harness TEXT, reasoning TEXT, input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd_micros INTEGER, duration_ms INTEGER, outcome TEXT, pricing_version TEXT, input_rate_usd_per_million_micros INTEGER, output_rate_usd_per_million_micros INTEGER, reasoning_rate_usd_per_million_micros INTEGER, principal TEXT, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_run ON run_telemetry_attempts(run_id, created_at, id); CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_model ON run_telemetry_attempts(model, provider, created_at);")?;
-        transaction.commit()?; Ok(())
+        transaction.commit()?;
+        Ok(())
     }
 
     fn migrate_25_to_26(&self) -> Result<()> {
@@ -6430,7 +6466,15 @@ struct RunRecord {
     agent: String,
     claim_expires_at: i64,
     proof: Option<String>,
-    telemetry_attempt_count: Option<i64>, telemetry_input_tokens: Option<i64>, telemetry_output_tokens: Option<i64>, telemetry_reasoning_tokens: Option<i64>, telemetry_estimated_cost_usd_micros: Option<i64>, telemetry_duration_ms: Option<i64>, telemetry_pricing_version: Option<String>, telemetry_outcome: Option<String>, telemetry_unattributed_attempt_count: Option<i64>,
+    telemetry_attempt_count: Option<i64>,
+    telemetry_input_tokens: Option<i64>,
+    telemetry_output_tokens: Option<i64>,
+    telemetry_reasoning_tokens: Option<i64>,
+    telemetry_estimated_cost_usd_micros: Option<i64>,
+    telemetry_duration_ms: Option<i64>,
+    telemetry_pricing_version: Option<String>,
+    telemetry_outcome: Option<String>,
+    telemetry_unattributed_attempt_count: Option<i64>,
     created_at: i64,
     updated_at: i64,
 }
@@ -6446,7 +6490,15 @@ impl RunRecord {
             agent: row.get(5)?,
             claim_expires_at: row.get(6)?,
             proof: row.get(7)?,
-            telemetry_attempt_count: row.get(8)?, telemetry_input_tokens: row.get(9)?, telemetry_output_tokens: row.get(10)?, telemetry_reasoning_tokens: row.get(11)?, telemetry_estimated_cost_usd_micros: row.get(12)?, telemetry_duration_ms: row.get(13)?, telemetry_pricing_version: row.get(14)?, telemetry_outcome: row.get(15)?, telemetry_unattributed_attempt_count: row.get(16)?,
+            telemetry_attempt_count: row.get(8)?,
+            telemetry_input_tokens: row.get(9)?,
+            telemetry_output_tokens: row.get(10)?,
+            telemetry_reasoning_tokens: row.get(11)?,
+            telemetry_estimated_cost_usd_micros: row.get(12)?,
+            telemetry_duration_ms: row.get(13)?,
+            telemetry_pricing_version: row.get(14)?,
+            telemetry_outcome: row.get(15)?,
+            telemetry_unattributed_attempt_count: row.get(16)?,
             created_at: row.get(17)?,
             updated_at: row.get(18)?,
         })
@@ -6465,7 +6517,21 @@ impl RunRecord {
             agent: self.agent,
             claim_expires_at: self.claim_expires_at,
             proof: self.proof,
-            telemetry: self.telemetry_attempt_count.map(|attempt_count| powder_core::RunTelemetrySummary { attempt_count, input_tokens: self.telemetry_input_tokens, output_tokens: self.telemetry_output_tokens, reasoning_tokens: self.telemetry_reasoning_tokens, estimated_cost_usd_micros: self.telemetry_estimated_cost_usd_micros, duration_ms: self.telemetry_duration_ms, pricing_version: self.telemetry_pricing_version, outcome: self.telemetry_outcome, unattributed_attempt_count: self.telemetry_unattributed_attempt_count.unwrap_or(0) }),
+            telemetry: self.telemetry_attempt_count.map(|attempt_count| {
+                powder_core::RunTelemetrySummary {
+                    attempt_count,
+                    input_tokens: self.telemetry_input_tokens,
+                    output_tokens: self.telemetry_output_tokens,
+                    reasoning_tokens: self.telemetry_reasoning_tokens,
+                    estimated_cost_usd_micros: self.telemetry_estimated_cost_usd_micros,
+                    duration_ms: self.telemetry_duration_ms,
+                    pricing_version: self.telemetry_pricing_version,
+                    outcome: self.telemetry_outcome,
+                    unattributed_attempt_count: self
+                        .telemetry_unattributed_attempt_count
+                        .unwrap_or(0),
+                }
+            }),
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

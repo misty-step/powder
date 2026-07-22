@@ -1656,7 +1656,7 @@ pub struct Run {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunTelemetrySummary {
     pub attempt_count: i64,
     pub input_tokens: Option<i64>,
@@ -1668,31 +1668,82 @@ pub struct RunTelemetrySummary {
     pub outcome: Option<String>,
     pub unattributed_attempt_count: i64,
 }
-impl Default for RunTelemetrySummary {
-    fn default() -> Self { Self { attempt_count: 0, input_tokens: None, output_tokens: None, reasoning_tokens: None, estimated_cost_usd_micros: None, duration_ms: None, pricing_version: None, outcome: None, unattributed_attempt_count: 0 } }
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunTelemetryAttemptInput {
-    pub provider: Option<String>, pub model: Option<String>, pub harness: Option<String>, pub reasoning: Option<String>,
-    pub input_tokens: Option<i64>, pub output_tokens: Option<i64>, pub reasoning_tokens: Option<i64>,
-    pub estimated_cost_usd_micros: Option<i64>, pub duration_ms: Option<i64>, pub outcome: Option<String>,
-    pub pricing_version: Option<String>, pub input_rate_usd_per_million_micros: Option<i64>,
-    pub output_rate_usd_per_million_micros: Option<i64>, pub reasoning_rate_usd_per_million_micros: Option<i64>,
-}
-impl Default for RunTelemetryAttemptInput {
-    fn default() -> Self { Self { provider: None, model: None, harness: None, reasoning: None, input_tokens: None, output_tokens: None, reasoning_tokens: None, estimated_cost_usd_micros: None, duration_ms: None, outcome: None, pricing_version: None, input_rate_usd_per_million_micros: None, output_rate_usd_per_million_micros: None, reasoning_rate_usd_per_million_micros: None } }
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub harness: Option<String>,
+    pub reasoning: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub estimated_cost_usd_micros: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub outcome: Option<String>,
+    pub pricing_version: Option<String>,
+    pub input_rate_usd_per_million_micros: Option<i64>,
+    pub output_rate_usd_per_million_micros: Option<i64>,
+    pub reasoning_rate_usd_per_million_micros: Option<i64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RunTelemetryWrite { #[serde(default)] pub attempts: Vec<RunTelemetryAttemptInput>, #[serde(default)] pub summary: Option<RunTelemetrySummary> }
+pub struct RunTelemetryWrite {
+    #[serde(default)]
+    pub attempts: Vec<RunTelemetryAttemptInput>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryReceipt { pub run_id: RunId, pub principal: String, pub attempt_count: i64, pub telemetry: RunTelemetrySummary, pub replayed: bool }
+pub struct RunTelemetryReceipt {
+    pub run_id: RunId,
+    pub principal: String,
+    pub attempt_count: i64,
+    pub telemetry: RunTelemetrySummary,
+    pub replayed: bool,
+}
+
+impl RunTelemetryReceipt {
+    /// Carry the outer keyed-operation replay bit into the domain receipt.
+    pub fn with_replayed(mut self, replayed: bool) -> Self {
+        self.replayed = replayed;
+        self
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryAggregateQuery { pub agent: Option<String>, pub model: Option<String>, pub provider: Option<String>, pub limit: usize }
-impl Default for RunTelemetryAggregateQuery { fn default() -> Self { Self { agent: None, model: None, provider: None, limit: 100 } } }
+pub struct RunTelemetryAggregateQuery {
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub limit: usize,
+}
+impl Default for RunTelemetryAggregateQuery {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            model: None,
+            provider: None,
+            limit: 100,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryAggregateRow { pub agent: String, pub model: String, pub provider: String, pub unattributed: bool, pub runs: i64, pub attempts: i64, pub input_tokens: i64, pub output_tokens: i64, pub reasoning_tokens: i64, pub estimated_cost_usd_micros: i64, pub duration_ms: i64, pub outcome_mix: std::collections::BTreeMap<String, i64> }
+pub struct RunTelemetryAggregateRow {
+    pub agent: String,
+    pub model: String,
+    pub provider: String,
+    pub unattributed: bool,
+    pub runs: i64,
+    pub attempts: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub estimated_cost_usd_micros: i64,
+    pub duration_ms: i64,
+    pub outcome_mix: std::collections::BTreeMap<String, i64>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryAggregate { pub rows: Vec<RunTelemetryAggregateRow>, pub total_rows: i64 }
+pub struct RunTelemetryAggregate {
+    pub rows: Vec<RunTelemetryAggregateRow>,
+    pub total_rows: i64,
+    pub has_more: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Activity {
