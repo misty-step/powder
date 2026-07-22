@@ -674,7 +674,7 @@ fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
                 kind: ParentIssueKind::InvalidStoredId,
                 evidence: format!(
                     "cards.id row {} is not a non-empty text id: {}",
-                    row.rowid, &row.card_description
+                    row.rowid, row.card_description
                 ),
                 repaired: false,
             });
