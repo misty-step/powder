@@ -1946,9 +1946,9 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   }
 
   .pw-filter-btn, .pw-icon-btn {
-    min-width: 44px;
-    height: 44px;
-    min-height: 44px;
+    min-width: var(--pw-touch-target);
+    min-height: var(--pw-touch-target);
+    height: var(--pw-touch-target);
   }
 
   .pw-filters {
@@ -1961,17 +1961,17 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   }
 
   .pw-filter-group .pw-search, .pw-filter-group .pw-sort {
+    min-height: var(--pw-touch-target);
     box-sizing: border-box;
     flex: auto;
-    min-height: 44px;
   }
 
   .pw-search input, .pw-sort, .pw-chip-btn, .pw-chip-btn .pw-chip {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-filter-clear {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
     margin-left: 0;
     padding-inline: .6rem;
   }

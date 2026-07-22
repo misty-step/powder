@@ -42,8 +42,9 @@ html[data-pw-route='card'] .pw-app {
 }
 
 /* ── base component primitives (Powder-owned and token-backed) ───────────────
-   Every value is a token reference; no raw hex or px literals. The scoped
-   overrides below (e.g. .pw-quick-add-form .pw-chrome) layer on top. */
+   Semantic color, focus, and touch-target roles use named tokens here. Localized
+   geometry and type literals remain current debt; ui/TOKENS.md records the scope
+   and the later tone-token work that governs it. */
 
 body {
   margin: 0;
@@ -721,8 +722,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 /* powder-ui-tone-down-tokens: the panel title is the one place hierarchy
    reads on this surface — a text-lg semibold title over sm/base labels —
-   so the type scale is exercised without exceeding the still-enforced
-   one-size law on the unmigrated board. */
+   so the type scale is exercised with deliberate hierarchy. */
 .pw-quick-add-title {
   margin: 0;
   font-size: var(--text-lg);
@@ -742,8 +742,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
   display: block;
 }
 
-/* scoped theme for the shared .pw-chrome label and .pw-input control.
-   Every value below is a token reference; literals live in tokens.css. */
+/* Scoped theme for the shared .pw-chrome label and .pw-input control.
+   Their semantic colors, spacing, type, border, radius, and motion values use
+   named tokens; relative layout values remain local to the component. */
 .pw-quick-add-form .pw-chrome {
   display: block;
   margin-bottom: var(--pw-space-1);
@@ -791,9 +792,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   margin-top: var(--pw-space-1);
 }
 
-/* scoped re-theme of the shared .pw-button pair so the action row reads
-   from the new role tokens. min-height is left to the base .pw-button so no
-   px literal enters the migrated view code. */
+/* Scoped re-theme of the shared .pw-button pair so the action row reads
+   from the role tokens. Its base min-height remains owned by .pw-button. */
 .pw-quick-add-actions .pw-button {
   border-radius: var(--radius-0);
   font-size: var(--text-sm);
@@ -1644,9 +1644,8 @@ html:not([data-pw-route='card']) .pw-detail-app {
   width: 100%;
 }
 
-/* scoped re-theme of the shared .pw-search field the combobox wraps, so the
-   quick-add repo input reads from the new role tokens (the filters-panel
-   .pw-search stays on the comic-ops kit until its own migration card). */
+/* Scoped re-theme of the shared .pw-search field the combobox wraps, so the
+   quick-add repo input reads from the same role tokens as the filters panel. */
 .pw-quick-add-form .pw-combo-field {
   display: inline-flex;
   align-items: center;
@@ -1927,9 +1926,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
   .pw-filter-btn,
   .pw-icon-btn {
-    min-width: 44px;
-    min-height: 44px;
-    height: 44px;
+    min-width: var(--pw-touch-target);
+    min-height: var(--pw-touch-target);
+    height: var(--pw-touch-target);
   }
 
   .pw-filters {
@@ -1944,22 +1943,22 @@ html:not([data-pw-route='card']) .pw-detail-app {
   .pw-filter-group .pw-search,
   .pw-filter-group .pw-sort {
     flex: 1 1 auto;
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
     box-sizing: border-box;
   }
 
   .pw-search input,
   .pw-sort {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-chip-btn,
   .pw-chip-btn .pw-chip {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
   }
 
   .pw-filter-clear {
-    min-height: 44px;
+    min-height: var(--pw-touch-target);
     padding-inline: 0.6rem;
     margin-left: 0;
   }
