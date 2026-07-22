@@ -2245,6 +2245,15 @@ async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
         .unwrap()
         .raw_key;
     seed_rollup_fixture(&private_state, &private_admin_key).await;
+    let mut admin_dangling = ready_order_fixture_card("admin-dangling", Priority::P2, 5)
+        .with_parent(Some(CardId::new("missing-admin-parent").unwrap()));
+    admin_dangling.repo = Some("secret-rollups".to_string());
+    private_state
+        .store
+        .lock()
+        .unwrap()
+        .import_cards(vec![admin_dangling])
+        .unwrap();
     let private_app = app(private_state);
 
     let no_bearer = private_app
@@ -2277,8 +2286,29 @@ async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
         .await
         .unwrap();
     assert_eq!(admin_hidden.status(), StatusCode::OK);
-    let admin_hidden_body = response_text(admin_hidden).await;
+    let admin_hidden = response_json(admin_hidden).await;
+    assert_eq!(admin_hidden["coverage"]["total_cards"], 5);
+    assert_eq!(admin_hidden["coverage"]["accounted_cards"], 4);
+    assert_eq!(admin_hidden["coverage"]["parent_issue_count"], 1);
+    let admin_status_sum: u64 = admin_hidden["rollups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row["status_counts"].as_object().unwrap().values())
+        .map(|count| count.as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        admin_status_sum + admin_hidden["coverage"]["root_epics"].as_u64().unwrap(),
+        admin_hidden["coverage"]["accounted_cards"]
+            .as_u64()
+            .unwrap(),
+    );
+    assert!(!admin_hidden["coverage"]["complete"].as_bool().unwrap());
+    let admin_hidden_body = serde_json::to_string(&admin_hidden).unwrap();
     assert!(admin_hidden_body.contains("secret-rollups"));
+    assert!(!admin_hidden_body.contains("admin-dangling"));
+    assert!(admin_hidden_body.contains("\"title\":\"Unsorted\""));
+    assert!(!admin_hidden_body.contains("\"card_id\":\"secret-rollup\""));
 
     let (public_state, public_admin_key) = test_state_with_public_reads(AuthMode::ApiKey, true);
     seed_rollup_fixture(&public_state, &public_admin_key).await;

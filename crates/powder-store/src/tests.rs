@@ -6866,6 +6866,70 @@ fn board_rollups_report_dirty_parent_edges_without_leaking_issues() -> Result<()
 }
 
 #[test]
+fn board_rollups_global_excludes_dangling_and_invalid_parent_rows() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("admin-dangling", 1),
+        ready_card("admin-invalid", 2),
+    ])?;
+    store.connection.execute(
+        "UPDATE cards SET parent = 'missing-parent' WHERE id = 'admin-dangling'",
+        [],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET parent = X'01' WHERE id = 'admin-invalid'",
+        [],
+    )?;
+
+    let global = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: true,
+        ..Default::default()
+    })?;
+    assert_eq!(global.total_count, 0);
+    assert!(global.rollups.is_empty());
+    assert_eq!(global.coverage.total_cards, 2);
+    assert_eq!(global.coverage.accounted_cards, 0);
+    assert_eq!(global.coverage.parent_issue_count, 2);
+    let global_status_sum: usize = global
+        .rollups
+        .iter()
+        .flat_map(|row| row.status_counts.values())
+        .sum();
+    assert_eq!(
+        global_status_sum + global.coverage.root_epics,
+        global.coverage.accounted_cards,
+    );
+    assert!(!global.coverage.complete);
+
+    let scoped = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert_eq!(scoped.total_count, 1);
+    assert_eq!(scoped.coverage.total_cards, 2);
+    assert_eq!(scoped.coverage.accounted_cards, 1);
+    assert_eq!(scoped.coverage.parent_issue_count, 1);
+    let scoped_status_sum: usize = scoped
+        .rollups
+        .iter()
+        .flat_map(|row| row.status_counts.values())
+        .sum();
+    assert_eq!(
+        scoped_status_sum + scoped.coverage.root_epics,
+        scoped.coverage.accounted_cards,
+    );
+    assert!(!scoped.coverage.complete);
+    assert_eq!(scoped.rollups[0].title, "General");
+    assert_eq!(scoped.rollups[0].status_counts.get("ready"), Some(&1));
+    Ok(())
+}
+
+#[test]
 fn board_rollups_respect_hidden_repository_scope() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

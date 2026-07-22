@@ -2480,9 +2480,13 @@ impl Store {
                 SELECT c.*
                 FROM visible_cards c
                 WHERE c.parent IS NULL
-                   OR NOT EXISTS (
-                       SELECT 1 FROM visible_cards parent
-                       WHERE parent.id = c.parent
+                   OR (
+                       ?1 = 0
+                       AND typeof(c.parent) = 'text'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM visible_cards parent
+                           WHERE parent.id = c.parent
+                       )
                    )
             )
             SELECT
