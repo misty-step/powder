@@ -90,8 +90,10 @@ impl std::error::Error for DomainError {}
 /// leases; worker labels remain explicit claim/run metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
-    /// No identity enforcement: single-operator surfaces (CLI/MCP without an
-    /// explicit actor, or HTTP auth disabled) that predate real identity.
+    /// No identity enforcement: trusted single-operator CLI usage or an
+    /// explicitly auth-disabled loopback HTTP surface. Local MCP must provide
+    /// transport authority; a missing MCP principal is an unauthenticated error,
+    /// never an implicit Unchecked mutation.
     Unchecked,
     Principal {
         name: String,
@@ -278,11 +280,11 @@ impl Operation {
             | Self::MergeRepositoryAlias
             | Self::DeleteRepository
             | Self::NormalizeRepositories => (Repo, None, Principal, Keyed),
-            Self::CreateApiKey
-            | Self::RevokeApiKey
-            | Self::CreateSubscription
-            | Self::DisableSubscription
-            | Self::ReplayDeadLetter => (Security, None, Principal, Keyed),
+            Self::CreateApiKey | Self::CreateSubscription => (Security, None, Principal, NoKey),
+            Self::RevokeApiKey | Self::DisableSubscription => {
+                (Security, None, Principal, RetrySafe)
+            }
+            Self::ReplayDeadLetter => (Security, None, Principal, Keyed),
             Self::Destructive => (Destroy, None, Principal, NoKey),
         };
         OperationRule {
@@ -2561,6 +2563,28 @@ mod tests {
         assert_eq!(
             Operation::DeleteRepository.rule().capability,
             OperationCapability::RepositoryAdmin
+        );
+        assert_eq!(
+            Operation::CreateApiKey.rule().idempotency,
+            IdempotencyMode::None,
+            "one-shot API-key secrets must never be replayed or persisted"
+        );
+        assert_eq!(
+            Operation::CreateSubscription.rule().idempotency,
+            IdempotencyMode::None,
+            "one-shot webhook secrets must never be replayed or persisted"
+        );
+        assert_eq!(
+            Operation::RevokeApiKey.rule().idempotency,
+            IdempotencyMode::RetrySafe
+        );
+        assert_eq!(
+            Operation::DisableSubscription.rule().idempotency,
+            IdempotencyMode::RetrySafe
+        );
+        assert_eq!(
+            Operation::ReplayDeadLetter.rule().idempotency,
+            IdempotencyMode::Keyed
         );
         assert_eq!(
             Operation::Destructive.rule().capability,

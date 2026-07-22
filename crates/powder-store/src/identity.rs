@@ -1,5 +1,6 @@
 use bcrypt::verify;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use powder_core::{Authority, Operation};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{non_empty, DomainError, Result, Store, StoreError, API_KEY_ALPHABET};
 
@@ -154,9 +155,27 @@ impl Store {
         scope: ApiKeyScope,
         now: i64,
     ) -> Result<ApiKeyCreated> {
+        self.create_api_key_with_authority(name, scope, now, &Authority::unchecked())
+    }
+
+    /// Create a credential in one transaction. This operation is deliberately
+    /// not replayable: the raw secret is disclosed once and never persisted in
+    /// an idempotency receipt.
+    pub fn create_api_key_with_authority(
+        &mut self,
+        name: &str,
+        scope: ApiKeyScope,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<ApiKeyCreated> {
+        authority.authorize_operation(Operation::CreateApiKey, None, None, now)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let name = non_empty("name", name)?;
         let key = new_api_key(&name, scope, now)?;
-        insert_api_key(&self.connection, &key)?;
+        insert_api_key(&transaction, &key)?;
+        transaction.commit()?;
         Ok(key)
     }
 
@@ -270,22 +289,46 @@ impl Store {
     /// key that is already revoked stays revoked at its original timestamp
     /// (no double-write, no error). Errors only if `key_id` does not exist.
     pub fn revoke_api_key(&mut self, key_id: &str, now: i64) -> Result<()> {
-        let updated = self.connection.execute(
-            "UPDATE api_keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
-            params![key_id, now],
-        )?;
-        if updated == 0 {
-            let exists = self
-                .connection
-                .query_row("SELECT 1 FROM api_keys WHERE id = ?1", [key_id], |_| Ok(()))
-                .optional()?
-                .is_some();
-            if !exists {
-                return Err(DomainError::not_found("api_key", key_id.to_string()).into());
-            }
-        }
+        self.revoke_api_key_with_authority(key_id, now, &Authority::unchecked())
+    }
+
+    /// Revoke is a retry-safe state transition. Repeating it is a no-op and
+    /// preserves the original revocation timestamp; no raw secret is involved.
+    pub fn revoke_api_key_with_authority(
+        &mut self,
+        key_id: &str,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<()> {
+        authority.authorize_operation(Operation::RevokeApiKey, None, None, now)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        revoke_api_key_in_transaction(&transaction, key_id, now)?;
+        transaction.commit()?;
         Ok(())
     }
+}
+
+fn revoke_api_key_in_transaction(
+    transaction: &Transaction<'_>,
+    key_id: &str,
+    now: i64,
+) -> Result<()> {
+    let updated = transaction.execute(
+        "UPDATE api_keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+        params![key_id, now],
+    )?;
+    if updated == 0 {
+        let exists = transaction
+            .query_row("SELECT 1 FROM api_keys WHERE id = ?1", [key_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(DomainError::not_found("api_key", key_id.to_string()).into());
+        }
+    }
+    Ok(())
 }
 
 fn new_api_key(name: &str, scope: ApiKeyScope, now: i64) -> Result<ApiKeyCreated> {

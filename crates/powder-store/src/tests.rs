@@ -1071,6 +1071,202 @@ fn repository_alias_merge_rehomes_cards_and_audits_each_change() -> Result<()> {
 }
 
 #[test]
+fn admin_one_shots_and_retry_safe_transitions_are_atomic() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let admin = Authority::principal("operator", true);
+    let agent = Authority::principal("agent", false);
+
+    let denied = store
+        .create_api_key_with_authority("denied", ApiKeyScope::Agent, 1, &agent)
+        .unwrap_err();
+    assert_eq!(
+        match denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+
+    let created =
+        store.create_api_key_with_authority("one-shot-agent", ApiKeyScope::Agent, 2, &admin)?;
+    assert!(!created.raw_key.is_empty());
+    assert_eq!(
+        store.connection.query_row(
+            "SELECT COUNT(*) FROM operation_idempotency WHERE operation = 'create_api_key'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    let key_row = store
+        .list_api_keys()?
+        .into_iter()
+        .find(|key| key.id == created.id)
+        .expect("created key metadata");
+    assert_eq!(key_row.revoked_at, None);
+
+    let revoke_denied = store
+        .revoke_api_key_with_authority(&created.id, 3, &agent)
+        .unwrap_err();
+    assert_eq!(
+        match revoke_denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+    store.revoke_api_key_with_authority(&created.id, 4, &admin)?;
+    store.revoke_api_key_with_authority(&created.id, 5, &admin)?;
+    let revoked = store
+        .list_api_keys()?
+        .into_iter()
+        .find(|key| key.id == created.id)
+        .expect("revoked key metadata");
+    assert_eq!(revoked.revoked_at, Some(4));
+    assert!(store.verify_api_key(&created.raw_key, 6)?.is_none());
+
+    let subscription_denied = store
+        .create_event_subscription_with_authority(
+            "https://example.test/denied",
+            vec!["completed".to_string()],
+            7,
+            &agent,
+        )
+        .unwrap_err();
+    assert_eq!(
+        match subscription_denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+    let created_subscription = store.create_event_subscription_with_authority(
+        "https://example.test/one-shot",
+        vec!["completed".to_string()],
+        8,
+        &admin,
+    )?;
+    assert!(!created_subscription.signing_secret.is_empty());
+    assert_eq!(
+        store.connection.query_row(
+            "SELECT COUNT(*) FROM operation_idempotency WHERE operation = 'create_subscription'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+
+    let disable_denied = store
+        .disable_event_subscription_with_authority(&created_subscription.subscription.id, 9, &agent)
+        .unwrap_err();
+    assert_eq!(
+        match disable_denied {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::Capability)
+    );
+    let disabled = store.disable_event_subscription_with_authority(
+        &created_subscription.subscription.id,
+        10,
+        &admin,
+    )?;
+    assert_eq!(disabled.disabled_at, Some(10));
+    let disabled_again = store.disable_event_subscription_with_authority(
+        &created_subscription.subscription.id,
+        11,
+        &admin,
+    )?;
+    assert_eq!(disabled_again.disabled_at, Some(10));
+    Ok(())
+}
+
+#[test]
+fn keyed_dead_letter_replay_is_atomic_and_replay_safe() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let admin = Authority::principal("operator", true);
+    let subscription = store.create_event_subscription_with_authority(
+        "https://example.test/replay",
+        vec!["completed".to_string()],
+        1,
+        &admin,
+    )?;
+    store.import_cards(vec![ready_card("keyed-dlq", 2)])?;
+    store.complete_card(&CardId::new("keyed-dlq")?, None, Vec::new(), 3, &admin)?;
+
+    let mut now = 3_i64;
+    for _ in 0..6 {
+        for delivery in store.due_webhook_deliveries(now, 10)? {
+            store.record_webhook_delivery_failure(
+                &delivery.id,
+                Some(500),
+                "forced failure",
+                now,
+            )?;
+        }
+        now += 300;
+    }
+    assert_eq!(store.list_dead_letter_deliveries(10)?.len(), 1);
+
+    let forced_rollback = store
+        .with_keyed_operation::<usize, _, _>(
+            Operation::ReplayDeadLetter,
+            "dead_letter:all",
+            &serde_json::json!({"subscription_id": null}),
+            "dead-letter-rollback",
+            now,
+            &admin,
+            |_| Err(DomainError::conflict("forced rollback").into()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        forced_rollback,
+        StoreError::Domain(DomainError::Conflict(_))
+    ));
+    let replayed = store.replay_dead_letters_with_authority_keyed(
+        None,
+        now,
+        "dead-letter-rollback",
+        &admin,
+    )?;
+    assert!(!replayed.replayed);
+    assert_eq!(replayed.value, 1);
+    let replay = store.replay_dead_letters_with_authority_keyed(
+        None,
+        now + 1,
+        "dead-letter-rollback",
+        &admin,
+    )?;
+    assert!(replay.replayed);
+    assert_eq!(replay.value, 1);
+
+    let conflict = store
+        .with_keyed_operation::<usize, _, _>(
+            Operation::ReplayDeadLetter,
+            "dead_letter:all",
+            &serde_json::json!({"subscription_id": "different"}),
+            "dead-letter-rollback",
+            now + 2,
+            &admin,
+            |_| Err(DomainError::conflict("receipt must prevent execution").into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        match conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+    assert!(store.list_dead_letter_deliveries(10)?.is_empty());
+    assert_eq!(store.due_webhook_deliveries(now, 10)?.len(), 1);
+    assert_eq!(subscription.subscription.disabled_at, None);
+    Ok(())
+}
+
+#[test]
 fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
