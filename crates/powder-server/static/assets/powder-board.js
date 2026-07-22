@@ -145,6 +145,8 @@ const state = {
   // statuses' card-list fetch failed so only that display lane renders an
   // inline notice instead of its cards -- see fetchBoardData/render.
   statsTotals: {},
+  readyCards: [],
+  readyMeta: { total_count: 0, cycle_card_ids: [] },
   cardFetchErrors: {},
   detailCache: new Map(),
   selectedId: null,
@@ -222,14 +224,37 @@ async function apiJson(path, options = {}) {
   return response.json();
 }
 
-function listPageCards(data, label) {
-  const cards = Array.isArray(data.cards) ? data.cards : [];
-  if (data.has_more) {
-    const total =
-      typeof data.total_count === "number" ? data.total_count : "more than one page";
-    throw new Error(`${label} list truncated at ${cards.length} of ${total}`);
+async function drainListPages(path, label) {
+  const cards = [];
+  let after = null;
+  let first = null;
+  for (;;) {
+    const separator = path.includes("?") ? "&" : "?";
+    const data = await apiJson(after ? `${path}${separator}after=${encodeURIComponent(after)}` : path);
+    first ||= data;
+    if (Array.isArray(data.cards)) cards.push(...data.cards);
+    if (!data.has_more) return { cards, metadata: first };
+    if (typeof data.next_after !== "string" || !data.next_after) {
+      throw new Error(`${label} page says has_more without next_after`);
+    }
+    after = data.next_after;
   }
-  return cards;
+}
+
+async function drainReadyPages() {
+  const params = new URLSearchParams({ limit: String(PAGE_LIMIT) });
+  if (state.filters.repos.size) params.set("repo", [...state.filters.repos].join(","));
+  if (state.filters.prios.size === 1) params.set("priority", [...state.filters.prios][0]);
+  const result = await drainListPages(`/api/v1/cards/ready?${params}`, "ready");
+  const metadata = result.metadata || {};
+  return {
+    cards: result.cards,
+    metadata: {
+      total_count: metadata.total_count || 0,
+      cycle_card_ids: Array.isArray(metadata.cycle_card_ids) ? metadata.cycle_card_ids : [],
+      has_more: false,
+    },
+  };
 }
 
 async function loadOnboarding() {
@@ -288,13 +313,14 @@ function renderHomeLink(homeUrl) {
 // lane header count unconditionally, decoupled from whether that lane's
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
-  const [results, repositoryData, statsTotals] = await Promise.all([
+  const [results, readyResult, repositoryData, statsTotals] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
-        const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
-        return listPageCards(data, status);
+        const result = await drainListPages(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`, status);
+        return result.cards;
       }),
     ),
+    drainReadyPages().catch((error) => ({ error })),
     apiJson("/api/v1/repositories?include_hidden=true"),
     fetchBoardStats(),
   ]);
@@ -309,9 +335,12 @@ async function fetchBoardData() {
       cardFetchErrors[status] = result.reason?.message || String(result.reason);
     }
   });
+  if (readyResult.error) cardFetchErrors.ready = readyResult.error.message || String(readyResult.error);
 
   return {
     cards: dedupeCards(cardGroups.flat()).map(normalizeCard),
+    readyCards: readyResult.error ? [] : readyResult.cards.map(normalizeCard),
+    readyMeta: readyResult.error ? { total_count: 0, cycle_card_ids: [] } : readyResult.metadata,
     repositories: normalizeRepositories(repositoryData.repositories || []),
     statsTotals,
     cardFetchErrors,
@@ -348,6 +377,8 @@ async function loadBoard(options = {}) {
     await loadOnboarding();
     const data = await fetchBoardData();
     state.cards = mergePendingOptimistic(data.cards);
+    state.readyCards = data.readyCards || [];
+    state.readyMeta = data.readyMeta || { total_count: 0, cycle_card_ids: [] };
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
@@ -452,6 +483,8 @@ async function refreshLive() {
     const data = await fetchBoardData();
     const changed = changedCardIds(state.cards, data.cards);
     state.cards = mergePendingOptimistic(data.cards);
+    state.readyCards = data.readyCards || [];
+    state.readyMeta = data.readyMeta || { total_count: 0, cycle_card_ids: [] };
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
@@ -991,7 +1024,7 @@ function buildFilters() {
   const hasRepositoryScope = repositories.length > 0;
   const repos = [
     ...new Set(
-      state.cards
+      [...state.cards, ...state.readyCards]
         .filter((card) => !card.explicitRepo || !hasRepositoryScope || visibleRepositorySet.has(card.repoKey))
         .map((card) => card.repoKey),
     ),
@@ -1070,7 +1103,7 @@ function repoPassesScope(repo) {
 }
 
 function renderTierToggle() {
-  els.tierToggle.textContent = state.showAllTiers ? "all tiers" : "active only";
+  els.tierToggle.textContent = state.showAllTiers ? "all repository tiers" : "active repository view";
   els.tierToggle.setAttribute("aria-pressed", String(state.showAllTiers));
 }
 
@@ -1397,7 +1430,7 @@ function cleanPriority(priority) {
 }
 
 function passes(card) {
-  if (card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
+  if (card.displayStatus !== "ready" && card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
   if (state.filters.repos.size && !state.filters.repos.has(card.repoKey)) return false;
   if (state.filters.prios.size && !state.filters.prios.has(cleanPriority(card.priority))) return false;
   const query = state.filters.search.trim().toLowerCase();
@@ -1463,11 +1496,9 @@ function bucket() {
   const cardsById = new Map(state.cards.map((card) => [card.id, card]));
   return {
     backlog: sorted(visible.filter((card) => card.displayStatus === "backlog")),
-    ready: sorted(
-      visible.filter(
-        (card) => card.displayStatus === "ready" && !hasUnresolvedBlocker(card, cardsById),
-      ),
-    ),
+    // Ready admission comes from the server typed /cards/ready query. Keep
+    // its topological order; status=ready is used only for blocked presentation.
+    ready: state.readyCards.filter(passes),
     blocked: sorted(
       visible.filter(
         (card) => card.displayStatus === "ready" && hasUnresolvedBlocker(card, cardsById),
@@ -1565,6 +1596,12 @@ function laneStatTotal(displayLaneName) {
   return 0;
 }
 
+function readyDiagnosticsHTML() {
+  const cycleIds = state.readyMeta?.cycle_card_ids || [];
+  if (!cycleIds.length) return "";
+  return "<p class=\"ae-chrome pw-ready-diagnostic\">Cycle members: " + cycleIds.map((id) => escapeHtml(id)).join(", ") + "</p>";
+}
+
 function render() {
   if (state.loading) {
     renderLoading();
@@ -1579,7 +1616,8 @@ function render() {
   const failedLanes = failedDisplayLanes();
   els.laneReady.innerHTML = failedLanes.has("ready")
     ? laneFailureHTML("ready")
-    : (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true)) +
+    : readyDiagnosticsHTML() +
+      (buckets.ready.map(cardHTML).join("") || boardEmptyCopy("ready", true)) +
       (buckets.blocked.length
         ? `<p class="ae-plate-cap pw-blocked-cap">BLOCKED · ${buckets.blocked.length}</p>${buckets.blocked.map(cardHTML).join("")}`
         : "");

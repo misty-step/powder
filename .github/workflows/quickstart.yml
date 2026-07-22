@@ -54,13 +54,14 @@ jobs:
           DB="$RUNNER_TEMP/quickstart/powder.db"
           mkdir -p "$(dirname "$DB")"
           echo "POWDER_DB_PATH=$DB" >> "$GITHUB_ENV"
-
-          POWDER_DB_PATH="$DB" \
-          POWDER_AUTH_MODE=api-key \
-          POWDER_DISCLOSE_BOOTSTRAP_KEY=true \
-          POWDER_BIND_ADDR=127.0.0.1:4000 \
-          PORT=4000 \
-          ./target/release/powder-server > "$RUNNER_TEMP/quickstart/server.log" 2>&1 &
+           KEY_FILE="$RUNNER_TEMP/quickstart/bootstrap-key"
+           mkdir -p "$(dirname "$KEY_FILE")"
+           POWDER_DB_PATH="$DB" \
+           POWDER_AUTH_MODE=api-key \
+           POWDER_BOOTSTRAP_KEY_FILE="$KEY_FILE" \
+           POWDER_BIND_ADDR=127.0.0.1:4000 \
+           PORT=4000 \
+           ./target/release/powder-server > "$RUNNER_TEMP/quickstart/server.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/quickstart/server.pid"
 
           for _ in $(seq 1 30); do
@@ -75,19 +76,17 @@ jobs:
       - name: Drive the quickstart card lifecycle
         run: |
           set -euo pipefail
-          LOG="$RUNNER_TEMP/quickstart/server.log"
+           KEY=$(cat "$RUNNER_TEMP/quickstart/bootstrap-key")
+           test -n "$KEY"
+           if grep -F "$KEY" "$RUNNER_TEMP/quickstart/server.log"; then
+             echo "::error::bootstrap key leaked into service log"
+             exit 1
+           fi
 
-          curl -fsS http://127.0.0.1:4000/healthz | tee /dev/stderr | grep -q '"ok":true'
-          curl -fsS http://127.0.0.1:4000/readyz | tee /dev/stderr | grep -q '"ok":true'
+           curl -fsS http://127.0.0.1:4000/healthz | tee /dev/stderr | grep -q '"ok":true'
+           curl -fsS http://127.0.0.1:4000/readyz | tee /dev/stderr | grep -q '"ok":true'
 
-          KEY=$(grep -o 'bootstrap API key: .*' "$LOG" | head -n1 | sed 's/^bootstrap API key: //')
-          if [ -z "$KEY" ]; then
-            echo "::error::could not find bootstrap API key in server log"
-            cat "$LOG"
-            exit 1
-          fi
-
-          CARD_ID="quickstart-ci-${{ github.run_id }}"
+           CARD_ID="quickstart-ci-${{ github.run_id }}"
 
           echo "creating card"
           curl -fsS -X POST http://127.0.0.1:4000/api/v1/cards \
