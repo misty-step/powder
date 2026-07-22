@@ -139,7 +139,7 @@ pub const ROUTES: &[ApiRoute] = &[
         intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
         policy: Some(Operation::PatchCard.rule()),
         body_shape: Some(
-            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"risk":null,"labels":null} -- every field is optional; only the fields present in the body are changed; any authenticated actor may patch and the change is audited with actor and field list; estimate is one of S|M|L|XL; risk is one of low|medium|high"#,
+            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"risk":null,"labels":null} -- every field is optional; only the fields present in the body are changed; an authenticated agent must hold the current claim, while an authenticated admin may correct card truth without one; the change is audited with the transport principal and field list; estimate is one of S|M|L|XL; risk is one of low|medium|high"#,
         ),
     },
     ApiRoute {

@@ -88,10 +88,10 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
             )
             .expect("add link");
         let first = store
-            .add_comment_as(&card_id, "operator", "first", 50, &authority)
+            .add_comment_as(&card_id, "roster", "first", 50, &authority)
             .expect("add first comment");
         let second = store
-            .add_comment_as(&card_id, "operator", "second", 50, &authority)
+            .add_comment_as(&card_id, "roster", "second", 50, &authority)
             .expect("add second comment");
         let work_log = store
             .append_work_log_as(
@@ -118,7 +118,7 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
         assert!(detail
             .comments
             .iter()
-            .all(|comment| comment.author == "operator"));
+            .all(|comment| comment.author == "roster"));
         assert_eq!(detail.work_log[0].agent, "worker-a");
         assert!(detail.comments.iter().any(|comment| comment.id == first.id));
         assert!(detail
@@ -136,8 +136,8 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
         for (kind, subject_id, semantic_actor) in [
             ("criterion", "0", "operator"),
             ("link", link.id.as_str(), "roster"),
-            ("comment", first.id.as_str(), "operator"),
-            ("comment", second.id.as_str(), "operator"),
+            ("comment", first.id.as_str(), "roster"),
+            ("comment", second.id.as_str(), "roster"),
             ("work_log", work_log.id.as_str(), "worker-a"),
         ] {
             assert!(attributed.iter().any(|event| {
@@ -242,7 +242,7 @@ fn outbound_failure_rolls_back_domain_row_and_audit_event() {
     let mut store = Store::open(&path).expect("reopen store");
     let authority = Authority::principal("roster", false);
     let error = store
-        .add_comment_as(&card_id, "operator", "must roll back", 70, &authority)
+        .add_comment_as(&card_id, "roster", "must roll back", 70, &authority)
         .expect_err("outbound failure aborts comment");
     assert!(error.to_string().contains("forced outbound failure"));
     let claim = store

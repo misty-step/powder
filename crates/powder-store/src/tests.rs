@@ -8420,10 +8420,28 @@ fn keyed_store_mutations_do_not_duplicate_real_rows() {
         .unwrap();
     assert!(replay.replayed);
 
-    let comment = store
+    let impersonation = store
         .add_comment_as_keyed(
             &card_id,
             "semantic-author",
+            "forged",
+            11,
+            "comment-forged",
+            &authority,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        impersonation,
+        StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdentityMismatch,
+            ..
+        })
+    ));
+
+    let comment = store
+        .add_comment_as_keyed(
+            &card_id,
+            "principal-a",
             "hello",
             11,
             "comment-1",
@@ -8434,7 +8452,7 @@ fn keyed_store_mutations_do_not_duplicate_real_rows() {
     let comment_replay = store
         .add_comment_as_keyed(
             &card_id,
-            "semantic-author",
+            "principal-a",
             "hello",
             11,
             "comment-1",
@@ -8446,6 +8464,35 @@ fn keyed_store_mutations_do_not_duplicate_real_rows() {
     let claim = store
         .claim_card(&card_id, "worker-a", 12, 100, &authority)
         .unwrap();
+    let criterion_impersonation = store
+        .check_criterion_as_keyed(
+            &card_id,
+            0,
+            "semantic-actor",
+            true,
+            KeyedOperationContext::new(13, "criterion-forged", &authority),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        criterion_impersonation,
+        StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdentityMismatch,
+            ..
+        })
+    ));
+    let checked = store
+        .check_criterion_as_keyed(
+            &card_id,
+            0,
+            "principal-a",
+            true,
+            KeyedOperationContext::new(13, "criterion-valid", &authority),
+        )
+        .unwrap();
+    assert_eq!(
+        checked.value.criteria[0].checked_by.as_deref(),
+        Some("principal-a")
+    );
     let attribution = WorkLogAttribution {
         run_id: Some(claim.run_id.as_str()),
         ..WorkLogAttribution::default()

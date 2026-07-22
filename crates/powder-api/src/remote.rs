@@ -798,8 +798,32 @@ mod tests {
             .unwrap_err()
             .contains("cycle_card_ids must be an array"));
     }
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::{BufRead, BufReader, Read};
+
+        let mut reader = BufReader::new(stream);
+        let mut headers = String::new();
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).expect("read request line"), 0);
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().expect("content length");
+                }
+            }
+            headers.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).expect("read request body");
+        headers
+    }
+
     fn socket_error_response(status: u16, body: &str) -> String {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::thread;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind error listener");
@@ -807,8 +831,7 @@ mod tests {
         let body = body.to_owned();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept error request");
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).expect("read error request");
+            let _request = read_http_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -879,7 +902,7 @@ mod tests {
 
     #[test]
     fn keyed_request_reuses_caller_key_across_auth_refresh_retry() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::sync::mpsc;
         use std::thread;
 
@@ -890,9 +913,7 @@ mod tests {
             let mut keys = Vec::new();
             for attempt in 0..2 {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut request = [0_u8; 4096];
-                let size = stream.read(&mut request).expect("read request");
-                let request = String::from_utf8_lossy(&request[..size]);
+                let request = read_http_request(&mut stream);
                 keys.push(
                     request
                         .lines()

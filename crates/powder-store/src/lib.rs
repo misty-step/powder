@@ -5081,6 +5081,9 @@ fn check_criterion_in_transaction(
     authority: &Authority,
 ) -> Result<Card> {
     let actor = non_empty("actor", actor)?;
+    authority.require_identity(&actor).map_err(|error| {
+        DomainError::authority_denied(DenialClass::IdentityMismatch, error.to_string())
+    })?;
     let mut card = load_card(transaction, card_id)?;
     authorize_card_operation(authority, Operation::CheckCriterion, &card, None, None, now)?;
     let criterion_state = criterion_mut(&mut card, criterion)?;
@@ -5352,6 +5355,11 @@ fn add_comment_in_transaction(
         body: non_empty_scrubbed("body", body)?,
         created_at: now,
     };
+    authority
+        .require_identity(&comment.author)
+        .map_err(|error| {
+            DomainError::authority_denied(DenialClass::IdentityMismatch, error.to_string())
+        })?;
     transaction.execute(
         "INSERT INTO comments (id, card_id, author, body, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
