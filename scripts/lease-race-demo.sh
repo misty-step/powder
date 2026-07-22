@@ -160,6 +160,7 @@ rule
 say "[setup] creating card $CARD_ID (as the operator)"
 curl -fsS -X POST "$BASE_URL/api/v1/cards" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: lease-race-$CARD_ID-create" \
   -d "{\"id\":\"$CARD_ID\",\"title\":\"Lease race demo card\",\"acceptance\":[\"the race resolves via lease expiry, not a human unsticking it\"]}" \
   | jq -c '{id: .id, status: .status}'
 
@@ -193,6 +194,7 @@ say "[check] confirmed: card is NOT in list_ready while claimed"
 say "[actor A] appending a work-log entry, then going dark"
 curl -fsS -X POST "$BASE_URL/api/v1/cards/$CARD_ID/work-log" \
   -H "Authorization: Bearer $KEY_A" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: lease-race-$CARD_ID-work-log" \
   -d "{\"agent\":\"codex-agent\",\"run_id\":\"$RUN_A\",\"body\":\"starting work, about to crash and never heartbeat\"}" \
   | jq -c '{card_id: .card_id, agent: .agent}'
 
@@ -243,6 +245,7 @@ say "[actor B] completing the card with proof (attribution comes from actor B's 
 PROOF="lease-race-demo local run, card=$CARD_ID, reclaimed after ${POLL_ELAPSED}s"
 curl -fsS -X POST "$BASE_URL/api/v1/cards/$CARD_ID/complete" \
   -H "Authorization: Bearer $KEY_B" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: lease-race-$CARD_ID-complete" \
   -d "$(jq -n --arg proof "$PROOF" '{proof: $proof}')" \
   | jq -c '{id: .id, status: .status}'
 rule

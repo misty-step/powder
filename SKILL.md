@@ -153,9 +153,10 @@ Default agent persona (23 tools):
 - `request_input`: move the run to `awaiting_input` with the exact question.
 - `complete_card`: mark the card done, optionally attaching proof.
 - `update_card`: patch title, body, acceptance, proof_plan, status, priority,
-  or labels on an existing card (`PATCH /api/v1/cards/{id}`). Any
-  authenticated actor may patch; every patch is audited with actor and field
-  list, so recording an operator ruling never requires the admin key.
+  or labels on an existing card (`PATCH /api/v1/cards/{id}`). Agent-scoped
+  callers need the current unexpired claim; an authenticated admin may correct
+  card truth without one. Powder derives audit principal and role from the
+  transport credential rather than trusting caller-supplied labels.
 
 Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all` (9 tools; 32 tools total):
 

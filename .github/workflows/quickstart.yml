@@ -94,6 +94,7 @@ jobs:
           echo "creating card"
           curl -fsS -X POST http://127.0.0.1:4000/api/v1/cards \
             -H "Authorization: Bearer $KEY" \
+            -H "Idempotency-Key: quickstart-$CARD_ID-create" \
             -H "Content-Type: application/json" \
             -d "{\"id\":\"$CARD_ID\",\"title\":\"Quickstart smoke card\",\"acceptance\":[\"the quickstart works\"]}" \
             | tee /dev/stderr | grep -q '"status":"ready"'
@@ -108,6 +109,7 @@ jobs:
           echo "completing card"
           curl -fsS -X POST "http://127.0.0.1:4000/api/v1/cards/$CARD_ID/complete" \
             -H "Authorization: Bearer $KEY" \
+            -H "Idempotency-Key: quickstart-$CARD_ID-complete" \
             -H "Content-Type: application/json" \
             -d '{"proof":"https://github.com/misty-step/powder/actions/runs/'"${{ github.run_id }}"'"}' \
             | tee /dev/stderr | grep -q '"status":"done"'
