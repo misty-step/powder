@@ -6848,10 +6848,12 @@ fn board_rollups_report_dirty_parent_edges_without_leaking_issues() -> Result<()
         include_hidden: false,
         ..Default::default()
     })?;
-    assert!(!page.coverage.complete);
-    assert_eq!(page.coverage.parent_issue_count, 1);
+    assert!(page.coverage.complete);
+    assert_eq!(page.coverage.parent_issue_count, 0);
     assert_eq!(page.coverage.total_cards, 2);
-    assert_eq!(page.coverage.accounted_cards, 1);
+    assert_eq!(page.coverage.accounted_cards, 2);
+    let global = store.parent_graph_report()?;
+    assert_eq!(global.issues.len(), 1);
     let encoded = serde_json::to_value(page)?;
     assert!(encoded["coverage"]["issues"].is_null());
     assert!(encoded["coverage"]["assignments"].is_null());
@@ -6915,6 +6917,75 @@ fn board_rollups_respect_hidden_repository_scope() -> Result<()> {
         .rollups
         .iter()
         .any(|row| row.repo.as_deref() == Some("secret")));
+    Ok(())
+}
+
+#[test]
+fn board_rollups_scope_hidden_parent_as_visible_root_without_leaking() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    for (name, visibility) in [
+        ("secret", RepositoryVisibility::Hidden),
+        ("visible", RepositoryVisibility::Visible),
+    ] {
+        store.upsert_repository(
+            RepositoryUpsert {
+                name: name.to_string(),
+                aliases: None,
+                visibility: Some(visibility),
+                tier: Some(RepositoryTier::Active),
+                import_provenance: Some("hidden-parent rollup fixture".to_string()),
+            },
+            1,
+        )?;
+    }
+    let hidden_parent_id = CardId::new("hidden-parent")?;
+    let visible_root_id = CardId::new("visible-root")?;
+    let mut hidden_parent = ready_card(hidden_parent_id.as_str(), 1);
+    hidden_parent.repo = Some("secret".to_string());
+    let mut visible_root =
+        ready_card(visible_root_id.as_str(), 2).with_parent(Some(hidden_parent_id.clone()));
+    visible_root.repo = Some("visible".to_string());
+    let mut visible_leaf = ready_card("visible-leaf", 3).with_parent(Some(hidden_parent_id));
+    visible_leaf.repo = Some("visible".to_string());
+    let mut visible_child = ready_card("visible-child", 4)
+        .with_status(CardStatus::Done)
+        .with_parent(Some(visible_root_id));
+    visible_child.repo = Some("visible".to_string());
+    store.import_cards(vec![
+        hidden_parent,
+        visible_root,
+        visible_leaf,
+        visible_child,
+    ])?;
+
+    let page = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert_eq!(page.coverage.total_cards, 3);
+    assert_eq!(page.coverage.accounted_cards, 3);
+    assert_eq!(page.coverage.root_epics, 1);
+    assert_eq!(page.coverage.unsorted_cards, 1);
+    assert_eq!(page.coverage.parent_issue_count, 0);
+    assert!(page.coverage.complete);
+    let epic = page
+        .rollups
+        .iter()
+        .find(|row| row.card_id.as_ref().map(CardId::as_str) == Some("visible-root"))
+        .expect("visible child of hidden parent becomes a scoped root epic");
+    assert_eq!(epic.status_counts.get("done"), Some(&1));
+    let unsorted = page
+        .rollups
+        .iter()
+        .find(|row| row.kind == "unsorted" && row.repo.as_deref() == Some("visible"))
+        .expect("visible leaf of hidden parent becomes an Unsorted row");
+    assert_eq!(unsorted.status_counts.get("ready"), Some(&1));
+    let encoded = serde_json::to_string(&page)?;
+    assert!(!encoded.contains("hidden-parent"));
+    assert!(!encoded.contains("secret"));
     Ok(())
 }
 

@@ -2476,6 +2476,14 @@ impl Store {
                 FROM cards c
                 LEFT JOIN repositories r ON r.name = c.repo
                 WHERE ?1 OR COALESCE(r.visibility, 'visible') = 'visible'
+            ), scoped_roots AS (
+                SELECT c.*
+                FROM visible_cards c
+                WHERE c.parent IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1 FROM visible_cards parent
+                       WHERE parent.id = c.parent
+                   )
             )
             SELECT
                 'epic' AS kind,
@@ -2495,10 +2503,9 @@ impl Store {
                               AND c.claim_expires_at > ?2 THEN 1 ELSE 0 END) AS active_claims,
                 MIN(c.updated_at) AS oldest_update,
                 MAX(c.updated_at) AS newest_update
-            FROM visible_cards p
+            FROM scoped_roots p
             JOIN visible_cards c
               ON typeof(c.parent) = 'text' AND c.parent = p.id
-            WHERE p.parent IS NULL
             GROUP BY p.id, p.title, p.repo, c.status
             UNION ALL
             SELECT
@@ -2519,9 +2526,8 @@ impl Store {
                               AND c.claim_expires_at > ?2 THEN 1 ELSE 0 END) AS active_claims,
                 MIN(c.updated_at) AS oldest_update,
                 MAX(c.updated_at) AS newest_update
-            FROM visible_cards c
-            WHERE c.parent IS NULL
-              AND NOT EXISTS (
+            FROM scoped_roots c
+            WHERE NOT EXISTS (
                   SELECT 1 FROM visible_cards child
                   WHERE typeof(child.parent) = 'text' AND child.parent = c.id
               )
