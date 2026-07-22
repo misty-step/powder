@@ -632,15 +632,30 @@ test("board · mobile-390 · operator can quick-add a card with no CLI (powder-9
 
   await page.locator("#quick-add-title").fill("powder-925 law-gate quick add");
   await page.locator("#quick-add-body").fill("Filed touch-first, no CLI, from a 390px viewport.");
+  await page.locator("#quick-add-attachments").setInputFiles({
+    name: "law-proof.png",
+    mimeType: "image/png",
+    buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+  });
+  await expect(page.locator("#quick-add-attachment-list")).toContainText("law-proof.png");
   const repoBeforeSubmit = await page.locator("#quick-add-repo").inputValue();
   expect(repoBeforeSubmit, "captures default to the repo-less general bucket (operator ruling 2026-07-20)").toBe("");
 
   const created = page.waitForResponse(
     (response) => response.url().endsWith("/api/v1/cards") && response.request().method() === "POST",
   );
+  const uploaded = page.waitForRequest(
+    (request) => request.url().includes("/api/v1/cards/") && request.url().endsWith("/attachments") && request.method() === "POST",
+  );
   await page.locator("#quick-add-form button[type=submit]").click();
   const response = await created;
   expect(response.status()).toBe(200);
+  const createdKey = (await response.request().allHeaders())["idempotency-key"] || "";
+  expect(createdKey, "quick-add card creation must carry a receipt").not.toBe("");
+  const uploadedRequest = await uploaded;
+  const uploadKey = (await uploadedRequest.allHeaders())["idempotency-key"] || "";
+  expect(uploadKey, "quick-add attachment upload must carry a receipt").not.toBe("");
+  expect(uploadKey).not.toBe(createdKey);
   const card = await response.json();
   expect(card.title).toBe("powder-925 law-gate quick add");
   expect(card.status).toBe("backlog");
@@ -793,4 +808,62 @@ test("board · a zero-card repository is hidden until the show-empty toggle is u
 
   const deleted = await page.request.delete(`/api/v1/repositories/${repoName}`);
   expect(deleted.ok(), "clean up the zero-card fixture repository").toBe(true);
+});
+
+
+// powder-operation-authority: every browser mutation receives a non-empty
+// caller-owned receipt, retries can replay that receipt, and separate intents
+// do not share it. This observes the actual served transport, not source text.
+test("board · operation authority · mutation receipts are stable and unique", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 900 });
+  const observed: Array<{ method: string; path: string; headers: Record<string, string> }> = [];
+  const pending = new Set<Promise<void>>();
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (!url.pathname.startsWith("/api/v1/")) return;
+    const task = (async () => {
+      observed.push({ method: request.method(), path: url.pathname, headers: await request.allHeaders() });
+    })();
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+  });
+
+  await boot(page, "light", "/c/001");
+  const firstStatus = page.waitForResponse(
+    (response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST",
+  );
+  await page.locator("#detail-status-change").selectOption("backlog");
+  await expect((await firstStatus).status()).toBe(200);
+
+  const retryKey = await page.evaluate(async () => {
+    const options = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "backlog" }),
+    };
+    await apiJson("/api/v1/cards/001/status", options);
+    const key = options.idempotencyKey;
+    await apiJson("/api/v1/cards/001/status", options);
+    return key;
+  });
+
+  const restoreStatus = page.waitForResponse(
+    (response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST",
+  );
+  await page.locator("#detail-status-change").selectOption("ready");
+  await expect((await restoreStatus).status()).toBe(200);
+  await Promise.all([...pending]);
+
+  const mutationRequests = observed.filter(({ method }) => !["GET", "HEAD"].includes(method));
+  expect(mutationRequests.length).toBeGreaterThanOrEqual(4);
+  for (const request of mutationRequests) {
+    const key = request.headers["idempotency-key"] || "";
+    expect(key, "mutation request must carry a receipt").not.toBe("");
+  }
+  const statusKeys = observed
+    .filter(({ method, path }) => method === "POST" && path === "/api/v1/cards/001/status")
+    .map(({ headers }) => headers["idempotency-key"] || "");
+  expect(statusKeys.filter((key) => key === retryKey)).toHaveLength(2);
+  expect(new Set(statusKeys).size).toBeGreaterThanOrEqual(3);
+  expect(observed.filter(({ method }) => ["GET", "HEAD"].includes(method)).every(({ headers }) => !headers["idempotency-key"])).toBe(true);
 });

@@ -218,10 +218,55 @@ function apiHeaders(extra = {}) {
   return headers;
 }
 
+const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+// One receipt belongs to one caller intent. The transport caches a generated
+// receipt on its options object so an internal retry can replay the exact same
+// key; separate apiJson calls receive separate receipts.
+function createMutationReceipt() {
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
+  if (typeof webCrypto?.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    webCrypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join("-");
+  }
+  throw new Error("secure browser randomness is required for mutation receipts");
+}
+
+function mutationMethod(method) {
+  return MUTATION_METHODS.has(String(method || "GET").toUpperCase());
+}
+
+function headerValue(headers, name) {
+  if (headers instanceof Headers) return headers.get(name) || "";
+  return headers?.[name] || headers?.[name.toLowerCase()] || "";
+}
+
 async function apiJson(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  const requestOptions = { ...options, method };
+  delete requestOptions.idempotencyKey;
+  const headers = options.headers instanceof Headers
+    ? Object.fromEntries(options.headers.entries())
+    : { ...(options.headers || {}) };
+  if (mutationMethod(method)) {
+    const suppliedKey = typeof options.idempotencyKey === "string" && options.idempotencyKey.trim()
+      ? options.idempotencyKey.trim()
+      : headerValue(options.headers, "Idempotency-Key");
+    const key = suppliedKey || createMutationReceipt();
+    options.idempotencyKey = key;
+    headers["Idempotency-Key"] = key;
+  } else {
+    delete headers["Idempotency-Key"];
+    delete headers["idempotency-key"];
+  }
   const response = await fetch(path, {
-    ...options,
-    headers: apiHeaders(options.headers || {}),
+    ...requestOptions,
+    headers: apiHeaders(headers),
   });
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
@@ -1451,6 +1496,7 @@ async function saveRepository(form) {
   }
   await apiJson(`/api/v1/repositories/${encodePath(payload.name)}`, {
     method: "POST",
+    idempotencyKey: createMutationReceipt(),
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
@@ -1473,6 +1519,7 @@ async function createRepository(form) {
   }
   await apiJson("/api/v1/repositories", {
     method: "POST",
+    idempotencyKey: createMutationReceipt(),
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
@@ -1605,6 +1652,7 @@ function quickAddCardId(repo) {
 async function uploadCardAttachment(cardId, file) {
   return apiJson("/api/v1/cards/" + encodePath(cardId) + "/attachments", {
     method: "POST",
+    idempotencyKey: createMutationReceipt(),
     headers: {
       "Content-Type": file.type || "application/octet-stream",
       "X-Attachment-Filename": file.name || "image",
@@ -1684,6 +1732,7 @@ async function createCardFromQuickAdd(form) {
   try {
     await apiJson("/api/v1/cards", {
       method: "POST",
+      idempotencyKey: createMutationReceipt(),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
@@ -1726,6 +1775,7 @@ async function mergeRepositoryAlias(form) {
   }
   const result = await apiJson(`/api/v1/repositories/${encodePath(target)}/merge-alias`, {
     method: "POST",
+    idempotencyKey: createMutationReceipt(),
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ alias, actor: "board-settings" }),
   });
@@ -1737,6 +1787,7 @@ async function mergeRepositoryAlias(form) {
 async function deleteRepository(name) {
   await apiJson(`/api/v1/repositories/${encodePath(name)}`, {
     method: "DELETE",
+    idempotencyKey: createMutationReceipt(),
   });
   renderAuthState(`Repository ${name} deleted.`);
   await loadBoard({ silent: true });
@@ -2146,6 +2197,7 @@ async function changeCardStatus(cardId, status) {
   try {
     await apiJson(`/api/v1/cards/${encodePath(cardId)}/status`, {
       method: "POST",
+      idempotencyKey: createMutationReceipt(),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     });
