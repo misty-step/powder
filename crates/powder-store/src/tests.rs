@@ -7273,6 +7273,65 @@ fn search_result_carries_blockers_for_unloaded_ui_rows() -> Result<()> {
 }
 
 #[test]
+fn search_repo_filter_normalizes_legacy_slashes_and_preserves_boundaries() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut legacy = ready_card("legacy-repo-filter", 10);
+    legacy.title = "repo-filter-token".to_string();
+    let mut boundary = ready_card("boundary-repo-filter", 11);
+    boundary.title = "repo-filter-token".to_string();
+    let mut numeric_with_repo = ready_card("name-123", 12);
+    numeric_with_repo.title = "repo-filter-token".to_string();
+    let mut numeric_without_repo = ready_card("name-456", 13);
+    numeric_without_repo.title = "repo-filter-token".to_string();
+    store.import_cards(vec![
+        legacy,
+        boundary,
+        numeric_with_repo,
+        numeric_without_repo,
+    ])?;
+
+    store.connection.execute(
+        "UPDATE cards SET repo = ?1 WHERE id = ?2",
+        rusqlite::params!["owner/name/", "legacy-repo-filter"],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET repo = ?1 WHERE id = ?2",
+        rusqlite::params!["owner/name-other/", "boundary-repo-filter"],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET repo = ?1 WHERE id = ?2",
+        rusqlite::params!["other", "name-123"],
+    )?;
+
+    let page = store.search_page(&SearchQuery {
+        q: "repo-filter-token".to_string(),
+        repo: Some("name".to_string()),
+        limit: 20,
+        ..SearchQuery::default()
+    })?;
+    let ids = page
+        .matches
+        .iter()
+        .map(|hit| hit.card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"legacy-repo-filter"));
+    assert!(ids.contains(&"name-456"));
+    assert!(!ids.contains(&"boundary-repo-filter"));
+    assert!(!ids.contains(&"name-123"));
+
+    let invalid_repo = store.search_page(&SearchQuery {
+        q: "repo-filter-token".to_string(),
+        repo: Some("///".to_string()),
+        limit: 20,
+        ..SearchQuery::default()
+    })?;
+    assert!(invalid_repo.matches.is_empty());
+    Ok(())
+}
+
+#[test]
 fn search_page_shapes_recall_filters_cursor_and_safe_snippets() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

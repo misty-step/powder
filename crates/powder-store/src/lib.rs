@@ -742,6 +742,7 @@ impl Store {
             .map(str::trim)
             .filter(|v| !v.is_empty());
         let source_repo = query.repo.as_deref().and_then(canonical_repo_label);
+        let repo_filter_requested = query.repo.is_some();
         let source_after = query.source_created_after;
         let source_before = query.source_created_before;
         let status = query.status.map(|value| value.as_str());
@@ -794,14 +795,15 @@ impl Store {
                     SELECT 1 FROM json_each(c.labels_json)
                     WHERE lower(json_each.value) = lower(?16)
                   ))
-              AND (?17 IS NULL OR
-                   lower(trim(c.repo)) = lower(?17) OR
-                   lower(trim(c.repo)) = lower(?17) || '.git' OR
-                   lower(trim(c.repo)) LIKE '%/' || lower(?17) OR
-                   lower(trim(c.repo)) LIKE '%/' || lower(?17) || '.git' OR
-                   (lower(c.id) LIKE lower(?17) || '-%' AND
-                    substr(c.id, length(?17) + 2) <> '' AND
-                    substr(c.id, length(?17) + 2) NOT GLOB '*[^0-9]*'))
+              AND (?18 = 0 OR
+                   (?17 IS NOT NULL AND (
+                     lower(rtrim(trim(c.repo), '/')) = lower(?17) OR
+                     lower(rtrim(trim(c.repo), '/')) = lower(?17) || '.git' OR
+                     lower(rtrim(trim(c.repo), '/')) LIKE '%/' || lower(?17) OR
+                     lower(rtrim(trim(c.repo), '/')) LIKE '%/' || lower(?17) || '.git' OR
+                     (c.repo IS NULL AND lower(c.id) LIKE lower(?17) || '-%' AND
+                      substr(c.id, length(?17) + 2) <> '' AND
+                      substr(c.id, length(?17) + 2) NOT GLOB '*[^0-9]*'))))
         "#;
         let page_sql = format!(
             "{cte} SELECT m.source_table, m.source_field, m.source_id, m.card_id,
@@ -810,7 +812,7 @@ impl Store {
              JOIN cards c ON c.id = m.card_id
              {filters}
              ORDER BY m.match_rank, m.source_table, m.source_field, m.card_id, m.source_id, m.created_at
-             LIMIT ?18 OFFSET ?19"
+             LIMIT ?19 OFFSET ?20"
         );
         let mut statement = self.connection.prepare(&page_sql)?;
         let mut rows = statement.query(params![
@@ -831,6 +833,7 @@ impl Store {
             query.updated_before,
             label,
             source_repo.as_deref(),
+            repo_filter_requested,
             query.limit as i64,
             offset as i64,
         ])?;
@@ -879,6 +882,7 @@ impl Store {
                         query.updated_before,
                         label,
                         source_repo.as_deref(),
+                        repo_filter_requested,
                     ],
                     |row| row.get::<_, i64>(0),
                 )? as usize
