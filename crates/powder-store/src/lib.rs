@@ -13,6 +13,12 @@ use powder_core::{
     Comment, CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId,
     Priority, ReadyCursor, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
+use rusqlite::{
+    functions::{Context, FunctionFlags},
+    params,
+    types::ValueRef,
+    Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -689,6 +695,14 @@ impl Store {
                     self.migrate_22_to_23()?;
                     23
                 }
+                23 => {
+                    self.migrate_23_to_24()?;
+                    24
+                }
+                24 => {
+                    self.migrate_24_to_25()?;
+                    25
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -921,164 +935,6 @@ impl Store {
         })
     }
 
-    /// Search through the FTS spine with deliberate recall shaping and card filters.
-    /// Query terms are quoted and rewritten as prefixes; multiple terms use FTS5
-    /// NEAR so their order is not treated as an accidental phrase. The index keeps
-    /// hyphen and underscore compounds as single tokens, so a sub-token such as
-    /// fts does not match powder-query-fts-store; callers should use the full
-    /// identifier or a prefix (for example powder-query).
-    pub fn search_page(&self, query: &SearchQuery) -> Result<SearchPage> {
-        let query_text = query.q.trim();
-        if query_text.is_empty() || query.limit == 0 || !self.table_exists("card_search_fts")? {
-            return Ok(SearchPage {
-                matches: Vec::new(),
-                total_count: 0,
-                has_more: false,
-                next_after: None,
-            });
-        }
-        let mut rows = self.search_rows(query_text)?;
-        let repo_filter = query.repo.as_deref().and_then(canonical_repo_label);
-        let mut summaries = HashMap::<String, CardSummary>::new();
-        let mut results = Vec::new();
-        for row in rows.drain(..) {
-            if !search_source_matches(query.source_kind.as_deref(), &row.source_table)
-                || query
-                    .source_field
-                    .as_deref()
-                    .is_some_and(|wanted| !wanted.eq_ignore_ascii_case(&row.source_field))
-                || query
-                    .source_created_after
-                    .is_some_and(|value| row.created_at < value)
-                || query
-                    .source_created_before
-                    .is_some_and(|value| row.created_at > value)
-            {
-                continue;
-            }
-            let key = row.card_id.as_str().to_string();
-            let summary = if let Some(summary) = summaries.get(&key).cloned() {
-                summary
-            } else {
-                let card = match self.get_card(&row.card_id)? {
-                    Some(card) => card,
-                    None => continue,
-                };
-                if query.status.is_some_and(|value| card.status != value)
-                    || query.priority.is_some_and(|value| card.priority != value)
-                    || query
-                        .estimate
-                        .is_some_and(|value| card.estimate != Some(value))
-                    || query.risk.is_some_and(|value| card.risk != Some(value))
-                    || query
-                        .created_after
-                        .is_some_and(|value| card.created_at < value)
-                    || query
-                        .created_before
-                        .is_some_and(|value| card.created_at > value)
-                    || query
-                        .updated_after
-                        .is_some_and(|value| card.updated_at < value)
-                    || query
-                        .updated_before
-                        .is_some_and(|value| card.updated_at > value)
-                    || query.label.as_ref().is_some_and(|wanted| {
-                        !card
-                            .labels
-                            .iter()
-                            .any(|label| label.eq_ignore_ascii_case(wanted.trim()))
-                    })
-                    || repo_filter.as_deref().is_some_and(|wanted| {
-                        !card
-                            .repo
-                            .as_deref()
-                            .is_some_and(|repo| canonical_repo_matches(repo, wanted))
-                            && repo_from_numeric_card_id_prefix(card.id.as_str()).as_deref()
-                                != Some(wanted)
-                    })
-                {
-                    continue;
-                }
-                let summary = card.summary();
-                summaries.insert(key.clone(), summary.clone());
-                summary
-            };
-            results.push(SearchResult {
-                card: summary,
-                source_kind: row.source_table,
-                source_field: row.source_field,
-                source_created_at: row.created_at,
-                snippet: row.snippet,
-                rank: row.rank,
-            });
-        }
-        results.sort_by(|left, right| {
-            left.rank
-                .partial_cmp(&right.rank)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.source_kind.cmp(&right.source_kind))
-                .then_with(|| left.source_field.cmp(&right.source_field))
-                .then_with(|| left.card.id.as_str().cmp(right.card.id.as_str()))
-                .then_with(|| left.source_created_at.cmp(&right.source_created_at))
-        });
-        let total_count = results.len();
-        let fingerprint = search_query_fingerprint(query);
-        let offset = query
-            .after
-            .as_deref()
-            .map(|cursor| decode_search_cursor(cursor, &fingerprint))
-            .transpose()?
-            .unwrap_or(0);
-        let start = offset.min(total_count);
-        let end = start.saturating_add(query.limit).min(total_count);
-        let matches = results
-            .into_iter()
-            .skip(start)
-            .take(end - start)
-            .collect::<Vec<_>>();
-        let has_more = end < total_count;
-        Ok(SearchPage {
-            matches,
-            total_count,
-            has_more,
-            next_after: has_more.then(|| encode_search_cursor(&fingerprint, end)),
-        })
-    }
-
-    /// powder-epic-truthful-ops: steps 1-10 originally ran their DDL
-    /// unconditionally, unlike the `cards_has_column`-guarded steps below
-    /// (11-16). A process crash (OOM kill, host reboot, `pkill -9`) between a
-    /// step's DDL and its `PRAGMA user_version` bump left the DB schema
-    /// ahead of its recorded version; the next boot would re-run the same
-    /// `ALTER TABLE ... ADD COLUMN` and fail with "duplicate column name",
-    /// wedging every subsequent boot until a human intervened by hand. These
-    /// wrappers close that gap the same way 11-16 already do: check whether
-    /// the DDL's effect is already present before re-issuing it. Table
-    /// creation and index statements already use `IF NOT EXISTS` and are
-    /// naturally idempotent, so only the bare `ALTER TABLE` steps need a
-    /// guard.
-    /// powder-epic-truthful-ops (review fix): `MIGRATE_1_TO_2` is DDL *plus*
-    /// two backfill statements, and `execute_batch` autocommits per
-    /// statement -- so guarding the whole batch on `actor_id`'s existence was
-    /// wrong. A crash after the `ALTER TABLE ... ADD COLUMN actor_id` commits
-    /// but before the two backfills run leaves the column present with every
-    /// value NULL; on retry the single column-existence guard would see the
-    /// column and skip the backfills *forever*. That is not cosmetic:
-    /// `verify_api_key` INNER JOINs `api_keys` to `actors`, so a permanently
-    /// unbackfilled `actor_id` silently stops every pre-existing key from
-    /// authenticating. Decomposed into three independently-idempotent phases,
-    /// mirroring `migrate_3_to_4`'s per-effect guards:
-    ///
-    /// 1. `actors` table + the `api_keys` index are `CREATE ... IF NOT
-    ///    EXISTS`, safe to re-run unconditionally.
-    /// 2. the `ADD COLUMN` is guarded on column existence (an `ALTER ... ADD
-    ///    COLUMN` cannot be re-run).
-    /// 3. the backfill is guarded on its own *effect* -- whether any row is
-    ///    still `actor_id IS NULL` -- not on the column's existence, so an
-    ///    interrupted backfill is finished on the next boot. (The backfill's
-    ///    own `WHERE actor_id IS NULL` also makes re-running it harmless; the
-    ///    completeness guard just avoids a pointless full-table UPDATE when
-    ///    there is nothing left to do.)
     fn migrate_1_to_2(&mut self) -> Result<()> {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS actors (
@@ -1797,6 +1653,10 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    fn migrate_24_to_25(&self) -> Result<()> {
+        self.ensure_principal_role_columns()
     }
 
     fn migrate_19_to_20(&mut self) -> Result<()> {
