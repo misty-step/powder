@@ -49,7 +49,9 @@ impl From<DomainError> for ShellError {
                 Self::Conflict(value.to_string())
             }
             DomainError::Validation { .. } => Self::Invalid(value.to_string()),
-            DomainError::Forbidden(_) => Self::Forbidden(value.to_string()),
+            DomainError::Forbidden(_) | DomainError::AuthorityDenied { .. } => {
+                Self::Forbidden(value.to_string())
+            }
         }
     }
 }
