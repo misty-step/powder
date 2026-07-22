@@ -1501,6 +1501,12 @@ html:not([data-pw-route='card']) .pw-detail-app {
   padding: 0.4em;
 }
 
+.pw-cmdk-status {
+  padding: 0.55em 0.7em;
+  color: var(--ae-ink-faint);
+  font-size: 13px;
+}
+
 .pw-cmdk-item {
   display: flex;
   align-items: baseline;

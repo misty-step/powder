@@ -354,6 +354,7 @@ function schedulePaletteSearch(query) {
   const normalized = query.trim();
   clearTimeout(paletteSearchTimer);
   const seq = ++paletteSearchSeq;
+  palettePendingActivation = false;
   paletteError = "";
   paletteMatches = [];
   paletteLoading = Boolean(normalized);
@@ -379,10 +380,14 @@ async function requestPaletteSearch(query) {
     paletteLoading = false;
     paletteMatches = groupedSearchMatches(data.matches);
     paletteActiveIndex = paletteMatches.length ? 0 : -1;
+    const shouldActivate = palettePendingActivation;
+    palettePendingActivation = false;
     renderPaletteList();
+    if (shouldActivate && paletteMatches.length) activatePaletteSelection(0);
   } catch (err) {
     if (seq !== paletteSearchSeq) return;
     paletteLoading = false;
+    palettePendingActivation = false;
     paletteError = err?.message || String(err);
     paletteMatches = [];
     paletteActiveIndex = -1;
@@ -2517,6 +2522,7 @@ let paletteActiveIndex = -1;
 let paletteInvoker = null;
 let paletteLoading = false;
 let paletteError = "";
+let palettePendingActivation = false;
 let paletteSearchSeq = 0;
 let paletteSearchTimer = null;
 let searchDebounceTimer = null;
@@ -2541,6 +2547,7 @@ function closeCommandPalette() {
   els.cmdk.hidden = true;
   clearTimeout(paletteSearchTimer);
   paletteSearchSeq += 1;
+  palettePendingActivation = false;
   paletteLoading = false;
   paletteError = "";
   paletteMatches = [];
@@ -2597,6 +2604,7 @@ function filterPalette(query) {
   const q = query.trim();
   if (!q) {
     paletteSearchSeq += 1;
+    palettePendingActivation = false;
     paletteLoading = false;
     paletteError = "";
     paletteMatches = state.cards.slice(0, CMDK_MATCH_LIMIT).map((card) => ({
@@ -2617,10 +2625,10 @@ function renderPaletteList() {
   els.cmdkInput.setAttribute("aria-busy", paletteLoading ? "true" : "false");
   if (paletteLoading) {
     els.cmdkEmpty.hidden = true;
-    els.cmdkList.innerHTML = '<li role="status" class="pw-cmdk-item">Searching…</li>';
+    els.cmdkList.innerHTML = '<li role="status" class="pw-cmdk-status">Searching…</li>';
   } else if (paletteError) {
     els.cmdkEmpty.hidden = true;
-    els.cmdkList.innerHTML = '<li role="alert" class="pw-cmdk-item">' + escapeHtml(paletteError) + '</li>';
+    els.cmdkList.innerHTML = '<li role="alert" class="pw-cmdk-status">' + escapeHtml(paletteError) + '</li>';
   } else {
     els.cmdkEmpty.hidden = paletteMatches.length > 0;
     els.cmdkList.innerHTML = paletteMatches.map((entry, index) => {
@@ -2883,6 +2891,10 @@ els.cmdkInput?.addEventListener("keydown", (event) => {
   } else if (event.key === "Enter") {
     event.preventDefault();
     event.stopPropagation();
+    if (paletteLoading) {
+      palettePendingActivation = true;
+      return;
+    }
     activatePaletteSelection();
   } else if (event.key === "Escape") {
     event.preventDefault();

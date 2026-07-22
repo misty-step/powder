@@ -1468,6 +1468,12 @@ html[data-pw-route="card"] .pw-app, html:not([data-pw-route="card"]) .pw-detail-
   overflow-y: auto;
 }
 
+.pw-cmdk-status {
+  color: var(--ae-ink-faint);
+  padding: .55em .7em;
+  font-size: 13px;
+}
+
 .pw-cmdk-item {
   border-radius: var(--ae-radius);
   cursor: pointer;
