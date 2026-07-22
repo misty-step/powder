@@ -461,9 +461,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|route| {
-                route["method"] == "POST" && route["path"] == "/api/v1/repositories"
-            })
+            .find(|route| route["method"] == "POST" && route["path"] == "/api/v1/repositories")
             .expect("root repository creation route is documented");
         assert_eq!(
             create_repository["policy"]["operation"],

@@ -6083,9 +6083,15 @@ fn claim_transition_authority_returns_matrix_denial_classes() -> Result<()> {
     let missing_run = RunId::new("missing-run")?;
 
     for result in [
-        store.release_claim(&missing_id, &missing_run, 20, &holder).map(|_| ()),
-        store.renew_claim(&missing_id, &missing_run, 20, 60, &holder).map(|_| ()),
-        store.heartbeat_claim(&missing_id, &missing_run, 20, &holder).map(|_| ()),
+        store
+            .release_claim(&missing_id, &missing_run, 20, &holder)
+            .map(|_| ()),
+        store
+            .renew_claim(&missing_id, &missing_run, 20, 60, &holder)
+            .map(|_| ()),
+        store
+            .heartbeat_claim(&missing_id, &missing_run, 20, &holder)
+            .map(|_| ()),
         store
             .transfer_claim(&missing_id, &missing_run, "worker-b", 20, 60, &holder)
             .map(|_| ()),
@@ -6109,7 +6115,14 @@ fn claim_transition_authority_returns_matrix_denial_classes() -> Result<()> {
         DenialClass::CrossResource,
     );
     assert_authority_denial(
-        store.transfer_claim(&wrong_id, &wrong_claim.run_id, "worker-b", 20, 3_600, &intruder),
+        store.transfer_claim(
+            &wrong_id,
+            &wrong_claim.run_id,
+            "worker-b",
+            20,
+            3_600,
+            &intruder,
+        ),
         DenialClass::CrossResource,
     );
 
@@ -6149,7 +6162,10 @@ fn claim_transition_authority_returns_matrix_denial_classes() -> Result<()> {
 fn claim_transition_operations_accept_holder_and_admin() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
-    store.import_cards(vec![ready_card("holder-matrix", 2), ready_card("admin-matrix", 2)])?;
+    store.import_cards(vec![
+        ready_card("holder-matrix", 2),
+        ready_card("admin-matrix", 2),
+    ])?;
     let holder = Authority::actor("principal-a", false);
     let admin = Authority::actor("operator", true);
 
@@ -6179,14 +6195,8 @@ fn claim_transition_operations_accept_holder_and_admin() -> Result<()> {
     assert!(store
         .heartbeat_claim(&admin_id, &admin_claim.run_id, 21, &admin)
         .is_ok());
-    let admin_transfer = store.transfer_claim(
-        &admin_id,
-        &admin_claim.run_id,
-        "worker-b",
-        22,
-        60,
-        &admin,
-    )?;
+    let admin_transfer =
+        store.transfer_claim(&admin_id, &admin_claim.run_id, "worker-b", 22, 60, &admin)?;
     assert_eq!(admin_transfer.agent, "worker-b");
     assert!(store
         .release_claim(&admin_id, &admin_claim.run_id, 23, &admin)
