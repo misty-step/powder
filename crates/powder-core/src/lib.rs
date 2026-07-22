@@ -18,12 +18,12 @@ pub use model::{
     DomainError, EpicEvidence, EpicFreshness, EpicState, Estimate, EvidenceKind, Link, LinkId,
     Priority, Risk, Run, RunDetail, RunId, RunState, WorkLogEntry,
 };
-pub use queries::{ClaimReceipt, ReadyQuery};
+pub use queries::{ClaimReceipt, ReadyCursor, ReadyQuery};
 pub use ready_order::{
     order_ready_cards, ready_sort_cmp, transitive_blocked_by, ReadyOrder, TransitiveBlockers,
 };
 pub use repository::{
-    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
+    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix, RepositoryName,
 };
 
 pub mod papercut;
