@@ -2,8 +2,8 @@
 
 mod remote;
 
-use powder_core::OperationRule;
 use powder_core::Operation;
+use powder_core::OperationRule;
 
 pub use remote::{
     parse_card_summary_page, parse_list_page, urlencode, CardSummaryPage, ClientCardSummary,
@@ -493,7 +493,10 @@ mod tests {
                 operation
             );
         }
-        let mut unique = exposed.iter().map(|operation| operation.as_str()).collect::<Vec<_>>();
+        let mut unique = exposed
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<Vec<_>>();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), Operation::ALL.len() - 1);
@@ -502,5 +505,4 @@ mod tests {
             assert_eq!(rule.operation.rule(), rule);
         }
     }
-
 }

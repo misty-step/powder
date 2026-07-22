@@ -896,7 +896,10 @@ fn app(state: AppState) -> Router {
             "/api/v1/repositories",
             post(upsert_repository).get(list_repositories),
         )
-        .route("/api/v1/repositories/normalize", post(normalize_repositories))
+        .route(
+            "/api/v1/repositories/normalize",
+            post(normalize_repositories),
+        )
         .route(
             "/api/v1/repositories/{name}",
             get(get_repository)
@@ -1425,7 +1428,11 @@ async fn normalize_repositories(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
     let outcome = lock_store(&state)?
-        .normalize_repository_strings_with_authority_keyed(&actor.authority(), unix_now(), idempotency_key)?
+        .normalize_repository_strings_with_authority_keyed(
+            &actor.authority(),
+            unix_now(),
+            idempotency_key,
+        )?
         .value;
     Ok(Json(json!(outcome)))
 }
@@ -1438,7 +1445,12 @@ async fn delete_repository(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let idempotency_key = required_idempotency_key(&headers)?;
     lock_store(&state)?
-        .delete_repository_with_authority_keyed(&name, unix_now(), idempotency_key, &actor.authority())?
+        .delete_repository_with_authority_keyed(
+            &name,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
         .value;
     Ok(Json(json!({ "deleted": true, "repository": name })))
 }
@@ -1580,12 +1592,7 @@ async fn file_papercut(
         let seed = format!("{}:{idempotency_key}", actor.authority().actor_label());
         let digest = Sha256::digest(seed.as_bytes());
         let id = CardId::new(format!("papercut-{}", hex::encode(&digest[..6])))?;
-        let card = powder_core::papercut::file_papercut(
-            report,
-            resolved_repo.as_deref(),
-            now,
-            id,
-        )?;
+        let card = powder_core::papercut::file_papercut(report, resolved_repo.as_deref(), now, id)?;
         store
             .create_card_with_events_as_keyed(card, idempotency_key, &actor.authority(), now)?
             .value
@@ -1658,7 +1665,13 @@ async fn release_claim(
     let run_id = RunId::new(request.run_id)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     let receipt = lock_store(&state)?
-        .release_claim_keyed(&card_id, &run_id, unix_now(), idempotency_key, &actor.authority())?
+        .release_claim_keyed(
+            &card_id,
+            &run_id,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
         .value;
     Ok(Json(json!(receipt)))
 }
@@ -1697,7 +1710,13 @@ async fn heartbeat_claim(
     let run_id = RunId::new(request.run_id)?;
     let idempotency_key = required_idempotency_key(&headers)?;
     let receipt = lock_store(&state)?
-        .heartbeat_claim_keyed(&card_id, &run_id, unix_now(), idempotency_key, &actor.authority())?
+        .heartbeat_claim_keyed(
+            &card_id,
+            &run_id,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
         .value;
     Ok(Json(json!(receipt)))
 }
@@ -1892,14 +1911,13 @@ async fn detach_attachment(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id.clone())?;
     let idempotency_key = required_idempotency_key(&headers)?;
-    lock_store(&state)?
-        .detach_as_keyed(
-            &card_id,
-            &attachment_id,
-            unix_now(),
-            idempotency_key,
-            &authenticated.authority(),
-        )?; 
+    lock_store(&state)?.detach_as_keyed(
+        &card_id,
+        &attachment_id,
+        unix_now(),
+        idempotency_key,
+        &authenticated.authority(),
+    )?;
     Ok(Json(
         json!({ "deleted": true, "card_id": id, "attachment_id": attachment_id }),
     ))
@@ -2103,7 +2121,11 @@ async fn disable_event_subscription(
     AdminActor(actor): AdminActor,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let subscription = lock_store(&state)?.disable_event_subscription_with_authority(&id, unix_now(), &actor.authority())?;
+    let subscription = lock_store(&state)?.disable_event_subscription_with_authority(
+        &id,
+        unix_now(),
+        &actor.authority(),
+    )?;
     Ok(Json(json!(subscription)))
 }
 

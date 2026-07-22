@@ -898,7 +898,8 @@ mod tests {
                         .lines()
                         .find_map(|line| {
                             let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("idempotency-key").then_some(value.trim())
+                            name.eq_ignore_ascii_case("idempotency-key")
+                                .then_some(value.trim())
                         })
                         .unwrap_or_default()
                         .to_string(),
@@ -908,12 +909,18 @@ mod tests {
                 } else {
                     r#"{"ok":true}"#
                 };
-                let status = if attempt == 0 { "401 Unauthorized" } else { "200 OK" };
+                let status = if attempt == 0 {
+                    "401 Unauthorized"
+                } else {
+                    "200 OK"
+                };
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                stream.write_all(response.as_bytes()).expect("write response");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
             }
             tx.send(keys).expect("send observed keys");
         });
@@ -926,16 +933,11 @@ mod tests {
             marker.display(),
             marker.display(),
         );
-        let client = RemoteClient::new_with_key_cmd(
-            format!("http://{addr}"),
-            None,
-            Some(key_cmd),
-        );
+        let client = RemoteClient::new_with_key_cmd(format!("http://{addr}"), None, Some(key_cmd));
         let response = client.post_with_key("/api/v1/cards", json!({"id":"card"}), "intent-123");
         let keys = rx.recv().expect("server observations");
         assert_eq!(keys, vec!["intent-123", "intent-123"]);
         assert_eq!(response.expect("auth refresh retry succeeds")["ok"], true);
         let _ = std::fs::remove_file(marker);
     }
-
 }
