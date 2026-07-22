@@ -2031,6 +2031,14 @@ html:not([data-pw-route="card"]) .pw-detail-app {
     min-height: var(--pw-touch-target);
   }
 
+  .pw-retry-actions button, .pw-retry-remove {
+    min-height: var(--pw-touch-target);
+  }
+
+  .pw-retry-remove {
+    min-width: var(--pw-touch-target);
+  }
+
   .pw-board {
     overflow-x: hidden;
   }
@@ -2221,6 +2229,82 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   overflow-wrap: anywhere;
   max-width: 100%;
   display: inline-flex;
+}
+
+.pw-retry-banner[hidden] {
+  display: none;
+}
+
+.pw-retry-banner {
+  padding: var(--pw-space-3) var(--pw-space-6);
+  border-bottom: var(--pw-line-width) solid var(--color-warn);
+  background: var(--color-surface-raised);
+  flex: none;
+}
+
+.pw-retry-entry {
+  gap: var(--pw-space-2);
+  max-width: var(--pw-measure-form);
+  flex-direction: column;
+  display: flex;
+}
+
+.pw-retry-label {
+  font-size: var(--text-sm);
+  color: var(--color-ink);
+  margin: 0;
+}
+
+.pw-retry-files {
+  gap: var(--pw-space-1) var(--pw-space-3);
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+}
+
+.pw-retry-files li {
+  align-items: baseline;
+  gap: var(--pw-space-1);
+  overflow-wrap: anywhere;
+  max-width: 100%;
+  display: inline-flex;
+}
+
+.pw-retry-actions {
+  gap: var(--pw-space-3);
+  display: flex;
+}
+
+.pw-retry-actions .pw-button {
+  border-radius: var(--radius-0);
+  font-size: var(--text-sm);
+  font-weight: var(--pw-weight-medium);
+  padding: var(--pw-space-2) var(--pw-space-5);
+}
+
+.pw-retry-actions .pw-button:not(.pw-button-quiet) {
+  background: var(--color-ink);
+  color: var(--color-accent-ink);
+  border-color: var(--color-ink);
+}
+
+.pw-retry-actions .pw-button-quiet {
+  color: var(--color-ink);
+  border-color: var(--color-line);
+  background: none;
+}
+
+.pw-retry-actions .pw-button-quiet:hover {
+  background: var(--color-surface-sunken);
+}
+
+.pw-retry-actions .pw-button:disabled {
+  cursor: default;
+  opacity: .6;
 }
 
 .pw-toast {

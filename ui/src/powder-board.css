@@ -2027,6 +2027,15 @@ html:not([data-pw-route='card']) .pw-detail-app {
     min-height: var(--pw-touch-target);
   }
 
+  .pw-retry-actions button,
+  .pw-retry-remove {
+    min-height: var(--pw-touch-target);
+  }
+
+  .pw-retry-remove {
+    min-width: var(--pw-touch-target);
+  }
+
   .pw-board {
     overflow-x: hidden;
   }
@@ -2237,6 +2246,86 @@ html:not([data-pw-route='card']) .pw-detail-app {
   gap: var(--pw-space-1);
   max-width: 100%;
   overflow-wrap: anywhere;
+}
+
+/* Attachment retry banner: visible after card creation when image uploads
+   fail. The failed File objects are retained until success, removal, or
+   dismiss — the user can retry without reselecting files. Token-backed to
+   match the quick-add panel's visual language. */
+.pw-retry-banner[hidden] {
+  display: none;
+}
+
+.pw-retry-banner {
+  flex: none;
+  padding: var(--pw-space-3) var(--pw-space-6);
+  border-bottom: var(--pw-line-width) solid var(--color-warn);
+  background: var(--color-surface-raised);
+}
+
+.pw-retry-entry {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pw-space-2);
+  max-width: var(--pw-measure-form);
+}
+
+.pw-retry-label {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-ink);
+}
+
+.pw-retry-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pw-space-1) var(--pw-space-3);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+}
+
+.pw-retry-files li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--pw-space-1);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.pw-retry-actions {
+  display: flex;
+  gap: var(--pw-space-3);
+}
+
+.pw-retry-actions .pw-button {
+  border-radius: var(--radius-0);
+  font-size: var(--text-sm);
+  font-weight: var(--pw-weight-medium);
+  padding: var(--pw-space-2) var(--pw-space-5);
+}
+
+.pw-retry-actions .pw-button:not(.pw-button-quiet) {
+  background: var(--color-ink);
+  color: var(--color-accent-ink);
+  border-color: var(--color-ink);
+}
+
+.pw-retry-actions .pw-button-quiet {
+  background: transparent;
+  color: var(--color-ink);
+  border-color: var(--color-line);
+}
+
+.pw-retry-actions .pw-button-quiet:hover {
+  background: var(--color-surface-sunken);
+}
+
+.pw-retry-actions .pw-button:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .pw-toast {

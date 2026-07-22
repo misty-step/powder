@@ -116,7 +116,7 @@
       </label>
       <label class="pw-quick-add-attach">
         <span class="pw-chrome">Images <span class="pw-optional">paste or choose · up to 2 · 10 MB each</span></span>
-        <input id="quick-add-attachments" type="file" accept="image/*" multiple>
+        <input id="quick-add-attachments" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
       </label>
       <ul id="quick-add-attachment-list" class="pw-quick-add-attachment-list" aria-live="polite"></ul>
       <div class="pw-quick-add-actions">
@@ -126,6 +126,7 @@
       <p id="quick-add-message" class="pw-chrome" aria-live="polite"></p>
     </form>
   </section>
+  <div id="attachment-retry-banner" class="pw-retry-banner" hidden aria-live="polite"></div>
 
   <section id="auth-panel" class="pw-auth" hidden>
     <div>

@@ -74,6 +74,7 @@ const els = {
   quickAddAttachments: document.getElementById("quick-add-attachments"),
   quickAddAttachmentList: document.getElementById("quick-add-attachment-list"),
   quickAddSubmit: document.getElementById("quick-add-submit"),
+  attachmentRetryBanner: document.getElementById("attachment-retry-banner"),
   detailConnection: document.getElementById("detail-connection-status"),
   detailBoardLink: document.getElementById("detail-board-link"),
   detailHomeLink: document.getElementById("detail-home-link"),
@@ -179,6 +180,7 @@ const state = {
 let railShare = 24;
 let quickAddFiles = [];
 let quickAddSubmitting = false;
+let pendingAttachmentRetries = new Map();
 let toastTimer = null;
 let silentRetryTimer = null;
 let statusChangeSeq = 0;
@@ -1567,7 +1569,7 @@ function syncRepoCombo(query, open) {
       const classes = [index === repoComboActive ? "is-active" : "", repo ? "" : "pw-combo-none"]
         .filter(Boolean)
         .join(" ");
-      return `<li id="quick-add-repo-opt-${index}" role="option" data-repo="${escapeHtml(repo)}"${index === repoComboActive ? ' aria-selected="true"' : ""}${classes ? ` class="${classes}"` : ""}>${repo ? escapeHtml(repo) : "no repo · general"}</li>`;
+      return `<li id="quick-add-repo-opt-${index}" role="option" data-repo="${escapeHtml(repo)}"${index === repoComboActive ? ' aria-selected="true"' : ""}${classes ? ` class="${classes}"` : ""}>${repo ? escapeHtml(repo) : "no repo · General"}</li>`;
     })
     .join("");
   const show = Boolean(open) && matches.length > 0;
@@ -1601,8 +1603,9 @@ function hideQuickAdd() {
   els.quickAddToggle.setAttribute("aria-expanded", "false");
 }
 
+const SUPPORTED_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 function isImageFile(file) {
-  return Boolean(file && String(file.type || "").toLowerCase().startsWith("image/"));
+  return Boolean(file && SUPPORTED_IMAGE_MIMES.has(String(file.type || "").toLowerCase()));
 }
 
 const QUICK_ADD_MAX_IMAGES = 2;
@@ -1611,7 +1614,7 @@ const QUICK_ADD_MAX_IMAGE_BYTES = 10 * 1024 * 1024; // matches server MAX_ATTACH
 // Returns { accepted, rejected } so the caller can report why a file was
 // turned away without silently dropping it.
 function validateQuickAddFile(file) {
-  if (!isImageFile(file)) return { ok: false, reason: "not an image" };
+  if (!isImageFile(file)) return { ok: false, reason: "unsupported image type (PNG, JPEG, WebP, or GIF only)" };
   if (file.size > QUICK_ADD_MAX_IMAGE_BYTES) return { ok: false, reason: "exceeds 10 MB" };
   return { ok: true };
 }
@@ -1623,7 +1626,7 @@ function attachmentFilesFromClipboard(clipboard) {
     if (isImageFile(file)) files.push(file);
   }
   for (const item of clipboard.items || []) {
-    if (item.kind === "file" && item.type.startsWith("image/")) {
+    if (item.kind === "file" && SUPPORTED_IMAGE_MIMES.has(String(item.type || "").toLowerCase())) {
       const file = item.getAsFile();
       if (file) files.push(file);
     }
@@ -1710,6 +1713,75 @@ async function uploadQuickAddFiles(cardId, files) {
     .filter(Boolean);
 }
 
+function renderPendingRetries() {
+  const banner = els.attachmentRetryBanner;
+  if (!banner) return;
+  if (!pendingAttachmentRetries.size) {
+    banner.hidden = true;
+    banner.innerHTML = "";
+    return;
+  }
+  banner.hidden = false;
+  banner.innerHTML = [...pendingAttachmentRetries.entries()].map(([cardId, entry]) => {
+    const title = escapeHtml(entry.title || cardId);
+    const fileList = entry.files.map((f, i) => {
+      const name = escapeHtml(f.file.name || ("image-" + (i + 1)));
+      const size = Math.ceil(f.file.size / 1024) + " KB";
+      return '<li><span>' + name + '</span><span class="pw-chrome">' + size + '</span>' +
+        '<button type="button" class="pw-quick-add-remove pw-retry-remove" data-retry-card="' + escapeHtml(cardId) + '" data-retry-index="' + i + '" aria-label="Remove ' + name + '">&times;</button></li>';
+    }).join("");
+    const busy = entry.retrying;
+    return '<div class="pw-retry-entry" data-retry-card="' + escapeHtml(cardId) + '">' +
+      '<p class="pw-retry-label"><span class="pw-chrome">UPLOAD FAILED</span> ' + title + '</p>' +
+      '<ul class="pw-retry-files">' + fileList + '</ul>' +
+      '<div class="pw-retry-actions">' +
+      '<button type="button" class="pw-button pw-button-compact pw-retry-upload" data-retry-card="' + escapeHtml(cardId) + '"' + (busy ? " disabled" : "") + '>' + (busy ? "Uploading…" : "Retry upload") + '</button>' +
+      '<button type="button" class="pw-button pw-button-quiet pw-button-compact pw-retry-dismiss" data-retry-card="' + escapeHtml(cardId) + '"' + (busy ? " disabled" : "") + '>Dismiss</button>' +
+      '</div></div>';
+  }).join("");
+}
+
+async function retryCardAttachments(cardId) {
+  const entry = pendingAttachmentRetries.get(cardId);
+  if (!entry || entry.retrying) return;
+  entry.retrying = true;
+  renderPendingRetries();
+  try {
+    const files = entry.files.map((f) => f.file);
+    const failures = await uploadQuickAddFiles(cardId, files);
+    if (!failures.length) {
+      pendingAttachmentRetries.delete(cardId);
+      showToast("Images attached.", "ok");
+      loadBoard({ silent: true });
+    } else {
+      entry.files = failures.map((f) => ({ file: f.file }));
+      const failed = failures.length;
+      showToast(failed + " " + (failed === 1 ? "image" : "images") + " still failed to upload.", "warn");
+    }
+    renderPendingRetries();
+  } catch (err) {
+    showToast("Retry failed: " + (err.message || err), "warn");
+  } finally {
+    entry.retrying = false;
+    renderPendingRetries();
+  }
+}
+
+function dismissCardAttachmentRetry(cardId) {
+  pendingAttachmentRetries.delete(cardId);
+  renderPendingRetries();
+}
+
+function removeRetryFile(cardId, index) {
+  const entry = pendingAttachmentRetries.get(cardId);
+  if (!entry) return;
+  entry.files.splice(index, 1);
+  if (!entry.files.length) {
+    pendingAttachmentRetries.delete(cardId);
+  }
+  renderPendingRetries();
+}
+
 function showToast(message, kind = "info") {
   if (!els.toast) return;
   els.toast.hidden = false;
@@ -1750,70 +1822,86 @@ async function createCardFromQuickAdd(form) {
     }
   }
   setQuickAddSubmitting(true);
-  const attachments = quickAddFiles.slice();
-  const now = Math.floor(Date.now() / 1000);
-  const payload = {
-    id: quickAddCardId(repo),
-    title,
-    body,
-    acceptance: [],
-    status: "backlog",
-    ...(repo ? { repo } : {}),
-  };
-  // Optimistic: the card lands on the board instantly; the POST confirms in
-  // the background and a failure rolls it back with the draft restored.
-  pendingOptimisticIds.add(payload.id);
-  state.cards = [
-    normalizeCard({ ...payload, priority: "p2", created_at: now, updated_at: now }),
-    ...state.cards,
-  ];
-  form.reset();
-  clearQuickAddFiles();
-  hideQuickAdd();
-  els.quickAddMessage.textContent = "";
-  buildFilters();
-  render();
   try {
-    await apiJson("/api/v1/cards", {
-      method: "POST",
-      idempotencyKey: createMutationReceipt(),
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  } catch (err) {
-    pendingOptimisticIds.delete(payload.id);
-    state.cards = state.cards.filter((card) => card.id !== payload.id);
+    const attachments = quickAddFiles.slice();
+    const now = Math.floor(Date.now() / 1000);
+    const payload = {
+      id: quickAddCardId(repo),
+      title,
+      body,
+      acceptance: [],
+      status: "backlog",
+      ...(repo ? { repo } : {}),
+    };
+    // Optimistic: the card lands on the board instantly; the POST confirms in
+    // the background and a failure rolls it back with the draft restored.
+    pendingOptimisticIds.add(payload.id);
+    state.cards = [
+      normalizeCard({ ...payload, priority: "p2", created_at: now, updated_at: now }),
+      ...state.cards,
+    ];
+    form.reset();
+    clearQuickAddFiles();
+    hideQuickAdd();
+    els.quickAddMessage.textContent = "";
+    if (attachments.length) {
+      pendingAttachmentRetries.set(payload.id, { files: attachments.map((f) => ({ file: f })), title, retrying: true });
+      renderPendingRetries();
+    }
     buildFilters();
     render();
-    showQuickAdd();
-    els.quickAddTitle.value = enteredTitle;
-    els.quickAddBody.value = body;
-    els.quickAddRepo.value = repo;
-    els.quickAddRepoInput.value = repo;
-    quickAddFiles = attachments;
-    renderQuickAddAttachments();
-    els.quickAddMessage.textContent = "Failed: " + (err.message || err);
-    setQuickAddSubmitting(false);
-    return;
-  }
-  pendingOptimisticIds.delete(payload.id);
-  let uploadFailures = [];
-  if (attachments.length) {
-    uploadFailures = await uploadQuickAddFiles(payload.id, attachments);
-  }
-  if (uploadFailures.length) {
-    const failed = uploadFailures.length;
-    const total = attachments.length;
-    if (failed < total) {
-      showToast(total - failed + " of " + total + " images attached; " + failed + " failed to upload.", "warn");
-    } else {
-      showToast("Filed, but " + failed + " " + (failed === 1 ? "image" : "images") + " could not upload. Open the entry and retry from there.", "warn");
+    try {
+      await apiJson("/api/v1/cards", {
+        method: "POST",
+        idempotencyKey: createMutationReceipt(),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      pendingOptimisticIds.delete(payload.id);
+      state.cards = state.cards.filter((card) => card.id !== payload.id);
+      pendingAttachmentRetries.delete(payload.id);
+      renderPendingRetries();
+      buildFilters();
+      render();
+      showQuickAdd();
+      els.quickAddTitle.value = enteredTitle;
+      els.quickAddBody.value = body;
+      els.quickAddRepo.value = repo;
+      els.quickAddRepoInput.value = repo;
+      quickAddFiles = attachments;
+      renderQuickAddAttachments();
+      els.quickAddMessage.textContent = "Failed: " + (err.message || err);
+      return;
     }
-  } else if (attachments.length) {
-    showToast(attachments.length + " " + (attachments.length === 1 ? "image" : "images") + " attached.", "ok");
+    pendingOptimisticIds.delete(payload.id);
+    let uploadFailures = [];
+    if (attachments.length) {
+      uploadFailures = await uploadQuickAddFiles(payload.id, attachments);
+    }
+    const entry = pendingAttachmentRetries.get(payload.id);
+    if (entry) entry.retrying = false;
+    if (uploadFailures.length) {
+      const failed = uploadFailures.length;
+      const total = attachments.length;
+      pendingAttachmentRetries.set(payload.id, { files: uploadFailures.map((f) => ({ file: f.file })), title, retrying: false });
+      renderPendingRetries();
+      if (failed < total) {
+        showToast(total - failed + " of " + total + " images attached; " + failed + " failed to upload.", "warn");
+      } else {
+        showToast("Filed, but " + failed + " " + (failed === 1 ? "image" : "images") + " could not upload. Retry below.", "warn");
+      }
+    } else {
+      pendingAttachmentRetries.delete(payload.id);
+      renderPendingRetries();
+      if (attachments.length) {
+        showToast(attachments.length + " " + (attachments.length === 1 ? "image" : "images") + " attached.", "ok");
+      }
+    }
+    loadBoard({ silent: true });
+  } finally {
+    setQuickAddSubmitting(false);
   }
-  setQuickAddSubmitting(false);
-  loadBoard({ silent: true });
 }
 
 async function mergeRepositoryAlias(form) {
@@ -3042,6 +3130,22 @@ els.quickAddAttachmentList?.addEventListener("click", (event) => {
   if (!btn) return;
   removeQuickAddFile(Number(btn.dataset.remove));
 });
+els.attachmentRetryBanner?.addEventListener("click", (event) => {
+  const retryBtn = event.target.closest(".pw-retry-upload");
+  if (retryBtn) {
+    retryCardAttachments(retryBtn.dataset.retryCard);
+    return;
+  }
+  const dismissBtn = event.target.closest(".pw-retry-dismiss");
+  if (dismissBtn) {
+    dismissCardAttachmentRetry(dismissBtn.dataset.retryCard);
+    return;
+  }
+  const removeBtn = event.target.closest(".pw-retry-remove");
+  if (removeBtn) {
+    removeRetryFile(removeBtn.dataset.retryCard, Number(removeBtn.dataset.retryIndex));
+  }
+});
 els.quickAddForm.addEventListener("paste", (event) => {
   const files = attachmentFilesFromClipboard(event.clipboardData);
   if (!files.length) return;
@@ -3058,6 +3162,7 @@ els.quickAddForm.addEventListener("submit", (event) => {
   event.preventDefault();
   createCardFromQuickAdd(event.currentTarget).catch((err) => {
     els.quickAddMessage.textContent = `Failed: ${err.message || err}`;
+    if (quickAddSubmitting) setQuickAddSubmitting(false);
   });
 });
 els.quickAddRepoInput?.addEventListener("input", () => {
