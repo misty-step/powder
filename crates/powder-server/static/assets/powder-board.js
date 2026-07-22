@@ -1284,6 +1284,7 @@ function renderReadyFacet(group, key, values, label) {
       }
       buildFilters();
       render();
+      void refreshReadyForFilters();
     });
     group.appendChild(button);
   }
@@ -1351,6 +1352,7 @@ function buildFilters() {
       else state.filters.repos.add(repo);
       buildFilters();
       render();
+      void refreshReadyForFilters();
     });
     els.repoFilters.appendChild(button);
   }
@@ -1371,6 +1373,7 @@ function buildFilters() {
       }
       buildFilters();
       render();
+      void refreshReadyForFilters();
     });
     els.prioFilters.appendChild(button);
   }

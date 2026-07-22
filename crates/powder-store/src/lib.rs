@@ -2469,6 +2469,19 @@ impl Store {
                 .into());
             }
         }
+        // Resolve caller-supplied repository aliases once at the Store seam.
+        // The original typed query remains bound into ReadyCursor, while
+        // matching uses the registered canonical repository name.
+        let repository_filters = query
+            .repo
+            .as_ref()
+            .map(|repositories| {
+                repositories
+                    .iter()
+                    .map(|repository| resolve_repository_name(&self.connection, repository))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let all_cards = load_all_cards(&self.connection)?;
         // reuses the same full scan already loaded above, rather than a
         // second query per blocker: a blocker missing from this map is
@@ -2481,13 +2494,13 @@ impl Store {
             }) {
                 continue;
             }
-            if query.repo.as_ref().is_some_and(|repositories| {
+            if repository_filters.as_ref().is_some_and(|repositories| {
                 let card_repo = card
                     .repo
                     .as_deref()
                     .map(ToOwned::to_owned)
                     .or_else(|| repo_from_numeric_card_id_prefix(card.id.as_str()));
-                !repositories.iter().any(|repository| {
+                !repositories.iter().flatten().any(|repository| {
                     card_repo.as_deref().is_some_and(|candidate| {
                         canonical_repo_matches(candidate, repository.as_str())
                     })
