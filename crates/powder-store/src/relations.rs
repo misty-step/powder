@@ -688,7 +688,7 @@ fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
                 kind: ParentIssueKind::InvalidStoredId,
                 evidence: format!(
                     "cards.id row {} is not canonical text id: {}",
-                    row.rowid, &row.card_description
+                    row.rowid, row.card_description
                 ),
                 repaired: false,
             });
@@ -722,7 +722,7 @@ fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
                 kind: ParentIssueKind::InvalidStoredId,
                 evidence: format!(
                     "cards.parent for {card_id} is not canonical text id or NULL: {}",
-                    &row.parent_description
+                    row.parent_description
                 ),
                 repaired: false,
             });
