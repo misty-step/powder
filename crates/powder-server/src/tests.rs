@@ -2479,10 +2479,26 @@ async fn hidden_read_queries_require_admin_across_stats_and_repositories() {
         .raw_key;
     let app = app(state);
     for (path, key, expected) in [
-        ("/api/v1/stats?include_hidden=true", Some(agent_key.as_str()), StatusCode::FORBIDDEN),
-        ("/api/v1/repositories?include_hidden=true", Some(agent_key.as_str()), StatusCode::FORBIDDEN),
-        ("/api/v1/stats?include_hidden=true", None, StatusCode::UNAUTHORIZED),
-        ("/api/v1/repositories?include_hidden=true", None, StatusCode::UNAUTHORIZED),
+        (
+            "/api/v1/stats?include_hidden=true",
+            Some(agent_key.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/api/v1/repositories?include_hidden=true",
+            Some(agent_key.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/api/v1/stats?include_hidden=true",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "/api/v1/repositories?include_hidden=true",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
     ] {
         let response = app
             .clone()
@@ -2491,13 +2507,20 @@ async fn hidden_read_queries_require_admin_across_stats_and_repositories() {
             .unwrap();
         assert_eq!(response.status(), expected, "hidden read {path}");
     }
-    for path in ["/api/v1/stats?include_hidden=true", "/api/v1/repositories?include_hidden=true"] {
+    for path in [
+        "/api/v1/stats?include_hidden=true",
+        "/api/v1/repositories?include_hidden=true",
+    ] {
         let response = app
             .clone()
             .oneshot(json_request(Method::GET, path, Some(&admin_key), ""))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "admin hidden read {path}");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "admin hidden read {path}"
+        );
     }
 }
 async fn repository_settings_crud_and_alias_merge_are_admin_gated() {

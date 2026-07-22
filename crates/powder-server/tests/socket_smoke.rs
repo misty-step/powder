@@ -78,7 +78,6 @@ fn server_lifecycle_over_real_http() {
     let _ = std::fs::remove_file(&bootstrap_key_file);
 }
 
-
 #[test]
 fn public_reads_is_live_only_on_loopback() {
     let server = support::spawn_server_with_public_reads("public-reads-loopback", true);
@@ -118,10 +117,13 @@ fn public_reads_non_loopback_startup_fails_closed_before_listen() {
         &format!("0.0.0.0:{port}"),
         true,
     );
-    assert!(!attempt.status.success(), "unsafe public-read startup must fail");
-    assert!(attempt.output.contains(
-        "public reads are only allowed on a loopback bind in api-key mode"
-    ));
+    assert!(
+        !attempt.status.success(),
+        "unsafe public-read startup must fail"
+    );
+    assert!(attempt
+        .output
+        .contains("public reads are only allowed on a loopback bind in api-key mode"));
     assert!(
         !attempt.bootstrap_key_file.exists(),
         "failed config validation must not create a bootstrap key file"

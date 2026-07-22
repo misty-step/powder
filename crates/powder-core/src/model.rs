@@ -169,7 +169,9 @@ impl Authority {
         match self {
             Self::Unchecked => PrincipalRole::Unchecked,
             Self::Principal { is_admin: true, .. } => PrincipalRole::Admin,
-            Self::Principal { is_admin: false, .. } => PrincipalRole::Agent,
+            Self::Principal {
+                is_admin: false, ..
+            } => PrincipalRole::Agent,
         }
     }
 

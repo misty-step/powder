@@ -37,7 +37,8 @@ use powder_core::Priority;
 use powder_core::{
     canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
     parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
-    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyCursor, ReadyQuery, RunId,
+    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyCursor, ReadyQuery,
+    RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -254,7 +255,6 @@ impl Config {
                 "public reads are only allowed on a loopback bind in api-key mode",
             ));
         }
-
 
         Ok(Self {
             db_path,
@@ -1119,13 +1119,17 @@ async fn routes() -> Json<serde_json::Value> {
 
 fn parse_repository_filter(raw: &str) -> Result<Vec<String>, ApiError> {
     if raw.trim().is_empty() {
-        return Err(ApiError::bad_request("repo must contain at least one repository"));
+        return Err(ApiError::bad_request(
+            "repo must contain at least one repository",
+        ));
     }
     raw.split(',')
         .map(str::trim)
         .map(|value| {
             if value.is_empty() {
-                Err(ApiError::bad_request("repo must not contain a blank repository"))
+                Err(ApiError::bad_request(
+                    "repo must not contain a blank repository",
+                ))
             } else {
                 Ok(value.to_string())
             }
@@ -1165,8 +1169,7 @@ async fn list_ready(
             }
         })
         .transpose()?;
-    let page = lock_store(&state)?
-        .list_ready_page_after(query.clone(), after.as_ref())?;
+    let page = lock_store(&state)?.list_ready_page_after(query.clone(), after.as_ref())?;
     Ok(Json(card_list_page_json(
         page.cards,
         page.total_count,

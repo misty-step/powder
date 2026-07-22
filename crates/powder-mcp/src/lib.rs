@@ -404,9 +404,13 @@ pub fn call_tool_store(
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let repo = parse_repository_filter(args)?;
-            let estimate = optional_str(args, "estimate").map(parse_estimate).transpose()?;
+            let estimate = optional_str(args, "estimate")
+                .map(parse_estimate)
+                .transpose()?;
             let risk = optional_str(args, "risk").map(parse_risk).transpose()?;
-            let priority = optional_str(args, "priority").map(parse_priority).transpose()?;
+            let priority = optional_str(args, "priority")
+                .map(parse_priority)
+                .transpose()?;
             let query = ReadyQuery::new(now, limit)
                 .with_repositories(repo.unwrap_or_default())
                 .with_estimate(estimate)
@@ -416,7 +420,9 @@ pub fn call_tool_store(
                 .map(|raw| ReadyCursor::decode_for_query(raw, &query))
                 .transpose()
                 .map_err(to_string)?;
-            let page = store.list_ready_page_after(query, after.as_ref()).map_err(to_string)?;
+            let page = store
+                .list_ready_page_after(query, after.as_ref())
+                .map_err(to_string)?;
             ready_page_payload(&page)
         }
         "list_cards" => {
@@ -1217,11 +1223,23 @@ fn criterion_arg(args: &Value) -> Result<usize, String> {
 }
 
 fn parse_repository_filter(args: &Value) -> Result<Option<Vec<String>>, String> {
-    let Some(raw) = optional_str(args, "repo") else { return Ok(None); };
-    if raw.trim().is_empty() { return Err("repo must contain at least one repository".to_string()); }
-    let values = raw.split(',').map(str::trim).map(|value| {
-        if value.is_empty() { Err("repo must not contain a blank repository".to_string()) } else { Ok(value.to_string()) }
-    }).collect::<Result<Vec<_>, _>>()?;
+    let Some(raw) = optional_str(args, "repo") else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Err("repo must contain at least one repository".to_string());
+    }
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .map(|value| {
+            if value.is_empty() {
+                Err("repo must not contain a blank repository".to_string())
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(values))
 }
 

@@ -3,9 +3,9 @@
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
     normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
-    ReadyCursor,
     parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
-    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyQuery, Risk, RunId,
+    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyCursor, ReadyQuery, Risk,
+    RunId,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
@@ -891,7 +891,9 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
-    let risk = flag_value(args, "--risk").map(parse_risk_flag).transpose()?;
+    let risk = flag_value(args, "--risk")
+        .map(parse_risk_flag)
+        .transpose()?;
     let priority = flag_value(args, "--priority")
         .map(parse_priority_flag)
         .transpose()?;
@@ -935,13 +937,14 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         ));
     };
     if json_output {
-        return serde_json::to_string(&payload)
-            .map_err(|err| ShellError::Store(err.to_string()));
+        return serde_json::to_string(&payload).map_err(|err| ShellError::Store(err.to_string()));
     }
     let mut out = String::new();
-    for card in json_array(payload.get("cards").ok_or_else(|| {
-        ShellError::Store("ready response missing cards array".to_string())
-    })?)? {
+    for card in json_array(
+        payload
+            .get("cards")
+            .ok_or_else(|| ShellError::Store("ready response missing cards array".to_string()))?,
+    )? {
         out.push_str(&format!(
             "{}\t{}\t{}\n",
             json_string(card, "id")?,

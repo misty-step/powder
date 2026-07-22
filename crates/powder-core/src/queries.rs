@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    model::{CardId, DomainError, Estimate, Priority, Risk, RunId},
-};
+use crate::model::{CardId, DomainError, Estimate, Priority, Risk, RunId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyQuery {
@@ -69,12 +67,26 @@ pub struct ReadyCursor {
 
 impl ReadyCursor {
     pub fn for_query(query: &ReadyQuery, anchor: CardId, snapshot: Vec<CardId>) -> Self {
-        Self { fingerprint: query.fingerprint(), anchor, snapshot }
+        Self {
+            fingerprint: query.fingerprint(),
+            anchor,
+            snapshot,
+        }
     }
 
     pub fn encode(&self) -> String {
-        let snapshot = self.snapshot.iter().map(|id| hex_encode(id.as_str().as_bytes())).collect::<Vec<_>>().join(",");
-        format!("v2.{}.{}.{}", self.fingerprint, hex_encode(self.anchor.as_str().as_bytes()), snapshot)
+        let snapshot = self
+            .snapshot
+            .iter()
+            .map(|id| hex_encode(id.as_str().as_bytes()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "v2.{}.{}.{}",
+            self.fingerprint,
+            hex_encode(self.anchor.as_str().as_bytes()),
+            snapshot
+        )
     }
 
     pub fn matches_query(&self, query: &ReadyQuery) -> bool {
@@ -84,18 +96,60 @@ impl ReadyCursor {
     pub fn decode_for_query(raw: &str, query: &ReadyQuery) -> Result<Self, DomainError> {
         let mut parts = raw.split('.');
         let version = parts.next();
-        let fingerprint = parts.next().ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
-        let anchor_hex = parts.next().ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
+        let fingerprint = parts
+            .next()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
+        let anchor_hex = parts
+            .next()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
         let snapshot_raw = match version {
             Some("v1") => "",
-            Some("v2") => parts.next().ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?,
-            _ => return Err(DomainError::validation("after", "invalid continuation cursor")),
+            Some("v2") => parts
+                .next()
+                .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?,
+            _ => {
+                return Err(DomainError::validation(
+                    "after",
+                    "invalid continuation cursor",
+                ))
+            }
         };
-        if parts.next().is_some() || fingerprint != query.fingerprint() { return Err(DomainError::validation("after", "stale continuation cursor: query filters do not match")); }
-        let bytes = hex_decode(anchor_hex).ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
-        let anchor = CardId::new(String::from_utf8(bytes).map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?).map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?;
-        let snapshot = if snapshot_raw.is_empty() { Vec::new() } else { snapshot_raw.split(',').map(|raw| { let bytes = hex_decode(raw).ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?; let value = String::from_utf8(bytes).map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?; CardId::new(value).map_err(|_| DomainError::validation("after", "invalid continuation cursor")) }).collect::<Result<Vec<_>, _>>()? };
-        Ok(Self { fingerprint: fingerprint.to_owned(), anchor, snapshot })
+        if parts.next().is_some() || fingerprint != query.fingerprint() {
+            return Err(DomainError::validation(
+                "after",
+                "stale continuation cursor: query filters do not match",
+            ));
+        }
+        let bytes = hex_decode(anchor_hex)
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
+        let anchor = CardId::new(
+            String::from_utf8(bytes)
+                .map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?,
+        )
+        .map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?;
+        let snapshot = if snapshot_raw.is_empty() {
+            Vec::new()
+        } else {
+            snapshot_raw
+                .split(',')
+                .map(|raw| {
+                    let bytes = hex_decode(raw).ok_or_else(|| {
+                        DomainError::validation("after", "invalid continuation cursor")
+                    })?;
+                    let value = String::from_utf8(bytes).map_err(|_| {
+                        DomainError::validation("after", "invalid continuation cursor")
+                    })?;
+                    CardId::new(value).map_err(|_| {
+                        DomainError::validation("after", "invalid continuation cursor")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Self {
+            fingerprint: fingerprint.to_owned(),
+            anchor,
+            snapshot,
+        })
     }
 }
 

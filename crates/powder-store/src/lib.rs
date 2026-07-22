@@ -2497,25 +2497,32 @@ impl Store {
                 .collect::<HashMap<_, _>>();
             let mut replayed = Vec::with_capacity(by_id.len());
             for id in &cursor.snapshot {
-                if let Some(card) = by_id.remove(id) { replayed.push(card); }
+                if let Some(card) = by_id.remove(id) {
+                    replayed.push(card);
+                }
             }
             replayed.extend(by_id.into_values());
             replayed.sort_by(|left, right| {
                 let left_pos = cursor.snapshot.iter().position(|id| id == &left.id);
                 let right_pos = cursor.snapshot.iter().position(|id| id == &right.id);
-                left_pos.cmp(&right_pos).then_with(|| powder_core::ready_sort_cmp(left, right))
+                left_pos
+                    .cmp(&right_pos)
+                    .then_with(|| powder_core::ready_sort_cmp(left, right))
             });
             ordered_cards = replayed;
         }
-        let snapshot = ordered_cards.iter().map(|card| card.id.clone()).collect::<Vec<_>>();
+        let snapshot = ordered_cards
+            .iter()
+            .map(|card| card.id.clone())
+            .collect::<Vec<_>>();
         let (cards, next_after) = paginate_ordered_cards(
             ordered_cards,
             query.limit,
             after.map(|cursor| &cursor.anchor),
         )?;
-        let ready_cursor = next_after.as_ref().map(|anchor| {
-            ReadyCursor::for_query(&query, anchor.clone(), snapshot).encode()
-        });
+        let ready_cursor = next_after
+            .as_ref()
+            .map(|anchor| ReadyCursor::for_query(&query, anchor.clone(), snapshot).encode());
         Ok(CardListPage {
             cards,
             total_count,

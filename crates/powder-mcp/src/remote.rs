@@ -29,7 +29,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mut query = format!("limit={limit}");
             if let Some(repo) = optional_str(args, "repo") {
-                if repo.trim().is_empty() { return Err("repo must contain at least one repository".to_string()); }
+                if repo.trim().is_empty() {
+                    return Err("repo must contain at least one repository".to_string());
+                }
                 query.push_str(&format!("&repo={}", urlencode(repo)));
             }
             if let Some(estimate) = optional_str(args, "estimate") {

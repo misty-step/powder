@@ -3,9 +3,9 @@
 //! driving the axum `Router` in-process. Lifted out of `socket_smoke.rs`
 //! (per its own instruction) when `sse_live.rs` became the second such test.
 use std::io::Read;
-use std::sync::{Arc, Mutex};
 use std::net::TcpListener;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Kills the child `powder-server` process (and reaps it) on drop, including
@@ -166,7 +166,10 @@ pub fn run_server_attempt(label: &str, bind_addr: &str, public_reads: bool) -> F
         .env("POWDER_BOOTSTRAP_KEY_FILE", &bootstrap_key_file)
         .env("POWDER_BIND_ADDR", bind_addr)
         .env("POWDER_AUTH_MODE", "api-key")
-        .env("POWDER_PUBLIC_READS", if public_reads { "true" } else { "false" })
+        .env(
+            "POWDER_PUBLIC_READS",
+            if public_reads { "true" } else { "false" },
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn config-attempt server");
@@ -180,7 +183,12 @@ pub fn run_server_attempt(label: &str, bind_addr: &str, public_reads: bool) -> F
     let status = reap_with_deadline(&mut child, Duration::from_secs(10));
     out_reader.join().expect("join attempt stdout reader");
     err_reader.join().expect("join attempt stderr reader");
-    FailedServerAttempt { status, output: output_text(&output), db_path, bootstrap_key_file }
+    FailedServerAttempt {
+        status,
+        output: output_text(&output),
+        db_path,
+        bootstrap_key_file,
+    }
 }
 
 pub fn spawn_server(label: &str) -> RunningServer {
@@ -200,7 +208,10 @@ pub fn spawn_server_with_public_reads(label: &str, public_reads: bool) -> Runnin
         .env("POWDER_BOOTSTRAP_KEY_FILE", &bootstrap_key_file)
         .env("POWDER_BIND_ADDR", format!("127.0.0.1:{port}"))
         .env("POWDER_AUTH_MODE", "api-key")
-        .env("POWDER_PUBLIC_READS", if public_reads { "true" } else { "false" })
+        .env(
+            "POWDER_PUBLIC_READS",
+            if public_reads { "true" } else { "false" },
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
