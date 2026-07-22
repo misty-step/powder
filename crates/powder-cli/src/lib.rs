@@ -17,6 +17,10 @@ use powder_store::{
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_IDEMPOTENCY_KEY: AtomicU64 = AtomicU64::new(0);
 
 pub const COMMANDS: &[&str] = &[
     "version",
@@ -716,7 +720,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         if let Some(parent) = parent {
             payload["parent"] = json!(parent.as_str());
         }
-        client.post("/api/v1/cards", payload).map_err(remote_err)?
+        client
+            .post_with_key("/api/v1/cards", payload, &idempotency_key(args)?)
+            .map_err(remote_err)?
     } else {
         return Err(missing_transport("create-card"));
     };
@@ -791,7 +797,11 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             payload["labels"] = json!(labels);
         }
         client
-            .patch(&format!("/api/v1/cards/{card_id}"), payload)
+            .patch_with_key(
+                &format!("/api/v1/cards/{card_id}"),
+                payload,
+                &idempotency_key(args)?,
+            )
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("update-card"));
@@ -1235,7 +1245,7 @@ fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 "/api/v1/cards/papercut",
                 json!({
                     "agent": report.agent,
@@ -1244,6 +1254,7 @@ fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
                     "model": report.model,
                     "harness": report.harness,
                 }),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1405,9 +1416,10 @@ fn release_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
         (claim.card_id.to_string(), claim.run_id.to_string())
     } else if let Some(client) = remote_env.client() {
         let released = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/release"),
                 json!({"run_id": run_id.as_str()}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (
@@ -1437,9 +1449,10 @@ fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         )
     } else if let Some(client) = remote_env.client() {
         let renewed = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/renew"),
                 json!({"run_id": run_id.as_str(), "ttl_seconds": ttl_seconds}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (
@@ -1483,9 +1496,10 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
         )
     } else if let Some(client) = remote_env.client() {
         let transferred = client
-                .post(
+                .post_with_key(
                     &format!("/api/v1/cards/{card_id}/transfer"),
                     json!({"run_id": run_id.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
+                    &idempotency_key(args)?,
                 )
                 .map_err(remote_err)?;
         (
@@ -1518,9 +1532,10 @@ fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErr
         )
     } else if let Some(client) = remote_env.client() {
         let beat = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/heartbeat"),
                 json!({"run_id": run_id.as_str()}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (
@@ -1609,9 +1624,10 @@ fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shell
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/runs/{run_id}/answer"),
                 json!({"actor": actor, "answer": answer}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1642,9 +1658,10 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/status"),
                 json!({"status": status.as_str()}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1671,9 +1688,10 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/criteria/check"),
                 json!({"criterion": criterion, "actor": actor, "checked": checked}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1701,9 +1719,10 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
         (link.card_id.to_string(), link.id.to_string())
     } else if let Some(client) = remote_env.client() {
         let link = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/links"),
                 json!({"label": label, "url": url}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (json_string(&link, "card_id")?, json_string(&link, "id")?)
@@ -1726,9 +1745,10 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/comments"),
                 json!({"author": author, "body": body}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1765,7 +1785,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/cards/{card_id}/work-log"),
                 json!({
                     "agent": agent,
@@ -1775,6 +1795,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                     "harness": harness,
                     "run_id": run_id,
                 }),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?
     } else {
@@ -1804,9 +1825,10 @@ fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
         (run.id.to_string(), run.card_id.to_string())
     } else if let Some(client) = remote_env.client() {
         let run = client
-            .post(
+            .post_with_key(
                 &format!("/api/v1/runs/{run_id}/input"),
                 json!({"question": question}),
+                &idempotency_key(args)?,
             )
             .map_err(remote_err)?;
         (json_string(&run, "id")?, json_string(&run, "card_id")?)
@@ -1840,7 +1862,11 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
                 .collect::<Vec<_>>());
         }
         client
-            .post(&format!("/api/v1/cards/{card_id}/complete"), body)
+            .post_with_key(
+                &format!("/api/v1/cards/{card_id}/complete"),
+                body,
+                &idempotency_key(args)?,
+            )
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("complete-card"));
@@ -1947,6 +1973,53 @@ fn event_tail(args: &[String]) -> Result<String, ShellError> {
             .list_event_tail(after, parse_limit(args).unwrap_or(20))
             .map_err(store_err)?
     }))
+}
+
+fn idempotency_key(args: &[String]) -> Result<String, ShellError> {
+    let mut values = Vec::new();
+    let mut supplied = false;
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--idempotency-key" {
+            supplied = true;
+            let value = args.get(index + 1).ok_or_else(|| {
+                ShellError::Invalid("--idempotency-key requires a value".to_string())
+            })?;
+            let value = value.trim();
+            if value.is_empty() || value.starts_with("--") {
+                return Err(ShellError::Invalid(
+                    "--idempotency-key requires a non-empty value".to_string(),
+                ));
+            }
+            values.push(value);
+        } else if let Some(value) = arg.strip_prefix("--idempotency-key=") {
+            supplied = true;
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ShellError::Invalid(
+                    "--idempotency-key requires a non-empty value".to_string(),
+                ));
+            }
+            values.push(value);
+        }
+    }
+    if !supplied {
+        let sequence = NEXT_IDEMPOTENCY_KEY.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        return Ok(format!(
+            "powder-cli-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+    }
+    let first = values[0];
+    if values.iter().any(|value| *value != first) {
+        return Err(ShellError::Invalid(
+            "conflicting --idempotency-key values are not accepted".to_string(),
+        ));
+    }
+    Ok(first.to_string())
 }
 
 fn open_store(path: &str) -> Result<Store, ShellError> {
@@ -4485,6 +4558,70 @@ mod tests {
     }
 
     #[test]
+    fn cli_idempotency_key_override_is_stable_and_conflicts_fail() {
+        let explicit = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "replay-1",
+        ]);
+        assert_eq!(idempotency_key(&explicit).unwrap(), "replay-1");
+        let repeated = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "replay-1",
+            "--idempotency-key",
+            "replay-1",
+        ]);
+        assert_eq!(idempotency_key(&repeated).unwrap(), "replay-1");
+        let conflicting = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "replay-1",
+            "--idempotency-key",
+            "replay-2",
+        ]);
+        let error = idempotency_key(&conflicting).unwrap_err().to_string();
+        assert!(error.contains("conflicting --idempotency-key"));
+        let empty = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+            "",
+        ]);
+        assert!(idempotency_key(&empty)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a non-empty"));
+        let missing = args([
+            "update-status",
+            "card-1",
+            "--status",
+            "done",
+            "--idempotency-key",
+        ]);
+        assert!(idempotency_key(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a value"));
+        let generated = args(["update-status", "card-1", "--status", "done"]);
+        let first = idempotency_key(&generated).unwrap();
+        let second = idempotency_key(&generated).unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with("powder-cli-"));
+    }
+
+    #[test]
     fn cli_remote_mode_uses_http_for_the_accepted_card_commands() {
         let (base_url, recorded) = spawn_test_server(vec![
             (
@@ -4572,6 +4709,8 @@ mod tests {
                 "misty-step/powder",
                 "--related",
                 "remote-1",
+                "--idempotency-key",
+                "create-replay",
             ]),
             &env,
         )
@@ -4641,6 +4780,14 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| { request.authorization.as_deref() == Some("Bearer sk_powder_test") }));
+        assert_eq!(
+            requests[3].idempotency_key.as_deref(),
+            Some("create-replay")
+        );
+        assert!(requests[4].idempotency_key.is_none());
+        for index in [5usize, 6, 7] {
+            assert!(requests[index].idempotency_key.is_some());
+        }
         assert_eq!(
             requests[3].body,
             Some(json!({
@@ -5183,6 +5330,7 @@ Serve grid thumbnails instead of full originals.\n\n\
         method: String,
         path: String,
         authorization: Option<String>,
+        idempotency_key: Option<String>,
         body: Option<Value>,
     }
 
@@ -5213,6 +5361,7 @@ Serve grid thumbnails instead of full originals.\n\n\
 
                 let mut content_length = 0usize;
                 let mut authorization = None;
+                let mut idempotency_key = None;
                 loop {
                     let mut header_line = String::new();
                     reader.read_line(&mut header_line).expect("read header");
@@ -5224,6 +5373,9 @@ Serve grid thumbnails instead of full originals.\n\n\
                     }
                     if let Some(value) = header_line.strip_prefix("Authorization:") {
                         authorization = Some(value.trim().to_string());
+                    }
+                    if let Some(value) = header_line.strip_prefix("Idempotency-Key:") {
+                        idempotency_key = Some(value.trim().to_string());
                     }
                 }
 
@@ -5238,6 +5390,7 @@ Serve grid thumbnails instead of full originals.\n\n\
                     method,
                     path,
                     authorization,
+                    idempotency_key,
                     body: request_body,
                 });
 
