@@ -2217,8 +2217,10 @@ async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
             .unwrap();
         assert_eq!(hidden_repo.status(), StatusCode::OK);
         for body in [
+            r#"{"id":"hidden-parent","title":"Hidden parent","acceptance":["proof"],"status":"ready","repo":"secret-rollups"}"#,
             r#"{"id":"public-rollup","title":"Public rollup","acceptance":["proof"],"status":"ready"}"#,
             r#"{"id":"secret-rollup","title":"Secret rollup","acceptance":["proof"],"status":"ready","repo":"secret-rollups"}"#,
+            r#"{"id":"visible-child","title":"Visible child","acceptance":["proof"],"status":"ready","parent":"hidden-parent"}"#,
         ] {
             let created = router
                 .clone()
@@ -2288,8 +2290,16 @@ async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
         .await
         .unwrap();
     assert_eq!(public_default.status(), StatusCode::OK);
-    let public_default_body = response_text(public_default).await;
-    assert!(public_default_body.contains("General"));
+    let public_default = response_json(public_default).await;
+    assert_eq!(public_default["coverage"]["total_cards"], 2);
+    assert_eq!(public_default["coverage"]["accounted_cards"], 2);
+    assert_eq!(public_default["coverage"]["unsorted_cards"], 2);
+    assert_eq!(public_default["coverage"]["parent_issue_count"], 0);
+    assert!(public_default["coverage"]["complete"].as_bool().unwrap());
+    assert_eq!(public_default["rollups"][0]["title"], "General");
+    assert_eq!(public_default["rollups"][0]["status_counts"]["ready"], 2);
+    let public_default_body = serde_json::to_string(&public_default).unwrap();
+    assert!(!public_default_body.contains("hidden-parent"));
     assert!(!public_default_body.contains("secret-rollups"));
 
     let public_hidden_without_admin = public_app
