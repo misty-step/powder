@@ -688,9 +688,16 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         card.blocked_by = blocked_by;
         card.parent = parent;
         card.repo = repo;
-        json!(store
-            .create_card_with_events_as(card, &authority(args), now)
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .create_card_with_events_as_keyed(
+                    card,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                    now,
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({
             "id": id,
@@ -764,9 +771,17 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .patch_card_as(&card_id, patch, &authority(args), now)
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .patch_card_as_keyed(
+                    &card_id,
+                    patch,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                    now,
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({});
         if let Some(title) = patch.title {
@@ -820,15 +835,17 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
     let card_id = positional_card_id(args, "update-relations")?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .update_relations(
+        .update_relations_keyed(
             &card_id,
             card_ids_flag(args, "--related")?,
             card_ids_flag(args, "--blocks")?,
             card_ids_flag(args, "--blocked-by")?,
             now,
+            &idempotency_key(args)?,
             &authority(args),
         )
-        .map_err(store_err)?;
+        .map_err(store_err)?
+        .value;
     Ok(format!("relations\t{}\n", card.id))
 }
 
@@ -868,8 +885,15 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
     };
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .set_parent(&card_id, parent, now, &authority(args))
-        .map_err(store_err)?;
+        .set_parent_keyed(
+            &card_id,
+            parent,
+            now,
+            &idempotency_key(args)?,
+            &authority(args),
+        )
+        .map_err(store_err)?
+        .value;
     Ok(format!(
         "parent\t{}\t{}\n",
         card.id,
@@ -1314,8 +1338,8 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
         })
         .transpose()?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    let repository = store
-        .upsert_repository_with_authority(
+    let repository_outcome = store
+        .upsert_repository_with_authority_keyed(
             RepositoryUpsert {
                 name,
                 aliases: aliases_flag(args),
@@ -1324,9 +1348,13 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
                 import_provenance: flag_value(args, "--import-provenance").map(str::to_string),
             },
             now,
+            &idempotency_key(args)?,
             &admin_authority(args),
         )
         .map_err(store_err)?;
+    let mut repository = serde_json::to_value(repository_outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    repository["replayed"] = json!(repository_outcome.replayed);
     to_pretty_json(&repository)
 }
 
@@ -1341,21 +1369,36 @@ fn repository_merge_alias(args: &[String]) -> Result<String, ShellError> {
     }
     let mut store = open_store(required_flag(args, "--db")?)?;
     let outcome = store
-        .merge_repository_alias_with_authority(alias, target, &auth, now)
+        .merge_repository_alias_with_authority_keyed(
+            alias,
+            target,
+            &auth,
+            now,
+            &idempotency_key(args)?,
+        )
         .map_err(store_err)?;
-    to_pretty_json(&outcome)
+    let mut value = serde_json::to_value(outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    value["replayed"] = json!(outcome.replayed);
+    to_pretty_json(&value)
 }
 
 fn repository_delete(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
     let name = positional(args)
         .first()
         .copied()
         .ok_or_else(|| ShellError::Invalid("repository-delete requires a name".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    store
-        .delete_repository_with_authority(name, &admin_authority(args))
+    let outcome = store
+        .delete_repository_with_authority_keyed(
+            name,
+            now,
+            &idempotency_key(args)?,
+            &admin_authority(args),
+        )
         .map_err(store_err)?;
-    Ok(format!("deleted\t{name}\n"))
+    Ok(format!("deleted\t{name}\t{}\n", outcome.replayed))
 }
 
 /// powder-904: admin-ish, local-db-only sweep -- normalizes every card
@@ -1370,10 +1413,13 @@ fn repository_normalize(args: &[String]) -> Result<String, ShellError> {
         let auth = admin_authority(args);
         let mut store = open_store(required_flag(args, "--db")?)?;
         store
-            .normalize_repository_strings_with_authority(&auth, now)
+            .normalize_repository_strings_with_authority_keyed(&auth, now, &idempotency_key(args)?)
             .map_err(store_err)?
     };
-    to_pretty_json(&outcome)
+    let mut value = serde_json::to_value(outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    value["replayed"] = json!(outcome.replayed);
+    to_pretty_json(&value)
 }
 
 fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1411,8 +1457,15 @@ fn release_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (released_card_id, released_run_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .release_claim(&card_id, &run_id, now, &authority(args))
-            .map_err(store_err)?;
+            .release_claim_keyed(
+                &card_id,
+                &run_id,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (claim.card_id.to_string(), claim.run_id.to_string())
     } else if let Some(client) = remote_env.client() {
         let released = client
@@ -1440,8 +1493,16 @@ fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let (renewed_card_id, renewed_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
-            .map_err(store_err)?;
+            .renew_claim_keyed(
+                &card_id,
+                &run_id,
+                now,
+                ttl_seconds,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (
             claim.card_id.to_string(),
             claim.run_id.to_string(),
@@ -1479,15 +1540,17 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
     {
         let mut store = open_store(db)?;
         let claim = store
-            .transfer_claim(
+            .transfer_claim_keyed(
                 &card_id,
                 &run_id,
                 to_agent,
                 now,
                 ttl_seconds,
+                &idempotency_key(args)?,
                 &authority(args),
             )
-            .map_err(store_err)?;
+            .map_err(store_err)?
+            .value;
         (
             claim.card_id.to_string(),
             claim.run_id.to_string(),
@@ -1523,8 +1586,15 @@ fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErr
     let (beat_card_id, beat_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .heartbeat_claim(&card_id, &run_id, now, &authority(args))
-            .map_err(store_err)?;
+            .heartbeat_claim_keyed(
+                &card_id,
+                &run_id,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (
             claim.card_id.to_string(),
             claim.run_id.to_string(),
@@ -1619,9 +1689,18 @@ fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shell
     let answer = required_flag(args, "--answer")?;
     let run = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .answer_input(&run_id, actor, answer, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .answer_input_keyed(
+                    &run_id,
+                    actor,
+                    answer,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
             .post_with_key(
@@ -1653,9 +1732,17 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .update_status(&card_id, status, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .update_status_keyed(
+                    &card_id,
+                    status,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
             .post_with_key(
@@ -1683,9 +1770,19 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let checked = !has_flag(args, "--unchecked");
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .check_criterion_as(&card_id, criterion, actor, checked, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .check_criterion_as_keyed(
+                    &card_id,
+                    criterion,
+                    actor,
+                    checked,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
             .post_with_key(
@@ -1714,8 +1811,16 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     let (link_card_id, link_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let link = store
-            .add_link_as(&card_id, label, url, now, &authority(args))
-            .map_err(store_err)?;
+            .add_link_as_keyed(
+                &card_id,
+                label,
+                url,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (link.card_id.to_string(), link.id.to_string())
     } else if let Some(client) = remote_env.client() {
         let link = client
@@ -1740,9 +1845,18 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let body = required_flag(args, "--body")?;
     let comment = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .add_comment_as(&card_id, author, body, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .add_comment_as_keyed(
+                    &card_id,
+                    author,
+                    body,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
             .post_with_key(
@@ -1780,9 +1894,19 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .append_work_log_as(&card_id, agent, attribution, body, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .append_work_log_as_keyed(
+                    &card_id,
+                    agent,
+                    attribution,
+                    body,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         client
             .post_with_key(
@@ -1820,8 +1944,15 @@ fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (awaiting_run_id, awaiting_card_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let run = store
-            .request_input(&run_id, question, now, &authority(args))
-            .map_err(store_err)?;
+            .request_input_keyed(
+                &run_id,
+                question,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
         (run.id.to_string(), run.card_id.to_string())
     } else if let Some(client) = remote_env.client() {
         let run = client
@@ -1847,9 +1978,18 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let criterion_proofs = criterion_proofs_flag(args)?;
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        json!(store
-            .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
-            .map_err(store_err)?)
+        keyed_json(
+            store
+                .complete_card_keyed(
+                    &card_id,
+                    proof,
+                    criterion_proofs,
+                    now,
+                    &idempotency_key(args)?,
+                    &authority(args),
+                )
+                .map_err(store_err)?,
+        )?
     } else if let Some(client) = remote_env.client() {
         let mut body = json!({});
         if let Some(proof) = proof {
@@ -2020,6 +2160,17 @@ fn idempotency_key(args: &[String]) -> Result<String, ShellError> {
         ));
     }
     Ok(first.to_string())
+}
+
+fn keyed_json<T: serde::Serialize>(
+    outcome: powder_store::IdempotencyOutcome<T>,
+) -> Result<Value, ShellError> {
+    let mut value = serde_json::to_value(outcome.value)
+        .map_err(|error| ShellError::Store(error.to_string()))?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("replayed".to_string(), json!(outcome.replayed));
+    }
+    Ok(value)
 }
 
 fn open_store(path: &str) -> Result<Store, ShellError> {
