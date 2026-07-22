@@ -211,8 +211,9 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
 
    Run the report *before* repairing: normal doctor runs are read-only and
    include deterministic `parent_issues` findings for dangling, self, cycle,
-   and invalid persisted parent edges. Repair uses union semantics for relation
-   mirrors (it adds the missing mirror edge, never deletes the one-sided edge),
+   and invalid persisted parent edges, plus typed `issues` findings when relation
+   JSON is malformed or contains noncanonical IDs. Repair uses union semantics for
+   relation mirrors (it adds the missing mirror edge, never deletes the one-sided edge),
    so it cannot distinguish a missing mirror-add from a half-applied removal —
    if the report shows an edge you know was meant to be deleted, delete it via
    `update-relations` instead of letting repair resurrect it. Parent repair

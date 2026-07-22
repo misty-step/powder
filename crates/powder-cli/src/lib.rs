@@ -303,10 +303,10 @@ pub fn help() -> String {
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000  (mirrors reciprocally onto 002, 003, and 004 atomically)\n",
     );
     help.push_str(
-        "  powder relations-doctor --db ./data/powder.db  (report-only: relation asymmetry plus dangling/self/cycle/invalid parent edges; nested parents remain valid)\n",
+        "  powder relations-doctor --db ./data/powder.db  (report-only: relation asymmetry, malformed relation values, plus dangling/self/cycle/invalid parent edges; nested parents remain valid)\n",
     );
     help.push_str(
-        "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (audited relation mirror repair; parent repair refuses with evidence)\n",
+        "  powder relations-doctor --db ./data/powder.db --repair --actor operator  (audited relation mirror repair; malformed relation values stay unchanged; parent repair refuses with evidence)\n",
     );
     help.push_str(
         "    (--repair always ADDS missing relation mirrors, never invents parents; parent findings are refused with evidence because raw state has no unambiguous audited correction.)\n",
