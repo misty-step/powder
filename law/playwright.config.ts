@@ -1,10 +1,9 @@
 import { defineConfig } from "@playwright/test";
 
-// The law gate (aesthetic 015/011): proves @misty-step/aesthetic's
-// render-time invariants hold on powder's own served board UI, not just
-// eyeballed per PR. Boots a real powder-server against a throwaway seeded
-// DB (law/scripts/start-fixture-server.sh) so the board renders populated
-// cards rather than an empty shell.
+// The board law gate proves Powder's render-time invariants on its own served
+// UI, not just by eyeballing each PR. It boots a real powder-server against a
+// throwaway seeded DB (law/scripts/start-fixture-server.sh) so the board
+// renders populated cards rather than an empty shell.
 const PORT = 4100;
 
 // powder-ui-keyboard-firstrun: a second, genuinely-empty instance

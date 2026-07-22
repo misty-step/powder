@@ -1,10 +1,10 @@
 /* powder-ui-toolchain-foundation: Tailwind v4 wired into the Vite build.
    CSS-first config (no tailwind.config.js needed in v4) -- this file *is*
    the config. Deliberately imports only the theme tokens and utilities
-   layers, NOT preflight: the board's hand-authored aesthetic.css/
-   powder-board.css already define the reset/typography baseline this repo
-   ships today, and Preflight's margin/box-sizing resets would silently
-   change rendered output and break the law gate's Playwright assertions.
+   layers, NOT preflight: the board's hand-authored powder-board.css defines
+   the reset/typography baseline this repo ships today, and Preflight's
+   margin/box-sizing resets would silently change rendered output and break
+   the law gate's Playwright assertions.
 
    `source(none)` on both imports turns off Tailwind's automatic class-name
    scanner entirely, and no `@source` directive is declared, so Tailwind's

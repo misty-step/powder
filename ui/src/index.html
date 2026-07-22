@@ -7,10 +7,10 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231a1a1a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m10 20-1.25-2.5L6 18'/%3E%3Cpath d='M10 4 8.75 6.5 6 6'/%3E%3Cpath d='m14 20 1.25-2.5L18 18'/%3E%3Cpath d='m14 4 1.25 2.5L18 6'/%3E%3Cpath d='m17 21-3-6h-4'/%3E%3Cpath d='m17 3-3 6 1.5 3'/%3E%3Cpath d='M2 12h6.5L10 9'/%3E%3Cpath d='m20 10-1.5 2 1.5 2'/%3E%3Cpath d='M22 12h-6.5L14 15'/%3E%3Cpath d='m4 10 1.5 2L4 14'/%3E%3Cpath d='m7 21 3-6-1.5-3'/%3E%3Cpath d='m7 3 3 6h4'/%3E%3C/svg%3E">
   <script>
     try {
-      const mode = localStorage.getItem("ae-mode");
+      const mode = localStorage.getItem("pw-mode");
       if (mode === "dark" || mode === "light") {
         document.documentElement.classList.add(mode);
-        document.documentElement.setAttribute("data-ae-mode", mode);
+        document.documentElement.setAttribute("data-pw-mode", mode);
         document.documentElement.style.colorScheme = mode;
       }
     } catch (_err) {}
@@ -22,7 +22,6 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&amp;family=Geist+Mono:wght@100..900&amp;display=swap">
-  <link rel="stylesheet" href="/assets/aesthetic.css">
   <link rel="stylesheet" href="/assets/powder-board.css">
 </head>
 <body>
@@ -64,33 +63,33 @@
 </svg>
 
 <div id="powder-board-app" class="pw-app">
-  <header class="pw-top ae-chrome">
+  <header class="pw-top pw-chrome">
     <div class="pw-brand">
-      <span class="pw-mark" aria-hidden="true"><svg class="ae-icon"><use href="#i-snowflake"></use></svg></span>
-      <span class="ae-name">POWDER</span>
+      <span class="pw-mark" aria-hidden="true"><svg class="pw-icon"><use href="#i-snowflake"></use></svg></span>
+      <span class="pw-name">POWDER</span>
     </div>
-    <nav class="ae-tabs" id="tabs" role="tablist" aria-label="views">
+    <nav class="pw-tabs" id="tabs" role="tablist" aria-label="views">
       <button id="tab-backlog" type="button" role="tab" aria-selected="false">Backlog</button>
       <button id="tab-both" type="button" role="tab" aria-selected="true">Both</button>
       <button id="tab-board" type="button" role="tab" aria-selected="false">Board</button>
-      <span class="ae-nav-ind" id="ind"></span>
+      <span class="pw-nav-ind" id="ind"></span>
     </nav>
     <div class="pw-top-right">
       <span id="live-indicator" class="pw-live" data-state="idle" title="live board updates via SSE">live</span>
       <button class="pw-filter-btn" id="quick-add-toggle" type="button" aria-expanded="false" aria-controls="quick-add-panel">
-        <svg class="ae-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+        <svg class="pw-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
         new card
       </button>
       <button class="pw-filter-btn" id="cmdk-toggle" type="button" aria-haspopup="dialog" aria-controls="cmdk">
-        <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+        <svg class="pw-icon" aria-hidden="true"><use href="#i-search"></use></svg>
         jump <kbd>&#8984;K</kbd>
       </button>
       <button class="pw-filter-btn" id="filter-btn" type="button" aria-expanded="false" aria-controls="filters">
-        <svg class="ae-icon" aria-hidden="true"><use href="#i-filter"></use></svg>
+        <svg class="pw-icon" aria-hidden="true"><use href="#i-filter"></use></svg>
         filter<span class="pw-filter-n" id="filter-n"></span>
       </button>
       <button id="settings-toggle" class="pw-icon-btn" type="button" aria-label="connection and API key settings" aria-expanded="false" aria-controls="auth-panel">
-        <svg class="ae-icon" aria-hidden="true"><use href="#i-gear"></use></svg>
+        <svg class="pw-icon" aria-hidden="true"><use href="#i-gear"></use></svg>
       </button>
     </div>
   </header>
@@ -99,119 +98,119 @@
     <form id="quick-add-form" class="pw-quick-add-form">
       <h2 class="pw-quick-add-title">New card</h2>
       <label>
-        <span class="ae-chrome">Title</span>
-        <input id="quick-add-title" class="ae-input" type="text" autocomplete="off" placeholder="Short title (first description line works too)">
+        <span class="pw-chrome">Title</span>
+        <input id="quick-add-title" class="pw-input" type="text" autocomplete="off" placeholder="Short title (first description line works too)">
       </label>
       <label>
-        <span class="ae-chrome">Description</span>
-        <textarea id="quick-add-body" class="ae-input" rows="4" placeholder="Paste or type the whole thought here…"></textarea>
+        <span class="pw-chrome">Description</span>
+        <textarea id="quick-add-body" class="pw-input" rows="4" placeholder="Paste or type the whole thought here…"></textarea>
       </label>
       <label class="pw-combo-label">
-        <span class="ae-chrome">Repo <span class="pw-optional">type to search · defaults to general</span></span>
+        <span class="pw-chrome">Repo <span class="pw-optional">type to search · defaults to general</span></span>
         <div class="pw-combo">
-          <span class="pw-search pw-combo-field"><svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="quick-add-repo-input" type="text" role="combobox" aria-expanded="false" aria-controls="quick-add-repo-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="no repo · general"></span>
+          <span class="pw-search pw-combo-field"><svg class="pw-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="quick-add-repo-input" type="text" role="combobox" aria-expanded="false" aria-controls="quick-add-repo-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="no repo · general"></span>
           <input id="quick-add-repo" type="hidden" value="">
           <ul id="quick-add-repo-list" class="pw-combo-list" role="listbox" hidden></ul>
         </div>
       </label>
       <label class="pw-quick-add-attach">
-        <span class="ae-chrome">Images <span class="pw-optional">paste or choose</span></span>
+        <span class="pw-chrome">Images <span class="pw-optional">paste or choose</span></span>
         <input id="quick-add-attachments" type="file" accept="image/*" multiple>
       </label>
       <ul id="quick-add-attachment-list" class="pw-quick-add-attachment-list" aria-live="polite"></ul>
       <div class="pw-quick-add-actions">
-        <button class="ae-button ae-button-compact" type="submit">Save</button>
-        <button class="ae-button ae-button-quiet ae-button-compact" type="button" id="quick-add-cancel">Cancel</button>
+        <button class="pw-button pw-button-compact" type="submit">Save</button>
+        <button class="pw-button pw-button-quiet pw-button-compact" type="button" id="quick-add-cancel">Cancel</button>
       </div>
-      <p id="quick-add-message" class="ae-chrome" aria-live="polite"></p>
+      <p id="quick-add-message" class="pw-chrome" aria-live="polite"></p>
     </form>
   </section>
 
   <section id="auth-panel" class="pw-auth" hidden>
     <div>
-      <p id="auth-intro" class="ae-item">Checking this instance's access requirements&hellip;</p>
-      <p class="ae-chrome">Connection: <span id="connection-status" class="pw-connection" data-kind="loading">loading</span></p>
-      <p class="ae-chrome">Need a key? Mint one on the instance with:</p>
+      <p id="auth-intro" class="pw-item">Checking this instance's access requirements&hellip;</p>
+      <p class="pw-chrome">Connection: <span id="connection-status" class="pw-connection" data-kind="loading">loading</span></p>
+      <p class="pw-chrome">Need a key? Mint one on the instance with:</p>
       <span class="pw-mint-cmd">
         <code id="mint-command">powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
-        <button id="copy-mint-command" class="ae-button ae-button-quiet ae-button-compact" type="button">copy</button>
+        <button id="copy-mint-command" class="pw-button pw-button-quiet pw-button-compact" type="button">copy</button>
       </span>
     </div>
     <section class="pw-repo-settings" aria-label="repository settings">
       <div class="pw-settings-head">
-        <p class="ae-h">REPOSITORIES</p>
+        <p class="pw-section-head">REPOSITORIES</p>
         <span class="pw-settings-head-meta">
-          <span id="repo-settings-count" class="ae-num">0</span>
+          <span id="repo-settings-count" class="pw-num">0</span>
           <button id="repo-empty-toggle" class="pw-filter-clear" type="button" aria-pressed="false" hidden>show empty</button>
         </span>
       </div>
       <form id="repo-create-form" class="pw-repo-create">
         <label>
-          <span class="ae-chrome">Name</span>
-          <input id="repo-create-name" class="ae-input" type="text" autocomplete="off" placeholder="repo">
+          <span class="pw-chrome">Name</span>
+          <input id="repo-create-name" class="pw-input" type="text" autocomplete="off" placeholder="repo">
         </label>
         <label>
-          <span class="ae-chrome">Aliases</span>
-          <input id="repo-create-aliases" class="ae-input" type="text" autocomplete="off" placeholder="owner/repo,legacy">
+          <span class="pw-chrome">Aliases</span>
+          <input id="repo-create-aliases" class="pw-input" type="text" autocomplete="off" placeholder="owner/repo,legacy">
         </label>
         <label>
-          <span class="ae-chrome">Provenance</span>
-          <input id="repo-create-provenance" class="ae-input" type="text" autocomplete="off" placeholder="manual">
+          <span class="pw-chrome">Provenance</span>
+          <input id="repo-create-provenance" class="pw-input" type="text" autocomplete="off" placeholder="manual">
         </label>
         <label>
-          <span class="ae-chrome">Visibility</span>
+          <span class="pw-chrome">Visibility</span>
           <select id="repo-create-visibility" class="pw-sort">
             <option value="visible">visible</option>
             <option value="hidden">hidden</option>
           </select>
         </label>
         <label>
-          <span class="ae-chrome">Tier</span>
+          <span class="pw-chrome">Tier</span>
           <select id="repo-create-tier" class="pw-sort">
             <option value="active">active</option>
             <option value="backburner" selected>backburner</option>
             <option value="archived">archived</option>
           </select>
         </label>
-        <button class="ae-button ae-button-compact" type="submit">save</button>
+        <button class="pw-button pw-button-compact" type="submit">save</button>
       </form>
       <div id="repo-settings-list" class="pw-repo-list" aria-live="polite"></div>
     </section>
     <form id="api-key-form" class="pw-auth-form">
       <label>
-        <span class="ae-chrome">API key</span>
-        <input id="api-key-input" class="ae-input" type="password" autocomplete="off" placeholder="paste key">
+        <span class="pw-chrome">API key</span>
+        <input id="api-key-input" class="pw-input" type="password" autocomplete="off" placeholder="paste key">
       </label>
-      <button id="paste-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button" hidden>paste &amp; connect</button>
-      <button class="ae-button ae-button-compact" type="submit">save</button>
-      <button id="clear-api-key" class="ae-button ae-button-quiet ae-button-compact" type="button">clear</button>
-      <p id="auth-message" class="ae-chrome"></p>
+      <button id="paste-api-key" class="pw-button pw-button-quiet pw-button-compact" type="button" hidden>paste &amp; connect</button>
+      <button class="pw-button pw-button-compact" type="submit">save</button>
+      <button id="clear-api-key" class="pw-button pw-button-quiet pw-button-compact" type="button">clear</button>
+      <p id="auth-message" class="pw-chrome"></p>
     </form>
   </section>
 
   <div class="pw-filters" id="filters">
     <span class="pw-filter-group" id="fg-repo" role="group" aria-label="filter by repository">
-      <span class="ae-plate-cap">REPO</span>
+      <span class="pw-caption">REPO</span>
     </span>
     <span class="pw-filter-group" aria-label="repository tier scope">
-      <span class="ae-plate-cap">TIER</span>
+      <span class="pw-caption">TIER</span>
       <button class="pw-filter-clear" id="tier-toggle" type="button" aria-pressed="false">active only</button>
     </span>
     <span class="pw-filter-group" id="fg-prio" role="group" aria-label="filter by priority">
-      <span class="ae-plate-cap">PRIORITY</span>
+      <span class="pw-caption">PRIORITY</span>
     </span>
     <span class="pw-filter-group" id="fg-estimate" role="group" aria-label="filter by estimate">
-      <span class="ae-plate-cap">ESTIMATE</span>
+      <span class="pw-caption">ESTIMATE</span>
     </span>
     <span class="pw-filter-group" id="fg-risk" role="group" aria-label="filter by risk">
-      <span class="ae-plate-cap">RISK</span>
+      <span class="pw-caption">RISK</span>
     </span>
     <span class="pw-filter-group" aria-label="text search">
-      <span class="ae-plate-cap">SEARCH</span>
-      <span class="pw-search"><svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="text-filter" type="search" aria-describedby="text-search-status" autocomplete="off" placeholder="title, label, body"></span><span id="text-search-status" class="pw-search-status" role="status" aria-live="polite"></span>
+      <span class="pw-caption">SEARCH</span>
+      <span class="pw-search"><svg class="pw-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="text-filter" type="search" aria-describedby="text-search-status" autocomplete="off" placeholder="title, label, body"></span><span id="text-search-status" class="pw-search-status" role="status" aria-live="polite"></span>
     </span>
     <span class="pw-filter-group" aria-label="sort">
-      <span class="ae-plate-cap">SORT</span>
+      <span class="pw-caption">SORT</span>
       <select class="pw-sort" id="sort">
         <option value="repo">by repo</option>
         <option value="prio">by priority</option>
@@ -226,29 +225,29 @@
     <aside class="pw-rail-wrap" aria-label="backlog">
       <div class="pw-rail-inner">
         <div class="pw-rail-head">
-          <span class="ae-h">BACKLOG</span>
-          <span class="pw-lane-n ae-num" id="bk-count">0</span>
+          <span class="pw-section-head">BACKLOG</span>
+          <span class="pw-lane-n pw-num" id="bk-count">0</span>
         </div>
         <div class="pw-rail-list" id="rail-list"></div>
       </div>
     </aside>
 
     <main class="pw-board" id="board" data-lane="ready">
-      <nav class="ae-tabs pw-lane-switch" id="lane-switch" role="tablist" aria-label="board column">
+      <nav class="pw-tabs pw-lane-switch" id="lane-switch" role="tablist" aria-label="board column">
         <button type="button" role="tab" data-lane="ready" aria-selected="true">Ready</button>
         <button type="button" role="tab" data-lane="inprogress" aria-selected="false">In Progress</button>
         <button type="button" role="tab" data-lane="done" aria-selected="false">Done</button>
       </nav>
       <section class="pw-lane" data-lane="ready" aria-label="ready">
-        <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-zap"></use></svg>READY</span><span class="pw-lane-n ae-num" id="rd-count">0</span></header>
+        <header class="pw-lane-h"><span class="pw-section-head"><svg class="pw-icon" aria-hidden="true"><use href="#i-zap"></use></svg>READY</span><span class="pw-lane-n pw-num" id="rd-count">0</span></header>
         <div class="pw-lane-scroll" id="lane-ready"></div>
       </section>
       <section class="pw-lane" data-lane="inprogress" aria-label="in progress">
-        <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-play"></use></svg>IN PROGRESS</span><span class="pw-lane-n ae-num" id="ip-count">0</span></header>
+        <header class="pw-lane-h"><span class="pw-section-head"><svg class="pw-icon" aria-hidden="true"><use href="#i-play"></use></svg>IN PROGRESS</span><span class="pw-lane-n pw-num" id="ip-count">0</span></header>
         <div class="pw-lane-scroll" id="lane-inprog"></div>
       </section>
       <section class="pw-lane" data-lane="done" aria-label="done">
-        <header class="pw-lane-h"><span class="ae-h"><svg class="ae-icon" aria-hidden="true"><use href="#i-check"></use></svg>DONE</span><span class="pw-lane-n ae-num" id="dn-count">0</span></header>
+        <header class="pw-lane-h"><span class="pw-section-head"><svg class="pw-icon" aria-hidden="true"><use href="#i-check"></use></svg>DONE</span><span class="pw-lane-n pw-num" id="dn-count">0</span></header>
         <div class="pw-lane-scroll" id="lane-done"></div>
       </section>
     </main>
@@ -264,7 +263,7 @@
     <div class="pw-cmdk-backdrop" data-cmdk-dismiss></div>
     <div class="pw-cmdk-panel" role="dialog" aria-modal="true" aria-label="Jump to card">
       <div class="pw-cmdk-combobox">
-        <svg class="ae-icon" aria-hidden="true"><use href="#i-search"></use></svg>
+        <svg class="pw-icon" aria-hidden="true"><use href="#i-search"></use></svg>
         <input
           id="cmdk-input"
           class="pw-cmdk-input"
@@ -286,14 +285,14 @@
 <div id="pw-toast" class="pw-toast" role="status" aria-live="polite" hidden></div>
 
 <div id="powder-card-app" class="pw-detail-app" aria-live="polite">
-  <header class="pw-detail-top ae-chrome">
+  <header class="pw-detail-top pw-chrome">
     <div class="pw-detail-nav">
       <a class="pw-board-link" id="detail-board-link" href="/board">board</a>
       <a class="pw-board-link" id="detail-home-link" href="" hidden>sanctum</a>
     </div>
     <div class="pw-brand">
-      <span class="pw-mark" aria-hidden="true"><svg class="ae-icon"><use href="#i-snowflake"></use></svg></span>
-      <span class="ae-name">POWDER</span>
+      <span class="pw-mark" aria-hidden="true"><svg class="pw-icon"><use href="#i-snowflake"></use></svg></span>
+      <span class="pw-name">POWDER</span>
     </div>
     <p class="pw-detail-connection">Connection: <span id="detail-connection-status" class="pw-connection" data-kind="loading">loading</span></p>
   </header>

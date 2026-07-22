@@ -1,21 +1,44 @@
 import { test, expect, type Page } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-// vendored from @misty-step/aesthetic v0.25.0 — see vendor/aesthetic-law/README.md
-// for why this is a vendored copy rather than a package import.
-import {
-  assertLaw,
-  checkFontSize,
-  checkRadius,
-  collectConsoleErrors,
-} from "./vendor/aesthetic-law/index.js";
+// board law gate: no-page-scroll and clean-console invariants, proven on
+// the real UI instead of eyeballed per PR.
+// Inline assertion helpers (replacing the deleted vendor/aesthetic-law module).
+// The law gate now checks no-page-scroll and clean-console instead of the
+// retired fontSize<=16 and radius=0 invariants. Touch-target and horizontal-
+// overflow checks live in the mobile-390 test below.
+function collectConsoleErrors(page: Page): string[] {
+  const errors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") errors.push(msg.text());
+  });
+  page.on("pageerror", (err) => {
+    errors.push(err.message);
+  });
+  return errors;
+}
+
+async function assertBoard(page: Page, consoleErrors: string[]) {
+  // No page scroll: the app shell is overflow:hidden
+  const scrollable = await page.evaluate(() =>
+    document.documentElement.scrollHeight >
+      document.documentElement.clientHeight + 1,
+  );
+  expect(scrollable, "page must not scroll").toBe(false);
+
+  const cursor = await page.evaluate(() => getComputedStyle(document.body).cursor);
+  expect(cursor, "body cursor must remain default for static text").toBe("default");
+
+  // Clean console: no error-level messages or uncaught page errors
+  expect(consoleErrors, "console must be clean").toEqual([]);
+}
 
 /* the law gate, wired against powder's own served board UI (crates/
-   powder-server, at /board) — the render-time invariants from
-   @misty-step/aesthetic/law, proven on the real UI instead of eyeballed
-   per PR (aesthetic 011/015). playwright.config.ts boots powder-server
-   against a throwaway DB seeded through the public card-creation command, so
-   the board renders real cards rather than an empty shell. */
+   powder-server, at /board) — no-page-scroll and clean-console invariants,
+   proven on the real UI instead of eyeballed per PR. playwright.config.ts
+   boots powder-server against a throwaway DB seeded through the public
+   card-creation command, so the board renders real cards rather than an
+   empty shell. */
 
 const MODES = ["light", "dark"] as const;
 // powder-ui-keyboard-firstrun: the second, genuinely-empty fixture server
@@ -59,7 +82,7 @@ async function waitForSettled(page: Page) {
 
 async function boot(page: Page, mode: (typeof MODES)[number], path = "/board") {
   const errors = collectConsoleErrors(page);
-  await page.addInitScript((m) => localStorage.setItem("ae-mode", m), mode);
+  await page.addInitScript((m) => localStorage.setItem("pw-mode", m), mode);
   await page.goto(path);
   await waitForSettled(page);
   return errors;
@@ -71,7 +94,7 @@ async function bootSite(
   route: (typeof SITE_ROUTES)[number],
 ) {
   const errors = collectConsoleErrors(page);
-  await page.addInitScript((m) => localStorage.setItem("ae-mode", m), mode);
+  await page.addInitScript((m) => localStorage.setItem("pw-mode", m), mode);
   await page.goto(pathToFileURL(path.join(SITE_ROOT, route.path)).href);
   await page.waitForLoadState("networkidle");
   return errors;
@@ -87,14 +110,14 @@ for (const mode of MODES) {
       "href",
       "https://sanctum.example.test",
     );
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 
   test(`board filters panel · ${mode} · the law holds`, async ({ page }) => {
     const errors = await boot(page, mode);
     await page.locator("#filter-btn").click();
     await expect(page.locator("#filters")).toBeVisible();
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 
 
@@ -143,7 +166,7 @@ for (const mode of MODES) {
     ] as const) {
       await expect(page.locator(`#${lane} [data-id='${id}']`)).toHaveCount(0);
     }
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 
   test(`board filters · ${mode} · estimate and risk state survives reload`, async ({ page }) => {
@@ -158,7 +181,7 @@ for (const mode of MODES) {
     await expect(page.locator("#fg-estimate [data-estimates='s']")).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator("#fg-risk [data-risks='high']")).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator("#lane-ready [data-id='blocked-card']")).toBeVisible();
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
   test(`board settings page · ${mode} · the law holds`, async ({ page }) => {
     const errors = await boot(page, mode);
@@ -178,9 +201,9 @@ for (const mode of MODES) {
     const powderRow = page.locator('.pw-repo-row[data-repo-name="powder"]');
     await expect(powderRow).toBeVisible();
     await expect(powderRow.locator(".pw-repo-tier-badge")).toBeVisible();
-    const seededCount = await powderRow.locator(".ae-num").innerText();
+    const seededCount = await powderRow.locator(".pw-num").innerText();
     expect(Number(seededCount)).toBeGreaterThan(0);
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 
   test(`board · mobile-390 · ${mode} · lane switcher reaches every column without horizontal scroll (powder-930)`, async ({
@@ -198,7 +221,7 @@ for (const mode of MODES) {
       const overflows = await board.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
       expect(overflows, `${lane} lane must not force horizontal scroll on the board`).toBe(false);
     }
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 
   test(`board card link · ${mode} · opens the detail route and back returns`, async ({ page }) => {
@@ -212,7 +235,7 @@ for (const mode of MODES) {
     await expect(page).toHaveURL(/\/c\/001$/);
     await expect(page.locator("#powder-card-app")).toBeVisible();
     await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
     await page.goBack();
     await expect(page).toHaveURL(/\/board$/);
     await expect(page.locator("#powder-board-app")).toBeVisible();
@@ -238,7 +261,7 @@ for (const mode of MODES) {
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(new RegExp(`${href}$`));
     await expect(page.locator("#powder-card-app")).toBeVisible();
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
     await page.keyboard.press("Escape");
     await expect(page).toHaveURL(/\/board$/);
     await expect(page.locator("#powder-board-app")).toBeVisible();
@@ -262,7 +285,7 @@ for (const mode of MODES) {
     await expect(page.locator('#cmdk-list [role="option"]')).toHaveCount(1);
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(/\/c\/epic-hierarchy-child-a$/);
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 }
 
@@ -275,7 +298,7 @@ for (const mode of MODES) {
     await page.locator("#cmdk-input").fill("epic-hierarchy-child-a");
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(/\/c\/epic-hierarchy-child-a$/);
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 }
 
@@ -298,7 +321,7 @@ for (const mode of MODES) {
     await page.locator("#text-filter").fill("blocked-card");
     await expect(page.locator("#lane-ready .pw-blocked-cap")).toContainText("BLOCKED");
     await expect(page.locator("#lane-ready")).toContainText("blocked-card");
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 }
 
@@ -323,7 +346,7 @@ test("board · the command palette traps Tab focus and restores the invoker on c
   await page.keyboard.press("Escape");
   await expect(page.locator("#cmdk")).toBeHidden();
   await expect(page.locator("#cmdk-toggle")).toBeFocused();
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 // powder-ui-keyboard-firstrun: honest empty states -- a brand-new instance
@@ -340,7 +363,7 @@ for (const mode of MODES) {
     await expect(page.locator("#lane-ready")).toContainText("powder key-create");
     const nudge = page.locator("#lane-ready [data-firstrun-file-card]");
     await expect(nudge).toBeVisible();
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
     await nudge.click();
     await expect(page.locator("#quick-add-panel")).toBeVisible();
   });
@@ -357,7 +380,7 @@ for (const mode of MODES) {
       'No matches for "zzz-no-such-card-zzz"',
     );
     await expect(page.locator("#lane-ready")).toContainText("clear filters");
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 }
 
@@ -407,7 +430,7 @@ test("board · view switch controls stay responsive mid-transition (powder-903)"
   await page.locator("#tab-both").click();
   await expect(page.locator("#tab-both")).toHaveAttribute("aria-selected", "true");
   await expect(page.locator("#main")).toHaveAttribute("data-view", "both");
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 test("board · prefers-reduced-motion collapses the view-switch transition (powder-903)", async ({
@@ -419,7 +442,7 @@ test("board · prefers-reduced-motion collapses the view-switch transition (powd
     .locator("#main")
     .evaluate((el) => getComputedStyle(el).transitionDuration);
   expect(parseFloat(duration)).toBeLessThan(0.001);
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 // powder-ui-hierarchy-render: get_card_detail already returns children,
@@ -435,10 +458,10 @@ for (const mode of MODES) {
       "1/2 criteria checked across 2 children",
     );
     await expect(
-      page.locator(".pw-epic-progress ~ .pw-repo-counts .ae-chip", { hasText: "done 1" }),
+      page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", { hasText: "done 1" }),
     ).toBeVisible();
     await expect(
-      page.locator(".pw-epic-progress ~ .pw-repo-counts .ae-chip", { hasText: "ready 1" }),
+      page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", { hasText: "ready 1" }),
     ).toBeVisible();
     // evidence carries child provenance (child id + label), not just a bare link
     await expect(page.locator("#detail-body")).toContainText("epic-hierarchy-child-a · proof");
@@ -447,7 +470,7 @@ for (const mode of MODES) {
     await expect(page.locator("#detail-body")).toContainText("CHILDREN");
     const childLink = page.locator("#detail-body a", { hasText: "epic-hierarchy-child-a" });
     await expect(childLink).toHaveAttribute("href", "/c/epic-hierarchy-child-a");
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
 
     // children link back up to their parent from their own detail page.
     await childLink.click();
@@ -457,7 +480,7 @@ for (const mode of MODES) {
       "href",
       "/c/epic-hierarchy",
     );
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 }
 
@@ -469,7 +492,7 @@ test("card route · epic-mismatch · parent/child drift renders as a warning, no
   await expect(page.locator(".pw-epic-warn")).toContainText(
     "parent is done while 1 of 1 children are not terminal",
   );
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 test('board · child cards badge "part of <epic>" even though the board list has no children_total (powder-ui-hierarchy-render)', async ({
@@ -480,7 +503,7 @@ test('board · child cards badge "part of <epic>" even though the board list has
     hasText: "part of epic-hierarchy",
   });
   await expect(badge).toBeVisible();
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 for (const mode of MODES) {
@@ -488,7 +511,7 @@ for (const mode of MODES) {
     test(`site ${route.name} · ${mode} · the law holds`, async ({ page }) => {
       const errors = await bootSite(page, mode, route);
       await expect(page.locator("body")).toContainText(route.expected);
-      await assertLaw(page, { consoleErrors: errors });
+      await assertBoard(page, errors);
     });
   }
 }
@@ -508,7 +531,7 @@ for (const mode of MODES) {
         "href",
         "https://sanctum.example.test",
       );
-      await assertLaw(page, { consoleErrors: errors });
+      await assertBoard(page, errors);
     });
   }
 }
@@ -531,7 +554,7 @@ test("board · touch device · keyboard-shortcut hint hides, footer bar and home
   });
   const page = await context.newPage();
   const errors = collectConsoleErrors(page);
-  await page.addInitScript(() => localStorage.setItem("ae-mode", "light"));
+  await page.addInitScript(() => localStorage.setItem("pw-mode", "light"));
   await page.goto("/board");
   await waitForSettled(page);
   await expect(page.locator(".pw-foot")).toBeVisible();
@@ -541,30 +564,25 @@ test("board · touch device · keyboard-shortcut hint hides, footer bar and home
     "href",
     "https://sanctum.example.test",
   );
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
   await context.close();
 });
 
-test("the gate catches a planted off-law element (not theater)", async ({
+test("the gate catches a planted console error (not theater)", async ({
   page,
 }) => {
   // proves the wiring actually fails on a violation rather than silently
-  // passing everything — mirrors aesthetic's own law.spec.ts self-test.
+  // passing everything — the gate's live assertion is console-clean.
+  const errors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") errors.push(msg.text());
+  });
   await page.goto("/board");
   await waitForSettled(page);
-  expect((await checkRadius(page)).pass).toBe(true);
-  expect((await checkFontSize(page)).pass).toBe(true);
+  expect(errors, "no console errors on a clean board").toEqual([]);
 
-  await page.evaluate(() => {
-    const bad = document.createElement("button");
-    bad.textContent = "off-law";
-    bad.style.borderRadius = "9px";
-    bad.style.fontSize = "20px";
-    document.body.appendChild(bad);
-  });
-
-  expect((await checkRadius(page)).pass).toBe(false);
-  expect((await checkFontSize(page)).pass).toBe(false);
+  await page.evaluate(() => console.error("planted gate self-test error"));
+  expect(errors.length, "the gate must catch the planted error").toBe(1);
 });
 
 // powder-925: the operator's mobile write path. These run once each,
@@ -600,7 +618,7 @@ test("board · mobile-390 · operator can change a card's status with no CLI (po
   await page.locator("#detail-status-change").selectOption("ready");
   await restored;
 
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 test("board · mobile-390 · operator can quick-add a card with no CLI (powder-925)", async ({
@@ -631,7 +649,7 @@ test("board · mobile-390 · operator can quick-add a card with no CLI (powder-9
   const board = page.locator("#board");
   const overflows = await board.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
   expect(overflows, "quick-add panel must not force horizontal scroll at 390px").toBe(false);
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 // powder-epic-answer-board: proves the board updates itself from the SSE
@@ -675,7 +693,7 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
     timeout: 5_000,
   });
 
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 // Review regression (powder-ui-awaiting-you review): the header's right
@@ -714,13 +732,17 @@ test("board · mobile-390 · header controls stay on-screen with the live indica
     const box = await page.locator(id).boundingBox();
     expect(box, `${id} must have a bounding box`).not.toBeNull();
     expect(box!.x, `${id} must not start left of the viewport`).toBeGreaterThanOrEqual(0);
+    if (id !== "#live-indicator") {
+      expect(box!.width, `${id} must be at least 44px wide`).toBeGreaterThanOrEqual(44);
+      expect(box!.height, `${id} must be at least 44px tall`).toBeGreaterThanOrEqual(44);
+    }
     expect(
       box!.x + box!.width,
       `${id} must end inside the ${viewport!.width}px viewport`,
     ).toBeLessThanOrEqual(viewport!.width);
   }
 
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 });
 
 // powder-915: zero-card repositories are hidden from the settings list by
@@ -751,9 +773,9 @@ test("board · a zero-card repository is hidden until the show-empty toggle is u
   await toggle.click();
   await expect(toggle).toHaveAttribute("aria-pressed", "true");
   await expect(row).toBeVisible();
-  await expect(row.locator(".ae-num")).toHaveText("0");
+  await expect(row.locator(".pw-num")).toHaveText("0");
 
-  await assertLaw(page, { consoleErrors: errors });
+  await assertBoard(page, errors);
 
   // Review fix: showEmptyRepos persists through the same
   // saveBoardState()/restoreBoardState() session round-trip as its sibling
