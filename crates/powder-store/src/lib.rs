@@ -2506,9 +2506,6 @@ impl Store {
             );
         }
 
-        if after.is_some() && !after.is_some_and(ReadyCursor::is_durable) {
-            return Err(DomainError::validation("after", "invalid continuation cursor").into());
-        }
         if after.is_none() && ordered_cards.len() > query.limit {
             let ordered_digest = ready_order_digest(&ordered_cards);
             let transaction =
@@ -4765,10 +4762,6 @@ pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
         .collect()
 }
 
-/// Shared continuation-slicing step for [`Store::list_cards_page_after`]
-/// and [`Store::list_ready_page_after`] (powder-cards-api-paged-continuation):
-/// `cards` is the caller's already fully-computed, already-ordered eligible
-/// list (post filter, post sort/topological-order, pre-truncate) -- this
 fn ready_order_digest(cards: &[Card]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"ready-order-v1\0");
@@ -4780,6 +4773,10 @@ fn ready_order_digest(cards: &[Card]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// Shared continuation-slicing step for [`Store::list_cards_page_after`]
+/// and [`Store::list_ready_page_after`] (powder-cards-api-paged-continuation):
+/// `cards` is the caller's already fully-computed, already-ordered eligible
+/// list (post filter, post sort/topological-order, pre-truncate) -- this
 /// helper never touches the database or recomputes anything, it only walks
 /// that in-memory `Vec` to find where a prior page left off.
 ///

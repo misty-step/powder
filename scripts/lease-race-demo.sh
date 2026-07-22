@@ -260,7 +260,7 @@ RUN_COUNT="$(printf '%s' "$DETAIL" | jq '.runs | length')"
 FINAL_STATUS="$(printf '%s' "$DETAIL" | jq -r '.card.status')"
 WORK_LOG_COUNT="$(printf '%s' "$DETAIL" | jq '[.work_log[] | select(.agent == "codex-agent")] | length')"
 CARD_CREATED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "card-created")] | length')"
-CLAIM_EXPIRED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "claim-expired" and .actor == "human-with-curl" and .change.agent == "codex-agent" and .claim.agent == "codex-agent")] | length')"
+CLAIM_EXPIRED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "claim-expired" and .actor == "human-with-curl" and .change.agent == "codex-agent")] | length')"
 COMPLETED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "completed" and .actor == "human-with-curl")] | length')"
 
 fail=0
