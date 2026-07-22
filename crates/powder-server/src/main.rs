@@ -37,8 +37,7 @@ use powder_core::Priority;
 use powder_core::{
     canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
     parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
-    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyCursor, ReadyQuery,
-    RepositoryName, RunId,
+    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyQuery, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -403,13 +402,9 @@ struct Onboarding {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadyParams {
     limit: Option<usize>,
-    repo: Option<String>,
     estimate: Option<String>,
-    risk: Option<String>,
-    priority: Option<String>,
     /// powder-cards-api-paged-continuation: resume past a prior response's
     /// `next_after` instead of only ever seeing the first `limit` cards of
     /// the same order. See `ListCardsParams::after` for the full
@@ -762,12 +757,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let bootstrap_key_file = config.bootstrap_key_file.clone();
     let bootstrap_file_created = Cell::new(false);
-    if let Some(path) = bootstrap_key_file.as_deref() {
-        if path.exists() && !store.initial_seed_applied()? {
-            std::fs::remove_file(path).map_err(StoreError::from)?;
-            tracing::warn!("removed stale bootstrap key file from an interrupted first seed");
-        }
-    }
     if let Some(_key) = store.apply_initial_seed_with(
         unix_now(),
         |key| {
@@ -777,11 +766,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "POWDER_BOOTSTRAP_KEY_FILE is required for a new database; use powder init-db --show-secret for explicit recovery",
                 ))
             })?;
+            // The seed transaction holds BEGIN IMMEDIATE while this runs. A
+            // leftover file can therefore only be stale from a crashed seed;
+            // remove it under the same lock before publishing the new key.
+            if path.exists() {
+                std::fs::remove_file(path).map_err(StoreError::from)?;
+                tracing::warn!(path = %path.display(), "removed stale bootstrap key file from an interrupted first seed");
+            }
             write_one_shot_bootstrap_key(path, &key.raw_key)
                 .map_err(StoreError::from)
-                .map(|()| {
-                    bootstrap_file_created.set(true);
-                })
+                .map(|()| bootstrap_file_created.set(true))
         },
         |_| {
             if bootstrap_file_created.get() {
@@ -1112,19 +1106,6 @@ async fn routes() -> Json<serde_json::Value> {
     Json(powder_api::routes_json())
 }
 
-fn parse_repository_filter(raw: &str) -> Result<Vec<RepositoryName>, ApiError> {
-    if raw.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "repo must contain at least one repository",
-        ));
-    }
-    raw.split(',')
-        .map(str::trim)
-        .map(RepositoryName::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(ApiError::from)
-}
-
 async fn list_ready(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1132,34 +1113,16 @@ async fn list_ready(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
-    let repo = params
-        .repo
-        .as_deref()
-        .map(parse_repository_filter)
-        .transpose()?;
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
-    let risk = params.risk.as_deref().map(parse_risk).transpose()?;
-    let priority = params.priority.as_deref().map(parse_priority).transpose()?;
-    let query = ReadyQuery::new(unix_now(), limit)
-        .with_repositories(repo.unwrap_or_default())
-        .with_estimate(estimate)
-        .with_risk(risk)
-        .with_priority(priority);
-    let after = params
-        .after
-        .as_deref()
-        .map(|raw| ReadyCursor::decode_for_query(raw, &query))
-        .transpose()?;
-    let page = lock_store(&state)?
-        .list_ready_page_after(query.clone(), after.as_ref())?;
+    let after = params.after.as_deref().map(CardId::new).transpose()?;
+    let query = ReadyQuery::new(unix_now(), limit).with_estimate(estimate);
+    let page = lock_store(&state)?.list_ready_page_after(query, after.as_ref())?;
     Ok(Json(card_list_page_json(
         page.cards,
         page.total_count,
         page.excluded_terminal_count,
         &page.cycle_card_ids,
         page.next_after,
-        Some(&query),
-        page.continuation_snapshot.as_deref(),
     )))
 }
 
@@ -1241,8 +1204,6 @@ async fn list_cards(
         page.excluded_terminal_count,
         &page.cycle_card_ids,
         page.next_after,
-        None,
-        page.continuation_snapshot.as_deref(),
     )))
 }
 
@@ -1252,10 +1213,8 @@ fn card_list_page_json(
     excluded_terminal_count: usize,
     cycle_card_ids: &[CardId],
     next_after: Option<CardId>,
-    cursor_query: Option<&ReadyQuery>,
-    continuation_snapshot: Option<&str>,
 ) -> serde_json::Value {
-    let has_more = next_after.is_some() || excluded_terminal_count > 0;
+    let has_more = total_count > cards.len();
     let mut payload = json!({
         "cards": cards,
         "total_count": total_count,
@@ -1287,14 +1246,7 @@ fn card_list_page_json(
     // presence/absence is the authoritative "is there another page"
     // answer once a caller is walking pages with `after`.
     if let Some(next_after) = next_after {
-        payload["next_after"] = match cursor_query {
-            Some(query) => json!(ReadyCursor::for_query_with_snapshot(
-                query,
-                next_after,
-                continuation_snapshot.unwrap_or(""),
-            ).encode()),
-            None => json!(next_after),
-        };
+        payload["next_after"] = json!(next_after);
     }
     payload
 }
@@ -1315,7 +1267,7 @@ async fn board_stats(
     headers: HeaderMap,
     Query(params): Query<BoardStatsParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_hidden_read(&state, &headers, params.include_hidden.unwrap_or(false))?;
+    authorize_read(&state, &headers)?;
     let stats = lock_store(&state)?.board_stats(powder_store::BoardStatsQuery {
         repo: params.repo,
         include_hidden: params.include_hidden.unwrap_or(false),
@@ -1349,7 +1301,7 @@ async fn list_repositories(
     headers: HeaderMap,
     Query(params): Query<ListRepositoriesParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_hidden_read(&state, &headers, params.include_hidden.unwrap_or(false))?;
+    authorize_read(&state, &headers)?;
     let repositories = if params.include_hidden.unwrap_or(false) {
         lock_store(&state)?.list_repositories_with_hidden()?
     } else {
@@ -1491,7 +1443,7 @@ async fn create_card(
     card.repo = request.repo;
     let card = {
         let mut store = lock_store(&state)?;
-        store.create_card_with_authority(card, &actor.authority(), now)?
+        store.create_card_with_events(card, &actor.principal, now)?
     };
     let mut payload = json!(card);
     if card.acceptance.is_empty() {
@@ -1503,13 +1455,12 @@ async fn create_card(
 
 async fn file_papercut(
     State(state): State<AppState>,
-    AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Json(request): Json<FilePapercutRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    // Authenticate before consuming JSON so malformed unauthenticated input
-    // is still a 401, and audit the credential principal rather than the
-    // semantic worker label in the papercut body.
-    let authority = actor.authority();
+    // Same authorization posture as create_card: an agent-scoped key may
+    // file friction without claiming it or holding admin.
+    authorize(&state, &headers)?;
     let now = unix_now();
     let report = PapercutReport {
         agent: request.agent,
@@ -1520,7 +1471,7 @@ async fn file_papercut(
     };
     let card = {
         let mut store = lock_store(&state)?;
-        store.file_papercut_with_authority(&report, &authority, now)?
+        store.file_papercut(&report, &report.agent, now)?
     };
     Ok(Json(json!({
         "id": card.id.as_str(),
@@ -1549,7 +1500,7 @@ async fn patch_card(
     if patch.repo.is_some() {
         require_admin(&state, &headers)?;
     }
-    let card = lock_store(&state)?.patch_card_with_authority(&card_id, patch, &actor.authority(), unix_now())?;
+    let card = lock_store(&state)?.patch_card(&card_id, patch, &actor.principal, unix_now())?;
     Ok(Json(card))
 }
 
@@ -2279,18 +2230,6 @@ fn authorize_api_key(state: &AppState, headers: &HeaderMap) -> Result<Authorized
 /// - `tailscale-header` mode: unchanged; trust the injected tailnet identity.
 /// - `api-key` mode: reads require a valid key unless `POWDER_PUBLIC_READS=true`
 ///   is set, which preserves the historical private-perimeter behavior.
-fn authorize_hidden_read(
-    state: &AppState,
-    headers: &HeaderMap,
-    include_hidden: bool,
-) -> Result<(), ApiError> {
-    if include_hidden {
-        require_admin(state, headers).map(|_| ())
-    } else {
-        authorize_read(state, headers)
-    }
-}
-
 fn authorize_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     match state.config.auth_mode {
         AuthMode::None => Ok(()),

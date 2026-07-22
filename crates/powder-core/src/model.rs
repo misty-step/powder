@@ -93,14 +93,6 @@ impl Authority {
         }
     }
 
-    pub fn role(&self) -> &'static str {
-        match self {
-            Self::Unchecked => "unchecked",
-            Self::Principal { is_admin: true, .. } => "admin",
-            Self::Principal { is_admin: false, .. } => "agent",
-        }
-    }
-
     /// A non-admin actor may only act using their own identity string
     /// (guards fields like `claim.agent` or `answer.actor` that a caller
     /// supplies directly).
@@ -1178,12 +1170,6 @@ pub struct Activity {
     pub run_id: RunId,
     pub activity_type: ActivityType,
     pub payload: String,
-    /// Authenticated mutation principal; legacy rows deserialize as absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal: Option<String>,
-    /// Stable resolved role for the authenticated principal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
     pub created_at: i64,
 }
 
@@ -1196,9 +1182,6 @@ pub struct CardEvent {
     pub payload: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
-    /// Stable resolved role for the authenticated principal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -57,8 +57,6 @@ pub struct CardEventEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
     pub card: Card,
     pub change: Value,
@@ -529,11 +527,6 @@ fn append_outbound_card_event_inner(
         occurred_at: now,
         actor: non_empty("actor", actor)?,
         principal: audit_event.and_then(|event| event.principal.clone()),
-        role: Some(
-            audit_event
-                .and_then(|event| event.role.clone())
-                .unwrap_or_else(|| "legacy".to_string()),
-        ),
         audit_event_id: audit_event.map(|event| event.id.to_string()),
         card: card.clone(),
         change,

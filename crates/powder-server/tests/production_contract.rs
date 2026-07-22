@@ -76,8 +76,18 @@ fn spawn_server(envs: &[(&str, String)], cwd: &std::path::Path) -> ChildGuard {
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let bootstrap_key_file = envs
+        .iter()
+        .find(|(key, _)| *key == "POWDER_DB_PATH")
+        .map(|(_, value)| std::path::PathBuf::from(value).with_extension("bootstrap.key"));
+    if let Some(path) = bootstrap_key_file.as_ref() {
+        let _ = std::fs::remove_file(path);
+        command.env("POWDER_BOOTSTRAP_KEY_FILE", path);
+    }
     for (key, value) in envs {
-        command.env(key, value);
+        if *key != "POWDER_DISCLOSE_BOOTSTRAP_KEY" {
+            command.env(key, value);
+        }
     }
     let mut child = command
         .spawn()
@@ -139,7 +149,8 @@ fn binary_boots_from_real_process_environment_only_and_ignores_a_dotenv_file_in_
         &[
             ("POWDER_DB_PATH", db_path.display().to_string()),
             ("POWDER_BIND_ADDR", format!("127.0.0.1:{real_port}")),
-            ("POWDER_AUTH_MODE", "none".to_string()),
+            ("POWDER_AUTH_MODE", "api-key".to_string()),
+            ("POWDER_DISCLOSE_BOOTSTRAP_KEY", "false".to_string()),
         ],
         &work_dir,
     );
@@ -174,7 +185,8 @@ fn migrations_are_idempotent_across_two_consecutive_boots_of_the_same_database()
             &[
                 ("POWDER_DB_PATH", db_path.display().to_string()),
                 ("POWDER_BIND_ADDR", format!("127.0.0.1:{first_port}")),
-                ("POWDER_AUTH_MODE", "none".to_string()),
+                ("POWDER_AUTH_MODE", "api-key".to_string()),
+                ("POWDER_DISCLOSE_BOOTSTRAP_KEY", "false".to_string()),
             ],
             &cwd,
         );
@@ -197,7 +209,8 @@ fn migrations_are_idempotent_across_two_consecutive_boots_of_the_same_database()
             &[
                 ("POWDER_DB_PATH", db_path.display().to_string()),
                 ("POWDER_BIND_ADDR", format!("127.0.0.1:{second_port}")),
-                ("POWDER_AUTH_MODE", "none".to_string()),
+                ("POWDER_AUTH_MODE", "api-key".to_string()),
+                ("POWDER_DISCLOSE_BOOTSTRAP_KEY", "false".to_string()),
             ],
             &cwd,
         );
@@ -241,7 +254,8 @@ fn readyz_gates_on_schema_version_matching_this_builds_expectation() {
         &[
             ("POWDER_DB_PATH", db_path.display().to_string()),
             ("POWDER_BIND_ADDR", format!("127.0.0.1:{port}")),
-            ("POWDER_AUTH_MODE", "none".to_string()),
+            ("POWDER_AUTH_MODE", "api-key".to_string()),
+            ("POWDER_DISCLOSE_BOOTSTRAP_KEY", "false".to_string()),
         ],
         &cwd,
     );

@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 23;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -106,8 +106,6 @@ CREATE TABLE IF NOT EXISTS activities (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   activity_type TEXT NOT NULL,
   payload TEXT NOT NULL,
-  principal TEXT,
-  role TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_activities_run_created ON activities(run_id, created_at);
@@ -119,7 +117,6 @@ CREATE TABLE IF NOT EXISTS card_events (
   actor TEXT NOT NULL,
   payload TEXT NOT NULL,
   principal TEXT,
-  role TEXT,
   subject_kind TEXT,
   subject_id TEXT,
   created_at INTEGER NOT NULL

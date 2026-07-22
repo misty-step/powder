@@ -16,45 +16,79 @@ Nothing here is copied from memory of how it's supposed to work.
 
 ## Quickstart
 
-The server never writes a bootstrap key to stdout, stderr, or service logs. Choose one explicit recovery channel before first startup: a 0600 file via POWDER_BOOTSTRAP_KEY_FILE, or the CLI pre-seed command powder init-db --show-secret in a protected terminal. Store the key immediately, then remove the file or rotate the key.
+Either option writes the first-run bootstrap API key once to a configured 0600
+file. It never prints or logs the raw key; read the file, store it securely,
+then remove it. Both are also documented in the
+[README quickstart](../README.md#quickstart), which CI runs on every change
+(`.github/workflows/quickstart.yml`) so it can't silently drift from this
+document.
 
 ### Option A — Docker
 
-~~~sh
-mkdir -p data
-chmod 700 data
-docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/data:/data" \
+```sh
+docker volume create powder-data
+docker run --rm -p 4000:4000 -v powder-data:/data \
   -e POWDER_AUTH_MODE=api-key \
-  -e POWDER_BIND_ADDR=0.0.0.0:4000 \
-  -e POWDER_BOOTSTRAP_KEY_FILE=/data/bootstrap-key \
+  -e POWDER_BOOTSTRAP_KEY_FILE=/data/powder-bootstrap.key \
   ghcr.io/misty-step/powder:latest
-~~~
+```
 
-Read data/bootstrap-key from a protected shell, store it, and remove it. A host-loopback-only publish keeps the explicitly non-loopback container bind private.
+A named volume, not a host bind mount, so the container's non-root `app`
+user always has write access regardless of host UID mapping.
+
+**Verified 2026-07-14, with a caveat.** `docker build .` from this checkout,
+then `docker run` against the freshly built image, was exercised end to end:
+container boot, the printed bootstrap key, `/healthz`, `/readyz`, card
+create, and claim all worked exactly as documented. Pulling the *already
+published* `ghcr.io/misty-step/powder:latest` image could only be checked to
+the registry's login wall — `docker manifest inspect
+ghcr.io/misty-step/powder:latest` returns `401 Unauthorized` as of this
+writing, meaning the GHCR package is not yet public. `docker login
+ghcr.io` (with a GitHub PAT that has `read:packages` on this org) or making
+the package public in GitHub's package settings unblocks the exact command
+above; the image itself, once pulled, is the same image this section
+verified by building locally.
 
 ### Option B — release binary
 
-~~~sh
-mkdir -p data
-POWDER_DB_PATH=./data/powder.db \
-POWDER_AUTH_MODE=api-key \
-POWDER_BIND_ADDR=127.0.0.1:4000 \
-POWDER_BOOTSTRAP_KEY_FILE=./data/bootstrap-key \
-  ./powder-server
-~~~
+macOS arm64 or Linux x86_64/arm64, from the
+[latest release](https://github.com/misty-step/powder/releases/latest):
 
-Read data/bootstrap-key from a protected shell, store it, and remove it. Alternatively, before starting the server, run powder init-db --db ./data/powder.db --show-secret; the CLI prints the raw key only to the invoking terminal and the server then observes an already-seeded database.
+```sh
+curl -fsSL -o powder.tar.gz \
+  https://github.com/misty-step/powder/releases/latest/download/powder-aarch64-apple-darwin.tar.gz
+tar -xzf powder.tar.gz
+mkdir -p ./data && chmod 700 ./data
+POWDER_DB_PATH=./data/powder.db POWDER_BOOTSTRAP_KEY_FILE=./data/powder-bootstrap.key POWDER_AUTH_MODE=api-key \
+  ./powder-server
+```
+
+Swap the tarball name for `powder-x86_64-unknown-linux-gnu.tar.gz` or
+`powder-aarch64-unknown-linux-gnu.tar.gz` on Linux. The tarball also
+contains the `powder` CLI and `powder-mcp` binaries.
+
+**Verified 2026-07-14**: downloaded the real `v0.1.0` release asset
+(`powder-aarch64-apple-darwin.tar.gz`) from
+`github.com/misty-step/powder/releases`, extracted it, and ran the exact
+command above — the bootstrap key printed and `/healthz` answered `{"ok":
+true,"service":"powder"}`.
 
 ### Then, exercise the lifecycle
 
-~~~sh
-KEY=$(cat ./data/bootstrap-key)
-curl -s http://127.0.0.1:4000/healthz
-curl -s http://127.0.0.1:4000/readyz
-curl -s -X POST http://127.0.0.1:4000/api/v1/cards \
+```sh
+KEY=<paste the bootstrap key>
+
+curl -s http://localhost:4000/healthz
+curl -s http://localhost:4000/readyz
+
+curl -s -X POST http://localhost:4000/api/v1/cards \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"id":"first-card","title":"My first card","acceptance":["it exists"]}'
-~~~
+
+curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"agent":"me"}'
+```
 
 ## Deploy matrix
 
@@ -130,13 +164,11 @@ variables.
 | Var | Default | Read by | Purpose |
 | --- | --- | --- | --- |
 | `POWDER_DB_PATH` | `/data/powder.db` | `powder-server` | Path to the SQLite database file (WAL mode). Parent directory must exist. |
-| `PORT` | `4000` | `powder-server` | Used only to build the default `POWDER_BIND_ADDR` (`127.0.0.1:$PORT`) when `POWDER_BIND_ADDR` itself is unset. |
-| `POWDER_BIND_ADDR` | `127.0.0.1:<PORT>` | `powder-server` | Explicit socket address to bind, e.g. `127.0.0.1:4000` or `[::]:4000`. Overrides `PORT`. |
+| `PORT` | `4000` | `powder-server` | Used only to build the default loopback `POWDER_BIND_ADDR` (`127.0.0.1:$PORT`) when `POWDER_BIND_ADDR` itself is unset. |
+| `POWDER_BIND_ADDR` | `127.0.0.1:<PORT>` | `powder-server` | Explicit socket address to bind. Non-loopback binds require an authenticated mode; `none` is loopback-only. |
 | `POWDER_AUTH_MODE` | `api-key` | `powder-server` | One of `api-key` (aliases: `agent-api-key`, `shared-secret`), `tailscale-header` (aliases: `tailnet`), or `none` (aliases: `disabled`). See [auth modes](#auth-modes) below. |
 | `POWDER_PUBLIC_READS` | `false` | `powder-server` | In `api-key` mode, set `true` to allow keyless reads. Only safe when the listener is on a genuinely private perimeter (e.g. Flycast/Tailscale internal ingress). Ignored in `tailscale-header` and `none` modes. |
-| `POWDER_BOOTSTRAP_KEY_FILE` | unset | `powder-server` | Optional one-shot output file for the first-run key. Created with mode `0600`; store the key immediately and remove the file. The key is never logged. |
-| `POWDER_TAILNET_PROXY_SECRET` | unset | `powder-server` | Secret required with each forwarded identity header. Required for `tailscale-header` on a non-loopback bind; missing or wrong values are rejected. |
-| `POWDER_TAILNET_ADMIN_PRINCIPALS` | unset | `powder-server` | Exact comma-separated forwarded identities allowed admin scope; unset/empty is fail-closed and wildcard is rejected. |
+| `POWDER_BOOTSTRAP_KEY_FILE` | unset (required on first boot) | `powder-server` | One-shot 0600 path for the first-run bootstrap API key. The server refuses a new database without it, writes the key without logging it, and leaves the file for explicit operator retrieval/removal. |
 | `POWDER_PUBLIC_BASE_URL` | unset | `powder-server` | Advertised base URL, surfaced via `/api/v1/onboarding`; informational only, does not change binding. |
 | `POWDER_HOME_URL` | unset | `powder-server` | If set, the board UI renders a plain-text link back to this URL (for a deployment fronted by a portal Powder doesn't own). Leave unset for no change. |
 | `POWDER_FIELD_NOTE_REPOS` | unset (disabled) | `powder-server` | Comma-separated repo allowlist for the optional field-note draft-card generator. Empty/unset fully disables it. |
@@ -174,7 +206,10 @@ cargo run -p powder-server
   `POWDER_PUBLIC_READS=true` only when the deployment's perimeter is genuinely
   private (e.g. a Flycast/Tailcast internal listener with no public ingress).
 - **`tailscale-header`**: trusts an identity header injected by a Tailscale
-  Serve-equivalent trusted proxy. Only use this behind ingress that actually
+  Serve-equivalent trusted proxy only when `POWDER_TAILNET_PROXY_SECRET` is
+  configured and matches the forwarded secret. Admin scope is granted only to
+  exact identities in `POWDER_TAILNET_ADMIN_PRINCIPALS`; the retired global
+  `POWDER_TAILNET_ADMIN` setting is rejected. Only use this behind ingress that
   strips client-supplied spoofed identity headers before they reach Powder.
 - **`none`**: no auth at all. Local disposable development only.
 
@@ -328,7 +363,12 @@ the full remote-mode command table).
   that migration is deferred to a follow-up rather than folded into this
   change, to avoid colliding with another lane's `SCHEMA_VERSION` bump (see
   the powder-918 PR notes).
-- **The bootstrap admin key** is hashed in the database and never written to logs. Set `POWDER_BOOTSTRAP_KEY_FILE` to a new path before first startup to receive the raw key in a mode-0600 file, then store it and remove the file. Or run `powder init-db --db <path> --show-secret` before starting the server; this is the explicit terminal recovery path. If the database is already seeded, mint a new admin key with `powder key-create --show-secret`, store it, and revoke the old key.
+- **The bootstrap admin key** follows the API-key rule above (hashed, not
+  recoverable) and has no log-disclosure switch. `POWDER_BOOTSTRAP_KEY_FILE`
+  is required for an unseeded database; the server writes the raw key exactly
+  once to that path with mode 0600 while holding the SQLite seed lock, never
+  logs it, and leaves removal to the operator after secure retrieval. A stale
+  file from an interrupted first seed is replaced inside that transaction.
 
 ## Backup and restore (Litestream + S3)
 

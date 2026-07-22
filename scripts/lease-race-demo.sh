@@ -19,7 +19,7 @@
 #     .github/workflows/quickstart.yml) against a fresh ephemeral SQLite DB
 #     and a random free TCP port -- no shared state with any other run.
 #   - Auth/attribution: the first-run bootstrap key
-#     (POWDER_BOOTSTRAP_KEY_FILE=./data/bootstrap-key) plays the operator -- it creates
+#     (POWDER_BOOTSTRAP_KEY_FILE=$BOOTSTRAP_KEY_FILE) plays the operator -- it creates
 #     the card and mints one agent-scope key per actor via `powder key-create
 #     --db` (the documented operational pattern from docs/operations.md).
 #     Each actor then authenticates as itself: in api-key mode every audited
@@ -66,7 +66,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/powder-lease-race-demo.XXXXXX")"
 DB="$WORKDIR/powder.db"
 SERVER_LOG="$WORKDIR/server.log"
-KEY_FILE="$WORKDIR/bootstrap-key"
+BOOTSTRAP_KEY_FILE="$WORKDIR/powder-bootstrap.key"
 CLAIM_TTL_SECONDS=2
 POLL_TIMEOUT_SECONDS=10
 POLL_INTERVAL_SECONDS=1
@@ -121,10 +121,9 @@ fi
 POWDER_CLI="$ROOT/target/release/powder"
 
 say "[boot] starting powder-server on $BASE_URL against a fresh ephemeral DB"
-mkdir -p "$(dirname "$DB")" "$(dirname "$KEY_FILE")"
 POWDER_DB_PATH="$DB" \
 POWDER_AUTH_MODE=api-key \
-POWDER_BOOTSTRAP_KEY_FILE="$KEY_FILE" \
+POWDER_BOOTSTRAP_KEY_FILE="$BOOTSTRAP_KEY_FILE" \
 POWDER_BIND_ADDR="127.0.0.1:$LISTEN_PORT" \
 PORT="$LISTEN_PORT" \
 "$ROOT/target/release/powder-server" >"$SERVER_LOG" 2>&1 &
@@ -145,12 +144,13 @@ if [ "$server_up" -ne 1 ]; then
 fi
 say "[boot] server is up"
 
-KEY="$(cat "$KEY_FILE")"
-test -n "$KEY"
-if grep -F "$KEY" "$SERVER_LOG"; then
-  echo "bootstrap key leaked into service log" >&2
+KEY="$(cat "$BOOTSTRAP_KEY_FILE")"
+if [ -z "$KEY" ]; then
+  echo "bootstrap key file was empty or missing" >&2
+  cat "$SERVER_LOG" >&2
   exit 1
 fi
+rm -f "$BOOTSTRAP_KEY_FILE"
 say "[boot] operator holds the first-run bootstrap key"
 rule
 

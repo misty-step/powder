@@ -315,8 +315,6 @@ pub struct CardListPage {
     /// last page, or whenever the eligible set already fits within
     /// `limit`.
     pub next_after: Option<CardId>,
-    /// Opaque snapshot binding for Ready continuation; absent on generic lists.
-    pub continuation_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -529,88 +527,6 @@ struct MutationAudit<'a> {
     authority: &'a Authority,
 }
 
-#[derive(Debug)]
-struct BoardRollupCard {
-    id: CardId,
-    title: String,
-    parent: Option<CardId>,
-    repo: Option<String>,
-    status: String,
-    criteria_checked: usize,
-    criteria_total: usize,
-    claim_expires_at: Option<i64>,
-    updated_at: i64,
-}
-
-fn add_rollup_child(rollup: &mut BoardRollup, child: &BoardRollupCard, now: i64) {
-    rollup.status_counts.increment(&child.status);
-    rollup.criteria_checked += child.criteria_checked;
-    rollup.criteria_total += child.criteria_total;
-    if child
-        .claim_expires_at
-        .is_some_and(|expires_at| expires_at > now)
-    {
-        rollup.active_claims += 1;
-    }
-    rollup.freshness = Some(match rollup.freshness {
-        None => EpicFreshness {
-            oldest_update: child.updated_at,
-            newest_update: child.updated_at,
-        },
-        Some(freshness) => EpicFreshness {
-            oldest_update: freshness.oldest_update.min(child.updated_at),
-            newest_update: freshness.newest_update.max(child.updated_at),
-        },
-    });
-}
-
-fn board_rollup_coverage(
-    records: &[BoardRollupCard],
-    children: &HashMap<CardId, Vec<&BoardRollupCard>>,
-) -> BoardRollupCoverage {
-    let by_id = records
-        .iter()
-        .map(|card| (card.id.clone(), card))
-        .collect::<HashMap<_, _>>();
-    let root_epics = records
-        .iter()
-        .filter(|card| card.parent.is_none() && children.contains_key(&card.id))
-        .count();
-    let unsorted_cards = records
-        .iter()
-        .filter(|card| card.parent.is_none() && !children.contains_key(&card.id))
-        .count();
-    let mut accounted_cards = 0;
-    let mut parent_issue_count = 0;
-    for card in records {
-        let mut current = card;
-        let mut seen = std::collections::HashSet::new();
-        loop {
-            if !seen.insert(current.id.clone()) {
-                parent_issue_count += 1;
-                break;
-            }
-            let Some(parent_id) = current.parent.as_ref() else {
-                accounted_cards += 1;
-                break;
-            };
-            let Some(parent) = by_id.get(parent_id) else {
-                parent_issue_count += 1;
-                break;
-            };
-            current = parent;
-        }
-    }
-    BoardRollupCoverage {
-        total_cards: records.len(),
-        accounted_cards,
-        root_epics,
-        unsorted_cards,
-        parent_issue_count,
-        complete: accounted_cards == records.len() && parent_issue_count == 0,
-    }
-}
-
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -768,10 +684,6 @@ impl Store {
                 22 => {
                     self.migrate_22_to_23()?;
                     23
-                }
-                23 => {
-                    self.migrate_23_to_24()?;
-                    24
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -999,6 +911,130 @@ impl Store {
         let has_more = end < total_count;
         Ok(SearchPage {
             matches: results,
+            total_count,
+            has_more,
+            next_after: has_more.then(|| encode_search_cursor(&fingerprint, end)),
+        })
+    }
+
+    /// Search through the FTS spine with deliberate recall shaping and card filters.
+    /// Query terms are quoted and rewritten as prefixes; multiple terms use FTS5
+    /// NEAR so their order is not treated as an accidental phrase. The index keeps
+    /// hyphen and underscore compounds as single tokens, so a sub-token such as
+    /// fts does not match powder-query-fts-store; callers should use the full
+    /// identifier or a prefix (for example powder-query).
+    pub fn search_page(&self, query: &SearchQuery) -> Result<SearchPage> {
+        let query_text = query.q.trim();
+        if query_text.is_empty() || query.limit == 0 || !self.table_exists("card_search_fts")? {
+            return Ok(SearchPage {
+                matches: Vec::new(),
+                total_count: 0,
+                has_more: false,
+                next_after: None,
+            });
+        }
+        let mut rows = self.search_rows(query_text)?;
+        let repo_filter = query.repo.as_deref().and_then(canonical_repo_label);
+        let mut summaries = HashMap::<String, CardSummary>::new();
+        let mut results = Vec::new();
+        for row in rows.drain(..) {
+            if !search_source_matches(query.source_kind.as_deref(), &row.source_table)
+                || query
+                    .source_field
+                    .as_deref()
+                    .is_some_and(|wanted| !wanted.eq_ignore_ascii_case(&row.source_field))
+                || query
+                    .source_created_after
+                    .is_some_and(|value| row.created_at < value)
+                || query
+                    .source_created_before
+                    .is_some_and(|value| row.created_at > value)
+            {
+                continue;
+            }
+            let key = row.card_id.as_str().to_string();
+            let summary = if let Some(summary) = summaries.get(&key).cloned() {
+                summary
+            } else {
+                let card = match self.get_card(&row.card_id)? {
+                    Some(card) => card,
+                    None => continue,
+                };
+                if query.status.is_some_and(|value| card.status != value)
+                    || query.priority.is_some_and(|value| card.priority != value)
+                    || query
+                        .estimate
+                        .is_some_and(|value| card.estimate != Some(value))
+                    || query.risk.is_some_and(|value| card.risk != Some(value))
+                    || query
+                        .created_after
+                        .is_some_and(|value| card.created_at < value)
+                    || query
+                        .created_before
+                        .is_some_and(|value| card.created_at > value)
+                    || query
+                        .updated_after
+                        .is_some_and(|value| card.updated_at < value)
+                    || query
+                        .updated_before
+                        .is_some_and(|value| card.updated_at > value)
+                    || query.label.as_ref().is_some_and(|wanted| {
+                        !card
+                            .labels
+                            .iter()
+                            .any(|label| label.eq_ignore_ascii_case(wanted.trim()))
+                    })
+                    || repo_filter.as_deref().is_some_and(|wanted| {
+                        !card
+                            .repo
+                            .as_deref()
+                            .is_some_and(|repo| canonical_repo_matches(repo, wanted))
+                            && repo_from_numeric_card_id_prefix(card.id.as_str()).as_deref()
+                                != Some(wanted)
+                    })
+                {
+                    continue;
+                }
+                let summary = card.summary();
+                summaries.insert(key.clone(), summary.clone());
+                summary
+            };
+            results.push(SearchResult {
+                card: summary,
+                source_kind: row.source_table,
+                source_field: row.source_field,
+                source_created_at: row.created_at,
+                snippet: row.snippet,
+                rank: row.rank,
+            });
+        }
+        results.sort_by(|left, right| {
+            left.rank
+                .partial_cmp(&right.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.source_kind.cmp(&right.source_kind))
+                .then_with(|| left.source_field.cmp(&right.source_field))
+                .then_with(|| left.card.id.as_str().cmp(right.card.id.as_str()))
+                .then_with(|| left.source_created_at.cmp(&right.source_created_at))
+        });
+        let total_count = results.len();
+        let fingerprint = search_query_fingerprint(query);
+        let offset = query
+            .after
+            .as_deref()
+            .map(|cursor| decode_search_cursor(cursor, &fingerprint))
+            .transpose()?
+            .unwrap_or(0);
+        let start = offset.min(total_count);
+        let end = start.saturating_add(query.limit).min(total_count);
+        let matches = results
+            .into_iter()
+            .skip(start)
+            .take(end - start)
+            .collect::<Vec<_>>();
+        let has_more = end < total_count;
+        Ok(SearchPage {
+            matches,
             total_count,
             has_more,
             next_after: has_more.then(|| encode_search_cursor(&fingerprint, end)),
@@ -1686,28 +1722,6 @@ impl Store {
     /// row is copied through the same trigger-maintained search spine used by
     /// live writes, so retrying after a crash can only replace the same
     /// source-keyed documents and rebuild the derived index from source truth.
-    /// Adds structured principal/role provenance to new audit rows while
-    /// leaving legacy rows nullable for lossless readback.
-    fn migrate_23_to_24(&mut self) -> Result<()> {
-        let needs_activity_principal = !self.table_has_column("activities", "principal")?;
-        let needs_activity_role = !self.table_has_column("activities", "role")?;
-        let needs_event_role = !self.table_has_column("card_events", "role")?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if needs_activity_principal {
-            transaction.execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
-        }
-        if needs_activity_role {
-            transaction.execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
-        }
-        if needs_event_role {
-            transaction.execute_batch("ALTER TABLE card_events ADD COLUMN role TEXT;")?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
     fn migrate_22_to_23(&mut self) -> Result<()> {
         // A few unit fixtures intentionally carry only the table needed by an
         // earlier migration. They are not searchable databases, so leave them
@@ -2048,22 +2062,11 @@ impl Store {
 
     pub fn create_card_with_events(
         &mut self,
-        card: Card,
+        mut card: Card,
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let authority = Authority::actor(actor, false);
-        self.create_card_with_authority(card, &authority, now)
-    }
-
-    pub fn create_card_with_authority(
-        &mut self,
-        mut card: Card,
-        authority: &Authority,
-        now: i64,
-    ) -> Result<Card> {
-        let actor_name = authority.actor_label();
-        let actor = non_empty("actor", &actor_name)?;
+        let actor = non_empty("actor", actor)?;
         let card_id = card.id.clone();
         card.title = secrets::scrub_secrets(&card.title);
         card.body = secrets::scrub_secrets(&card.body);
@@ -2103,25 +2106,21 @@ impl Store {
         }
         persist_card(&transaction, &card)?;
         let saved = load_card(&transaction, &card_id)?;
-        append_authority_card_event(
+        append_card_event(
             &transaction,
             &saved.id,
             "create",
-            authority,
+            &actor,
             "created card",
-            "card",
-            saved.id.as_str(),
             now,
         )?;
         if let Some(parent_id) = saved.parent.as_ref() {
-            append_authority_card_event(
+            append_card_event(
                 &transaction,
                 parent_id,
                 "decompose",
-                authority,
+                &actor,
                 &format!("child {card_id} created"),
-                "parent",
-                card_id.as_str(),
                 now,
             )?;
         }
@@ -2155,18 +2154,7 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let authority = Authority::actor(actor.to_owned(), false);
-        self.file_papercut_with_authority(report, &authority, now)
-    }
-
-    pub fn file_papercut_with_authority(
-        &mut self,
-        report: &powder_core::papercut::PapercutReport,
-        authority: &Authority,
-        now: i64,
-    ) -> Result<Card> {
-        let actor = authority.actor_label();
-        let _actor = non_empty("actor", &actor)?;
+        let actor = non_empty("actor", actor)?;
         let resolved_repo = report
             .service
             .as_deref()
@@ -2184,7 +2172,7 @@ impl Store {
             now,
             id,
         )?;
-        self.create_card_with_authority(card, authority, now)
+        self.create_card_with_events(card, &actor, now)
     }
 
     pub fn patch_card(
@@ -2194,19 +2182,7 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let authority = Authority::actor(actor, false);
-        self.patch_card_with_authority(card_id, patch, &authority, now)
-    }
-
-    pub fn patch_card_with_authority(
-        &mut self,
-        card_id: &CardId,
-        patch: CardPatch,
-        authority: &Authority,
-        now: i64,
-    ) -> Result<Card> {
-        let _actor_name = authority.actor_label();
-        let _actor = non_empty("actor", &_actor_name)?;
+        let actor = non_empty("actor", actor)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2261,14 +2237,12 @@ impl Store {
 
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        append_authority_card_event(
+        append_card_event(
             &transaction,
             card_id,
             "patch",
-            authority,
+            &actor,
             &format!("patched {}", patched_fields.join(", ")),
-            "fields",
-            &patched_fields.join(","),
             now,
         )?;
         // `persist_card` canonicalizes `repo` at write time via
@@ -2475,9 +2449,8 @@ impl Store {
     /// itself), used directly by the HTTP `/api/v1/cards/ready` route to
     /// resume past a prior page (powder-cards-api-paged-continuation).
     ///
-    /// `after`, when set, must be a typed opaque cursor for the *same*
-    /// eligibility-filtered query. The cursor fingerprint is checked here,
-    /// at the owning Store seam, before the anchor is used.
+    /// `after`, when set, must be the id of a card present in the *same*
+    /// eligibility-filtered, topologically-ordered list this call
     /// recomputes from scratch (typically the `next_after`/last card id a
     /// prior call on this store returned); an id absent from that list --
     /// never existed, no longer ready-eligible, or filtered by different
@@ -2493,30 +2466,8 @@ impl Store {
     pub fn list_ready_page_after(
         &self,
         query: ReadyQuery,
-        after: Option<&ReadyCursor>,
+        after: Option<&CardId>,
     ) -> Result<CardListPage> {
-        if let Some(cursor) = after {
-            if !cursor.matches_query(&query) {
-                return Err(DomainError::validation(
-                    "after",
-                    "stale continuation cursor: query filters do not match",
-                )
-                .into());
-            }
-        }
-        // Resolve caller-supplied repository aliases once at the Store seam.
-        // The original typed query remains bound into ReadyCursor, while
-        // matching uses the registered canonical repository name.
-        let repository_filters = query
-            .repo
-            .as_ref()
-            .map(|repositories| {
-                repositories
-                    .iter()
-                    .map(|repository| resolve_repository_name(&self.connection, repository.as_str()))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
         let all_cards = load_all_cards(&self.connection)?;
         // reuses the same full scan already loaded above, rather than a
         // second query per blocker: a blocker missing from this map is
@@ -2529,32 +2480,9 @@ impl Store {
             }) {
                 continue;
             }
-            if repository_filters.as_ref().is_some_and(|repositories| {
-                let card_repo = card
-                    .repo
-                    .as_deref()
-                    .map(ToOwned::to_owned)
-                    .or_else(|| repo_from_numeric_card_id_prefix(card.id.as_str()));
-                !repositories.iter().flatten().any(|repository| {
-                    card_repo.as_deref().is_some_and(|candidate| {
-                        canonical_repo_matches(candidate, repository.as_str())
-                    })
-                })
-            }) {
-                continue;
-            }
             if query
                 .estimate
                 .is_some_and(|estimate| card.estimate != Some(estimate))
-            {
-                continue;
-            }
-            if query.risk.is_some_and(|risk| card.risk != Some(risk)) {
-                continue;
-            }
-            if query
-                .priority
-                .is_some_and(|priority| card.priority != priority)
             {
                 continue;
             }
@@ -2564,28 +2492,13 @@ impl Store {
 
         let order = powder_core::order_ready_cards(cards);
         let cycle_card_ids = order.cycle_card_ids;
-        let snapshot = ready_order_snapshot(&order.cards, &cycle_card_ids);
-        if let Some(cursor) = after {
-            if !cursor.matches_snapshot(&snapshot) {
-                return Err(DomainError::validation(
-                    "after",
-                    "stale continuation cursor: ready result changed; restart from the first page",
-                )
-                .into());
-            }
-        }
-        let (cards, next_after) = paginate_ordered_cards(
-            order.cards,
-            query.limit,
-            after.map(|cursor| &cursor.anchor),
-        )?;
+        let (cards, next_after) = paginate_ordered_cards(order.cards, query.limit, after)?;
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count: 0,
             cycle_card_ids,
             next_after,
-            continuation_snapshot: Some(snapshot),
         })
     }
 
@@ -2686,7 +2599,6 @@ impl Store {
             excluded_terminal_count,
             cycle_card_ids: Vec::new(),
             next_after,
-            continuation_snapshot: None,
         })
     }
 
@@ -3085,25 +2997,11 @@ impl Store {
             updated_at: now,
         };
         persist_run(&transaction, &run)?;
-        append_activity_with_authority(
+        append_activity(
             &transaction,
             &run_id,
             ActivityType::Action,
             &format!("claimed {card_id}"),
-            now,
-            authority,
-        )?;
-        append_authority_card_event(
-            &transaction,
-            card_id,
-            "claim",
-            authority,
-            &format!(
-                "agent={agent}; run_id={run_id}; expires_at={}",
-                claim.expires_at
-            ),
-            "claim",
-            run_id.as_str(),
             now,
         )?;
         transaction.commit()?;
@@ -3133,23 +3031,20 @@ impl Store {
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
             close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
-            append_activity_with_authority(
+            append_activity(
                 &transaction,
                 &claim.run_id,
                 ActivityType::Action,
                 &format!("status set {card_id} to {}", status.as_str()),
                 now,
-            authority,
             )?;
         }
-        append_authority_card_event(
+        append_card_event(
             &transaction,
             card_id,
             "status",
-            authority,
+            &authority.actor_label(),
             &format!("{} -> {}", previous.as_str(), status.as_str()),
-            "status",
-            status.as_str(),
             now,
         )?;
         if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
@@ -3210,17 +3105,15 @@ impl Store {
 
         card.apply_relations(related, blocks, blocked_by, now);
         persist_card(&transaction, &card)?;
-        append_authority_card_event(
+        append_card_event(
             &transaction,
             card_id,
             "relations",
-            authority,
+            &actor,
             &format!(
                 "related={:?} blocks={:?} blocked_by={:?}",
                 card.related, card.blocks, card.blocked_by
             ),
-            "relations",
-            card_id.as_str(),
             now,
         )?;
 
@@ -3280,45 +3173,40 @@ impl Store {
         card.parent = parent.clone();
         card.updated_at = now;
         persist_card(&transaction, &card)?;
+        let actor = authority.actor_label();
         let label = |value: &Option<CardId>| {
             value
                 .as_ref()
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "none".to_string())
         };
-        append_authority_card_event(
+        append_card_event(
             &transaction,
             card_id,
             "hierarchy",
-            authority,
+            &actor,
             &format!("parent {} -> {}", label(&previous), label(&parent)),
-            "parent",
-            card_id.as_str(),
             now,
         )?;
         if let Some(old_parent) = previous.as_ref() {
             if load_card_optional(&transaction, old_parent)?.is_some() {
-                append_authority_card_event(
+                append_card_event(
                     &transaction,
                     old_parent,
                     "hierarchy",
-                    authority,
+                    &actor,
                     &format!("child {card_id} unlinked"),
-                    "parent",
-                    card_id.as_str(),
                     now,
                 )?;
             }
         }
         if let Some(new_parent) = parent.as_ref() {
-            append_authority_card_event(
+            append_card_event(
                 &transaction,
                 new_parent,
                 "decompose",
-                authority,
+                &actor,
                 &format!("child {card_id} linked"),
-                "parent",
-                card_id.as_str(),
                 now,
             )?;
         }
@@ -3341,13 +3229,12 @@ impl Store {
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
-        append_activity_with_authority(
+        append_activity(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("released {card_id}"),
             now,
-            authority,
         )?;
         events::append_outbound_card_event(
             &transaction,
@@ -3385,13 +3272,12 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity_with_authority(
+        append_activity(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("renewed {card_id} until {}", claim.expires_at),
             now,
-            authority,
         )?;
         transaction.commit()?;
         Ok(claim_receipt(card_id, &claim))
@@ -3420,13 +3306,12 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity_with_authority(
+        append_activity(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("heartbeat {card_id}"),
             now,
-            authority,
         )?;
         transaction.commit()?;
         Ok(claim_receipt(card_id, &claim))
@@ -3465,13 +3350,12 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity_with_authority(
+        append_activity(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("transferred {card_id} from {from_agent} to {to_agent}"),
             now,
-            authority,
         )?;
         transaction.commit()?;
         Ok(claim_receipt(card_id, &claim))
@@ -3890,22 +3774,19 @@ impl Store {
 
         persist_card(&transaction, &card)?;
         persist_run(&transaction, &run)?;
-        append_activity_with_authority(
+        append_activity(
             &transaction,
             run_id,
             ActivityType::Elicitation,
             &question,
             now,
-            authority,
         )?;
-        append_authority_card_event(
+        append_card_event(
             &transaction,
             &card.id,
             "status",
-            authority,
+            &authority.actor_label(),
             "awaiting input",
-            "status",
-            CardStatus::AwaitingInput.as_str(),
             now,
         )?;
         events::append_outbound_card_event(
@@ -3961,7 +3842,7 @@ impl Store {
                 now,
                 proof.as_deref(),
             )?;
-            append_activity_with_authority(
+            append_activity(
                 &transaction,
                 &run_id,
                 ActivityType::Response,
@@ -3971,17 +3852,14 @@ impl Store {
                     .unwrap_or_else(|| "completed without proof".to_string())
                     .as_str(),
                 now,
-            authority,
             )?;
         }
-        append_authority_card_event(
+        append_card_event(
             &transaction,
             card_id,
             "status",
-            authority,
+            &authority.actor_label(),
             &format!("{} -> done", previous.as_str()),
-            "status",
-            CardStatus::Done.as_str(),
             now,
         )?;
         if !previous.is_terminal() {
@@ -4292,13 +4170,12 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     Ok(())
 }
 
-fn append_activity_with_authority(
+fn append_activity(
     connection: &Connection,
     run_id: &RunId,
     activity_type: ActivityType,
     payload: &str,
     now: i64,
-    authority: &Authority,
 ) -> Result<Activity> {
     let activity = Activity {
         id: ActivityId::new(format!(
@@ -4308,20 +4185,16 @@ fn append_activity_with_authority(
         run_id: run_id.clone(),
         activity_type,
         payload: payload.to_owned(),
-        principal: authority.principal_name().map(str::to_string),
-        role: Some(authority.role().to_string()),
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO activities (id, run_id, activity_type, payload, principal, role, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO activities (id, run_id, activity_type, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             activity.id.as_str(),
             activity.run_id.as_str(),
             activity.activity_type.as_str(),
             activity.payload,
-            activity.principal.as_deref(),
-            activity.role.as_deref(),
             activity.created_at
         ],
     )?;
@@ -4343,7 +4216,6 @@ fn append_card_event(
         actor: non_empty("actor", actor)?,
         payload: payload.to_owned(),
         principal: None,
-        role: Some("legacy".to_string()),
         subject_kind: None,
         subject_id: None,
         created_at: now,
@@ -4374,22 +4246,17 @@ fn append_attributed_card_event(
         card_id: card_id.clone(),
         event_type: non_empty("event_type", audit.event_type)?,
         actor: non_empty("actor", audit.actor)?,
-        payload: format!(
-            "role={}; {}",
-            audit.authority.role(),
-            audit.payload
-        ),
+        payload: audit.payload.to_owned(),
         principal: audit.authority.principal_name().map(str::to_string),
-        role: Some(audit.authority.role().to_string()),
         subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
         subject_id: Some(non_empty("subject_id", audit.subject_id)?),
         created_at: now,
     };
     connection.execute(
         "INSERT INTO card_events (
-           id, card_id, event_type, actor, payload, principal, role,
+           id, card_id, event_type, actor, payload, principal,
            subject_kind, subject_id, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
@@ -4397,38 +4264,12 @@ fn append_attributed_card_event(
             event.actor.as_str(),
             event.payload.as_str(),
             event.principal.as_deref(),
-            event.role.as_deref(),
             event.subject_kind.as_deref(),
             event.subject_id.as_deref(),
             event.created_at,
         ],
     )?;
     Ok(event)
-}
-
-fn append_authority_card_event(
-    connection: &Connection,
-    card_id: &CardId,
-    event_type: &str,
-    authority: &Authority,
-    payload: &str,
-    subject_kind: &str,
-    subject_id: &str,
-    now: i64,
-) -> Result<CardEvent> {
-    append_attributed_card_event(
-        connection,
-        card_id,
-        MutationAudit {
-            event_type,
-            actor: &authority.actor_label(),
-            payload,
-            subject_kind,
-            subject_id,
-            authority,
-        },
-        now,
-    )
 }
 
 fn release_run(connection: &Connection, run_id: &RunId, now: i64) -> Result<()> {
@@ -4670,24 +4511,6 @@ pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
 /// just after `after`'s position, plus `next_after`: the id to pass on the
 /// following call, present only when this slice didn't reach the end of
 /// `cards`.
-fn ready_order_snapshot(cards: &[Card], cycle_card_ids: &[CardId]) -> String {
-    let mut digest = Sha256::new();
-    for card in cards {
-        digest.update(card.id.as_str().as_bytes());
-        digest.update([0]);
-        digest.update(card.status.as_str().as_bytes());
-        digest.update([0]);
-        digest.update(card.updated_at.to_le_bytes());
-        digest.update([0]);
-    }
-    for card_id in cycle_card_ids {
-        digest.update(card_id.as_str().as_bytes());
-        digest.update([0]);
-    }
-    let bytes = digest.finalize();
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn paginate_ordered_cards(
     mut cards: Vec<Card>,
     limit: usize,

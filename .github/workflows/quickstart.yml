@@ -52,16 +52,16 @@ jobs:
         run: |
           set -euo pipefail
           DB="$RUNNER_TEMP/quickstart/powder.db"
+          BOOTSTRAP_KEY_FILE="$RUNNER_TEMP/quickstart/powder-bootstrap.key"
           mkdir -p "$(dirname "$DB")"
           echo "POWDER_DB_PATH=$DB" >> "$GITHUB_ENV"
-           KEY_FILE="$RUNNER_TEMP/quickstart/bootstrap-key"
-           mkdir -p "$(dirname "$KEY_FILE")"
-           POWDER_DB_PATH="$DB" \
-           POWDER_AUTH_MODE=api-key \
-           POWDER_BOOTSTRAP_KEY_FILE="$KEY_FILE" \
-           POWDER_BIND_ADDR=127.0.0.1:4000 \
-           PORT=4000 \
-           ./target/release/powder-server > "$RUNNER_TEMP/quickstart/server.log" 2>&1 &
+
+          POWDER_DB_PATH="$DB" \
+          POWDER_AUTH_MODE=api-key \
+          POWDER_BOOTSTRAP_KEY_FILE="$BOOTSTRAP_KEY_FILE" \
+          POWDER_BIND_ADDR=127.0.0.1:4000 \
+          PORT=4000 \
+          ./target/release/powder-server > "$RUNNER_TEMP/quickstart/server.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/quickstart/server.pid"
 
           for _ in $(seq 1 30); do
@@ -76,17 +76,20 @@ jobs:
       - name: Drive the quickstart card lifecycle
         run: |
           set -euo pipefail
-           KEY=$(cat "$RUNNER_TEMP/quickstart/bootstrap-key")
-           test -n "$KEY"
-           if grep -F "$KEY" "$RUNNER_TEMP/quickstart/server.log"; then
-             echo "::error::bootstrap key leaked into service log"
-             exit 1
-           fi
+          LOG="$RUNNER_TEMP/quickstart/server.log"
 
-           curl -fsS http://127.0.0.1:4000/healthz | tee /dev/stderr | grep -q '"ok":true'
-           curl -fsS http://127.0.0.1:4000/readyz | tee /dev/stderr | grep -q '"ok":true'
+          curl -fsS http://127.0.0.1:4000/healthz | tee /dev/stderr | grep -q '"ok":true'
+          curl -fsS http://127.0.0.1:4000/readyz | tee /dev/stderr | grep -q '"ok":true'
 
-           CARD_ID="quickstart-ci-${{ github.run_id }}"
+          KEY=$(cat "$RUNNER_TEMP/quickstart/powder-bootstrap.key")
+          if [ -z "$KEY" ]; then
+            echo "::error::bootstrap key file was empty or missing"
+            cat "$LOG"
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/quickstart/powder-bootstrap.key"
+
+          CARD_ID="quickstart-ci-${{ github.run_id }}"
 
           echo "creating card"
           curl -fsS -X POST http://127.0.0.1:4000/api/v1/cards \

@@ -4,8 +4,7 @@ use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
     normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
     parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
-    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyCursor, ReadyQuery,
-    RepositoryName, Risk, RunId,
+    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyQuery, Risk, RunId,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
@@ -275,7 +274,7 @@ pub fn help() -> String {
     help.push_str(
         "  powder repair-criteria ./backlog.d --db ./data/powder.db --repo misty-step/sploot --apply --actor operator\n",
     );
-    help.push_str("  powder list-ready --db ./data/powder.db --limit 10 [--repo repo-a,repo-b] [--estimate S] [--risk low] [--priority P0] [--after cursor] [--json]\n");
+    help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str(
         "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary [--proof-plan \"CI + PR\"]\n",
     );
@@ -515,9 +514,8 @@ fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
         out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
     } else {
         let mut store = open_store(required_flag(args, "--db")?)?;
-        let authority = required_authority(args)?;
         let outcome = store
-            .import_cards_with_events(cards.clone(), &authority.actor_label(), now)
+            .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
             .map_err(store_err)?;
         out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
     }
@@ -681,9 +679,8 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         card.blocked_by = blocked_by;
         card.parent = parent;
         card.repo = repo;
-        let authority = required_authority(args)?;
         json!(store
-            .create_card_with_authority(card, &authority, now)
+            .create_card_with_events(card, &authority(args).actor_label(), now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({
@@ -756,9 +753,8 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        let authority = required_authority(args)?;
         json!(store
-            .patch_card_with_authority(&card_id, patch, &authority, now)
+            .patch_card(&card_id, patch, &authority(args).actor_label(), now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({});
@@ -815,7 +811,7 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
             card_ids_flag(args, "--blocks")?,
             card_ids_flag(args, "--blocked-by")?,
             now,
-            &required_authority(args)?,
+            &authority(args),
         )
         .map_err(store_err)?;
     Ok(format!("relations\t{}\n", card.id))
@@ -858,7 +854,7 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
     };
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .set_parent(&card_id, parent, now, &required_authority(args)?)
+        .set_parent(&card_id, parent, now, &authority(args))
         .map_err(store_err)?;
     Ok(format!(
         "parent\t{}\t{}\n",
@@ -873,72 +869,28 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
 fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
     let now = unix_now();
-    let repo_raw = flag_value(args, "--repo").map(str::to_string);
-    let repo = repo_raw
-        .as_deref()
-        .map(parse_repository_filter)
-        .transpose()?;
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
-    let risk = flag_value(args, "--risk")
-        .map(parse_risk_flag)
-        .transpose()?;
-    let priority = flag_value(args, "--priority")
-        .map(parse_priority_flag)
-        .transpose()?;
-    let after_raw = flag_value(args, "--after").map(str::to_string);
-    let query = ReadyQuery::new(now, limit)
-        .with_repositories(repo.unwrap_or_default())
-        .with_estimate(estimate)
-        .with_risk(risk)
-        .with_priority(priority);
-    let after = after_raw
-        .as_deref()
-        .map(|raw| {
-            ReadyCursor::decode_for_query(raw, &query)
-                .map_err(|err| ShellError::Invalid(err.to_string()))
-        })
-        .transpose()?;
+    let query = ReadyQuery::new(now, limit).with_estimate(estimate);
     let ready = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
-        let page = store
-            .list_ready_page_after(query.clone(), after.as_ref())
-            .map_err(store_err)?;
-        ready_page_json(&page, &query)
+        json!(store.list_ready(query).map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut url = format!("/api/v1/cards/ready?limit={limit}");
-        if let Some(repo) = repo_raw {
-            url.push_str(&format!("&repo={}", urlencode(&repo)));
-        }
         if let Some(estimate) = estimate {
             url.push_str(&format!("&estimate={}", estimate.as_str()));
         }
-        if let Some(risk) = risk {
-            url.push_str(&format!("&risk={}", risk.as_str()));
-        }
-        if let Some(priority) = priority {
-            url.push_str(&format!("&priority={}", priority.as_str()));
-        }
-        if let Some(after) = after_raw {
-            url.push_str(&format!("&after={}", urlencode(&after)));
-        }
-        client.get(&url).map_err(remote_err)?
+        let page = client.get(&url).map_err(remote_err)?;
+        list_page_cards(page)?
     } else {
         return Err(ShellError::Invalid(
             "list-ready requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments".to_string(),
         ));
     };
-    if has_flag(args, "--json") {
-        return to_pretty_json(&ready);
-    }
 
     let mut out = String::new();
-    for card in ready
-        .get("cards")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ShellError::Store("ready response expected cards array".to_string()))?
-    {
+    for card in json_array(&ready)? {
         out.push_str(&format!(
             "{}\t{}\t{}\n",
             json_string(card, "id")?,
@@ -1223,9 +1175,8 @@ fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
 
     let ack = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        let authority = required_authority(args)?;
         json!(store
-            .file_papercut_with_authority(&report, &authority, now)
+            .file_papercut(&report, agent, now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1358,7 +1309,7 @@ fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> 
     let claim = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .claim_card(&card_id, agent, now, ttl_seconds, &required_authority(args)?)
+            .claim_card(&card_id, agent, now, ttl_seconds, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1385,7 +1336,7 @@ fn release_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (released_card_id, released_run_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .release_claim(&card_id, &run_id, now, &required_authority(args)?)
+            .release_claim(&card_id, &run_id, now, &authority(args))
             .map_err(store_err)?;
         (claim.card_id.to_string(), claim.run_id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1413,7 +1364,7 @@ fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let (renewed_card_id, renewed_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .renew_claim(&card_id, &run_id, now, ttl_seconds, &required_authority(args)?)
+            .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
             .map_err(store_err)?;
         (
             claim.card_id.to_string(),
@@ -1457,7 +1408,7 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
                 to_agent,
                 now,
                 ttl_seconds,
-                &required_authority(args)?,
+                &authority(args),
             )
             .map_err(store_err)?;
         (
@@ -1494,7 +1445,7 @@ fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErr
     let (beat_card_id, beat_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .heartbeat_claim(&card_id, &run_id, now, &required_authority(args)?)
+            .heartbeat_claim(&card_id, &run_id, now, &authority(args))
             .map_err(store_err)?;
         (
             claim.card_id.to_string(),
@@ -1590,7 +1541,7 @@ fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shell
     let run = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .answer_input(&run_id, actor, answer, now, &required_authority(args)?)
+            .answer_input(&run_id, actor, answer, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1623,7 +1574,7 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .update_status(&card_id, status, now, &required_authority(args)?)
+            .update_status(&card_id, status, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1651,9 +1602,8 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let checked = !has_flag(args, "--unchecked");
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        let authority = required_authority(args)?;
         json!(store
-            .check_criterion_as(&card_id, criterion, actor, checked, now, &authority)
+            .check_criterion(&card_id, criterion, actor, checked, now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1681,9 +1631,8 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     let url = required_flag(args, "--url")?;
     let (link_card_id, link_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        let authority = required_authority(args)?;
         let link = store
-            .add_link_as(&card_id, label, url, now, &authority)
+            .add_link(&card_id, label, url, now)
             .map_err(store_err)?;
         (link.card_id.to_string(), link.id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1708,9 +1657,8 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let body = required_flag(args, "--body")?;
     let comment = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        let authority = required_authority(args)?;
         json!(store
-            .add_comment_as(&card_id, author, body, now, &authority)
+            .add_comment(&card_id, author, body, now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1748,9 +1696,8 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
-        let authority = required_authority(args)?;
         json!(store
-            .append_work_log_as(&card_id, agent, attribution, body, now, &authority)
+            .append_work_log(&card_id, agent, attribution, body, now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1788,7 +1735,7 @@ fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (awaiting_run_id, awaiting_card_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let run = store
-            .request_input(&run_id, question, now, &required_authority(args)?)
+            .request_input(&run_id, question, now, &authority(args))
             .map_err(store_err)?;
         (run.id.to_string(), run.card_id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1815,7 +1762,7 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .complete_card(&card_id, proof, criterion_proofs, now, &required_authority(args)?)
+            .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut body = json!({});
@@ -1993,19 +1940,6 @@ fn parse_status_flag(raw: &str) -> Result<CardStatus, ShellError> {
     parse_status(raw).map_err(|error| cli_field_error(error, "status"))
 }
 
-fn parse_repository_filter(raw: &str) -> Result<Vec<RepositoryName>, ShellError> {
-    if raw.trim().is_empty() {
-        return Err(ShellError::Invalid(
-            "--repo must contain at least one repository".to_string(),
-        ));
-    }
-    raw.split(',')
-        .map(str::trim)
-        .map(RepositoryName::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ShellError::Invalid(error.to_string()))
-}
-
 fn parse_priority_flag(raw: &str) -> Result<Priority, ShellError> {
     parse_priority(raw).map_err(|error| cli_field_error(error, "priority"))
 }
@@ -2073,13 +2007,11 @@ fn criterion_flag(args: &[String]) -> Result<usize, ShellError> {
 /// Build the `Authority` a mutation is checked against from `--actor` (and
 /// `--admin`). Omitting `--actor` preserves prior CLI behavior exactly: a
 /// direct-DB-access operator is trusted and no ownership check runs.
-
-fn required_authority(args: &[String]) -> Result<Authority, ShellError> {
-    let actor = required_flag(args, "--actor")?;
-    if actor.trim().is_empty() {
-        return Err(ShellError::Invalid("--actor cannot be blank".to_string()));
+fn authority(args: &[String]) -> Authority {
+    match flag_value(args, "--actor") {
+        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
+        None => Authority::unchecked(),
     }
-    Ok(Authority::actor(actor, has_flag(args, "--admin")))
 }
 
 fn reject_principal_flag(args: &[String]) -> Result<(), ShellError> {
@@ -2242,29 +2174,6 @@ mod tests {
         net::TcpListener,
         sync::{Arc, Mutex},
     };
-
-    // Existing unit scenarios predate the local-auth contract and omit
-    // --actor from their command fixtures. Keep production run strict while
-    // making those fixtures explicit through one test-only adapter.
-    fn run(args: &[String]) -> Result<String, ShellError> {
-        const MUTATIONS: &[&str] = &[
-            "create-card", "update-card", "update-relations", "set-parent",
-            "claim", "release-claim", "renew-claim", "transfer-claim",
-            "heartbeat", "answer-input", "update-status", "check-criterion",
-            "add-link", "add-comment", "append-work-log", "request-input",
-            "complete-card", "papercut", "import-github-issues",
-            "repository-upsert", "repository-merge-alias", "repository-delete",
-            "repository-normalize", "relations-doctor", "subscription-create",
-            "subscription-disable", "dead-letter-replay",
-        ];
-        let mut owned = args.to_vec();
-        if args.first().is_some_and(|command| MUTATIONS.contains(&command.as_str()))
-            && !args.iter().any(|arg| arg == "--actor" || arg.starts_with("--actor="))
-        {
-            owned.extend(["--actor".to_string(), "test-operator".to_string()]);
-        }
-        super::run(&owned)
-    }
 
     #[test]
     fn cli_names_the_instance_workflow() {
@@ -2731,87 +2640,6 @@ mod tests {
         .unwrap();
 
         assert!(completed.contains("completed\tcli-test\tdone"));
-    }
-
-    #[test]
-    fn cli_list_ready_json_filters_and_returns_cursor_metadata() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-ready-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-        run(&args(["init-db", "--db", &db])).unwrap();
-        for repo in ["repo-a", "repo-b"] {
-            run(&args(["repository-upsert", "--db", &db, "--name", repo])).unwrap();
-        }
-        for (id, repo, risk) in [
-            ("repo-a-1", "repo-a", "low"),
-            ("repo-a-2", "repo-a", "low"),
-            ("repo-a-missing-risk", "repo-a", "high"),
-            ("repo-b-other", "repo-b", "low"),
-        ] {
-            run(&args([
-                "create-card",
-                "--db",
-                &db,
-                "--id",
-                id,
-                "--title",
-                id,
-                "--acceptance",
-                "proof exists",
-                "--status",
-                "ready",
-                "--repo",
-                repo,
-                "--estimate",
-                "S",
-                "--priority",
-                "P0",
-                "--risk",
-                risk,
-            ]))
-            .unwrap();
-        }
-        let page = run(&args([
-            "list-ready",
-            "--db",
-            &db,
-            "--limit",
-            "1",
-            "--repo",
-            "repo-a",
-            "--estimate",
-            "S",
-            "--risk",
-            "low",
-            "--priority",
-            "P0",
-            "--json",
-        ]))
-        .unwrap();
-        let page: Value = serde_json::from_str(&page).unwrap();
-        assert_eq!(page["total_count"], 2);
-        assert_eq!(page["cards"].as_array().unwrap().len(), 1);
-        assert_eq!(page["cards"][0]["id"], "repo-a-1");
-        assert_eq!(page["has_more"], true);
-        let after = page["next_after"].as_str().unwrap();
-        let second = run(&args([
-            "list-ready", "--db", &db, "--limit", "1", "--repo", "repo-a",
-            "--estimate", "S", "--risk", "low", "--priority", "P0", "--after", after, "--json",
-        ])).unwrap();
-        let second: Value = serde_json::from_str(&second).unwrap();
-        assert_eq!(second["cards"][0]["id"], "repo-a-2");
-        assert_eq!(second["has_more"], false);
-        let changed = run(&args([
-            "list-ready", "--db", &db, "--limit", "1", "--repo", "repo-b",
-            "--estimate", "S", "--risk", "low", "--priority", "P0", "--after", after, "--json",
-        ])).unwrap_err();
-        assert!(changed.to_string().contains("stale continuation cursor"));
-        let _ = std::fs::remove_file(db);
     }
 
     #[test]
@@ -5016,8 +4844,6 @@ mod tests {
                 "Local card",
                 "--acceptance",
                 "proof exists",
-                "--actor",
-                "test-operator",
             ]),
             &env,
         )

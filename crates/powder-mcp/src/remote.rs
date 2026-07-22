@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use super::{
     card_id, card_ids_array, claim_action, missing_required, optional_i64,
     optional_repository_tier, optional_repository_visibility, optional_str, parse_estimate,
+    card_id, card_ids_array, claim_action, missing_required, optional_i64,
+    optional_repository_tier, optional_repository_visibility, optional_str, parse_estimate,
     parse_priority, parse_repository_filter, parse_risk, parse_status, required_claim_arg, required_str, run_id,
     run_id_for_claim, string_array, to_string, ClaimAction,
 };
@@ -28,28 +30,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mut query = format!("limit={limit}");
-            if let Some(repositories) = parse_repository_filter(args)? {
-                let repo = repositories
-                    .iter()
-                    .map(|repository| repository.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                query.push_str(&format!("&repo={}", urlencode(&repo)));
-            }
             if let Some(estimate) = optional_str(args, "estimate") {
                 parse_estimate(estimate)?;
                 query.push_str(&format!("&estimate={}", urlencode(estimate)));
-            }
-            if let Some(risk) = optional_str(args, "risk") {
-                parse_risk(risk)?;
-                query.push_str(&format!("&risk={}", urlencode(risk)));
-            }
-            if let Some(priority) = optional_str(args, "priority") {
-                parse_priority(priority)?;
-                query.push_str(&format!("&priority={}", urlencode(priority)));
-            }
-            if let Some(after) = optional_str(args, "after") {
-                query.push_str(&format!("&after={}", urlencode(after)));
             }
             let response = client.get(&format!("/api/v1/cards/ready?{query}"))?;
             remote_card_summary_page_payload(response)?
@@ -527,8 +510,6 @@ fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
     let excluded_terminal_count = page.excluded_terminal_count;
     let total_count = page.total_count;
     let has_more = page.has_more;
-    let cycle_card_ids = page.cycle_card_ids;
-    let next_after = page.next_after;
     let summaries = page.cards;
 
     let mut payload = json!({
@@ -540,12 +521,6 @@ fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
         crate::list_cards_hint(summaries.len(), total_count, excluded_terminal_count)
     {
         payload["hint"] = json!(hint);
-    }
-    if !cycle_card_ids.is_empty() {
-        payload["cycle_card_ids"] = json!(cycle_card_ids);
-    }
-    if let Some(next_after) = next_after {
-        payload["next_after"] = json!(next_after);
     }
     Ok(payload)
 }
@@ -1111,34 +1086,6 @@ mod tests {
         assert_eq!(requests[0].method, "GET");
         assert_eq!(requests[0].path, "/api/v1/cards/ready?limit=5");
         assert_eq!(requests[0].authorization, None);
-    }
-
-    #[test]
-    fn list_ready_forwards_filters_cursor_and_preserves_page_metadata() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({
-                "cards": [api_card("remote-ready-1", "Remote ready", "ready", "p0", 10)],
-                "total_count": 2,
-                "has_more": true,
-                "next_after": "remote-ready-1",
-                "cycle_card_ids": ["remote-cycle-1"],
-            }),
-        )]);
-        let client = RemoteClient::new(base_url, None);
-        let result = call_tool_remote(
-            &client,
-            "list_ready",
-            &json!({"limit": 1, "repo": "repo-a,repo-b", "estimate": "S", "risk": "low", "priority": "P0", "after": "remote-after"}),
-        )
-        .unwrap();
-        let payload = tool_payload(&result);
-        assert_eq!(payload["total_count"], 2);
-        assert_eq!(payload["has_more"], true);
-        assert_eq!(payload["next_after"], "remote-ready-1");
-        assert_eq!(payload["cycle_card_ids"][0], "remote-cycle-1");
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests[0].path, "/api/v1/cards/ready?limit=1&repo=repo-a%2Crepo-b&estimate=S&risk=low&priority=P0&after=remote-after");
     }
 
     #[test]

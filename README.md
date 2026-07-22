@@ -26,44 +26,70 @@ CI run, and the stdout below is checked in verbatim at
 
 ## Quickstart
 
-Run a server with secure defaults, retrieve the first-run bootstrap key through an explicit 0600 file, and create a card.
+Run a server, mint the first-run bootstrap key, create a card, and claim it.
+No `cargo` required — either `docker run` the published image or download a
+release binary.
 
 **Option A — Docker:**
 
 ```sh
-mkdir -p data
-chmod 700 data
-docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/data:/data" \
+docker volume create powder-data
+docker run --rm -p 4000:4000 -v powder-data:/data \
   -e POWDER_AUTH_MODE=api-key \
-  -e POWDER_BIND_ADDR=0.0.0.0:4000 \
-  -e POWDER_BOOTSTRAP_KEY_FILE=/data/bootstrap-key \
+  -e POWDER_BOOTSTRAP_KEY_FILE=/data/powder-bootstrap.key \
   ghcr.io/misty-step/powder:latest
 ```
 
-The container never logs the key. In another shell, read data/bootstrap-key once, store it in a secret manager, and remove the file.
+(A named volume, not a host bind mount, so the container's non-root user
+always has write access regardless of host UID mapping.)
 
-**Option B — release binary** (macOS arm64 or Linux x86_64/arm64):
+**Option B — release binary** (macOS arm64 or Linux x86_64/arm64, from the
+[latest release](https://github.com/misty-step/powder/releases/latest)):
 
 ```sh
-mkdir -p data
-POWDER_DB_PATH=./data/powder.db \
-POWDER_AUTH_MODE=api-key \
-POWDER_BIND_ADDR=127.0.0.1:4000 \
-POWDER_BOOTSTRAP_KEY_FILE=./data/bootstrap-key \
+curl -fsSL -o powder.tar.gz \
+  https://github.com/misty-step/powder/releases/latest/download/powder-aarch64-apple-darwin.tar.gz
+tar -xzf powder.tar.gz
+mkdir -p ./data && chmod 700 ./data
+POWDER_DB_PATH=./data/powder.db POWDER_BOOTSTRAP_KEY_FILE=./data/powder-bootstrap.key POWDER_AUTH_MODE=api-key \
   ./powder-server
 ```
 
-Read data/bootstrap-key from a separate protected shell, store it, and remove it. For a pre-start recovery path, run ./powder init-db --db ./data/powder.db --show-secret before starting the server instead; that command prints the raw key only to the invoking terminal.
+(Swap the tarball name for `powder-x86_64-unknown-linux-gnu.tar.gz` or
+`powder-aarch64-unknown-linux-gnu.tar.gz` on Linux.)
 
-Then, in another shell:
+The first boot writes the bootstrap API key to the configured 0600 one-shot
+file and never prints the secret. Read it once, store it in your secret
+manager, then remove the file. For the release-binary example:
 
 ```sh
-KEY=$(cat ./data/bootstrap-key)
-curl -s http://127.0.0.1:4000/healthz
-curl -s -X POST http://127.0.0.1:4000/api/v1/cards \
+KEY="$(cat ./data/powder-bootstrap.key)"
+# Store KEY securely before removing the one-shot file.
+rm ./data/powder-bootstrap.key
+
+curl -s http://localhost:4000/healthz
+
+curl -s -X POST http://localhost:4000/api/v1/cards \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"id":"first-card","title":"My first card","acceptance":["it exists"]}'
+
+curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"agent":"me"}'
 ```
+
+Production runs one Rust service (`powder-server`) on a DigitalOcean droplet.
+SQLite lives at `/data` on a host volume with WAL enabled. Litestream
+replication is optional, and ingress is through the tailnet. In `api-key` mode,
+read routes require a valid bearer key by default; set `POWDER_PUBLIC_READS=true`
+only on a genuinely private tailnet perimeter. See
+[`docs/operations.md`](docs/operations.md) for the full read-auth posture and
+rollout runbook.
+
+That's the whole loop: a card exists, is claimable, and carries a
+`run_id`/`expires_at` lease the moment it's claimed. CI runs this sequence (and more)
+on every change (see `.github/workflows/quickstart.yml`), so it can't
+silently drift from what's in this README.
 
 ## Why Powder
 
@@ -159,8 +185,7 @@ repositories):
 DB=/tmp/powder-smoke/powder.db
 cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret
 cargo run -q -p powder-cli -- create-card --db "$DB" --id smoke-proof --title "Proof plan smoke" --acceptance "detail renders" --proof-plan "PR + HTTP smoke"
-cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10 --json
-# Optional filters: --repo repo-a,repo-b --estimate S --risk low --priority P0 --after <next_after>
+cargo run -q -p powder-cli -- list-ready --db "$DB" --limit 10
 CLAIM=$(cargo run -q -p powder-cli -- claim smoke-proof --db "$DB" --agent codex)
 printf "%s" "$CLAIM"
 RUN_ID=$(printf "%s" "$CLAIM" | cut -f3)

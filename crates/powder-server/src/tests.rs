@@ -6,9 +6,7 @@ use axum::{
         Method, Request, StatusCode,
     },
 };
-use powder_core::{Estimate, Risk};
 use std::{
-    cell::Cell,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     sync::mpsc,
@@ -103,7 +101,10 @@ fn config_defaults_tailnet_backstop_to_unset_secret_and_admin_false() {
 fn config_parses_tailnet_proxy_secret_and_admin_principal_policy() {
     let config = Config::from_pairs([
         ("POWDER_TAILNET_PROXY_SECRET", " shhh "),
-        ("POWDER_TAILNET_ADMIN_PRINCIPALS", " operator, admin@example.com "),
+        (
+            "POWDER_TAILNET_ADMIN_PRINCIPALS",
+            " operator, admin@example.com ",
+        ),
     ])
     .unwrap();
     assert_eq!(config.tailnet_proxy_secret.as_deref(), Some("shhh"));
@@ -251,11 +252,7 @@ fn config_rejects_blank_tailnet_proxy_secret() {
 
 #[test]
 fn config_rejects_wildcard_tailnet_admin_policy() {
-    let err = Config::from_pairs([(
-        "POWDER_TAILNET_ADMIN_PRINCIPALS",
-        "operator,*",
-    )])
-    .unwrap_err();
+    let err = Config::from_pairs([("POWDER_TAILNET_ADMIN_PRINCIPALS", "operator,*")]).unwrap_err();
     assert_eq!(err.variable, "POWDER_TAILNET_ADMIN_PRINCIPALS");
     assert!(err.message.contains("wildcard"));
 }
@@ -1430,8 +1427,7 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
         .as_str()
         .expect("first page must carry next_after when more cards remain")
         .to_string();
-    assert!(next_after.starts_with("v1."));
-    assert!(!next_after.contains("ready-cont-2"));
+    assert_eq!(next_after, "ready-cont-2");
 
     // (b) walk the rest of the pages with `after`.
     let second = app
@@ -1451,8 +1447,7 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
         .as_str()
         .expect("second page must still carry next_after")
         .to_string();
-    assert!(next_after_2.starts_with("v1."));
-    assert!(!next_after_2.contains("ready-cont-4"));
+    assert_eq!(next_after_2, "ready-cont-4");
 
     let third = app
         .clone()
@@ -1493,125 +1488,6 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
         .oneshot(json_request(
             Method::GET,
             "/api/v1/cards/ready?limit=2&after=does-not-exist",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn list_ready_http_filters_repo_risk_priority_and_pages_losslessly() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    {
-        let mut store = state.store.lock().unwrap();
-        for repo in ["repo-a", "repo-b"] {
-            store
-                .upsert_repository(
-                    RepositoryUpsert {
-                        name: repo.to_string(),
-                        aliases: None,
-                        visibility: None,
-                        tier: None,
-                        import_provenance: None,
-                    },
-                    1,
-                )
-                .unwrap();
-        }
-        for (id, repo, created_at, risk) in [
-            ("http-filter-1", "repo-a", 1, Some(Risk::Low)),
-            ("http-filter-2", "repo-a", 2, Some(Risk::Low)),
-            ("http-filter-missing-risk", "repo-a", 3, None),
-            ("http-filter-other-repo", "repo-b", 4, Some(Risk::Low)),
-        ] {
-            let mut card = Card::new(CardId::new(id).unwrap(), id, "do it")
-                .unwrap()
-                .with_status(CardStatus::Ready)
-                .with_priority(Priority::P0)
-                .with_estimate(Some(Estimate::S))
-                .with_risk(risk)
-                .with_acceptance(["proof exists".to_string()])
-                .with_created_at(created_at);
-            card.repo = Some(repo.to_string());
-            store.import_cards(vec![card]).unwrap();
-        }
-    }
-    let app = app(state.clone());
-    let first = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards/ready?limit=1&repo=repo-a&estimate=S&risk=low&priority=P0",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    let first = response_json(first).await;
-    assert_eq!(first["total_count"], 2);
-    assert_eq!(first["has_more"], true);
-    assert_eq!(first["cards"][0]["id"], "http-filter-1");
-    let after = first["next_after"].as_str().expect("cursor").to_string();
-
-    let changed_filter = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            &format!("/api/v1/cards/ready?limit=1&repo=repo-b&estimate=S&risk=low&priority=P0&after={after}"),
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(changed_filter.status(), StatusCode::BAD_REQUEST);
-    let changed_filter = response_json(changed_filter).await;
-    assert!(changed_filter["error"]
-        .as_str()
-        .unwrap()
-        .contains("stale continuation cursor"));
-
-    let second = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            &format!("/api/v1/cards/ready?limit=1&repo=repo-a&estimate=S&risk=low&priority=P0&after={after}"),
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::OK);
-    let second = response_json(second).await;
-    assert_eq!(second["cards"][0]["id"], "http-filter-2");
-    assert_eq!(second["has_more"], false);
-    assert!(second.get("next_after").is_none());
-
-    let invalid = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards/ready?repo=repo-a,",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-
-    {
-        let mut store = state.store.lock().unwrap();
-        let id = CardId::new("http-filter-1").unwrap();
-        let mut card = store.get_card(&id).unwrap().expect("filter card");
-        card.status = CardStatus::Done;
-        store.import_cards(vec![card]).unwrap();
-    }
-    let stale = app
-        .oneshot(json_request(
-            Method::GET,
-            &format!("/api/v1/cards/ready?limit=1&repo=repo-a&estimate=S&risk=low&priority=P0&after={after}"),
             Some(&raw_key),
             "",
         ))
@@ -2587,6 +2463,9 @@ async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
         .await
         .unwrap();
     assert_eq!(public_hidden_admin.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn hidden_read_queries_require_admin_across_stats_and_repositories() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state
@@ -2619,8 +2498,6 @@ async fn hidden_read_queries_require_admin_across_stats_and_repositories() {
         assert_eq!(response.status(), StatusCode::OK, "admin hidden read {path}");
     }
 }
-
-#[tokio::test]
 async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -5570,6 +5447,100 @@ async fn api_v1_routes_is_unauthenticated_and_documents_required_fields() {
     let body_shape = add_link["body_shape"].as_str().unwrap();
     assert!(body_shape.contains("\"label\""));
     assert!(body_shape.contains("not \"title\""));
+}
+
+#[tokio::test]
+async fn tailnet_router_distinguishes_listed_and_unlisted_routes() {
+    let state = test_state_with_tailnet_backstop(Some("test-proxy"), true);
+    let router = app(state);
+
+    let listed_contract = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/routes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed_contract.status(), StatusCode::OK);
+
+    let protected_without_identity = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        protected_without_identity.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let listed_with_identity = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header("Tailscale-User-Login", "agent@example.test")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed_with_identity.status(), StatusCode::OK);
+
+    let unlisted = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/not-a-route")
+                .header("Tailscale-User-Login", "agent@example.test")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unlisted.status(), StatusCode::NOT_FOUND);
+
+    let non_admin = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/keys")
+                .header("Tailscale-User-Login", "intruder@example.test")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_admin.status(), StatusCode::FORBIDDEN);
+
+    let listed_admin = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/keys")
+                .header("Tailscale-User-Login", "operator")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed_admin.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@ use powder_core::{
     parse_estimate as parse_card_estimate, parse_priority as parse_card_priority,
     parse_risk as parse_card_risk, parse_status as parse_card_status, Authority, Card, CardDetail,
     CardField, CardId, CardStatus, CardSummary, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyCursor, ReadyQuery, RepositoryName, Risk, RunId,
+    ReadyQuery, Risk, RunId,
 };
 use powder_store::{
     BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
@@ -45,7 +45,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
         description: "Scan claimable card summaries, dependency-ordered so no card appears after another card in the response it transitively blocks (ties broken by priority, age, identifier). Only true members of a blocks/blocked_by cycle lose topological ordering -- emitted as a group in tie-break order and named in cycle_card_ids (computed before limit truncation); cards downstream of a cycle stay dependency-ordered after it. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"repo":{"type":"string","description":"comma-separated repository allowlist"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"after":{"type":"string","description":"continuation cursor from next_after"}}}"#,
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"estimate":{"type":"string","enum":["S","M","L","XL"]}}}"#,
     },
     ToolDef {
         name: "list_cards",
@@ -403,34 +403,13 @@ pub fn call_tool_store(
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            let repo = parse_repository_filter(args)?;
             let estimate = optional_str(args, "estimate")
                 .map(parse_estimate)
                 .transpose()?;
-            let risk = optional_str(args, "risk").map(parse_risk).transpose()?;
-            let priority = optional_str(args, "priority")
-                .map(parse_priority)
-                .transpose()?;
-            let query = ReadyQuery::new(now, limit)
-                .with_repositories(repo.unwrap_or_default())
-                .with_estimate(estimate)
-                .with_risk(risk)
-                .with_priority(priority);
-            let after = optional_str(args, "after")
-                .map(|raw| ReadyCursor::decode_for_query(raw, &query))
-                .transpose()
-                .map_err(to_string)?;
             let page = store
-                .list_ready_page_after(query.clone(), after.as_ref())
+                .list_ready_page(ReadyQuery::new(now, limit).with_estimate(estimate))
                 .map_err(to_string)?;
-            card_summary_page_payload(
-                &page.cards,
-                page.total_count,
-                &page.cycle_card_ids,
-                page.next_after.as_ref(),
-                Some(&query),
-                page.continuation_snapshot.as_deref(),
-            )
+            card_summary_page_payload(&page.cards, page.total_count, &page.cycle_card_ids)
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -553,7 +532,7 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             card.repo = optional_str(args, "repo").map(str::to_string);
             let card = store
-                .create_card_with_authority(card, &authority_arg(args)?, now)
+                .create_card_with_events(card, &authority_arg(args).actor_label(), now)
                 .map_err(to_string)?;
             let mut payload = card_ack_payload(&card);
             if card.acceptance.is_empty() {
@@ -582,7 +561,7 @@ pub fn call_tool_store(
                 repo: None,
             };
             let card = store
-                .patch_card_with_authority(&card_id, patch, &authority_arg(args)?, now)
+                .patch_card(&card_id, patch, &authority_arg(args).actor_label(), now)
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -656,14 +635,14 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let answer = required_str(args, "answer")?;
             json!(store
-                .answer_input(&run_id, actor, answer, now, &authority_arg(args)?)
+                .answer_input(&run_id, actor, answer, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = parse_status(required_str(args, "status")?)?;
             let card = store
-                .update_status(&card_id, status, now, &authority_arg(args)?)
+                .update_status(&card_id, status, now, &authority_arg(args))
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -674,7 +653,7 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
             let card = store
-                .check_criterion_as(&card_id, criterion, actor, checked, now, &authority_arg(args)?)
+                .check_criterion(&card_id, criterion, actor, checked, now)
                 .map_err(to_string)?;
             criterion_ack_payload(&card, criterion, checked)
         }
@@ -701,7 +680,7 @@ pub fn call_tool_store(
                             card_ids_array(args, "blocks")?,
                             card_ids_array(args, "blocked_by")?,
                             now,
-                            &authority_arg(args)?,
+                            &authority_arg(args),
                         )
                         .map_err(to_string)?,
                 );
@@ -710,7 +689,7 @@ pub fn call_tool_store(
                 let parent = parent_arg.map(CardId::new).transpose().map_err(to_string)?;
                 card = Some(
                     store
-                        .set_parent(&card_id, parent, now, &authority_arg(args)?)
+                        .set_parent(&card_id, parent, now, &authority_arg(args))
                         .map_err(to_string)?,
                 );
             }
@@ -723,7 +702,7 @@ pub fn call_tool_store(
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
             json!(store
-                .add_link_as(&card_id, label, url, now, &authority_arg(args)?)
+                .add_link(&card_id, label, url, now)
                 .map_err(to_string)?)
         }
         "add_comment" => {
@@ -732,7 +711,7 @@ pub fn call_tool_store(
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
             json!(store
-                .add_comment_as(&card_id, author, body, now, &authority_arg(args)?)
+                .add_comment(&card_id, author, body, now)
                 .map_err(to_string)?)
         }
         "append_work_log" => {
@@ -747,7 +726,7 @@ pub fn call_tool_store(
                 run_id: optional_str(args, "run_id"),
             };
             json!(store
-                .append_work_log_as(&card_id, agent, attribution, body, now, &authority_arg(args)?)
+                .append_work_log(&card_id, agent, attribution, body, now)
                 .map_err(to_string)?)
         }
         "report_papercut" => {
@@ -759,7 +738,7 @@ pub fn call_tool_store(
                 harness: optional_str(args, "harness").map(str::to_string),
             };
             let card = store
-                .file_papercut_with_authority(&report, &authority_arg(args)?, now)
+                .file_papercut(&report, &report.agent, now)
                 .map_err(to_string)?;
             json!({
                 "id": card.id.as_str(),
@@ -772,7 +751,7 @@ pub fn call_tool_store(
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
             let question = required_str(args, "question")?;
             json!(store
-                .request_input(&run_id, question, now, &authority_arg(args)?)
+                .request_input(&run_id, question, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "complete_card" => {
@@ -783,7 +762,7 @@ pub fn call_tool_store(
                     optional_str(args, "proof"),
                     criterion_proofs_arg(args)?,
                     now,
-                    &authority_arg(args)?,
+                    &authority_arg(args),
                 )
                 .map_err(to_string)?;
             card_ack_payload(&card)
@@ -847,12 +826,9 @@ fn card_summary_page_payload(
     cards: &[Card],
     total_count: usize,
     cycle_card_ids: &[CardId],
-    next_after: Option<&CardId>,
-    cursor_query: Option<&ReadyQuery>,
-    continuation_snapshot: Option<&str>,
 ) -> Value {
     let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
-    let has_more = next_after.is_some();
+    let has_more = total_count > summaries.len();
     let mut payload = json!({
         "cards": summaries,
         "total_count": total_count,
@@ -870,16 +846,6 @@ fn card_summary_page_payload(
     // unchanged.
     if !cycle_card_ids.is_empty() {
         payload["cycle_card_ids"] = json!(cycle_card_ids);
-    }
-    if let Some(next_after) = next_after {
-        payload["next_after"] = match cursor_query {
-            Some(query) => json!(ReadyCursor::for_query_with_snapshot(
-                query,
-                next_after.clone(),
-                continuation_snapshot.unwrap_or(""),
-            ).encode()),
-            None => json!(next_after),
-        };
     }
     payload
 }
@@ -1084,7 +1050,7 @@ fn manage_claim_store(store: &mut Store, args: &Value, now: i64) -> Result<Value
     let action = claim_action(args)?;
     let card_id = card_id(args, "card_id")?;
     let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-    let authority = authority_arg(args)?;
+    let authority = authority_arg(args);
 
     Ok(match action {
         ClaimAction::Claim => {
@@ -1189,21 +1155,6 @@ fn string_array(args: &Value, key: &'static str) -> Result<Vec<String>, String> 
                 .collect()
         })
         .unwrap_or_else(|| Ok(Vec::new()))
-}
-
-fn parse_repository_filter(args: &Value) -> Result<Option<Vec<RepositoryName>>, String> {
-    optional_str(args, "repo")
-        .map(|raw| {
-            if raw.trim().is_empty() {
-                return Err("repo must contain at least one repository".to_string());
-            }
-            raw.split(',')
-                .map(str::trim)
-                .map(RepositoryName::new)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(to_string)
-        })
-        .transpose()
 }
 
 fn optional_string_array(args: &Value, key: &'static str) -> Result<Option<Vec<String>>, String> {
@@ -1368,13 +1319,15 @@ fn field_role(key: &'static str) -> &'static str {
 /// `actor`/`admin` tool arguments. Omitting `actor` preserves prior MCP
 /// behavior exactly: a stdio-local caller is trusted and no ownership check
 /// runs, matching the CLI's `--actor` default.
-fn authority_arg(args: &Value) -> Result<Authority, String> {
-    let actor = args["actor"]
+fn authority_arg(args: &Value) -> Authority {
+    match args["actor"]
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "missing required argument: actor (authenticated local principal)".to_string())?;
-    Ok(Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)))
+    {
+        Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
+        None => Authority::unchecked(),
+    }
 }
 
 fn reject_principal_arg(args: &Value) -> Result<(), String> {
@@ -3166,46 +3119,6 @@ mod tests {
             .collect::<Vec<_>>();
         cycle_ids.sort();
         assert_eq!(cycle_ids, vec!["cycle-x", "cycle-y"]);
-    }
-
-    #[test]
-    fn mcp_list_ready_filters_and_continues_with_lossless_metadata() {
-        let mut store = Store::open_in_memory().unwrap();
-        store.migrate().unwrap();
-        for (id, repo, created_at) in [
-            ("mcp-filter-1", "repo-a", 1),
-            ("mcp-filter-2", "repo-a", 2),
-            ("mcp-filter-other", "repo-b", 3),
-        ] {
-            let mut card = seeded_card(id, id, CardStatus::Ready, created_at)
-                .with_priority(Priority::P0)
-                .with_estimate(Some(Estimate::S))
-                .with_risk(Some(Risk::Low));
-            card.repo = Some(repo.to_string());
-            store.import_cards(vec![card]).unwrap();
-        }
-        let first = call_tool_store(
-            &mut store,
-            "list_ready",
-            &json!({"limit": 1, "repo": "repo-a,repo-b", "estimate": "S", "risk": "low", "priority": "P0"}),
-            10,
-        )
-        .unwrap();
-        let first = tool_payload(&first);
-        assert_eq!(first["total_count"], 3);
-        assert_eq!(first["cards"][0]["id"], "mcp-filter-1");
-        assert_eq!(first["has_more"], true);
-        let after = first["next_after"].as_str().unwrap().to_string();
-        let second = call_tool_store(
-            &mut store,
-            "list_ready",
-            &json!({"limit": 1, "repo": "repo-a,repo-b", "estimate": "S", "risk": "low", "priority": "P0", "after": after}),
-            10,
-        )
-        .unwrap();
-        let second = tool_payload(&second);
-        assert_eq!(second["cards"][0]["id"], "mcp-filter-2");
-        assert!(second["next_after"].as_str().is_some());
     }
 
     #[test]

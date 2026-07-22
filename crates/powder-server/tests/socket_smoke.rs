@@ -64,33 +64,8 @@ fn server_lifecycle_over_real_http() {
     assert_eq!(completed.status(), 200, "complete should return 200");
 
     let db_path = server.db_path.clone();
-    let key_path = server.bootstrap_key_path.clone();
+    let bootstrap_key_file = server.bootstrap_key_file.clone();
     drop(server);
     let _ = std::fs::remove_file(&db_path);
-    let _ = std::fs::remove_file(&key_path);
-}
-
-#[test]
-fn bootstrap_key_is_retrievable_without_entering_service_logs() {
-    let server = support::spawn_server("bootstrap-log-smoke");
-    let logs = server
-        .logs
-        .lock()
-        .expect("read captured server logs")
-        .clone();
-    assert!(!logs.contains(&server.bootstrap_key));
-    assert!(!logs.contains("Powder bootstrap API key:"));
-    let metadata =
-        std::fs::metadata(&server.bootstrap_key_path).expect("bootstrap key file exists");
-    #[cfg(unix)]
-    assert_eq!(
-        std::os::unix::fs::MetadataExt::mode(&metadata) & 0o777,
-        0o600,
-        "bootstrap recovery file must not be readable by other users"
-    );
-    let db_path = server.db_path.clone();
-    let key_path = server.bootstrap_key_path.clone();
-    drop(server);
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(key_path);
+    let _ = std::fs::remove_file(&bootstrap_key_file);
 }

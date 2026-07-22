@@ -9,7 +9,7 @@ use powder_core::{
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    append_activity_with_authority, load_all_cards, load_card, non_empty, non_empty_scrubbed, persist_card,
+    append_activity, load_all_cards, load_card, non_empty, non_empty_scrubbed, persist_card,
     persist_run, schema::RUN_SELECT_SQL, Result, RunRecord, Store, StoreError,
 };
 
@@ -224,13 +224,12 @@ impl Store {
 
         persist_card(&transaction, &card)?;
         persist_run(&transaction, &run)?;
-        append_activity_with_authority(
+        append_activity(
             &transaction,
             run_id,
             ActivityType::Response,
             &format!("answered by {actor}: {answer}"),
             now,
-            authority,
         )?;
         transaction.commit()?;
         Ok(run)
@@ -465,7 +464,7 @@ fn load_activities_for_card(
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
                 "SELECT activities.id, activities.run_id, activities.activity_type,
-                        activities.payload, activities.principal, activities.role, activities.created_at
+                        activities.payload, activities.created_at
                  FROM activities
                  JOIN runs ON runs.id = activities.run_id
                  WHERE runs.card_id = ?1
@@ -479,7 +478,7 @@ fn load_activities_for_card(
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
                 "SELECT activities.id, activities.run_id, activities.activity_type,
-                        activities.payload, activities.principal, activities.role, activities.created_at
+                        activities.payload, activities.created_at
                  FROM activities
                  JOIN runs ON runs.id = activities.run_id
                  WHERE runs.card_id = ?1
@@ -532,7 +531,7 @@ fn load_activities_for_run(
     let records = match detail {
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
-                "SELECT id, run_id, activity_type, payload, principal, role, created_at
+                "SELECT id, run_id, activity_type, payload, created_at
                  FROM activities
                  WHERE run_id = ?1
                  ORDER BY created_at ASC, rowid ASC",
@@ -544,7 +543,7 @@ fn load_activities_for_run(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT id, run_id, activity_type, payload, principal, role, created_at
+                "SELECT id, run_id, activity_type, payload, created_at
                  FROM activities
                  WHERE run_id = ?1
                  ORDER BY created_at DESC, rowid DESC
@@ -594,7 +593,7 @@ fn load_events_for_card(
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, event_type, actor, payload,
-                        principal, role, subject_kind, subject_id, created_at
+                        principal, subject_kind, subject_id, created_at
                  FROM card_events
                  WHERE card_id = ?1
                  ORDER BY created_at ASC, rowid ASC",
@@ -607,7 +606,7 @@ fn load_events_for_card(
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, event_type, actor, payload,
-                        principal, role, subject_kind, subject_id, created_at
+                        principal, subject_kind, subject_id, created_at
                  FROM card_events
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, rowid DESC
@@ -650,7 +649,7 @@ fn count_events_for_card(connection: &Connection, card_id: &CardId) -> Result<us
 fn latest_elicitation(connection: &Connection, run_id: &RunId) -> Result<Option<Activity>> {
     connection
         .query_row(
-            "SELECT id, run_id, activity_type, payload, principal, role, created_at
+            "SELECT id, run_id, activity_type, payload, created_at
              FROM activities
              WHERE run_id = ?1 AND activity_type = 'elicitation'
              ORDER BY created_at DESC, rowid DESC
@@ -793,8 +792,6 @@ struct ActivityRecord {
     run_id: String,
     activity_type: String,
     payload: String,
-    principal: Option<String>,
-    role: Option<String>,
     created_at: i64,
 }
 
@@ -805,7 +802,6 @@ struct CardEventRecord {
     actor: String,
     payload: String,
     principal: Option<String>,
-    role: Option<String>,
     subject_kind: Option<String>,
     subject_id: Option<String>,
     created_at: i64,
@@ -820,10 +816,9 @@ impl CardEventRecord {
             actor: row.get(3)?,
             payload: row.get(4)?,
             principal: row.get(5)?,
-            role: row.get(6)?,
-            subject_kind: row.get(7)?,
-            subject_id: row.get(8)?,
-            created_at: row.get(9)?,
+            subject_kind: row.get(6)?,
+            subject_id: row.get(7)?,
+            created_at: row.get(8)?,
         })
     }
 
@@ -835,7 +830,6 @@ impl CardEventRecord {
             actor: self.actor,
             payload: self.payload,
             principal: self.principal,
-            role: self.role,
             subject_kind: self.subject_kind,
             subject_id: self.subject_id,
             created_at: self.created_at,
@@ -850,9 +844,7 @@ impl ActivityRecord {
             run_id: row.get(1)?,
             activity_type: row.get(2)?,
             payload: row.get(3)?,
-            principal: row.get(4)?,
-            role: row.get(5)?,
-            created_at: row.get(6)?,
+            created_at: row.get(4)?,
         })
     }
 
@@ -867,8 +859,6 @@ impl ActivityRecord {
                 },
             )?,
             payload: self.payload,
-            principal: self.principal,
-            role: self.role,
             created_at: self.created_at,
         })
     }

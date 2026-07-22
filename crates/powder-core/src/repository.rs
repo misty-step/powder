@@ -1,35 +1,3 @@
-use crate::DomainError;
-
-/// A validated canonical repository label used by domain queries. Transport
-/// faces parse their comma-separated input into this value before calling the
-/// core; the store never receives wire syntax.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RepositoryName(String);
-
-impl RepositoryName {
-    pub fn new(raw: &str) -> Result<Self, DomainError> {
-        let canonical = canonical_repo_label(raw)
-            .ok_or_else(|| DomainError::validation("repo", "repository name must not be empty"))?;
-        if canonical.contains(",") {
-            return Err(DomainError::validation(
-                "repo",
-                "repository names must be supplied as separate values",
-            ));
-        }
-        Ok(Self(canonical))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for RepositoryName {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
 /// Canonical operator-facing repository label for filters, board grouping,
 /// and card JSON. Import callers may pass full GitHub slugs such as
 /// `misty-step/canary`; in a single-org Powder instance the owner segment is
