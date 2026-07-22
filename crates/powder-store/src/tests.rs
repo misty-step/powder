@@ -35,6 +35,20 @@ fn ready_card_without_acceptance(id: &str, created_at: i64) -> Card {
         .with_created_at(created_at)
 }
 
+fn search_page_matches(
+    store: &Store,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::SearchResult>> {
+    Ok(store
+        .search_page(&SearchQuery {
+            q: query.to_string(),
+            limit,
+            ..SearchQuery::default()
+        })?
+        .matches)
+}
+
 #[test]
 fn file_store_uses_wal_and_persists_card_lifecycle() -> Result<()> {
     let path = temp_db("lifecycle");
@@ -6381,33 +6395,36 @@ fn fts_search_indexes_all_store_text_and_literal_tokens() -> Result<()> {
         30,
     )?;
 
-    let title = store.search("SQLite", 10)?;
+    let title = search_page_matches(&store, "SQLite", 10)?;
     assert!(title.iter().any(|hit| {
-        hit.source_table == "cards"
+        hit.source_kind == "cards"
             && hit.source_field == "title"
-            && hit.card_id == card.id
-            && hit.created_at == card.created_at
-            && hit.snippet.contains("<b>SQLite</b>")
+            && hit.card.id == card.id
+            && hit.source_created_at == card.created_at
+            && hit.snippet.contains("SQLite")
     }));
-    let body = store.search("SQLITE_BUSY", 10)?;
+    let body = search_page_matches(&store, "SQLITE_BUSY", 10)?;
     assert!(body.iter().any(|hit| {
-        hit.source_table == "cards" && hit.source_field == "body" && hit.card_id == card.id
+        hit.source_kind == "cards" && hit.source_field == "body" && hit.card.id == card.id
     }));
-    let card_id_hits = store.search("powder-query-fts-store", 10)?;
-    assert_eq!(card_id_hits.len(), 5);
-    assert!(card_id_hits.iter().all(|hit| hit.card_id == card.id));
-    assert!(store
-        .search("criteria-token", 10)?
+    let card_id_hits = search_page_matches(&store, "powder-query-fts-store", 10)?;
+    assert_eq!(card_id_hits.len(), 6);
+    assert!(card_id_hits.iter().all(|hit| hit.card.id == card.id));
+    assert!(card_id_hits
+        .iter()
+        .any(|hit| hit.source_kind == "cards" && hit.source_field == "id"));
+    assert!(card_id_hits
+        .iter()
+        .any(|hit| hit.source_kind == "cards" && hit.source_field == "title"));
+    assert!(search_page_matches(&store, "criteria-token", 10)?
         .iter()
         .any(|hit| hit.source_field == "criteria"));
-    assert!(store
-        .search("comment-token", 10)?
+    assert!(search_page_matches(&store, "comment-token", 10)?
         .iter()
-        .any(|hit| hit.source_table == "comments"));
-    assert!(store
-        .search("work-log-token", 10)?
+        .any(|hit| hit.source_kind == "comments"));
+    assert!(search_page_matches(&store, "work-log-token", 10)?
         .iter()
-        .any(|hit| hit.source_table == "work_log_entries"));
+        .any(|hit| hit.source_kind == "work_log_entries"));
     assert_eq!(comment.card_id, card.id);
     assert_eq!(work_log.card_id, card.id);
     Ok(())
@@ -6424,7 +6441,7 @@ fn fts_search_ranks_by_bm25_and_rolls_back_source_writes() -> Result<()> {
     repeated.body = "rank-token rank-token rank-token".to_string();
     store.import_cards(vec![exact.clone(), repeated.clone()])?;
 
-    let ranked = store.search("rank-token", 10)?;
+    let ranked = search_page_matches(&store, "rank-token", 10)?;
     assert!(ranked.len() >= 2);
     assert!(ranked.windows(2).all(|pair| pair[0].rank <= pair[1].rank));
     assert!(ranked.iter().all(|hit| hit.rank.is_finite()));
@@ -6444,7 +6461,7 @@ fn fts_search_ranks_by_bm25_and_rolls_back_source_writes() -> Result<()> {
         ],
     )?;
     drop(transaction);
-    assert!(store.search("ghost-token", 10)?.is_empty());
+    assert!(search_page_matches(&store, "ghost-token", 10)?.is_empty());
     Ok(())
 }
 
@@ -6455,12 +6472,12 @@ fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
     let mut card = ready_card("fts-trigger-card", 10);
     card.body = "old-card-token".to_string();
     store.upsert_card(card.clone())?;
-    assert_eq!(store.search("old-card-token", 10)?.len(), 1);
+    assert_eq!(search_page_matches(&store, "old-card-token", 10)?.len(), 1);
 
     card.body = "new-card-token".to_string();
     store.upsert_card(card.clone())?;
-    assert!(store.search("old-card-token", 10)?.is_empty());
-    assert_eq!(store.search("new-card-token", 10)?.len(), 1);
+    assert!(search_page_matches(&store, "old-card-token", 10)?.is_empty());
+    assert_eq!(search_page_matches(&store, "new-card-token", 10)?.len(), 1);
 
     store.connection.execute(
         "INSERT INTO comments (id, card_id, author, body, created_at)
@@ -6477,8 +6494,8 @@ fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
         "UPDATE comments SET body = ?1 WHERE id = ?2",
         rusqlite::params!["new-comment-token", "fts-trigger-comment"],
     )?;
-    assert!(store.search("old-comment-token", 10)?.is_empty());
-    assert_eq!(store.search("new-comment-token", 10)?.len(), 1);
+    assert!(search_page_matches(&store, "old-comment-token", 10)?.is_empty());
+    assert_eq!(search_page_matches(&store, "new-comment-token", 10)?.len(), 1);
     store.connection.execute(
         "INSERT OR REPLACE INTO comments (id, card_id, author, body, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -6490,8 +6507,8 @@ fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
             25_i64
         ],
     )?;
-    assert!(store.search("new-comment-token", 10)?.is_empty());
-    assert_eq!(store.search("replace-comment-token", 10)?.len(), 1);
+    assert!(search_page_matches(&store, "new-comment-token", 10)?.is_empty());
+    assert_eq!(search_page_matches(&store, "replace-comment-token", 10)?.len(), 1);
 
     store.connection.execute(
         "INSERT INTO work_log_entries (id, card_id, agent, body, created_at)
@@ -6504,19 +6521,19 @@ fn fts_triggers_remove_replaced_and_deleted_text() -> Result<()> {
             30_i64
         ],
     )?;
-    assert_eq!(store.search("deleted-work-token", 10)?.len(), 1);
+    assert_eq!(search_page_matches(&store, "deleted-work-token", 10)?.len(), 1);
     store.connection.execute(
         "DELETE FROM work_log_entries WHERE id = ?1",
         rusqlite::params!["fts-trigger-work-log"],
     )?;
-    assert!(store.search("deleted-work-token", 10)?.is_empty());
+    assert!(search_page_matches(&store, "deleted-work-token", 10)?.is_empty());
 
     store.connection.execute(
         "DELETE FROM cards WHERE id = ?1",
         rusqlite::params![card.id.as_str()],
     )?;
-    assert!(store.search("new-card-token", 10)?.is_empty());
-    assert!(store.search("new-comment-token", 10)?.is_empty());
+    assert!(search_page_matches(&store, "new-card-token", 10)?.is_empty());
+    assert!(search_page_matches(&store, "new-comment-token", 10)?.is_empty());
     Ok(())
 }
 
@@ -6574,13 +6591,13 @@ fn fts_migration_backfills_a_snapshot_idempotently() -> Result<()> {
                 row.get(0)
             })?;
     assert_eq!(first_count, 8);
-    assert_eq!(store.search("snapshot-criteria-token", 10)?.len(), 1);
+    assert_eq!(search_page_matches(&store, "snapshot-criteria-token", 10)?.len(), 1);
     assert_eq!(
-        store.search("snapshot-legacy-acceptance-token", 10)?.len(),
+        search_page_matches(&store, "snapshot-legacy-acceptance-token", 10)?.len(),
         1
     );
-    assert_eq!(store.search("snapshot-comment-token", 10)?.len(), 1);
-    assert_eq!(store.search("snapshot-work-log-token", 10)?.len(), 1);
+    assert_eq!(search_page_matches(&store, "snapshot-comment-token", 10)?.len(), 1);
+    assert_eq!(search_page_matches(&store, "snapshot-work-log-token", 10)?.len(), 1);
 
     store.migrate()?;
     let second_count: i64 =
@@ -6590,7 +6607,7 @@ fn fts_migration_backfills_a_snapshot_idempotently() -> Result<()> {
                 row.get(0)
             })?;
     assert_eq!(second_count, first_count);
-    assert_eq!(store.search("snapshot-criteria-token", 10)?.len(), 1);
+    assert_eq!(search_page_matches(&store, "snapshot-criteria-token", 10)?.len(), 1);
     Ok(())
 }
 
@@ -6894,7 +6911,7 @@ fn fts_search_times_10k_synthetic_cards() -> Result<()> {
     store.import_cards(cards)?;
 
     let started = std::time::Instant::now();
-    let hits = store.search("bulk-search-token", 10)?;
+    let hits = search_page_matches(&store, "bulk-search-token", 10)?;
     let elapsed = started.elapsed();
     println!("FTS5 search over 10,000 synthetic cards: {elapsed:?}");
     assert_eq!(hits.len(), 10);

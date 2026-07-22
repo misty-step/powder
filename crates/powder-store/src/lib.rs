@@ -93,18 +93,6 @@ pub struct Store {
     field_note_config: Option<FieldNoteConfig>,
 }
 
-/// One ranked result from the store-owned FTS5 index. The raw `rank` is
-/// SQLite `bm25` output; lower values rank ahead of higher values.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchMatch {
-    pub source_table: String,
-    pub source_field: String,
-    pub card_id: CardId,
-    pub created_at: i64,
-    pub snippet: String,
-    pub rank: f64,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     pub q: String,
@@ -691,38 +679,6 @@ impl Store {
     /// bodies. Query text is treated as a literal FTS phrase so identifiers
     /// such as `powder-query-fts-store` and `SQLITE_BUSY` keep
     /// their punctuation and cannot become FTS operators.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchMatch>> {
-        let query = query.trim();
-        if query.is_empty() || limit == 0 || !self.table_exists("card_search_fts")? {
-            return Ok(Vec::new());
-        }
-        let match_query = format!("\"{}\"", query.replace('\"', "\"\""));
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut statement = self.connection.prepare(
-            "SELECT source_table, source_field, card_id, created_at,
-                    snippet(card_search_fts, 5, '<b>', '</b>', '…', 32),
-                    bm25(card_search_fts)
-             FROM card_search_fts
-             WHERE card_search_fts MATCH ?1
-             ORDER BY bm25(card_search_fts), source_table, source_field, card_id
-             LIMIT ?2",
-        )?;
-        let mut rows = statement.query(params![match_query, limit])?;
-        let mut matches = Vec::new();
-        while let Some(row) = rows.next()? {
-            let card_id = CardId::new(row.get::<_, String>(2)?)?;
-            matches.push(SearchMatch {
-                source_table: row.get(0)?,
-                source_field: row.get(1)?,
-                card_id,
-                created_at: row.get(3)?,
-                snippet: row.get(4)?,
-                rank: row.get(5)?,
-            });
-        }
-        Ok(matches)
-    }
-
     fn search_rows(&self, query: &str) -> Result<Vec<RawSearchMatch>> {
         let Some(match_query) = rewrite_search_query(query) else {
             return Ok(Vec::new());

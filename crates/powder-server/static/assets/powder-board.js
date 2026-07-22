@@ -156,6 +156,9 @@ const state = {
   error: "",
   errorKind: "",
   searchMatches: [],
+  searchTotalCount: 0,
+  searchHasMore: false,
+  searchNextAfter: null,
   searchLoading: false,
   searchError: "",
   filters: {
@@ -260,13 +263,18 @@ function renderSearchStatus() {
   if (!els.searchStatus) return;
   const query = state.filters.search.trim();
   const count = groupedSearchMatches(state.searchMatches).length;
+  const totalCount = Number.isFinite(state.searchTotalCount)
+    ? state.searchTotalCount
+    : count;
   els.searchStatus.textContent = !query
     ? ""
     : state.searchLoading
       ? "Searching…"
       : state.searchError
         ? "Search error: " + state.searchError
-        : count + " result" + (count === 1 ? "" : "s");
+        : state.searchHasMore
+          ? `first ${count} of ${totalCount} matches`
+          : count + " result" + (count === 1 ? "" : "s");
   els.searchStatus.dataset.state = state.searchError ? "error" : state.searchLoading ? "loading" : "ready";
 }
 
@@ -277,6 +285,9 @@ async function requestTextSearch(query) {
   if (!normalized) {
     state.searchLoading = false;
     state.searchMatches = [];
+    state.searchTotalCount = 0;
+    state.searchHasMore = false;
+    state.searchNextAfter = null;
     renderSearchStatus();
     render();
     return;
@@ -289,6 +300,11 @@ async function requestTextSearch(query) {
     const data = await apiJson("/api/v1/cards/search?" + params.toString());
     if (seq !== searchRequestSeq) return;
     state.searchMatches = Array.isArray(data.matches) ? data.matches : [];
+    state.searchTotalCount = Number.isInteger(data.total_count) && data.total_count >= 0
+      ? data.total_count
+      : state.searchMatches.length;
+    state.searchHasMore = data.has_more === true;
+    state.searchNextAfter = typeof data.next_after === "string" ? data.next_after : null;
     state.searchLoading = false;
     state.searchError = "";
     renderSearchStatus();
@@ -297,6 +313,9 @@ async function requestTextSearch(query) {
     if (seq !== searchRequestSeq) return;
     state.searchLoading = false;
     state.searchMatches = [];
+    state.searchTotalCount = 0;
+    state.searchHasMore = false;
+    state.searchNextAfter = null;
     state.searchError = err?.message || String(err);
     renderSearchStatus();
     render();
@@ -311,6 +330,9 @@ function scheduleTextSearch(query) {
     state.searchLoading = false;
     state.searchError = "";
     state.searchMatches = [];
+    state.searchTotalCount = 0;
+    state.searchHasMore = false;
+    state.searchNextAfter = null;
     renderSearchStatus();
     render();
     return;
@@ -318,6 +340,9 @@ function scheduleTextSearch(query) {
   state.searchLoading = true;
   state.searchError = "";
   state.searchMatches = [];
+  state.searchTotalCount = 0;
+  state.searchHasMore = false;
+  state.searchNextAfter = null;
   renderSearchStatus();
   render();
   searchDebounceTimer = setTimeout(() => {
@@ -2644,6 +2669,9 @@ els.filterClear.addEventListener("click", () => {
   state.searchMatches = [];
   state.searchError = "";
   state.searchLoading = false;
+  state.searchTotalCount = 0;
+  state.searchHasMore = false;
+  state.searchNextAfter = null;
   state.showAllTiers = false;
   els.textFilter.value = "";
   buildFilters();
