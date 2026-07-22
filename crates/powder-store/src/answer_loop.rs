@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use powder_core::{
     Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
     CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DetailLevel, DomainError,
-    EpicEvidence, EpicState, EvidenceKind, Link, LinkId, Run, RunDetail, RunId, RunState,
-    WorkLogEntry,
+    EpicEvidence, EpicState, EvidenceKind, Link, LinkId, Operation, Run, RunDetail, RunId,
+    RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -217,6 +217,15 @@ impl Store {
             ))
             .into());
         }
+        super::authorize_card_operation(
+            authority,
+            Operation::AnswerInput,
+            &card,
+            Some(run_id),
+            None,
+            now,
+        )?;
+
         card.status = CardStatus::InProgress;
         card.updated_at = now;
         run.state = RunState::Active;
