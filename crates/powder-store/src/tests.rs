@@ -1115,6 +1115,222 @@ fn repository_settings_can_be_upserted_and_deleted_when_unused() -> Result<()> {
 }
 
 #[test]
+fn keyed_repository_mutations_replay_conflict_and_rollback_atomically() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let admin = Authority::principal("operator", true);
+
+    // A failed keyed mutation must not leave a receipt behind: the same key can
+    // be retried with a corrected payload and executes exactly once.
+    let invalid = store
+        .upsert_repository_with_authority_keyed(
+            RepositoryUpsert {
+                name: "keyed-upsert".to_string(),
+                aliases: Some(vec![String::new()]),
+                visibility: None,
+                tier: None,
+                import_provenance: None,
+            },
+            10,
+            "repo-upsert",
+            &admin,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        StoreError::Domain(DomainError::Validation { .. })
+    ));
+    assert!(store.get_repository("keyed-upsert")?.is_none());
+
+    let upsert = RepositoryUpsert {
+        name: "keyed-upsert".to_string(),
+        aliases: Some(vec!["ku".to_string()]),
+        visibility: None,
+        tier: None,
+        import_provenance: None,
+    };
+    let first =
+        store.upsert_repository_with_authority_keyed(upsert.clone(), 11, "repo-upsert", &admin)?;
+    assert!(!first.replayed);
+    let replay = store.upsert_repository_with_authority_keyed(upsert, 12, "repo-upsert", &admin)?;
+    assert!(replay.replayed);
+    let conflict = store
+        .upsert_repository_with_authority_keyed(
+            RepositoryUpsert {
+                name: "keyed-upsert".to_string(),
+                aliases: Some(vec!["different".to_string()]),
+                visibility: None,
+                tier: None,
+                import_provenance: None,
+            },
+            13,
+            "repo-upsert",
+            &admin,
+        )
+        .unwrap_err();
+    assert_eq!(
+        match conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "legacy/keyed".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: None,
+        },
+        19,
+    )?;
+    let mut card = ready_card("keyed-merge-card", 20);
+    card.repo = Some("legacy/keyed".to_string());
+    store.import_cards(vec![card])?;
+    let invalid_merge = store
+        .merge_repository_alias_with_authority_keyed("", "merged", &admin, 21, "repo-merge")
+        .unwrap_err();
+    assert!(matches!(
+        invalid_merge,
+        StoreError::Domain(DomainError::Validation { .. })
+    ));
+    let merged = store.merge_repository_alias_with_authority_keyed(
+        "legacy/keyed",
+        "merged",
+        &admin,
+        22,
+        "repo-merge",
+    )?;
+    assert!(!merged.replayed);
+    assert_eq!(merged.value.rehomed_cards, 1);
+    let merged_replay = store.merge_repository_alias_with_authority_keyed(
+        "legacy/keyed",
+        "merged",
+        &admin,
+        23,
+        "repo-merge",
+    )?;
+    assert!(merged_replay.replayed);
+    let merge_conflict = store
+        .merge_repository_alias_with_authority_keyed(
+            "other-alias",
+            "merged",
+            &admin,
+            24,
+            "repo-merge",
+        )
+        .unwrap_err();
+    assert_eq!(
+        match merge_conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+
+    let invalid_delete = store
+        .delete_repository_with_authority_keyed("keyed-delete", 25, "repo-delete", &admin)
+        .unwrap_err();
+    assert!(matches!(
+        invalid_delete,
+        StoreError::Domain(DomainError::NotFound { .. })
+    ));
+    store.upsert_repository_with_authority(
+        RepositoryUpsert {
+            name: "keyed-delete".to_string(),
+            aliases: None,
+            visibility: None,
+            tier: None,
+            import_provenance: None,
+        },
+        26,
+        &admin,
+    )?;
+    let deleted =
+        store.delete_repository_with_authority_keyed("keyed-delete", 27, "repo-delete", &admin)?;
+    assert!(!deleted.replayed);
+    let deleted_replay =
+        store.delete_repository_with_authority_keyed("keyed-delete", 28, "repo-delete", &admin)?;
+    assert!(deleted_replay.replayed);
+    let delete_conflict = store
+        .with_keyed_operation::<(), _, _>(
+            Operation::DeleteRepository,
+            "repository:keyed-delete",
+            &serde_json::json!({"name": "different"}),
+            "repo-delete",
+            29,
+            &admin,
+            |_| Err(DomainError::conflict("receipt must prevent execution").into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        match delete_conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+    assert!(store.get_repository("keyed-delete")?.is_none());
+
+    let mut normalize_card = ready_card("keyed-normalize-card", 30);
+    normalize_card.repo = Some("canary".to_string());
+    store.import_cards(vec![normalize_card])?;
+    store.connection.execute(
+        "UPDATE cards SET repo = 'misty-step/canary' WHERE id = 'keyed-normalize-card'",
+        [],
+    )?;
+    let forced_rollback = store
+        .with_keyed_operation::<(), _, _>(
+            Operation::NormalizeRepositories,
+            "repositories:all",
+            &serde_json::json!({"normalize": true}),
+            "repo-normalize",
+            31,
+            &admin,
+            |_| Err(DomainError::conflict("forced rollback").into()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        forced_rollback,
+        StoreError::Domain(DomainError::Conflict(_))
+    ));
+    let normalized =
+        store.normalize_repository_strings_with_authority_keyed(&admin, 32, "repo-normalize")?;
+    assert!(!normalized.replayed);
+    assert_eq!(normalized.value.normalized(), 1);
+    let normalized_replay =
+        store.normalize_repository_strings_with_authority_keyed(&admin, 33, "repo-normalize")?;
+    assert!(normalized_replay.replayed);
+    let normalize_conflict = store
+        .with_keyed_operation::<(), _, _>(
+            Operation::NormalizeRepositories,
+            "repositories:all",
+            &serde_json::json!({"normalize": false}),
+            "repo-normalize",
+            34,
+            &admin,
+            |_| Err(DomainError::conflict("receipt must prevent execution").into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        match normalize_conflict {
+            StoreError::Domain(ref error) => error.denial_class(),
+            _ => None,
+        },
+        Some(DenialClass::IdempotencyConflict)
+    );
+    let stored_repo: String = store.connection.query_row(
+        "SELECT repo FROM cards WHERE id = 'keyed-normalize-card'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_repo, "canary");
+    Ok(())
+}
+
+#[test]
 fn ratified_repository_tier_seed_marks_active_backburner_and_archived_repos() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

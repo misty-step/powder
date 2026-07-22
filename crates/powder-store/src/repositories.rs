@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use powder_core::{canonical_repo_label, Authority, CardStatus, DomainError};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use powder_core::{canonical_repo_label, Authority, CardStatus, DomainError, Operation};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::{non_empty, non_empty_scrubbed, Result, Store, StoreError};
+use crate::{non_empty, non_empty_scrubbed, IdempotencyOutcome, Result, Store, StoreError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,7 +65,7 @@ impl RepositoryTier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySummary {
     pub name: String,
     /// Compatibility alias for older consumers that still render `repo`.
@@ -80,7 +80,7 @@ pub struct RepositorySummary {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryUpsert {
     pub name: String,
     pub aliases: Option<Vec<String>>,
@@ -89,7 +89,7 @@ pub struct RepositoryUpsert {
     pub import_provenance: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryMergeOutcome {
     pub repository: RepositorySummary,
     pub alias: String,
@@ -98,7 +98,7 @@ pub struct RepositoryMergeOutcome {
 
 /// Result of [`Store::normalize_repository_strings`]: how many cards the
 /// sweep looked at and exactly which ones it rewrote.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryNormalizeOutcome {
     pub scanned: usize,
     pub changes: Vec<RepositoryNormalizeChange>,
@@ -110,7 +110,7 @@ impl RepositoryNormalizeOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryNormalizeChange {
     pub card_id: String,
     pub previous_repo: String,
@@ -258,62 +258,37 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<RepositorySummary> {
-        authority.require_admin()?;
-        let raw_name = normalize_repository_token(&upsert.name)?;
-        let name = canonical_repo_label(&raw_name)
-            .ok_or_else(|| DomainError::validation("repository.name", "value cannot be empty"))?;
-        let visibility = upsert.visibility.unwrap_or(RepositoryVisibility::Visible);
-        let tier = upsert.tier.unwrap_or(RepositoryTier::Backburner);
-        let replace_tier = upsert.tier.is_some();
-        let aliases = upsert
-            .aliases
-            .map(|aliases| {
-                aliases
-                    .into_iter()
-                    .map(|alias| normalize_repository_token(&alias))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
-        let import_provenance = upsert
-            .import_provenance
-            .as_deref()
-            .map(|value| non_empty_scrubbed("import_provenance", value))
-            .transpose()?;
-
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_repository_row(
-            &transaction,
-            RepositoryRowUpsert {
-                name: &name,
-                visibility,
-                tier,
-                import_provenance: import_provenance.as_deref(),
-                now,
-                replace_visibility: true,
-                replace_tier,
-            },
-        )?;
-        let mut alias_set = BTreeSet::new();
-        if raw_name != name {
-            alias_set.insert(raw_name);
-        }
-        if let Some(aliases) = aliases {
-            for alias in aliases {
-                if alias != name {
-                    alias_set.insert(alias);
-                }
-            }
-            replace_repository_aliases(&transaction, &name, alias_set.into_iter().collect(), now)?;
-        } else {
-            for alias in alias_set {
-                insert_repository_alias(&transaction, &name, &alias, now, false)?;
-            }
-        }
+        let name = upsert_repository_in_transaction(&transaction, upsert, now, authority)?;
         transaction.commit()?;
         self.repository_summary(&name)?
             .ok_or_else(|| DomainError::not_found("repository", name).into())
+    }
+
+    pub fn upsert_repository_with_authority_keyed(
+        &mut self,
+        upsert: RepositoryUpsert,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<RepositorySummary>> {
+        let resource_name = upsert.name.clone();
+        let payload = upsert.clone();
+        self.with_keyed_operation(
+            Operation::UpsertRepository,
+            format!("repository:{}", resource_name),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                let name = upsert_repository_in_transaction(transaction, upsert, now, authority)?;
+                repository_summary_on_connection(transaction, &name)?
+                    .ok_or_else(|| DomainError::not_found("repository", name).into())
+            },
+        )
     }
 
     pub fn delete_repository(&mut self, name: &str) -> Result<()> {
@@ -325,29 +300,31 @@ impl Store {
         name: &str,
         authority: &Authority,
     ) -> Result<()> {
-        authority.require_admin()?;
-        self.delete_repository_impl(name)
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        delete_repository_in_transaction(&transaction, name, authority)?;
+        transaction.commit()?;
+        Ok(())
     }
 
-    fn delete_repository_impl(&mut self, name: &str) -> Result<()> {
-        let Some(repository_name) = resolve_repository_name(&self.connection, name)? else {
-            return Err(DomainError::not_found("repository", name).into());
-        };
-        let card_count = resolved_repository_card_count(&self.connection, &repository_name)?;
-        if card_count > 0 {
-            return Err(DomainError::conflict(format!(
-                "repository {repository_name} still has {card_count} cards"
-            ))
-            .into());
-        }
-        let deleted = self.connection.execute(
-            "DELETE FROM repositories WHERE name = ?1",
-            [repository_name.as_str()],
-        )?;
-        if deleted == 0 {
-            return Err(DomainError::not_found("repository", repository_name).into());
-        }
-        Ok(())
+    pub fn delete_repository_with_authority_keyed(
+        &mut self,
+        name: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<()>> {
+        let payload = serde_json::json!({"name": name});
+        self.with_keyed_operation(
+            Operation::DeleteRepository,
+            format!("repository:{}", name),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| delete_repository_in_transaction(transaction, name, authority),
+        )
     }
 
     pub fn merge_repository_alias(
@@ -367,9 +344,65 @@ impl Store {
         authority: &Authority,
         now: i64,
     ) -> Result<RepositoryMergeOutcome> {
-        authority.require_admin()?;
         let actor = authority.actor_label();
-        self.merge_repository_alias_impl(alias, target, &actor, now)
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (target_name, canonical_alias, rehomed_cards) = merge_repository_alias_in_transaction(
+            &transaction,
+            alias,
+            target,
+            &actor,
+            now,
+            authority,
+        )?;
+        transaction.commit()?;
+        let repository = self
+            .repository_summary(&target_name)?
+            .ok_or_else(|| DomainError::not_found("repository", target_name.clone()))?;
+        Ok(RepositoryMergeOutcome {
+            repository,
+            alias: canonical_alias,
+            rehomed_cards,
+        })
+    }
+
+    pub fn merge_repository_alias_with_authority_keyed(
+        &mut self,
+        alias: &str,
+        target: &str,
+        authority: &Authority,
+        now: i64,
+        idempotency_key: &str,
+    ) -> Result<IdempotencyOutcome<RepositoryMergeOutcome>> {
+        let payload = serde_json::json!({"alias": alias, "target": target});
+        self.with_keyed_operation(
+            Operation::MergeRepositoryAlias,
+            format!("repository:{}", target),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                let actor = authority.actor_label();
+                let (target_name, canonical_alias, rehomed_cards) =
+                    merge_repository_alias_in_transaction(
+                        transaction,
+                        alias,
+                        target,
+                        &actor,
+                        now,
+                        authority,
+                    )?;
+                let repository = repository_summary_on_connection(transaction, &target_name)?
+                    .ok_or_else(|| DomainError::not_found("repository", target_name.clone()))?;
+                Ok(RepositoryMergeOutcome {
+                    repository,
+                    alias: canonical_alias,
+                    rehomed_cards,
+                })
+            },
+        )
     }
 
     fn merge_repository_alias_impl(
@@ -499,9 +532,35 @@ impl Store {
         authority: &Authority,
         now: i64,
     ) -> Result<RepositoryNormalizeOutcome> {
-        authority.require_admin()?;
         let actor = authority.actor_label();
-        self.normalize_repository_strings_impl(&actor, now)
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcome =
+            normalize_repository_strings_in_transaction(&transaction, &actor, now, authority)?;
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn normalize_repository_strings_with_authority_keyed(
+        &mut self,
+        authority: &Authority,
+        now: i64,
+        idempotency_key: &str,
+    ) -> Result<IdempotencyOutcome<RepositoryNormalizeOutcome>> {
+        let payload = serde_json::json!({"normalize": true});
+        self.with_keyed_operation(
+            Operation::NormalizeRepositories,
+            "repositories:all",
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                let actor = authority.actor_label();
+                normalize_repository_strings_in_transaction(transaction, &actor, now, authority)
+            },
+        )
     }
 
     fn normalize_repository_strings_impl(
@@ -1134,3 +1193,256 @@ const RATIFIED_REPOSITORY_TIERS: &[(&str, RepositoryTier)] = &[
     ("gradient-quarantine-20260516", RepositoryTier::Archived),
     ("atlas", RepositoryTier::Archived),
 ];
+
+fn repository_summary_on_connection(
+    connection: &Connection,
+    name: &str,
+) -> Result<Option<RepositorySummary>> {
+    let status_counts = repository_status_counts(connection, name)?;
+    let Some(record) = connection
+        .query_row(
+            "SELECT name, visibility, tier, import_provenance, created_at, updated_at
+             FROM repositories WHERE name = ?1",
+            [name],
+            RepositoryRecord::from_row,
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let aliases = repository_aliases(connection, &record.name)?;
+    let card_count = status_counts.values().sum();
+    Ok(Some(RepositorySummary {
+        repo: record.name.clone(),
+        name: record.name,
+        aliases,
+        visibility: record.visibility,
+        tier: record.tier,
+        import_provenance: record.import_provenance,
+        card_count,
+        status_counts,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }))
+}
+
+fn upsert_repository_in_transaction(
+    transaction: &Transaction<'_>,
+    upsert: RepositoryUpsert,
+    now: i64,
+    authority: &Authority,
+) -> Result<String> {
+    authority.require_admin()?;
+    let raw_name = normalize_repository_token(&upsert.name)?;
+    let name = canonical_repo_label(&raw_name)
+        .ok_or_else(|| DomainError::validation("repository.name", "value cannot be empty"))?;
+    let visibility = upsert.visibility.unwrap_or(RepositoryVisibility::Visible);
+    let tier = upsert.tier.unwrap_or(RepositoryTier::Backburner);
+    let replace_tier = upsert.tier.is_some();
+    let aliases = upsert
+        .aliases
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|alias| normalize_repository_token(&alias))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let import_provenance = upsert
+        .import_provenance
+        .as_deref()
+        .map(|value| non_empty_scrubbed("import_provenance", value))
+        .transpose()?;
+    upsert_repository_row(
+        transaction,
+        RepositoryRowUpsert {
+            name: &name,
+            visibility,
+            tier,
+            import_provenance: import_provenance.as_deref(),
+            now,
+            replace_visibility: true,
+            replace_tier,
+        },
+    )?;
+    let mut alias_set = BTreeSet::new();
+    if raw_name != name {
+        alias_set.insert(raw_name);
+    }
+    if let Some(values) = aliases {
+        for alias in values {
+            if alias != name {
+                alias_set.insert(alias);
+            }
+        }
+        replace_repository_aliases(transaction, &name, alias_set.into_iter().collect(), now)?;
+    } else {
+        for alias in alias_set {
+            insert_repository_alias(transaction, &name, &alias, now, false)?;
+        }
+    }
+    Ok(name)
+}
+
+fn delete_repository_in_transaction(
+    transaction: &Transaction<'_>,
+    name: &str,
+    authority: &Authority,
+) -> Result<()> {
+    authority.require_admin()?;
+    let Some(repository_name) = resolve_repository_name(transaction, name)? else {
+        return Err(DomainError::not_found("repository", name).into());
+    };
+    let card_count = resolved_repository_card_count(transaction, &repository_name)?;
+    if card_count > 0 {
+        return Err(DomainError::conflict(format!(
+            "repository {repository_name} still has {card_count} cards"
+        ))
+        .into());
+    }
+    let deleted = transaction.execute(
+        "DELETE FROM repositories WHERE name = ?1",
+        [repository_name.as_str()],
+    )?;
+    if deleted == 0 {
+        return Err(DomainError::not_found("repository", repository_name).into());
+    }
+    Ok(())
+}
+
+fn merge_repository_alias_in_transaction(
+    transaction: &Transaction<'_>,
+    alias: &str,
+    target: &str,
+    actor: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<(String, String, usize)> {
+    authority.require_admin()?;
+    let actor = non_empty("actor", actor)?;
+    let alias = normalize_repository_token(alias)?;
+    let target = normalize_repository_token(target)?;
+    let target_name = canonical_repo_label(&target)
+        .ok_or_else(|| DomainError::validation("repository.target", "value cannot be empty"))?;
+    let alias_canonical = canonical_repo_label(&alias)
+        .ok_or_else(|| DomainError::validation("repository.alias", "value cannot be empty"))?;
+    upsert_repository_row(
+        transaction,
+        RepositoryRowUpsert {
+            name: &target_name,
+            visibility: RepositoryVisibility::Visible,
+            tier: RepositoryTier::Backburner,
+            import_provenance: Some("manual alias merge"),
+            now,
+            replace_visibility: false,
+            replace_tier: false,
+        },
+    )?;
+    let source_name =
+        resolve_repository_name(transaction, &alias)?.unwrap_or(alias_canonical.clone());
+    if source_name != target_name {
+        move_repository_aliases(transaction, &source_name, &target_name, now)?;
+    }
+    insert_repository_alias(transaction, &target_name, &alias, now, true)?;
+    if source_name != target_name {
+        insert_repository_alias(transaction, &target_name, &source_name, now, true)?;
+    }
+    let card_rows = {
+        let mut statement =
+            transaction.prepare("SELECT id, repo FROM cards WHERE repo IS NOT NULL")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut rehomed_cards = 0usize;
+    for (card_id, raw_repo) in card_rows {
+        let row_canonical = canonical_repo_label(&raw_repo);
+        let matches_alias = raw_repo == alias
+            || raw_repo == source_name
+            || row_canonical.as_deref() == Some(alias_canonical.as_str());
+        if matches_alias && raw_repo != target_name {
+            transaction.execute(
+                "UPDATE cards SET repo = ?2, updated_at = ?3 WHERE id = ?1",
+                params![card_id, target_name, now],
+            )?;
+            append_repository_card_event(
+                transaction,
+                &card_id,
+                &actor,
+                &format!("{raw_repo} -> {target_name}; alias {alias} merged"),
+                now,
+            )?;
+            rehomed_cards += 1;
+        }
+    }
+    if source_name != target_name {
+        let remaining_cards: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM cards WHERE repo = ?1",
+            [source_name.as_str()],
+            |row| row.get(0),
+        )?;
+        if remaining_cards == 0 {
+            transaction.execute(
+                "DELETE FROM repositories WHERE name = ?1",
+                [source_name.as_str()],
+            )?;
+        }
+    }
+    transaction.execute(
+        "UPDATE repositories SET updated_at = ?2 WHERE name = ?1",
+        params![target_name, now],
+    )?;
+    Ok((target_name, alias, rehomed_cards))
+}
+
+fn normalize_repository_strings_in_transaction(
+    transaction: &Transaction<'_>,
+    actor: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<RepositoryNormalizeOutcome> {
+    authority.require_admin()?;
+    let actor = non_empty("actor", actor)?;
+    let rows = {
+        let mut statement =
+            transaction.prepare("SELECT id, repo FROM cards WHERE repo IS NOT NULL")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let scanned = rows.len();
+    let mut changes = Vec::new();
+    for (card_id, raw_repo) in rows {
+        let canonical = resolve_repository_name(transaction, &raw_repo)?
+            .or_else(|| canonical_repo_label(&raw_repo));
+        let Some(canonical) = canonical else {
+            continue;
+        };
+        if canonical == raw_repo {
+            continue;
+        }
+        transaction.execute(
+            "UPDATE cards SET repo = ?2, updated_at = ?3 WHERE id = ?1",
+            params![card_id, canonical, now],
+        )?;
+        append_repository_card_event(
+            transaction,
+            &card_id,
+            &actor,
+            &format!("repository-normalize: {raw_repo} -> {canonical}"),
+            now,
+        )?;
+        changes.push(RepositoryNormalizeChange {
+            card_id,
+            previous_repo: raw_repo,
+            canonical_repo: canonical,
+        });
+    }
+    Ok(RepositoryNormalizeOutcome { scanned, changes })
+}
