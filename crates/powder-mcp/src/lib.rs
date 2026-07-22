@@ -2590,10 +2590,7 @@ mod tests {
         assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
         assert_eq!(payload["total_count"], 3);
         assert_eq!(payload["has_more"], true);
-        assert_eq!(
-            payload["hint"],
-            "2 more cards; filter by status/repo or raise limit"
-        );
+        assert_eq!(payload["hint"], "2 more cards; continue with next_after");
     }
 
     #[test]
