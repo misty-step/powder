@@ -907,7 +907,13 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
 /// Search cards and indexed comments/work logs. The JSON envelope is shared with
 /// the HTTP and MCP surfaces; --json is accepted explicitly for scripts.
 fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let positional_query = positional(args).into_iter().next();
+    let positionals = positional(args);
+    if positionals.len() > 1 {
+        return Err(ShellError::Invalid(
+            "search accepts one positional query; quote multi-word queries or use --q".to_string(),
+        ));
+    }
+    let positional_query = positionals.into_iter().next();
     let q = flag_value(args, "--q")
         .or(positional_query)
         .ok_or_else(|| ShellError::Invalid("search requires --q <text>".to_string()))?;
@@ -2466,6 +2472,13 @@ mod tests {
         let positional_payload: Value = serde_json::from_str(&positional_output).unwrap();
         assert_eq!(positional_payload["matches"][0]["card"]["id"], "cli-search");
         assert_eq!(positional_payload["total_count"], 1);
+
+        let unquoted =
+            run(&args(["search", "--json", "--db", &db, "needle", "second"])).unwrap_err();
+        assert!(matches!(
+            unquoted,
+            ShellError::Invalid(message) if message.contains("one positional query")
+        ));
         let _ = std::fs::remove_file(db);
     }
 

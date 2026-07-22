@@ -272,9 +272,9 @@ function renderSearchStatus() {
       ? "Searching…"
       : state.searchError
         ? "Search error: " + state.searchError
-        : state.searchHasMore
-          ? `first ${count} of ${totalCount} matches`
-          : count + " result" + (count === 1 ? "" : "s");
+        : totalCount !== count || state.searchHasMore
+          ? `${count} card${count === 1 ? "" : "s"} from ${totalCount} matching source${totalCount === 1 ? "" : "s"}`
+          : count + " card" + (count === 1 ? "" : "s");
   els.searchStatus.dataset.state = state.searchError ? "error" : state.searchLoading ? "loading" : "ready";
 }
 

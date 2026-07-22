@@ -4219,7 +4219,7 @@ fn encode_search_cursor(fingerprint: &str, offset: usize) -> String {
 }
 
 fn decode_search_cursor(raw: &str, expected_fingerprint: &str) -> Result<usize> {
-    if raw.is_empty() || !raw.len().is_multiple_of(2) {
+    if raw.is_empty() || !raw.is_ascii() || !raw.len().is_multiple_of(2) {
         return Err(StoreError::InvalidSearchCursor(raw.to_string()));
     }
     let bytes = (0..raw.len())

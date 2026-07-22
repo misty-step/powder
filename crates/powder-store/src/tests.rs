@@ -7009,5 +7009,12 @@ fn search_page_shapes_recall_filters_cursor_and_safe_snippets() -> Result<()> {
     assert!(
         matches!(mismatch, Err(StoreError::InvalidSearchCursor(message)) if message.contains("does not match"))
     );
+    let malformed = store.search_page(&SearchQuery {
+        q: "needle".to_string(),
+        after: Some("€a".to_string()),
+        limit: 1,
+        ..SearchQuery::default()
+    });
+    assert!(matches!(malformed, Err(StoreError::InvalidSearchCursor(_))));
     Ok(())
 }
