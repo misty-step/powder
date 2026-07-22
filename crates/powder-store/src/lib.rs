@@ -1684,6 +1684,28 @@ impl Store {
     /// row is copied through the same trigger-maintained search spine used by
     /// live writes, so retrying after a crash can only replace the same
     /// source-keyed documents and rebuild the derived index from source truth.
+    /// Adds structured principal/role provenance to new audit rows while
+    /// leaving legacy rows nullable for lossless readback.
+    fn migrate_23_to_24(&mut self) -> Result<()> {
+        let needs_activity_principal = !self.table_has_column("activities", "principal")?;
+        let needs_activity_role = !self.table_has_column("activities", "role")?;
+        let needs_event_role = !self.table_has_column("card_events", "role")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if needs_activity_principal {
+            transaction.execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
+        }
+        if needs_activity_role {
+            transaction.execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
+        }
+        if needs_event_role {
+            transaction.execute_batch("ALTER TABLE card_events ADD COLUMN role TEXT;")?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn migrate_22_to_23(&mut self) -> Result<()> {
         // A few unit fixtures intentionally carry only the table needed by an
         // earlier migration. They are not searchable databases, so leave them
@@ -2131,7 +2153,18 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
+        let authority = Authority::actor(actor.to_owned(), false);
+        self.file_papercut_with_authority(report, &authority, now)
+    }
+
+    pub fn file_papercut_with_authority(
+        &mut self,
+        report: &powder_core::papercut::PapercutReport,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<Card> {
+        let actor = authority.actor_label();
+        let _actor = non_empty("actor", &actor)?;
         let resolved_repo = report
             .service
             .as_deref()
@@ -2149,7 +2182,7 @@ impl Store {
             now,
             id,
         )?;
-        self.create_card_with_events(card, &actor, now)
+        self.create_card_with_authority(card, authority, now)
     }
 
     pub fn patch_card(
@@ -2170,8 +2203,8 @@ impl Store {
         authority: &Authority,
         now: i64,
     ) -> Result<Card> {
-        let actor_name = authority.actor_label();
-        let actor = non_empty("actor", &actor_name)?;
+        let _actor_name = authority.actor_label();
+        let _actor = non_empty("actor", &_actor_name)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2478,7 +2511,7 @@ impl Store {
             .map(|repositories| {
                 repositories
                     .iter()
-                    .map(|repository| resolve_repository_name(&self.connection, repository))
+                    .map(|repository| resolve_repository_name(&self.connection, repository.as_str()))
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
@@ -3038,12 +3071,13 @@ impl Store {
             updated_at: now,
         };
         persist_run(&transaction, &run)?;
-        append_activity(
+        append_activity_with_authority(
             &transaction,
             &run_id,
             ActivityType::Action,
             &format!("claimed {card_id}"),
             now,
+            authority,
         )?;
         append_authority_card_event(
             &transaction,
@@ -3085,12 +3119,13 @@ impl Store {
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
             close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
-            append_activity(
+            append_activity_with_authority(
                 &transaction,
                 &claim.run_id,
                 ActivityType::Action,
                 &format!("status set {card_id} to {}", status.as_str()),
                 now,
+            authority,
             )?;
         }
         append_authority_card_event(
@@ -3231,7 +3266,6 @@ impl Store {
         card.parent = parent.clone();
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        let actor = authority.actor_label();
         let label = |value: &Option<CardId>| {
             value
                 .as_ref()
@@ -3293,12 +3327,13 @@ impl Store {
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
-        append_activity(
+        append_activity_with_authority(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("released {card_id}"),
             now,
+            authority,
         )?;
         events::append_outbound_card_event(
             &transaction,
@@ -3336,12 +3371,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_with_authority(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("renewed {card_id} until {}", claim.expires_at),
             now,
+            authority,
         )?;
         transaction.commit()?;
         Ok(claim_receipt(card_id, &claim))
@@ -3370,12 +3406,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_with_authority(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("heartbeat {card_id}"),
             now,
+            authority,
         )?;
         transaction.commit()?;
         Ok(claim_receipt(card_id, &claim))
@@ -3414,12 +3451,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_with_authority(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("transferred {card_id} from {from_agent} to {to_agent}"),
             now,
+            authority,
         )?;
         transaction.commit()?;
         Ok(claim_receipt(card_id, &claim))
@@ -3838,12 +3876,13 @@ impl Store {
 
         persist_card(&transaction, &card)?;
         persist_run(&transaction, &run)?;
-        append_activity(
+        append_activity_with_authority(
             &transaction,
             run_id,
             ActivityType::Elicitation,
             &question,
             now,
+            authority,
         )?;
         append_authority_card_event(
             &transaction,
@@ -3908,7 +3947,7 @@ impl Store {
                 now,
                 proof.as_deref(),
             )?;
-            append_activity(
+            append_activity_with_authority(
                 &transaction,
                 &run_id,
                 ActivityType::Response,
@@ -3918,6 +3957,7 @@ impl Store {
                     .unwrap_or_else(|| "completed without proof".to_string())
                     .as_str(),
                 now,
+            authority,
             )?;
         }
         append_authority_card_event(
@@ -4238,12 +4278,13 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     Ok(())
 }
 
-fn append_activity(
+fn append_activity_with_authority(
     connection: &Connection,
     run_id: &RunId,
     activity_type: ActivityType,
     payload: &str,
     now: i64,
+    authority: &Authority,
 ) -> Result<Activity> {
     let activity = Activity {
         id: ActivityId::new(format!(
@@ -4253,16 +4294,20 @@ fn append_activity(
         run_id: run_id.clone(),
         activity_type,
         payload: payload.to_owned(),
+        principal: authority.principal_name().map(str::to_string),
+        role: Some(authority.role().to_string()),
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO activities (id, run_id, activity_type, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO activities (id, run_id, activity_type, payload, principal, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             activity.id.as_str(),
             activity.run_id.as_str(),
             activity.activity_type.as_str(),
             activity.payload,
+            activity.principal.as_deref(),
+            activity.role.as_deref(),
             activity.created_at
         ],
     )?;
@@ -4284,6 +4329,7 @@ fn append_card_event(
         actor: non_empty("actor", actor)?,
         payload: payload.to_owned(),
         principal: None,
+        role: Some("legacy".to_string()),
         subject_kind: None,
         subject_id: None,
         created_at: now,
@@ -4320,15 +4366,16 @@ fn append_attributed_card_event(
             audit.payload
         ),
         principal: audit.authority.principal_name().map(str::to_string),
+        role: Some(audit.authority.role().to_string()),
         subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
         subject_id: Some(non_empty("subject_id", audit.subject_id)?),
         created_at: now,
     };
     connection.execute(
         "INSERT INTO card_events (
-           id, card_id, event_type, actor, payload, principal,
+           id, card_id, event_type, actor, payload, principal, role,
            subject_kind, subject_id, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
@@ -4336,6 +4383,7 @@ fn append_attributed_card_event(
             event.actor.as_str(),
             event.payload.as_str(),
             event.principal.as_deref(),
+            event.role.as_deref(),
             event.subject_kind.as_deref(),
             event.subject_id.as_deref(),
             event.created_at,

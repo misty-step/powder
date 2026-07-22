@@ -1178,6 +1178,12 @@ pub struct Activity {
     pub run_id: RunId,
     pub activity_type: ActivityType,
     pub payload: String,
+    /// Authenticated mutation principal; legacy rows deserialize as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// Stable resolved role for the authenticated principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub created_at: i64,
 }
 
@@ -1190,6 +1196,9 @@ pub struct CardEvent {
     pub payload: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// Stable resolved role for the authenticated principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

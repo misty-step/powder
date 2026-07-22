@@ -515,8 +515,9 @@ fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
         out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
     } else {
         let mut store = open_store(required_flag(args, "--db")?)?;
+        let authority = required_authority(args)?;
         let outcome = store
-            .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
+            .import_cards_with_events(cards.clone(), &authority.actor_label(), now)
             .map_err(store_err)?;
         out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
     }
@@ -680,8 +681,9 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         card.blocked_by = blocked_by;
         card.parent = parent;
         card.repo = repo;
+        let authority = required_authority(args)?;
         json!(store
-            .create_card_with_events(card, &authority(args).actor_label(), now)
+            .create_card_with_authority(card, &authority, now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({
@@ -754,8 +756,9 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
+        let authority = required_authority(args)?;
         json!(store
-            .patch_card(&card_id, patch, &authority(args).actor_label(), now)
+            .patch_card_with_authority(&card_id, patch, &authority, now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({});
@@ -812,7 +815,7 @@ fn update_relations(args: &[String]) -> Result<String, ShellError> {
             card_ids_flag(args, "--blocks")?,
             card_ids_flag(args, "--blocked-by")?,
             now,
-            &authority(args),
+            &required_authority(args)?,
         )
         .map_err(store_err)?;
     Ok(format!("relations\t{}\n", card.id))
@@ -855,7 +858,7 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
     };
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
-        .set_parent(&card_id, parent, now, &authority(args))
+        .set_parent(&card_id, parent, now, &required_authority(args)?)
         .map_err(store_err)?;
     Ok(format!(
         "parent\t{}\t{}\n",
@@ -1216,8 +1219,9 @@ fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
 
     let ack = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
+        let authority = required_authority(args)?;
         json!(store
-            .file_papercut(&report, agent, now)
+            .file_papercut_with_authority(&report, &authority, now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1350,7 +1354,7 @@ fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> 
     let claim = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .claim_card(&card_id, agent, now, ttl_seconds, &authority(args))
+            .claim_card(&card_id, agent, now, ttl_seconds, &required_authority(args)?)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1377,7 +1381,7 @@ fn release_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (released_card_id, released_run_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .release_claim(&card_id, &run_id, now, &authority(args))
+            .release_claim(&card_id, &run_id, now, &required_authority(args)?)
             .map_err(store_err)?;
         (claim.card_id.to_string(), claim.run_id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1405,7 +1409,7 @@ fn renew_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let (renewed_card_id, renewed_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .renew_claim(&card_id, &run_id, now, ttl_seconds, &authority(args))
+            .renew_claim(&card_id, &run_id, now, ttl_seconds, &required_authority(args)?)
             .map_err(store_err)?;
         (
             claim.card_id.to_string(),
@@ -1449,7 +1453,7 @@ fn transfer_claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
                 to_agent,
                 now,
                 ttl_seconds,
-                &authority(args),
+                &required_authority(args)?,
             )
             .map_err(store_err)?;
         (
@@ -1486,7 +1490,7 @@ fn heartbeat(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErr
     let (beat_card_id, beat_run_id, expires_at) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let claim = store
-            .heartbeat_claim(&card_id, &run_id, now, &authority(args))
+            .heartbeat_claim(&card_id, &run_id, now, &required_authority(args)?)
             .map_err(store_err)?;
         (
             claim.card_id.to_string(),
@@ -1582,7 +1586,7 @@ fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shell
     let run = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .answer_input(&run_id, actor, answer, now, &authority(args))
+            .answer_input(&run_id, actor, answer, now, &required_authority(args)?)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1615,7 +1619,7 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .update_status(&card_id, status, now, &authority(args))
+            .update_status(&card_id, status, now, &required_authority(args)?)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1643,8 +1647,9 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let checked = !has_flag(args, "--unchecked");
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
+        let authority = required_authority(args)?;
         json!(store
-            .check_criterion(&card_id, criterion, actor, checked, now)
+            .check_criterion_as(&card_id, criterion, actor, checked, now, &authority)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1672,8 +1677,9 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     let url = required_flag(args, "--url")?;
     let (link_card_id, link_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
+        let authority = required_authority(args)?;
         let link = store
-            .add_link(&card_id, label, url, now)
+            .add_link_as(&card_id, label, url, now, &authority)
             .map_err(store_err)?;
         (link.card_id.to_string(), link.id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1698,8 +1704,9 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let body = required_flag(args, "--body")?;
     let comment = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
+        let authority = required_authority(args)?;
         json!(store
-            .add_comment(&card_id, author, body, now)
+            .add_comment_as(&card_id, author, body, now, &authority)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1737,8 +1744,9 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
+        let authority = required_authority(args)?;
         json!(store
-            .append_work_log(&card_id, agent, attribution, body, now)
+            .append_work_log_as(&card_id, agent, attribution, body, now, &authority)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1776,7 +1784,7 @@ fn request_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let (awaiting_run_id, awaiting_card_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let run = store
-            .request_input(&run_id, question, now, &authority(args))
+            .request_input(&run_id, question, now, &required_authority(args)?)
             .map_err(store_err)?;
         (run.id.to_string(), run.card_id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1803,7 +1811,7 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .complete_card(&card_id, proof, criterion_proofs, now, &authority(args))
+            .complete_card(&card_id, proof, criterion_proofs, now, &required_authority(args)?)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut body = json!({});
@@ -2061,11 +2069,13 @@ fn criterion_flag(args: &[String]) -> Result<usize, ShellError> {
 /// Build the `Authority` a mutation is checked against from `--actor` (and
 /// `--admin`). Omitting `--actor` preserves prior CLI behavior exactly: a
 /// direct-DB-access operator is trusted and no ownership check runs.
-fn authority(args: &[String]) -> Authority {
-    match flag_value(args, "--actor") {
-        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
-        None => Authority::unchecked(),
+
+fn required_authority(args: &[String]) -> Result<Authority, ShellError> {
+    let actor = required_flag(args, "--actor")?;
+    if actor.trim().is_empty() {
+        return Err(ShellError::Invalid("--actor cannot be blank".to_string()));
     }
+    Ok(Authority::actor(actor, has_flag(args, "--admin")))
 }
 
 fn reject_principal_flag(args: &[String]) -> Result<(), ShellError> {
@@ -2228,6 +2238,29 @@ mod tests {
         net::TcpListener,
         sync::{Arc, Mutex},
     };
+
+    // Existing unit scenarios predate the local-auth contract and omit
+    // --actor from their command fixtures. Keep production run strict while
+    // making those fixtures explicit through one test-only adapter.
+    fn run(args: &[String]) -> Result<String, ShellError> {
+        const MUTATIONS: &[&str] = &[
+            "create-card", "update-card", "update-relations", "set-parent",
+            "claim", "release-claim", "renew-claim", "transfer-claim",
+            "heartbeat", "answer-input", "update-status", "check-criterion",
+            "add-link", "add-comment", "append-work-log", "request-input",
+            "complete-card", "papercut", "import-github-issues",
+            "repository-upsert", "repository-merge-alias", "repository-delete",
+            "repository-normalize", "relations-doctor", "subscription-create",
+            "subscription-disable", "dead-letter-replay",
+        ];
+        let mut owned = args.to_vec();
+        if args.first().is_some_and(|command| MUTATIONS.contains(&command.as_str()))
+            && !args.iter().any(|arg| arg == "--actor" || arg.starts_with("--actor="))
+        {
+            owned.extend(["--actor".to_string(), "test-operator".to_string()]);
+        }
+        super::run(&owned)
+    }
 
     #[test]
     fn cli_names_the_instance_workflow() {
@@ -4979,6 +5012,8 @@ mod tests {
                 "Local card",
                 "--acceptance",
                 "proof exists",
+                "--actor",
+                "test-operator",
             ]),
             &env,
         )
