@@ -2468,6 +2468,49 @@ fn relations_doctor_repairs_mirrors_when_parent_repair_is_refused() -> Result<()
 }
 
 #[test]
+fn relation_write_rejects_corrupt_peer_without_partial_update() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![ready_card("source", 10), ready_card("peer", 11)])?;
+    store.connection.execute(
+        "UPDATE cards SET blocks_json = 'not-json' WHERE id = 'peer'",
+        [],
+    )?;
+    let source = CardId::new("source")?;
+    let peer = CardId::new("peer")?;
+    let error = store
+        .update_relations(
+            &source,
+            Vec::new(),
+            Vec::new(),
+            vec![peer],
+            20,
+            &Authority::unchecked(),
+        )
+        .expect_err("corrupt peer must abort the atomic relation write");
+    assert!(matches!(
+        error,
+        StoreError::InvalidStoredValue {
+            field: "blocks_json",
+            ..
+        }
+    ));
+    let source_blocked_by: String = store.connection.query_row(
+        "SELECT blocked_by_json FROM cards WHERE id = 'source'",
+        [],
+        |row| row.get(0),
+    )?;
+    let peer_blocks: String = store.connection.query_row(
+        "SELECT blocks_json FROM cards WHERE id = 'peer'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(source_blocked_by, "[]");
+    assert_eq!(peer_blocks, "not-json");
+    Ok(())
+}
+
+#[test]
 fn relations_doctor_reports_corrupt_values_without_normalizing_them() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
