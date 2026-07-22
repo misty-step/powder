@@ -6930,6 +6930,104 @@ fn board_rollups_global_excludes_dangling_and_invalid_parent_rows() -> Result<()
 }
 
 #[test]
+fn board_rollups_reject_noncanonical_text_parents_in_both_scopes() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("canonical-dangling", 1),
+        ready_card("ascii-empty", 2),
+        ready_card("ascii-space", 3),
+        ready_card("unicode-space", 4),
+        ready_card("unicode-padded", 5),
+        ready_card("epic-root", 6),
+        ready_card("valid-child", 7),
+        ready_card("invalid-child", 8),
+        ready_card("join-root", 9),
+        ready_card("join-child", 10),
+    ])?;
+    for (id, parent) in [
+        ("canonical-dangling", "missing-parent"),
+        ("ascii-empty", ""),
+        ("ascii-space", " "),
+        ("unicode-space", "\u{00a0}"),
+        ("unicode-padded", "\u{2003}epic-root\u{2003}"),
+        ("valid-child", "epic-root"),
+        ("invalid-child", "\t\n"),
+        ("join-child", "join-root "),
+    ] {
+        store.connection.execute(
+            "UPDATE cards SET parent = ?1 WHERE id = ?2",
+            rusqlite::params![parent, id],
+        )?;
+    }
+    store.connection.execute(
+        "UPDATE cards SET id = 'join-root ' WHERE id = 'join-root'",
+        [],
+    )?;
+
+    let global = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: true,
+        ..Default::default()
+    })?;
+    assert_eq!(global.total_count, 1);
+    assert_eq!(global.rollups[0].kind, "epic");
+    assert_eq!(
+        global.rollups[0].card_id.as_ref().map(CardId::as_str),
+        Some("epic-root")
+    );
+    assert_eq!(global.rollups[0].status_counts.get("ready"), Some(&1));
+    assert_eq!(global.coverage.total_cards, 10);
+    assert_eq!(global.coverage.accounted_cards, 2);
+    assert_eq!(global.coverage.root_epics, 1);
+    assert_eq!(global.coverage.unsorted_cards, 0);
+    assert_eq!(global.coverage.parent_issue_count, 8);
+    assert!(!global.coverage.complete);
+
+    let scoped = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert_eq!(scoped.total_count, 2);
+    assert!(scoped
+        .rollups
+        .iter()
+        .any(|row| row.kind == "unsorted" && row.title == "General" && row.repo.is_none()));
+    assert!(scoped
+        .rollups
+        .iter()
+        .any(|row| row.kind == "epic"
+            && row.card_id.as_ref().map(CardId::as_str) == Some("epic-root")));
+    assert!(!scoped
+        .rollups
+        .iter()
+        .any(|row| row.card_id.as_ref().map(CardId::as_str) == Some("canonical-dangling")));
+    assert!(!scoped
+        .rollups
+        .iter()
+        .any(|row| row.card_id.as_ref().map(CardId::as_str) == Some("join-root")));
+    assert_eq!(scoped.coverage.total_cards, 10);
+    assert_eq!(scoped.coverage.accounted_cards, 3);
+    assert_eq!(scoped.coverage.root_epics, 1);
+    assert_eq!(scoped.coverage.unsorted_cards, 1);
+    assert_eq!(scoped.coverage.parent_issue_count, 7);
+    let scoped_status_sum: usize = scoped
+        .rollups
+        .iter()
+        .flat_map(|row| row.status_counts.values())
+        .sum();
+    assert_eq!(
+        scoped_status_sum + scoped.coverage.root_epics,
+        scoped.coverage.accounted_cards
+    );
+    assert!(!scoped.coverage.complete);
+    Ok(())
+}
+
+#[test]
 fn board_rollups_respect_hidden_repository_scope() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;

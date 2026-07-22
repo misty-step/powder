@@ -13,7 +13,12 @@ use powder_core::{
     Comment, CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId,
     Priority, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    functions::{Context, FunctionFlags},
+    params,
+    types::ValueRef,
+    Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -547,6 +552,23 @@ impl Store {
             connection,
             field_note_config: None,
         };
+        store.connection.create_scalar_function(
+            "powder_card_id_is_canonical",
+            1,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            |context: &Context<'_>| {
+                let raw = match context.get_raw(0) {
+                    ValueRef::Text(raw) => match std::str::from_utf8(raw) {
+                        Ok(raw) => raw,
+                        Err(_) => return Ok(false),
+                    },
+                    _ => return Ok(false),
+                };
+                Ok(CardId::new(raw)
+                    .map(|card_id| card_id.as_str() == raw)
+                    .unwrap_or(false))
+            },
+        )?;
         store.connection.pragma_update(None, "foreign_keys", "ON")?;
         store.connection.pragma_update(None, "busy_timeout", 5000)?;
         let _mode: String = store
@@ -2479,15 +2501,18 @@ impl Store {
             ), scoped_roots AS (
                 SELECT c.*
                 FROM visible_cards c
-                WHERE c.parent IS NULL
+                WHERE powder_card_id_is_canonical(c.id)
+                  AND (c.parent IS NULL
                    OR (
                        ?1 = 0
                        AND typeof(c.parent) = 'text'
+                       AND powder_card_id_is_canonical(c.parent)
                        AND NOT EXISTS (
                            SELECT 1 FROM visible_cards parent
                            WHERE parent.id = c.parent
                        )
                    )
+                  )
             )
             SELECT
                 'epic' AS kind,
@@ -2509,7 +2534,9 @@ impl Store {
                 MAX(c.updated_at) AS newest_update
             FROM scoped_roots p
             JOIN visible_cards c
-              ON typeof(c.parent) = 'text' AND c.parent = p.id
+              ON typeof(c.parent) = 'text'
+             AND powder_card_id_is_canonical(c.parent)
+             AND c.parent = p.id
             GROUP BY p.id, p.title, p.repo, c.status
             UNION ALL
             SELECT
@@ -2533,7 +2560,9 @@ impl Store {
             FROM scoped_roots c
             WHERE NOT EXISTS (
                   SELECT 1 FROM visible_cards child
-                  WHERE typeof(child.parent) = 'text' AND child.parent = c.id
+                  WHERE typeof(child.parent) = 'text'
+                    AND powder_card_id_is_canonical(child.parent)
+                    AND child.parent = c.id
               )
             GROUP BY c.repo, c.status
             "#,
