@@ -12,12 +12,28 @@ use serde_json::{json, Value};
 use super::{
     card_id, card_ids_array, claim_action, missing_required, optional_i64,
     optional_repository_tier, optional_repository_visibility, optional_str, parse_estimate,
-    parse_priority, parse_risk, parse_status, required_claim_arg, required_idempotency_key,
-    required_str, run_id, run_id_for_claim, string_array, to_string, ClaimAction,
+    parse_priority, parse_risk, parse_status, required_claim_arg, required_str, run_id,
+    run_id_for_claim, string_array, to_string, ClaimAction,
 };
 
+fn required_remote_idempotency_key(args: &Value) -> Result<&str, String> {
+    let key = args["idempotency_key"]
+        .as_str()
+        .ok_or_else(|| "missing idempotency_key: caller-generated key is required".to_string())?;
+    if key.trim().is_empty() {
+        return Err("idempotency_key must be non-empty".to_string());
+    }
+    if !key.is_ascii() {
+        return Err("idempotency_key must contain only ASCII characters".to_string());
+    }
+    Ok(key)
+}
+
 fn keyed_subkey(args: &Value, operation: &str) -> Result<String, String> {
-    Ok(format!("{}:{operation}", required_idempotency_key(args)?))
+    Ok(format!(
+        "{}:{operation}",
+        required_remote_idempotency_key(args)?
+    ))
 }
 
 fn normalize_relation_wire(args: &Value, key: &'static str) -> Result<Value, String> {
@@ -197,8 +213,11 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(value) = optional_str(args, "parent") {
                 body["parent"] = json!(value);
             }
-            let response =
-                client.post_with_key("/api/v1/cards", body, required_idempotency_key(args)?)?;
+            let response = client.post_with_key(
+                "/api/v1/cards",
+                body,
+                required_remote_idempotency_key(args)?,
+            )?;
             remote_card_ack_payload(&response)?
         }
         "report_papercut" => {
@@ -211,7 +230,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                     "model": optional_str(args, "model"),
                     "harness": optional_str(args, "harness"),
                 }),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?;
             response
         }
@@ -252,7 +271,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let response = client.patch_with_key(
                 &format!("/api/v1/cards/{id}"),
                 body,
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?;
             remote_card_ack_payload(&response)?
         }
@@ -276,7 +295,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.post_with_key(
                 "/api/v1/repositories",
                 body,
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?
         }
         "merge_repository_alias" => {
@@ -286,13 +305,17 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.post_with_key(
                 &format!("/api/v1/repositories/{}/merge-alias", urlencode(target)),
                 body,
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?
         }
         "delete_repository" => {
             let name = required_str(args, "name")?;
             let path = format!("/api/v1/repositories/{}", urlencode(name));
-            client.delete_with_body_with_key(&path, json!({}), required_idempotency_key(args)?)?
+            client.delete_with_body_with_key(
+                &path,
+                json!({}),
+                required_remote_idempotency_key(args)?,
+            )?
         }
         "manage_claim" => manage_claim_remote(client, args)?,
         "get_card" => {
@@ -334,7 +357,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.post_with_key(
                 &format!("/api/v1/runs/{run}/answer"),
                 json!({"actor": actor, "answer": answer}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?
         }
         "update_status" => {
@@ -344,7 +367,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let response = client.post_with_key(
                 &format!("/api/v1/cards/{id}/status"),
                 json!({"status": status}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?;
             remote_card_ack_payload(&response)?
         }
@@ -359,7 +382,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let response = client.post_with_key(
                 &format!("/api/v1/cards/{id}/criteria/check"),
                 json!({"criterion": criterion, "actor": actor, "checked": checked}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?;
             remote_criterion_ack_payload(&response, criterion, checked, actor)?
         }
@@ -406,7 +429,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.post_with_key(
                 &format!("/api/v1/cards/{id}/links"),
                 json!({"label": label, "url": url}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?
         }
         "add_comment" => {
@@ -417,7 +440,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.post_with_key(
                 &format!("/api/v1/cards/{id}/comments"),
                 json!({"author": author, "body": body}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?
         }
         "append_work_log" => {
@@ -435,7 +458,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                     "harness": optional_str(args, "harness"),
                     "run_id": optional_str(args, "run_id"),
                 }),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?
         }
         "request_input" => {
@@ -444,7 +467,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.post_with_key(
                 &format!("/api/v1/runs/{run}/input"),
                 json!({"question": question}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?
         }
         "complete_card" => {
@@ -459,7 +482,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let response = client.post_with_key(
                 &format!("/api/v1/cards/{id}/complete"),
                 body,
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )?;
             remote_card_ack_payload(&response)?
         }
@@ -516,7 +539,7 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
             client.post_with_key(
                 &format!("/api/v1/cards/{id}/renew"),
                 json!({"run_id": run.as_str(), "ttl_seconds": ttl_seconds}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )
         }
         ClaimAction::Heartbeat => {
@@ -524,7 +547,7 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
             client.post_with_key(
                 &format!("/api/v1/cards/{id}/heartbeat"),
                 json!({"run_id": run.as_str()}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )
         }
         ClaimAction::Release => {
@@ -532,7 +555,7 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
             client.post_with_key(
                 &format!("/api/v1/cards/{id}/release"),
                 json!({"run_id": run.as_str()}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )
         }
         ClaimAction::Transfer => {
@@ -541,7 +564,7 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
             client.post_with_key(
                 &format!("/api/v1/cards/{id}/transfer"),
                 json!({"run_id": run.as_str(), "to_agent": to_agent, "ttl_seconds": ttl_seconds}),
-                required_idempotency_key(args)?,
+                required_remote_idempotency_key(args)?,
             )
         }
     }
@@ -1071,7 +1094,7 @@ mod tests {
         let result = call_tool_remote(
             &client,
             "add_comment",
-            &json!({"card_id": "001", "author": "operator", "body": "looks good"}),
+            &json!({"card_id": "001", "author": "operator", "body": "looks good", "idempotency_key": "remote-comment"}),
         )
         .unwrap();
 
@@ -1141,6 +1164,7 @@ mod tests {
                 "agent": "codex",
                 "body": "tracing the claim expiry bug",
                 "model": "claude-sonnet-5",
+                "idempotency_key": "remote-work-log",
             }),
         )
         .unwrap();
@@ -1509,13 +1533,13 @@ mod tests {
         call_tool_remote(
             &client,
             "create_card",
-            &json!({"id": "sized", "title": "Sized", "acceptance": ["proof"], "estimate": "L"}),
+            &json!({"id": "sized", "title": "Sized", "acceptance": ["proof"], "estimate": "L", "idempotency_key": "remote-create-sized"}),
         )
         .unwrap();
         call_tool_remote(
             &client,
             "update_card",
-            &json!({"card_id": "sized", "estimate": "XL"}),
+            &json!({"card_id": "sized", "estimate": "XL", "idempotency_key": "remote-update-sized"}),
         )
         .unwrap();
 
@@ -1725,7 +1749,7 @@ mod tests {
         let result = call_tool_remote(
             &client,
             "update_card",
-            &json!({"card_id": "proof-plan", "title": "Edited title", "status": "in_progress"}),
+            &json!({"card_id": "proof-plan", "title": "Edited title", "status": "in_progress", "idempotency_key": "remote-update-card"}),
         )
         .unwrap();
 
@@ -1789,7 +1813,8 @@ mod tests {
                 "proof_plan": ["PR plus smoke"],
                 "status": "ready",
                 "priority": "p0",
-                "repo": "misty-step/powder"
+                "repo": "misty-step/powder",
+                "idempotency_key": "remote-create-card"
             }),
         )
         .unwrap();
@@ -1801,7 +1826,7 @@ mod tests {
         let checked = call_tool_remote(
             &client,
             "check_criterion",
-            &json!({"card_id": "proof-plan", "criterion": 0, "actor": "operator"}),
+            &json!({"card_id": "proof-plan", "criterion": 0, "actor": "operator", "idempotency_key": "remote-check-criterion"}),
         )
         .unwrap();
         assert_eq!(
@@ -1821,7 +1846,8 @@ mod tests {
             "complete_card",
             &json!({
                 "card_id": "proof-plan",
-                "criterion_proofs": [{"criterion": 0, "url": "https://example.test/pr"}]
+                "criterion_proofs": [{"criterion": 0, "url": "https://example.test/pr"}],
+                "idempotency_key": "remote-complete-card"
             }),
         )
         .unwrap();
@@ -1898,7 +1924,7 @@ mod tests {
         let status = call_tool_remote(
             &client,
             "update_status",
-            &json!({"card_id": "006", "status": "in_progress"}),
+            &json!({"card_id": "006", "status": "in_progress", "idempotency_key": "remote-update-status"}),
         )
         .unwrap();
         assert_eq!(
@@ -1909,7 +1935,7 @@ mod tests {
         let relations = call_tool_remote(
             &client,
             "update_relations",
-            &json!({"card_id": "006", "related": ["peer"], "blocks": ["child"]}),
+            &json!({"card_id": "006", "related": ["peer"], "blocks": ["child"], "idempotency_key": "remote-update-relations"}),
         )
         .unwrap();
         assert_eq!(
@@ -1969,17 +1995,23 @@ mod tests {
                 "aliases": ["misty-step/canary"],
                 "visibility": "visible",
                 "tier": "active",
-                "import_provenance": "manual"
+                "import_provenance": "manual",
+                "idempotency_key": "remote-upsert-repository"
             }),
         )
         .unwrap();
         call_tool_remote(
             &client,
             "merge_repository_alias",
-            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator"}),
+            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator", "idempotency_key": "remote-merge-repository"}),
         )
         .unwrap();
-        call_tool_remote(&client, "delete_repository", &json!({"name": "unused"})).unwrap();
+        call_tool_remote(
+            &client,
+            "delete_repository",
+            &json!({"name": "unused", "idempotency_key": "remote-delete-repository"}),
+        )
+        .unwrap();
 
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "GET");
@@ -1998,10 +2030,7 @@ mod tests {
         );
         assert_eq!(requests[2].method, "POST");
         assert_eq!(requests[2].path, "/api/v1/repositories/canary/merge-alias");
-        assert_eq!(
-            requests[2].body,
-            Some(json!({"alias": "legacy-canary", "actor": "operator"}))
-        );
+        assert_eq!(requests[2].body, Some(json!({"alias": "legacy-canary"})));
         assert_eq!(requests[3].method, "DELETE");
         assert_eq!(requests[3].path, "/api/v1/repositories/unused");
         assert!(requests
@@ -2389,7 +2418,7 @@ mod tests {
         let err = call_tool_remote(
             &client,
             "manage_claim",
-            &json!({"card_id": "001", "action": "release", "run_id": "run-001"}),
+            &json!({"card_id": "001", "action": "release", "run_id": "run-001", "idempotency_key": "remote-release-missing"}),
         )
         .unwrap_err();
 
@@ -2410,6 +2439,9 @@ mod tests {
         ("create_card", &["actor"]),
         ("update_card", &["actor"]),
         ("manage_claim", &["actor", "admin"]),
+        ("upsert_repository", &["actor"]),
+        ("merge_repository_alias", &["actor"]),
+        ("delete_repository", &["actor"]),
         ("update_status", &["actor", "admin"]),
         ("update_relations", &["actor", "admin"]),
         ("request_input", &["actor", "admin"]),

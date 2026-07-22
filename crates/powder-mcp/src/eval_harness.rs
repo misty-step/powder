@@ -206,20 +206,22 @@ fn run_work_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioMe
                 "model": "eval",
                 "harness": "powder-mcp-eval",
                 "run_id": run_id,
-                "body": "Implemented deterministic proof path for eval fixture."
+                "body": "Implemented deterministic proof path for eval fixture.",
+                "idempotency_key": "eval-work-log"
             }),
         )?;
         mcp.call_tool(
             recorder,
             "check_criterion",
-            json!({"card_id": "work-loop", "criterion": 0, "actor": AGENT}),
+            json!({"card_id": "work-loop", "criterion": 0, "actor": AGENT, "idempotency_key": "eval-check-criterion"}),
         )?;
         let completed = mcp.call_tool(
             recorder,
             "complete_card",
             json!({
                 "card_id": "work-loop",
-                "proof": "https://example.test/powder-mcp-eval/work-loop"
+                "proof": "https://example.test/powder-mcp-eval/work-loop",
+                "idempotency_key": "eval-complete-card"
             }),
         )?;
         expect_eq(
@@ -245,7 +247,8 @@ fn run_input_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioM
             "request_input",
             json!({
                 "run_id": run_id,
-                "question": "Should the eval fixture continue?"
+                "question": "Should the eval fixture continue?",
+                "idempotency_key": "eval-request-input"
             }),
         )?;
         let awaiting = mcp.call_tool(recorder, "list_awaiting_input", json!({"limit": 10}))?;
@@ -266,7 +269,8 @@ fn run_input_loop(command: &McpCommand, temp: &mut TempFixtureRoot) -> ScenarioM
             json!({
                 "run_id": run_id,
                 "actor": "operator",
-                "answer": "Approved for eval baseline."
+                "answer": "Approved for eval baseline.",
+                "idempotency_key": "eval-answer-input"
             }),
         )?;
         let run = mcp.call_tool(
@@ -325,7 +329,8 @@ fn run_error_recovery(command: &McpCommand, temp: &mut TempFixtureRoot) -> Scena
             json!({
                 "card_id": "error-recovery",
                 "status": "awaiting_input",
-                "actor": AGENT
+                "actor": AGENT,
+                "idempotency_key": "eval-update-status"
             }),
         )?;
         expect_eq(
@@ -695,6 +700,8 @@ impl McpProcess {
             .env_remove("POWDER_API_BASE_URL")
             .env_remove("POWDER_API_KEY")
             .env_remove("POWDER_MCP_TOOLSETS")
+            .env("POWDER_MCP_PRINCIPAL", FIXTURE_ACTOR)
+            .env("POWDER_MCP_ROLE", "admin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
