@@ -6,7 +6,7 @@ use powder_core::{
     parse_estimate as parse_card_estimate, parse_priority as parse_card_priority,
     parse_risk as parse_card_risk, parse_status as parse_card_status, Authority, Card, CardDetail,
     CardField, CardId, CardStatus, CardSummary, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyQuery, Risk, RunId,
+    ReadyCursor, ReadyQuery, Risk, RunId,
 };
 use powder_store::{
     BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
@@ -45,7 +45,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
         description: "Scan claimable card summaries, dependency-ordered so no card appears after another card in the response it transitively blocks (ties broken by priority, age, identifier). Only true members of a blocks/blocked_by cycle lose topological ordering -- emitted as a group in tie-break order and named in cycle_card_ids (computed before limit truncation); cards downstream of a cycle stay dependency-ordered after it. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"estimate":{"type":"string","enum":["S","M","L","XL"]}}}"#,
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"repo":{"type":"string","description":"comma-separated repository allowlist"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"after":{"type":"string","description":"continuation cursor from next_after"}}}"#,
     },
     ToolDef {
         name: "list_cards",
@@ -403,13 +403,21 @@ pub fn call_tool_store(
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-            let estimate = optional_str(args, "estimate")
-                .map(parse_estimate)
-                .transpose()?;
-            let page = store
-                .list_ready_page(ReadyQuery::new(now, limit).with_estimate(estimate))
+            let repo = parse_repository_filter(args)?;
+            let estimate = optional_str(args, "estimate").map(parse_estimate).transpose()?;
+            let risk = optional_str(args, "risk").map(parse_risk).transpose()?;
+            let priority = optional_str(args, "priority").map(parse_priority).transpose()?;
+            let query = ReadyQuery::new(now, limit)
+                .with_repositories(repo.unwrap_or_default())
+                .with_estimate(estimate)
+                .with_risk(risk)
+                .with_priority(priority);
+            let after = optional_str(args, "after")
+                .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+                .transpose()
                 .map_err(to_string)?;
-            card_summary_page_payload(&page.cards, page.total_count, &page.cycle_card_ids)
+            let page = store.list_ready_page_after(query, after.as_ref()).map_err(to_string)?;
+            card_summary_page_payload(&page.cards, page.total_count, &page.cycle_card_ids, page.next_after.as_ref(), page.ready_cursor.as_deref())
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -846,6 +854,8 @@ fn card_summary_page_payload(
     cards: &[Card],
     total_count: usize,
     cycle_card_ids: &[CardId],
+    next_after: Option<&CardId>,
+    ready_cursor: Option<&str>,
 ) -> Value {
     let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
     let has_more = total_count > summaries.len();
@@ -866,6 +876,9 @@ fn card_summary_page_payload(
     // unchanged.
     if !cycle_card_ids.is_empty() {
         payload["cycle_card_ids"] = json!(cycle_card_ids);
+    }
+    if let Some(next_after) = next_after {
+        payload["next_after"] = json!(ready_cursor.unwrap_or_else(|| next_after.as_str()));
     }
     payload
 }
@@ -1212,6 +1225,15 @@ fn criterion_arg(args: &Value) -> Result<usize, String> {
         .as_u64()
         .map(|value| value as usize)
         .ok_or_else(|| missing_required("criterion"))
+}
+
+fn parse_repository_filter(args: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = optional_str(args, "repo") else { return Ok(None); };
+    if raw.trim().is_empty() { return Err("repo must contain at least one repository".to_string()); }
+    let values = raw.split(',').map(str::trim).map(|value| {
+        if value.is_empty() { Err("repo must not contain a blank repository".to_string()) } else { Ok(value.to_string()) }
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(values))
 }
 
 fn parse_status(raw: &str) -> Result<CardStatus, String> {

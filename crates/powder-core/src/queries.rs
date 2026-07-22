@@ -97,6 +97,7 @@ impl ReadyCursor {
         let snapshot = if snapshot_raw.is_empty() { Vec::new() } else { snapshot_raw.split(',').map(|raw| { let bytes = hex_decode(raw).ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?; let value = String::from_utf8(bytes).map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?; CardId::new(value).map_err(|_| DomainError::validation("after", "invalid continuation cursor")) }).collect::<Result<Vec<_>, _>>()? };
         Ok(Self { fingerprint: fingerprint.to_owned(), anchor, snapshot })
     }
+}
 
 impl ReadyQuery {
     pub fn fingerprint(&self) -> String {
@@ -196,12 +197,12 @@ mod tests {
     #[test]
     fn ready_cursor_is_opaque_and_binds_query_filters() {
         let query = ReadyQuery::new(100, 2)
-            .with_repositories([String::new("repo-a").unwrap()])
+            .with_repositories(["repo-a".to_string()])
             .with_priority(Some(Priority::P1));
         let anchor = CardId::new("ready-2").unwrap();
-        let cursor = ReadyCursor::for_query(&query, anchor.clone());
+        let cursor = ReadyCursor::for_query(&query, anchor.clone(), Vec::new());
         let encoded = cursor.encode();
-        assert!(encoded.starts_with("v1."));
+        assert!(encoded.starts_with("v2."));
         assert!(!encoded.contains(anchor.as_str()));
         assert_eq!(
             ReadyCursor::decode_for_query(&encoded, &query)

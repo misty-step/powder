@@ -2001,7 +2001,10 @@ fn migration_15_to_16_drops_autonomy_from_existing_databases() -> Result<()> {
         .list_ready(ReadyQuery {
             now: 20,
             limit: 10,
+            repo: None,
             estimate: None,
+            risk: None,
+            priority: None,
         })?
         .into_iter()
         .map(|card| card.id.to_string())

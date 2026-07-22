@@ -869,18 +869,28 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
 fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
     let now = unix_now();
-    let estimate = flag_value(args, "--estimate")
-        .map(parse_estimate_flag)
-        .transpose()?;
-    let query = ReadyQuery::new(now, limit).with_estimate(estimate);
+    let repo = flag_value(args, "--repo").map(|raw| {
+        raw.split(',').map(str::trim).map(|value| {
+            if value.is_empty() { Err(ShellError::Invalid("--repo must not contain a blank repository".to_string())) } else { Ok(value.to_string()) }
+        }).collect::<Result<Vec<_>, _>>()
+    }).transpose()?.unwrap_or_default();
+    let estimate = flag_value(args, "--estimate").map(parse_estimate_flag).transpose()?;
+    let risk = flag_value(args, "--risk").map(parse_risk_flag).transpose()?;
+    let priority = flag_value(args, "--priority").map(parse_priority_flag).transpose()?;
+    let query = ReadyQuery::new(now, limit)
+        .with_repositories(repo.clone())
+        .with_estimate(estimate)
+        .with_risk(risk)
+        .with_priority(priority);
     let ready = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         json!(store.list_ready(query).map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut url = format!("/api/v1/cards/ready?limit={limit}");
-        if let Some(estimate) = estimate {
-            url.push_str(&format!("&estimate={}", estimate.as_str()));
-        }
+        if !repo.is_empty() { url.push_str(&format!("&repo={}", urlencode(&repo.join(",")))); }
+        if let Some(estimate) = estimate { url.push_str(&format!("&estimate={}", estimate.as_str())); }
+        if let Some(risk) = risk { url.push_str(&format!("&risk={}", risk.as_str())); }
+        if let Some(priority) = priority { url.push_str(&format!("&priority={}", priority.as_str())); }
         let page = client.get(&url).map_err(remote_err)?;
         list_page_cards(page)?
     } else {
@@ -888,19 +898,11 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
             "list-ready requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments".to_string(),
         ));
     };
-
     let mut out = String::new();
     for card in json_array(&ready)? {
-        out.push_str(&format!(
-            "{}\t{}\t{}\n",
-            json_string(card, "id")?,
-            json_priority(card)?,
-            json_string(card, "title")?
-        ));
+        out.push_str(&format!("{}\t{}\t{}\n", json_string(card, "id")?, json_priority(card)?, json_string(card, "title")?));
     }
-    if out.is_empty() {
-        out.push_str("no-ready-cards\n");
-    }
+    if out.is_empty() { out.push_str("no-ready-cards\n"); }
     Ok(out)
 }
 
