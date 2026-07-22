@@ -13,7 +13,7 @@ bcrypt = "0.17.1"
 nanoid = "0.4"
 powder-core = { path = "../powder-core" }
 regex = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

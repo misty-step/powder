@@ -6848,10 +6848,12 @@ fn board_rollups_report_dirty_parent_edges_without_leaking_issues() -> Result<()
         include_hidden: false,
         ..Default::default()
     })?;
-    assert!(!page.coverage.complete);
-    assert_eq!(page.coverage.parent_issue_count, 1);
+    assert!(page.coverage.complete);
+    assert_eq!(page.coverage.parent_issue_count, 0);
     assert_eq!(page.coverage.total_cards, 2);
-    assert_eq!(page.coverage.accounted_cards, 1);
+    assert_eq!(page.coverage.accounted_cards, 2);
+    let global = store.parent_graph_report()?;
+    assert_eq!(global.issues.len(), 1);
     let encoded = serde_json::to_value(page)?;
     assert!(encoded["coverage"]["issues"].is_null());
     assert!(encoded["coverage"]["assignments"].is_null());
@@ -6860,6 +6862,178 @@ fn board_rollups_report_dirty_parent_edges_without_leaking_issues() -> Result<()
         .unwrap()
         .iter()
         .any(|row| row["title"] == "General"));
+    Ok(())
+}
+
+#[test]
+fn board_rollups_global_excludes_dangling_and_invalid_parent_rows() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("admin-dangling", 1),
+        ready_card("admin-invalid", 2),
+    ])?;
+    store.connection.execute(
+        "UPDATE cards SET parent = 'missing-parent' WHERE id = 'admin-dangling'",
+        [],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET parent = X'01' WHERE id = 'admin-invalid'",
+        [],
+    )?;
+
+    let global = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: true,
+        ..Default::default()
+    })?;
+    assert_eq!(global.total_count, 0);
+    assert!(global.rollups.is_empty());
+    assert_eq!(global.coverage.total_cards, 2);
+    assert_eq!(global.coverage.accounted_cards, 0);
+    assert_eq!(global.coverage.parent_issue_count, 2);
+    let global_status_sum: usize = global
+        .rollups
+        .iter()
+        .flat_map(|row| row.status_counts.values())
+        .sum();
+    assert_eq!(
+        global_status_sum + global.coverage.root_epics,
+        global.coverage.accounted_cards,
+    );
+    assert!(!global.coverage.complete);
+
+    let scoped = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert_eq!(scoped.total_count, 1);
+    assert_eq!(scoped.coverage.total_cards, 2);
+    assert_eq!(scoped.coverage.accounted_cards, 1);
+    assert_eq!(scoped.coverage.parent_issue_count, 1);
+    let scoped_status_sum: usize = scoped
+        .rollups
+        .iter()
+        .flat_map(|row| row.status_counts.values())
+        .sum();
+    assert_eq!(
+        scoped_status_sum + scoped.coverage.root_epics,
+        scoped.coverage.accounted_cards,
+    );
+    assert!(!scoped.coverage.complete);
+    assert_eq!(scoped.rollups[0].title, "General");
+    assert_eq!(scoped.rollups[0].status_counts.get("ready"), Some(&1));
+    Ok(())
+}
+
+#[test]
+fn board_rollups_reject_noncanonical_text_parents_in_both_scopes() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.import_cards(vec![
+        ready_card("canonical-dangling", 1),
+        ready_card("ascii-empty", 2),
+        ready_card("ascii-space", 3),
+        ready_card("unicode-space", 4),
+        ready_card("unicode-padded", 5),
+        ready_card("epic-root", 6),
+        ready_card("valid-child", 7),
+        ready_card("invalid-child", 8),
+        ready_card("join-root", 9),
+        ready_card("join-child", 10),
+        ready_card("invalid-id-child", 11),
+    ])?;
+    for (id, parent) in [
+        ("canonical-dangling", "missing-parent"),
+        ("ascii-empty", ""),
+        ("ascii-space", " "),
+        ("unicode-space", "\u{00a0}"),
+        ("unicode-padded", "\u{2003}epic-root\u{2003}"),
+        ("valid-child", "epic-root"),
+        ("invalid-child", "\t\n"),
+        ("join-child", "join-root "),
+        ("invalid-id-child", "epic-root"),
+    ] {
+        store.connection.execute(
+            "UPDATE cards SET parent = ?1 WHERE id = ?2",
+            rusqlite::params![parent, id],
+        )?;
+    }
+    store.connection.execute(
+        "UPDATE cards SET id = 'join-root ' WHERE id = 'join-root'",
+        [],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET id = 'invalid-id-child ' WHERE id = 'invalid-id-child'",
+        [],
+    )?;
+
+    let global = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: true,
+        ..Default::default()
+    })?;
+    assert_eq!(global.total_count, 1);
+    assert_eq!(global.rollups[0].kind, "epic");
+    assert_eq!(
+        global.rollups[0].card_id.as_ref().map(CardId::as_str),
+        Some("epic-root")
+    );
+    assert_eq!(global.rollups[0].status_counts.get("ready"), Some(&1));
+    assert_eq!(global.coverage.total_cards, 11);
+    assert_eq!(global.coverage.accounted_cards, 2);
+    assert_eq!(global.coverage.root_epics, 1);
+    assert_eq!(global.coverage.unsorted_cards, 0);
+    assert_eq!(global.coverage.parent_issue_count, 9);
+    assert!(!global.coverage.complete);
+
+    let scoped = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert_eq!(scoped.total_count, 2);
+    assert!(scoped
+        .rollups
+        .iter()
+        .any(|row| row.kind == "unsorted" && row.title == "General" && row.repo.is_none()));
+    assert!(scoped
+        .rollups
+        .iter()
+        .any(|row| row.kind == "epic"
+            && row.card_id.as_ref().map(CardId::as_str) == Some("epic-root")));
+    assert!(!scoped
+        .rollups
+        .iter()
+        .any(|row| row.card_id.as_ref().map(CardId::as_str) == Some("canonical-dangling")));
+    assert!(!scoped
+        .rollups
+        .iter()
+        .any(|row| row.card_id.as_ref().map(CardId::as_str) == Some("join-root")));
+    assert!(!scoped
+        .rollups
+        .iter()
+        .any(|row| row.card_id.as_ref().map(CardId::as_str) == Some("invalid-id-child")));
+    assert_eq!(scoped.coverage.total_cards, 11);
+    assert_eq!(scoped.coverage.accounted_cards, 3);
+    assert_eq!(scoped.coverage.root_epics, 1);
+    assert_eq!(scoped.coverage.unsorted_cards, 1);
+    assert_eq!(scoped.coverage.parent_issue_count, 8);
+    let scoped_status_sum: usize = scoped
+        .rollups
+        .iter()
+        .flat_map(|row| row.status_counts.values())
+        .sum();
+    assert_eq!(
+        scoped_status_sum + scoped.coverage.root_epics,
+        scoped.coverage.accounted_cards
+    );
+    assert!(!scoped.coverage.complete);
     Ok(())
 }
 
@@ -6915,6 +7089,75 @@ fn board_rollups_respect_hidden_repository_scope() -> Result<()> {
         .rollups
         .iter()
         .any(|row| row.repo.as_deref() == Some("secret")));
+    Ok(())
+}
+
+#[test]
+fn board_rollups_scope_hidden_parent_as_visible_root_without_leaking() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    for (name, visibility) in [
+        ("secret", RepositoryVisibility::Hidden),
+        ("visible", RepositoryVisibility::Visible),
+    ] {
+        store.upsert_repository(
+            RepositoryUpsert {
+                name: name.to_string(),
+                aliases: None,
+                visibility: Some(visibility),
+                tier: Some(RepositoryTier::Active),
+                import_provenance: Some("hidden-parent rollup fixture".to_string()),
+            },
+            1,
+        )?;
+    }
+    let hidden_parent_id = CardId::new("hidden-parent")?;
+    let visible_root_id = CardId::new("visible-root")?;
+    let mut hidden_parent = ready_card(hidden_parent_id.as_str(), 1);
+    hidden_parent.repo = Some("secret".to_string());
+    let mut visible_root =
+        ready_card(visible_root_id.as_str(), 2).with_parent(Some(hidden_parent_id.clone()));
+    visible_root.repo = Some("visible".to_string());
+    let mut visible_leaf = ready_card("visible-leaf", 3).with_parent(Some(hidden_parent_id));
+    visible_leaf.repo = Some("visible".to_string());
+    let mut visible_child = ready_card("visible-child", 4)
+        .with_status(CardStatus::Done)
+        .with_parent(Some(visible_root_id));
+    visible_child.repo = Some("visible".to_string());
+    store.import_cards(vec![
+        hidden_parent,
+        visible_root,
+        visible_leaf,
+        visible_child,
+    ])?;
+
+    let page = store.board_rollups(BoardRollupsQuery {
+        limit: 10,
+        now: 10,
+        include_hidden: false,
+        ..Default::default()
+    })?;
+    assert_eq!(page.coverage.total_cards, 3);
+    assert_eq!(page.coverage.accounted_cards, 3);
+    assert_eq!(page.coverage.root_epics, 1);
+    assert_eq!(page.coverage.unsorted_cards, 1);
+    assert_eq!(page.coverage.parent_issue_count, 0);
+    assert!(page.coverage.complete);
+    let epic = page
+        .rollups
+        .iter()
+        .find(|row| row.card_id.as_ref().map(CardId::as_str) == Some("visible-root"))
+        .expect("visible child of hidden parent becomes a scoped root epic");
+    assert_eq!(epic.status_counts.get("done"), Some(&1));
+    let unsorted = page
+        .rollups
+        .iter()
+        .find(|row| row.kind == "unsorted" && row.repo.as_deref() == Some("visible"))
+        .expect("visible leaf of hidden parent becomes an Unsorted row");
+    assert_eq!(unsorted.status_counts.get("ready"), Some(&1));
+    let encoded = serde_json::to_string(&page)?;
+    assert!(!encoded.contains("hidden-parent"));
+    assert!(!encoded.contains("secret"));
     Ok(())
 }
 

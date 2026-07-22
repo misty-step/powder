@@ -824,8 +824,9 @@ fn classify_parent_coverage(
     cycle_cards: &HashSet<String>,
     invalid_parent_cards: &HashSet<String>,
     unique_card_rows: &HashSet<i64>,
+    scoped: bool,
 ) -> ParentCoverageReport {
-    let root_epics = parents
+    let roots_with_visible_children = parents
         .values()
         .filter_map(Option::as_ref)
         .filter(|parent| ids.contains(*parent))
@@ -846,8 +847,10 @@ fn classify_parent_coverage(
             unclassified += 1;
             continue;
         };
-        if parent.is_none() {
-            let is_root_epic = root_epics.contains(card_id.as_str());
+        let is_scoped_root = parent.is_none()
+            || (scoped && parent.as_ref().is_some_and(|parent| !ids.contains(parent)));
+        if is_scoped_root {
+            let is_root_epic = roots_with_visible_children.contains(card_id.as_str());
             assignments.push(ParentCoverageAssignment {
                 card_id: card_id.to_string(),
                 bucket: if is_root_epic {
@@ -877,7 +880,7 @@ fn classify_parent_coverage(
                 break Some(current);
             };
             if !ids.contains(parent) {
-                break None;
+                break scoped.then_some(current);
             }
             current = parent.clone();
         };
@@ -1000,7 +1003,7 @@ fn scan_parent_graph(connection: &Connection, include_hidden: bool) -> Result<Pa
                 evidence: "parent points to the same card".to_string(),
                 repaired: false,
             });
-        } else if !ids.contains(&parent) {
+        } else if include_hidden && !ids.contains(&parent) {
             issues.push(ParentDoctorIssue {
                 card_id: Some(card_id),
                 parent_id: Some(parent),
@@ -1044,6 +1047,7 @@ fn scan_parent_graph(connection: &Connection, include_hidden: bool) -> Result<Pa
         &cycle_cards,
         &invalid_parent_cards,
         &unique_card_rows,
+        !include_hidden,
     );
     Ok(ParentGraphReport {
         scanned: rows.len(),
@@ -1060,7 +1064,9 @@ impl Store {
     }
 
     /// Return parent graph coverage for the same visible repository scope as a
-    /// board read. The relations doctor keeps using the global report above.
+    /// board read. A parent outside that scope is treated as a scoped root so a
+    /// read cannot disclose whether it is hidden or missing; the relations
+    /// doctor keeps using the global report above for true dangling edges.
     pub fn parent_graph_report_scoped(&self, include_hidden: bool) -> Result<ParentGraphReport> {
         scan_parent_graph(&self.connection, include_hidden)
     }
