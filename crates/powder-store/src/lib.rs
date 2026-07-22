@@ -30,7 +30,10 @@ pub use events::{
 };
 pub use identity::{ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 use relations::{list_delta, mirror_delta, mirror_initial_relations};
-pub use relations::{RelationField, RelationsDoctorIssue, RelationsDoctorReport};
+pub use relations::{
+    ParentCoverageAssignment, ParentCoverageBucket, ParentCoverageReport, ParentDoctorIssue,
+    ParentGraphReport, ParentIssueKind, RelationField, RelationsDoctorIssue, RelationsDoctorReport,
+};
 use repositories::{resolve_registered_repository_for_write, resolve_repository_name};
 pub use repositories::{
     RepositoryDoctorEntry, RepositoryDoctorReport, RepositoryMergeOutcome,
