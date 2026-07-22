@@ -89,7 +89,7 @@
 use std::collections::{HashMap, HashSet};
 
 use powder_core::{Card, CardId};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{types::Value, Connection, TransactionBehavior};
 use serde::Serialize;
 
 use crate::{append_card_event, load_all_cards, load_card_optional, non_empty, persist_card};
@@ -286,6 +286,76 @@ pub(crate) fn mirror_initial_relations(
     Ok(())
 }
 
+/// The kind of structural defect found on a stored parent edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentIssueKind {
+    DanglingParent,
+    SelfParent,
+    Cycle,
+    InvalidStoredId,
+}
+
+/// A typed, read-only finding from the raw parent column. Raw strings are kept
+/// as optional values so a malformed row can be reported without first
+/// decoding it as a domain card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParentDoctorIssue {
+    pub card_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub kind: ParentIssueKind,
+    pub evidence: String,
+    pub repaired: bool,
+}
+
+/// The bucket to which a valid card belongs for hierarchy coverage. Cards with
+/// no parent belong to their repository's unsorted bucket; descendants belong
+/// to the root ancestor that owns their nested epic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentCoverageBucket {
+    EpicAncestor,
+    Unsorted,
+}
+
+/// One deterministic card-to-bucket assignment from the full parent graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParentCoverageAssignment {
+    pub card_id: String,
+    pub bucket: ParentCoverageBucket,
+    pub ancestor_id: Option<String>,
+    pub repo: Option<String>,
+}
+
+/// Full-board parent coverage counts and assignments. classified plus
+/// unclassified must equal scanned; duplicate is retained explicitly so
+/// rollup callers can fail closed if a future classifier ever emits more than
+/// one assignment for a card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParentCoverageReport {
+    pub scanned: usize,
+    pub classified: usize,
+    pub unclassified: usize,
+    pub duplicate: usize,
+    pub assignments: Vec<ParentCoverageAssignment>,
+}
+
+impl ParentCoverageReport {
+    pub fn is_complete(&self) -> bool {
+        self.unclassified == 0 && self.duplicate == 0 && self.classified == self.scanned
+    }
+}
+
+/// Shared read-only parent graph evidence. The relations doctor exposes its
+/// issues; rollup queries consume coverage without rebuilding hierarchy
+/// semantics or summing paginated rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParentGraphReport {
+    pub scanned: usize,
+    pub issues: Vec<ParentDoctorIssue>,
+    pub coverage: ParentCoverageReport,
+}
+
 /// One directed relation edge that disagrees with its peer: `card_id` names
 /// `target_id` in `field`, but `target_id` (which exists) does not name
 /// `card_id` back in `field.mirror()`. `repaired` is only ever `true` in a
@@ -307,12 +377,18 @@ pub struct RelationsDoctorIssue {
 pub struct RelationsDoctorReport {
     pub scanned: usize,
     pub issues: Vec<RelationsDoctorIssue>,
+    pub parent_issues: Vec<ParentDoctorIssue>,
+    pub parent_repair_refusal: Option<String>,
     pub repaired: bool,
 }
 
 impl RelationsDoctorReport {
     pub fn issue_count(&self) -> usize {
         self.issues.len()
+    }
+
+    pub fn parent_issue_count(&self) -> usize {
+        self.parent_issues.len()
     }
 }
 
@@ -349,22 +425,307 @@ fn find_relation_issues(cards: &[Card]) -> Vec<RelationsDoctorIssue> {
     issues
 }
 
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn value_description(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(value) => value.to_string(),
+        Value::Real(value) => value.to_string(),
+        Value::Text(value) => format!("text({value:?})"),
+        Value::Blob(value) => format!("blob({} bytes)", value.len()),
+    }
+}
+
+#[derive(Debug)]
+struct RawParentRow {
+    rowid: i64,
+    card_text: Option<String>,
+    card_description: String,
+    card_id: Option<CardId>,
+    parent_text: Option<String>,
+    parent_description: String,
+    parent_id: Option<CardId>,
+    repo: Option<String>,
+}
+
+fn raw_parent_rows(connection: &Connection) -> Result<Vec<RawParentRow>> {
+    let mut statement = connection.prepare(
+        "SELECT rowid, id, parent, repo FROM cards ORDER BY rowid",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Value>(1)?,
+                row.get::<_, Value>(2)?,
+                row.get::<_, Value>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(rowid, card, parent, repo)| RawParentRow {
+            rowid,
+            card_text: value_text(&card),
+            card_description: value_description(&card),
+            card_id: value_text(&card).and_then(|value| CardId::new(value).ok()),
+            parent_text: value_text(&parent),
+            parent_description: value_description(&parent),
+            parent_id: value_text(&parent).and_then(|value| CardId::new(value).ok()),
+            repo: value_text(&repo),
+        })
+        .collect())
+}
+
+fn parent_issue_sort_key(issue: &ParentDoctorIssue) -> (&str, u8, &str) {
+    let kind = match issue.kind {
+        ParentIssueKind::DanglingParent => 0,
+        ParentIssueKind::SelfParent => 1,
+        ParentIssueKind::Cycle => 2,
+        ParentIssueKind::InvalidStoredId => 3,
+    };
+    (
+        issue.card_id.as_deref().unwrap_or(""),
+        kind,
+        issue.parent_id.as_deref().unwrap_or(""),
+    )
+}
+
+fn parent_cycle_members(
+    start: &str,
+    parents: &HashMap<String, Option<String>>,
+    ids: &HashSet<String>,
+) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    let mut positions = HashMap::new();
+    let mut current = start.to_string();
+    loop {
+        if let Some(position) = positions.get(&current) {
+            let mut cycle = path[*position..].to_vec();
+            cycle.sort();
+            return Some(cycle);
+        }
+        positions.insert(current.clone(), path.len());
+        path.push(current.clone());
+        let Some(Some(parent)) = parents.get(&current) else {
+            return None;
+        };
+        if !ids.contains(parent) {
+            return None;
+        }
+        current = parent.clone();
+    }
+}
+
+fn classify_parent_coverage(
+    rows: &[RawParentRow],
+    parents: &HashMap<String, Option<String>>,
+    ids: &HashSet<String>,
+    cycle_cards: &HashSet<String>,
+    invalid_parent_cards: &HashSet<String>,
+    unique_card_rows: &HashSet<i64>,
+) -> ParentCoverageReport {
+    let mut assignments = Vec::new();
+    let mut unclassified = 0;
+    for row in rows
+        .iter()
+        .filter(|row| unique_card_rows.contains(&row.rowid)) {
+        let card_id = row.card_id.as_ref().expect("filtered card id");
+        if invalid_parent_cards.contains(card_id.as_str()) {
+            unclassified += 1;
+            continue;
+        }
+        let Some(parent) = parents.get(card_id.as_str()) else {
+            unclassified += 1;
+            continue;
+        };
+        if parent.is_none() {
+            assignments.push(ParentCoverageAssignment {
+                card_id: card_id.to_string(),
+                bucket: ParentCoverageBucket::Unsorted,
+                ancestor_id: None,
+                repo: row.repo.clone(),
+            });
+            continue;
+        }
+        if cycle_cards.contains(card_id.as_str()) {
+            unclassified += 1;
+            continue;
+        }
+        let mut current = card_id.as_str().to_string();
+        let mut seen = HashSet::new();
+        let root = loop {
+            if !seen.insert(current.clone()) || cycle_cards.contains(current.as_str()) {
+                break None;
+            }
+            let Some(Some(parent)) = parents.get(&current) else {
+                break Some(current);
+            };
+            if !ids.contains(parent) {
+                break None;
+            }
+            current = parent.clone();
+        };
+        let Some(ancestor_id) = root else {
+            unclassified += 1;
+            continue;
+        };
+        assignments.push(ParentCoverageAssignment {
+            card_id: card_id.to_string(),
+            bucket: ParentCoverageBucket::EpicAncestor,
+            ancestor_id: Some(ancestor_id),
+            repo: row.repo.clone(),
+        });
+    }
+    assignments.sort_by(|left, right| left.card_id.cmp(&right.card_id));
+    let classified = assignments.len();
+    let scanned = rows.len();
+    let invalid_rows = rows.len() - unique_card_rows.len();
+    ParentCoverageReport {
+        scanned,
+        classified,
+        unclassified: unclassified + invalid_rows,
+        duplicate: 0,
+        assignments,
+    }
+}
+
+fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
+    let rows = raw_parent_rows(connection)?;
+    let mut ids = HashSet::new();
+    let mut parents = HashMap::new();
+    let mut invalid_parent_cards = HashSet::new();
+    let mut unique_card_rows = HashSet::new();
+    let mut issues = Vec::new();
+    for row in &rows {
+        let card_id = row.card_text.clone();
+        if row.card_id.is_none() {
+            issues.push(ParentDoctorIssue {
+                card_id: card_id.clone(),
+                parent_id: row.parent_text.clone(),
+                kind: ParentIssueKind::InvalidStoredId,
+                evidence: format!(
+                    "cards.id row {} is not a non-empty text id: {}",
+                    row.rowid,
+                    &row.card_description
+                ),
+                repaired: false,
+            });
+            continue;
+        }
+        let card_id = row.card_id.as_ref().expect("validated card id").to_string();
+        if !ids.insert(card_id.clone()) {
+            issues.push(ParentDoctorIssue {
+                card_id: Some(card_id),
+                parent_id: row.parent_text.clone(),
+                kind: ParentIssueKind::InvalidStoredId,
+                evidence: format!(
+                    "cards.id row {} duplicates a normalized stored id",
+                    row.rowid
+                ),
+                repaired: false,
+            });
+            continue;
+        }
+        unique_card_rows.insert(row.rowid);
+        if row.parent_description != "NULL" && row.parent_id.is_none() {
+            invalid_parent_cards.insert(card_id.clone());
+            issues.push(ParentDoctorIssue {
+                card_id: Some(card_id.clone()),
+                parent_id: row.parent_text.clone(),
+                kind: ParentIssueKind::InvalidStoredId,
+                evidence: format!(
+                    "cards.parent for {card_id} is not a non-empty text id: {}",
+                    &row.parent_description
+                ),
+                repaired: false,
+            });
+        }
+        parents.insert(card_id, row.parent_id.as_ref().map(ToString::to_string));
+    }
+    for row in rows.iter().filter(|row| unique_card_rows.contains(&row.rowid)) {
+        let card_id = row.card_id.as_ref().expect("validated card id").to_string();
+        let Some(parent) = row.parent_id.as_ref().map(ToString::to_string) else {
+            continue;
+        };
+        if parent == card_id {
+            issues.push(ParentDoctorIssue {
+                card_id: Some(card_id),
+                parent_id: Some(parent),
+                kind: ParentIssueKind::SelfParent,
+                evidence: "parent points to the same card".to_string(),
+                repaired: false,
+            });
+        } else if !ids.contains(&parent) {
+            issues.push(ParentDoctorIssue {
+                card_id: Some(card_id),
+                parent_id: Some(parent),
+                kind: ParentIssueKind::DanglingParent,
+                evidence: "parent id does not name a stored card".to_string(),
+                repaired: false,
+            });
+        }
+    }
+    let mut cycle_cards = HashSet::new();
+    let mut cycle_by_card = HashMap::<String, Vec<String>>::new();
+    let mut starts = ids.iter().cloned().collect::<Vec<_>>();
+    starts.sort();
+    for start in starts {
+        if let Some(cycle) = parent_cycle_members(&start, &parents, &ids) {
+            if cycle.len() > 1 {
+                for card_id in &cycle {
+                    cycle_cards.insert(card_id.clone());
+                    cycle_by_card.insert(card_id.clone(), cycle.clone());
+                }
+            }
+        }
+    }
+    let mut cycle_ids = cycle_by_card.keys().cloned().collect::<Vec<_>>();
+    cycle_ids.sort();
+    for card_id in cycle_ids {
+        let cycle = cycle_by_card.get(&card_id).expect("cycle map key");
+        issues.push(ParentDoctorIssue {
+            card_id: Some(card_id.clone()),
+            parent_id: parents.get(&card_id).and_then(|parent| parent.clone()),
+            kind: ParentIssueKind::Cycle,
+            evidence: format!("parent cycle: {}", cycle.join(" -> ")),
+            repaired: false,
+        });
+    }
+    issues.sort_by(|left, right| parent_issue_sort_key(left).cmp(&parent_issue_sort_key(right)));
+    let coverage = classify_parent_coverage(
+        &rows,
+        &parents,
+        &ids,
+        &cycle_cards,
+        &invalid_parent_cards,
+        &unique_card_rows,
+    );
+    Ok(ParentGraphReport {
+        scanned: rows.len(),
+        issues,
+        coverage,
+    })
+}
+
 impl Store {
-    /// Report every `blocks`/`blocked_by`/`related` edge where the named
-    /// peer exists but doesn't reciprocate -- the kind of drift that could
-    /// only be produced by data written before reciprocal-atomic writes
-    /// existed, or written directly against the database, bypassing every
-    /// face. `repair: false` only reports; `repair: true` additionally
-    /// mirrors every found issue (same one-transaction-per-run guarantee as
-    /// `update_relations`) and marks each issue `repaired: true`. A second
-    /// `repair: true` run over an already-consistent graph reports zero
-    /// issues (idempotent).
-    ///
-    /// Repair always resolves by *adding* the missing mirror edge, never
-    /// by deleting the one-sided edge -- see the module doc comment's
-    /// "repair is union, not arbitration": a half-applied removal is
-    /// indistinguishable from a missing mirror-add, so repair resurrects
-    /// such an edge. Inspect the report before repairing.
+    /// Return raw parent-edge diagnostics and the full-board coverage
+    /// classification shared by the relations doctor and rollup queries.
+    pub fn parent_graph_report(&self) -> Result<ParentGraphReport> {
+        scan_parent_graph(&self.connection)
+    }
+
+    /// Report relation symmetry plus parent-edge drift. Parent findings are
+    /// always read-only: dangling, self, cycle, and invalid stored IDs have no
+    /// unambiguous source truth from which this command could invent a parent.
+    /// A repair pass therefore refuses parent changes while preserving the
+    /// existing audited union repair for reciprocal relation edges.
     pub fn relations_doctor(
         &mut self,
         actor: &str,
@@ -372,39 +733,71 @@ impl Store {
         repair: bool,
     ) -> Result<RelationsDoctorReport> {
         let actor = non_empty("actor", actor)?;
-        if !repair {
-            let cards = load_all_cards(&self.connection)?;
-            let issues = find_relation_issues(&cards);
+        if repair {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let parent_report = scan_parent_graph(&transaction)?;
+            let has_invalid_stored_id = parent_report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ParentIssueKind::InvalidStoredId);
+            let cards = if has_invalid_stored_id {
+                Vec::new()
+            } else {
+                load_all_cards(&transaction)?
+            };
+            let mut issues = find_relation_issues(&cards);
+            for issue in &mut issues {
+                mirror_relation_change(
+                    &transaction,
+                    &issue.target_id,
+                    issue.expected_mirror_field,
+                    &issue.card_id,
+                    true,
+                    &actor,
+                    now,
+                )?;
+                issue.repaired = true;
+            }
+            let scanned = parent_report.scanned;
+            transaction.commit()?;
+            let refusal = (!parent_report.issues.is_empty()).then(|| {
+                format!(
+                    "refused parent repair: no unambiguous audited correction exists ({})",
+                    parent_report
+                        .issues
+                        .iter()
+                        .map(|issue| issue.evidence.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            });
             return Ok(RelationsDoctorReport {
-                scanned: cards.len(),
+                scanned,
                 issues,
-                repaired: false,
+                parent_issues: parent_report.issues,
+                parent_repair_refusal: refusal,
+                repaired: true,
             });
         }
-
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cards = load_all_cards(&transaction)?;
-        let mut issues = find_relation_issues(&cards);
-        for issue in &mut issues {
-            mirror_relation_change(
-                &transaction,
-                &issue.target_id,
-                issue.expected_mirror_field,
-                &issue.card_id,
-                true,
-                &actor,
-                now,
-            )?;
-            issue.repaired = true;
-        }
-        let scanned = cards.len();
-        transaction.commit()?;
+        let parent_report = scan_parent_graph(&self.connection)?;
+        let has_invalid_stored_id = parent_report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ParentIssueKind::InvalidStoredId);
+        let cards = if has_invalid_stored_id {
+            Vec::new()
+        } else {
+            load_all_cards(&self.connection)?
+        };
+        let issues = find_relation_issues(&cards);
         Ok(RelationsDoctorReport {
-            scanned,
+            scanned: parent_report.scanned,
             issues,
-            repaired: true,
+            parent_issues: parent_report.issues,
+            parent_repair_refusal: None,
+            repaired: false,
         })
     }
 }
