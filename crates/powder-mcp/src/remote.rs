@@ -76,8 +76,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             client.get(&format!("/api/v1/stats?{query}"))?
         }
         "board_rollups" => {
-            let limit = args["limit"].as_u64().unwrap_or(20);
-            let mut query = format!("limit={limit}");
+            let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100);
+            let include_hidden = args["include_hidden"].as_bool().unwrap_or(false);
+            let mut query = format!("limit={limit}&include_hidden={include_hidden}");
             if let Some(after) = optional_str(args, "after") {
                 query.push_str(&format!("&after={}", urlencode(after)));
             }
@@ -1347,8 +1348,14 @@ mod tests {
         assert_eq!(tool_payload(&result)["total_count"], 2);
         let requests = recorded.lock().unwrap();
         assert_eq!(requests[0].method, "GET");
-        assert_eq!(requests[0].path, "/api/v1/board/rollups?limit=1&after=e%3Aepic");
-        assert_eq!(requests[0].authorization.as_deref(), Some("Bearer sk_powder_test"));
+        assert_eq!(
+            requests[0].path,
+            "/api/v1/board/rollups?limit=1&include_hidden=false&after=e%3Aepic"
+        );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
+        );
     }
 
     #[test]
