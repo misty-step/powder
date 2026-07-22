@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -233,7 +233,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS card_search_fts USING fts5(
   source_field UNINDEXED,
   source_id UNINDEXED,
   created_at UNINDEXED,
-  card_id,
+  card_id UNINDEXED,
   content,
   content='search_documents',
   content_rowid='doc_id',
