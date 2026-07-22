@@ -145,6 +145,10 @@ a:hover {
   position: absolute;
   bottom: 0;
   height: 2px;
+  background: var(--color-accent);
+  transition:
+    left var(--pw-quick) var(--pw-ease),
+    width var(--pw-quick) var(--pw-ease);
 }
 
 .pw-input {
@@ -295,6 +299,9 @@ textarea.pw-input {
 }
 
 .pw-crumbs ol {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   list-style: none;
   margin: 0;
   padding: 0;

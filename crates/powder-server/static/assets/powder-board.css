@@ -234,7 +234,9 @@ a:hover {
 }
 
 .pw-nav-ind {
+  background: var(--color-accent);
   height: 2px;
+  transition: left var(--pw-quick) var(--pw-ease), width var(--pw-quick) var(--pw-ease);
   position: absolute;
   bottom: 0;
 }
@@ -424,9 +426,12 @@ textarea.pw-input {
 }
 
 .pw-crumbs ol {
+  flex-wrap: wrap;
+  align-items: center;
   margin: 0;
   padding: 0;
   list-style: none;
+  display: flex;
 }
 
 .pw-crumbs li {

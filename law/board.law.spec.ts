@@ -26,6 +26,9 @@ async function assertBoard(page: Page, consoleErrors: string[]) {
   );
   expect(scrollable, "page must not scroll").toBe(false);
 
+  const cursor = await page.evaluate(() => getComputedStyle(document.body).cursor);
+  expect(cursor, "body cursor must remain default for static text").toBe("default");
+
   // Clean console: no error-level messages or uncaught page errors
   expect(consoleErrors, "console must be clean").toEqual([]);
 }
@@ -163,7 +166,7 @@ for (const mode of MODES) {
     ] as const) {
       await expect(page.locator(`#${lane} [data-id='${id}']`)).toHaveCount(0);
     }
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
 
   test(`board filters · ${mode} · estimate and risk state survives reload`, async ({ page }) => {
@@ -178,7 +181,7 @@ for (const mode of MODES) {
     await expect(page.locator("#fg-estimate [data-estimates='s']")).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator("#fg-risk [data-risks='high']")).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator("#lane-ready [data-id='blocked-card']")).toBeVisible();
-    await assertLaw(page, { consoleErrors: errors });
+    await assertBoard(page, errors);
   });
   test(`board settings page · ${mode} · the law holds`, async ({ page }) => {
     const errors = await boot(page, mode);
@@ -729,6 +732,10 @@ test("board · mobile-390 · header controls stay on-screen with the live indica
     const box = await page.locator(id).boundingBox();
     expect(box, `${id} must have a bounding box`).not.toBeNull();
     expect(box!.x, `${id} must not start left of the viewport`).toBeGreaterThanOrEqual(0);
+    if (id !== "#live-indicator") {
+      expect(box!.width, `${id} must be at least 44px wide`).toBeGreaterThanOrEqual(44);
+      expect(box!.height, `${id} must be at least 44px tall`).toBeGreaterThanOrEqual(44);
+    }
     expect(
       box!.x + box!.width,
       `${id} must end inside the ${viewport!.width}px viewport`,
