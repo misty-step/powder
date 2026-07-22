@@ -78,7 +78,7 @@
       <span id="live-indicator" class="pw-live" data-state="idle" title="live board updates via SSE">live</span>
       <button class="pw-filter-btn" id="quick-add-toggle" type="button" aria-expanded="false" aria-controls="quick-add-panel">
         <svg class="pw-icon" aria-hidden="true"><use href="#i-plus"></use></svg>
-        new card
+        add
       </button>
       <button class="pw-filter-btn" id="cmdk-toggle" type="button" aria-haspopup="dialog" aria-controls="cmdk">
         <svg class="pw-icon" aria-hidden="true"><use href="#i-search"></use></svg>
@@ -95,31 +95,32 @@
   </header>
 
   <section id="quick-add-panel" class="pw-quick-add" hidden>
-    <form id="quick-add-form" class="pw-quick-add-form">
-      <h2 class="pw-quick-add-title">New card</h2>
+    <form id="quick-add-form" class="pw-quick-add-form" novalidate>
+      <h2 class="pw-quick-add-title">Quick add</h2>
+      <p class="pw-quick-add-hint pw-chrome">A title or a description is enough. Leave the title blank and the first description line becomes it.</p>
       <label>
         <span class="pw-chrome">Title</span>
-        <input id="quick-add-title" class="pw-input" type="text" autocomplete="off" placeholder="Short title (first description line works too)">
+        <input id="quick-add-title" class="pw-input" type="text" autocomplete="off" placeholder="Short title (optional — first description line works too)">
       </label>
       <label>
         <span class="pw-chrome">Description</span>
         <textarea id="quick-add-body" class="pw-input" rows="4" placeholder="Paste or type the whole thought here…"></textarea>
       </label>
       <label class="pw-combo-label">
-        <span class="pw-chrome">Repo <span class="pw-optional">type to search · defaults to general</span></span>
+        <span class="pw-chrome">Repo <span class="pw-optional">type to search · defaults to General</span></span>
         <div class="pw-combo">
-          <span class="pw-search pw-combo-field"><svg class="pw-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="quick-add-repo-input" type="text" role="combobox" aria-expanded="false" aria-controls="quick-add-repo-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="no repo · general"></span>
+          <span class="pw-search pw-combo-field"><svg class="pw-icon" aria-hidden="true"><use href="#i-search"></use></svg><input id="quick-add-repo-input" type="text" role="combobox" aria-expanded="false" aria-controls="quick-add-repo-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="no repo · General"></span>
           <input id="quick-add-repo" type="hidden" value="">
           <ul id="quick-add-repo-list" class="pw-combo-list" role="listbox" hidden></ul>
         </div>
       </label>
       <label class="pw-quick-add-attach">
-        <span class="pw-chrome">Images <span class="pw-optional">paste or choose</span></span>
+        <span class="pw-chrome">Images <span class="pw-optional">paste or choose · up to 2 · 10 MB each</span></span>
         <input id="quick-add-attachments" type="file" accept="image/*" multiple>
       </label>
       <ul id="quick-add-attachment-list" class="pw-quick-add-attachment-list" aria-live="polite"></ul>
       <div class="pw-quick-add-actions">
-        <button class="pw-button pw-button-compact" type="submit">Save</button>
+        <button class="pw-button pw-button-compact" type="submit" id="quick-add-submit">Save</button>
         <button class="pw-button pw-button-quiet pw-button-compact" type="button" id="quick-add-cancel">Cancel</button>
       </div>
       <p id="quick-add-message" class="pw-chrome" aria-live="polite"></p>

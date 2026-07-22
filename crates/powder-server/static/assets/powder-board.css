@@ -827,6 +827,16 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   margin: 0;
 }
 
+.pw-quick-add-hint {
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+  font-weight: var(--pw-weight-regular);
+  text-transform: none;
+  letter-spacing: 0;
+  margin: 0;
+  line-height: 1.5;
+}
+
 .pw-quick-add-form {
   gap: var(--pw-space-3);
   max-width: var(--pw-measure-form);
@@ -906,6 +916,38 @@ html:not([data-pw-route="card"]) .pw-detail-app {
 
 .pw-quick-add-actions .pw-button-quiet:hover {
   background: var(--color-surface-sunken);
+}
+
+.pw-quick-add-actions .pw-button:disabled {
+  cursor: default;
+  opacity: .6;
+}
+
+.pw-quick-add-remove {
+  border-radius: var(--radius-sm);
+  width: 1.5em;
+  height: 1.5em;
+  color: var(--color-faint);
+  font-size: var(--text-base);
+  cursor: pointer;
+  transition: color var(--pw-quick) var(--pw-ease), background var(--pw-quick) var(--pw-ease);
+  background: none;
+  border: 0;
+  flex: none;
+  justify-content: center;
+  align-items: center;
+  line-height: 1;
+  display: inline-flex;
+}
+
+.pw-quick-add-remove:hover {
+  color: var(--color-danger);
+  background: var(--color-surface-sunken);
+}
+
+.pw-quick-add-remove:focus-visible {
+  outline: var(--pw-focus-width) solid var(--pw-focus-color);
+  outline-offset: var(--pw-focus-offset);
 }
 
 .pw-status-change {
@@ -1981,6 +2023,11 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   }
 
   .pw-quick-add-form .pw-input, .pw-quick-add-actions button, .pw-quick-add-attach input {
+    min-height: var(--pw-touch-target);
+  }
+
+  .pw-quick-add-remove {
+    min-width: var(--pw-touch-target);
     min-height: var(--pw-touch-target);
   }
 

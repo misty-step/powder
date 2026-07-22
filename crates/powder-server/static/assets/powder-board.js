@@ -73,6 +73,7 @@ const els = {
   quickAddMessage: document.getElementById("quick-add-message"),
   quickAddAttachments: document.getElementById("quick-add-attachments"),
   quickAddAttachmentList: document.getElementById("quick-add-attachment-list"),
+  quickAddSubmit: document.getElementById("quick-add-submit"),
   detailConnection: document.getElementById("detail-connection-status"),
   detailBoardLink: document.getElementById("detail-board-link"),
   detailHomeLink: document.getElementById("detail-home-link"),
@@ -177,6 +178,7 @@ const state = {
 
 let railShare = 24;
 let quickAddFiles = [];
+let quickAddSubmitting = false;
 let toastTimer = null;
 let silentRetryTimer = null;
 let statusChangeSeq = 0;
@@ -1603,6 +1605,17 @@ function isImageFile(file) {
   return Boolean(file && String(file.type || "").toLowerCase().startsWith("image/"));
 }
 
+const QUICK_ADD_MAX_IMAGES = 2;
+const QUICK_ADD_MAX_IMAGE_BYTES = 10 * 1024 * 1024; // matches server MAX_ATTACHMENT_BYTES
+
+// Returns { accepted, rejected } so the caller can report why a file was
+// turned away without silently dropping it.
+function validateQuickAddFile(file) {
+  if (!isImageFile(file)) return { ok: false, reason: "not an image" };
+  if (file.size > QUICK_ADD_MAX_IMAGE_BYTES) return { ok: false, reason: "exceeds 10 MB" };
+  return { ok: true };
+}
+
 function attachmentFilesFromClipboard(clipboard) {
   const files = [];
   if (!clipboard) return files;
@@ -1619,9 +1632,18 @@ function attachmentFilesFromClipboard(clipboard) {
 }
 
 function mergeQuickAddFiles(files) {
-  const images = files.filter(isImageFile);
   const seen = new Set(quickAddFiles.map((file) => file.name + ":" + file.size + ":" + file.lastModified));
-  for (const file of images) {
+  const rejected = [];
+  for (const file of files) {
+    if (quickAddFiles.length >= QUICK_ADD_MAX_IMAGES) {
+      rejected.push({ file, reason: "limit is " + QUICK_ADD_MAX_IMAGES });
+      continue;
+    }
+    const check = validateQuickAddFile(file);
+    if (!check.ok) {
+      rejected.push({ file, reason: check.reason });
+      continue;
+    }
     const key = file.name + ":" + file.size + ":" + file.lastModified;
     if (!seen.has(key)) {
       quickAddFiles.push(file);
@@ -1629,12 +1651,23 @@ function mergeQuickAddFiles(files) {
     }
   }
   renderQuickAddAttachments();
+  return rejected;
+}
+
+function removeQuickAddFile(index) {
+  quickAddFiles.splice(index, 1);
+  if (els.quickAddAttachments) els.quickAddAttachments.value = "";
+  renderQuickAddAttachments();
 }
 
 function renderQuickAddAttachments() {
   if (!els.quickAddAttachmentList) return;
   els.quickAddAttachmentList.innerHTML = quickAddFiles
-    .map((file, index) => '<li><span>' + escapeHtml(file.name || ("image-" + (index + 1))) + '</span><span class="pw-chrome">' + Math.ceil(file.size / 1024) + ' KB</span></li>')
+    .map((file, index) => {
+      const name = escapeHtml(file.name || ("image-" + (index + 1)));
+      const size = Math.ceil(file.size / 1024) + " KB";
+      return '<li><span>' + name + '</span><span class="pw-chrome">' + size + '</span><button type="button" class="pw-quick-add-remove" data-remove="' + index + '" aria-label="Remove ' + name + '">&times;</button></li>';
+    })
     .join("");
 }
 
@@ -1642,6 +1675,14 @@ function clearQuickAddFiles() {
   quickAddFiles = [];
   if (els.quickAddAttachments) els.quickAddAttachments.value = "";
   renderQuickAddAttachments();
+}
+
+function setQuickAddSubmitting(busy) {
+  quickAddSubmitting = busy;
+  if (els.quickAddSubmit) {
+    els.quickAddSubmit.disabled = busy;
+    els.quickAddSubmit.textContent = busy ? "Saving…" : "Save";
+  }
 }
 
 function quickAddCardId(repo) {
@@ -1681,12 +1722,14 @@ function showToast(message, kind = "info") {
 }
 
 async function createCardFromQuickAdd(form) {
+  if (quickAddSubmitting) return;
   const enteredTitle = els.quickAddTitle.value.trim();
   const body = els.quickAddBody.value.trim();
   const firstLine = body.split(/\r?\n/, 1)[0].trim();
   const title = enteredTitle || firstLine.slice(0, 160);
   if (!title) {
-    els.quickAddMessage.textContent = "Add a title or a line of ramble first.";
+    els.quickAddMessage.textContent = "Add a title or a description first.";
+    els.quickAddTitle.focus();
     return;
   }
   // Resolve typed text against the known repositories -- the combobox is an
@@ -1706,6 +1749,7 @@ async function createCardFromQuickAdd(form) {
       return;
     }
   }
+  setQuickAddSubmitting(true);
   const attachments = quickAddFiles.slice();
   const now = Math.floor(Date.now() / 1000);
   const payload = {
@@ -1749,6 +1793,7 @@ async function createCardFromQuickAdd(form) {
     quickAddFiles = attachments;
     renderQuickAddAttachments();
     els.quickAddMessage.textContent = "Failed: " + (err.message || err);
+    setQuickAddSubmitting(false);
     return;
   }
   pendingOptimisticIds.delete(payload.id);
@@ -1757,11 +1802,17 @@ async function createCardFromQuickAdd(form) {
     uploadFailures = await uploadQuickAddFiles(payload.id, attachments);
   }
   if (uploadFailures.length) {
-    const suffix = uploadFailures.length === 1 ? "image" : "images";
-    showToast("Card filed, but " + uploadFailures.length + " " + suffix + " could not be uploaded. Attachments are unavailable on this server.", "warn");
+    const failed = uploadFailures.length;
+    const total = attachments.length;
+    if (failed < total) {
+      showToast(total - failed + " of " + total + " images attached; " + failed + " failed to upload.", "warn");
+    } else {
+      showToast("Filed, but " + failed + " " + (failed === 1 ? "image" : "images") + " could not upload. Open the entry and retry from there.", "warn");
+    }
   } else if (attachments.length) {
     showToast(attachments.length + " " + (attachments.length === 1 ? "image" : "images") + " attached.", "ok");
   }
+  setQuickAddSubmitting(false);
   loadBoard({ silent: true });
 }
 
@@ -2978,14 +3029,30 @@ els.quickAddCancel.addEventListener("click", () => {
   hideQuickAdd();
 });
 els.quickAddAttachments?.addEventListener("change", (event) => {
-  mergeQuickAddFiles([...event.target.files]);
+  const rejected = mergeQuickAddFiles([...event.target.files]);
+  if (rejected.length) {
+    const details = rejected.map((r) => r.file.name + " (" + r.reason + ")").join(", ");
+    els.quickAddMessage.textContent = "Rejected: " + details;
+  } else {
+    els.quickAddMessage.textContent = "";
+  }
+});
+els.quickAddAttachmentList?.addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-remove]");
+  if (!btn) return;
+  removeQuickAddFile(Number(btn.dataset.remove));
 });
 els.quickAddForm.addEventListener("paste", (event) => {
   const files = attachmentFilesFromClipboard(event.clipboardData);
   if (!files.length) return;
   event.preventDefault();
-  mergeQuickAddFiles(files);
-  els.quickAddMessage.textContent = files.length === 1 ? "Pasted 1 image." : "Pasted " + files.length + " images.";
+  const rejected = mergeQuickAddFiles(files);
+  if (rejected.length) {
+    const details = rejected.map((r) => r.file.name + " (" + r.reason + ")").join(", ");
+    els.quickAddMessage.textContent = "Rejected: " + details;
+  } else {
+    els.quickAddMessage.textContent = files.length === 1 ? "Pasted 1 image." : "Pasted " + files.length + " images.";
+  }
 });
 els.quickAddForm.addEventListener("submit", (event) => {
   event.preventDefault();
