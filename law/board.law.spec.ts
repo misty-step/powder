@@ -692,6 +692,7 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
   // the rest of this fixture's cards (see start-fixture-server.sh).
   const cardId = `law-gate-live-${Date.now()}x`;
   const created = await page.request.post("/api/v1/cards", {
+    headers: { "Idempotency-Key": `law-gate-live-card-create:${cardId}` },
     data: {
       id: cardId,
       title: "SSE live-update proof card",
@@ -728,9 +729,11 @@ test("board · mobile-390 · header controls stay on-screen with the live indica
   await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
     timeout: 15_000,
   });
+  const headerWrapCardId = `law-gate-headerwrap-${Date.now()}x`;
   const created = await page.request.post("/api/v1/cards", {
+    headers: { "Idempotency-Key": `law-gate-headerwrap-card-create:${headerWrapCardId}` },
     data: {
-      id: `law-gate-headerwrap-${Date.now()}x`,
+      id: headerWrapCardId,
       title: "header wrap trigger card",
       acceptance: [],
       status: "backlog",
@@ -771,6 +774,7 @@ test("board · a zero-card repository is hidden until the show-empty toggle is u
 }) => {
   const repoName = `law-gate-zero-card-${Date.now()}`;
   const created = await page.request.post("/api/v1/repositories", {
+    headers: { "Idempotency-Key": `law-gate-zero-card-repository-create:${repoName}` },
     data: { name: repoName, aliases: [], visibility: "visible", tier: "active" },
   });
   expect(created.ok()).toBe(true);
@@ -806,7 +810,9 @@ test("board · a zero-card repository is hidden until the show-empty toggle is u
   await expect(page.locator("#repo-empty-toggle")).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator(`.pw-repo-row[data-repo-name="${repoName}"]`)).toBeVisible();
 
-  const deleted = await page.request.delete(`/api/v1/repositories/${repoName}`);
+  const deleted = await page.request.delete(`/api/v1/repositories/${repoName}`, {
+    headers: { "Idempotency-Key": `law-gate-zero-card-repository-delete:${repoName}` },
+  });
   expect(deleted.ok(), "clean up the zero-card fixture repository").toBe(true);
 });
 
