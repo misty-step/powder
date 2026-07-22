@@ -1497,9 +1497,9 @@ async fn create_card(
     headers: HeaderMap,
     Json(request): Json<CreateCardRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    // powder-925: single-card authoring is agent-accessible, same as
-    // claim/status/comment/complete -- a scoped (non-admin) key can carry
-    // the operator's mobile quick-add flow without holding admin.
+    // CreateCard is claimless in Operation::ALL, so a scoped key can carry the
+    // operator's mobile quick-add flow without holding admin. Claim-bound card
+    // corrections remain protected by the current-card claim requirement.
     let now = unix_now();
     // Default status reflects whether a real oracle exists (VISION.md:
     // "ready is a query, not vibes") -- see
@@ -1611,13 +1611,10 @@ async fn patch_card(
     Path(id): Path<String>,
     Json(request): Json<PatchCardRequest>,
 ) -> Result<Json<Card>, ApiError> {
-    // powder-ruling-patch-scope: single-card field patches follow the same
-    // rule as single-card authoring (powder-925) -- an actor-scoped key can
-    // record an operator ruling (title/body/acceptance/priority) without the
-    // admin key; every patch is audited with actor and field list. `repo`
-    // is the exception (powder-repo-hygiene): reassigning a card's board
-    // grouping is administrative, same tier as `merge_repository_alias`, so
-    // it requires admin scope even though the rest of the patch doesn't.
+    // PatchCard is a claim-bound card correction for agent keys; an admin key
+    // bypasses the coordination claim while every patch remains audited. The
+    // `repo` field is additionally admin-only because it reassigns board
+    // grouping.
     let card_id = CardId::new(id)?;
     let patch = request.into_patch()?;
     if patch.repo.is_some() {
@@ -1822,9 +1819,9 @@ async fn check_criterion(
     Json(request): Json<CriterionRequest>,
 ) -> Result<Json<Card>, ApiError> {
     let card_id = CardId::new(id)?;
-    // The request's actor is semantic payload only; audit actor identity comes
-    // from the authenticated transport and cannot be forged in JSON.
-    let _requested_actor = request.actor.clone();
+    // The request's actor is a semantic label. Store audit principal/role come
+    // from the authenticated transport authority, while identity checks prevent
+    // non-admin callers from using a different semantic actor.
     let idempotency_key = required_idempotency_key(&headers)?;
     let card = lock_store(&state)?
         .check_criterion_as_keyed(

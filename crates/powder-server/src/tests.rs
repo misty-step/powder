@@ -709,8 +709,19 @@ async fn patch_card_repo_is_admin_gated_canonicalized_and_clearable() {
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
 
-    // A non-admin, actor-scoped key can patch ordinary fields (existing
-    // powder-ruling-patch-scope rule) but not `repo`.
+    // Agent corrections are claim-bound; the repository field remains admin-only.
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/repo-patchable/claim",
+            Some(&agent_key),
+            r#"{"agent":"codex","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim.status(), StatusCode::OK);
+
     let scoped_ok = app
         .clone()
         .oneshot(json_request(
@@ -814,7 +825,7 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
         .unwrap();
     assert_eq!(checked.status(), StatusCode::OK);
     let checked = response_json(checked).await;
-    assert_eq!(checked["criteria"][0]["checked_by"], "bootstrap");
+    assert_eq!(checked["criteria"][0]["checked_by"], "operator");
     assert!(checked["criteria"][0]["checked_at"].as_i64().unwrap() > 0);
 
     let complete = app
@@ -847,7 +858,9 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
     let detail = response_json(detail).await;
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["event_type"] == "criterion"
-            && event["actor"] == "bootstrap"
+            && event["actor"] == "operator"
+            && event["principal"] == "bootstrap"
+            && event["role"] == "admin"
             && event["payload"].as_str().unwrap().contains("checked")
     }));
 }
@@ -3464,10 +3477,41 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
         assert!(response_text(response).await.contains("principal"));
     }
 
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/principal-http/claim",
+            Some(&roster_key),
+            r#"{"agent":"worker-a","ttl_seconds":60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim.status(), StatusCode::OK);
+
     for (path, body) in [
         (
             "/api/v1/cards/principal-http/criteria/check",
             r#"{"criterion":0,"actor":"operator"}"#,
+        ),
+        (
+            "/api/v1/cards/principal-http/comments",
+            r#"{"author":"operator","body":"note"}"#,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, path, Some(&roster_key), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response_text(response).await.contains("identity_mismatch"));
+    }
+
+    for (path, body) in [
+        (
+            "/api/v1/cards/principal-http/criteria/check",
+            r#"{"criterion":0,"actor":"roster"}"#,
         ),
         (
             "/api/v1/cards/principal-http/links",
@@ -3475,7 +3519,7 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
         ),
         (
             "/api/v1/cards/principal-http/comments",
-            r#"{"author":"operator","body":"note"}"#,
+            r#"{"author":"roster","body":"note"}"#,
         ),
         (
             "/api/v1/cards/principal-http/work-log",
@@ -3490,18 +3534,6 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    let claim = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/principal-http/claim",
-            Some(&roster_key),
-            r#"{"agent":"worker-a","ttl_seconds":60}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(claim.status(), StatusCode::OK);
-
     let response = app
         .oneshot(
             Request::builder()
@@ -3515,7 +3547,7 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let detail = response_json(response).await;
-    assert_eq!(detail["comments"][0]["author"], "operator");
+    assert_eq!(detail["comments"][0]["author"], "roster");
     assert_eq!(detail["work_log"][0]["agent"], "worker-a");
     assert_eq!(detail["runs"][0]["principal"], "roster");
     assert_eq!(detail["runs"][0]["role"], "agent");
@@ -3537,7 +3569,7 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
         .collect::<Vec<_>>();
     assert_eq!(attributed.len(), 4);
     assert!(attributed.iter().any(|event| {
-        event["actor"] == "operator"
+        event["actor"] == "roster"
             && event["subject_kind"] == "comment"
             && event["subject_id"] == comment_id
     }));
@@ -4660,9 +4692,8 @@ async fn agent_scoped_key_can_author_a_card() {
 
 #[tokio::test]
 async fn agent_scoped_key_can_patch_card_fields_and_the_patch_is_audited() {
-    // powder-ruling-patch-scope: recording an operator ruling
-    // (priority/acceptance/body) must not require the admin key; single-card
-    // patches follow the powder-925 authoring rule and stay fully audited.
+    // Agent card corrections require the agent's current card claim; admins bypass
+    // that coordination gate while every patch remains fully audited.
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state
         .store
@@ -4684,6 +4715,18 @@ async fn agent_scoped_key_can_patch_card_fields_and_the_patch_is_audited() {
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
+
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/ruled/claim",
+            Some(&agent_key),
+            r#"{"agent":"lead-daybook","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim.status(), StatusCode::OK);
 
     let patched = app
         .clone()
@@ -5029,7 +5072,7 @@ async fn revoking_an_unknown_key_id_returns_not_found() {
 }
 
 #[tokio::test]
-async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
+async fn non_holder_agent_key_cannot_mutate_lease_or_card_corrections() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let holder_key = state
         .store
@@ -5083,7 +5126,7 @@ async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
         ))
         .await
         .unwrap();
-    assert_eq!(status_ok.status(), StatusCode::OK);
+    assert_eq!(status_ok.status(), StatusCode::FORBIDDEN);
 
     let heartbeat_denied = app
         .clone()
@@ -5131,7 +5174,7 @@ async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
         ))
         .await
         .unwrap();
-    assert_eq!(complete_ok.status(), StatusCode::OK);
+    assert_eq!(complete_ok.status(), StatusCode::FORBIDDEN);
 
     let release_denied = app
         .clone()
@@ -5158,8 +5201,8 @@ async fn non_holder_agent_key_cannot_mutate_lease_but_can_audit_status() {
         .await
         .unwrap();
     let detail = response_json(detail).await;
-    assert_eq!(detail["card"]["status"], "done");
-    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
+    assert_eq!(detail["card"]["status"], "in_progress");
+    assert!(!detail["events"].as_array().unwrap().iter().any(|event| {
         event["actor"] == "intruder" && event["payload"].to_string().contains("done")
     }));
 }
@@ -6421,6 +6464,7 @@ async fn attachments_http_upload_fetch_round_trip_and_card_detail() {
             Method::POST,
             "/api/v1/cards/attachment-round-trip/attachments",
             Some(&raw_key),
+            Some("attachment-upload-round-trip"),
             "image/png",
             Some("diagram.png"),
             bytes.clone(),
@@ -6498,6 +6542,7 @@ async fn attachments_dedupe_across_cards_and_detach_garbage_collects_blob() {
             Method::POST,
             "/api/v1/cards/attachment-dedupe-a/attachments",
             Some(&raw_key),
+            Some("attachment-upload-dedupe-a"),
             "image/webp",
             Some("first.webp"),
             bytes.clone(),
@@ -6512,6 +6557,7 @@ async fn attachments_dedupe_across_cards_and_detach_garbage_collects_blob() {
             Method::POST,
             "/api/v1/cards/attachment-dedupe-b/attachments",
             Some(&raw_key),
+            Some("attachment-upload-dedupe-b"),
             "image/webp",
             Some("second.webp"),
             bytes,
@@ -6523,10 +6569,11 @@ async fn attachments_dedupe_across_cards_and_detach_garbage_collects_blob() {
 
     let detach_first = app
         .clone()
-        .oneshot(authorized_empty_request(
+        .oneshot(authorized_keyed_empty_request(
             Method::DELETE,
             &format!("/api/v1/cards/attachment-dedupe-a/attachments/{attachment_id}"),
             &raw_key,
+            "attachment-detach-dedupe-a",
         ))
         .await
         .unwrap();
@@ -6544,10 +6591,11 @@ async fn attachments_dedupe_across_cards_and_detach_garbage_collects_blob() {
 
     let detach_second = app
         .clone()
-        .oneshot(authorized_empty_request(
+        .oneshot(authorized_keyed_empty_request(
             Method::DELETE,
             &format!("/api/v1/cards/attachment-dedupe-b/attachments/{attachment_id}"),
             &raw_key,
+            "attachment-detach-dedupe-b",
         ))
         .await
         .unwrap();
@@ -6584,6 +6632,7 @@ async fn attachments_reject_oversize_and_non_image_mime() {
             Method::POST,
             "/api/v1/cards/attachment-bounds/attachments",
             Some(&raw_key),
+            Some("attachment-upload-oversize"),
             "image/png",
             None,
             vec![0_u8; 10 * 1024 * 1024 + 1],
@@ -6596,6 +6645,7 @@ async fn attachments_reject_oversize_and_non_image_mime() {
             Method::POST,
             "/api/v1/cards/attachment-bounds/attachments",
             Some(&raw_key),
+            Some("attachment-upload-bad-mime"),
             "text/plain",
             None,
             b"not-an-image".to_vec(),
@@ -6615,6 +6665,7 @@ async fn attachments_require_auth_and_report_unknown_resources() {
             Method::POST,
             "/api/v1/cards/missing/attachments",
             None,
+            None,
             "image/png",
             None,
             b"bytes".to_vec(),
@@ -6628,6 +6679,7 @@ async fn attachments_require_auth_and_report_unknown_resources() {
             Method::POST,
             "/api/v1/cards/missing/attachments",
             Some(&raw_key),
+            Some("attachment-upload-unknown-card"),
             "image/png",
             None,
             b"bytes".to_vec(),
@@ -6650,6 +6702,7 @@ fn raw_attachment_request(
     method: Method,
     uri: &str,
     raw_key: Option<&str>,
+    idempotency_key: Option<&str>,
     mime: &str,
     filename: Option<&str>,
     bytes: Vec<u8>,
@@ -6664,6 +6717,9 @@ fn raw_attachment_request(
     if let Some(raw_key) = raw_key {
         builder = builder.header(AUTHORIZATION, format!("Bearer {raw_key}"));
     }
+    if let Some(idempotency_key) = idempotency_key {
+        builder = builder.header("Idempotency-Key", idempotency_key);
+    }
     builder.body(Body::from(bytes)).unwrap()
 }
 
@@ -6672,6 +6728,21 @@ fn authorized_empty_request(method: Method, uri: &str, raw_key: &str) -> Request
         .method(method)
         .uri(uri)
         .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn authorized_keyed_empty_request(
+    method: Method,
+    uri: &str,
+    raw_key: &str,
+    idempotency_key: &str,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(AUTHORIZATION, format!("Bearer {raw_key}"))
+        .header("Idempotency-Key", idempotency_key)
         .body(Body::empty())
         .unwrap()
 }
