@@ -63,13 +63,20 @@ pub struct RemoteClient {
     consecutive_404s: AtomicU32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteError {
-    /// An HTTP response came back with a non-2xx status; the `String` is
-    /// the already-formatted `"http {status}: {message}"` error text.
-    Status(u16, String),
-    /// Anything else: a transport failure or a response body that didn't
-    /// parse as JSON.
-    Other(String),
+    /// An HTTP response came back with a non-2xx status. Keep the wire fields
+    /// separate until the public String boundary so the stable denial class
+    /// cannot be lost while retaining the existing "http {status}: ..." form.
+    Status {
+        status: u16,
+        message: String,
+        denial_class: Option<String>,
+    },
+    /// A request could not complete because the transport failed.
+    Transport(String),
+    /// A successful response body could not be decoded as JSON.
+    Parse(String),
 }
 
 impl RemoteClient {
@@ -198,7 +205,7 @@ impl RemoteClient {
         );
         let mut used_key = first_key;
 
-        if let Err(RemoteError::Status(401, _)) = &result {
+        if let Err(RemoteError::Status { status: 401, .. }) = &result {
             if let Some(cmd) = self.key_cmd.as_deref() {
                 if let Some(refreshed) = resolve_key_cmd(cmd) {
                     if Some(refreshed.as_str()) != used_key.as_deref() {
@@ -221,15 +228,37 @@ impl RemoteClient {
                 self.consecutive_404s.store(0, Ordering::Relaxed);
                 Ok(value)
             }
-            Err(RemoteError::Status(401, message)) => {
+            Err(RemoteError::Status {
+                status: 401,
+                message,
+                denial_class,
+            }) => {
                 self.consecutive_404s.store(0, Ordering::Relaxed);
+                let message = render_status_error(401, &message, denial_class.as_deref());
                 Err(diagnosable_401(&message, used_key.as_deref()))
             }
-            Err(RemoteError::Status(404, message)) => {
+            Err(RemoteError::Status {
+                status: 404,
+                message,
+                denial_class,
+            }) => {
                 let streak = self.consecutive_404s.fetch_add(1, Ordering::Relaxed) + 1;
+                let message = render_status_error(404, &message, denial_class.as_deref());
                 Err(maybe_append_stale_base_url_steer(message, streak))
             }
-            Err(RemoteError::Status(_, message)) | Err(RemoteError::Other(message)) => {
+            Err(RemoteError::Status {
+                status,
+                message,
+                denial_class,
+            }) => {
+                self.consecutive_404s.store(0, Ordering::Relaxed);
+                Err(render_status_error(
+                    status,
+                    &message,
+                    denial_class.as_deref(),
+                ))
+            }
+            Err(RemoteError::Transport(message)) | Err(RemoteError::Parse(message)) => {
                 self.consecutive_404s.store(0, Ordering::Relaxed);
                 Err(message)
             }
@@ -256,20 +285,28 @@ impl RemoteClient {
         match response {
             Ok(response) => response
                 .into_json()
-                .map_err(|err| RemoteError::Other(err.to_string())),
+                .map_err(|err| RemoteError::Parse(err.to_string())),
             Err(ureq::Error::Status(status, response)) => {
-                let message = response
+                let (message, denial_class) = response
                     .into_json::<Value>()
                     .ok()
-                    .and_then(|body| body["error"].as_str().map(str::to_owned))
-                    .unwrap_or_else(|| format!("http {status}"));
-                Err(RemoteError::Status(
+                    .map(|body| {
+                        let message = body["error"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("http {status}"));
+                        let denial_class = body["denial_class"].as_str().map(str::to_owned);
+                        (message, denial_class)
+                    })
+                    .unwrap_or_else(|| (format!("http {status}"), None));
+                Err(RemoteError::Status {
                     status,
-                    format!("http {status}: {message}"),
-                ))
+                    message,
+                    denial_class,
+                })
             }
             Err(ureq::Error::Transport(transport)) => {
-                Err(RemoteError::Other(transport.to_string()))
+                Err(RemoteError::Transport(transport.to_string()))
             }
         }
     }
@@ -317,6 +354,16 @@ fn resolve_key_cmd(cmd: &str) -> Option<String> {
 
 fn key_prefix(key: &str) -> String {
     key.chars().take(KEY_PREFIX_LEN).collect()
+}
+
+fn render_status_error(status: u16, message: &str, denial_class: Option<&str>) -> String {
+    let mut rendered = format!("http {status}: {message}");
+    if let Some(denial_class) = denial_class {
+        rendered.push_str(" [denial_class=");
+        rendered.push_str(denial_class);
+        rendered.push(']');
+    }
+    rendered
 }
 
 fn diagnosable_401(message: &str, key: Option<&str>) -> String {
@@ -751,6 +798,85 @@ mod tests {
             .unwrap_err()
             .contains("cycle_card_ids must be an array"));
     }
+    fn socket_error_response(status: u16, body: &str) -> String {
+        use std::io::{Read, Write};
+        use std::thread;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind error listener");
+        let addr = listener.local_addr().expect("error listener address");
+        let body = body.to_owned();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept error request");
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).expect("read error request");
+            let response = format!(
+                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write error response");
+        });
+
+        let client =
+            RemoteClient::new(format!("http://{addr}"), Some("sk_powder_test".to_string()));
+        let error = client
+            .get("/api/v1/test")
+            .expect_err("error response must remain an error");
+        server.join().expect("error server must finish");
+        error
+    }
+
+    #[test]
+    fn socket_status_errors_preserve_stable_denial_classes() {
+        let identity = socket_error_response(
+            403,
+            r#"{"error":"worker identity does not match claim","denial_class":"identity_mismatch"}"#,
+        );
+        assert_eq!(
+            identity,
+            "http 403: worker identity does not match claim [denial_class=identity_mismatch]"
+        );
+
+        let claim = socket_error_response(
+            403,
+            r#"{"error":"claim required","denial_class":"claim_required"}"#,
+        );
+        assert_eq!(
+            claim,
+            "http 403: claim required [denial_class=claim_required]"
+        );
+
+        let idempotency = socket_error_response(
+            409,
+            r#"{"error":"idempotency key conflicts with existing request","denial_class":"idempotency_conflict"}"#,
+        );
+        assert_eq!(
+            idempotency,
+            "http 409: idempotency key conflicts with existing request [denial_class=idempotency_conflict]"
+        );
+    }
+
+    #[test]
+    fn socket_401_keeps_denial_class_and_key_diagnostic() {
+        let error = socket_error_response(
+            401,
+            r#"{"error":"invalid bearer token","denial_class":"unauthenticated"}"#,
+        );
+        assert_eq!(
+            error,
+            "http 401: invalid bearer token [denial_class=unauthenticated] (key prefix used: sk_powder_te; key may have been rotated; restart this MCP client or configure POWDER_API_KEY_CMD)"
+        );
+    }
+
+    #[test]
+    fn socket_error_body_without_a_class_keeps_legacy_message() {
+        let null_class = socket_error_response(403, r#"{"error":"forbidden","denial_class":null}"#);
+        let legacy = socket_error_response(403, r#"{"error":"forbidden"}"#);
+        assert_eq!(null_class, "http 403: forbidden");
+        assert_eq!(legacy, null_class);
+    }
+
     #[test]
     fn keyed_request_reuses_caller_key_across_auth_refresh_retry() {
         use std::io::{Read, Write};
