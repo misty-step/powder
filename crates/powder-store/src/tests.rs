@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DetailLevel, DomainError, Estimate, Operation, Priority, ReadyCursor, ReadyQuery, Risk, RunId,
+    DenialClass, DetailLevel, DomainError, Estimate, Operation, Priority, ReadyCursor, ReadyQuery, Risk, RunId,
     RunState,
 };
 
@@ -3699,7 +3699,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
         &Authority::actor("agent-a", false),
     )?;
 
-    let patched = store.patch_card(
+    let patched = store.patch_card_as(
         &card_id,
         CardPatch {
             title: Some("Patched title".to_string()),
@@ -3711,7 +3711,7 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
             ]),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         20,
     )?;
 
@@ -3753,24 +3753,24 @@ fn patch_card_can_set_and_clear_repo() -> Result<()> {
 
     // Leaving `repo` untouched (`None`) preserves whatever the row already
     // has -- distinct from `Some(None)`, which explicitly clears it.
-    let unpatched = store.patch_card(
+    let unpatched = store.patch_card_as(
         &card_id,
         CardPatch {
             title: Some("still untouched repo".to_string()),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         10,
     )?;
     assert_eq!(unpatched.repo, None);
 
-    let moved = store.patch_card(
+    let moved = store.patch_card_as(
         &card_id,
         CardPatch {
             repo: Some(Some("misty-step/canary".to_string())),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         20,
     )?;
     assert_eq!(
@@ -3785,13 +3785,13 @@ fn patch_card_can_set_and_clear_repo() -> Result<()> {
     )?;
     assert_eq!(stored_repo, "canary");
 
-    let cleared = store.patch_card(
+    let cleared = store.patch_card_as(
         &card_id,
         CardPatch {
             repo: Some(None),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         30,
     )?;
     assert_eq!(cleared.repo, None);
@@ -3849,7 +3849,7 @@ fn powder_905_regression_external_actor_closes_imported_running_card_in_one_call
         &card_id,
         CardStatus::Done,
         12,
-        &Authority::actor("external-closer", false),
+        &Authority::principal("external-closer", true),
     )?;
 
     assert_eq!(closed.status, CardStatus::Done);
@@ -5704,16 +5704,19 @@ fn answer_input_rejects_actor_impersonation() -> Result<()> {
     );
     assert!(matches!(
         err,
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdentityMismatch,
+            ..
+        }))
     ));
 
-    // the actor answering as themselves is allowed even though they are not the claim holder.
+    // A successful answer must come from the current claim holder/run.
     let answered = store.answer_input(
         &claim.run_id,
-        "codex",
+        "agent-a",
         "Approved",
         13,
-        &Authority::actor("codex", false),
+        &Authority::actor("agent-a", false),
     )?;
     assert_eq!(answered.state, RunState::Active);
     Ok(())
@@ -6634,14 +6637,14 @@ fn acceptance_and_proof_plan_carrying_a_fresh_key_read_back_scrubbed() -> Result
     }
 
     // Patch path: replacement acceptance/proof_plan lists get the same scrub.
-    let patched = store.patch_card(
+    let patched = store.patch_card_as(
         &card_id,
         CardPatch {
             acceptance: Some(vec![format!("rotate {} afterwards", leaked.raw_key)]),
             proof_plan: Some(vec![format!("readback without {}", leaked.raw_key)]),
             ..Default::default()
         },
-        "operator",
+        &Authority::principal("operator", true),
         20,
     )?;
     for text in patched

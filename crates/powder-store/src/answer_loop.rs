@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use powder_core::{
     Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
-    CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DetailLevel, DomainError,
+    CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DenialClass, DetailLevel, DomainError,
     EpicEvidence, EpicState, EvidenceKind, Link, LinkId, Operation, Run, RunDetail, RunId,
     RunState, WorkLogEntry,
 };
@@ -216,6 +216,9 @@ impl Store {
             ))
             .into());
         }
+        authority.require_identity(&actor).map_err(|error| {
+            DomainError::authority_denied(DenialClass::IdentityMismatch, error.to_string())
+        })?;
         super::authorize_card_operation(
             authority,
             Operation::AnswerInput,
