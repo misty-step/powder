@@ -61,6 +61,12 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/api/v1/board/rollups",
+        intent: "return deterministic top-level epic and per-repository Unsorted rollups with direct-child status counts, criteria sums, active claims, freshness, and global graph coverage; optional limit and after query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        body_shape: None,
+    },
+    ApiRoute {
+        method: "GET",
         path: "/api/v1/repositories",
         intent: "list repository entities with aliases, visibility, tier, import provenance, and status counts",
         body_shape: None,
@@ -328,6 +334,7 @@ mod tests {
         assert!(!paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
         assert!(paths.contains(&"/api/v1/approvals"));
+        assert!(paths.contains(&"/api/v1/board/rollups"));
         assert!(paths.contains(&"/api/v1/repositories"));
         assert!(paths.contains(&"/api/v1/repositories/{name}"));
         assert!(paths.contains(&"/api/v1/repositories/{name}/merge-alias"));

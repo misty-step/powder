@@ -2162,6 +2162,41 @@ async fn board_stats_route_returns_compact_counts_without_listing_cards() {
 }
 
 #[tokio::test]
+async fn board_rollups_route_returns_global_page_and_coverage() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    for body in [
+        r#"{"id":"http-epic","title":"Epic","acceptance":["proof"]}"#,
+        r#"{"id":"http-child","title":"Child","acceptance":["proof"],"status":"done","parent":"http-epic"}"#,
+        r#"{"id":"http-leaf","title":"Leaf","acceptance":["proof"]}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, "/api/v1/cards", Some(&admin_key), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = app
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/board/rollups?limit=1",
+            Some(&admin_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = response_json(response).await;
+    assert_eq!(page["total_count"], 2);
+    assert_eq!(page["coverage"]["total_cards"], 3);
+    assert_eq!(page["coverage"]["accounted_cards"], 3);
+    assert!(page["coverage"]["complete"].as_bool().unwrap());
+    assert_eq!(page["rollups"].as_array().unwrap().len(), 1);
+    assert!(page["has_more"].as_bool().unwrap());
+}
+
+#[tokio::test]
 async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
