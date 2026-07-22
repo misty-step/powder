@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
     DenialClass, DetailLevel, DomainError, Estimate, Operation, Priority, ReadyCursor, ReadyQuery,
-    Risk, RunId, RunState,
+    Risk, RunId, RunState, RunTelemetryAggregateQuery, RunTelemetryAttemptInput, RunTelemetryWrite,
 };
 
 use crate::schema::SCHEMA;
@@ -11,7 +11,7 @@ use crate::{
     ApiKeyScope, BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, FieldNoteConfig,
     IdempotencyRequest, ImportOutcome, KeyedOperationContext, ParentCoverageBucket,
     ParentIssueKind, RelationField, RepositoryTier, RepositoryUpsert, RepositoryVisibility, Result,
-    SearchQuery, Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET,
+    SearchQuery, Store, StoreError, WorkLogAttribution, API_KEY_ALPHABET, PricingConfig,
 };
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -1952,7 +1952,7 @@ fn schema_v25_database_migrates_ready_snapshot_tables() -> Result<()> {
         "DROP TABLE ready_snapshot_items; DROP TABLE ready_snapshots; PRAGMA user_version = 25;",
     )?;
     store.migrate()?;
-    assert_eq!(store.schema_version()?, 27);
+    assert_eq!(store.schema_version()?, 28);
     assert!(store.table_exists("ready_snapshots")?);
     assert!(store.table_exists("ready_snapshot_items")?);
     store.migrate()?;
@@ -7558,7 +7558,7 @@ fn fts_v24_rebuild_makes_card_ids_exact_metadata() -> Result<()> {
         limit: 10,
         ..SearchQuery::default()
     })?;
-    assert_eq!(store.schema_version()?, 27);
+    assert_eq!(store.schema_version()?, 28);
     assert_eq!(page.total_count, 1);
     assert_eq!(page.matches.len(), 1);
     assert_eq!(page.matches[0].source_kind, "cards");
@@ -8826,4 +8826,30 @@ fn every_keyed_matrix_operation_has_one_store_executor() {
         );
     }
     assert!(keyed > 0);
+}
+
+#[test]
+fn run_telemetry_is_keyed_normalized_priced_and_aggregated() -> Result<()> {
+    let path = temp_db("telemetry");
+    let card_id = CardId::new("telemetry-card")?;
+    let (run_id, authority) = {
+        let mut store = Store::open(&path)?; store.migrate()?;
+        store.import_cards(vec![ready_card("telemetry-card", 1)])?;
+        let authority = Authority::principal("telemetry-principal", false);
+        let receipt = store.claim_card(&card_id, "agent-a", 2, 600, &authority)?;
+        (receipt.run_id, authority)
+    };
+    let pricing = PricingConfig::from_json_str(r#"{"version":"prices-2026-07","rates":[{"provider":"acme","model":"model-a","version":"rate-a","input_rate_usd_per_million_micros":1000000,"output_rate_usd_per_million_micros":2000000,"reasoning_rate_usd_per_million_micros":3000000}]}"#)?;
+    let write = RunTelemetryWrite { attempts: vec![
+        RunTelemetryAttemptInput { provider: Some("acme".into()), model: Some("model-a".into()), harness: Some("codex".into()), reasoning: Some("high".into()), input_tokens: Some(100), output_tokens: Some(50), reasoning_tokens: Some(10), duration_ms: Some(20), outcome: Some("success".into()), ..Default::default() },
+        RunTelemetryAttemptInput { provider: None, model: None, harness: None, input_tokens: Some(7), output_tokens: Some(3), outcome: Some("error".into()), ..Default::default() },
+    ], summary: None };
+    let first = { let mut store = Store::open(&path)?; store.migrate()?; store.record_run_telemetry_with_pricing(&run_id, &write, 3, "telemetry-key", &authority, Some(&pricing))? };
+    let replay = { let mut store = Store::open(&path)?; store.migrate()?; store.record_run_telemetry_with_pricing(&run_id, &write, 4, "telemetry-key", &authority, Some(&pricing))? };
+    assert!(!first.replayed); assert!(replay.replayed); assert_eq!(first.value, replay.value);
+    let store = Store::open(&path)?; let mut store = store; store.migrate()?;
+    let run = store.get_run(&run_id)?.unwrap(); assert_eq!(run.telemetry.unwrap().estimated_cost_usd_micros, Some(230));
+    let aggregate = store.run_telemetry_aggregate(&RunTelemetryAggregateQuery::default())?;
+    assert_eq!(aggregate.rows.len(), 2); assert!(aggregate.rows.iter().any(|row| row.unattributed)); assert!(aggregate.rows.iter().any(|row| row.model == "model-a" && row.input_tokens == 100));
+    std::fs::remove_file(path).ok(); Ok(())
 }

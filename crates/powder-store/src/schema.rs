@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 27;
+pub const SCHEMA_VERSION: u32 = 28;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -117,10 +117,29 @@ CREATE TABLE IF NOT EXISTS runs (
   agent TEXT NOT NULL,
   claim_expires_at INTEGER NOT NULL,
   proof TEXT,
+  telemetry_attempt_count INTEGER,
+  telemetry_input_tokens INTEGER,
+  telemetry_output_tokens INTEGER,
+  telemetry_reasoning_tokens INTEGER,
+  telemetry_estimated_cost_usd_micros INTEGER,
+  telemetry_duration_ms INTEGER,
+  telemetry_pricing_version TEXT,
+  telemetry_outcome TEXT,
+  telemetry_unattributed_attempt_count INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_runs_card_created ON runs(card_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS run_telemetry_attempts (
+  id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  provider TEXT, model TEXT, harness TEXT, reasoning TEXT, input_tokens INTEGER, output_tokens INTEGER,
+  reasoning_tokens INTEGER, estimated_cost_usd_micros INTEGER, duration_ms INTEGER, outcome TEXT, pricing_version TEXT,
+  input_rate_usd_per_million_micros INTEGER, output_rate_usd_per_million_micros INTEGER, reasoning_rate_usd_per_million_micros INTEGER,
+  principal TEXT, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_run ON run_telemetry_attempts(run_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_model ON run_telemetry_attempts(model, provider, created_at);
 
 CREATE TABLE IF NOT EXISTS activities (
   id TEXT PRIMARY KEY,
@@ -549,4 +568,6 @@ claim_expires_at, created_at, updated_at, parent, risk FROM cards";
 
 pub const RUN_SELECT_SQL: &str =
     "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
-created_at, updated_at FROM runs WHERE id = ?1";
+telemetry_attempt_count, telemetry_input_tokens, telemetry_output_tokens, telemetry_reasoning_tokens,
+telemetry_estimated_cost_usd_micros, telemetry_duration_ms, telemetry_pricing_version, telemetry_outcome,
+telemetry_unattributed_attempt_count, created_at, updated_at FROM runs WHERE id = ?1";

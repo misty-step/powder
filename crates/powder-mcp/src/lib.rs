@@ -6,12 +6,12 @@ use powder_core::{
     parse_estimate as parse_card_estimate, parse_priority as parse_card_priority,
     parse_risk as parse_card_risk, parse_status as parse_card_status, Authority, Card, CardDetail,
     CardField, CardId, CardStatus, CardSummary, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyCursor, ReadyQuery, Risk, RunId,
+    ReadyCursor, ReadyQuery, Risk, RunId, RunTelemetryAggregateQuery, RunTelemetryWrite,
 };
 use powder_store::{
     BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput,
     KeyedOperationContext, RepositoryTier, RepositoryUpsert, RepositoryVisibility, SearchQuery,
-    Store,
+    Store, PricingConfig,
 };
 use serde_json::{json, Value};
 
@@ -112,6 +112,16 @@ pub const TOOLS: &[ToolDef] = &[
         name: "get_run",
         description: "Read one run with its card, activities, links, comments, and run state. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
         input_schema: r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
+    },
+    ToolDef {
+        name: "record_run_telemetry",
+        description: "Write nullable run-scoped telemetry attempts atomically with authenticated caller-keyed idempotency and audit evidence; repeated provider/model/harness attempts stay normalized and missing attribution is preserved.",
+        input_schema: r#"{"type":"object","required":["run_id","attempts","idempotency_key"],"properties":{"run_id":{"type":"string"},"attempts":{"type":"array","items":{"type":"object"}},"summary":{"type":"object"},"idempotency_key":{"type":"string"}}}"#,
+    },
+    ToolDef {
+        name: "run_telemetry_aggregate",
+        description: "Read SQL-backed run telemetry aggregates by agent, model, and provider with token, cost, duration, outcome mix, and an explicit unattributed bucket.",
+        input_schema: r#"{"type":"object","properties":{"agent":{"type":"string"},"model":{"type":"string"},"provider":{"type":"string"},"limit":{"type":"integer","minimum":1}}}"#,
     },
     ToolDef {
         name: "list_awaiting_input",
@@ -696,7 +706,18 @@ pub fn call_tool_store_with_authority(
                 })?;
             card_detail_payload(&detail)?
         }
-        "get_run" => {
+        "record_run_telemetry" => {
+            let run_id = run_id(args, "run_id")?;
+            let write: RunTelemetryWrite = serde_json::from_value(json!({"attempts": args["attempts"], "summary": args["summary"]})).map_err(to_string)?;
+            let pricing = PricingConfig::from_env().map_err(to_string)?;
+            let outcome = store.record_run_telemetry_with_pricing(&run_id, &write, now, required_idempotency_key(args)?, authority_arg(args, authority)?, pricing.as_ref()).map_err(to_string)?;
+            json!(outcome.value)
+        }
+        "run_telemetry_aggregate" => {
+            let query = RunTelemetryAggregateQuery { agent: optional_str(args, "agent").map(str::to_owned), model: optional_str(args, "model").map(str::to_owned), provider: optional_str(args, "provider").map(str::to_owned), limit: args["limit"].as_u64().unwrap_or(100) as usize };
+            json!(store.run_telemetry_aggregate(&query).map_err(to_string)?)
+        }
+                "get_run" => {
             let run_id = run_id(args, "run_id")?;
             json!(store
                 .get_run_detail(&run_id, detail_arg(args)?)
@@ -1010,7 +1031,7 @@ fn local_mutation_authority_preflight(
         }
         "create_card" | "update_card" | "manage_claim" | "answer_input" | "update_status"
         | "check_criterion" | "update_relations" | "add_link" | "add_comment"
-        | "append_work_log" | "report_papercut" | "request_input" | "complete_card" => {
+        | "append_work_log" | "report_papercut" | "request_input" | "complete_card" | "record_run_telemetry" => {
             authority_arg(args, transport_authority).map(|_| ())
         }
         _ => Ok(()),
@@ -1708,7 +1729,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 23);
+        assert_eq!(default_tools.len(), 25);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1898,6 +1919,8 @@ mod tests {
                 "manage_claim",
                 "get_card",
                 "get_run",
+                "record_run_telemetry",
+                "run_telemetry_aggregate",
                 "list_awaiting_input",
                 "list_approvals",
                 "answer_input",
@@ -1912,7 +1935,7 @@ mod tests {
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 23);
+        assert_eq!(default_names.len(), 25);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1924,7 +1947,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 32);
+        assert_eq!(admin_names.len(), 34);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));

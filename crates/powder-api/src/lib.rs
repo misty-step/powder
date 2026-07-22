@@ -275,6 +275,22 @@ pub const ROUTES: &[ApiRoute] = &[
         policy: Some(Operation::AnswerInput.rule()),
         body_shape: None,
     },
+    ApiRoute { method: "POST", path: "/api/v1/runs/{id}/telemetry", intent: "record run-scoped nullable telemetry attempts atomically with caller-keyed idempotency and audit evidence; pricing rates are supplied by the configured versioned table", policy: None, body_shape: Some(r#"{"attempts":[{"provider":null,"model":null,"harness":null,"reasoning":null,"input_tokens":null,"output_tokens":null,"reasoning_tokens":null,"estimated_cost_usd_micros":null,"duration_ms":null,"outcome":null,"pricing_version":null}],"summary":null}"#) },
+    ApiRoute { method: "GET", path: "/api/v1/runs/telemetry/aggregate", intent: "aggregate run telemetry in SQL by agent/provider/model with token, cost, duration, and outcome mix; missing attribution is grouped explicitly", policy: None, body_shape: None },
+    ApiRoute {
+        method: "POST",
+        path: "/api/v1/runs/{id}/telemetry",
+        intent: "record normalized run telemetry attempts with caller-keyed idempotency, persisted pricing snapshot, attribution, and audit evidence",
+        policy: Some(Operation::RecordRunTelemetry.rule()),
+        body_shape: Some(r#"{"attempts":[],"summary":null,"idempotency_key":"caller-generated"}"#),
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/runs/telemetry/aggregate",
+        intent: "aggregate run telemetry in SQL by agent/provider/model with token, cost, duration, and outcome mix; missing attribution is explicit; optional agent/model/provider/limit filters",
+        policy: None,
+        body_shape: None,
+    },
     ApiRoute {
         method: "GET",
         path: "/api/v1/runs/{id}",
