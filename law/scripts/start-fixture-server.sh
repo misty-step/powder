@@ -27,6 +27,11 @@ cargo run -q -p powder-cli -- create-card --db "$DB" --id 001 --title "Lifecycle
 cargo run -q -p powder-cli -- create-card --db "$DB" --id blocked-card --title "Blocked card" --acceptance "dependency clears" --status ready --estimate s --risk high --blocked-by blocker-dep >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id blocker-dep --title "Dependency the blocked card waits on" --acceptance "dependency work completes" --status ready >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id done-card --title "Done card" --acceptance "proof exists" --status done --estimate l --risk high >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id done-match --title "Done facet match" --acceptance "proof exists" --status done --estimate s --risk high >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id backlog-match --title "Backlog facet match" --acceptance "proof exists" --status backlog --estimate s --risk high >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id backlog-no-match --title "Backlog facet non-match" --acceptance "proof exists" --status backlog --estimate l --risk low >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id inprogress-match --title "In progress facet match" --acceptance "proof exists" --status in_progress --estimate s --risk high >/dev/null
+cargo run -q -p powder-cli -- create-card --db "$DB" --id inprogress-no-match --title "In progress facet non-match" --acceptance "proof exists" --status in_progress --estimate l --risk low >/dev/null
 
 # powder-915: init-db seeds ~24 "ratified tier" repository entities
 # (powder-916), every one of them at card_count 0 until something is filed

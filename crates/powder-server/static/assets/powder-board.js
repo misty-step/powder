@@ -1304,7 +1304,7 @@ function renderReadyFacet(group, key, values, label) {
   allChip.className = "pw-chip-btn"; allChip.type = "button";
   allChip.setAttribute("aria-pressed", String(state.filters[key].size === 0));
   allChip.innerHTML = `<span class="ae-chip">all ${escapeHtml(label)}</span>`;
-  allChip.addEventListener("click", () => { state.filters[key].clear(); buildFilters(); render(); void refreshReadyForFilters(); });
+  allChip.addEventListener("click", () => { state.filters[key].clear(); saveBoardState(); buildFilters(); render(); void refreshReadyForFilters(); });
   group.appendChild(allChip);
   for (const value of values) {
     const button = document.createElement("button"); button.className = "pw-chip-btn"; button.type = "button";
@@ -1313,6 +1313,7 @@ function renderReadyFacet(group, key, values, label) {
     button.addEventListener("click", () => {
       if (state.filters[key].has(value)) state.filters[key].clear();
       else { state.filters[key].clear(); state.filters[key].add(value); }
+      saveBoardState();
       buildFilters(); render(); void refreshReadyForFilters();
     });
     group.appendChild(button);
@@ -1320,7 +1321,6 @@ function renderReadyFacet(group, key, values, label) {
 }
 
 function buildFilters() {
-  if (!els.estimateFilters || !els.riskFilters) return;
   renderTierToggle();
   const repositories = state.repositories.length ? state.repositories : deriveRepositoriesFromCards();
   const visibleRepositorySet = new Set(
@@ -1356,6 +1356,7 @@ function buildFilters() {
   allChip.innerHTML = `<span class="ae-chip">${repoIcon("all")}All</span>`;
   allChip.addEventListener("click", () => {
     state.filters.repos.clear();
+    saveBoardState();
     buildFilters();
     render();
     void refreshReadyForFilters();
@@ -1373,6 +1374,7 @@ function buildFilters() {
     button.addEventListener("click", () => {
       if (state.filters.repos.has(repo)) state.filters.repos.delete(repo);
       else state.filters.repos.add(repo);
+      saveBoardState();
       buildFilters();
       render();
       void refreshReadyForFilters();
@@ -1391,6 +1393,7 @@ function buildFilters() {
     button.addEventListener("click", () => {
       if (state.filters.prios.has(prio)) state.filters.prios.delete(prio);
       else state.filters.prios.add(prio);
+      saveBoardState();
       buildFilters();
       render();
       void refreshReadyForFilters();
@@ -2005,6 +2008,8 @@ function renderCounts(buckets) {
   const activeFilterCount =
     state.filters.repos.size +
     state.filters.prios.size +
+    state.filters.estimates.size +
+    state.filters.risks.size +
     (state.filters.search.trim() ? 1 : 0) +
     (state.showAllTiers ? 1 : 0);
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
@@ -2023,6 +2028,8 @@ function saveBoardState() {
         filters: {
           repos: [...state.filters.repos],
           prios: [...state.filters.prios],
+          estimates: [...state.filters.estimates],
+          risks: [...state.filters.risks],
           search: state.filters.search,
           sort: state.filters.sort,
         },
@@ -2047,6 +2054,12 @@ function restoreBoardState() {
     const filters = saved.filters || {};
     state.filters.repos = new Set(Array.isArray(filters.repos) ? filters.repos : []);
     state.filters.prios = new Set(Array.isArray(filters.prios) ? filters.prios : []);
+    state.filters.estimates = new Set(
+      Array.isArray(filters.estimates) ? filters.estimates.filter((value) => READY_ESTIMATES.includes(value)) : [],
+    );
+    state.filters.risks = new Set(
+      Array.isArray(filters.risks) ? filters.risks.filter((value) => READY_RISKS.includes(value)) : [],
+    );
     state.filters.search = String(filters.search || "");
     state.filters.sort = ["repo", "prio", "id"].includes(filters.sort) ? filters.sort : "repo";
     els.textFilter.value = state.filters.search;
