@@ -216,6 +216,27 @@ for (const mode of MODES) {
   });
 }
 
+// powder-search-p2: exact card-id hits keep their source provenance, and a
+// search result retains the blocker relation needed by the derived blocked
+// strip rather than treating an unloaded summary as claimable.
+for (const mode of MODES) {
+  test(`board · ${mode} · search keeps exact-id provenance and blocked classification (powder-search-p2)`, async ({
+    page,
+  }) => {
+    const errors = await boot(page, mode);
+    await page.locator("#cmdk-toggle").click();
+    await page.locator("#cmdk-input").fill("blocked-card");
+    const option = page.locator('#cmdk-list [role="option"]').first();
+    await expect(option).toBeVisible();
+    await expect(option.locator(".pw-cmdk-item-source")).toContainText("cards / id");
+    await page.keyboard.press("Escape");
+    await page.locator("#text-filter").fill("blocked-card");
+    await expect(page.locator("#lane-ready .pw-blocked-cap")).toContainText("BLOCKED");
+    await expect(page.locator("#lane-ready")).toContainText("blocked-card");
+    await assertLaw(page, { consoleErrors: errors });
+  });
+}
+
 // Adversarial-review blocker: aria-modal="true" without focus containment
 // is a lie -- Tab used to walk straight out of the palette into the
 // visually-covered board. This proves the trap: Tab/Shift-Tab keep focus

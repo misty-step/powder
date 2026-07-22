@@ -245,8 +245,15 @@ function groupedSearchMatches(matches) {
     const card = match && match.card;
     if (!card || !card.id) continue;
     const rank = Number(match.rank);
+    const blockerContextKnown = Array.isArray(match.blocked_by);
+    const normalizedCard = normalizeCard(card);
+    // Search summaries are deliberately lean. The result-level blocker list is
+    // the authoritative relation context for cards that were not in the board
+    // page cache; never infer that an absent list means "unblocked".
+    if (blockerContextKnown) normalizedCard.blocked_by = match.blocked_by.map(String);
+    normalizedCard.searchResultBlockersKnown = blockerContextKnown;
     const candidate = {
-      card: normalizeCard(card),
+      card: normalizedCard,
       rank: Number.isFinite(rank) ? rank : Number.POSITIVE_INFINITY,
       source_kind: String(match.source_kind || "cards"),
       source_field: String(match.source_field || ""),
@@ -1606,6 +1613,10 @@ function priorityIndex(priority) {
 // including its fail-closed stance: a blocker id that is not on the board at
 // all still blocks -- it cannot be proven resolved.
 function hasUnresolvedBlocker(card, cardsById) {
+  // A search result can be outside the board page cache. If its response did
+  // not carry blocker context, fail closed rather than presenting an unloaded
+  // blocked card as claimable.
+  if (card.searchResultBlockersKnown === false) return true;
   return (card.blocked_by || []).some((id) => {
     const blocker = cardsById.get(id);
     return !blocker || blocker.displayStatus !== "done";
@@ -1624,7 +1635,10 @@ function bucket() {
       })
     : state.cards;
   const visible = sourceCards.filter(passes);
-  const cardsById = new Map(sourceCards.map((card) => [card.id, card]));
+  // Keep the full loaded board as blocker context even when the search result
+  // itself is a lean summary; matching cards may depend on non-matching cards.
+  const cardsById = new Map(state.cards.map((card) => [card.id, card]));
+  for (const card of sourceCards) cardsById.set(card.id, card);
   return {
     backlog: sorted(visible.filter((card) => card.displayStatus === "backlog")),
     ready: sorted(
