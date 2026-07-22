@@ -440,24 +440,6 @@ impl Authority {
         }
     }
 
-    /// A non-admin actor may only mutate a card that they hold the active
-    /// claim on. `holder` is `None` when the card has no active claim.
-    pub fn require_holder(&self, holder: Option<&str>) -> Result<(), DomainError> {
-        match self {
-            Self::Unchecked => Ok(()),
-            Self::Principal { is_admin: true, .. } => Ok(()),
-            Self::Principal {
-                name,
-                is_admin: false,
-            } => match holder {
-                Some(current) if current == name => Ok(()),
-                _ => Err(DomainError::forbidden(format!(
-                    "principal {name} does not hold the active claim"
-                ))),
-            },
-        }
-    }
-
     pub fn role(&self) -> PrincipalRole {
         match self {
             Self::Unchecked => PrincipalRole::Unchecked,
