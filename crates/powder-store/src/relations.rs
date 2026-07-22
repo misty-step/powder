@@ -91,8 +91,9 @@ use std::collections::{HashMap, HashSet};
 use powder_core::{Card, CardId};
 use rusqlite::{types::Value, Connection, TransactionBehavior};
 use serde::Serialize;
+use serde_json::from_str;
 
-use crate::{append_card_event, load_all_cards, load_card_optional, non_empty, persist_card};
+use crate::{append_card_event, load_card_optional, non_empty, persist_card};
 use crate::{Result, Store};
 
 /// Which pair of lists one edge connects. `Related` mirrors into the same
@@ -121,14 +122,6 @@ impl RelationField {
             RelationField::Related => RelationField::Related,
             RelationField::Blocks => RelationField::BlockedBy,
             RelationField::BlockedBy => RelationField::Blocks,
-        }
-    }
-
-    fn get(self, card: &Card) -> &Vec<CardId> {
-        match self {
-            RelationField::Related => &card.related,
-            RelationField::Blocks => &card.blocks,
-            RelationField::BlockedBy => &card.blocked_by,
         }
     }
 
@@ -308,9 +301,10 @@ pub struct ParentDoctorIssue {
     pub repaired: bool,
 }
 
-/// The bucket to which a valid card belongs for hierarchy coverage. Cards with
-/// no parent belong to their repository's unsorted bucket; descendants belong
-/// to the root ancestor that owns their nested epic.
+/// The bucket to which a valid card belongs for hierarchy coverage. Parentless
+/// leaves belong to their repository's unsorted bucket; parentless cards with
+/// direct children are root epics and own their descendants, including
+/// themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParentCoverageBucket {
@@ -392,8 +386,65 @@ impl RelationsDoctorReport {
     }
 }
 
-fn find_relation_issues(cards: &[Card]) -> Vec<RelationsDoctorIssue> {
-    let by_id: HashMap<&CardId, &Card> = cards.iter().map(|card| (&card.id, card)).collect();
+#[derive(Debug)]
+struct RelationGraphCard {
+    id: CardId,
+    related: Vec<CardId>,
+    blocks: Vec<CardId>,
+    blocked_by: Vec<CardId>,
+}
+
+impl RelationGraphCard {
+    fn field(&self, field: RelationField) -> &Vec<CardId> {
+        match field {
+            RelationField::Related => &self.related,
+            RelationField::Blocks => &self.blocks,
+            RelationField::BlockedBy => &self.blocked_by,
+        }
+    }
+}
+
+fn load_relation_cards(connection: &Connection) -> Result<Vec<RelationGraphCard>> {
+    let mut statement = connection.prepare(
+        "SELECT id, related_json, blocks_json, blocked_by_json FROM cards ORDER BY rowid",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .filter_map(|(id, related, blocks, blocked_by)| {
+            let normalized_id = CardId::new(id.clone()).ok()?;
+            if id != normalized_id.as_str() {
+                return None;
+            }
+            Some(Ok(RelationGraphCard {
+                id: normalized_id,
+                related: decode_relation_ids(&related),
+                blocks: decode_relation_ids(&blocks),
+                blocked_by: decode_relation_ids(&blocked_by),
+            }))
+        })
+        .collect()
+}
+
+fn decode_relation_ids(raw: &str) -> Vec<CardId> {
+    from_str::<Vec<String>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| CardId::new(id).ok())
+        .collect()
+}
+
+fn find_relation_issues(cards: &[RelationGraphCard]) -> Vec<RelationsDoctorIssue> {
+    let by_id: HashMap<&CardId, &RelationGraphCard> =
+        cards.iter().map(|card| (&card.id, card)).collect();
     let mut issues = Vec::new();
     for card in cards {
         for field in [
@@ -401,7 +452,7 @@ fn find_relation_issues(cards: &[Card]) -> Vec<RelationsDoctorIssue> {
             RelationField::BlockedBy,
             RelationField::Related,
         ] {
-            for target_id in field.get(card) {
+            for target_id in card.field(field) {
                 if target_id == &card.id {
                     continue;
                 }
@@ -410,7 +461,7 @@ fn find_relation_issues(cards: &[Card]) -> Vec<RelationsDoctorIssue> {
                     continue;
                 };
                 let mirror_field = field.mirror();
-                if !mirror_field.get(target).contains(&card.id) {
+                if !target.field(mirror_field).contains(&card.id) {
                     issues.push(RelationsDoctorIssue {
                         card_id: card.id.clone(),
                         field,
@@ -455,9 +506,8 @@ struct RawParentRow {
 }
 
 fn raw_parent_rows(connection: &Connection) -> Result<Vec<RawParentRow>> {
-    let mut statement = connection.prepare(
-        "SELECT rowid, id, parent, repo FROM cards ORDER BY rowid",
-    )?;
+    let mut statement =
+        connection.prepare("SELECT rowid, id, parent, repo FROM cards ORDER BY rowid")?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -531,11 +581,18 @@ fn classify_parent_coverage(
     invalid_parent_cards: &HashSet<String>,
     unique_card_rows: &HashSet<i64>,
 ) -> ParentCoverageReport {
+    let root_epics = parents
+        .values()
+        .filter_map(Option::as_ref)
+        .filter(|parent| ids.contains(*parent))
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut assignments = Vec::new();
     let mut unclassified = 0;
     for row in rows
         .iter()
-        .filter(|row| unique_card_rows.contains(&row.rowid)) {
+        .filter(|row| unique_card_rows.contains(&row.rowid))
+    {
         let card_id = row.card_id.as_ref().expect("filtered card id");
         if invalid_parent_cards.contains(card_id.as_str()) {
             unclassified += 1;
@@ -546,10 +603,15 @@ fn classify_parent_coverage(
             continue;
         };
         if parent.is_none() {
+            let is_root_epic = root_epics.contains(card_id.as_str());
             assignments.push(ParentCoverageAssignment {
                 card_id: card_id.to_string(),
-                bucket: ParentCoverageBucket::Unsorted,
-                ancestor_id: None,
+                bucket: if is_root_epic {
+                    ParentCoverageBucket::EpicAncestor
+                } else {
+                    ParentCoverageBucket::Unsorted
+                },
+                ancestor_id: is_root_epic.then(|| card_id.to_string()),
                 repo: row.repo.clone(),
             });
             continue;
@@ -612,14 +674,27 @@ fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
                 kind: ParentIssueKind::InvalidStoredId,
                 evidence: format!(
                     "cards.id row {} is not a non-empty text id: {}",
-                    row.rowid,
-                    &row.card_description
+                    row.rowid, &row.card_description
                 ),
                 repaired: false,
             });
             continue;
         }
-        let card_id = row.card_id.as_ref().expect("validated card id").to_string();
+        let parsed_card_id = row.card_id.as_ref().expect("validated card id");
+        if row.card_text.as_deref() != Some(parsed_card_id.as_str()) {
+            issues.push(ParentDoctorIssue {
+                card_id: row.card_text.clone(),
+                parent_id: row.parent_text.clone(),
+                kind: ParentIssueKind::InvalidStoredId,
+                evidence: format!(
+                    "cards.id row {} is not canonical text id: {}",
+                    row.rowid, &row.card_description
+                ),
+                repaired: false,
+            });
+            continue;
+        }
+        let card_id = parsed_card_id.to_string();
         if !ids.insert(card_id.clone()) {
             issues.push(ParentDoctorIssue {
                 card_id: Some(card_id),
@@ -634,23 +709,39 @@ fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
             continue;
         }
         unique_card_rows.insert(row.rowid);
-        if row.parent_description != "NULL" && row.parent_id.is_none() {
+        let invalid_parent = match (&row.parent_text, &row.parent_id) {
+            (None, None) => row.parent_description != "NULL",
+            (Some(raw), Some(parsed)) => raw != parsed.as_str(),
+            _ => true,
+        };
+        if invalid_parent {
             invalid_parent_cards.insert(card_id.clone());
             issues.push(ParentDoctorIssue {
                 card_id: Some(card_id.clone()),
                 parent_id: row.parent_text.clone(),
                 kind: ParentIssueKind::InvalidStoredId,
                 evidence: format!(
-                    "cards.parent for {card_id} is not a non-empty text id: {}",
+                    "cards.parent for {card_id} is not canonical text id or NULL: {}",
                     &row.parent_description
                 ),
                 repaired: false,
             });
         }
-        parents.insert(card_id, row.parent_id.as_ref().map(ToString::to_string));
+        parents.insert(
+            card_id,
+            (!invalid_parent)
+                .then(|| row.parent_id.as_ref().map(ToString::to_string))
+                .flatten(),
+        );
     }
-    for row in rows.iter().filter(|row| unique_card_rows.contains(&row.rowid)) {
+    for row in rows
+        .iter()
+        .filter(|row| unique_card_rows.contains(&row.rowid))
+    {
         let card_id = row.card_id.as_ref().expect("validated card id").to_string();
+        if invalid_parent_cards.contains(&card_id) {
+            continue;
+        }
         let Some(parent) = row.parent_id.as_ref().map(ToString::to_string) else {
             continue;
         };
@@ -738,15 +829,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let parent_report = scan_parent_graph(&transaction)?;
-            let has_invalid_stored_id = parent_report
-                .issues
-                .iter()
-                .any(|issue| issue.kind == ParentIssueKind::InvalidStoredId);
-            let cards = if has_invalid_stored_id {
-                Vec::new()
-            } else {
-                load_all_cards(&transaction)?
-            };
+            let cards = load_relation_cards(&transaction)?;
             let mut issues = find_relation_issues(&cards);
             for issue in &mut issues {
                 mirror_relation_change(
@@ -782,15 +865,7 @@ impl Store {
             });
         }
         let parent_report = scan_parent_graph(&self.connection)?;
-        let has_invalid_stored_id = parent_report
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ParentIssueKind::InvalidStoredId);
-        let cards = if has_invalid_stored_id {
-            Vec::new()
-        } else {
-            load_all_cards(&self.connection)?
-        };
+        let cards = load_relation_cards(&self.connection)?;
         let issues = find_relation_issues(&cards);
         Ok(RelationsDoctorReport {
             scanned: parent_report.scanned,
