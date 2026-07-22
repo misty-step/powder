@@ -425,6 +425,8 @@ pub struct CardSummaryPage {
     pub total_count: usize,
     pub has_more: bool,
     pub excluded_terminal_count: usize,
+    pub next_after: Option<String>,
+    pub cycle_card_ids: Vec<String>,
 }
 
 /// Decode a list response into client-card summaries, tolerating unknown
@@ -451,6 +453,8 @@ pub fn parse_card_summary_page(response: Value) -> Result<CardSummaryPage, Strin
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(0);
+    let next_after = response.get("next_after").and_then(Value::as_str).map(str::to_owned);
+    let cycle_card_ids = response.get("cycle_card_ids").and_then(Value::as_array).map(|ids| ids.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
     let mut cards = serde_json::from_value::<Vec<ClientCardSummary>>(Value::Array(cards))
         .map_err(|err| format!("remote list response card decode failed: {err}"))?;
     for card in &mut cards {
@@ -461,6 +465,8 @@ pub fn parse_card_summary_page(response: Value) -> Result<CardSummaryPage, Strin
         total_count,
         has_more,
         excluded_terminal_count,
+        next_after,
+        cycle_card_ids,
     })
 }
 

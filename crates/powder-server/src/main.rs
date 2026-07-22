@@ -37,7 +37,7 @@ use powder_core::Priority;
 use powder_core::{
     canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
     parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
-    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyQuery, RunId,
+    CardFieldError, CardId, CardStatus, DetailLevel, PapercutReport, ReadyCursor, ReadyQuery, RunId,
 };
 use powder_shell::unix_now;
 use powder_store::{
@@ -248,6 +248,13 @@ impl Config {
             env_value(&vars, "POWDER_PUBLIC_READS"),
         )?
         .unwrap_or(false);
+        if public_reads && auth_mode == AuthMode::ApiKey && !bind_addr.ip().is_loopback() {
+            return Err(ConfigError::new(
+                "POWDER_PUBLIC_READS",
+                "public reads are only allowed on a loopback bind in api-key mode",
+            ));
+        }
+
 
         Ok(Self {
             db_path,
@@ -404,7 +411,10 @@ struct Onboarding {
 #[derive(Debug, Deserialize)]
 struct ReadyParams {
     limit: Option<usize>,
+    repo: Option<String>,
     estimate: Option<String>,
+    risk: Option<String>,
+    priority: Option<String>,
     /// powder-cards-api-paged-continuation: resume past a prior response's
     /// `next_after` instead of only ever seeing the first `limit` cards of
     /// the same order. See `ListCardsParams::after` for the full
@@ -1106,6 +1116,21 @@ async fn routes() -> Json<serde_json::Value> {
     Json(powder_api::routes_json())
 }
 
+fn parse_repository_filter(raw: &str) -> Result<Vec<String>, ApiError> {
+    if raw.trim().is_empty() {
+        return Err(ApiError::bad_request("repo must contain at least one repository"));
+    }
+    raw.split(',')
+        .map(str::trim)
+        .map(|value| {
+            if value.is_empty() {
+                Err(ApiError::bad_request("repo must not contain a blank repository"))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .collect()
+}
 async fn list_ready(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1113,16 +1138,41 @@ async fn list_ready(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let limit = params.limit.unwrap_or(20).max(1);
+    let repo = params
+        .repo
+        .as_deref()
+        .map(parse_repository_filter)
+        .transpose()?;
     let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
-    let after = params.after.as_deref().map(CardId::new).transpose()?;
-    let query = ReadyQuery::new(unix_now(), limit).with_estimate(estimate);
-    let page = lock_store(&state)?.list_ready_page_after(query, after.as_ref())?;
+    let risk = params.risk.as_deref().map(parse_risk).transpose()?;
+    let priority = params.priority.as_deref().map(parse_priority).transpose()?;
+    let query = ReadyQuery::new(unix_now(), limit)
+        .with_repositories(repo.unwrap_or_default())
+        .with_estimate(estimate)
+        .with_risk(risk)
+        .with_priority(priority);
+    let after = params
+        .after
+        .as_deref()
+        .map(|raw| {
+            if raw.contains('.') {
+                ReadyCursor::decode_for_query(raw, &query)
+            } else {
+                CardId::new(raw.to_string())
+                    .map(|anchor| ReadyCursor::for_query(&query, anchor, Vec::new()))
+                    .map_err(|err| powder_core::DomainError::validation("after", err.to_string()))
+            }
+        })
+        .transpose()?;
+    let page = lock_store(&state)?
+        .list_ready_page_after(query.clone(), after.as_ref())?;
     Ok(Json(card_list_page_json(
         page.cards,
         page.total_count,
         page.excluded_terminal_count,
         &page.cycle_card_ids,
         page.next_after,
+        page.ready_cursor,
     )))
 }
 
@@ -1204,6 +1254,7 @@ async fn list_cards(
         page.excluded_terminal_count,
         &page.cycle_card_ids,
         page.next_after,
+        None,
     )))
 }
 
@@ -1213,6 +1264,7 @@ fn card_list_page_json(
     excluded_terminal_count: usize,
     cycle_card_ids: &[CardId],
     next_after: Option<CardId>,
+    ready_cursor: Option<String>,
 ) -> serde_json::Value {
     let has_more = total_count > cards.len();
     let mut payload = json!({
@@ -1246,7 +1298,7 @@ fn card_list_page_json(
     // presence/absence is the authoritative "is there another page"
     // answer once a caller is walking pages with `after`.
     if let Some(next_after) = next_after {
-        payload["next_after"] = json!(next_after);
+        payload["next_after"] = json!(ready_cursor.unwrap_or_else(|| next_after.to_string()));
     }
     payload
 }

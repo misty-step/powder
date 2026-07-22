@@ -315,6 +315,9 @@ pub struct CardListPage {
     /// last page, or whenever the eligible set already fits within
     /// `limit`.
     pub next_after: Option<CardId>,
+    /// Encoded Ready continuation when the page needs a stable snapshot.
+    /// List-cards callers continue to use `next_after` unchanged.
+    pub ready_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2550,8 +2553,30 @@ impl Store {
     pub fn list_ready_page_after(
         &self,
         query: ReadyQuery,
-        after: Option<&CardId>,
+        after: Option<&ReadyCursor>,
     ) -> Result<CardListPage> {
+        if let Some(cursor) = after {
+            if !cursor.matches_query(&query) {
+                return Err(DomainError::validation(
+                    "after",
+                    "stale continuation cursor: query filters do not match",
+                )
+                .into());
+            }
+        }
+        // Resolve caller-supplied repository aliases once at the Store seam.
+        // The original typed query remains bound into ReadyCursor, while
+        // matching uses the registered canonical repository name.
+        let repository_filters = query
+            .repo
+            .as_ref()
+            .map(|repositories| {
+                repositories
+                    .iter()
+                    .map(|repository| resolve_repository_name(&self.connection, repository))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let all_cards = load_all_cards(&self.connection)?;
         // reuses the same full scan already loaded above, rather than a
         // second query per blocker: a blocker missing from this map is
@@ -2564,9 +2589,32 @@ impl Store {
             }) {
                 continue;
             }
+            if repository_filters.as_ref().is_some_and(|repositories| {
+                let card_repo = card
+                    .repo
+                    .as_deref()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| repo_from_numeric_card_id_prefix(card.id.as_str()));
+                !repositories.iter().flatten().any(|repository| {
+                    card_repo.as_deref().is_some_and(|candidate| {
+                        canonical_repo_matches(candidate, repository.as_str())
+                    })
+                })
+            }) {
+                continue;
+            }
             if query
                 .estimate
                 .is_some_and(|estimate| card.estimate != Some(estimate))
+            {
+                continue;
+            }
+            if query.risk.is_some_and(|risk| card.risk != Some(risk)) {
+                continue;
+            }
+            if query
+                .priority
+                .is_some_and(|priority| card.priority != priority)
             {
                 continue;
             }
@@ -2576,13 +2624,45 @@ impl Store {
 
         let order = powder_core::order_ready_cards(cards);
         let cycle_card_ids = order.cycle_card_ids;
-        let (cards, next_after) = paginate_ordered_cards(order.cards, query.limit, after)?;
+        let mut ordered_cards = order.cards;
+        // A cycle is emitted in a stable tie-break group. If a non-anchor
+        // member departs between pages, recomputing the graph can move cards
+        // before the anchor. Replay the prior ordered snapshot first so the
+        // continuation cannot silently skip those cards. New cards retain
+        // their current order after the snapshot intersection.
+        if let Some(cursor) = after.filter(|cursor| !cursor.snapshot.is_empty()) {
+            let mut by_id = ordered_cards
+                .into_iter()
+                .map(|card| (card.id.clone(), card))
+                .collect::<HashMap<_, _>>();
+            let mut replayed = Vec::with_capacity(by_id.len());
+            for id in &cursor.snapshot {
+                if let Some(card) = by_id.remove(id) { replayed.push(card); }
+            }
+            replayed.extend(by_id.into_values());
+            replayed.sort_by(|left, right| {
+                let left_pos = cursor.snapshot.iter().position(|id| id == &left.id);
+                let right_pos = cursor.snapshot.iter().position(|id| id == &right.id);
+                left_pos.cmp(&right_pos).then_with(|| powder_core::ready_sort_cmp(left, right))
+            });
+            ordered_cards = replayed;
+        }
+        let snapshot = ordered_cards.iter().map(|card| card.id.clone()).collect::<Vec<_>>();
+        let (cards, next_after) = paginate_ordered_cards(
+            ordered_cards,
+            query.limit,
+            after.map(|cursor| &cursor.anchor),
+        )?;
+        let ready_cursor = next_after.as_ref().filter(|_| !cycle_card_ids.is_empty()).map(|anchor| {
+            ReadyCursor::for_query(&query, anchor.clone(), snapshot).encode()
+        });
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count: 0,
             cycle_card_ids,
             next_after,
+            ready_cursor,
         })
     }
 
@@ -2683,6 +2763,7 @@ impl Store {
             excluded_terminal_count,
             cycle_card_ids: Vec::new(),
             next_after,
+            ready_cursor: None,
         })
     }
 

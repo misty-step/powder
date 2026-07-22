@@ -30,9 +30,24 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mut query = format!("limit={limit}");
+            if let Some(repo) = optional_str(args, "repo") {
+                if repo.trim().is_empty() { return Err("repo must contain at least one repository".to_string()); }
+                query.push_str(&format!("&repo={}", urlencode(repo)));
+            }
             if let Some(estimate) = optional_str(args, "estimate") {
                 parse_estimate(estimate)?;
                 query.push_str(&format!("&estimate={}", urlencode(estimate)));
+            }
+            if let Some(risk) = optional_str(args, "risk") {
+                parse_risk(risk)?;
+                query.push_str(&format!("&risk={}", urlencode(risk)));
+            }
+            if let Some(priority) = optional_str(args, "priority") {
+                parse_priority(priority)?;
+                query.push_str(&format!("&priority={}", urlencode(priority)));
+            }
+            if let Some(after) = optional_str(args, "after") {
+                query.push_str(&format!("&after={}", urlencode(after)));
             }
             let response = client.get(&format!("/api/v1/cards/ready?{query}"))?;
             remote_card_summary_page_payload(response)?
