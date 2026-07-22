@@ -93,6 +93,15 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "POST",
+        path: "/api/v1/repositories",
+        intent: "create one repository entity; requires authenticated repository-admin authority",
+        policy: Some(Operation::UpsertRepository.rule()),
+        body_shape: Some(
+            r#"{"name":"...","aliases":[],"visibility":"visible","tier":"active","import_provenance":null} -- name is required; every other field is optional"#,
+        ),
+    },
+    ApiRoute {
+        method: "POST",
         path: "/api/v1/repositories/normalize",
         intent: "normalize legacy repository strings across cards and audit every correction",
         policy: Some(Operation::NormalizeRepositories.rule()),
@@ -447,6 +456,23 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("acceptance"));
+
+        let create_repository = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| {
+                route["method"] == "POST" && route["path"] == "/api/v1/repositories"
+            })
+            .expect("root repository creation route is documented");
+        assert_eq!(
+            create_repository["policy"]["operation"],
+            Operation::UpsertRepository.as_str()
+        );
+        assert!(create_repository["body_shape"]
+            .as_str()
+            .unwrap()
+            .contains("\"name\""));
 
         let healthz_shaped = json
             .as_array()
