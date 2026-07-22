@@ -2,15 +2,15 @@ use std::collections::HashMap;
 
 use powder_core::{
     Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
-    CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DenialClass, DetailLevel, DomainError,
+    CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DetailLevel, DomainError,
     EpicEvidence, EpicState, EvidenceKind, Link, LinkId, Operation, Run, RunDetail, RunId,
     RunState, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{
-    append_activity_attributed, load_all_cards, load_card, non_empty, non_empty_scrubbed,
-    persist_card, persist_run, schema::RUN_SELECT_SQL, Result, RunRecord, Store, StoreError,
+    load_all_cards, load_card, non_empty, non_empty_scrubbed, schema::RUN_SELECT_SQL, Result,
+    RunRecord, Store, StoreError,
 };
 
 const CONCISE_DETAIL_LIMIT: i64 = 20;
@@ -197,74 +197,108 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Run> {
-        let actor = non_empty("actor", actor)?;
-        let answer = non_empty_scrubbed("answer", answer)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut run = load_run(&transaction, run_id)?;
-        if run.state != RunState::AwaitingInput {
-            return Err(
-                DomainError::conflict(format!("run {run_id} is not awaiting input")).into(),
-            );
-        }
-        let mut card = load_card(&transaction, &run.card_id)?;
-        if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
-            return Err(DomainError::conflict(format!(
-                "run {run_id} is not the current claim for card {}",
-                card.id
-            ))
-            .into());
-        }
-        authority.require_identity(&actor).map_err(|error| {
-            DomainError::authority_denied(DenialClass::IdentityMismatch, error.to_string())
-        })?;
-        super::authorize_card_operation(
-            authority,
-            Operation::AnswerInput,
-            &card,
-            Some(run_id),
-            None,
-            now,
-        )?;
-
-        card.status = CardStatus::InProgress;
-        card.updated_at = now;
-        run.state = RunState::Active;
-        run.updated_at = now;
-
-        persist_card(&transaction, &card)?;
-        persist_run(&transaction, &run)?;
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Response,
-            &format!("answered by {actor}: {answer}"),
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
-        super::append_attributed_card_event(
-            &transaction,
-            &card.id,
-            super::MutationAudit {
-                operation: Operation::AnswerInput,
-                resource: card.id.as_str(),
-                semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
-                run_id: Some(run_id),
-                reason: None,
-                event_type: "answer-input",
-                actor: &actor,
-                payload: "answered input",
-                subject_kind: "run",
-                subject_id: run_id.as_str(),
-                authority,
-            },
-            now,
-        )?;
+        let run = answer_input_in_transaction(&transaction, run_id, actor, answer, now, authority)?;
         transaction.commit()?;
         Ok(run)
     }
+
+    pub fn answer_input_keyed(
+        &mut self,
+        run_id: &RunId,
+        actor: &str,
+        answer: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<super::IdempotencyOutcome<Run>> {
+        let payload = serde_json::json!({"actor": actor, "answer": answer});
+        self.with_keyed_operation(
+            Operation::AnswerInput,
+            format!("run:{}", run_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                answer_input_in_transaction(transaction, run_id, actor, answer, now, authority)
+            },
+        )
+    }
+}
+
+fn answer_input_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &RunId,
+    actor: &str,
+    answer: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<Run> {
+    let actor = non_empty("actor", actor)?;
+    let answer = non_empty_scrubbed("answer", answer)?;
+    let mut run = load_run(transaction, run_id)?;
+    if run.state != RunState::AwaitingInput {
+        return Err(DomainError::conflict(format!("run {run_id} is not awaiting input")).into());
+    }
+    let mut card = load_card(transaction, &run.card_id)?;
+    if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
+        return Err(DomainError::conflict(format!(
+            "run {run_id} is not the current claim for card {}",
+            card.id
+        ))
+        .into());
+    }
+    authority.require_identity(&actor).map_err(|error| {
+        DomainError::authority_denied(
+            powder_core::DenialClass::IdentityMismatch,
+            error.to_string(),
+        )
+    })?;
+    super::authorize_card_operation(
+        authority,
+        Operation::AnswerInput,
+        &card,
+        Some(run_id),
+        None,
+        now,
+    )?;
+    card.status = CardStatus::InProgress;
+    card.updated_at = now;
+    run.state = RunState::Active;
+    run.updated_at = now;
+    super::persist_card(transaction, &card)?;
+    super::persist_run(transaction, &run)?;
+    super::append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Response,
+        &format!("answered by {actor}: {answer}"),
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    super::append_attributed_card_event(
+        transaction,
+        &card.id,
+        super::MutationAudit {
+            operation: Operation::AnswerInput,
+            resource: card.id.as_str(),
+            semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+            run_id: Some(run_id),
+            reason: None,
+            event_type: "answer-input",
+            actor: &actor,
+            payload: "answered input",
+            subject_kind: "run",
+            subject_id: run_id.as_str(),
+            authority,
+        },
+        now,
+    )?;
+    Ok(run)
 }
 
 /// powder-epic-ready-plan: `card.blocked_by` already shows depth-1 blockers

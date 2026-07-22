@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DenialClass, DetailLevel, DomainError, Estimate, Operation, Priority, ReadyCursor, ReadyQuery, Risk, RunId,
-    RunState,
+    DenialClass, DetailLevel, DomainError, Estimate, Operation, Priority, ReadyCursor, ReadyQuery,
+    Risk, RunId, RunState,
 };
 
 use crate::schema::SCHEMA;
@@ -5481,7 +5481,10 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
     ));
     assert!(matches!(
         store.request_input(&claim.run_id, "Approve?", 20, &intruder),
-        Err(StoreError::Domain(DomainError::Forbidden(_)))
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::CrossResource,
+            ..
+        }))
     ));
 
     // Worker execution and lifecycle effects are claim-bound; only the
@@ -7957,6 +7960,100 @@ fn keyed_store_mutations_do_not_duplicate_real_rows() {
         .events
         .iter()
         .any(|event| event.operation.as_deref() == Some("work_log")));
+}
+
+#[test]
+fn keyed_link_attachment_and_answer_delivery_replay_atomically() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("keyed-lifecycle")?;
+    store.import_cards(vec![ready_card("keyed-lifecycle", 2)])?;
+    let admin = Authority::principal("operator", true);
+
+    let first_link = store.add_link_as_keyed(
+        &card_id,
+        "proof",
+        "https://example.test/proof",
+        10,
+        "link-1",
+        &admin,
+    )?;
+    assert!(!first_link.replayed);
+    let replay_link = store.add_link_as_keyed(
+        &card_id,
+        "proof",
+        "https://example.test/proof",
+        11,
+        "link-1",
+        &admin,
+    )?;
+    assert!(replay_link.replayed);
+    assert_eq!(
+        store.connection.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM links WHERE card_id = ?1",
+            [card_id.as_str()],
+            |row| row.get(0),
+        )?,
+        1
+    );
+    let conflict = store.add_link_as_keyed(
+        &card_id,
+        "other",
+        "https://example.test/other",
+        12,
+        "link-1",
+        &admin,
+    );
+    assert!(matches!(
+        conflict,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: DenialClass::IdempotencyConflict,
+            ..
+        }))
+    ));
+
+    let image = store.attach_image_as_keyed(
+        &card_id,
+        b"image-bytes",
+        "image/png",
+        "proof.png",
+        13,
+        "image-1",
+        &admin,
+    )?;
+    assert!(!image.replayed);
+    let image_replay = store.attach_image_as_keyed(
+        &card_id,
+        b"image-bytes",
+        "image/png",
+        "proof.png",
+        14,
+        "image-1",
+        &admin,
+    )?;
+    assert!(image_replay.replayed);
+    assert_eq!(store.attachments_for_card(&card_id)?.len(), 1);
+    store.detach_as_keyed(&card_id, &image.value.id, 15, "detach-1", &admin)?;
+    let detached = store.detach_as_keyed(&card_id, &image.value.id, 16, "detach-1", &admin)?;
+    assert!(detached.replayed);
+
+    let worker = Authority::principal("worker", false);
+    let claim = store.claim_card(&card_id, "worker", 20, 3600, &worker)?;
+    store.update_status(&card_id, CardStatus::InProgress, 21, &worker)?;
+    let requested =
+        store.request_input_keyed(&claim.run_id, "Approve?", 22, "request-1", &worker)?;
+    assert!(!requested.replayed);
+    let requested_replay =
+        store.request_input_keyed(&claim.run_id, "Approve?", 23, "request-1", &worker)?;
+    assert!(requested_replay.replayed);
+    let answered =
+        store.answer_input_keyed(&claim.run_id, "worker", "Approved", 24, "answer-1", &worker)?;
+    assert!(!answered.replayed);
+    let answered_replay =
+        store.answer_input_keyed(&claim.run_id, "worker", "Approved", 25, "answer-1", &worker)?;
+    assert!(answered_replay.replayed);
+    assert_eq!(answered.value.state, RunState::Active);
+    Ok(())
 }
 
 #[test]

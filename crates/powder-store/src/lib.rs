@@ -3776,70 +3776,53 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<AttachmentMeta> {
-        let mime = non_empty("mime", mime)?;
-        if !is_supported_image_mime(&mime) {
-            return Err(DomainError::validation(
-                "mime",
-                format!("unsupported image MIME type: {mime}"),
-            )
-            .into());
-        }
-        let filename = non_empty_scrubbed("filename", filename)?;
-        let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
-        let id = format!("{:x}", Sha256::digest(bytes));
-        let size = i64::try_from(bytes.len())
-            .map_err(|_| DomainError::validation("bytes", "image is too large to store"))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_card(&transaction, card_id)?;
-        transaction.execute(
-            "INSERT INTO attachments (id, mime, size, bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO NOTHING",
-            params![id, mime, size, bytes, now],
-        )?;
-        let (stored_mime, stored_size) = transaction.query_row(
-            "SELECT mime, size FROM attachments WHERE id = ?1",
-            [&id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )?;
-        transaction.execute(
-            "INSERT INTO card_attachments
-             (card_id, attachment_id, filename, created_at, principal)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(card_id, attachment_id) DO UPDATE SET
-               filename = excluded.filename,
-               created_at = excluded.created_at,
-               principal = excluded.principal",
-            params![card_id.as_str(), id, filename, now, principal],
-        )?;
-        append_attributed_card_event(
+        let attachment = attach_image_in_transaction(
             &transaction,
             card_id,
-            MutationAudit {
-                operation: Operation::AttachImage,
-                resource: card_id.as_str(),
-                semantic_identity: Some(principal.as_str()),
-                run_id: None,
-                reason: Some("attachment correction"),
-                event_type: "attachment",
-                actor: &principal,
-                payload: "attached image",
-                subject_kind: "attachment",
-                subject_id: &id,
-                authority,
-            },
+            bytes,
+            mime,
+            filename,
             now,
+            authority,
         )?;
         transaction.commit()?;
-        Ok(AttachmentMeta {
-            id,
-            filename,
-            mime: stored_mime,
-            size: stored_size,
-            created_at: now,
-        })
+        Ok(attachment)
+    }
+
+    pub fn attach_image_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        bytes: &[u8],
+        mime: &str,
+        filename: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<AttachmentMeta>> {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let payload = json!({"digest": digest, "mime": mime, "filename": filename});
+        self.with_keyed_operation(
+            Operation::AttachImage,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                attach_image_in_transaction(
+                    transaction,
+                    card_id,
+                    bytes,
+                    mime,
+                    filename,
+                    now,
+                    authority,
+                )
+            },
+        )
     }
 
     pub fn attachment_blob(&self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
@@ -3871,48 +3854,34 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<()> {
-        let attachment_id = non_empty("attachment_id", attachment_id)?;
-        let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_card(&transaction, card_id)?;
-        let removed = transaction.execute(
-            "DELETE FROM card_attachments
-             WHERE card_id = ?1 AND attachment_id = ?2",
-            params![card_id.as_str(), attachment_id],
-        )?;
-        if removed == 0 {
-            return Err(DomainError::not_found("attachment", attachment_id).into());
-        }
-        let referenced: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM card_attachments WHERE attachment_id = ?1",
-            [&attachment_id],
-            |row| row.get(0),
-        )?;
-        if referenced == 0 {
-            transaction.execute("DELETE FROM attachments WHERE id = ?1", [&attachment_id])?;
-        }
-        append_attributed_card_event(
-            &transaction,
-            card_id,
-            MutationAudit {
-                operation: Operation::DetachImage,
-                resource: card_id.as_str(),
-                semantic_identity: Some(principal.as_str()),
-                run_id: None,
-                reason: Some("attachment correction"),
-                event_type: "attachment",
-                actor: &principal,
-                payload: "detached image",
-                subject_kind: "attachment",
-                subject_id: &attachment_id,
-                authority,
-            },
-            now,
-        )?;
+        detach_in_transaction(&transaction, card_id, attachment_id, now, authority)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn detach_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        attachment_id: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<()>> {
+        let payload = json!({"attachment_id": attachment_id});
+        self.with_keyed_operation(
+            Operation::DetachImage,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                detach_in_transaction(transaction, card_id, attachment_id, now, authority)
+            },
+        )
     }
 
     pub fn attachments_for_card(&self, card_id: &CardId) -> Result<Vec<AttachmentMeta>> {
@@ -3957,36 +3926,30 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let card = load_card(&transaction, card_id)?;
-        authorize_card_operation(
-            authority,
-            Operation::AddLink,
-            &card,
-            None,
-            card.claim.as_ref().map(|claim| claim.agent.as_str()),
-            now,
-        )?;
-        let link = insert_link(&transaction, card_id, label, url, now)?;
-        append_attributed_card_event(
-            &transaction,
-            card_id,
-            MutationAudit {
-                operation: Operation::AddLink,
-                resource: card_id.as_str(),
-                semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
-                run_id: card.claim.as_ref().map(|claim| &claim.run_id),
-                reason: None,
-                event_type: "link",
-                actor: authority.principal_name().unwrap_or("unchecked"),
-                payload: "added link",
-                subject_kind: "link",
-                subject_id: link.id.as_str(),
-                authority,
-            },
-            now,
-        )?;
+        let link = add_link_in_transaction(&transaction, card_id, label, url, now, authority)?;
         transaction.commit()?;
         Ok(link)
+    }
+
+    pub fn add_link_as_keyed(
+        &mut self,
+        card_id: &CardId,
+        label: &str,
+        url: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Link>> {
+        let payload = json!({"label": label, "url": url});
+        self.with_keyed_operation(
+            Operation::AddLink,
+            format!("card:{}", card_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| add_link_in_transaction(transaction, card_id, label, url, now, authority),
+        )
     }
 
     /// Not claim-holder-gated, matching `add_link`: attaching a comment is
@@ -4147,73 +4110,34 @@ impl Store {
         now: i64,
         authority: &Authority,
     ) -> Result<Run> {
-        let question = non_empty_scrubbed("question", question)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut run = answer_loop::load_run(&transaction, run_id)?;
-        let mut card = load_card(&transaction, &run.card_id)?;
-        if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
-            return Err(DomainError::conflict(format!(
-                "run {run_id} is not the current claim for card {}",
-                card.id
-            ))
-            .into());
-        }
-        authority.require_holder(card.claim_principal())?;
-        authorize_card_operation(
-            authority,
-            Operation::RequestInput,
-            &card,
-            Some(run_id),
-            None,
-            now,
-        )?;
-
-        card.status = CardStatus::AwaitingInput;
-        card.updated_at = now;
-        run.state = RunState::AwaitingInput;
-        run.updated_at = now;
-
-        persist_card(&transaction, &card)?;
-        persist_run(&transaction, &run)?;
-        append_activity_attributed(
-            &transaction,
-            run_id,
-            ActivityType::Elicitation,
-            &question,
-            authority.principal_name(),
-            Some(authority.role_label()),
-            now,
-        )?;
-        append_attributed_card_event(
-            &transaction,
-            &card.id,
-            MutationAudit {
-                operation: Operation::RequestInput,
-                resource: card.id.as_str(),
-                semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
-                run_id: Some(run_id),
-                reason: None,
-                event_type: "request-input",
-                actor: &authority.actor_label(),
-                payload: "awaiting input",
-                subject_kind: "run",
-                subject_id: run_id.as_str(),
-                authority,
-            },
-            now,
-        )?;
-        events::append_outbound_card_event_with_authority(
-            &transaction,
-            &card,
-            "awaiting-input",
-            authority,
-            json!({"run_id": run_id.as_str(), "question": question}),
-            now,
-        )?;
+        let run = request_input_in_transaction(&transaction, run_id, question, now, authority)?;
         transaction.commit()?;
         Ok(run)
+    }
+
+    pub fn request_input_keyed(
+        &mut self,
+        run_id: &RunId,
+        question: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<Run>> {
+        let payload = json!({"question": question});
+        self.with_keyed_operation(
+            Operation::RequestInput,
+            format!("run:{}", run_id.as_str()),
+            &payload,
+            idempotency_key,
+            now,
+            authority,
+            |transaction| {
+                request_input_in_transaction(transaction, run_id, question, now, authority)
+            },
+        )
     }
 
     pub fn complete_card(
@@ -4439,6 +4363,234 @@ fn insert_link(
         ],
     )?;
     Ok(link)
+}
+
+fn add_link_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    label: &str,
+    url: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<Link> {
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(
+        authority,
+        Operation::AddLink,
+        &card,
+        None,
+        card.claim.as_ref().map(|claim| claim.agent.as_str()),
+        now,
+    )?;
+    let link = insert_link(transaction, card_id, label, url, now)?;
+    let actor = authority.actor_label();
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::AddLink,
+            resource: card_id.as_str(),
+            semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
+            reason: None,
+            event_type: "link",
+            actor: &actor,
+            payload: "added link",
+            subject_kind: "link",
+            subject_id: link.id.as_str(),
+            authority,
+        },
+        now,
+    )?;
+    Ok(link)
+}
+
+fn attach_image_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    bytes: &[u8],
+    mime: &str,
+    filename: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<AttachmentMeta> {
+    let mime = non_empty("mime", mime)?;
+    if !is_supported_image_mime(&mime) {
+        return Err(DomainError::validation(
+            "mime",
+            format!("unsupported image MIME type: {mime}"),
+        )
+        .into());
+    }
+    let filename = non_empty_scrubbed("filename", filename)?;
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::AttachImage, &card, None, None, now)?;
+    let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
+    let id = format!("{:x}", Sha256::digest(bytes));
+    let size = i64::try_from(bytes.len())
+        .map_err(|_| DomainError::validation("bytes", "image is too large to store"))?;
+    transaction.execute(
+        "INSERT INTO attachments (id, mime, size, bytes, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO NOTHING",
+        params![id, mime, size, bytes, now],
+    )?;
+    let (stored_mime, stored_size) = transaction.query_row(
+        "SELECT mime, size FROM attachments WHERE id = ?1",
+        [&id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    transaction.execute(
+        "INSERT INTO card_attachments
+         (card_id, attachment_id, filename, created_at, principal)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(card_id, attachment_id) DO UPDATE SET
+           filename = excluded.filename, created_at = excluded.created_at,
+           principal = excluded.principal",
+        params![card_id.as_str(), id, filename, now, principal],
+    )?;
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::AttachImage,
+            resource: card_id.as_str(),
+            semantic_identity: Some(principal.as_str()),
+            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
+            reason: Some("attachment correction"),
+            event_type: "attachment",
+            actor: &principal,
+            payload: "attached image",
+            subject_kind: "attachment",
+            subject_id: &id,
+            authority,
+        },
+        now,
+    )?;
+    Ok(AttachmentMeta {
+        id,
+        filename,
+        mime: stored_mime,
+        size: stored_size,
+        created_at: now,
+    })
+}
+
+fn detach_in_transaction(
+    transaction: &Transaction<'_>,
+    card_id: &CardId,
+    attachment_id: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<()> {
+    let attachment_id = non_empty("attachment_id", attachment_id)?;
+    let card = load_card(transaction, card_id)?;
+    authorize_card_operation(authority, Operation::DetachImage, &card, None, None, now)?;
+    let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
+    let removed = transaction.execute(
+        "DELETE FROM card_attachments WHERE card_id = ?1 AND attachment_id = ?2",
+        params![card_id.as_str(), attachment_id],
+    )?;
+    if removed == 0 {
+        return Err(DomainError::not_found("attachment", attachment_id).into());
+    }
+    let referenced: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM card_attachments WHERE attachment_id = ?1",
+        [&attachment_id],
+        |row| row.get(0),
+    )?;
+    if referenced == 0 {
+        transaction.execute("DELETE FROM attachments WHERE id = ?1", [&attachment_id])?;
+    }
+    append_attributed_card_event(
+        transaction,
+        card_id,
+        MutationAudit {
+            operation: Operation::DetachImage,
+            resource: card_id.as_str(),
+            semantic_identity: Some(principal.as_str()),
+            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
+            reason: Some("attachment correction"),
+            event_type: "attachment",
+            actor: &principal,
+            payload: "detached image",
+            subject_kind: "attachment",
+            subject_id: &attachment_id,
+            authority,
+        },
+        now,
+    )?;
+    Ok(())
+}
+
+fn request_input_in_transaction(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    question: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<Run> {
+    let question = non_empty_scrubbed("question", question)?;
+    let mut run = answer_loop::load_run(transaction, run_id)?;
+    let mut card = load_card(transaction, &run.card_id)?;
+    if card.claim.as_ref().map(|claim| &claim.run_id) != Some(run_id) {
+        return Err(DomainError::conflict(format!(
+            "run {run_id} is not the current claim for card {}",
+            card.id
+        ))
+        .into());
+    }
+    authorize_card_operation(
+        authority,
+        Operation::RequestInput,
+        &card,
+        Some(run_id),
+        None,
+        now,
+    )?;
+    card.status = CardStatus::AwaitingInput;
+    card.updated_at = now;
+    run.state = RunState::AwaitingInput;
+    run.updated_at = now;
+    persist_card(transaction, &card)?;
+    persist_run(transaction, &run)?;
+    append_activity_attributed(
+        transaction,
+        run_id,
+        ActivityType::Elicitation,
+        &question,
+        authority.principal_name(),
+        Some(authority.role_label()),
+        now,
+    )?;
+    let actor = authority.actor_label();
+    append_attributed_card_event(
+        transaction,
+        &card.id,
+        MutationAudit {
+            operation: Operation::RequestInput,
+            resource: card.id.as_str(),
+            semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
+            run_id: Some(run_id),
+            reason: None,
+            event_type: "request-input",
+            actor: &actor,
+            payload: "awaiting input",
+            subject_kind: "run",
+            subject_id: run_id.as_str(),
+            authority,
+        },
+        now,
+    )?;
+    events::append_outbound_card_event_with_authority(
+        transaction,
+        &card,
+        "awaiting-input",
+        authority,
+        json!({"run_id": run_id.as_str(), "question": question}),
+        now,
+    )?;
+    Ok(run)
 }
 
 fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
