@@ -5481,13 +5481,79 @@ fn non_holder_actor_is_rejected_from_claim_mutations() -> Result<()> {
         Err(StoreError::Domain(DomainError::Forbidden(_)))
     ));
 
-    // audit-over-enforcement: any actor may set status/complete, but not
-    // mutate another actor's lease heartbeat/renew/release path.
-    store.update_status(&card_id, CardStatus::InProgress, 20, &intruder)?;
-    let completed = store.complete_card(&card_id, None, Vec::new(), 21, &intruder)?;
-    assert_eq!(completed.status, CardStatus::Done);
+    // Worker execution and lifecycle effects are claim-bound; only the
+    // operator/admin correction path may bypass the holder lease.
+    assert!(matches!(
+        store.update_status(&card_id, CardStatus::InProgress, 20, &intruder),
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::CrossResource,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        store.complete_card(&card_id, None, Vec::new(), 21, &intruder),
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::CrossResource,
+            ..
+        }))
+    ));
     let card = store.get_card(&card_id)?.expect("card");
-    assert!(card.claim.is_none());
+    assert_eq!(
+        card.claim.as_ref().map(|current| current.run_id.clone()),
+        Some(claim.run_id)
+    );
+    Ok(())
+}
+
+#[test]
+fn holder_matrix_rejects_wrong_worker_and_expired_annotations() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("authority-annotations")?;
+    store.import_cards(vec![ready_card("authority-annotations", 2)])?;
+    let holder = Authority::actor("integration", false);
+    let claim = store.claim_card(&card_id, "worker-a", 10, 10, &holder)?;
+
+    let link = store.add_link_as(&card_id, "proof", "https://example.test/proof", 11, &holder)?;
+    assert_eq!(link.card_id, card_id);
+
+    let wrong_worker = store.append_work_log_as(
+        &card_id,
+        "worker-b",
+        WorkLogAttribution {
+            run_id: Some(claim.run_id.as_str()),
+            ..WorkLogAttribution::default()
+        },
+        "must be denied",
+        12,
+        &holder,
+    );
+    assert!(matches!(
+        wrong_worker,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::IdentityMismatch,
+            ..
+        }))
+    ));
+
+    let expired = store.append_work_log_as(
+        &card_id,
+        "worker-a",
+        WorkLogAttribution {
+            run_id: Some(claim.run_id.as_str()),
+            ..WorkLogAttribution::default()
+        },
+        "expired claim must be denied",
+        20,
+        &holder,
+    );
+    assert!(matches!(
+        expired,
+        Err(StoreError::Domain(DomainError::AuthorityDenied {
+            class: powder_core::DenialClass::ClaimExpired,
+            ..
+        }))
+    ));
     Ok(())
 }
 

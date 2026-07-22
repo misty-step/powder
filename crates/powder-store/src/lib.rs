@@ -10,8 +10,8 @@ use powder_core::{
     canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim, ClaimReceipt,
-    Comment, CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId,
-    Priority, ReadyCursor, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
+    Comment, CriterionProof, DenialClass, DomainError, EpicFreshness, EpicState, Estimate, Link,
+    LinkId, Operation, Priority, ReadyCursor, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{
     functions::{Context, FunctionFlags},
@@ -536,6 +536,46 @@ struct MutationAudit<'a> {
     subject_kind: &'a str,
     subject_id: &'a str,
     authority: &'a Authority,
+}
+
+/// Every authority-aware card mutation enters this evaluator after loading
+/// the current claim snapshot. A worker can only act for its own principal,
+/// current unexpired claim, semantic worker label, and (when supplied) run.
+/// Admin/trusted-local authority is deliberately the correction escape hatch.
+fn authorize_card_operation(
+    authority: &Authority,
+    operation: Operation,
+    card: &Card,
+    run_id: Option<&RunId>,
+    worker: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    authority.authorize_operation_with_worker(
+        operation,
+        card.claim.as_ref(),
+        run_id,
+        worker,
+        now,
+    )?;
+    if matches!(authority.role(), powder_core::PrincipalRole::Agent) {
+        if let Some(target_run) = run_id {
+            let Some(claim) = card.claim.as_ref() else {
+                return Err(DomainError::authority_denied(
+                    DenialClass::ClaimRequired,
+                    format!("operation {} requires the current run", operation.as_str()),
+                )
+                .into());
+            };
+            if claim.run_id != *target_run {
+                return Err(DomainError::authority_denied(
+                    DenialClass::CrossResource,
+                    format!("operation {} targets another run", operation.as_str()),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Store {
@@ -2147,6 +2187,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authorize_card_operation(authority, Operation::PatchCard, &card, None, None, now)?;
         let mut patched_fields = Vec::new();
 
         if let Some(title) = patch.title {
@@ -2252,6 +2293,8 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authorize_card_operation(authority, Operation::CheckCriterion, &card, None, None, now)?;
+        authority.require_identity(&actor)?;
         let criterion_state = criterion_mut(&mut card, criterion)?;
         if checked {
             criterion_state.checked_by = Some(actor.clone());
@@ -3132,6 +3175,13 @@ impl Store {
     ) -> Result<ClaimReceipt> {
         let agent = non_empty("agent", agent)?;
         let principal = authority.actor_label();
+        authority.authorize_operation_with_worker(
+            Operation::ClaimCard,
+            None,
+            None,
+            Some(agent.as_str()),
+            now,
+        )?;
         if ttl_seconds == 0 {
             return Err(DomainError::validation(
                 "ttl_seconds",
@@ -3241,6 +3291,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authorize_card_operation(authority, Operation::UpdateStatus, &card, None, None, now)?;
         let previous = card.status;
         let released_claim = card.apply_status(status, now);
         persist_card(&transaction, &card)?;
@@ -3315,6 +3366,14 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authorize_card_operation(
+            authority,
+            Operation::UpdateRelations,
+            &card,
+            None,
+            None,
+            now,
+        )?;
         let actor = authority.actor_label();
 
         let related_delta = list_delta(&card.related, &related);
@@ -3381,6 +3440,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authorize_card_operation(authority, Operation::SetParent, &card, None, None, now)?;
         let previous = card.parent.clone();
         if previous == parent {
             transaction.commit()?;
@@ -3784,7 +3844,15 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_card(&transaction, card_id)?;
+        let card = load_card(&transaction, card_id)?;
+        authorize_card_operation(
+            authority,
+            Operation::AddLink,
+            &card,
+            None,
+            card.claim.as_ref().map(|claim| claim.agent.as_str()),
+            now,
+        )?;
         let link = insert_link(&transaction, card_id, label, url, now)?;
         append_attributed_card_event(
             &transaction,
@@ -3828,6 +3896,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let card = load_card(&transaction, card_id)?;
+        authorize_card_operation(authority, Operation::AddComment, &card, None, None, now)?;
         let id = format!("comment-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
         let comment = Comment {
             id: id.clone(),
@@ -3929,6 +3998,14 @@ impl Store {
             body: non_empty_scrubbed("body", body)?,
             created_at: now,
         };
+        authorize_card_operation(
+            authority,
+            Operation::WorkLog,
+            &card,
+            entry.run_id.as_ref(),
+            Some(entry.agent.as_str()),
+            now,
+        )?;
         transaction.execute(
             "INSERT INTO work_log_entries
              (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
@@ -3996,6 +4073,14 @@ impl Store {
             .into());
         }
         authority.require_holder(card.claim_principal())?;
+        authorize_card_operation(
+            authority,
+            Operation::RequestInput,
+            &card,
+            Some(run_id),
+            None,
+            now,
+        )?;
 
         card.status = CardStatus::AwaitingInput;
         card.updated_at = now;
@@ -4051,6 +4136,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut card = load_card(&transaction, card_id)?;
+        authorize_card_operation(authority, Operation::CompleteCard, &card, None, None, now)?;
 
         let previous = card.status;
         let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());

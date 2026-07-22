@@ -17,8 +17,8 @@ pub use model::{
     CardSource, CardStatus, CardSummary, Claim, ClaimRequirement, ClaimSummary, Comment,
     CriterionProof, DenialClass, DetailLevel, DomainError, EpicEvidence, EpicFreshness, EpicState,
     Estimate, EvidenceKind, IdempotencyMode, IdentityRequirement, Link, LinkId, Operation,
-    OperationCapability, OperationRule, Priority, Risk, Run, RunDetail, RunId, RunState,
-    WorkLogEntry,
+    OperationCapability, OperationRule, PrincipalRole, Priority, Risk, Run, RunDetail, RunId,
+    RunState, WorkLogEntry,
 };
 pub use queries::{ClaimReceipt, ReadyCursor, ReadyQuery};
 pub use ready_order::{

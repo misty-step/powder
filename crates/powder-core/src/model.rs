@@ -269,11 +269,9 @@ impl Operation {
             Self::ReleaseClaim | Self::RenewClaim | Self::HeartbeatClaim | Self::TransferClaim => {
                 (Execute, Card, Worker, RetrySafe)
             }
-            Self::WorkLog
-            | Self::AddLink
-            | Self::AddComment
-            | Self::AttachImage
-            | Self::DetachImage => (Execute, Card, Worker, Keyed),
+            Self::WorkLog | Self::AddLink => (Execute, Card, Worker, Keyed),
+            Self::AddComment => (Execute, None, Principal, Keyed),
+            Self::AttachImage | Self::DetachImage => (Execute, Card, Principal, Keyed),
             Self::RequestInput | Self::AnswerInput => (Execute, Run, RunIdentity, Keyed),
             Self::UpsertRepository
             | Self::MergeRepositoryAlias
@@ -490,6 +488,20 @@ impl Authority {
         run_id: Option<&RunId>,
         now: i64,
     ) -> Result<(), DomainError> {
+        self.authorize_operation_with_worker(operation, claim, run_id, None, now)
+    }
+
+    /// Evaluate the matrix with optional semantic worker metadata. A worker
+    /// label is never authority; when an operation carries one it must match
+    /// both the authenticated principal's current claim and the target run.
+    pub fn authorize_operation_with_worker(
+        &self,
+        operation: Operation,
+        claim: Option<&Claim>,
+        run_id: Option<&RunId>,
+        worker: Option<&str>,
+        now: i64,
+    ) -> Result<(), DomainError> {
         let rule = operation.rule();
         if !rule.capability.allows(self.role()) {
             return Err(DomainError::authority_denied(
@@ -504,6 +516,12 @@ impl Authority {
         if matches!(self.role(), PrincipalRole::Admin | PrincipalRole::Unchecked) {
             return Ok(());
         }
+        if matches!(rule.identity, IdentityRequirement::Worker) && worker.is_none() {
+            return Err(DomainError::authority_denied(
+                DenialClass::IdentityMismatch,
+                format!("operation {} requires a worker label", operation.as_str()),
+            ));
+        }
         match rule.claim {
             ClaimRequirement::None => Ok(()),
             ClaimRequirement::CurrentCardClaim => match claim {
@@ -514,16 +532,25 @@ impl Authority {
                         operation.as_str()
                     ),
                 )),
-                Some(current) if self.principal_name() == Some(current.principal.as_str()) => {
-                    Ok(())
+                Some(current) if self.principal_name() != Some(current.principal.as_str()) => {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!(
+                            "operation {} targets another principal's claim",
+                            operation.as_str()
+                        ),
+                    ))
                 }
-                Some(_) => Err(DomainError::authority_denied(
-                    DenialClass::CrossResource,
-                    format!(
-                        "operation {} targets another principal's claim",
-                        operation.as_str()
-                    ),
-                )),
+                Some(current)
+                    if matches!(rule.identity, IdentityRequirement::Worker)
+                        && worker != Some(current.agent.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::IdentityMismatch,
+                        format!("operation {} targets another worker", operation.as_str()),
+                    ))
+                }
+                Some(_) => Ok(()),
                 None => Err(DomainError::authority_denied(
                     DenialClass::ClaimRequired,
                     format!(
@@ -539,16 +566,33 @@ impl Authority {
                         format!("operation {} requires an unexpired run", operation.as_str()),
                     ))
                 }
-                (Some(current), Some(target))
-                    if current.run_id == *target
-                        && self.principal_name() == Some(current.principal.as_str()) =>
-                {
-                    Ok(())
+                (Some(current), Some(target)) if current.run_id != *target => {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!("operation {} targets another run", operation.as_str()),
+                    ))
                 }
-                (Some(_), Some(_)) => Err(DomainError::authority_denied(
-                    DenialClass::CrossResource,
-                    format!("operation {} targets another run", operation.as_str()),
-                )),
+                (Some(current), Some(_))
+                    if self.principal_name() != Some(current.principal.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::CrossResource,
+                        format!(
+                            "operation {} targets another principal's run",
+                            operation.as_str()
+                        ),
+                    ))
+                }
+                (Some(current), Some(_))
+                    if matches!(rule.identity, IdentityRequirement::Worker)
+                        && worker != Some(current.agent.as_str()) =>
+                {
+                    Err(DomainError::authority_denied(
+                        DenialClass::IdentityMismatch,
+                        format!("operation {} targets another worker", operation.as_str()),
+                    ))
+                }
+                (Some(_), Some(_)) => Ok(()),
                 _ => Err(DomainError::authority_denied(
                     DenialClass::ClaimRequired,
                     format!("operation {} requires the current run", operation.as_str()),
@@ -2567,5 +2611,37 @@ mod tests {
         assert_eq!(Operation::RequestInput.rule().audit.run, true);
         assert_eq!(Operation::UpdateStatus.rule().audit.reason, true);
         assert_eq!(Operation::WorkLog.rule().audit.semantic_identity, true);
+    }
+
+    #[test]
+    fn same_principal_different_worker_is_not_claim_holder() {
+        let authority = Authority::principal("integration", false);
+        let run_id = RunId::new("run-1").unwrap();
+        let claim = Claim {
+            principal: "integration".to_string(),
+            agent: "worker-a".to_string(),
+            run_id: run_id.clone(),
+            acquired_at: 1,
+            expires_at: 20,
+        };
+        let error = authority
+            .authorize_operation_with_worker(
+                Operation::WorkLog,
+                Some(&claim),
+                Some(&run_id),
+                Some("worker-b"),
+                5,
+            )
+            .unwrap_err();
+        assert_eq!(error.denial_class(), Some(DenialClass::IdentityMismatch));
+        assert!(authority
+            .authorize_operation_with_worker(
+                Operation::WorkLog,
+                Some(&claim),
+                Some(&run_id),
+                Some("worker-a"),
+                5,
+            )
+            .is_ok());
     }
 }
