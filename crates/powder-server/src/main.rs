@@ -1323,10 +1323,15 @@ async fn board_stats(
     headers: HeaderMap,
     Query(params): Query<BoardStatsParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
+    let include_hidden = params.include_hidden.unwrap_or(false);
+    if include_hidden {
+        require_admin(&state, &headers)?;
+    } else {
+        authorize_read(&state, &headers)?;
+    }
     let stats = lock_store(&state)?.board_stats(powder_store::BoardStatsQuery {
         repo: params.repo,
-        include_hidden: params.include_hidden.unwrap_or(false),
+        include_hidden,
         now: unix_now(),
     })?;
     Ok(Json(json!(stats)))
@@ -1357,8 +1362,13 @@ async fn list_repositories(
     headers: HeaderMap,
     Query(params): Query<ListRepositoriesParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let repositories = if params.include_hidden.unwrap_or(false) {
+    let include_hidden = params.include_hidden.unwrap_or(false);
+    if include_hidden {
+        require_admin(&state, &headers)?;
+    } else {
+        authorize_read(&state, &headers)?;
+    }
+    let repositories = if include_hidden {
         lock_store(&state)?.list_repositories_with_hidden()?
     } else {
         lock_store(&state)?.list_repositories()?
