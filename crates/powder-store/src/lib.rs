@@ -586,6 +586,7 @@ impl Store {
                 return Err(StoreError::UnsupportedSchema(current));
             }
             if current == SCHEMA_VERSION {
+                self.ensure_principal_role_columns()?;
                 return Ok(());
             }
             let next = match current {
@@ -1889,6 +1890,24 @@ impl Store {
         Ok(())
     }
 
+    fn ensure_principal_role_columns(&self) -> Result<()> {
+        if !self.table_has_column("runs", "role")? {
+            self.connection.execute_batch(
+                "ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'agent';",
+            )?;
+        }
+        if !self.table_has_column("activities", "principal")? {
+            self.connection.execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
+        }
+        if !self.table_has_column("activities", "role")? {
+            self.connection.execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
+        }
+        if !self.table_has_column("card_events", "role")? {
+            self.connection.execute_batch("ALTER TABLE card_events ADD COLUMN role TEXT;")?;
+        }
+        Ok(())
+    }
+
     pub fn schema_version(&self) -> Result<u32> {
         Ok(self
             .connection
@@ -1957,19 +1976,20 @@ impl Store {
             match load_card_optional(&transaction, &incoming.id)? {
                 None => {
                     persist_card(&transaction, &incoming)?;
-                    append_card_event(
+                    append_card_event_with_authority(
                         &transaction,
                         &incoming.id,
                         "create",
                         &actor,
                         "imported card",
                         now,
+                        authority,
                     )?;
-                    events::append_outbound_card_event(
+                    events::append_outbound_card_event_with_authority(
                         &transaction,
                         &incoming,
                         "card-created",
-                        &actor,
+                        authority,
                         json!({"source": "import"}),
                         now,
                     )?;
@@ -1984,19 +2004,20 @@ impl Store {
                     if let Some(event_type) =
                         events::outbound_event_for_status_change(previous, merged.status)
                     {
-                        append_card_event(
+                        append_card_event_with_authority(
                             &transaction,
                             &merged.id,
                             "status",
                             &actor,
                             &format!("{} -> {}", previous.as_str(), merged.status.as_str()),
                             now,
+                            authority,
                         )?;
-                        events::append_outbound_card_event(
+                        events::append_outbound_card_event_with_authority(
                             &transaction,
                             &merged,
                             event_type,
-                            &actor,
+                            authority,
                             json!({
                                 "previous_status": previous.as_str(),
                                 "status": merged.status.as_str(),
@@ -3003,6 +3024,7 @@ impl Store {
             card_id: card_id.clone(),
             state: RunState::Active,
             principal: principal.clone(),
+            role: authority.role_label().to_string(),
             agent: agent.clone(),
             claim_expires_at: claim.expires_at,
             proof: None,
@@ -3010,11 +3032,13 @@ impl Store {
             updated_at: now,
         };
         persist_run(&transaction, &run)?;
-        append_activity(
+        append_activity_attributed(
             &transaction,
             &run_id,
             ActivityType::Action,
             &format!("claimed {card_id}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -3044,11 +3068,13 @@ impl Store {
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
             close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
-            append_activity(
+            append_activity_attributed(
                 &transaction,
                 &claim.run_id,
                 ActivityType::Action,
                 &format!("status set {card_id} to {}", status.as_str()),
+                authority.principal_name(),
+                Some(authority.role_label()),
                 now,
             )?;
         }
@@ -3242,11 +3268,13 @@ impl Store {
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("released {card_id}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         events::append_outbound_card_event(
@@ -3285,11 +3313,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("renewed {card_id} until {}", claim.expires_at),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -3319,11 +3349,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("heartbeat {card_id}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -3363,11 +3395,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("transferred {card_id} from {from_agent} to {to_agent}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -3787,11 +3821,13 @@ impl Store {
 
         persist_card(&transaction, &card)?;
         persist_run(&transaction, &run)?;
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Elicitation,
             &question,
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         append_card_event(
@@ -3855,7 +3891,7 @@ impl Store {
                 now,
                 proof.as_deref(),
             )?;
-            append_activity(
+            append_activity_attributed(
                 &transaction,
                 &run_id,
                 ActivityType::Response,
@@ -3864,6 +3900,8 @@ impl Store {
                     .map(|proof| format!("completed: {proof}"))
                     .unwrap_or_else(|| "completed without proof".to_string())
                     .as_str(),
+                authority.principal_name(),
+                Some(authority.role_label()),
                 now,
             )?;
         }
@@ -4163,6 +4201,7 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
            card_id = excluded.card_id,
            state = excluded.state,
            principal = excluded.principal,
+           role = excluded.role,
            agent = excluded.agent,
            claim_expires_at = excluded.claim_expires_at,
            proof = excluded.proof,
@@ -4173,6 +4212,7 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
             run.card_id.as_str(),
             run.state.as_str(),
             run.principal,
+            run.role,
             run.agent,
             run.claim_expires_at,
             run.proof,
@@ -4190,6 +4230,18 @@ fn append_activity(
     payload: &str,
     now: i64,
 ) -> Result<Activity> {
+    append_activity_attributed(connection, run_id, activity_type, payload, None, None, now)
+}
+
+fn append_activity_attributed(
+    connection: &Connection,
+    run_id: &RunId,
+    activity_type: ActivityType,
+    payload: &str,
+    principal: Option<&str>,
+    role: Option<&str>,
+    now: i64,
+) -> Result<Activity> {
     let activity = Activity {
         id: ActivityId::new(format!(
             "activity-{}",
@@ -4198,16 +4250,20 @@ fn append_activity(
         run_id: run_id.clone(),
         activity_type,
         payload: payload.to_owned(),
+        principal: principal.map(str::to_string),
+        role: role.map(str::to_string),
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO activities (id, run_id, activity_type, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO activities (id, run_id, activity_type, payload, principal, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             activity.id.as_str(),
             activity.run_id.as_str(),
             activity.activity_type.as_str(),
             activity.payload,
+            activity.principal,
+            activity.role,
             activity.created_at
         ],
     )?;
@@ -4222,26 +4278,49 @@ fn append_card_event(
     payload: &str,
     now: i64,
 ) -> Result<CardEvent> {
+    append_card_event_with_authority(
+        connection,
+        card_id,
+        event_type,
+        actor,
+        payload,
+        now,
+        &Authority::actor(actor.to_owned(), false),
+    )
+}
+
+fn append_card_event_with_authority(
+    connection: &Connection,
+    card_id: &CardId,
+    event_type: &str,
+    actor: &str,
+    payload: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<CardEvent> {
     let event = CardEvent {
         id: CardEventId::new(format!("event-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
         card_id: card_id.clone(),
         event_type: non_empty("event_type", event_type)?,
         actor: non_empty("actor", actor)?,
         payload: payload.to_owned(),
-        principal: None,
+        principal: authority.principal_name().map(str::to_string),
+        role: Some(authority.role_label().to_string()),
         subject_kind: None,
         subject_id: None,
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO card_events (id, card_id, event_type, actor, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO card_events (id, card_id, event_type, actor, payload, principal, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
             event.event_type.as_str(),
             event.actor.as_str(),
             event.payload.as_str(),
+            event.principal.as_deref(),
+            event.role.as_deref(),
             event.created_at
         ],
     )?;
@@ -4261,13 +4340,14 @@ fn append_attributed_card_event(
         actor: non_empty("actor", audit.actor)?,
         payload: audit.payload.to_owned(),
         principal: audit.authority.principal_name().map(str::to_string),
+        role: Some(audit.authority.role_label().to_string()),
         subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
         subject_id: Some(non_empty("subject_id", audit.subject_id)?),
         created_at: now,
     };
     connection.execute(
         "INSERT INTO card_events (
-           id, card_id, event_type, actor, payload, principal,
+           id, card_id, event_type, actor, payload, principal, role,
            subject_kind, subject_id, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
@@ -4277,6 +4357,7 @@ fn append_attributed_card_event(
             event.actor.as_str(),
             event.payload.as_str(),
             event.principal.as_deref(),
+            event.role.as_deref(),
             event.subject_kind.as_deref(),
             event.subject_id.as_deref(),
             event.created_at,
@@ -4968,6 +5049,7 @@ struct RunRecord {
     card_id: String,
     state: String,
     principal: String,
+    role: String,
     agent: String,
     claim_expires_at: i64,
     proof: Option<String>,
@@ -4982,11 +5064,12 @@ impl RunRecord {
             card_id: row.get(1)?,
             state: row.get(2)?,
             principal: row.get(3)?,
-            agent: row.get(4)?,
-            claim_expires_at: row.get(5)?,
-            proof: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            role: row.get(4)?,
+            agent: row.get(5)?,
+            claim_expires_at: row.get(6)?,
+            proof: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     }
 
@@ -4999,6 +5082,7 @@ impl RunRecord {
                 value: self.state,
             })?,
             principal: self.principal,
+            role: self.role,
             agent: self.agent,
             claim_expires_at: self.claim_expires_at,
             proof: self.proof,

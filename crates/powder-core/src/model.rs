@@ -77,6 +77,24 @@ pub enum Authority {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalRole {
+    Admin,
+    Agent,
+    Unchecked,
+}
+
+impl PrincipalRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Agent => "agent",
+            Self::Unchecked => "unchecked",
+        }
+    }
+}
+
 impl Authority {
     pub fn unchecked() -> Self {
         Self::Unchecked
@@ -145,6 +163,18 @@ impl Authority {
                 ))),
             },
         }
+    }
+
+    pub fn role(&self) -> PrincipalRole {
+        match self {
+            Self::Unchecked => PrincipalRole::Unchecked,
+            Self::Principal { is_admin: true, .. } => PrincipalRole::Admin,
+            Self::Principal { is_admin: false, .. } => PrincipalRole::Agent,
+        }
+    }
+
+    pub fn role_label(&self) -> &'static str {
+        self.role().as_str()
     }
 
     pub fn actor_label(&self) -> String {
@@ -1170,6 +1200,7 @@ pub struct Run {
     pub card_id: CardId,
     pub state: RunState,
     pub principal: String,
+    pub role: String,
     pub agent: String,
     pub claim_expires_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1184,6 +1215,10 @@ pub struct Activity {
     pub run_id: RunId,
     pub activity_type: ActivityType,
     pub payload: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub created_at: i64,
 }
 
@@ -1196,6 +1231,8 @@ pub struct CardEvent {
     pub payload: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

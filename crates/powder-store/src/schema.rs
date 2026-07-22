@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS runs (
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   state TEXT NOT NULL,
   principal TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'agent',
   agent TEXT NOT NULL,
   claim_expires_at INTEGER NOT NULL,
   proof TEXT,
@@ -106,6 +107,8 @@ CREATE TABLE IF NOT EXISTS activities (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   activity_type TEXT NOT NULL,
   payload TEXT NOT NULL,
+  principal TEXT,
+  role TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_activities_run_created ON activities(run_id, created_at);
@@ -117,6 +120,7 @@ CREATE TABLE IF NOT EXISTS card_events (
   actor TEXT NOT NULL,
   payload TEXT NOT NULL,
   principal TEXT,
+  role TEXT,
   subject_kind TEXT,
   subject_id TEXT,
   created_at INTEGER NOT NULL
@@ -505,5 +509,5 @@ source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_ac
 claim_expires_at, created_at, updated_at, parent, risk FROM cards";
 
 pub const RUN_SELECT_SQL: &str =
-    "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,
+    "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
 created_at, updated_at FROM runs WHERE id = ?1";
