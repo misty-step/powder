@@ -66,7 +66,7 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
     let (link_id, first_comment_id, second_comment_id, work_log_id) = {
         let mut store = Store::open(&path).expect("open store");
         store.migrate().expect("migrate fresh store");
-        assert_eq!(SCHEMA_VERSION, 23);
+        assert_eq!(SCHEMA_VERSION, 24);
         store
             .import_cards(vec![ready_card(card_id.as_str())])
             .expect("import card");
@@ -370,7 +370,7 @@ fn sanitized_schema_19_snapshot_migrates_losslessly_and_old_envelope_deserialize
     let mut store = Store::open(&path).expect("open schema 19 snapshot");
     store.migrate().expect("migrate snapshot");
     store.migrate().expect("retry is idempotent");
-    assert_eq!(store.schema_version().expect("schema version"), 23);
+    assert_eq!(store.schema_version().expect("schema version"), 24);
     for item in store.list_event_tail(0, 20).expect("read old envelopes") {
         assert_eq!(item.event.principal, None);
         assert_eq!(item.event.audit_event_id, None);
@@ -404,7 +404,7 @@ fn schema_v20_adds_only_audit_provenance_columns() {
     let path = temp_db("principal-schema");
     let mut store = Store::open(&path).expect("open store");
     store.migrate().expect("migrate fresh store");
-    assert_eq!(SCHEMA_VERSION, 23);
+    assert_eq!(SCHEMA_VERSION, 24);
     drop(store);
 
     let connection = Connection::open(&path).expect("open inspection database");

@@ -230,6 +230,7 @@ for (const mode of MODES) {
     await expect(option).toBeVisible();
     await expect(option.locator(".pw-cmdk-item-source")).toContainText("cards / id");
     await page.keyboard.press("Escape");
+    await page.locator("#filter-btn").click();
     await page.locator("#text-filter").fill("blocked-card");
     await expect(page.locator("#lane-ready .pw-blocked-cap")).toContainText("BLOCKED");
     await expect(page.locator("#lane-ready")).toContainText("blocked-card");
