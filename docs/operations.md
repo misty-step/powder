@@ -137,7 +137,7 @@ MCP claim lifecycle operations are consolidated under `manage_claim` with an
 pre-1.0 MCP break: the former `claim_card`, `renew_claim`, `heartbeat`,
 `release_claim`, and `transfer_claim` tools are removed from `tools/list`.
 
-By default, `powder-mcp` advertises the agent persona only: card discovery,
+By default, `powder-mcp` advertises the 23-tool agent persona only: card discovery,
 card/runs reads, card creation/update, status/relations/criteria writes,
 claim management, comments, work logs, links, input requests/answers,
 completion, and `list_repositories` for repo filters. Operator/admin tools are
@@ -146,7 +146,7 @@ hidden from both `tools/list` and `tools/call`: `create_event_subscription`,
 `tail_events`, `list_keys`, `upsert_repository`, `delete_repository`, and
 `merge_repository_alias`. Set `POWDER_MCP_TOOLSETS=admin` or
 `POWDER_MCP_TOOLSETS=all` before starting the MCP subprocess to add those
-admin tools to the same server registration. The value is read once at startup
+admin tools to the same server registration (32 tools total, including the 9-tool admin add-on). The value is read once at startup
 for MCP client cache stability; changing it requires restarting `powder-mcp`.
 A hidden-tool call returns an error naming `POWDER_MCP_TOOLSETS`.
 

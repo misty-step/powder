@@ -52,7 +52,7 @@ sweep with `list_cards label:papercut` (MCP) or
 
 ## Expected MCP Tools
 
-Default agent persona (22 tools):
+Default agent persona (23 tools):
 
 - `list_ready`: return claimable cards from active repositories, ordered so
   no card appears after another card in the response it transitively
@@ -157,7 +157,7 @@ Default agent persona (22 tools):
   authenticated actor may patch; every patch is audited with actor and field
   list, so recording an operator ruling never requires the admin key.
 
-Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all` (9 tools):
+Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all` (9 tools; 32 tools total):
 
 - `upsert_repository`: create or update repository settings.
 - `merge_repository_alias`: merge duplicate repo strings into one canonical
