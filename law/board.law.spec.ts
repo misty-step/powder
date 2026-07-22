@@ -205,7 +205,7 @@ for (const mode of MODES) {
     const errors = await boot(page, mode);
     await page.locator("#tab-board").click();
     await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
-    const card = page.locator("[data-card-link]").first();
+    const card = page.locator("[data-card-link][data-id='001']");
     await card.waitFor({ state: "visible" });
     await expect(card).toHaveAttribute("href", "/c/001");
     await card.click();
