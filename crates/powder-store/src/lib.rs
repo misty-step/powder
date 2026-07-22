@@ -315,6 +315,8 @@ pub struct CardListPage {
     /// last page, or whenever the eligible set already fits within
     /// `limit`.
     pub next_after: Option<CardId>,
+    /// Opaque snapshot binding for Ready continuation; absent on generic lists.
+    pub continuation_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2562,6 +2564,16 @@ impl Store {
 
         let order = powder_core::order_ready_cards(cards);
         let cycle_card_ids = order.cycle_card_ids;
+        let snapshot = ready_order_snapshot(&order.cards, &cycle_card_ids);
+        if let Some(cursor) = after {
+            if !cursor.matches_snapshot(&snapshot) {
+                return Err(DomainError::validation(
+                    "after",
+                    "stale continuation cursor: ready result changed; restart from the first page",
+                )
+                .into());
+            }
+        }
         let (cards, next_after) = paginate_ordered_cards(
             order.cards,
             query.limit,
@@ -2573,6 +2585,7 @@ impl Store {
             excluded_terminal_count: 0,
             cycle_card_ids,
             next_after,
+            continuation_snapshot: Some(snapshot),
         })
     }
 
@@ -2673,6 +2686,7 @@ impl Store {
             excluded_terminal_count,
             cycle_card_ids: Vec::new(),
             next_after,
+            continuation_snapshot: None,
         })
     }
 
@@ -4656,6 +4670,24 @@ pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
 /// just after `after`'s position, plus `next_after`: the id to pass on the
 /// following call, present only when this slice didn't reach the end of
 /// `cards`.
+fn ready_order_snapshot(cards: &[Card], cycle_card_ids: &[CardId]) -> String {
+    let mut digest = Sha256::new();
+    for card in cards {
+        digest.update(card.id.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(card.status.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(card.updated_at.to_le_bytes());
+        digest.update([0]);
+    }
+    for card_id in cycle_card_ids {
+        digest.update(card_id.as_str().as_bytes());
+        digest.update([0]);
+    }
+    let bytes = digest.finalize();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn paginate_ordered_cards(
     mut cards: Vec<Card>,
     limit: usize,

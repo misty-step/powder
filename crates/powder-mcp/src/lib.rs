@@ -429,6 +429,7 @@ pub fn call_tool_store(
                 &page.cycle_card_ids,
                 page.next_after.as_ref(),
                 Some(&query),
+                page.continuation_snapshot.as_deref(),
             )
         }
         "list_cards" => {
@@ -552,7 +553,7 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             card.repo = optional_str(args, "repo").map(str::to_string);
             let card = store
-                .create_card_with_events(card, &authority_arg(args).actor_label(), now)
+                .create_card_with_authority(card, &authority_arg(args)?, now)
                 .map_err(to_string)?;
             let mut payload = card_ack_payload(&card);
             if card.acceptance.is_empty() {
@@ -581,7 +582,7 @@ pub fn call_tool_store(
                 repo: None,
             };
             let card = store
-                .patch_card(&card_id, patch, &authority_arg(args).actor_label(), now)
+                .patch_card_with_authority(&card_id, patch, &authority_arg(args)?, now)
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -655,14 +656,14 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let answer = required_str(args, "answer")?;
             json!(store
-                .answer_input(&run_id, actor, answer, now, &authority_arg(args))
+                .answer_input(&run_id, actor, answer, now, &authority_arg(args)?)
                 .map_err(to_string)?)
         }
         "update_status" => {
             let card_id = card_id(args, "card_id")?;
             let status = parse_status(required_str(args, "status")?)?;
             let card = store
-                .update_status(&card_id, status, now, &authority_arg(args))
+                .update_status(&card_id, status, now, &authority_arg(args)?)
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -673,7 +674,7 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
             let card = store
-                .check_criterion(&card_id, criterion, actor, checked, now)
+                .check_criterion_as(&card_id, criterion, actor, checked, now, &authority_arg(args)?)
                 .map_err(to_string)?;
             criterion_ack_payload(&card, criterion, checked)
         }
@@ -700,7 +701,7 @@ pub fn call_tool_store(
                             card_ids_array(args, "blocks")?,
                             card_ids_array(args, "blocked_by")?,
                             now,
-                            &authority_arg(args),
+                            &authority_arg(args)?,
                         )
                         .map_err(to_string)?,
                 );
@@ -709,7 +710,7 @@ pub fn call_tool_store(
                 let parent = parent_arg.map(CardId::new).transpose().map_err(to_string)?;
                 card = Some(
                     store
-                        .set_parent(&card_id, parent, now, &authority_arg(args))
+                        .set_parent(&card_id, parent, now, &authority_arg(args)?)
                         .map_err(to_string)?,
                 );
             }
@@ -722,7 +723,7 @@ pub fn call_tool_store(
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
             json!(store
-                .add_link(&card_id, label, url, now)
+                .add_link_as(&card_id, label, url, now, &authority_arg(args)?)
                 .map_err(to_string)?)
         }
         "add_comment" => {
@@ -731,7 +732,7 @@ pub fn call_tool_store(
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
             json!(store
-                .add_comment(&card_id, author, body, now)
+                .add_comment_as(&card_id, author, body, now, &authority_arg(args)?)
                 .map_err(to_string)?)
         }
         "append_work_log" => {
@@ -746,7 +747,7 @@ pub fn call_tool_store(
                 run_id: optional_str(args, "run_id"),
             };
             json!(store
-                .append_work_log(&card_id, agent, attribution, body, now)
+                .append_work_log_as(&card_id, agent, attribution, body, now, &authority_arg(args)?)
                 .map_err(to_string)?)
         }
         "report_papercut" => {
@@ -758,7 +759,7 @@ pub fn call_tool_store(
                 harness: optional_str(args, "harness").map(str::to_string),
             };
             let card = store
-                .file_papercut(&report, &report.agent, now)
+                .file_papercut_with_authority(&report, &authority_arg(args)?, now)
                 .map_err(to_string)?;
             json!({
                 "id": card.id.as_str(),
@@ -771,7 +772,7 @@ pub fn call_tool_store(
             let run_id = RunId::new(required_str(args, "run_id")?).map_err(to_string)?;
             let question = required_str(args, "question")?;
             json!(store
-                .request_input(&run_id, question, now, &authority_arg(args))
+                .request_input(&run_id, question, now, &authority_arg(args)?)
                 .map_err(to_string)?)
         }
         "complete_card" => {
@@ -782,7 +783,7 @@ pub fn call_tool_store(
                     optional_str(args, "proof"),
                     criterion_proofs_arg(args)?,
                     now,
-                    &authority_arg(args),
+                    &authority_arg(args)?,
                 )
                 .map_err(to_string)?;
             card_ack_payload(&card)
@@ -848,6 +849,7 @@ fn card_summary_page_payload(
     cycle_card_ids: &[CardId],
     next_after: Option<&CardId>,
     cursor_query: Option<&ReadyQuery>,
+    continuation_snapshot: Option<&str>,
 ) -> Value {
     let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
     let has_more = next_after.is_some();
@@ -871,7 +873,11 @@ fn card_summary_page_payload(
     }
     if let Some(next_after) = next_after {
         payload["next_after"] = match cursor_query {
-            Some(query) => json!(ReadyCursor::for_query(query, next_after.clone()).encode()),
+            Some(query) => json!(ReadyCursor::for_query_with_snapshot(
+                query,
+                next_after.clone(),
+                continuation_snapshot.unwrap_or(""),
+            ).encode()),
             None => json!(next_after),
         };
     }
@@ -1078,7 +1084,7 @@ fn manage_claim_store(store: &mut Store, args: &Value, now: i64) -> Result<Value
     let action = claim_action(args)?;
     let card_id = card_id(args, "card_id")?;
     let ttl_seconds = args["ttl_seconds"].as_u64().unwrap_or(3600);
-    let authority = authority_arg(args);
+    let authority = authority_arg(args)?;
 
     Ok(match action {
         ClaimAction::Claim => {
@@ -1362,15 +1368,13 @@ fn field_role(key: &'static str) -> &'static str {
 /// `actor`/`admin` tool arguments. Omitting `actor` preserves prior MCP
 /// behavior exactly: a stdio-local caller is trusted and no ownership check
 /// runs, matching the CLI's `--actor` default.
-fn authority_arg(args: &Value) -> Authority {
-    match args["actor"]
+fn authority_arg(args: &Value) -> Result<Authority, String> {
+    let actor = args["actor"]
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
-        None => Authority::unchecked(),
-    }
+        .ok_or_else(|| "missing required argument: actor (authenticated local principal)".to_string())?;
+    Ok(Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)))
 }
 
 fn reject_principal_arg(args: &Value) -> Result<(), String> {

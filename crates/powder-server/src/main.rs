@@ -1159,6 +1159,7 @@ async fn list_ready(
         &page.cycle_card_ids,
         page.next_after,
         Some(&query),
+        page.continuation_snapshot.as_deref(),
     )))
 }
 
@@ -1241,6 +1242,7 @@ async fn list_cards(
         &page.cycle_card_ids,
         page.next_after,
         None,
+        page.continuation_snapshot.as_deref(),
     )))
 }
 
@@ -1251,6 +1253,7 @@ fn card_list_page_json(
     cycle_card_ids: &[CardId],
     next_after: Option<CardId>,
     cursor_query: Option<&ReadyQuery>,
+    continuation_snapshot: Option<&str>,
 ) -> serde_json::Value {
     let has_more = next_after.is_some() || excluded_terminal_count > 0;
     let mut payload = json!({
@@ -1285,7 +1288,11 @@ fn card_list_page_json(
     // answer once a caller is walking pages with `after`.
     if let Some(next_after) = next_after {
         payload["next_after"] = match cursor_query {
-            Some(query) => json!(ReadyCursor::for_query(query, next_after).encode()),
+            Some(query) => json!(ReadyCursor::for_query_with_snapshot(
+                query,
+                next_after,
+                continuation_snapshot.unwrap_or(""),
+            ).encode()),
             None => json!(next_after),
         };
     }
@@ -1496,12 +1503,13 @@ async fn create_card(
 
 async fn file_papercut(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    AuthActor(actor): AuthActor,
     Json(request): Json<FilePapercutRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    // Same authorization posture as create_card: an agent-scoped key may
-    // file friction without claiming it or holding admin.
-    authorize(&state, &headers)?;
+    // Authenticate before consuming JSON so malformed unauthenticated input
+    // is still a 401, and audit the credential principal rather than the
+    // semantic worker label in the papercut body.
+    let authority = actor.authority();
     let now = unix_now();
     let report = PapercutReport {
         agent: request.agent,
@@ -1512,7 +1520,7 @@ async fn file_papercut(
     };
     let card = {
         let mut store = lock_store(&state)?;
-        store.file_papercut(&report, &report.agent, now)?
+        store.file_papercut_with_authority(&report, &authority, now)?
     };
     Ok(Json(json!({
         "id": card.id.as_str(),

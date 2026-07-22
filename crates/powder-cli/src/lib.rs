@@ -1095,7 +1095,11 @@ fn ready_page_json(page: &powder_store::CardListPage, query: &ReadyQuery) -> Val
         payload["cycle_card_ids"] = json!(page.cycle_card_ids);
     }
     if let Some(next_after) = page.next_after.as_ref() {
-        payload["next_after"] = json!(ReadyCursor::for_query(query, next_after.clone()).encode());
+        payload["next_after"] = json!(ReadyCursor::for_query_with_snapshot(
+            query,
+            next_after.clone(),
+            page.continuation_snapshot.as_deref().unwrap_or(""),
+        ).encode());
     }
     payload
 }

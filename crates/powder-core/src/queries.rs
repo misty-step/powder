@@ -63,27 +63,50 @@ impl ReadyQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyCursor {
     fingerprint: String,
+    snapshot: String,
     pub anchor: CardId,
 }
 
 impl ReadyCursor {
     pub fn for_query(query: &ReadyQuery, anchor: CardId) -> Self {
+        Self::for_query_with_snapshot(query, anchor, "")
+    }
+
+    pub fn for_query_with_snapshot(
+        query: &ReadyQuery,
+        anchor: CardId,
+        snapshot: impl Into<String>,
+    ) -> Self {
         Self {
             fingerprint: query.fingerprint(),
+            snapshot: snapshot.into(),
             anchor,
         }
     }
 
     pub fn encode(&self) -> String {
-        format!(
-            "v1.{}.{}",
-            self.fingerprint,
-            hex_encode(self.anchor.as_str().as_bytes())
-        )
+        if self.snapshot.is_empty() {
+            format!(
+                "v1.{}.{}",
+                self.fingerprint,
+                hex_encode(self.anchor.as_str().as_bytes())
+            )
+        } else {
+            format!(
+                "v1.{}.{}.{}",
+                self.fingerprint,
+                self.snapshot,
+                hex_encode(self.anchor.as_str().as_bytes())
+            )
+        }
     }
 
     pub fn matches_query(&self, query: &ReadyQuery) -> bool {
         self.fingerprint == query.fingerprint()
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &str) -> bool {
+        self.snapshot.is_empty() || self.snapshot == snapshot
     }
 
     pub fn decode_for_query(raw: &str, query: &ReadyQuery) -> Result<Self, DomainError> {
@@ -97,15 +120,19 @@ impl ReadyCursor {
         let fingerprint = parts
             .next()
             .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
-        let anchor_hex = parts
+        let third = parts
             .next()
             .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
-        if parts.next().is_some() {
-            return Err(DomainError::validation(
-                "after",
-                "invalid continuation cursor",
-            ));
-        }
+        let (snapshot, anchor_hex) = match parts.next() {
+            None => (String::new(), third),
+            Some(anchor_hex) if parts.next().is_none() => (third.to_string(), anchor_hex),
+            Some(_) => {
+                return Err(DomainError::validation(
+                    "after",
+                    "invalid continuation cursor",
+                ));
+            }
+        };
         if fingerprint != query.fingerprint() {
             return Err(DomainError::validation(
                 "after",
@@ -120,6 +147,7 @@ impl ReadyCursor {
             .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
         Ok(Self {
             fingerprint: fingerprint.to_string(),
+            snapshot,
             anchor,
         })
     }
