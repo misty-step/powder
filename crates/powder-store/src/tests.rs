@@ -7955,3 +7955,38 @@ fn keyed_store_mutations_do_not_duplicate_real_rows() {
         .iter()
         .any(|event| event.operation.as_deref() == Some("work_log")));
 }
+
+#[test]
+fn every_keyed_matrix_operation_has_one_store_executor() {
+    let mut store = Store::open_in_memory().unwrap();
+    store.migrate().unwrap();
+    let authority = Authority::principal("matrix-principal", false);
+    let payload = serde_json::json!({"operation": "matrix"});
+    let mut keyed = 0;
+    for operation in Operation::ALL {
+        if !matches!(
+            operation.rule().idempotency,
+            powder_core::IdempotencyMode::Keyed
+        ) {
+            continue;
+        }
+        keyed += 1;
+        let result = store
+            .with_keyed_operation(
+                operation,
+                format!("matrix:{}", operation.as_str()),
+                &payload,
+                format!("key-{}", operation.as_str()).as_str(),
+                100,
+                &authority,
+                |_| Ok(operation.as_str().to_string()),
+            )
+            .unwrap();
+        assert!(
+            !result.replayed,
+            "first {} delivery replayed",
+            operation.as_str()
+        );
+    }
+    assert!(keyed > 0);
+}

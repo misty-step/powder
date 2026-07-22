@@ -821,6 +821,47 @@ impl Store {
         }
     }
 
+    /// Canonical Store boundary for every matrix operation whose rule is
+    /// keyed. Faces supply only semantic payload/resource data; principal and
+    /// role come from the authenticated authority, and the closure runs inside
+    /// the same transaction as the durable receipt.
+    pub fn with_keyed_operation<T, P, F>(
+        &mut self,
+        operation: Operation,
+        resource: impl Into<String>,
+        payload: &P,
+        key: &str,
+        now: i64,
+        authority: &Authority,
+        mutation: F,
+    ) -> Result<IdempotencyOutcome<T>>
+    where
+        T: Serialize + DeserializeOwned,
+        P: Serialize,
+        F: FnOnce(&Transaction<'_>) -> Result<T>,
+    {
+        if !matches!(
+            operation.rule().idempotency,
+            powder_core::IdempotencyMode::Keyed
+        ) {
+            return Err(DomainError::validation(
+                "operation",
+                format!("{} is not keyed", operation.as_str()),
+            )
+            .into());
+        }
+        let request = IdempotencyRequest::from_payload(
+            operation,
+            resource,
+            authority,
+            key,
+            payload,
+            now,
+            24 * 60 * 60,
+        )?;
+        self.with_idempotency(&request, mutation)
+    }
+
     /// Execute one keyed mutation and persist its receipt in the same
     /// transaction as the mutation. Immediate locking serializes duplicate
     /// deliveries, so a replay returns the original value without running the
