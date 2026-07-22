@@ -126,6 +126,7 @@ pub struct SearchResult {
     pub source_field: String,
     pub source_created_at: i64,
     pub snippet: String,
+    pub blocked_by: Vec<CardId>,
     pub rank: f64,
 }
 
@@ -690,6 +691,10 @@ impl Store {
                     self.migrate_22_to_23()?;
                     23
                 }
+                23 => {
+                    self.migrate_23_to_24()?;
+                    24
+                }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
             self.connection
@@ -697,61 +702,10 @@ impl Store {
         }
     }
 
-    /// Searches card titles/bodies/criteria, comment bodies, and work-log
-    /// bodies. Query text is treated as a literal FTS phrase so identifiers
-    /// such as `powder-query-fts-store` and `SQLITE_BUSY` keep
-    /// their punctuation and cannot become FTS operators.
-    fn search_rows(&self, query: &str) -> Result<Vec<RawSearchMatch>> {
-        let Some(match_query) = rewrite_search_query(query) else {
-            return Ok(Vec::new());
-        };
-        let mut statement = self.connection.prepare(
-            "SELECT source_table, source_field, source_id, card_id, created_at,
-                    snippet(card_search_fts, 5, '', '', '…', 32), bm25(card_search_fts)
-             FROM card_search_fts
-             WHERE card_search_fts MATCH ?1
-             ORDER BY bm25(card_search_fts), source_table, source_field, card_id, source_id",
-        )?;
-        let mut rows = statement.query(params![match_query])?;
-        let mut matches = Vec::new();
-        while let Some(row) = rows.next()? {
-            matches.push(RawSearchMatch {
-                source_table: row.get(0)?,
-                source_field: row.get(1)?,
-                _source_id: row.get(2)?,
-                card_id: CardId::new(row.get::<_, String>(3)?)?,
-                created_at: row.get(4)?,
-                snippet: row.get(5)?,
-                rank: row.get(6)?,
-            });
-        }
-        let prefix = escape_like_prefix(query);
-        let mut id_statement = self.connection.prepare(
-            "SELECT DISTINCT 'cards', 'id', card_id, card_id, created_at, card_id, -1000.0
-             FROM search_documents
-             WHERE source_table = 'cards' AND (card_id = ?1 OR card_id LIKE ?2 ESCAPE '\\')",
-        )?;
-        let mut id_rows = id_statement.query(params![query, format!("{prefix}%")])?;
-        while let Some(row) = id_rows.next()? {
-            matches.push(RawSearchMatch {
-                source_table: row.get(0)?,
-                source_field: row.get(1)?,
-                _source_id: row.get(2)?,
-                card_id: CardId::new(row.get::<_, String>(3)?)?,
-                created_at: row.get(4)?,
-                snippet: row.get(5)?,
-                rank: row.get(6)?,
-            });
-        }
-        Ok(matches)
-    }
-
-    /// Search through the FTS spine with deliberate recall shaping and card filters.
-    /// Query terms are quoted and rewritten as prefixes; multiple terms use FTS5
-    /// NEAR so their order is not treated as an accidental phrase. The index keeps
-    /// hyphen and underscore compounds as single tokens, so a sub-token such as
-    /// fts does not match powder-query-fts-store; callers should use the full
-    /// identifier or a prefix (for example powder-query).
+    /// Searches through the FTS spine with SQL-side ranking, filtering, and
+    /// pagination. Only the requested page is hydrated into `Card` values;
+    /// the window count keeps `total_count` exact without materializing every
+    /// matching source row in Rust.
     pub fn search_page(&self, query: &SearchQuery) -> Result<SearchPage> {
         let query_text = query.q.trim();
         if query_text.is_empty() || query.limit == 0 || !self.table_exists("card_search_fts")? {
@@ -762,91 +716,14 @@ impl Store {
                 next_after: None,
             });
         }
-        let mut rows = self.search_rows(query_text)?;
-        let repo_filter = query.repo.as_deref().and_then(canonical_repo_label);
-        let mut summaries = HashMap::<String, CardSummary>::new();
-        let mut results = Vec::new();
-        for row in rows.drain(..) {
-            if !search_source_matches(query.source_kind.as_deref(), &row.source_table)
-                || query
-                    .source_field
-                    .as_deref()
-                    .is_some_and(|wanted| !wanted.eq_ignore_ascii_case(&row.source_field))
-                || query
-                    .source_created_after
-                    .is_some_and(|value| row.created_at < value)
-                || query
-                    .source_created_before
-                    .is_some_and(|value| row.created_at > value)
-            {
-                continue;
-            }
-            let key = row.card_id.as_str().to_string();
-            let summary = if let Some(summary) = summaries.get(&key).cloned() {
-                summary
-            } else {
-                let card = match self.get_card(&row.card_id)? {
-                    Some(card) => card,
-                    None => continue,
-                };
-                if query.status.is_some_and(|value| card.status != value)
-                    || query.priority.is_some_and(|value| card.priority != value)
-                    || query
-                        .estimate
-                        .is_some_and(|value| card.estimate != Some(value))
-                    || query.risk.is_some_and(|value| card.risk != Some(value))
-                    || query
-                        .created_after
-                        .is_some_and(|value| card.created_at < value)
-                    || query
-                        .created_before
-                        .is_some_and(|value| card.created_at > value)
-                    || query
-                        .updated_after
-                        .is_some_and(|value| card.updated_at < value)
-                    || query
-                        .updated_before
-                        .is_some_and(|value| card.updated_at > value)
-                    || query.label.as_ref().is_some_and(|wanted| {
-                        !card
-                            .labels
-                            .iter()
-                            .any(|label| label.eq_ignore_ascii_case(wanted.trim()))
-                    })
-                    || repo_filter.as_deref().is_some_and(|wanted| {
-                        !card
-                            .repo
-                            .as_deref()
-                            .is_some_and(|repo| canonical_repo_matches(repo, wanted))
-                            && repo_from_numeric_card_id_prefix(card.id.as_str()).as_deref()
-                                != Some(wanted)
-                    })
-                {
-                    continue;
-                }
-                let summary = card.summary();
-                summaries.insert(key.clone(), summary.clone());
-                summary
-            };
-            results.push(SearchResult {
-                card: summary,
-                source_kind: row.source_table,
-                source_field: row.source_field,
-                source_created_at: row.created_at,
-                snippet: row.snippet,
-                rank: row.rank,
+        let Some(match_query) = rewrite_search_query(query_text) else {
+            return Ok(SearchPage {
+                matches: Vec::new(),
+                total_count: 0,
+                has_more: false,
+                next_after: None,
             });
-        }
-        results.sort_by(|left, right| {
-            left.rank
-                .partial_cmp(&right.rank)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.source_kind.cmp(&right.source_kind))
-                .then_with(|| left.source_field.cmp(&right.source_field))
-                .then_with(|| left.card.id.as_str().cmp(right.card.id.as_str()))
-                .then_with(|| left.source_created_at.cmp(&right.source_created_at))
-        });
-        let total_count = results.len();
+        };
         let fingerprint = search_query_fingerprint(query);
         let offset = query
             .after
@@ -854,16 +731,196 @@ impl Store {
             .map(|cursor| decode_search_cursor(cursor, &fingerprint))
             .transpose()?
             .unwrap_or(0);
-        let start = offset.min(total_count);
-        let end = start.saturating_add(query.limit).min(total_count);
-        let matches = results
-            .into_iter()
-            .skip(start)
-            .take(end - start)
-            .collect::<Vec<_>>();
+        let source_kind = query
+            .source_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let source_field = query
+            .source_field
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let source_repo = query.repo.as_deref().and_then(canonical_repo_label);
+        let repo_filter_requested = query.repo.is_some();
+        let source_after = query.source_created_after;
+        let source_before = query.source_created_before;
+        let status = query.status.map(|value| value.as_str());
+        let priority = query.priority.map(|value| value.as_str());
+        let estimate = query.estimate.map(|value| value.as_str());
+        let risk = query.risk.map(|value| value.as_str());
+        let label = query
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let prefix = escape_like_prefix(query_text);
+        let id_prefix = format!("{prefix}%");
+        let cte = r#"
+            WITH matched(source_table, source_field, source_id, card_id, created_at, snippet, match_rank) AS (
+                SELECT source_table, source_field, source_id, card_id, created_at,
+                       snippet(card_search_fts, 5, '', '', '…', 32),
+                       bm25(card_search_fts)
+                FROM card_search_fts
+                WHERE card_search_fts MATCH ?1
+                UNION ALL
+                SELECT 'cards', 'id', documents.card_id, documents.card_id, cards.created_at,
+                       documents.card_id, -1000.0
+                FROM search_documents documents
+                JOIN cards ON cards.id = documents.card_id
+                WHERE documents.source_table = 'cards'
+                  AND (documents.card_id = ?2 OR documents.card_id LIKE ?3 ESCAPE '\')
+                GROUP BY documents.card_id
+            )
+        "#;
+        let filters = r#"
+            WHERE (?4 IS NULL OR
+                   (lower(?4) IN ('card', 'cards') AND m.source_table = 'cards') OR
+                   (lower(?4) IN ('comment', 'comments') AND m.source_table = 'comments') OR
+                   (lower(?4) IN ('worklog', 'work_log', 'work-log', 'work_log_entries')
+                    AND m.source_table = 'work_log_entries') OR
+                   lower(m.source_table) = lower(?4))
+              AND (?5 IS NULL OR lower(m.source_field) = lower(?5))
+              AND (?6 IS NULL OR m.created_at >= ?6)
+              AND (?7 IS NULL OR m.created_at <= ?7)
+              AND (?8 IS NULL OR c.status = ?8)
+              AND (?9 IS NULL OR c.priority = ?9)
+              AND (?10 IS NULL OR c.estimate = ?10)
+              AND (?11 IS NULL OR c.risk = ?11)
+              AND (?12 IS NULL OR c.created_at >= ?12)
+              AND (?13 IS NULL OR c.created_at <= ?13)
+              AND (?14 IS NULL OR c.updated_at >= ?14)
+              AND (?15 IS NULL OR c.updated_at <= ?15)
+              AND (?16 IS NULL OR EXISTS (
+                    SELECT 1 FROM json_each(c.labels_json)
+                    WHERE lower(json_each.value) = lower(?16)
+                  ))
+              AND (?18 = 0 OR
+                   (?17 IS NOT NULL AND (
+                     lower(rtrim(trim(c.repo), '/')) = lower(?17) OR
+                     lower(rtrim(trim(c.repo), '/')) = lower(?17) || '.git' OR
+                     lower(rtrim(trim(c.repo), '/')) LIKE '%/' || lower(?17) OR
+                     lower(rtrim(trim(c.repo), '/')) LIKE '%/' || lower(?17) || '.git' OR
+                     (c.repo IS NULL AND lower(c.id) LIKE lower(?17) || '-%' AND
+                      substr(c.id, length(?17) + 2) <> '' AND
+                      substr(c.id, length(?17) + 2) NOT GLOB '*[^0-9]*'))))
+        "#;
+        let page_sql = format!(
+            "{cte} SELECT m.source_table, m.source_field, m.source_id, m.card_id,
+                    m.created_at, m.snippet, m.match_rank, COUNT(*) OVER()
+             FROM matched m
+             JOIN cards c ON c.id = m.card_id
+             {filters}
+             ORDER BY m.match_rank, m.source_table, m.source_field, m.card_id, m.source_id, m.created_at
+             LIMIT ?19 OFFSET ?20"
+        );
+        let mut statement = self.connection.prepare(&page_sql)?;
+        let mut rows = statement.query(params![
+            match_query,
+            query_text,
+            id_prefix,
+            source_kind,
+            source_field,
+            source_after,
+            source_before,
+            status,
+            priority,
+            estimate,
+            risk,
+            query.created_after,
+            query.created_before,
+            query.updated_after,
+            query.updated_before,
+            label,
+            source_repo.as_deref(),
+            repo_filter_requested,
+            query.limit as i64,
+            offset as i64,
+        ])?;
+        let mut raw_rows = Vec::new();
+        let mut total_count = None;
+        while let Some(row) = rows.next()? {
+            total_count = Some(row.get::<_, i64>(7)? as usize);
+            raw_rows.push(RawSearchMatch {
+                source_table: row.get(0)?,
+                source_field: row.get(1)?,
+                card_id: CardId::new(row.get::<_, String>(3)?)?,
+                created_at: row.get(4)?,
+                snippet: row.get(5)?,
+                rank: row.get(6)?,
+            });
+        }
+        drop(rows);
+        drop(statement);
+
+        let total_count = match total_count {
+            Some(total_count) => total_count,
+            None => {
+                let count_sql = format!(
+                    "{cte} SELECT COUNT(*)
+                     FROM matched m
+                     JOIN cards c ON c.id = m.card_id
+                     {filters}"
+                );
+                self.connection.query_row(
+                    &count_sql,
+                    params![
+                        match_query,
+                        query_text,
+                        id_prefix,
+                        source_kind,
+                        source_field,
+                        source_after,
+                        source_before,
+                        status,
+                        priority,
+                        estimate,
+                        risk,
+                        query.created_after,
+                        query.created_before,
+                        query.updated_after,
+                        query.updated_before,
+                        label,
+                        source_repo.as_deref(),
+                        repo_filter_requested,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )? as usize
+            }
+        };
+
+        let mut summaries = HashMap::<String, CardSummary>::new();
+        let mut blockers = HashMap::<String, Vec<CardId>>::new();
+        let mut results = Vec::with_capacity(raw_rows.len());
+        for row in raw_rows {
+            let key = row.card_id.as_str().to_string();
+            let (summary, blocked_by) = if let Some(summary) = summaries.get(&key).cloned() {
+                (summary, blockers.get(&key).cloned().unwrap_or_default())
+            } else {
+                let card = match self.get_card(&row.card_id)? {
+                    Some(card) => card,
+                    None => continue,
+                };
+                let summary = card.summary();
+                let blocked_by = card.blocked_by.clone();
+                summaries.insert(key.clone(), summary.clone());
+                blockers.insert(key, blocked_by.clone());
+                (summary, blocked_by)
+            };
+            results.push(SearchResult {
+                card: summary,
+                blocked_by,
+                source_kind: row.source_table,
+                source_field: row.source_field,
+                source_created_at: row.created_at,
+                snippet: row.snippet,
+                rank: row.rank,
+            });
+        }
+        let end = offset.saturating_add(query.limit).min(total_count);
         let has_more = end < total_count;
         Ok(SearchPage {
-            matches,
+            matches: results,
             total_count,
             has_more,
             next_after: has_more.then(|| encode_search_cursor(&fingerprint, end)),
@@ -1588,6 +1645,37 @@ impl Store {
         transaction.execute(
             "INSERT INTO card_search_fts(card_search_fts) VALUES ('rebuild')",
             [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Rebuilds the external-content FTS index with card IDs kept as exact
+    /// metadata rather than indexed text. Card IDs are searched through the
+    /// explicit source-document path in `search_page`, so an identifier hit
+    /// has the exact `cards/id` provenance instead of one false hit per
+    /// title/body/criteria document.
+    fn migrate_23_to_24(&mut self) -> Result<()> {
+        if !self.table_exists("card_search_fts")? {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "DROP TABLE card_search_fts;
+             CREATE VIRTUAL TABLE card_search_fts USING fts5(
+               source_table UNINDEXED,
+               source_field UNINDEXED,
+               source_id UNINDEXED,
+               created_at UNINDEXED,
+               card_id UNINDEXED,
+               content,
+               content='search_documents',
+               content_rowid='doc_id',
+               tokenize = 'unicode61 tokenchars ''-_'''
+             );
+             INSERT INTO card_search_fts(card_search_fts) VALUES ('rebuild');",
         )?;
         transaction.commit()?;
         Ok(())
@@ -4140,27 +4228,10 @@ fn load_card_optional(connection: &Connection, card_id: &CardId) -> Result<Optio
 struct RawSearchMatch {
     source_table: String,
     source_field: String,
-    _source_id: String,
     card_id: CardId,
     created_at: i64,
     snippet: String,
     rank: f64,
-}
-
-fn search_source_matches(wanted: Option<&str>, actual: &str) -> bool {
-    let Some(wanted) = wanted.map(str::trim).filter(|value| !value.is_empty()) else {
-        return true;
-    };
-    let wanted = wanted.to_ascii_lowercase();
-    match actual {
-        "cards" => wanted == "cards" || wanted == "card",
-        "comments" => wanted == "comments" || wanted == "comment",
-        "work_log_entries" => matches!(
-            wanted.as_str(),
-            "work_log_entries" | "work-log" | "work_log" | "worklog"
-        ),
-        _ => wanted == actual,
-    }
 }
 
 fn quote_fts_prefix(term: &str) -> String {

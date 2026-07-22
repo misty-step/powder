@@ -6408,14 +6408,13 @@ fn fts_search_indexes_all_store_text_and_literal_tokens() -> Result<()> {
         hit.source_kind == "cards" && hit.source_field == "body" && hit.card.id == card.id
     }));
     let card_id_hits = search_page_matches(&store, "powder-query-fts-store", 10)?;
-    assert_eq!(card_id_hits.len(), 6);
+    assert_eq!(card_id_hits.len(), 1);
     assert!(card_id_hits.iter().all(|hit| hit.card.id == card.id));
+    assert_eq!(card_id_hits[0].source_kind, "cards");
+    assert_eq!(card_id_hits[0].source_field, "id");
     assert!(card_id_hits
         .iter()
         .any(|hit| hit.source_kind == "cards" && hit.source_field == "id"));
-    assert!(card_id_hits
-        .iter()
-        .any(|hit| hit.source_kind == "cards" && hit.source_field == "title"));
     assert!(search_page_matches(&store, "criteria-token", 10)?
         .iter()
         .any(|hit| hit.source_field == "criteria"));
@@ -6462,6 +6461,43 @@ fn fts_search_ranks_by_bm25_and_rolls_back_source_writes() -> Result<()> {
     )?;
     drop(transaction);
     assert!(search_page_matches(&store, "ghost-token", 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn fts_v24_rebuild_makes_card_ids_exact_metadata() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("v24-card-id", 10);
+    card.title = "v24 searchable title".to_string();
+    store.import_cards(vec![card.clone()])?;
+
+    // Recreate the v23 shape to prove the migration, rather than only testing
+    // a fresh v24 database. The old index searched card_id as content and
+    // therefore produced one false source hit per card document.
+    store.connection.execute_batch(
+        "DROP TABLE card_search_fts;
+         CREATE VIRTUAL TABLE card_search_fts USING fts5(
+           source_table UNINDEXED, source_field UNINDEXED, source_id UNINDEXED,
+           created_at UNINDEXED, card_id, content,
+           content='search_documents', content_rowid='doc_id',
+           tokenize = 'unicode61 tokenchars ''-_'''
+         );
+         INSERT INTO card_search_fts(card_search_fts) VALUES ('rebuild');
+         PRAGMA user_version = 23;",
+    )?;
+    store.migrate()?;
+
+    let page = store.search_page(&SearchQuery {
+        q: card.id.to_string(),
+        limit: 10,
+        ..SearchQuery::default()
+    })?;
+    assert_eq!(store.schema_version()?, 24);
+    assert_eq!(page.total_count, 1);
+    assert_eq!(page.matches.len(), 1);
+    assert_eq!(page.matches[0].source_kind, "cards");
+    assert_eq!(page.matches[0].source_field, "id");
     Ok(())
 }
 
@@ -7180,6 +7216,118 @@ fn fts_search_times_10k_synthetic_cards() -> Result<()> {
     println!("FTS5 search over 10,000 synthetic cards: {elapsed:?}");
     assert_eq!(hits.len(), 10);
     assert!(hits.iter().all(|hit| hit.source_field == "title"));
+    Ok(())
+}
+
+#[test]
+fn search_page_paginates_before_hydrating_and_keeps_exact_total() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let cards = (0..10_000)
+        .map(|index| {
+            let mut card = ready_card(&format!("bounded-search-{index:05}"), index);
+            card.title = format!("bounded-search-token card {index}");
+            card
+        })
+        .collect();
+    store.import_cards(cards)?;
+
+    let started = std::time::Instant::now();
+    let page = store.search_page(&SearchQuery {
+        q: "bounded-search-token".to_string(),
+        limit: 1,
+        ..SearchQuery::default()
+    })?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "bounded search took {elapsed:?}"
+    );
+    assert_eq!(page.matches.len(), 1);
+    assert_eq!(page.total_count, 10_000);
+    assert!(page.has_more);
+    assert!(page.next_after.is_some());
+    Ok(())
+}
+
+#[test]
+fn search_result_carries_blockers_for_unloaded_ui_rows() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let blocker = ready_card("search-blocker", 1).with_status(CardStatus::Done);
+    let target_id = CardId::new("search-blocked")?;
+    let mut target = ready_card(target_id.as_str(), 2);
+    target.title = "search-blocked needle".to_string();
+    target.blocked_by = vec![blocker.id.clone()];
+    store.import_cards(vec![blocker, target.clone()])?;
+
+    let page = store.search_page(&SearchQuery {
+        q: "needle".to_string(),
+        limit: 1,
+        ..SearchQuery::default()
+    })?;
+    assert_eq!(page.matches.len(), 1);
+    assert_eq!(page.matches[0].card.id, target_id);
+    assert_eq!(page.matches[0].blocked_by, target.blocked_by);
+    Ok(())
+}
+
+#[test]
+fn search_repo_filter_normalizes_legacy_slashes_and_preserves_boundaries() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut legacy = ready_card("legacy-repo-filter", 10);
+    legacy.title = "repo-filter-token".to_string();
+    let mut boundary = ready_card("boundary-repo-filter", 11);
+    boundary.title = "repo-filter-token".to_string();
+    let mut numeric_with_repo = ready_card("name-123", 12);
+    numeric_with_repo.title = "repo-filter-token".to_string();
+    let mut numeric_without_repo = ready_card("name-456", 13);
+    numeric_without_repo.title = "repo-filter-token".to_string();
+    store.import_cards(vec![
+        legacy,
+        boundary,
+        numeric_with_repo,
+        numeric_without_repo,
+    ])?;
+
+    store.connection.execute(
+        "UPDATE cards SET repo = ?1 WHERE id = ?2",
+        rusqlite::params!["owner/name/", "legacy-repo-filter"],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET repo = ?1 WHERE id = ?2",
+        rusqlite::params!["owner/name-other/", "boundary-repo-filter"],
+    )?;
+    store.connection.execute(
+        "UPDATE cards SET repo = ?1 WHERE id = ?2",
+        rusqlite::params!["other", "name-123"],
+    )?;
+
+    let page = store.search_page(&SearchQuery {
+        q: "repo-filter-token".to_string(),
+        repo: Some("name".to_string()),
+        limit: 20,
+        ..SearchQuery::default()
+    })?;
+    let ids = page
+        .matches
+        .iter()
+        .map(|hit| hit.card.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"legacy-repo-filter"));
+    assert!(ids.contains(&"name-456"));
+    assert!(!ids.contains(&"boundary-repo-filter"));
+    assert!(!ids.contains(&"name-123"));
+
+    let invalid_repo = store.search_page(&SearchQuery {
+        q: "repo-filter-token".to_string(),
+        repo: Some("///".to_string()),
+        limit: 20,
+        ..SearchQuery::default()
+    })?;
+    assert!(invalid_repo.matches.is_empty());
     Ok(())
 }
 
