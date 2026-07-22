@@ -119,23 +119,58 @@ impl RemoteClient {
     }
 
     pub fn get(&self, path: &str) -> Result<Value, String> {
-        self.dispatch("GET", path, None)
+        self.dispatch("GET", path, None, None)
+    }
+
+    /// Send a keyed mutation with a caller-owned idempotency key. The key is
+    /// reused verbatim if authentication refresh retries the request. Callers
+    /// must retain one key for the whole user intent; this client never mints
+    /// or changes it.
+    pub fn post_with_key(
+        &self,
+        path: &str,
+        body: Value,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        self.dispatch("POST", path, Some(body), Some(idempotency_key))
+    }
+
+    pub fn patch_with_key(
+        &self,
+        path: &str,
+        body: Value,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        self.dispatch("PATCH", path, Some(body), Some(idempotency_key))
+    }
+
+    pub fn delete_with_key(&self, path: &str, idempotency_key: &str) -> Result<Value, String> {
+        self.dispatch("DELETE", path, None, Some(idempotency_key))
+    }
+
+    pub fn delete_with_body_with_key(
+        &self,
+        path: &str,
+        body: Value,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        self.dispatch("DELETE", path, Some(body), Some(idempotency_key))
     }
 
     pub fn post(&self, path: &str, body: Value) -> Result<Value, String> {
-        self.dispatch("POST", path, Some(body))
+        self.dispatch("POST", path, Some(body), None)
     }
 
     pub fn patch(&self, path: &str, body: Value) -> Result<Value, String> {
-        self.dispatch("PATCH", path, Some(body))
+        self.dispatch("PATCH", path, Some(body), None)
     }
 
     pub fn delete(&self, path: &str) -> Result<Value, String> {
-        self.dispatch("DELETE", path, None)
+        self.dispatch("DELETE", path, None, None)
     }
 
     pub fn delete_with_body(&self, path: &str, body: Value) -> Result<Value, String> {
-        self.dispatch("DELETE", path, Some(body))
+        self.dispatch("DELETE", path, Some(body), None)
     }
 
     /// Send `method path` with the key active at call time; on a `401`,
@@ -146,9 +181,21 @@ impl RemoteClient {
     /// the process is handled exactly like the first. Tracks a 404 streak
     /// across calls so a stale-base-URL class of failure (powder-965) gets
     /// a distinct steer from an auth failure.
-    fn dispatch(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+    fn dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        idempotency_key: Option<&str>,
+    ) -> Result<Value, String> {
         let first_key = self.current_key();
-        let mut result = self.send_once(method, path, body.as_ref(), first_key.as_deref());
+        let mut result = self.send_once(
+            method,
+            path,
+            body.as_ref(),
+            first_key.as_deref(),
+            idempotency_key,
+        );
         let mut used_key = first_key;
 
         if let Err(RemoteError::Status(401, _)) = &result {
@@ -156,7 +203,13 @@ impl RemoteClient {
                 if let Some(refreshed) = resolve_key_cmd(cmd) {
                     if Some(refreshed.as_str()) != used_key.as_deref() {
                         self.set_key(refreshed.clone());
-                        result = self.send_once(method, path, body.as_ref(), Some(&refreshed));
+                        result = self.send_once(
+                            method,
+                            path,
+                            body.as_ref(),
+                            Some(&refreshed),
+                            idempotency_key,
+                        );
                         used_key = Some(refreshed);
                     }
                 }
@@ -189,9 +242,13 @@ impl RemoteClient {
         path: &str,
         body: Option<&Value>,
         key: Option<&str>,
+        idempotency_key: Option<&str>,
     ) -> Result<Value, RemoteError> {
         let url = format!("{}{path}", self.base_url);
-        let request = Self::attach_auth(self.build_request(method, &url), key);
+        let mut request = Self::attach_auth(self.build_request(method, &url), key);
+        if let Some(idempotency_key) = idempotency_key {
+            request = request.set("Idempotency-Key", idempotency_key);
+        }
         let response = match body {
             Some(body) => request.send_json(body.clone()),
             None => request.call(),
@@ -694,4 +751,65 @@ mod tests {
             .unwrap_err()
             .contains("cycle_card_ids must be an array"));
     }
+    #[test]
+    fn keyed_request_reuses_caller_key_across_auth_refresh_retry() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener address");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut keys = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0_u8; 4096];
+                let size = stream.read(&mut request).expect("read request");
+                let request = String::from_utf8_lossy(&request[..size]);
+                keys.push(
+                    request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("idempotency-key").then_some(value.trim())
+                        })
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let body = if attempt == 0 {
+                    r#"{"error":"invalid bearer token"}"#
+                } else {
+                    r#"{"ok":true}"#
+                };
+                let status = if attempt == 0 { "401 Unauthorized" } else { "200 OK" };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write response");
+            }
+            tx.send(keys).expect("send observed keys");
+        });
+
+        let marker = std::env::temp_dir().join(format!("powder-api-key-{}", std::process::id()));
+        std::fs::write(&marker, "sk_powder_old").expect("write key marker");
+        let key_cmd = format!(
+            "if test -f \"{}\"; then cat \"{}\"; rm -f \"{}\"; else printf sk_powder_new; fi",
+            marker.display(),
+            marker.display(),
+            marker.display(),
+        );
+        let client = RemoteClient::new_with_key_cmd(
+            format!("http://{addr}"),
+            None,
+            Some(key_cmd),
+        );
+        let response = client.post_with_key("/api/v1/cards", json!({"id":"card"}), "intent-123");
+        let keys = rx.recv().expect("server observations");
+        assert_eq!(keys, vec!["intent-123", "intent-123"]);
+        assert_eq!(response.expect("auth refresh retry succeeds")["ok"], true);
+        let _ = std::fs::remove_file(marker);
+    }
+
 }

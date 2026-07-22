@@ -47,7 +47,7 @@ use powder_store::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 #[cfg(unix)]
@@ -896,6 +896,7 @@ fn app(state: AppState) -> Router {
             "/api/v1/repositories",
             post(upsert_repository).get(list_repositories),
         )
+        .route("/api/v1/repositories/normalize", post(normalize_repositories))
         .route(
             "/api/v1/repositories/{name}",
             get(get_repository)
@@ -1378,17 +1379,22 @@ async fn get_repository(
 async fn upsert_repository(
     State(state): State<AppState>,
     AdminActor(actor): AdminActor,
+    headers: HeaderMap,
     Json(request): Json<RepositoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = request
         .name
         .clone()
         .ok_or_else(|| ApiError::bad_request("repository name is required"))?;
-    let repository = lock_store(&state)?.upsert_repository_with_authority(
-        repository_upsert(name, request)?,
-        unix_now(),
-        &actor.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let repository = lock_store(&state)?
+        .upsert_repository_with_authority_keyed(
+            repository_upsert(name, request)?,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(json!(repository)))
 }
 
@@ -1396,23 +1402,44 @@ async fn update_repository(
     State(state): State<AppState>,
     AdminActor(actor): AdminActor,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<RepositoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let repository_name = request.name.clone().unwrap_or(name);
-    let repository = lock_store(&state)?.upsert_repository_with_authority(
-        repository_upsert(repository_name, request)?,
-        unix_now(),
-        &actor.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let repository = lock_store(&state)?
+        .upsert_repository_with_authority_keyed(
+            repository_upsert(repository_name, request)?,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(json!(repository)))
+}
+
+async fn normalize_repositories(
+    State(state): State<AppState>,
+    AdminActor(actor): AdminActor,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let outcome = lock_store(&state)?
+        .normalize_repository_strings_with_authority_keyed(&actor.authority(), unix_now(), idempotency_key)?
+        .value;
+    Ok(Json(json!(outcome)))
 }
 
 async fn delete_repository(
     State(state): State<AppState>,
     AdminActor(actor): AdminActor,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    lock_store(&state)?.delete_repository_with_authority(&name, &actor.authority())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    lock_store(&state)?
+        .delete_repository_with_authority_keyed(&name, unix_now(), idempotency_key, &actor.authority())?
+        .value;
     Ok(Json(json!({ "deleted": true, "repository": name })))
 }
 
@@ -1420,17 +1447,22 @@ async fn merge_repository_alias(
     State(state): State<AppState>,
     AdminActor(actor): AdminActor,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<RepositoryMergeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(requested_actor) = request.actor.as_deref() {
         actor.authority().require_identity(requested_actor)?;
     }
-    let outcome = lock_store(&state)?.merge_repository_alias_with_authority(
-        &request.alias,
-        &name,
-        &actor.authority(),
-        unix_now(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let outcome = lock_store(&state)?
+        .merge_repository_alias_with_authority_keyed(
+            &request.alias,
+            &name,
+            &actor.authority(),
+            unix_now(),
+            idempotency_key,
+        )?
+        .value;
     Ok(Json(json!(outcome)))
 }
 
@@ -1521,10 +1553,13 @@ async fn create_card(
 async fn file_papercut(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Json(request): Json<FilePapercutRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    // Same authorization posture as create_card: an agent-scoped key may
-    // file friction without claiming it or holding admin.
+    // Papercut is a CreateCard delivery. Derive its generated id from the
+    // caller-owned key and transport principal so the retry has the same
+    // payload while the key remains scoped by the atomic receipt.
+    let idempotency_key = required_idempotency_key(&headers)?;
     let now = unix_now();
     let report = PapercutReport {
         agent: request.agent,
@@ -1535,7 +1570,25 @@ async fn file_papercut(
     };
     let card = {
         let mut store = lock_store(&state)?;
-        store.file_papercut_as(&report, &actor.authority(), now)?
+        let resolved_repo = report
+            .service
+            .as_deref()
+            .map(|service| store.get_repository(service))
+            .transpose()?
+            .flatten()
+            .map(|summary| summary.repo);
+        let seed = format!("{}:{idempotency_key}", actor.authority().actor_label());
+        let digest = Sha256::digest(seed.as_bytes());
+        let id = CardId::new(format!("papercut-{}", hex::encode(&digest[..6])))?;
+        let card = powder_core::papercut::file_papercut(
+            report,
+            resolved_repo.as_deref(),
+            now,
+            id,
+        )?;
+        store
+            .create_card_with_events_as_keyed(card, idempotency_key, &actor.authority(), now)?
+            .value
     };
     Ok(Json(json!({
         "id": card.id.as_str(),
@@ -1597,44 +1650,55 @@ async fn claim_card(
 async fn release_claim(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
-    let receipt =
-        lock_store(&state)?.release_claim(&card_id, &run_id, unix_now(), &actor.authority())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let receipt = lock_store(&state)?
+        .release_claim_keyed(&card_id, &run_id, unix_now(), idempotency_key, &actor.authority())?
+        .value;
     Ok(Json(json!(receipt)))
 }
 
 async fn renew_claim(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
-    let receipt = lock_store(&state)?.renew_claim(
-        &card_id,
-        &run_id,
-        unix_now(),
-        request.ttl_seconds.unwrap_or(3600),
-        &actor.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let receipt = lock_store(&state)?
+        .renew_claim_keyed(
+            &card_id,
+            &run_id,
+            unix_now(),
+            request.ttl_seconds.unwrap_or(3600),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(json!(receipt)))
 }
 
 async fn heartbeat_claim(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
-    let receipt =
-        lock_store(&state)?.heartbeat_claim(&card_id, &run_id, unix_now(), &actor.authority())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let receipt = lock_store(&state)?
+        .heartbeat_claim_keyed(&card_id, &run_id, unix_now(), idempotency_key, &actor.authority())?
+        .value;
     Ok(Json(json!(receipt)))
 }
 
@@ -1645,19 +1709,24 @@ async fn heartbeat_claim(
 async fn transfer_claim(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<TransferRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id)?;
     let run_id = RunId::new(request.run_id)?;
-    let receipt = lock_store(&state)?.transfer_claim(
-        &card_id,
-        &run_id,
-        &request.to_agent,
-        unix_now(),
-        request.ttl_seconds.unwrap_or(3600),
-        &actor.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let receipt = lock_store(&state)?
+        .transfer_claim_keyed(
+            &card_id,
+            &run_id,
+            &request.to_agent,
+            unix_now(),
+            request.ttl_seconds.unwrap_or(3600),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(json!(receipt)))
 }
 
@@ -1778,14 +1847,18 @@ async fn upload_attachment(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("attachment");
     let card_id = CardId::new(id)?;
-    let attachment = lock_store(&state)?.attach_image_as(
-        &card_id,
-        body.as_ref(),
-        mime,
-        filename,
-        unix_now(),
-        &authenticated.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let attachment = lock_store(&state)?
+        .attach_image_as_keyed(
+            &card_id,
+            body.as_ref(),
+            mime,
+            filename,
+            unix_now(),
+            idempotency_key,
+            &authenticated.authority(),
+        )?
+        .value;
     Ok(Json(json!({
         "id": attachment.id,
         "filename": attachment.filename,
@@ -1815,14 +1888,18 @@ async fn detach_attachment(
     State(state): State<AppState>,
     AuthActor(authenticated): AuthActor,
     Path((id, attachment_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id.clone())?;
-    lock_store(&state)?.detach_as(
-        &card_id,
-        &attachment_id,
-        unix_now(),
-        &authenticated.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    lock_store(&state)?
+        .detach_as_keyed(
+            &card_id,
+            &attachment_id,
+            unix_now(),
+            idempotency_key,
+            &authenticated.authority(),
+        )?; 
     Ok(Json(
         json!({ "deleted": true, "card_id": id, "attachment_id": attachment_id }),
     ))
@@ -1832,16 +1909,21 @@ async fn add_link(
     State(state): State<AppState>,
     AuthActor(authenticated): AuthActor,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<LinkRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id)?;
-    let link = lock_store(&state)?.add_link_as(
-        &card_id,
-        &request.label,
-        &request.url,
-        unix_now(),
-        &authenticated.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let link = lock_store(&state)?
+        .add_link_as_keyed(
+            &card_id,
+            &request.label,
+            &request.url,
+            unix_now(),
+            idempotency_key,
+            &authenticated.authority(),
+        )?
+        .value;
     Ok(Json(json!(link)))
 }
 
@@ -1899,33 +1981,43 @@ async fn append_work_log(
 async fn request_input(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<InputRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let run_id = RunId::new(id)?;
-    let run = lock_store(&state)?.request_input(
-        &run_id,
-        &request.question,
-        unix_now(),
-        &actor.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let run = lock_store(&state)?
+        .request_input_keyed(
+            &run_id,
+            &request.question,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(json!(run)))
 }
 
 async fn answer_input(
     State(state): State<AppState>,
     AuthActor(actor): AuthActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<AnswerRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let run_id = RunId::new(id)?;
-    let run = lock_store(&state)?.answer_input(
-        &run_id,
-        &request.actor,
-        &request.answer,
-        unix_now(),
-        &actor.authority(),
-    )?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let run = lock_store(&state)?
+        .answer_input_keyed(
+            &run_id,
+            &request.actor,
+            &request.answer,
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(json!(run)))
 }
 
@@ -1986,13 +2078,14 @@ async fn complete_card(
 
 async fn create_event_subscription(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
     Json(request): Json<EventSubscriptionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let created = lock_store(&state)?.create_event_subscription(
+    let created = lock_store(&state)?.create_event_subscription_with_authority(
         &request.url,
         request.event_filter.unwrap_or_default(),
         unix_now(),
+        &actor.authority(),
     )?;
     Ok(Json(json!(created)))
 }
@@ -2007,10 +2100,10 @@ async fn list_event_subscriptions(
 
 async fn disable_event_subscription(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let subscription = lock_store(&state)?.disable_event_subscription(&id, unix_now())?;
+    let subscription = lock_store(&state)?.disable_event_subscription_with_authority(&id, unix_now(), &actor.authority())?;
     Ok(Json(json!(subscription)))
 }
 
@@ -2039,11 +2132,19 @@ struct DeadLetterReplayRequest {
 /// authored change.
 async fn replay_dead_letters(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
+    headers: HeaderMap,
     Json(request): Json<DeadLetterReplayRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let replayed =
-        lock_store(&state)?.replay_dead_letters(request.subscription_id.as_deref(), unix_now())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let replayed = lock_store(&state)?
+        .replay_dead_letters_with_authority_keyed(
+            request.subscription_id.as_deref(),
+            unix_now(),
+            idempotency_key,
+            &actor.authority(),
+        )?
+        .value;
     Ok(Json(json!({ "replayed": replayed })))
 }
 
@@ -2191,21 +2292,26 @@ async fn list_keys(
 
 async fn create_key(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
     Json(request): Json<CreateKeyRequest>,
 ) -> Result<Json<CreatedKeyResponse>, ApiError> {
     let scope = ApiKeyScope::parse(&request.scope)
         .ok_or_else(|| ApiError::bad_request(format!("invalid key scope {:?}", request.scope)))?;
-    let created = lock_store(&state)?.create_api_key(&request.name, scope, unix_now())?;
+    let created = lock_store(&state)?.create_api_key_with_authority(
+        &request.name,
+        scope,
+        unix_now(),
+        &actor.authority(),
+    )?;
     Ok(Json(CreatedKeyResponse::from(created)))
 }
 
 async fn revoke_key(
     State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
+    AdminActor(actor): AdminActor,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    lock_store(&state)?.revoke_api_key(&id, unix_now())?;
+    lock_store(&state)?.revoke_api_key_with_authority(&id, unix_now(), &actor.authority())?;
     Ok(Json(json!({ "id": id, "revoked": true })))
 }
 
