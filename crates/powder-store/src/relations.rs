@@ -88,12 +88,12 @@
 //! (which unmirrors atomically) instead of letting repair re-add them.
 use std::collections::{HashMap, HashSet};
 
-use powder_core::{Card, CardId};
+use powder_core::{Authority, Card, CardId};
 use rusqlite::{types::Value, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::from_str;
 
-use crate::{append_card_event, non_empty};
+use crate::{append_card_event, append_card_event_with_authority, non_empty};
 use crate::{Result, Store};
 
 /// Which pair of lists one edge connects. `Related` mirrors into the same
@@ -179,6 +179,7 @@ fn decode_relation_ids_strict(value: &Value) -> Option<Vec<CardId>> {
 struct MirrorChangeOptions<'a> {
     reject_corrupt: bool,
     actor: &'a str,
+    authority: Option<&'a Authority>,
     now: i64,
 }
 
@@ -236,28 +237,41 @@ fn mirror_relation_change_inner(
     if updated == 0 {
         return Ok(false);
     }
-    append_card_event(
-        connection,
-        other_id,
-        "relations",
-        options.actor,
-        &format!(
-            "mirrored {} {} {self_id}",
-            if add { "add" } else { "remove" },
-            field.as_str()
-        ),
-        options.now,
-    )?;
+    let detail = format!(
+        "mirrored {} {} {self_id}",
+        if add { "add" } else { "remove" },
+        field.as_str()
+    );
+    if let Some(authority) = options.authority {
+        append_card_event_with_authority(
+            connection,
+            other_id,
+            "relations",
+            options.actor,
+            &detail,
+            options.now,
+            authority,
+        )?;
+    } else {
+        append_card_event(
+            connection,
+            other_id,
+            "relations",
+            options.actor,
+            &detail,
+            options.now,
+        )?;
+    }
     Ok(true)
 }
 
-pub(crate) fn mirror_relation_change(
+pub(crate) fn mirror_relation_change_with_authority(
     connection: &Connection,
     other_id: &CardId,
     field: RelationField,
     self_id: &CardId,
     add: bool,
-    actor: &str,
+    authority: &Authority,
     now: i64,
 ) -> Result<bool> {
     mirror_relation_change_inner(
@@ -268,7 +282,8 @@ pub(crate) fn mirror_relation_change(
         add,
         MirrorChangeOptions {
             reject_corrupt: true,
-            actor,
+            actor: &authority.actor_label(),
+            authority: Some(authority),
             now,
         },
     )
@@ -292,72 +307,82 @@ fn mirror_relation_change_for_doctor(
         MirrorChangeOptions {
             reject_corrupt: false,
             actor,
+            authority: None,
             now,
         },
     )
 }
 
-/// Mirror every added/removed id in `delta` onto the peer named by each id,
-/// into `field.mirror()` on that peer (see [`RelationField::mirror`]).
-/// `self_id` is the card whose own `field` list just changed.
-pub(crate) fn mirror_delta(
+pub(crate) fn mirror_delta_with_authority(
     connection: &Connection,
     self_id: &CardId,
     field: RelationField,
     delta: &ListDelta,
-    actor: &str,
+    authority: &Authority,
     now: i64,
 ) -> Result<()> {
     let mirror_field = field.mirror();
     for id in &delta.added {
-        mirror_relation_change(connection, id, mirror_field, self_id, true, actor, now)?;
+        mirror_relation_change_with_authority(
+            connection,
+            id,
+            mirror_field,
+            self_id,
+            true,
+            authority,
+            now,
+        )?;
     }
     for id in &delta.removed {
-        mirror_relation_change(connection, id, mirror_field, self_id, false, actor, now)?;
+        mirror_relation_change_with_authority(
+            connection,
+            id,
+            mirror_field,
+            self_id,
+            false,
+            authority,
+            now,
+        )?;
     }
     Ok(())
 }
 
-/// Mirror a brand-new card's initial relation lists (all-additions against
-/// empty old lists) -- used by `create_card_with_events` so a card born
-/// with `blocked_by: ["x"]` doesn't need a follow-up `update_relations`
-/// call on `x` just to make `x.blocks` agree.
-pub(crate) fn mirror_initial_relations(
+pub(crate) fn mirror_initial_relations_with_authority(
     connection: &Connection,
     card: &Card,
-    actor: &str,
+    authority: &Authority,
     now: i64,
 ) -> Result<()> {
     for id in &card.related {
-        mirror_relation_change(
+        mirror_relation_change_with_authority(
             connection,
             id,
             RelationField::Related,
             &card.id,
             true,
-            actor,
+            authority,
             now,
         )?;
     }
     for id in &card.blocks {
-        mirror_relation_change(
+        mirror_relation_change_with_authority(
             connection,
             id,
             RelationField::BlockedBy,
             &card.id,
             true,
-            actor,
+            authority,
             now,
         )?;
     }
     for id in &card.blocked_by {
-        mirror_relation_change(
+        mirror_relation_change_with_authority(
             connection,
             id,
             RelationField::Blocks,
             &card.id,
             true,
-            actor,
+            authority,
             now,
         )?;
     }

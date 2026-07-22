@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use powder_core::{canonical_repo_label, CardStatus, DomainError};
+use powder_core::{canonical_repo_label, Authority, CardStatus, DomainError};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
@@ -249,6 +249,16 @@ impl Store {
         upsert: RepositoryUpsert,
         now: i64,
     ) -> Result<RepositorySummary> {
+        self.upsert_repository_with_authority(upsert, now, &Authority::unchecked())
+    }
+
+    pub fn upsert_repository_with_authority(
+        &mut self,
+        upsert: RepositoryUpsert,
+        now: i64,
+        authority: &Authority,
+    ) -> Result<RepositorySummary> {
+        authority.require_admin()?;
         let raw_name = normalize_repository_token(&upsert.name)?;
         let name = canonical_repo_label(&raw_name)
             .ok_or_else(|| DomainError::validation("repository.name", "value cannot be empty"))?;
@@ -307,6 +317,19 @@ impl Store {
     }
 
     pub fn delete_repository(&mut self, name: &str) -> Result<()> {
+        self.delete_repository_with_authority(name, &Authority::unchecked())
+    }
+
+    pub fn delete_repository_with_authority(
+        &mut self,
+        name: &str,
+        authority: &Authority,
+    ) -> Result<()> {
+        authority.require_admin()?;
+        self.delete_repository_impl(name)
+    }
+
+    fn delete_repository_impl(&mut self, name: &str) -> Result<()> {
         let Some(repository_name) = resolve_repository_name(&self.connection, name)? else {
             return Err(DomainError::not_found("repository", name).into());
         };
@@ -328,6 +351,28 @@ impl Store {
     }
 
     pub fn merge_repository_alias(
+        &mut self,
+        alias: &str,
+        target: &str,
+        actor: &str,
+        now: i64,
+    ) -> Result<RepositoryMergeOutcome> {
+        self.merge_repository_alias_impl(alias, target, actor, now)
+    }
+
+    pub fn merge_repository_alias_with_authority(
+        &mut self,
+        alias: &str,
+        target: &str,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<RepositoryMergeOutcome> {
+        authority.require_admin()?;
+        let actor = authority.actor_label();
+        self.merge_repository_alias_impl(alias, target, &actor, now)
+    }
+
+    fn merge_repository_alias_impl(
         &mut self,
         alias: &str,
         target: &str,
@@ -442,6 +487,24 @@ impl Store {
     /// `Store::migrate`, so it never blocks startup and can be re-run safely
     /// after alias data changes.
     pub fn normalize_repository_strings(
+        &mut self,
+        actor: &str,
+        now: i64,
+    ) -> Result<RepositoryNormalizeOutcome> {
+        self.normalize_repository_strings_impl(actor, now)
+    }
+
+    pub fn normalize_repository_strings_with_authority(
+        &mut self,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<RepositoryNormalizeOutcome> {
+        authority.require_admin()?;
+        let actor = authority.actor_label();
+        self.normalize_repository_strings_impl(&actor, now)
+    }
+
+    fn normalize_repository_strings_impl(
         &mut self,
         actor: &str,
         now: i64,

@@ -104,6 +104,8 @@ const els = {
   repoFilters: document.getElementById("fg-repo"),
   tierToggle: document.getElementById("tier-toggle"),
   prioFilters: document.getElementById("fg-prio"),
+  estimateFilters: document.getElementById("fg-estimate"),
+  riskFilters: document.getElementById("fg-risk"),
   repoAll: document.getElementById("repo-all"),
   filterClear: document.getElementById("filter-clear"),
   textFilter: document.getElementById("text-filter"),
@@ -139,6 +141,8 @@ const state = {
   publicReads: null,
   needsSetup: false,
   cards: [],
+  readyCards: [],
+  readyMeta: { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null },
   repositories: [],
   // powder-board-lane-fetch-cascade: statsTotals backs the lane header
   // counts unconditionally (board_stats is a plain SQL GROUP BY/COUNT(*),
@@ -164,6 +168,8 @@ const state = {
   filters: {
     repos: new Set(),
     prios: new Set(),
+    estimates: new Set(),
+    risks: new Set(),
     search: "",
     sort: "repo",
   },
@@ -174,6 +180,7 @@ let quickAddFiles = [];
 let toastTimer = null;
 let silentRetryTimer = null;
 let statusChangeSeq = 0;
+let readyRequestSeq = 0;
 const pendingOptimisticIds = new Set();
 const BOARD_CACHE_VERSION = 1;
 const BOARD_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -237,6 +244,134 @@ function listPageCards(data, label) {
     throw new Error(`${label} list truncated at ${cards.length} of ${total}`);
   }
   return cards;
+}
+
+async function drainListPages(path, label) {
+  const cardsById = new Map();
+  let after = null;
+  let first = null;
+  for (;;) {
+    const separator = path.includes("?") ? "&" : "?";
+    const data = await apiJson(after ? `${path}${separator}after=${encodeURIComponent(after)}` : path);
+    first ||= data;
+    for (const card of Array.isArray(data.cards) ? data.cards : []) {
+      if (card && card.id && !cardsById.has(card.id)) cardsById.set(card.id, card);
+    }
+    if (!data.has_more) return { cards: [...cardsById.values()], metadata: { ...(first || {}), total_count: Number(first?.total_count ?? cardsById.size), cycle_card_ids: first?.cycle_card_ids || [], has_more: false, next_after: null } };
+    if (typeof data.next_after !== "string" || !data.next_after) throw new Error(`${label} page says has_more without next_after`);
+    after = data.next_after;
+  }
+}
+
+async function drainReadyPages() {
+  const params = new URLSearchParams({ limit: String(PAGE_LIMIT) });
+  if (state.filters.repos.size) params.set("repo", [...state.filters.repos].join(","));
+  if (state.filters.prios.size === 1) params.set("priority", [...state.filters.prios][0]);
+  if (state.filters.estimates.size === 1) params.set("estimate", [...state.filters.estimates][0]);
+  if (state.filters.risks.size === 1) params.set("risk", [...state.filters.risks][0]);
+  const result = await drainListPages(`/api/v1/cards/ready?${params}`, "ready");
+  return { cards: result.cards, metadata: result.metadata };
+}
+
+async function refreshReadyForFilters() {
+  const request = ++readyRequestSeq;
+  try {
+    const result = await drainReadyPages();
+    if (request !== readyRequestSeq) return;
+    state.readyCards = dedupeCards(result.cards).map(normalizeCard);
+    state.readyMeta = result.metadata;
+    delete state.cardFetchErrors.ready;
+    render();
+  } catch (error) {
+    if (request !== readyRequestSeq) return;
+    state.cardFetchErrors.ready = error.message || String(error);
+    state.readyCards = [];
+    state.readyMeta = { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null };
+    render();
+  }
+}
+
+function groupedSearchMatches(matches) {
+  const groups = new Map();
+  for (const match of Array.isArray(matches) ? matches : []) {
+    const card = match && match.card;
+    if (!card || !card.id) continue;
+    const rank = Number(match.rank);
+    const candidate = {
+      card: normalizeCard(card),
+      rank: Number.isFinite(rank) ? rank : Number.POSITIVE_INFINITY,
+      source_kind: String(match.source_kind || "cards"),
+      source_field: String(match.source_field || ""),
+      source_created_at: Number(match.source_created_at || 0),
+      snippet: String(match.snippet || ""),
+    };
+    const previous = groups.get(String(card.id));
+    if (!previous || candidate.rank < previous.rank) groups.set(String(card.id), candidate);
+  }
+  return [...groups.values()].sort((left, right) => left.rank - right.rank || left.card.id.localeCompare(right.card.id));
+}
+
+function renderSearchStatus() {
+  if (!els.searchStatus) return;
+  const query = state.filters.search.trim();
+  const count = groupedSearchMatches(state.searchMatches).length;
+  const totalCount = Number.isFinite(state.searchTotalCount)
+    ? state.searchTotalCount
+    : count;
+  els.searchStatus.textContent = !query
+    ? ""
+    : state.searchLoading
+      ? "Searching…"
+      : state.searchError
+        ? "Search error: " + state.searchError
+        : state.searchHasMore
+          ? `first ${count} of ${totalCount} matches`
+          : count + " result" + (count === 1 ? "" : "s");
+  els.searchStatus.dataset.state = state.searchError ? "error" : state.searchLoading ? "loading" : "ready";
+}
+
+async function requestTextSearch(query) {
+  const normalized = query.trim();
+  const seq = ++searchRequestSeq;
+  state.searchError = "";
+  if (!normalized) {
+    state.searchLoading = false;
+    state.searchMatches = [];
+    state.searchTotalCount = 0;
+    state.searchHasMore = false;
+    state.searchNextAfter = null;
+    renderSearchStatus();
+    render();
+    return;
+  }
+  state.searchLoading = true;
+  renderSearchStatus();
+  render();
+  try {
+    const params = new URLSearchParams({ q: normalized, limit: "100" });
+    const data = await apiJson("/api/v1/cards/search?" + params.toString());
+    if (seq !== searchRequestSeq) return;
+    state.searchMatches = Array.isArray(data.matches) ? data.matches : [];
+    state.searchTotalCount = Number.isInteger(data.total_count) && data.total_count >= 0
+      ? data.total_count
+      : state.searchMatches.length;
+    state.searchHasMore = data.has_more === true;
+    state.searchNextAfter = typeof data.next_after === "string" ? data.next_after : null;
+    state.searchLoading = false;
+    state.searchError = "";
+    renderSearchStatus();
+    render();
+  } catch (err) {
+    if (seq !== searchRequestSeq) return;
+    state.searchLoading = false;
+    state.searchMatches = [];
+    state.searchTotalCount = 0;
+    state.searchHasMore = false;
+    state.searchNextAfter = null;
+    state.searchError = err?.message || String(err);
+    renderSearchStatus();
+    render();
+  }
 }
 
 function groupedSearchMatches(matches) {
@@ -463,30 +598,28 @@ function renderHomeLink(homeUrl) {
 // lane header count unconditionally, decoupled from whether that lane's
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
-  const [results, repositoryData, statsTotals] = await Promise.all([
+  const [results, readyResult, repositoryData, statsTotals] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
         const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
         return listPageCards(data, status);
       }),
     ),
+    drainReadyPages().catch((error) => ({ error })),
     apiJson("/api/v1/repositories?include_hidden=true"),
     fetchBoardStats(),
   ]);
-
   const cardGroups = [];
   const cardFetchErrors = {};
   results.forEach((result, index) => {
-    if (result.status === "fulfilled") {
-      cardGroups.push(result.value);
-    } else {
-      const status = RAW_STATUSES[index];
-      cardFetchErrors[status] = result.reason?.message || String(result.reason);
-    }
+    if (result.status === "fulfilled") cardGroups.push(result.value);
+    else cardFetchErrors[RAW_STATUSES[index]] = result.reason?.message || String(result.reason);
   });
-
+  if (readyResult.error) cardFetchErrors.ready = readyResult.error.message || String(readyResult.error);
   return {
     cards: dedupeCards(cardGroups.flat()).map(normalizeCard),
+    readyCards: readyResult.error ? [] : readyResult.cards.map(normalizeCard),
+    readyMeta: readyResult.error ? { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null } : readyResult.metadata,
     repositories: normalizeRepositories(repositoryData.repositories || []),
     statsTotals,
     cardFetchErrors,
@@ -523,6 +656,8 @@ async function loadBoard(options = {}) {
     await loadOnboarding();
     const data = await fetchBoardData();
     state.cards = mergePendingOptimistic(data.cards);
+    state.readyCards = data.readyCards || [];
+    state.readyMeta = data.readyMeta || { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null };
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
@@ -628,6 +763,8 @@ async function refreshLive() {
     const data = await fetchBoardData();
     const changed = changedCardIds(state.cards, data.cards);
     state.cards = mergePendingOptimistic(data.cards);
+    state.readyCards = data.readyCards || [];
+    state.readyMeta = data.readyMeta || { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null };
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
@@ -1157,6 +1294,32 @@ function repoIcon(repo, extraClass = "") {
   return `<svg class="${className}" aria-hidden="true"><use href="#${meta.icon}"></use></svg>`;
 }
 
+const READY_ESTIMATES = ["s", "m", "l", "xl"];
+const READY_RISKS = ["low", "medium", "high"];
+
+function renderReadyFacet(group, key, values, label) {
+  if (!group) return;
+  group.querySelectorAll(".pw-chip-btn").forEach((node) => node.remove());
+  const allChip = document.createElement("button");
+  allChip.className = "pw-chip-btn"; allChip.type = "button";
+  allChip.setAttribute("aria-pressed", String(state.filters[key].size === 0));
+  allChip.innerHTML = `<span class="ae-chip">all ${escapeHtml(label)}</span>`;
+  allChip.addEventListener("click", () => { state.filters[key].clear(); saveBoardState(); buildFilters(); render(); void refreshReadyForFilters(); });
+  group.appendChild(allChip);
+  for (const value of values) {
+    const button = document.createElement("button"); button.className = "pw-chip-btn"; button.type = "button";
+    button.dataset[key] = value; button.setAttribute("aria-pressed", String(state.filters[key].has(value)));
+    button.innerHTML = `<span class="ae-chip">${escapeHtml(value)}</span>`;
+    button.addEventListener("click", () => {
+      if (state.filters[key].has(value)) state.filters[key].clear();
+      else { state.filters[key].clear(); state.filters[key].add(value); }
+      saveBoardState();
+      buildFilters(); render(); void refreshReadyForFilters();
+    });
+    group.appendChild(button);
+  }
+}
+
 function buildFilters() {
   renderTierToggle();
   const repositories = state.repositories.length ? state.repositories : deriveRepositoriesFromCards();
@@ -1168,19 +1331,21 @@ function buildFilters() {
   const hasRepositoryScope = repositories.length > 0;
   const repos = [
     ...new Set(
-      state.cards
+      [...state.cards, ...state.readyCards]
         .filter((card) => !card.explicitRepo || !hasRepositoryScope || visibleRepositorySet.has(card.repoKey))
         .map((card) => card.repoKey),
     ),
   ]
     .sort();
-  const prios = [...new Set(state.cards.map((card) => cleanPriority(card.priority)))].sort(
+  const prios = [...new Set([...state.cards, ...state.readyCards].map((card) => cleanPriority(card.priority)))].sort(
     (left, right) => priorityIndex(left) - priorityIndex(right),
   );
   const existingRepos = new Set(repos);
   state.filters.repos = new Set(
     [...state.filters.repos].filter((repo) => existingRepos.has(repo)),
   );
+  state.filters.estimates = new Set([...state.filters.estimates].filter((value) => READY_ESTIMATES.includes(value)));
+  state.filters.risks = new Set([...state.filters.risks].filter((value) => READY_RISKS.includes(value)));
 
   els.repoFilters.querySelectorAll(".pw-chip-btn").forEach((node) => node.remove());
   const allChip = document.createElement("button");
@@ -1191,8 +1356,10 @@ function buildFilters() {
   allChip.innerHTML = `<span class="ae-chip">${repoIcon("all")}All</span>`;
   allChip.addEventListener("click", () => {
     state.filters.repos.clear();
+    saveBoardState();
     buildFilters();
     render();
+    void refreshReadyForFilters();
   });
   els.repoFilters.appendChild(allChip);
 
@@ -1207,8 +1374,10 @@ function buildFilters() {
     button.addEventListener("click", () => {
       if (state.filters.repos.has(repo)) state.filters.repos.delete(repo);
       else state.filters.repos.add(repo);
+      saveBoardState();
       buildFilters();
       render();
+      void refreshReadyForFilters();
     });
     els.repoFilters.appendChild(button);
   }
@@ -1224,11 +1393,15 @@ function buildFilters() {
     button.addEventListener("click", () => {
       if (state.filters.prios.has(prio)) state.filters.prios.delete(prio);
       else state.filters.prios.add(prio);
+      saveBoardState();
       buildFilters();
       render();
+      void refreshReadyForFilters();
     });
     els.prioFilters.appendChild(button);
   }
+  renderReadyFacet(els.estimateFilters, "estimates", READY_ESTIMATES, "estimates");
+  renderReadyFacet(els.riskFilters, "risks", READY_RISKS, "risks");
 }
 
 function repositoryPassesScope(summary) {
@@ -1577,6 +1750,8 @@ function passes(card) {
   if (card.explicitRepo && !repoPassesScope(card.repoKey)) return false;
   if (state.filters.repos.size && !state.filters.repos.has(card.repoKey)) return false;
   if (state.filters.prios.size && !state.filters.prios.has(cleanPriority(card.priority))) return false;
+  if (state.filters.estimates.size && !state.filters.estimates.has(String(card.estimate || "").toLowerCase())) return false;
+  if (state.filters.risks.size && !state.filters.risks.has(String(card.risk || "").toLowerCase())) return false;
   const query = state.filters.search.trim();
   if (!query) return true;
   return groupedSearchMatches(state.searchMatches).some((match) => match.card.id === card.id);
@@ -1623,16 +1798,14 @@ function hasUnresolvedBlocker(card, cardsById) {
   });
 }
 
+function passesReady(card) {
+  return passes(card);
+}
+
 function bucket() {
   const loadedCards = new Map(state.cards.map((card) => [card.id, card]));
   const sourceCards = state.filters.search.trim()
-    ? groupedSearchMatches(state.searchMatches).map((match) => {
-        // Search summaries are intentionally small, but an already-loaded card
-        // carries blocker/relationship fields the lane renderer must preserve.
-        // Use the server result for genuinely unloaded cards so search never
-        // narrows back to the loaded cache.
-        return loadedCards.get(match.card.id) || match.card;
-      })
+    ? groupedSearchMatches(state.searchMatches).map((match) => loadedCards.get(match.card.id) || match.card)
     : state.cards;
   const visible = sourceCards.filter(passes);
   // Keep the full loaded board as blocker context even when the search result
@@ -1641,16 +1814,8 @@ function bucket() {
   for (const card of sourceCards) cardsById.set(card.id, card);
   return {
     backlog: sorted(visible.filter((card) => card.displayStatus === "backlog")),
-    ready: sorted(
-      visible.filter(
-        (card) => card.displayStatus === "ready" && !hasUnresolvedBlocker(card, cardsById),
-      ),
-    ),
-    blocked: sorted(
-      visible.filter(
-        (card) => card.displayStatus === "ready" && hasUnresolvedBlocker(card, cardsById),
-      ),
-    ),
+    ready: state.readyCards.filter(passesReady),
+    blocked: sorted(visible.filter((card) => card.displayStatus === "ready" && hasUnresolvedBlocker(card, cardsById))),
     inProgress: sorted(visible.filter((card) => card.displayStatus === "in_progress")),
     done: sorted(visible.filter((card) => card.displayStatus === "done")),
   };
@@ -1668,6 +1833,8 @@ function activeFilterDescriptors() {
   const parts = [];
   for (const repo of [...state.filters.repos].sort()) parts.push(`repo:${repo}`);
   for (const prio of [...state.filters.prios].sort()) parts.push(prio);
+  for (const estimate of [...state.filters.estimates].sort()) parts.push(`estimate:${estimate}`);
+  for (const risk of [...state.filters.risks].sort()) parts.push(`risk:${risk}`);
   const search = state.filters.search.trim();
   if (search) parts.push(`"${search}"`);
   return parts;
@@ -1841,6 +2008,8 @@ function renderCounts(buckets) {
   const activeFilterCount =
     state.filters.repos.size +
     state.filters.prios.size +
+    state.filters.estimates.size +
+    state.filters.risks.size +
     (state.filters.search.trim() ? 1 : 0) +
     (state.showAllTiers ? 1 : 0);
   els.filterN.textContent = activeFilterCount ? ` · ${activeFilterCount}` : "";
@@ -1859,6 +2028,8 @@ function saveBoardState() {
         filters: {
           repos: [...state.filters.repos],
           prios: [...state.filters.prios],
+          estimates: [...state.filters.estimates],
+          risks: [...state.filters.risks],
           search: state.filters.search,
           sort: state.filters.sort,
         },
@@ -1883,6 +2054,12 @@ function restoreBoardState() {
     const filters = saved.filters || {};
     state.filters.repos = new Set(Array.isArray(filters.repos) ? filters.repos : []);
     state.filters.prios = new Set(Array.isArray(filters.prios) ? filters.prios : []);
+    state.filters.estimates = new Set(
+      Array.isArray(filters.estimates) ? filters.estimates.filter((value) => READY_ESTIMATES.includes(value)) : [],
+    );
+    state.filters.risks = new Set(
+      Array.isArray(filters.risks) ? filters.risks.filter((value) => READY_RISKS.includes(value)) : [],
+    );
     state.filters.search = String(filters.search || "");
     state.filters.sort = ["repo", "prio", "id"].includes(filters.sort) ? filters.sort : "repo";
     els.textFilter.value = state.filters.search;
@@ -2683,10 +2860,13 @@ els.repoAll.addEventListener("click", () => {
   state.filters.repos.clear();
   buildFilters();
   render();
+  void refreshReadyForFilters();
 });
 els.filterClear.addEventListener("click", () => {
   state.filters.repos.clear();
   state.filters.prios.clear();
+  state.filters.estimates.clear();
+  state.filters.risks.clear();
   state.filters.search = "";
   state.searchMatches = [];
   state.searchError = "";
@@ -2698,11 +2878,14 @@ els.filterClear.addEventListener("click", () => {
   els.textFilter.value = "";
   buildFilters();
   scheduleTextSearch("");
+  render();
+  void refreshReadyForFilters();
 });
 els.tierToggle.addEventListener("click", () => {
   state.showAllTiers = !state.showAllTiers;
   buildFilters();
   render();
+  void refreshReadyForFilters();
 });
 els.repoEmptyToggle?.addEventListener("click", () => {
   state.showEmptyRepos = !state.showEmptyRepos;

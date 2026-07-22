@@ -36,7 +36,7 @@ release binary.
 docker volume create powder-data
 docker run --rm -p 4000:4000 -v powder-data:/data \
   -e POWDER_AUTH_MODE=api-key \
-  -e POWDER_DISCLOSE_BOOTSTRAP_KEY=true \
+  -e POWDER_BOOTSTRAP_KEY_FILE=/data/powder-bootstrap.key \
   ghcr.io/misty-step/powder:latest
 ```
 
@@ -50,18 +50,22 @@ always has write access regardless of host UID mapping.)
 curl -fsSL -o powder.tar.gz \
   https://github.com/misty-step/powder/releases/latest/download/powder-aarch64-apple-darwin.tar.gz
 tar -xzf powder.tar.gz
-POWDER_DB_PATH=./data/powder.db POWDER_AUTH_MODE=api-key POWDER_DISCLOSE_BOOTSTRAP_KEY=true \
+mkdir -p ./data && chmod 700 ./data
+POWDER_DB_PATH=./data/powder.db POWDER_BOOTSTRAP_KEY_FILE=./data/powder-bootstrap.key POWDER_AUTH_MODE=api-key \
   ./powder-server
 ```
 
 (Swap the tarball name for `powder-x86_64-unknown-linux-gnu.tar.gz` or
 `powder-aarch64-unknown-linux-gnu.tar.gz` on Linux.)
 
-Either option prints a bootstrap API key once on startup — copy it. Then, in
-another shell:
+The first boot writes the bootstrap API key to the configured 0600 one-shot
+file and never prints the secret. Read it once, store it in your secret
+manager, then remove the file. For the release-binary example:
 
 ```sh
-KEY=<paste the bootstrap key>
+KEY="$(cat ./data/powder-bootstrap.key)"
+# Store KEY securely before removing the one-shot file.
+rm ./data/powder-bootstrap.key
 
 curl -s http://localhost:4000/healthz
 
@@ -77,8 +81,8 @@ curl -s -X POST http://localhost:4000/api/v1/cards/first-card/claim \
 Production runs one Rust service (`powder-server`) on a DigitalOcean droplet.
 SQLite lives at `/data` on a host volume with WAL enabled. Litestream
 replication is optional, and ingress is through the tailnet. In `api-key` mode,
-read routes require a valid bearer key by default; set `POWDER_PUBLIC_READS=true`
-only on a genuinely private tailnet perimeter. See
+read routes require a valid bearer key by default; `POWDER_PUBLIC_READS=true` is
+loopback-only and is rejected on non-loopback binds. See
 [`docs/operations.md`](docs/operations.md) for the full read-auth posture and
 rollout runbook.
 

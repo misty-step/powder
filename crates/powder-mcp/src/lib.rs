@@ -6,7 +6,7 @@ use powder_core::{
     parse_estimate as parse_card_estimate, parse_priority as parse_card_priority,
     parse_risk as parse_card_risk, parse_status as parse_card_status, Authority, Card, CardDetail,
     CardField, CardId, CardStatus, CardSummary, DetailLevel, Estimate, PapercutReport, Priority,
-    ReadyQuery, Risk, RunId,
+    ReadyCursor, ReadyQuery, Risk, RunId,
 };
 use powder_store::{
     BoardRollupsQuery, BoardStatsQuery, CardFilter, CardPatch, CriterionProofInput, RepositoryTier,
@@ -45,7 +45,7 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "list_ready",
         description: "Scan claimable card summaries, dependency-ordered so no card appears after another card in the response it transitively blocks (ties broken by priority, age, identifier). Only true members of a blocks/blocked_by cycle lose topological ordering -- emitted as a group in tie-break order and named in cycle_card_ids (computed before limit truncation); cards downstream of a cycle stay dependency-ordered after it. Use get_card for full card detail before implementation.",
-        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"estimate":{"type":"string","enum":["S","M","L","XL"]}}}"#,
+        input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"repo":{"type":"string","description":"comma-separated repository allowlist"},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"after":{"type":"string","description":"continuation cursor from next_after"}}}"#,
     },
     ToolDef {
         name: "list_cards",
@@ -85,17 +85,17 @@ pub const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "upsert_repository",
         description: "Create or update one repository entity with canonical name, aliases, visibility, tier, and import provenance.",
-        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"tier":{"type":"string","enum":["active","backburner","archived"]},"import_provenance":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}},"visibility":{"type":"string","enum":["visible","hidden"]},"tier":{"type":"string","enum":["active","backburner","archived"]},"import_provenance":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "merge_repository_alias",
         description: "Merge an alias or duplicate repository string into a canonical repository and audit every re-homed card.",
-        input_schema: r#"{"type":"object","required":["alias","into"],"properties":{"alias":{"type":"string"},"into":{"type":"string"},"actor":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["alias","into"],"properties":{"alias":{"type":"string"},"into":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "delete_repository",
         description: "Delete an unused repository entity and its aliases.",
-        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#,
+        input_schema: r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"actor":{"type":"string"},"admin":{"type":"boolean"}}}"#,
     },
     ToolDef {
         name: "manage_claim",
@@ -403,13 +403,27 @@ pub fn call_tool_store(
     let payload = match name {
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+            let repo = parse_repository_filter(args)?;
             let estimate = optional_str(args, "estimate")
                 .map(parse_estimate)
                 .transpose()?;
-            let page = store
-                .list_ready_page(ReadyQuery::new(now, limit).with_estimate(estimate))
+            let risk = optional_str(args, "risk").map(parse_risk).transpose()?;
+            let priority = optional_str(args, "priority")
+                .map(parse_priority)
+                .transpose()?;
+            let query = ReadyQuery::new(now, limit)
+                .with_repositories(repo.unwrap_or_default())
+                .with_estimate(estimate)
+                .with_risk(risk)
+                .with_priority(priority);
+            let after = optional_str(args, "after")
+                .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+                .transpose()
                 .map_err(to_string)?;
-            card_summary_page_payload(&page.cards, page.total_count, &page.cycle_card_ids)
+            let page = store
+                .list_ready_page_after(query, after.as_ref())
+                .map_err(to_string)?;
+            ready_page_payload(&page)
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -532,7 +546,7 @@ pub fn call_tool_store(
                 .map_err(to_string)?;
             card.repo = optional_str(args, "repo").map(str::to_string);
             let card = store
-                .create_card_with_events(card, &authority_arg(args).actor_label(), now)
+                .create_card_with_events_as(card, &authority_arg(args), now)
                 .map_err(to_string)?;
             let mut payload = card_ack_payload(&card);
             if card.acceptance.is_empty() {
@@ -561,7 +575,7 @@ pub fn call_tool_store(
                 repo: None,
             };
             let card = store
-                .patch_card(&card_id, patch, &authority_arg(args).actor_label(), now)
+                .patch_card_as(&card_id, patch, &authority_arg(args), now)
                 .map_err(to_string)?;
             card_ack_payload(&card)
         }
@@ -575,7 +589,7 @@ pub fn call_tool_store(
         "upsert_repository" => {
             let name = required_str(args, "name")?.to_string();
             json!(store
-                .upsert_repository(
+                .upsert_repository_with_authority(
                     RepositoryUpsert {
                         name,
                         aliases: optional_string_array(args, "aliases")?,
@@ -585,20 +599,26 @@ pub fn call_tool_store(
                             .map(str::to_string),
                     },
                     now,
+                    &admin_authority_arg(args),
                 )
                 .map_err(to_string)?)
         }
         "merge_repository_alias" => {
             let alias = required_str(args, "alias")?;
             let target = required_str(args, "into")?;
-            let actor = optional_str(args, "actor").unwrap_or("operator");
+            let authority = admin_authority_arg(args);
+            if let Some(actor) = optional_str(args, "actor") {
+                authority.require_identity(actor).map_err(to_string)?;
+            }
             json!(store
-                .merge_repository_alias(alias, target, actor, now)
+                .merge_repository_alias_with_authority(alias, target, &authority, now)
                 .map_err(to_string)?)
         }
         "delete_repository" => {
             let name = required_str(args, "name")?;
-            store.delete_repository(name).map_err(to_string)?;
+            store
+                .delete_repository_with_authority(name, &admin_authority_arg(args))
+                .map_err(to_string)?;
             json!({"deleted": true, "repository": name})
         }
         "manage_claim" => manage_claim_store(store, args, now)?,
@@ -653,7 +673,14 @@ pub fn call_tool_store(
             let actor = required_str(args, "actor")?;
             let checked = args["checked"].as_bool().unwrap_or(true);
             let card = store
-                .check_criterion(&card_id, criterion, actor, checked, now)
+                .check_criterion_as(
+                    &card_id,
+                    criterion,
+                    actor,
+                    checked,
+                    now,
+                    &authority_arg(args),
+                )
                 .map_err(to_string)?;
             criterion_ack_payload(&card, criterion, checked)
         }
@@ -702,7 +729,7 @@ pub fn call_tool_store(
             let label = required_str(args, "label")?;
             let url = required_str(args, "url")?;
             json!(store
-                .add_link(&card_id, label, url, now)
+                .add_link_as(&card_id, label, url, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "add_comment" => {
@@ -711,7 +738,7 @@ pub fn call_tool_store(
             let author = required_str(args, "author")?;
             let body = required_str(args, "body")?;
             json!(store
-                .add_comment(&card_id, author, body, now)
+                .add_comment_as(&card_id, author, body, now, &authority_arg(args))
                 .map_err(to_string)?)
         }
         "append_work_log" => {
@@ -726,7 +753,14 @@ pub fn call_tool_store(
                 run_id: optional_str(args, "run_id"),
             };
             json!(store
-                .append_work_log(&card_id, agent, attribution, body, now)
+                .append_work_log_as(
+                    &card_id,
+                    agent,
+                    attribution,
+                    body,
+                    now,
+                    &authority_arg(args)
+                )
                 .map_err(to_string)?)
         }
         "report_papercut" => {
@@ -738,7 +772,7 @@ pub fn call_tool_store(
                 harness: optional_str(args, "harness").map(str::to_string),
             };
             let card = store
-                .file_papercut(&report, &report.agent, now)
+                .file_papercut_as(&report, &authority_arg(args), now)
                 .map_err(to_string)?;
             json!({
                 "id": card.id.as_str(),
@@ -822,30 +856,21 @@ fn is_admin_tool(name: &str) -> bool {
     ADMIN_TOOL_NAMES.contains(&name)
 }
 
-fn card_summary_page_payload(
-    cards: &[Card],
-    total_count: usize,
-    cycle_card_ids: &[CardId],
-) -> Value {
-    let summaries = cards.iter().map(CardSummary::from).collect::<Vec<_>>();
-    let has_more = total_count > summaries.len();
+fn ready_page_payload(page: &powder_store::CardListPage) -> Value {
+    let summaries = page.cards.iter().map(CardSummary::from).collect::<Vec<_>>();
     let mut payload = json!({
         "cards": summaries,
-        "total_count": total_count,
-        "has_more": has_more,
+        "total_count": page.total_count,
+        "has_more": page.ready_cursor.is_some(),
     });
-    if has_more {
-        payload["hint"] = json!(format!(
-            "{} more cards; filter by status/repo or raise limit",
-            total_count - summaries.len()
-        ));
+    if page.ready_cursor.is_some() {
+        payload["hint"] = json!("more cards; continue with next_after");
     }
-    // powder-epic-ready-plan: only ever nonzero for `list_ready` (a
-    // `blocks`/`blocked_by` cycle among the eligible set) -- additive and
-    // omitted whenever empty, so every existing caller's response shape is
-    // unchanged.
-    if !cycle_card_ids.is_empty() {
-        payload["cycle_card_ids"] = json!(cycle_card_ids);
+    if !page.cycle_card_ids.is_empty() {
+        payload["cycle_card_ids"] = json!(page.cycle_card_ids);
+    }
+    if let Some(cursor) = page.ready_cursor.as_deref() {
+        payload["next_after"] = json!(cursor);
     }
     payload
 }
@@ -1194,6 +1219,27 @@ fn criterion_arg(args: &Value) -> Result<usize, String> {
         .ok_or_else(|| missing_required("criterion"))
 }
 
+fn parse_repository_filter(args: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = optional_str(args, "repo") else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Err("repo must contain at least one repository".to_string());
+    }
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .map(|value| {
+            if value.is_empty() {
+                Err("repo must not contain a blank repository".to_string())
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(values))
+}
+
 fn parse_status(raw: &str) -> Result<CardStatus, String> {
     parse_card_status(raw).map_err(to_string)
 }
@@ -1326,7 +1372,18 @@ fn authority_arg(args: &Value) -> Authority {
         .filter(|value| !value.is_empty())
     {
         Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
-        None => Authority::unchecked(),
+        None => Authority::actor("operator", true),
+    }
+}
+
+fn admin_authority_arg(args: &Value) -> Authority {
+    match args["actor"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(actor) => Authority::actor(actor, args["admin"].as_bool().unwrap_or(false)),
+        None => Authority::actor("operator", true),
     }
 }
 
@@ -2530,10 +2587,7 @@ mod tests {
         assert_eq!(payload["cards"].as_array().unwrap().len(), 1);
         assert_eq!(payload["total_count"], 3);
         assert_eq!(payload["has_more"], true);
-        assert_eq!(
-            payload["hint"],
-            "2 more cards; filter by status/repo or raise limit"
-        );
+        assert_eq!(payload["hint"], "more cards; continue with next_after");
     }
 
     #[test]
@@ -2998,7 +3052,7 @@ mod tests {
         let merged = call_tool_store(
             &mut store,
             "merge_repository_alias",
-            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator"}),
+            &json!({"alias": "legacy-canary", "into": "canary", "actor": "operator", "admin": true}),
             12,
         )
         .unwrap();
@@ -3216,6 +3270,56 @@ mod tests {
                 .expect_err("principal argument rejected");
             assert!(error.contains("principal is not accepted"));
         }
+    }
+
+    #[test]
+    fn local_mutations_carry_operator_principal_and_role() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        call_tool_store(
+            &mut store,
+            "create_card",
+            &json!({"id":"mcp-attributed","title":"Attributed","acceptance":["proof"],"status":"ready"}),
+            1,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "add_comment",
+            &json!({"card_id":"mcp-attributed","author":"semantic-author","body":"note"}),
+            2,
+        )
+        .unwrap();
+        call_tool_store(
+            &mut store,
+            "manage_claim",
+            &json!({"action":"claim","card_id":"mcp-attributed","agent":"worker-a","ttl_seconds":60}),
+            3,
+        )
+        .unwrap();
+        let detail = tool_payload(
+            &call_tool_store(
+                &mut store,
+                "get_card",
+                &json!({"card_id":"mcp-attributed","detail":"detailed"}),
+                3,
+            )
+            .unwrap(),
+        );
+        assert_eq!(detail["runs"][0]["principal"], "operator");
+        assert_eq!(detail["runs"][0]["role"], "admin");
+        assert!(detail["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|activity| {
+                activity["principal"] == "operator" && activity["role"] == "admin"
+            }));
+        assert!(detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| { event["principal"].is_string() && event["role"].is_string() }));
     }
 
     #[test]

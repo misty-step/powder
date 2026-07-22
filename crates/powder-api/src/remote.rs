@@ -134,6 +134,10 @@ impl RemoteClient {
         self.dispatch("DELETE", path, None)
     }
 
+    pub fn delete_with_body(&self, path: &str, body: Value) -> Result<Value, String> {
+        self.dispatch("DELETE", path, Some(body))
+    }
+
     /// Send `method path` with the key active at call time; on a `401`,
     /// re-resolve `key_cmd` (if configured) and retry exactly once with
     /// whatever key that produces. This runs on every call that 401s, not
@@ -421,6 +425,8 @@ pub struct CardSummaryPage {
     pub total_count: usize,
     pub has_more: bool,
     pub excluded_terminal_count: usize,
+    pub next_after: Option<String>,
+    pub cycle_card_ids: Vec<String>,
 }
 
 /// Decode a list response into client-card summaries, tolerating unknown
@@ -442,11 +448,41 @@ pub fn parse_card_summary_page(response: Value) -> Result<CardSummaryPage, Strin
         .get("has_more")
         .and_then(Value::as_bool)
         .ok_or_else(|| "remote list response missing has_more".to_string())?;
-    let excluded_terminal_count = response
-        .get("excluded_terminal_count")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0);
+    let excluded_terminal_count = match response.get("excluded_terminal_count") {
+        None | Some(Value::Null) => 0,
+        Some(Value::Number(value)) => {
+            let count = value.as_u64().ok_or_else(|| {
+                "remote list response excluded_terminal_count must be a non-negative integer"
+                    .to_string()
+            })?;
+            usize::try_from(count).map_err(|_| {
+                "remote list response excluded_terminal_count is too large".to_string()
+            })?
+        }
+        Some(_) => {
+            return Err(
+                "remote list response excluded_terminal_count must be a non-negative integer"
+                    .to_string(),
+            )
+        }
+    };
+    let next_after = match response.get("next_after") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err("remote list response next_after must be a string".to_string()),
+    };
+    let cycle_card_ids = match response.get("cycle_card_ids") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(ids)) => ids
+            .iter()
+            .map(|id| {
+                id.as_str().map(str::to_owned).ok_or_else(|| {
+                    "remote list response cycle_card_ids must contain strings".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("remote list response cycle_card_ids must be an array".to_string()),
+    };
     let mut cards = serde_json::from_value::<Vec<ClientCardSummary>>(Value::Array(cards))
         .map_err(|err| format!("remote list response card decode failed: {err}"))?;
     for card in &mut cards {
@@ -457,6 +493,8 @@ pub fn parse_card_summary_page(response: Value) -> Result<CardSummaryPage, Strin
         total_count,
         has_more,
         excluded_terminal_count,
+        next_after,
+        cycle_card_ids,
     })
 }
 
@@ -628,5 +666,32 @@ mod tests {
         // Round-trip: the raw unknown value serializes back through.
         let value = serde_json::to_value(&page.cards[1]).expect("serialize");
         assert_eq!(value["status"].as_str(), Some("paused"));
+    }
+    #[test]
+    fn parse_card_summary_page_rejects_malformed_pagination_metadata() {
+        let base = || {
+            json!({
+                "cards": [],
+                "total_count": 0,
+                "has_more": false,
+            })
+        };
+        let mut next_after = base();
+        next_after["next_after"] = json!(42);
+        assert!(parse_card_summary_page(next_after)
+            .unwrap_err()
+            .contains("next_after must be a string"));
+
+        let mut cycle_ids = base();
+        cycle_ids["cycle_card_ids"] = json!(["ok", 42]);
+        assert!(parse_card_summary_page(cycle_ids)
+            .unwrap_err()
+            .contains("cycle_card_ids must contain strings"));
+
+        let mut cycle_shape = base();
+        cycle_shape["cycle_card_ids"] = json!("not-an-array");
+        assert!(parse_card_summary_page(cycle_shape)
+            .unwrap_err()
+            .contains("cycle_card_ids must be an array"));
     }
 }

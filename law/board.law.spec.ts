@@ -97,6 +97,69 @@ for (const mode of MODES) {
     await assertLaw(page, { consoleErrors: errors });
   });
 
+
+  test(`board filters · ${mode} · estimate and risk apply independently to every lane`, async ({ page }) => {
+    const errors = await boot(page, mode);
+    await page.locator("#filter-btn").click();
+
+    // Estimate S keeps the positive fixture in every rendered lane and removes
+    // the contrasting L fixture. The blocked card is a Ready card rendered in
+    // the derived blocked strip, so it proves that lane too.
+    await page.locator("#fg-estimate [data-estimates='s']").click();
+    for (const [lane, id] of [
+      ["lane-ready", "001"],
+      ["lane-ready", "blocked-card"],
+      ["rail-list", "backlog-match"],
+      ["lane-inprog", "inprogress-match"],
+      ["lane-done", "done-match"],
+    ] as const) {
+      await expect(page.locator(`#${lane} [data-id='${id}']`)).toBeVisible();
+    }
+    for (const [lane, id] of [
+      ["rail-list", "backlog-no-match"],
+      ["lane-inprog", "inprogress-no-match"],
+      ["lane-done", "done-card"],
+    ] as const) {
+      await expect(page.locator(`#${lane} [data-id='${id}']`)).toHaveCount(0);
+    }
+
+    // Clear estimate, then apply Risk High independently. Low-risk cards must
+    // disappear while high-risk cards remain in each lane.
+    await page.locator("#fg-estimate [data-estimates='s']").click();
+    await page.locator("#fg-risk [data-risks='high']").click();
+    for (const [lane, id] of [
+      ["lane-ready", "blocked-card"],
+      ["rail-list", "backlog-match"],
+      ["lane-inprog", "inprogress-match"],
+      ["lane-done", "done-card"],
+      ["lane-done", "done-match"],
+    ] as const) {
+      await expect(page.locator(`#${lane} [data-id='${id}']`)).toBeVisible();
+    }
+    for (const [lane, id] of [
+      ["lane-ready", "001"],
+      ["rail-list", "backlog-no-match"],
+      ["lane-inprog", "inprogress-no-match"],
+    ] as const) {
+      await expect(page.locator(`#${lane} [data-id='${id}']`)).toHaveCount(0);
+    }
+    await assertLaw(page, { consoleErrors: errors });
+  });
+
+  test(`board filters · ${mode} · estimate and risk state survives reload`, async ({ page }) => {
+    const errors = await boot(page, mode);
+    await page.locator("#filter-btn").click();
+    await page.locator("#fg-estimate [data-estimates='s']").click();
+    await page.locator("#fg-risk [data-risks='high']").click();
+    await expect(page.locator("#filter-n")).toContainText("· 2");
+    await page.reload();
+    await waitForSettled(page);
+    await page.locator("#filter-btn").click();
+    await expect(page.locator("#fg-estimate [data-estimates='s']")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.locator("#fg-risk [data-risks='high']")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.locator("#lane-ready [data-id='blocked-card']")).toBeVisible();
+    await assertLaw(page, { consoleErrors: errors });
+  });
   test(`board settings page · ${mode} · the law holds`, async ({ page }) => {
     const errors = await boot(page, mode);
     await page.locator("#settings-toggle").click();
@@ -142,7 +205,7 @@ for (const mode of MODES) {
     const errors = await boot(page, mode);
     await page.locator("#tab-board").click();
     await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
-    const card = page.locator("[data-card-link]").first();
+    const card = page.locator("[data-card-link][data-id='001']");
     await card.waitFor({ state: "visible" });
     await expect(card).toHaveAttribute("href", "/c/001");
     await card.click();
@@ -215,6 +278,7 @@ for (const mode of MODES) {
     await assertLaw(page, { consoleErrors: errors });
   });
 }
+
 
 // powder-search-p2: exact card-id hits keep their source provenance, and a
 // search result retains the blocker relation needed by the derived blocked

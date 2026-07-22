@@ -45,61 +45,31 @@ never a public URL:
   POWDER_BIND_ADDR=127.0.0.1:<port>
   POWDER_AUTH_MODE=tailscale-header
   POWDER_PUBLIC_BASE_URL=<the box's tailnet origin, see above>
-  POWDER_DISCLOSE_BOOTSTRAP_KEY=false
+  POWDER_BOOTSTRAP_KEY_FILE=/data/powder-bootstrap.key
   ```
 
-  `tailscale-header` mode trusts the `Tailscale-User-Login` (or equivalent)
-  identity header `tailscale serve` injects on proxied HTTPS requests, so
-  any tailnet peer -- a browser, the CLI, an MCP client -- reaches the
-  board with no key at all and still gets a real, attributed principal (an
-  actual tailnet login, not a static agent string). `POWDER_TAILNET_ADMIN`
-  (default `true`, unset) controls whether that identity is admin-scoped;
-  `POWDER_TAILNET_PROXY_SECRET` is an optional in-code backstop requiring a
-  matching `X-Powder-Proxy-Secret` header from a *further* trusted proxy in
-  front of `tailscale serve`, not something `tailscale serve` itself sends
-  -- leave it unset unless such a proxy exists.
+  `tailscale-header` mode trusts the identity header that the trusted ingress
+  injects only after it strips client-supplied values. Configure
+  `POWDER_TAILNET_PROXY_SECRET` and have the ingress set the matching
+  `X-Powder-Proxy-Secret`; identity-header authentication fails closed when
+  that secret is absent or wrong. Admin scope is limited to exact identities
+  listed in `POWDER_TAILNET_ADMIN_PRINCIPALS`; unset and wildcard policies
+  are fail-closed, and the retired global `POWDER_TAILNET_ADMIN` setting is
+  rejected. Same-box callers without an identity header may use a valid bearer
+  key through the explicit fallback.
 
-  **Same-box and off-mesh service callers never get that header.** A
-  request self-originated from the box to its own tailnet hostname (a
-  co-hosted app calling back through `tailscale serve`, e.g. Glass calling
-  Powder with its Mint-brokered `GLASS_POWDER_API_KEY`) does not traverse
-  the peer-identity handshake that populates it -- verified live
-  2026-07-17. `tailscale-header` mode's `authorize()` therefore falls back
-  to verifying a bearer token (the same check `api-key` mode uses) whenever
-  a request carries `Authorization: Bearer <key>` but no identity header,
-  so a minted API key still works for exactly that case. Reads and writes
-  share one `authorize()` call, so this fallback covers both.
+  `POWDER_BOOTSTRAP_KEY_FILE=/data/powder-bootstrap.key` is required on a
+  new database. The server writes the first admin key exactly once to this
+  0600 file while holding the SQLite seed lock and never writes raw key bytes
+  to stdout, stderr, or service logs. Read it over the operator channel, store
+  it in a secret manager, and remove the one-shot file. A stale file from an
+  interrupted first seed is replaced inside the locked transaction; a restart
+  against an already seeded database does not generate another key.
 
-  `POWDER_DISCLOSE_BOOTSTRAP_KEY=false` means the very first admin key
-  `powder-server` seeds on an empty database is created **redacted** --
-  nothing but `"Powder bootstrap API key created and redacted."` reaches
-  stderr, so the raw key never lands in `journald` for the box's lifetime.
-  This is a deliberate production-only posture; the code's own default
-  (`true`, unset) stays unchanged so a self-hoster running the binary with
-  zero config still sees their first key.
-
-  The seed only ever runs once (it's guarded by a `seed_runs` row) --
-  flipping the env var back to `true` and redeploying **after** the first
-  boot does nothing; the seed has already applied and there is no raw value
-  left to print. Get a usable admin key on a freshly bootstrapped production
-  box one of two ways, decided *before* or *at* that first boot:
-
-  - **`init-db --show-secret` on the box (preferred: never touches logs).**
-    SSH to the box and run `powder init-db --db <path> --show-secret`
-    yourself, once, before `powder-server` ever starts against that
-    database. This applies the one-time seed and prints the raw key
-    directly to your SSH session. Then start (or redeploy) `powder-server`
-    normally with `POWDER_DISCLOSE_BOOTSTRAP_KEY=false` already set --
-    its own call to the same seed finds it already applied and no-ops.
-  - **Disclose once, then rotate.** If `powder-server` already auto-seeded
-    the database (the common case), the raw bootstrap value is gone for
-    good -- there is no "re-disclose" path. Mint a fresh admin key instead
-    via the operator-key flow already documented in
-    [`docs/operations.md`](operations.md#self-hosting) (`powder key-create
-    --db <path> --name operator --scope admin --show-secret` over SSH),
-    confirm it authenticates, then `powder key-revoke <bootstrap-key-id>`
-    (its id is visible via `key-list`, which never needs the secret) to
-    retire the now-permanently-unrecoverable original.
+  If the database was seeded before the file setting was deployed, mint a new
+  admin key with `powder key-create --db <path> --name operator --scope admin
+  --show-secret` over SSH, confirm it authenticates, then revoke the original
+  bootstrap key by id.
 
   Either way, store the captured key per the durable key-drop convention in
   [`docs/operations.md`](operations.md#api-key-lifecycle-minting-storage-and-whats-recoverable-powder-918)

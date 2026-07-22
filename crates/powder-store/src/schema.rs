@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 26;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -50,6 +50,26 @@ CREATE TABLE IF NOT EXISTS cards (
 );
 CREATE INDEX IF NOT EXISTS idx_cards_status_priority ON cards(status, priority, created_at, id);
 
+CREATE TABLE IF NOT EXISTS ready_snapshots (
+  id TEXT PRIMARY KEY,
+  query_fingerprint TEXT NOT NULL,
+  ordered_digest TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ready_snapshots_expires ON ready_snapshots(expires_at);
+CREATE INDEX IF NOT EXISTS idx_ready_snapshots_query_digest
+  ON ready_snapshots(query_fingerprint, ordered_digest, expires_at);
+
+CREATE TABLE IF NOT EXISTS ready_snapshot_items (
+  snapshot_id TEXT NOT NULL REFERENCES ready_snapshots(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  card_id TEXT NOT NULL,
+  PRIMARY KEY(snapshot_id, position),
+  UNIQUE(snapshot_id, card_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ready_snapshot_items_card ON ready_snapshot_items(snapshot_id, card_id);
+
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
   mime TEXT NOT NULL,
@@ -93,6 +113,7 @@ CREATE TABLE IF NOT EXISTS runs (
   card_id TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   state TEXT NOT NULL,
   principal TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'agent',
   agent TEXT NOT NULL,
   claim_expires_at INTEGER NOT NULL,
   proof TEXT,
@@ -106,6 +127,8 @@ CREATE TABLE IF NOT EXISTS activities (
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   activity_type TEXT NOT NULL,
   payload TEXT NOT NULL,
+  principal TEXT,
+  role TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_activities_run_created ON activities(run_id, created_at);
@@ -117,6 +140,7 @@ CREATE TABLE IF NOT EXISTS card_events (
   actor TEXT NOT NULL,
   payload TEXT NOT NULL,
   principal TEXT,
+  role TEXT,
   subject_kind TEXT,
   subject_id TEXT,
   created_at INTEGER NOT NULL
@@ -505,5 +529,5 @@ source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_ac
 claim_expires_at, created_at, updated_at, parent, risk FROM cards";
 
 pub const RUN_SELECT_SQL: &str =
-    "SELECT id, card_id, state, principal, agent, claim_expires_at, proof,
+    "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
 created_at, updated_at FROM runs WHERE id = ?1";

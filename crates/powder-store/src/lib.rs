@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::Path,
 };
@@ -11,7 +11,7 @@ use powder_core::{
     AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
     CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim, ClaimReceipt,
     Comment, CriterionProof, DomainError, EpicFreshness, EpicState, Estimate, Link, LinkId,
-    Priority, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
+    Priority, ReadyCursor, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{
     functions::{Context, FunctionFlags},
@@ -38,7 +38,7 @@ pub use events::{
     EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
 };
 pub use identity::{ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
-use relations::{list_delta, mirror_delta, mirror_initial_relations};
+use relations::{list_delta, mirror_delta_with_authority, mirror_initial_relations_with_authority};
 pub use relations::{
     ParentCoverageAssignment, ParentCoverageBucket, ParentCoverageReport, ParentDoctorIssue,
     ParentGraphReport, ParentIssueKind, RelationField, RelationIssueKind, RelationsDoctorIssue,
@@ -65,6 +65,8 @@ use schema::{
 };
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+const READY_SNAPSHOT_TTL_SECONDS: i64 = 60 * 60;
 
 const API_KEY_ALPHABET: [char; 64] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
@@ -321,6 +323,9 @@ pub struct CardListPage {
     /// last page, or whenever the eligible set already fits within
     /// `limit`.
     pub next_after: Option<CardId>,
+    /// Encoded durable Ready continuation when the page needs another page.
+    /// The v3 token is opaque and store-backed; it contains no card IDs.
+    pub ready_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -592,6 +597,7 @@ impl Store {
                 return Err(StoreError::UnsupportedSchema(current));
             }
             if current == SCHEMA_VERSION {
+                self.ensure_principal_role_columns()?;
                 return Ok(());
             }
             let next = match current {
@@ -694,6 +700,14 @@ impl Store {
                 23 => {
                     self.migrate_23_to_24()?;
                     24
+                }
+                24 => {
+                    self.migrate_24_to_25()?;
+                    25
+                }
+                25 => {
+                    self.migrate_25_to_26()?;
+                    26
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -927,40 +941,6 @@ impl Store {
         })
     }
 
-    /// powder-epic-truthful-ops: steps 1-10 originally ran their DDL
-    /// unconditionally, unlike the `cards_has_column`-guarded steps below
-    /// (11-16). A process crash (OOM kill, host reboot, `pkill -9`) between a
-    /// step's DDL and its `PRAGMA user_version` bump left the DB schema
-    /// ahead of its recorded version; the next boot would re-run the same
-    /// `ALTER TABLE ... ADD COLUMN` and fail with "duplicate column name",
-    /// wedging every subsequent boot until a human intervened by hand. These
-    /// wrappers close that gap the same way 11-16 already do: check whether
-    /// the DDL's effect is already present before re-issuing it. Table
-    /// creation and index statements already use `IF NOT EXISTS` and are
-    /// naturally idempotent, so only the bare `ALTER TABLE` steps need a
-    /// guard.
-    /// powder-epic-truthful-ops (review fix): `MIGRATE_1_TO_2` is DDL *plus*
-    /// two backfill statements, and `execute_batch` autocommits per
-    /// statement -- so guarding the whole batch on `actor_id`'s existence was
-    /// wrong. A crash after the `ALTER TABLE ... ADD COLUMN actor_id` commits
-    /// but before the two backfills run leaves the column present with every
-    /// value NULL; on retry the single column-existence guard would see the
-    /// column and skip the backfills *forever*. That is not cosmetic:
-    /// `verify_api_key` INNER JOINs `api_keys` to `actors`, so a permanently
-    /// unbackfilled `actor_id` silently stops every pre-existing key from
-    /// authenticating. Decomposed into three independently-idempotent phases,
-    /// mirroring `migrate_3_to_4`'s per-effect guards:
-    ///
-    /// 1. `actors` table + the `api_keys` index are `CREATE ... IF NOT
-    ///    EXISTS`, safe to re-run unconditionally.
-    /// 2. the `ADD COLUMN` is guarded on column existence (an `ALTER ... ADD
-    ///    COLUMN` cannot be re-run).
-    /// 3. the backfill is guarded on its own *effect* -- whether any row is
-    ///    still `actor_id IS NULL` -- not on the column's existence, so an
-    ///    interrupted backfill is finished on the next boot. (The backfill's
-    ///    own `WHERE actor_id IS NULL` also makes re-running it harmless; the
-    ///    completeness guard just avoids a pointless full-table UPDATE when
-    ///    there is nothing left to do.)
     fn migrate_1_to_2(&mut self) -> Result<()> {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS actors (
@@ -1681,6 +1661,34 @@ impl Store {
         Ok(())
     }
 
+    fn migrate_24_to_25(&self) -> Result<()> {
+        self.ensure_principal_role_columns()
+    }
+
+    fn migrate_25_to_26(&self) -> Result<()> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ready_snapshots (
+               id TEXT PRIMARY KEY,
+               query_fingerprint TEXT NOT NULL,
+               ordered_digest TEXT NOT NULL DEFAULT '',
+               created_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_ready_snapshots_expires ON ready_snapshots(expires_at);
+             CREATE INDEX IF NOT EXISTS idx_ready_snapshots_query_digest
+               ON ready_snapshots(query_fingerprint, ordered_digest, expires_at);
+             CREATE TABLE IF NOT EXISTS ready_snapshot_items (
+               snapshot_id TEXT NOT NULL REFERENCES ready_snapshots(id) ON DELETE CASCADE,
+               position INTEGER NOT NULL,
+               card_id TEXT NOT NULL,
+               PRIMARY KEY(snapshot_id, position),
+               UNIQUE(snapshot_id, card_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_ready_snapshot_items_card ON ready_snapshot_items(snapshot_id, card_id);",
+        )?;
+        Ok(())
+    }
+
     fn migrate_19_to_20(&mut self) -> Result<()> {
         let needs_principal = !self.table_has_column("card_events", "principal")?;
         let needs_subject_kind = !self.table_has_column("card_events", "subject_kind")?;
@@ -1775,6 +1783,28 @@ impl Store {
         Ok(())
     }
 
+    fn ensure_principal_role_columns(&self) -> Result<()> {
+        if self.table_exists("runs")? && !self.table_has_column("runs", "role")? {
+            self.connection
+                .execute_batch("ALTER TABLE runs ADD COLUMN role TEXT NOT NULL DEFAULT 'agent';")?;
+        }
+        if self.table_exists("activities")? {
+            if !self.table_has_column("activities", "principal")? {
+                self.connection
+                    .execute_batch("ALTER TABLE activities ADD COLUMN principal TEXT;")?;
+            }
+            if !self.table_has_column("activities", "role")? {
+                self.connection
+                    .execute_batch("ALTER TABLE activities ADD COLUMN role TEXT;")?;
+            }
+        }
+        if self.table_exists("card_events")? && !self.table_has_column("card_events", "role")? {
+            self.connection
+                .execute_batch("ALTER TABLE card_events ADD COLUMN role TEXT;")?;
+        }
+        Ok(())
+    }
+
     pub fn schema_version(&self) -> Result<u32> {
         Ok(self
             .connection
@@ -1821,7 +1851,20 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<ImportOutcome> {
-        let actor = non_empty("actor", actor)?;
+        self.import_cards_with_events_with_authority(
+            cards,
+            &Authority::actor(actor.to_owned(), false),
+            now,
+        )
+    }
+
+    pub fn import_cards_with_events_with_authority(
+        &mut self,
+        cards: Vec<Card>,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<ImportOutcome> {
+        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1830,19 +1873,20 @@ impl Store {
             match load_card_optional(&transaction, &incoming.id)? {
                 None => {
                     persist_card(&transaction, &incoming)?;
-                    append_card_event(
+                    append_card_event_with_authority(
                         &transaction,
                         &incoming.id,
                         "create",
                         &actor,
                         "imported card",
                         now,
+                        authority,
                     )?;
-                    events::append_outbound_card_event(
+                    events::append_outbound_card_event_with_authority(
                         &transaction,
                         &incoming,
                         "card-created",
-                        &actor,
+                        authority,
                         json!({"source": "import"}),
                         now,
                     )?;
@@ -1857,19 +1901,20 @@ impl Store {
                     if let Some(event_type) =
                         events::outbound_event_for_status_change(previous, merged.status)
                     {
-                        append_card_event(
+                        append_card_event_with_authority(
                             &transaction,
                             &merged.id,
                             "status",
                             &actor,
                             &format!("{} -> {}", previous.as_str(), merged.status.as_str()),
                             now,
+                            authority,
                         )?;
-                        events::append_outbound_card_event(
+                        events::append_outbound_card_event_with_authority(
                             &transaction,
                             &merged,
                             event_type,
-                            &actor,
+                            authority,
                             json!({
                                 "previous_status": previous.as_str(),
                                 "status": merged.status.as_str(),
@@ -1946,13 +1991,17 @@ impl Store {
         Ok(saved)
     }
 
-    pub fn create_card_with_events(
+    pub fn create_card_with_events(&mut self, card: Card, actor: &str, now: i64) -> Result<Card> {
+        self.create_card_with_events_as(card, &Authority::actor(actor.to_owned(), false), now)
+    }
+
+    pub fn create_card_with_events_as(
         &mut self,
         mut card: Card,
-        actor: &str,
+        authority: &Authority,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
+        let actor = non_empty("actor", &authority.actor_label())?;
         let card_id = card.id.clone();
         card.title = secrets::scrub_secrets(&card.title);
         card.body = secrets::scrub_secrets(&card.body);
@@ -1992,22 +2041,24 @@ impl Store {
         }
         persist_card(&transaction, &card)?;
         let saved = load_card(&transaction, &card_id)?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             &saved.id,
             "create",
             &actor,
             "created card",
             now,
+            authority,
         )?;
         if let Some(parent_id) = saved.parent.as_ref() {
-            append_card_event(
+            append_card_event_with_authority(
                 &transaction,
                 parent_id,
                 "decompose",
                 &actor,
                 &format!("child {card_id} created"),
                 now,
+                authority,
             )?;
         }
         // A card born with related/blocks/blocked_by already set mirrors
@@ -2015,12 +2066,12 @@ impl Store {
         // reciprocity is a birth-time guarantee, not something the caller
         // has to establish with follow-up update_relations calls
         // (powder-dogfood-2026-07-14-nonreciprocal-relations).
-        mirror_initial_relations(&transaction, &saved, &actor, now)?;
-        events::append_outbound_card_event(
+        mirror_initial_relations_with_authority(&transaction, &saved, authority, now)?;
+        events::append_outbound_card_event_with_authority(
             &transaction,
             &saved,
             "card-created",
-            &actor,
+            authority,
             json!({"source": "create-card"}),
             now,
         )?;
@@ -2040,7 +2091,15 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
+        self.file_papercut_as(report, &Authority::actor(actor.to_owned(), false), now)
+    }
+
+    pub fn file_papercut_as(
+        &mut self,
+        report: &powder_core::papercut::PapercutReport,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<Card> {
         let resolved_repo = report
             .service
             .as_deref()
@@ -2058,7 +2117,7 @@ impl Store {
             now,
             id,
         )?;
-        self.create_card_with_events(card, &actor, now)
+        self.create_card_with_events_as(card, authority, now)
     }
 
     pub fn patch_card(
@@ -2068,7 +2127,22 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
+        self.patch_card_as(
+            card_id,
+            patch,
+            &Authority::actor(actor.to_owned(), false),
+            now,
+        )
+    }
+
+    pub fn patch_card_as(
+        &mut self,
+        card_id: &CardId,
+        patch: CardPatch,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<Card> {
+        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2123,13 +2197,14 @@ impl Store {
 
         card.updated_at = now;
         persist_card(&transaction, &card)?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "patch",
             &actor,
             &format!("patched {}", patched_fields.join(", ")),
             now,
+            authority,
         )?;
         // `persist_card` canonicalizes `repo` at write time via
         // `resolve_registered_repository_name` (an alias like
@@ -2222,7 +2297,22 @@ impl Store {
         actor: &str,
         now: i64,
     ) -> Result<CriteriaRepair> {
-        let actor = non_empty("actor", actor)?;
+        self.repair_criteria_as(
+            card_id,
+            acceptance,
+            &Authority::actor(actor.to_owned(), false),
+            now,
+        )
+    }
+
+    pub fn repair_criteria_as(
+        &mut self,
+        card_id: &CardId,
+        acceptance: Vec<String>,
+        authority: &Authority,
+        now: i64,
+    ) -> Result<CriteriaRepair> {
+        let actor = non_empty("actor", &authority.actor_label())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2261,13 +2351,14 @@ impl Store {
 
         if !changes.is_empty() {
             persist_card(&transaction, &repaired)?;
-            append_card_event(
+            append_card_event_with_authority(
                 &transaction,
                 card_id,
                 "repair",
                 &actor,
                 &format!("repaired {} acceptance criterion(s)", changes.len()),
                 now,
+                authority,
             )?;
         }
 
@@ -2330,39 +2421,56 @@ impl Store {
         self.list_ready_page_after(query, None)
     }
 
-    /// Continuation-aware variant of [`Store::list_ready_page`] --
-    /// unchanged when `after` is `None` (delegated to by `list_ready_page`
-    /// itself), used directly by the HTTP `/api/v1/cards/ready` route to
-    /// resume past a prior page (powder-cards-api-paged-continuation).
-    ///
-    /// `after`, when set, must be the id of a card present in the *same*
-    /// eligibility-filtered, topologically-ordered list this call
-    /// recomputes from scratch (typically the `next_after`/last card id a
-    /// prior call on this store returned); an id absent from that list --
-    /// never existed, no longer ready-eligible, or filtered by different
-    /// `query` parameters than the prior call used -- is rejected with a
-    /// validation error rather than silently resuming from the start or
-    /// skipping cards. This is an *interim* continuation over an
-    /// already-materialized in-memory list this call still fully
-    /// recomputes (full table scan, then eligibility filter, then
-    /// topological order) every time -- it bounds response payload size,
-    /// not per-request DB/CPU cost; see [`CardListPage::next_after`] and
-    /// the separate `powder-store-sql-pushed-list-filtering` follow-up for
-    /// what actually fixes that cost.
+    /// Continuation-aware Ready listing. A first page materializes a durable
+    /// SQLite snapshot when more cards remain; identical first-page polls reuse
+    /// an unexpired snapshot by ordered-card digest. Follow-up pages use the
+    /// opaque v3 cursor position, skip departed cards, and append new arrivals
+    /// after captured positions. Every continuation is v3 and query-bound.
     pub fn list_ready_page_after(
         &self,
         query: ReadyQuery,
-        after: Option<&CardId>,
+        after: Option<&ReadyCursor>,
     ) -> Result<CardListPage> {
+        if let Some(cursor) = after {
+            if !cursor.matches_query(&query) {
+                return Err(DomainError::validation(
+                    "after",
+                    "stale continuation cursor: query filters do not match",
+                )
+                .into());
+            }
+        }
+        // Resolve caller-supplied repository aliases once at the Store seam.
+        let repository_filters = query
+            .repo
+            .as_ref()
+            .map(|repositories| {
+                repositories
+                    .iter()
+                    .map(|repository| resolve_repository_name(&self.connection, repository))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let all_cards = load_all_cards(&self.connection)?;
-        // reuses the same full scan already loaded above, rather than a
-        // second query per blocker: a blocker missing from this map is
-        // treated as still blocking (fail closed).
         let statuses: HashMap<_, _> = all_cards.iter().map(|c| (c.id.clone(), c.status)).collect();
-        let mut cards = Vec::new();
+        let mut eligible = Vec::new();
         for card in all_cards {
             if !card.is_ready_at(query.now, |id| {
                 statuses.get(id).is_some_and(|status| status.is_terminal())
+            }) {
+                continue;
+            }
+            if repository_filters.as_ref().is_some_and(|repositories| {
+                let card_repo = card
+                    .repo
+                    .as_deref()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| repo_from_numeric_card_id_prefix(card.id.as_str()));
+                !repositories.iter().flatten().any(|repository| {
+                    card_repo.as_deref().is_some_and(|candidate| {
+                        canonical_repo_matches(candidate, repository.as_str())
+                    })
+                })
             }) {
                 continue;
             }
@@ -2372,19 +2480,236 @@ impl Store {
             {
                 continue;
             }
-            cards.push(card);
+            if query.risk.is_some_and(|risk| card.risk != Some(risk)) {
+                continue;
+            }
+            if query
+                .priority
+                .is_some_and(|priority| card.priority != priority)
+            {
+                continue;
+            }
+            eligible.push(card);
         }
-        let total_count = cards.len();
-
-        let order = powder_core::order_ready_cards(cards);
+        let total_count = eligible.len();
+        let order = powder_core::order_ready_cards(eligible);
         let cycle_card_ids = order.cycle_card_ids;
-        let (cards, next_after) = paginate_ordered_cards(order.cards, query.limit, after)?;
+        let ordered_cards = order.cards;
+
+        if let Some(cursor) = after.filter(|cursor| cursor.is_durable()) {
+            return self.list_ready_snapshot_page(
+                &query,
+                cursor,
+                ordered_cards,
+                total_count,
+                cycle_card_ids,
+            );
+        }
+
+        if after.is_none() && ordered_cards.len() > query.limit {
+            let ordered_digest = ready_order_digest(&ordered_cards);
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "DELETE FROM ready_snapshots WHERE expires_at <= ?1",
+                [query.now],
+            )?;
+            let existing = transaction
+                .query_row(
+                    "SELECT id FROM ready_snapshots
+                     WHERE query_fingerprint = ?1 AND ordered_digest = ?2 AND expires_at > ?3
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    rusqlite::params![query.fingerprint(), ordered_digest, query.now],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let snapshot_id = if let Some(snapshot_id) = existing {
+                transaction.commit()?;
+                snapshot_id
+            } else {
+                let snapshot_id =
+                    format!("ready-snapshot-{}", nanoid::nanoid!(20, &API_KEY_ALPHABET));
+                transaction.execute(
+                    "INSERT INTO ready_snapshots(id, query_fingerprint, ordered_digest, created_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        snapshot_id,
+                        query.fingerprint(),
+                        ordered_digest,
+                        query.now,
+                        query.now.saturating_add(READY_SNAPSHOT_TTL_SECONDS),
+                    ],
+                )?;
+                for (position, card) in ordered_cards.iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO ready_snapshot_items(snapshot_id, position, card_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![
+                            snapshot_id,
+                            i64::try_from(position).unwrap_or(i64::MAX),
+                            card.id.as_str()
+                        ],
+                    )?;
+                }
+                transaction.commit()?;
+                snapshot_id
+            };
+            let end = query.limit.max(1).min(ordered_cards.len());
+            let cards = ordered_cards.into_iter().take(end).collect::<Vec<_>>();
+            let next_after = cards.last().map(|card| card.id.clone());
+            let ready_cursor = ReadyCursor::for_snapshot(&query, snapshot_id, end).encode();
+            return Ok(CardListPage {
+                cards,
+                total_count,
+                excluded_terminal_count: 0,
+                cycle_card_ids,
+                next_after,
+                ready_cursor: Some(ready_cursor),
+            });
+        }
+
+        let cards = ordered_cards
+            .into_iter()
+            .take(query.limit.max(1))
+            .collect::<Vec<_>>();
         Ok(CardListPage {
             cards,
             total_count,
             excluded_terminal_count: 0,
             cycle_card_ids,
+            next_after: None,
+            ready_cursor: None,
+        })
+    }
+
+    fn list_ready_snapshot_page(
+        &self,
+        query: &ReadyQuery,
+        cursor: &ReadyCursor,
+        ordered_cards: Vec<Card>,
+        total_count: usize,
+        cycle_card_ids: Vec<CardId>,
+    ) -> Result<CardListPage> {
+        let snapshot_id = cursor
+            .snapshot_id()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
+        let current_by_id = ordered_cards
+            .iter()
+            .cloned()
+            .map(|card| (card.id.as_str().to_owned(), card))
+            .collect::<HashMap<_, _>>();
+        let current_order_ids = ordered_cards
+            .iter()
+            .map(|card| card.id.clone())
+            .collect::<Vec<_>>();
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM ready_snapshots WHERE expires_at <= ?1",
+            [query.now],
+        )?;
+        let metadata = transaction
+            .query_row(
+                "SELECT query_fingerprint, expires_at FROM ready_snapshots WHERE id = ?1",
+                [snapshot_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((fingerprint, _expires_at)) = metadata else {
+            transaction.commit()?;
+            return Err(
+                DomainError::validation("after", "unknown or expired continuation cursor").into(),
+            );
+        };
+        if fingerprint != query.fingerprint() {
+            transaction.commit()?;
+            return Err(DomainError::validation(
+                "after",
+                "stale continuation cursor: query filters do not match",
+            )
+            .into());
+        }
+        let snapshot_ids = {
+            let mut statement = transaction
+                .prepare("SELECT card_id FROM ready_snapshot_items WHERE snapshot_id = ?1")?;
+            let rows = statement
+                .query_map([snapshot_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            rows
+        };
+        let mut next_position = transaction.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM ready_snapshot_items WHERE snapshot_id = ?1",
+            [snapshot_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        // Newly eligible arrivals are appended in the current topological order;
+        // captured positions never move, even when graph changes or cards depart.
+        for card_id in &current_order_ids {
+            if snapshot_ids.contains(card_id.as_str()) {
+                continue;
+            }
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO ready_snapshot_items(snapshot_id, position, card_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![snapshot_id, next_position, card_id.as_str()],
+            )?;
+            if inserted > 0 {
+                next_position += 1;
+            }
+        }
+        let snapshot_len = usize::try_from(next_position).map_err(|_| {
+            DomainError::validation("after", "invalid continuation cursor position")
+        })?;
+        if cursor.position() >= snapshot_len {
+            transaction.commit()?;
+            return Err(
+                DomainError::validation("after", "invalid continuation cursor position").into(),
+            );
+        }
+        let start_position = i64::try_from(cursor.position()).map_err(|_| {
+            DomainError::validation("after", "invalid continuation cursor position")
+        })?;
+        let limit = query.limit.max(1);
+        let mut page = Vec::with_capacity(limit);
+        let mut extra_position = None;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT position, card_id FROM ready_snapshot_items
+                 WHERE snapshot_id = ?1 AND position >= ?2 ORDER BY position",
+            )?;
+            let mut rows = statement.query(rusqlite::params![snapshot_id, start_position])?;
+            while let Some(row) = rows.next()? {
+                let position: i64 = row.get(0)?;
+                let card_id: String = row.get(1)?;
+                if let Some(card) = current_by_id.get(&card_id) {
+                    if page.len() < limit {
+                        page.push(card.clone());
+                    } else {
+                        extra_position = Some(position);
+                        break;
+                    }
+                }
+            }
+        }
+        let (next_after, ready_cursor) = if let Some(position) = extra_position {
+            let last = page.last().map(|card| card.id.clone());
+            let cursor = ReadyCursor::for_snapshot(
+                query,
+                snapshot_id.to_owned(),
+                usize::try_from(position).map_err(|_| {
+                    DomainError::validation("after", "invalid continuation cursor position")
+                })?,
+            )
+            .encode();
+            (last, Some(cursor))
+        } else {
+            (None, None)
+        };
+        transaction.commit()?;
+        Ok(CardListPage {
+            cards: page,
+            total_count,
+            excluded_terminal_count: 0,
+            cycle_card_ids,
             next_after,
+            ready_cursor,
         })
     }
 
@@ -2485,6 +2810,7 @@ impl Store {
             excluded_terminal_count,
             cycle_card_ids: Vec::new(),
             next_after,
+            ready_cursor: None,
         })
     }
 
@@ -2836,11 +3162,11 @@ impl Store {
             params![card_id.as_str(), now],
         )?;
         if let Some(expired) = card.claim.as_ref().filter(|claim| claim.is_expired(now)) {
-            events::append_outbound_card_event(
+            events::append_outbound_card_event_with_authority(
                 &transaction,
                 &card,
                 "claim-expired",
-                &expired.principal,
+                authority,
                 json!({
                     "principal": expired.principal.as_str(),
                     "run_id": expired.run_id.as_str(),
@@ -2876,6 +3202,7 @@ impl Store {
             card_id: card_id.clone(),
             state: RunState::Active,
             principal: principal.clone(),
+            role: authority.role_label().to_string(),
             agent: agent.clone(),
             claim_expires_at: claim.expires_at,
             proof: None,
@@ -2883,11 +3210,13 @@ impl Store {
             updated_at: now,
         };
         persist_run(&transaction, &run)?;
-        append_activity(
+        append_activity_attributed(
             &transaction,
             &run_id,
             ActivityType::Action,
             &format!("claimed {card_id}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -2917,28 +3246,31 @@ impl Store {
         persist_card(&transaction, &card)?;
         if let Some(claim) = released_claim {
             close_run_for_status(&transaction, &claim.run_id, status, now, None)?;
-            append_activity(
+            append_activity_attributed(
                 &transaction,
                 &claim.run_id,
                 ActivityType::Action,
                 &format!("status set {card_id} to {}", status.as_str()),
+                authority.principal_name(),
+                Some(authority.role_label()),
                 now,
             )?;
         }
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "status",
             &authority.actor_label(),
             &format!("{} -> {}", previous.as_str(), status.as_str()),
             now,
+            authority,
         )?;
         if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
-            events::append_outbound_card_event(
+            events::append_outbound_card_event_with_authority(
                 &transaction,
                 &card,
                 event_type,
-                &authority.actor_label(),
+                authority,
                 json!({
                     "previous_status": previous.as_str(),
                     "status": status.as_str()
@@ -2947,10 +3279,10 @@ impl Store {
             )?;
         }
         if status.is_terminal() && !previous.is_terminal() {
-            append_parent_rollup_event(
+            append_parent_rollup_event_with_authority(
                 &transaction,
                 &card,
-                &authority.actor_label(),
+                authority,
                 &format!("child {card_id} reached {}", status.as_str()),
                 now,
             )?;
@@ -2991,7 +3323,7 @@ impl Store {
 
         card.apply_relations(related, blocks, blocked_by, now);
         persist_card(&transaction, &card)?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "relations",
@@ -3001,30 +3333,31 @@ impl Store {
                 card.related, card.blocks, card.blocked_by
             ),
             now,
+            authority,
         )?;
 
-        mirror_delta(
+        mirror_delta_with_authority(
             &transaction,
             card_id,
             RelationField::Related,
             &related_delta,
-            &actor,
+            authority,
             now,
         )?;
-        mirror_delta(
+        mirror_delta_with_authority(
             &transaction,
             card_id,
             RelationField::Blocks,
             &blocks_delta,
-            &actor,
+            authority,
             now,
         )?;
-        mirror_delta(
+        mirror_delta_with_authority(
             &transaction,
             card_id,
             RelationField::BlockedBy,
             &blocked_by_delta,
-            &actor,
+            authority,
             now,
         )?;
 
@@ -3066,34 +3399,37 @@ impl Store {
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "none".to_string())
         };
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "hierarchy",
             &actor,
             &format!("parent {} -> {}", label(&previous), label(&parent)),
             now,
+            authority,
         )?;
         if let Some(old_parent) = previous.as_ref() {
             if load_card_optional(&transaction, old_parent)?.is_some() {
-                append_card_event(
+                append_card_event_with_authority(
                     &transaction,
                     old_parent,
                     "hierarchy",
                     &actor,
                     &format!("child {card_id} unlinked"),
                     now,
+                    authority,
                 )?;
             }
         }
         if let Some(new_parent) = parent.as_ref() {
-            append_card_event(
+            append_card_event_with_authority(
                 &transaction,
                 new_parent,
                 "decompose",
                 &actor,
                 &format!("child {card_id} linked"),
                 now,
+                authority,
             )?;
         }
         transaction.commit()?;
@@ -3115,18 +3451,20 @@ impl Store {
         let claim = card.release_claim(run_id, now)?;
         persist_card(&transaction, &card)?;
         release_run(&transaction, run_id, now)?;
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("released {card_id}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
-        events::append_outbound_card_event(
+        events::append_outbound_card_event_with_authority(
             &transaction,
             &card,
             "moved-to-ready",
-            &authority.actor_label(),
+            authority,
             json!({"source": "release_claim", "run_id": run_id.as_str()}),
             now,
         )?;
@@ -3158,11 +3496,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("renewed {card_id} until {}", claim.expires_at),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -3192,11 +3532,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("heartbeat {card_id}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -3236,11 +3578,13 @@ impl Store {
         if updated == 0 {
             return Err(DomainError::not_found("run", run_id.to_string()).into());
         }
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Action,
             &format!("transferred {card_id} from {from_agent} to {to_agent}"),
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
         transaction.commit()?;
@@ -3660,26 +4004,29 @@ impl Store {
 
         persist_card(&transaction, &card)?;
         persist_run(&transaction, &run)?;
-        append_activity(
+        append_activity_attributed(
             &transaction,
             run_id,
             ActivityType::Elicitation,
             &question,
+            authority.principal_name(),
+            Some(authority.role_label()),
             now,
         )?;
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             &card.id,
             "status",
             &authority.actor_label(),
             "awaiting input",
             now,
+            authority,
         )?;
-        events::append_outbound_card_event(
+        events::append_outbound_card_event_with_authority(
             &transaction,
             &card,
             "awaiting-input",
-            &authority.actor_label(),
+            authority,
             json!({"run_id": run_id.as_str(), "question": question}),
             now,
         )?;
@@ -3728,7 +4075,7 @@ impl Store {
                 now,
                 proof.as_deref(),
             )?;
-            append_activity(
+            append_activity_attributed(
                 &transaction,
                 &run_id,
                 ActivityType::Response,
@@ -3737,23 +4084,26 @@ impl Store {
                     .map(|proof| format!("completed: {proof}"))
                     .unwrap_or_else(|| "completed without proof".to_string())
                     .as_str(),
+                authority.principal_name(),
+                Some(authority.role_label()),
                 now,
             )?;
         }
-        append_card_event(
+        append_card_event_with_authority(
             &transaction,
             card_id,
             "status",
             &authority.actor_label(),
             &format!("{} -> done", previous.as_str()),
             now,
+            authority,
         )?;
         if !previous.is_terminal() {
-            events::append_outbound_card_event(
+            events::append_outbound_card_event_with_authority(
                 &transaction,
                 &card,
                 "completed",
-                &authority.actor_label(),
+                authority,
                 json!({
                     "previous_status": previous.as_str(),
                     "status": card.status.as_str(),
@@ -3762,10 +4112,10 @@ impl Store {
                 }),
                 now,
             )?;
-            append_parent_rollup_event(
+            append_parent_rollup_event_with_authority(
                 &transaction,
                 &card,
-                &authority.actor_label(),
+                authority,
                 &proof
                     .as_deref()
                     .map(|proof| {
@@ -4029,13 +4379,14 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
 fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     connection.execute(
         "INSERT INTO runs (
-            id, card_id, state, principal, agent, claim_expires_at, proof,
+            id, card_id, state, principal, role, agent, claim_expires_at, proof,
             created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
            card_id = excluded.card_id,
            state = excluded.state,
            principal = excluded.principal,
+           role = excluded.role,
            agent = excluded.agent,
            claim_expires_at = excluded.claim_expires_at,
            proof = excluded.proof,
@@ -4046,6 +4397,7 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
             run.card_id.as_str(),
             run.state.as_str(),
             run.principal,
+            run.role,
             run.agent,
             run.claim_expires_at,
             run.proof,
@@ -4056,11 +4408,13 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     Ok(())
 }
 
-fn append_activity(
+fn append_activity_attributed(
     connection: &Connection,
     run_id: &RunId,
     activity_type: ActivityType,
     payload: &str,
+    principal: Option<&str>,
+    role: Option<&str>,
     now: i64,
 ) -> Result<Activity> {
     let activity = Activity {
@@ -4071,16 +4425,20 @@ fn append_activity(
         run_id: run_id.clone(),
         activity_type,
         payload: payload.to_owned(),
+        principal: principal.map(str::to_string),
+        role: role.map(str::to_string),
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO activities (id, run_id, activity_type, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO activities (id, run_id, activity_type, payload, principal, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             activity.id.as_str(),
             activity.run_id.as_str(),
             activity.activity_type.as_str(),
             activity.payload,
+            activity.principal,
+            activity.role,
             activity.created_at
         ],
     )?;
@@ -4095,26 +4453,49 @@ fn append_card_event(
     payload: &str,
     now: i64,
 ) -> Result<CardEvent> {
+    append_card_event_with_authority(
+        connection,
+        card_id,
+        event_type,
+        actor,
+        payload,
+        now,
+        &Authority::unchecked(),
+    )
+}
+
+fn append_card_event_with_authority(
+    connection: &Connection,
+    card_id: &CardId,
+    event_type: &str,
+    actor: &str,
+    payload: &str,
+    now: i64,
+    authority: &Authority,
+) -> Result<CardEvent> {
     let event = CardEvent {
         id: CardEventId::new(format!("event-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
         card_id: card_id.clone(),
         event_type: non_empty("event_type", event_type)?,
         actor: non_empty("actor", actor)?,
         payload: payload.to_owned(),
-        principal: None,
+        principal: authority.principal_name().map(str::to_string),
+        role: Some(authority.role_label().to_string()),
         subject_kind: None,
         subject_id: None,
         created_at: now,
     };
     connection.execute(
-        "INSERT INTO card_events (id, card_id, event_type, actor, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO card_events (id, card_id, event_type, actor, payload, principal, role, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
             event.event_type.as_str(),
             event.actor.as_str(),
             event.payload.as_str(),
+            event.principal.as_deref(),
+            event.role.as_deref(),
             event.created_at
         ],
     )?;
@@ -4134,15 +4515,16 @@ fn append_attributed_card_event(
         actor: non_empty("actor", audit.actor)?,
         payload: audit.payload.to_owned(),
         principal: audit.authority.principal_name().map(str::to_string),
+        role: Some(audit.authority.role_label().to_string()),
         subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
         subject_id: Some(non_empty("subject_id", audit.subject_id)?),
         created_at: now,
     };
     connection.execute(
         "INSERT INTO card_events (
-           id, card_id, event_type, actor, payload, principal,
+           id, card_id, event_type, actor, payload, principal, role,
            subject_kind, subject_id, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             event.id.as_str(),
             event.card_id.as_str(),
@@ -4150,6 +4532,7 @@ fn append_attributed_card_event(
             event.actor.as_str(),
             event.payload.as_str(),
             event.principal.as_deref(),
+            event.role.as_deref(),
             event.subject_kind.as_deref(),
             event.subject_id.as_deref(),
             event.created_at,
@@ -4379,6 +4762,17 @@ pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
         .collect()
 }
 
+fn ready_order_digest(cards: &[Card]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ready-order-v1\0");
+    for card in cards {
+        let bytes = card.id.as_str().as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 /// Shared continuation-slicing step for [`Store::list_cards_page_after`]
 /// and [`Store::list_ready_page_after`] (powder-cards-api-paged-continuation):
 /// `cards` is the caller's already fully-computed, already-ordered eligible
@@ -4466,14 +4860,10 @@ fn ensure_parent_linkable(
     }
 }
 
-/// Child outcomes roll up as audit events on the parent: any child
-/// transition into a terminal status appends a `rollup` event naming the
-/// child and, for completions, a bounded proof snippet. Nothing here changes
-/// the parent's own status -- parent acceptance stays authoritative.
-fn append_parent_rollup_event(
+fn append_parent_rollup_event_with_authority(
     connection: &Connection,
     child: &Card,
-    actor: &str,
+    authority: &Authority,
     detail: &str,
     now: i64,
 ) -> Result<()> {
@@ -4483,7 +4873,15 @@ fn append_parent_rollup_event(
     if load_card_optional(connection, parent_id)?.is_none() {
         return Ok(());
     }
-    append_card_event(connection, parent_id, "rollup", actor, detail, now)?;
+    append_card_event_with_authority(
+        connection,
+        parent_id,
+        "rollup",
+        &authority.actor_label(),
+        detail,
+        now,
+        authority,
+    )?;
     Ok(())
 }
 
@@ -4841,6 +5239,7 @@ struct RunRecord {
     card_id: String,
     state: String,
     principal: String,
+    role: String,
     agent: String,
     claim_expires_at: i64,
     proof: Option<String>,
@@ -4855,11 +5254,12 @@ impl RunRecord {
             card_id: row.get(1)?,
             state: row.get(2)?,
             principal: row.get(3)?,
-            agent: row.get(4)?,
-            claim_expires_at: row.get(5)?,
-            proof: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            role: row.get(4)?,
+            agent: row.get(5)?,
+            claim_expires_at: row.get(6)?,
+            proof: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     }
 
@@ -4872,6 +5272,7 @@ impl RunRecord {
                 value: self.state,
             })?,
             principal: self.principal,
+            role: self.role,
             agent: self.agent,
             claim_expires_at: self.claim_expires_at,
             proof: self.proof,

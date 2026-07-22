@@ -45,7 +45,7 @@ fn self_hoster_fly_reference_keeps_the_instance_always_on_with_data_volume_and_r
         r#"POWDER_DB_PATH = "/data/powder.db""#,
         r#"POWDER_BIND_ADDR = "[::]:4000""#,
         r#"POWDER_PUBLIC_BASE_URL = "http://powder.internal:4000""#,
-        r#"POWDER_DISCLOSE_BOOTSTRAP_KEY = "false""#,
+        r#"POWDER_BOOTSTRAP_KEY_FILE = "/data/powder-bootstrap.key""#,
         r#"POWDER_REQUIRE_LITESTREAM = "1""#,
         r#"auto_stop_machines = "off""#,
         "auto_start_machines = true",

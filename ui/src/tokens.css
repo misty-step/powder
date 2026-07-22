@@ -69,6 +69,18 @@
   --color-ok: #15714b;               /* success                              */
   --color-warn: #8a5f32;             /* warning                              */
 
+  /* ── categorical colors: repo identity hues (8 buckets, hashed by repo name).
+     Migrated from aesthetic.css's --ae-cat-0..7 so repo identity colors
+     survive the aesthetic.css deletion. Same hues, tokenized. ── */
+  --color-cat-0: #8c2f1f;
+  --color-cat-1: #2c6e62;
+  --color-cat-2: #a67c1e;
+  --color-cat-3: #6b4c86;
+  --color-cat-4: #46586b;
+  --color-cat-5: #5b7444;
+  --color-cat-6: #3d5a80;
+  --color-cat-7: #a1452e;
+
   /* ── spacing scale: 4px base. Consumers use these, never ad-hoc px ── */
   --pw-space-0: 0;
   --pw-space-1: 2px;
@@ -127,8 +139,16 @@
   --color-accent: #9aa6ff;
   --color-accent-ink: #161616;
   --color-danger: #e58379;
-  --color-ok: #6fd2a8;
   --color-warn: #c49d72;
+  --color-cat-0: #d06a4f;
+  --color-cat-1: #54bba4;
+  --color-cat-2: #d8b25a;
+  --color-cat-3: #b98fe0;
+  --color-cat-4: #93a8c2;
+  --color-cat-5: #9bc47a;
+  --color-cat-6: #7ea1d1;
+  --color-cat-7: #e08a6a;
+  --color-ok: #6fd2a8;
 }
 
 /* auto dark: follow the OS unless the page pinned a light mode */
@@ -144,6 +164,14 @@
     --color-accent: #9aa6ff;
     --color-accent-ink: #161616;
     --color-danger: #e58379;
+    --color-cat-0: #d06a4f;
+    --color-cat-1: #54bba4;
+    --color-cat-2: #d8b25a;
+    --color-cat-3: #b98fe0;
+    --color-cat-4: #93a8c2;
+    --color-cat-5: #9bc47a;
+    --color-cat-6: #7ea1d1;
+    --color-cat-7: #e08a6a;
     --color-ok: #6fd2a8;
     --color-warn: #c49d72;
   }

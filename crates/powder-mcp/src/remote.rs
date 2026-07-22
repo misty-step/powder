@@ -28,12 +28,29 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         "list_ready" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
             let mut query = format!("limit={limit}");
+            if let Some(repo) = optional_str(args, "repo") {
+                if repo.trim().is_empty() {
+                    return Err("repo must contain at least one repository".to_string());
+                }
+                query.push_str(&format!("&repo={}", urlencode(repo)));
+            }
             if let Some(estimate) = optional_str(args, "estimate") {
                 parse_estimate(estimate)?;
                 query.push_str(&format!("&estimate={}", urlencode(estimate)));
             }
+            if let Some(risk) = optional_str(args, "risk") {
+                parse_risk(risk)?;
+                query.push_str(&format!("&risk={}", urlencode(risk)));
+            }
+            if let Some(priority) = optional_str(args, "priority") {
+                parse_priority(priority)?;
+                query.push_str(&format!("&priority={}", urlencode(priority)));
+            }
+            if let Some(after) = optional_str(args, "after") {
+                query.push_str(&format!("&after={}", urlencode(after)));
+            }
             let response = client.get(&format!("/api/v1/cards/ready?{query}"))?;
-            remote_card_summary_page_payload(response)?
+            remote_card_summary_page_payload(response, true)?
         }
         "list_cards" => {
             let limit = args["limit"].as_u64().unwrap_or(20) as usize;
@@ -65,7 +82,7 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 explicit_status.is_some() || args["include_terminal"].as_bool().unwrap_or(false);
             query.push_str(&format!("&include_terminal={include_terminal}"));
             let response = client.get(&format!("/api/v1/cards?{query}"))?;
-            remote_card_summary_page_payload(response)?
+            remote_card_summary_page_payload(response, false)?
         }
         "search_cards" => {
             let q = required_str(args, "q")?;
@@ -239,16 +256,20 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             let name = required_str(args, "name")?;
             optional_repository_visibility(args)?;
             optional_repository_tier(args)?;
-            client.post(
-                "/api/v1/repositories",
-                json!({
-                    "name": name,
-                    "aliases": args["aliases"].as_array().cloned(),
-                    "visibility": optional_str(args, "visibility"),
-                    "tier": optional_str(args, "tier"),
-                    "import_provenance": optional_str(args, "import_provenance"),
-                }),
-            )?
+            let mut body = json!({
+                "name": name,
+                "aliases": args["aliases"].as_array().cloned(),
+                "visibility": optional_str(args, "visibility"),
+                "tier": optional_str(args, "tier"),
+                "import_provenance": optional_str(args, "import_provenance"),
+            });
+            if let Some(actor) = args["actor"].as_str() {
+                body["actor"] = json!(actor);
+            }
+            if let Some(admin) = args["admin"].as_bool() {
+                body["admin"] = json!(admin);
+            }
+            client.post("/api/v1/repositories", body)?
         }
         "merge_repository_alias" => {
             let target = required_str(args, "into")?;
@@ -257,6 +278,9 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             if let Some(actor) = args["actor"].as_str() {
                 body["actor"] = json!(actor);
             }
+            if let Some(admin) = args["admin"].as_bool() {
+                body["admin"] = json!(admin);
+            }
             client.post(
                 &format!("/api/v1/repositories/{}/merge-alias", urlencode(target)),
                 body,
@@ -264,7 +288,14 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "delete_repository" => {
             let name = required_str(args, "name")?;
-            client.delete(&format!("/api/v1/repositories/{}", urlencode(name)))?
+            let path = format!("/api/v1/repositories/{}", urlencode(name));
+            client.delete_with_body(
+                &path,
+                json!({
+                    "actor": optional_str(args, "actor"),
+                    "admin": args["admin"].as_bool(),
+                }),
+            )?
         }
         "manage_claim" => manage_claim_remote(client, args)?,
         "get_card" => {
@@ -500,7 +531,7 @@ fn manage_claim_remote(client: &RemoteClient, args: &Value) -> Result<Value, Str
     }
 }
 
-fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
+fn remote_card_summary_page_payload(response: Value, ready: bool) -> Result<Value, String> {
     // This decoder intentionally uses `ClientCardSummary` instead of
     // `Vec<Card>` so that one unknown/future status value cannot abort the
     // whole listing. The raw string is preserved and passed through.
@@ -508,6 +539,8 @@ fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
     let excluded_terminal_count = page.excluded_terminal_count;
     let total_count = page.total_count;
     let has_more = page.has_more;
+    let next_after = page.next_after;
+    let cycle_card_ids = page.cycle_card_ids;
     let summaries = page.cards;
 
     let mut payload = json!({
@@ -515,10 +548,20 @@ fn remote_card_summary_page_payload(response: Value) -> Result<Value, String> {
         "total_count": total_count,
         "has_more": has_more,
     });
-    if let Some(hint) =
+    if ready {
+        if next_after.is_some() {
+            payload["hint"] = json!("more cards; continue with next_after");
+        }
+    } else if let Some(hint) =
         crate::list_cards_hint(summaries.len(), total_count, excluded_terminal_count)
     {
         payload["hint"] = json!(hint);
+    }
+    if let Some(next_after) = next_after {
+        payload["next_after"] = json!(next_after);
+    }
+    if !cycle_card_ids.is_empty() {
+        payload["cycle_card_ids"] = json!(cycle_card_ids);
     }
     Ok(payload)
 }
@@ -1087,6 +1130,57 @@ mod tests {
     }
 
     #[test]
+    fn remote_card_summary_page_projects_continuation_and_cycle_metadata() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (
+                200,
+                json!({
+                    "cards": [api_card("cycle-a", "Cycle A", "ready", "p0", 10)],
+                    "total_count": 2,
+                    "has_more": true,
+                    "next_after": "ready-page-2",
+                    "cycle_card_ids": ["cycle-a", "cycle-b"]
+                }),
+            ),
+            (
+                200,
+                json!({
+                    "cards": [api_card("page-2", "Page two", "ready", "p1", 20)],
+                    "total_count": 2,
+                    "has_more": false
+                }),
+            ),
+        ]);
+        let client = RemoteClient::new(base_url, None);
+
+        let first = call_tool_remote(&client, "list_ready", &json!({"limit": 1})).unwrap();
+        let first_payload = tool_payload(&first);
+        assert_eq!(first_payload["next_after"], "ready-page-2");
+        assert_eq!(
+            first_payload["cycle_card_ids"],
+            json!(["cycle-a", "cycle-b"])
+        );
+
+        let second = call_tool_remote(
+            &client,
+            "list_ready",
+            &json!({"limit": 1, "after": "ready-page-2"}),
+        )
+        .unwrap();
+        let second_payload = tool_payload(&second);
+        assert_eq!(second_payload["cards"][0]["id"], "page-2");
+        assert!(second_payload.get("next_after").is_none());
+        assert!(second_payload.get("cycle_card_ids").is_none());
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].path, "/api/v1/cards/ready?limit=1");
+        assert_eq!(
+            requests[1].path,
+            "/api/v1/cards/ready?limit=1&after=ready-page-2"
+        );
+    }
+
+    #[test]
     fn list_cards_sends_get_with_status_and_url_encoded_repo_query() {
         let (base_url, recorded) = spawn_test_server(vec![(
             200,
@@ -1466,7 +1560,8 @@ mod tests {
                         api_card("remote-3", "Remote three", "backlog", "p2", 30)
                     ],
                     "total_count": 7,
-                    "has_more": true
+                    "has_more": true,
+                    "next_after": "cards-page-3"
                 }),
             ),
         ]);
@@ -1517,6 +1612,7 @@ mod tests {
         assert_eq!(second_payload["cards"].as_array().unwrap().len(), 2);
         assert_eq!(second_payload["total_count"], 7);
         assert_eq!(second_payload["has_more"], true);
+        assert_eq!(second_payload["next_after"], "cards-page-3");
         let hint = second_payload["hint"].as_str().unwrap();
         assert!(hint.contains("5 more cards"));
     }

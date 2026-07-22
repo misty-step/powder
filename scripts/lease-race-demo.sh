@@ -19,14 +19,17 @@
 #     .github/workflows/quickstart.yml) against a fresh ephemeral SQLite DB
 #     and a random free TCP port -- no shared state with any other run.
 #   - Auth/attribution: the first-run bootstrap key
-#     (POWDER_DISCLOSE_BOOTSTRAP_KEY=true) plays the operator -- it creates
+#     (POWDER_BOOTSTRAP_KEY_FILE=$BOOTSTRAP_KEY_FILE) plays the operator -- it creates
 #     the card and mints one agent-scope key per actor via `powder key-create
 #     --db` (the documented operational pattern from docs/operations.md).
 #     Each actor then authenticates as itself: in api-key mode every audited
-#     event is attributed to the authenticated key's actor (there is no
-#     request-body actor field on completion), so codex-agent's claim,
-#     work-log, and claim-expired -- and human-with-curl's claim and
-#     completion -- all carry the right name in the trail.
+#     event is attributed to the authenticated key's actor that performs the
+#     transition (there is no request-body actor field on completion). The
+#     claim-expired event is emitted while human-with-curl observes the expired
+#     lease through list_ready, so its event actor is human-with-curl; the
+#     nested claim/change agent fields retain codex-agent as the departed worker.
+#     codex-agent's claim and work-log, plus human-with-curl's claim and
+#     completion, all carry the right identity in the trail.
 #   - Actor A ("codex-agent") and Actor B ("human-with-curl") are both driven
 #     over plain curl against the HTTP API -- deliberately not powder-mcp --
 #     because the point of the demo is that *any* actor speaking the same
@@ -66,6 +69,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/powder-lease-race-demo.XXXXXX")"
 DB="$WORKDIR/powder.db"
 SERVER_LOG="$WORKDIR/server.log"
+BOOTSTRAP_KEY_FILE="$WORKDIR/powder-bootstrap.key"
 CLAIM_TTL_SECONDS=2
 POLL_TIMEOUT_SECONDS=10
 POLL_INTERVAL_SECONDS=1
@@ -122,7 +126,7 @@ POWDER_CLI="$ROOT/target/release/powder"
 say "[boot] starting powder-server on $BASE_URL against a fresh ephemeral DB"
 POWDER_DB_PATH="$DB" \
 POWDER_AUTH_MODE=api-key \
-POWDER_DISCLOSE_BOOTSTRAP_KEY=true \
+POWDER_BOOTSTRAP_KEY_FILE="$BOOTSTRAP_KEY_FILE" \
 POWDER_BIND_ADDR="127.0.0.1:$LISTEN_PORT" \
 PORT="$LISTEN_PORT" \
 "$ROOT/target/release/powder-server" >"$SERVER_LOG" 2>&1 &
@@ -143,12 +147,13 @@ if [ "$server_up" -ne 1 ]; then
 fi
 say "[boot] server is up"
 
-KEY="$(grep -o 'bootstrap API key: .*' "$SERVER_LOG" | head -n1 | sed 's/^bootstrap API key: //')"
+KEY="$(cat "$BOOTSTRAP_KEY_FILE")"
 if [ -z "$KEY" ]; then
-  echo "could not find bootstrap API key in server log" >&2
+  echo "bootstrap key file was empty or missing" >&2
   cat "$SERVER_LOG" >&2
   exit 1
 fi
+rm -f "$BOOTSTRAP_KEY_FILE"
 say "[boot] operator holds the first-run bootstrap key"
 rule
 
@@ -255,7 +260,7 @@ RUN_COUNT="$(printf '%s' "$DETAIL" | jq '.runs | length')"
 FINAL_STATUS="$(printf '%s' "$DETAIL" | jq -r '.card.status')"
 WORK_LOG_COUNT="$(printf '%s' "$DETAIL" | jq '[.work_log[] | select(.agent == "codex-agent")] | length')"
 CARD_CREATED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "card-created")] | length')"
-CLAIM_EXPIRED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "claim-expired" and .actor == "codex-agent")] | length')"
+CLAIM_EXPIRED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "claim-expired" and .actor == "human-with-curl" and .change.agent == "codex-agent")] | length')"
 COMPLETED_COUNT="$(printf '%s' "$EVENTS_JSON" | jq '[.[] | select(.event_type == "completed" and .actor == "human-with-curl")] | length')"
 
 fail=0
@@ -270,7 +275,7 @@ assert_eq "two runs recorded (Actor A's stale claim, Actor B's completing claim)
 assert_eq "final card status is done" "done" "$FINAL_STATUS"
 assert_eq "Actor A's work-log entry survived the crash" 1 "$WORK_LOG_COUNT"
 assert_eq "one card-created event" 1 "$CARD_CREATED_COUNT"
-assert_eq "one claim-expired event attributed to codex-agent" 1 "$CLAIM_EXPIRED_COUNT"
+assert_eq "one claim-expired event observed by human-with-curl for codex-agent" 1 "$CLAIM_EXPIRED_COUNT"
 assert_eq "one completed event attributed to human-with-curl" 1 "$COMPLETED_COUNT"
 
 if [ "$fail" -ne 0 ]; then

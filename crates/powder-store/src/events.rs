@@ -57,6 +57,8 @@ pub struct CardEventEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
     pub card: Card,
     pub change: Value,
@@ -478,6 +480,12 @@ impl Store {
     }
 }
 
+struct OutboundCardEventOptions<'a> {
+    audit_event: Option<&'a powder_core::CardEvent>,
+    principal: Option<&'a str>,
+    role: Option<&'a str>,
+}
+
 pub(super) fn append_outbound_card_event(
     connection: &Connection,
     card: &Card,
@@ -486,7 +494,43 @@ pub(super) fn append_outbound_card_event(
     change: Value,
     now: i64,
 ) -> Result<CardEventEnvelope> {
-    append_outbound_card_event_inner(connection, card, event_type, actor, change, now, None)
+    append_outbound_card_event_inner(
+        connection,
+        card,
+        event_type,
+        actor,
+        change,
+        now,
+        OutboundCardEventOptions {
+            audit_event: None,
+            principal: None,
+            role: Some("unchecked"),
+        },
+    )
+}
+
+pub(super) fn append_outbound_card_event_with_authority(
+    connection: &Connection,
+    card: &Card,
+    event_type: &str,
+    authority: &powder_core::Authority,
+    change: Value,
+    now: i64,
+) -> Result<CardEventEnvelope> {
+    let actor = authority.actor_label();
+    append_outbound_card_event_inner(
+        connection,
+        card,
+        event_type,
+        &actor,
+        change,
+        now,
+        OutboundCardEventOptions {
+            audit_event: None,
+            principal: authority.principal_name(),
+            role: Some(authority.role_label()),
+        },
+    )
 }
 
 pub(super) fn append_outbound_card_event_for_audit(
@@ -505,7 +549,11 @@ pub(super) fn append_outbound_card_event_for_audit(
         actor,
         change,
         now,
-        Some(audit_event),
+        OutboundCardEventOptions {
+            audit_event: Some(audit_event),
+            principal: audit_event.principal.as_deref(),
+            role: audit_event.role.as_deref(),
+        },
     )
 }
 
@@ -516,7 +564,7 @@ fn append_outbound_card_event_inner(
     actor: &str,
     change: Value,
     now: i64,
-    audit_event: Option<&powder_core::CardEvent>,
+    options: OutboundCardEventOptions<'_>,
 ) -> Result<CardEventEnvelope> {
     validate_event_type(event_type)?;
     let event_id = format!("evt-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
@@ -526,8 +574,9 @@ fn append_outbound_card_event_inner(
         event_type: event_type.to_string(),
         occurred_at: now,
         actor: non_empty("actor", actor)?,
-        principal: audit_event.and_then(|event| event.principal.clone()),
-        audit_event_id: audit_event.map(|event| event.id.to_string()),
+        principal: options.principal.map(str::to_string),
+        role: options.role.map(str::to_string),
+        audit_event_id: options.audit_event.map(|event| event.id.to_string()),
         card: card.clone(),
         change,
     };

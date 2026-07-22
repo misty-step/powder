@@ -1,14 +1,23 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::model::{CardId, Estimate, RunId};
+use crate::model::{CardId, DomainError, Estimate, Priority, Risk, RunId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyQuery {
     pub now: i64,
     pub limit: usize,
+    /// `None` means all repositories. Transport faces parse their wire values
+    /// before constructing this typed allowlist.
+    pub repo: Option<Vec<String>>,
     /// `None` means unfiltered; set to self-select for low-complexity work
     /// without reading full card bodies (powder-964).
     pub estimate: Option<Estimate>,
+    /// `None` means cards with any risk, including cards whose risk is missing.
+    /// A set value intentionally excludes missing-risk cards.
+    pub risk: Option<Risk>,
+    /// `None` means every priority.
+    pub priority: Option<Priority>,
 }
 
 impl ReadyQuery {
@@ -16,14 +25,159 @@ impl ReadyQuery {
         Self {
             now,
             limit: limit.max(1),
+            repo: None,
             estimate: None,
+            risk: None,
+            priority: None,
         }
+    }
+
+    pub fn with_repositories<I>(mut self, repositories: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let repositories = repositories.into_iter().collect::<Vec<_>>();
+        self.repo = (!repositories.is_empty()).then_some(repositories);
+        self
     }
 
     pub fn with_estimate(mut self, estimate: Option<Estimate>) -> Self {
         self.estimate = estimate;
         self
     }
+
+    pub fn with_risk(mut self, risk: Option<Risk>) -> Self {
+        self.risk = risk;
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Option<Priority>) -> Self {
+        self.priority = priority;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyCursor {
+    fingerprint: String,
+    /// Durable v3 cursors carry only an opaque snapshot id and stable position.
+    snapshot_id: Option<String>,
+    position: usize,
+}
+
+impl ReadyCursor {
+    /// Construct the bounded, durable cursor returned by Store-backed Ready
+    /// pagination. The token contains no card IDs or eligible-set data.
+    pub fn for_snapshot(query: &ReadyQuery, snapshot_id: String, position: usize) -> Self {
+        Self {
+            fingerprint: query.fingerprint(),
+            snapshot_id: Some(snapshot_id),
+            position,
+        }
+    }
+
+    pub fn snapshot_id(&self) -> Option<&str> {
+        self.snapshot_id.as_deref()
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.snapshot_id.is_some()
+    }
+
+    pub fn encode(&self) -> String {
+        let snapshot_id = self
+            .snapshot_id
+            .as_deref()
+            .expect("durable cursors always carry a snapshot id");
+        format!("v3.{}.{}.{}", self.fingerprint, snapshot_id, self.position)
+    }
+
+    pub fn matches_query(&self, query: &ReadyQuery) -> bool {
+        self.fingerprint == query.fingerprint()
+    }
+
+    pub fn decode_for_query(raw: &str, query: &ReadyQuery) -> Result<Self, DomainError> {
+        let mut parts = raw.split('.');
+        if parts.next() != Some("v3") {
+            return Err(DomainError::validation(
+                "after",
+                "invalid continuation cursor",
+            ));
+        }
+        let fingerprint = parts
+            .next()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
+        if fingerprint != query.fingerprint() {
+            return Err(DomainError::validation(
+                "after",
+                "stale continuation cursor: query filters do not match",
+            ));
+        }
+        let snapshot_id = parts
+            .next()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?;
+        let position = parts
+            .next()
+            .ok_or_else(|| DomainError::validation("after", "invalid continuation cursor"))?
+            .parse::<usize>()
+            .map_err(|_| DomainError::validation("after", "invalid continuation cursor"))?;
+        if parts.next().is_some()
+            || snapshot_id.is_empty()
+            || snapshot_id.len() > 96
+            || !snapshot_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(DomainError::validation(
+                "after",
+                "invalid continuation cursor",
+            ));
+        }
+        Ok(Self::for_snapshot(query, snapshot_id.to_owned(), position))
+    }
+}
+
+impl ReadyQuery {
+    pub fn fingerprint(&self) -> String {
+        let mut canonical = String::from("ready-v1|");
+        match &self.repo {
+            Some(repositories) => {
+                canonical.push_str("repo=");
+                let mut names = repositories
+                    .iter()
+                    .map(|repo| repo.as_str())
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                names.dedup();
+                canonical.push_str(&names.join(","));
+            }
+            None => canonical.push_str("repo=*"),
+        }
+        canonical.push('|');
+        canonical.push_str("estimate=");
+        canonical.push_str(self.estimate.map(|value| value.as_str()).unwrap_or("*"));
+        canonical.push('|');
+        canonical.push_str("risk=");
+        canonical.push_str(self.risk.map(|value| value.as_str()).unwrap_or("*"));
+        canonical.push('|');
+        canonical.push_str("priority=");
+        canonical.push_str(self.priority.map(|value| value.as_str()).unwrap_or("*"));
+        hex_encode(&Sha256::digest(canonical.as_bytes()))
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +204,9 @@ mod tests {
         assert_eq!(query.now, 10);
         assert_eq!(query.limit, 5);
         assert_eq!(query.estimate, Some(Estimate::S));
+        assert_eq!(query.repo, None);
+        assert_eq!(query.risk, None);
+        assert_eq!(query.priority, None);
 
         let receipt = ClaimReceipt {
             card_id: CardId::new("001").unwrap(),
@@ -63,6 +220,24 @@ mod tests {
         assert_eq!(receipt.principal, "roster");
         assert_eq!(receipt.agent, "agent-a");
         assert_eq!(receipt.expires_at, 100);
+    }
+
+    #[test]
+    fn ready_cursor_is_bounded_and_binds_query_filters() {
+        let query = ReadyQuery::new(100, 2)
+            .with_repositories(["repo-a".to_string()])
+            .with_priority(Some(Priority::P1));
+        let encoded =
+            ReadyCursor::for_snapshot(&query, "ready-snapshot-abc".to_string(), 17).encode();
+        assert!(encoded.starts_with("v3."));
+        assert!(encoded.len() < 128);
+        let decoded = ReadyCursor::decode_for_query(&encoded, &query).unwrap();
+        assert_eq!(decoded.position(), 17);
+        assert_eq!(decoded.snapshot_id(), Some("ready-snapshot-abc"));
+        let other = query.clone().with_priority(Some(Priority::P2));
+        let error = ReadyCursor::decode_for_query(&encoded, &other).unwrap_err();
+        assert!(error.to_string().contains("stale continuation cursor"));
+        assert!(ReadyCursor::decode_for_query("v2.foo.bar", &query).is_err());
     }
 
     #[test]

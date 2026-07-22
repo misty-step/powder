@@ -30,7 +30,8 @@ kill_timeout = "30s"
   POWDER_BIND_ADDR = "[::]:4000"
   POWDER_AUTH_MODE = "api-key"
   POWDER_PUBLIC_BASE_URL = "http://powder.internal:4000"
-  POWDER_DISCLOSE_BOOTSTRAP_KEY = "false"
+  # First-run key is written to this 0600 one-shot file; never log secrets.
+  POWDER_BOOTSTRAP_KEY_FILE = "/data/powder-bootstrap.key"
   # Fail boot loudly if Litestream backup configuration is ever missing or
   # incomplete, instead of silently running an unreplicated instance (the
   # entrypoint's default behavior otherwise: a warning on stderr, easy to

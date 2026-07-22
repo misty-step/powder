@@ -21,10 +21,10 @@ fn config_defaults_to_api_key_auth_and_data_path() {
     assert_eq!(config.db_path, PathBuf::from(DEFAULT_DB_PATH));
     assert_eq!(
         config.bind_addr,
-        SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT))
+        SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT))
     );
     assert_eq!(config.auth_mode, AuthMode::ApiKey);
-    assert!(config.disclose_bootstrap_key);
+    assert!(config.bootstrap_key_file.is_none());
     assert!(
         !config.public_reads,
         "api-key mode must default to authenticated reads"
@@ -79,43 +79,46 @@ fn config_rejects_the_retired_import_files_setting() {
 
 #[test]
 fn config_accepts_tailnet_and_none_modes() {
-    let tailnet = Config::from_pairs([
-        ("POWDER_AUTH_MODE", "tailnet"),
-        ("POWDER_DISCLOSE_BOOTSTRAP_KEY", "false"),
-    ])
-    .unwrap();
+    let tailnet = Config::from_pairs([("POWDER_AUTH_MODE", "tailnet")]).unwrap();
     let none = Config::from_pairs([("POWDER_AUTH_MODE", "none")]).unwrap();
 
     assert_eq!(tailnet.auth_mode, AuthMode::TailscaleHeader);
-    assert!(!tailnet.disclose_bootstrap_key);
+    assert!(tailnet.bootstrap_key_file.is_none());
     assert_eq!(none.auth_mode, AuthMode::None);
 }
 
 #[test]
-fn config_defaults_tailnet_backstop_to_unset_secret_and_admin_true() {
+fn config_defaults_tailnet_backstop_to_unset_secret_and_admin_false() {
     let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
     assert!(config.tailnet_proxy_secret.is_none());
     assert!(
-        config.tailnet_admin,
-        "unset POWDER_TAILNET_ADMIN must preserve tailscale-header mode's original all-admin behavior"
+        config.tailnet_admin_principals.is_empty(),
+        "unset POWDER_TAILNET_ADMIN must not grant admin scope"
     );
 }
 
 #[test]
-fn config_parses_tailnet_proxy_secret_and_admin_flag() {
+fn config_parses_tailnet_proxy_secret_and_admin_principal_policy() {
     let config = Config::from_pairs([
-        ("POWDER_TAILNET_PROXY_SECRET", "shhh"),
-        ("POWDER_TAILNET_ADMIN", "false"),
+        ("POWDER_TAILNET_PROXY_SECRET", " shhh "),
+        (
+            "POWDER_TAILNET_ADMIN_PRINCIPALS",
+            " operator, admin@example.com ",
+        ),
     ])
     .unwrap();
     assert_eq!(config.tailnet_proxy_secret.as_deref(), Some("shhh"));
-    assert!(!config.tailnet_admin);
+    assert_eq!(
+        config.tailnet_admin_principals,
+        vec!["operator".to_string(), "admin@example.com".to_string()]
+    );
 }
 
 #[test]
-fn config_rejects_a_non_boolean_tailnet_admin() {
-    let err = Config::from_pairs([("POWDER_TAILNET_ADMIN", "yes")]).unwrap_err();
+fn config_retires_global_tailnet_admin_flag() {
+    let err = Config::from_pairs([("POWDER_TAILNET_ADMIN", "true")]).unwrap_err();
     assert_eq!(err.variable, "POWDER_TAILNET_ADMIN");
+    assert!(err.message.contains("exact identities"));
 }
 
 #[test]
@@ -169,6 +172,108 @@ fn config_accepts_explicit_bind_addr() {
 
 /// powder-942: absent by default so self-hosters with no portal to link
 /// back to see no change; set explicitly when a deployment does have one.
+#[test]
+fn config_rejects_tailnet_on_non_loopback_without_proxy_secret() {
+    let err = Config::from_pairs([
+        ("POWDER_AUTH_MODE", "tailscale-header"),
+        ("POWDER_BIND_ADDR", "0.0.0.0:4000"),
+    ])
+    .unwrap_err();
+    assert_eq!(err.variable, "POWDER_TAILNET_PROXY_SECRET");
+    assert!(err.message.contains("non-loopback"));
+}
+
+#[test]
+fn config_rejects_none_auth_on_ipv4_and_ipv6_non_loopback_binds() {
+    for bind in ["0.0.0.0:4000", "[::]:4000"] {
+        let err = Config::from_pairs([("POWDER_AUTH_MODE", "none"), ("POWDER_BIND_ADDR", bind)])
+            .unwrap_err();
+        assert_eq!(err.variable, "POWDER_AUTH_MODE");
+        assert!(err.message.contains("loopback"));
+    }
+}
+
+#[test]
+fn config_accepts_none_auth_only_on_loopback_binds() {
+    for bind in ["127.0.0.1:4000", "[::1]:4000"] {
+        let config =
+            Config::from_pairs([("POWDER_AUTH_MODE", "none"), ("POWDER_BIND_ADDR", bind)]).unwrap();
+        assert_eq!(config.auth_mode, AuthMode::None);
+    }
+}
+
+#[test]
+fn bootstrap_prepare_failure_preserves_a_preexisting_key_file() {
+    let suffix = format!("{}-{}", std::process::id(), unix_now());
+    let db_path = std::env::temp_dir().join(format!("powder-bootstrap-rollback-{suffix}.db"));
+    let key_path = std::env::temp_dir().join(format!("powder-bootstrap-rollback-{suffix}.key"));
+    std::fs::write(&key_path, "operator-keeps-this-file\n").unwrap();
+    let mut store = Store::open(&db_path).unwrap();
+    store.migrate().unwrap();
+    let created = Cell::new(false);
+    let result = store.apply_initial_seed_with(
+        unix_now(),
+        |key| {
+            write_one_shot_bootstrap_key(&key_path, &key.raw_key)
+                .map_err(StoreError::from)
+                .map(|()| created.set(true))?;
+            Err(StoreError::Io(std::io::Error::other(
+                "simulated preparation failure",
+            )))
+        },
+        |_| {
+            if created.get() {
+                let _ = std::fs::remove_file(&key_path);
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&key_path).unwrap(),
+        "operator-keeps-this-file\n"
+    );
+    let _ = std::fs::remove_file(&key_path);
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn config_rejects_blank_tailnet_proxy_secret() {
+    for secret in ["", "   ", "\t"] {
+        let err = Config::from_pairs([
+            ("POWDER_AUTH_MODE", "tailscale-header"),
+            ("POWDER_TAILNET_PROXY_SECRET", secret),
+        ])
+        .unwrap_err();
+        assert_eq!(err.variable, "POWDER_TAILNET_PROXY_SECRET");
+        assert!(err.message.contains("blank"));
+    }
+}
+
+#[test]
+fn config_rejects_wildcard_tailnet_admin_policy() {
+    let err = Config::from_pairs([("POWDER_TAILNET_ADMIN_PRINCIPALS", "operator,*")]).unwrap_err();
+    assert_eq!(err.variable, "POWDER_TAILNET_ADMIN_PRINCIPALS");
+    assert!(err.message.contains("wildcard"));
+}
+
+#[test]
+fn config_accepts_tailnet_on_non_loopback_with_proxy_secret() {
+    let config = Config::from_pairs([
+        ("POWDER_AUTH_MODE", "tailscale-header"),
+        ("POWDER_BIND_ADDR", "0.0.0.0:4000"),
+        ("POWDER_TAILNET_PROXY_SECRET", "proxy-secret"),
+    ])
+    .unwrap();
+    assert_eq!(config.tailnet_proxy_secret.as_deref(), Some("proxy-secret"));
+}
+
+#[test]
+fn config_retires_log_bootstrap_disclosure() {
+    let err = Config::from_pairs([("POWDER_DISCLOSE_BOOTSTRAP_KEY", "true")]).unwrap_err();
+    assert_eq!(err.variable, "POWDER_DISCLOSE_BOOTSTRAP_KEY");
+    assert!(err.message.contains("retired"));
+}
+
 #[test]
 fn config_home_url_is_absent_by_default_and_configurable() {
     let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
@@ -706,7 +811,7 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
         .unwrap();
     assert_eq!(checked.status(), StatusCode::OK);
     let checked = response_json(checked).await;
-    assert_eq!(checked["criteria"][0]["checked_by"], "operator");
+    assert_eq!(checked["criteria"][0]["checked_by"], "bootstrap");
     assert!(checked["criteria"][0]["checked_at"].as_i64().unwrap() > 0);
 
     let complete = app
@@ -739,7 +844,7 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
     let detail = response_json(detail).await;
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["event_type"] == "criterion"
-            && event["actor"] == "operator"
+            && event["actor"] == "bootstrap"
             && event["payload"].as_str().unwrap().contains("checked")
     }));
 }
@@ -1237,6 +1342,9 @@ async fn list_cards_after_param_omitted_matches_first_page_and_continues_with_no
     assert_eq!(third.status(), StatusCode::OK);
     let third = response_json(third).await;
     assert_eq!(ids(&third), vec!["cont-5"]);
+    // Plain list_cards keeps its full-match total semantics, including
+    // terminal/hidden matches; Ready cursor walks use next_after authority.
+    assert_eq!(third["has_more"], true);
     assert!(
         third.get("next_after").is_none(),
         "the last page must omit next_after: {third}"
@@ -1321,7 +1429,8 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
         .as_str()
         .expect("first page must carry next_after when more cards remain")
         .to_string();
-    assert_eq!(next_after, "ready-cont-2");
+    assert!(next_after.starts_with("v3."));
+    assert_ne!(next_after, "ready-cont-2");
 
     // (b) walk the rest of the pages with `after`.
     let second = app
@@ -1341,7 +1450,8 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
         .as_str()
         .expect("second page must still carry next_after")
         .to_string();
-    assert_eq!(next_after_2, "ready-cont-4");
+    assert!(next_after_2.starts_with("v3."));
+    assert_ne!(next_after_2, "ready-cont-4");
 
     let third = app
         .clone()
@@ -1356,6 +1466,10 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
     assert_eq!(third.status(), StatusCode::OK);
     let third = response_json(third).await;
     assert_eq!(ids(&third), vec!["ready-cont-5"]);
+    assert_eq!(
+        third["has_more"], false,
+        "last cursor page must report no more cards"
+    );
     assert!(
         third.get("next_after").is_none(),
         "the last page must omit next_after: {third}"
@@ -1736,10 +1850,10 @@ async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
                     public_base_url: None,
                     home_url: None,
                     bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
-                    disclose_bootstrap_key: false,
+                    bootstrap_key_file: None,
                     field_note: FieldNoteConfig::default(),
                     tailnet_proxy_secret: None,
-                    tailnet_admin: true,
+                    tailnet_admin_principals: vec!["operator".to_string()],
                     dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
                     public_reads: false,
                 }),
@@ -2360,6 +2474,63 @@ async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
 }
 
 #[tokio::test]
+async fn hidden_read_queries_require_admin_across_stats_and_repositories() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let agent_key = state
+        .store
+        .lock()
+        .unwrap()
+        .create_api_key("agent", ApiKeyScope::Agent, 1)
+        .unwrap()
+        .raw_key;
+    let app = app(state);
+    for (path, key, expected) in [
+        (
+            "/api/v1/stats?include_hidden=true",
+            Some(agent_key.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/api/v1/repositories?include_hidden=true",
+            Some(agent_key.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/api/v1/stats?include_hidden=true",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "/api/v1/repositories?include_hidden=true",
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, path, key, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "hidden read {path}");
+    }
+    for path in [
+        "/api/v1/stats?include_hidden=true",
+        "/api/v1/repositories?include_hidden=true",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, path, Some(&admin_key), ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "admin hidden read {path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -2497,7 +2668,7 @@ async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
     assert_eq!(detail["card"]["repo"], "canary");
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["event_type"] == "repository"
-            && event["actor"] == "operator"
+            && event["actor"] == "bootstrap"
             && event["payload"]
                 .as_str()
                 .unwrap()
@@ -3337,6 +3508,18 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    let claim = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/principal-http/claim",
+            Some(&roster_key),
+            r#"{"agent":"worker-a","ttl_seconds":60}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claim.status(), StatusCode::OK);
+
     let response = app
         .oneshot(
             Request::builder()
@@ -3352,9 +3535,20 @@ async fn annotation_audit_principal_comes_only_from_http_authentication() {
     let detail = response_json(response).await;
     assert_eq!(detail["comments"][0]["author"], "operator");
     assert_eq!(detail["work_log"][0]["agent"], "worker-a");
+    assert_eq!(detail["runs"][0]["principal"], "roster");
+    assert_eq!(detail["runs"][0]["role"], "agent");
+    assert!(detail["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|activity| { activity["principal"] == "roster" && activity["role"] == "agent" }));
     let comment_id = detail["comments"][0]["id"].as_str().unwrap();
     let work_log_id = detail["work_log"][0]["id"].as_str().unwrap();
     let events = detail["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .filter(|event| event["principal"] == "roster")
+        .all(|event| event["role"] == "agent"));
     let attributed = events
         .iter()
         .filter(|event| event["principal"] == "roster")
@@ -4614,7 +4808,7 @@ async fn agent_scoped_key_cannot_list_or_revoke_keys() {
 /// prefix )" for a credential that never existed.
 #[tokio::test]
 async fn tailnet_identity_without_admin_gets_a_403_naming_the_identity_not_a_key() {
-    let state = test_state_with_tailnet_backstop(None, false);
+    let state = test_state_with_tailnet_backstop(Some("test-proxy"), false);
     let app = app(state);
     let denied = app
         .oneshot(
@@ -4622,6 +4816,7 @@ async fn tailnet_identity_without_admin_gets_a_403_naming_the_identity_not_a_key
                 .method(Method::GET)
                 .uri("/api/v1/keys")
                 .header("Tailscale-User-Login", "operator@example.com")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5311,8 +5506,102 @@ async fn api_v1_routes_is_unauthenticated_and_documents_required_fields() {
 }
 
 #[tokio::test]
+async fn tailnet_router_distinguishes_listed_and_unlisted_routes() {
+    let state = test_state_with_tailnet_backstop(Some("test-proxy"), true);
+    let router = app(state);
+
+    let listed_contract = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/routes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed_contract.status(), StatusCode::OK);
+
+    let protected_without_identity = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        protected_without_identity.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let listed_with_identity = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/cards/ready")
+                .header("Tailscale-User-Login", "agent@example.test")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed_with_identity.status(), StatusCode::OK);
+
+    let unlisted = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/not-a-route")
+                .header("Tailscale-User-Login", "agent@example.test")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unlisted.status(), StatusCode::NOT_FOUND);
+
+    let non_admin = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/keys")
+                .header("Tailscale-User-Login", "intruder@example.test")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_admin.status(), StatusCode::FORBIDDEN);
+
+    let listed_admin = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/keys")
+                .header("Tailscale-User-Login", "operator")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed_admin.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn tailnet_and_none_modes_authorize_as_configured() {
-    let (tailnet_state, _) = test_state(AuthMode::TailscaleHeader);
+    let tailnet_state = test_state_with_tailnet_backstop(Some("test-proxy"), true);
     let tailnet_app = app(tailnet_state);
     let missing = tailnet_app
         .clone()
@@ -5333,6 +5622,7 @@ async fn tailnet_and_none_modes_authorize_as_configured() {
                 .method(Method::GET)
                 .uri("/api/v1/cards/ready")
                 .header("Tailscale-User-Login", "agent@example.test")
+                .header(PROXY_SECRET_HEADER, "test-proxy")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5782,10 +6072,10 @@ fn test_state_with_public_reads(auth_mode: AuthMode, public_reads: bool) -> (App
             public_base_url: None,
             home_url: None,
             bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
-            disclose_bootstrap_key: false,
+            bootstrap_key_file: None,
             field_note: FieldNoteConfig::default(),
             tailnet_proxy_secret: None,
-            tailnet_admin: true,
+            tailnet_admin_principals: vec!["operator".to_string()],
             dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
             public_reads,
         }),
@@ -5846,7 +6136,11 @@ fn test_state_with_tailnet_backstop(proxy_secret: Option<&str>, tailnet_admin: b
     AppState {
         config: Arc::new(Config {
             tailnet_proxy_secret: proxy_secret.map(ToOwned::to_owned),
-            tailnet_admin,
+            tailnet_admin_principals: if tailnet_admin {
+                vec!["operator".to_string()]
+            } else {
+                Vec::new()
+            },
             ..(*state.config).clone()
         }),
         store: state.store,
@@ -6040,28 +6334,23 @@ fn proxy_secret_set_and_header_correct_is_authorized() {
 }
 
 #[test]
-fn proxy_secret_unset_preserves_current_behavior() {
+fn proxy_secret_unset_rejects_spoofed_identity() {
     let state = test_state_with_tailnet_backstop(None, true);
-    // No X-Powder-Proxy-Secret header at all -- unset config must not
-    // require one.
-    let actor = authorize(&state, &identity_headers("operator")).unwrap();
-    assert_eq!(actor.principal, "operator");
-    assert!(actor.is_admin);
-
-    let err = authorize(&state, &HeaderMap::new()).unwrap_err();
+    let err = authorize(&state, &identity_headers("operator")).unwrap_err();
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    assert!(err.message.contains("not configured"));
 }
 
 #[test]
 fn tailnet_admin_false_authorizes_but_require_admin_rejects() {
-    let state = test_state_with_tailnet_backstop(None, false);
-    let actor = authorize(&state, &identity_headers("operator")).unwrap();
+    let state = test_state_with_tailnet_backstop(Some("correct-horse"), false);
+    let actor = authorize(&state, &proxy_secret_header("correct-horse")).unwrap();
     assert!(
         !actor.is_admin,
         "POWDER_TAILNET_ADMIN=false must make tailnet identities non-admin"
     );
 
-    let err = require_admin(&state, &identity_headers("operator")).unwrap_err();
+    let err = require_admin(&state, &proxy_secret_header("correct-horse")).unwrap_err();
     assert_eq!(err.status, StatusCode::FORBIDDEN);
 }
 
@@ -6101,8 +6390,11 @@ fn tailnet_mode_rejects_an_invalid_bearer_token_with_the_api_key_error_not_the_h
 
 #[test]
 fn tailnet_mode_prefers_the_identity_header_over_a_bearer_token_when_both_are_present() {
-    let (state, raw_key) = test_state(AuthMode::TailscaleHeader);
-    let mut headers = identity_headers("operator");
+    let (state, raw_key) = (
+        test_state_with_tailnet_backstop(Some("correct-horse"), true),
+        test_state(AuthMode::ApiKey).1,
+    );
+    let mut headers = proxy_secret_header("correct-horse");
     headers.insert(
         AUTHORIZATION,
         axum::http::HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),

@@ -86,6 +86,8 @@ fn live_tail_delivers_events_created_while_idle() {
     );
 
     let db_path = server.db_path.clone();
+    let bootstrap_key_file = server.bootstrap_key_file.clone();
     drop(server);
     let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&bootstrap_key_file);
 }

@@ -76,8 +76,18 @@ fn spawn_server(envs: &[(&str, String)], cwd: &std::path::Path) -> ChildGuard {
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let bootstrap_key_file = envs
+        .iter()
+        .find(|(key, _)| *key == "POWDER_DB_PATH")
+        .map(|(_, value)| std::path::PathBuf::from(value).with_extension("bootstrap.key"));
+    if let Some(path) = bootstrap_key_file.as_ref() {
+        let _ = std::fs::remove_file(path);
+        command.env("POWDER_BOOTSTRAP_KEY_FILE", path);
+    }
     for (key, value) in envs {
-        command.env(key, value);
+        if *key != "POWDER_DISCLOSE_BOOTSTRAP_KEY" {
+            command.env(key, value);
+        }
     }
     let mut child = command
         .spawn()

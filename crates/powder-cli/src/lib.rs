@@ -4,7 +4,8 @@ use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
     normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
     parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
-    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyQuery, Risk, RunId,
+    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyCursor, ReadyQuery, Risk,
+    RunId,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
@@ -515,7 +516,7 @@ fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
     } else {
         let mut store = open_store(required_flag(args, "--db")?)?;
         let outcome = store
-            .import_cards_with_events(cards.clone(), &authority(args).actor_label(), now)
+            .import_cards_with_events_with_authority(cards.clone(), &authority(args), now)
             .map_err(store_err)?;
         out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
     }
@@ -586,10 +587,10 @@ fn repair_criteria(args: &[String]) -> Result<String, ShellError> {
         let truncated = detect_truncated_criteria(&id, &stored.acceptance, &parsed.card.acceptance);
         if apply {
             let repair = store
-                .repair_criteria(
+                .repair_criteria_as(
                     &card_id,
                     parsed.card.acceptance.clone(),
-                    actor.unwrap(),
+                    &authority(args),
                     now,
                 )
                 .map_err(store_err)?;
@@ -680,7 +681,7 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         card.parent = parent;
         card.repo = repo;
         json!(store
-            .create_card_with_events(card, &authority(args).actor_label(), now)
+            .create_card_with_events_as(card, &authority(args), now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({
@@ -754,7 +755,7 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .patch_card(&card_id, patch, &authority(args).actor_label(), now)
+            .patch_card_as(&card_id, patch, &authority(args), now)
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut payload = json!({});
@@ -868,29 +869,82 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
 
 fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
+    let json_output = has_flag(args, "--json");
     let now = unix_now();
+    let repo = flag_value(args, "--repo")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .map(|value| {
+                    if value.is_empty() {
+                        Err(ShellError::Invalid(
+                            "--repo must not contain a blank repository".to_string(),
+                        ))
+                    } else {
+                        Ok(value.to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let estimate = flag_value(args, "--estimate")
         .map(parse_estimate_flag)
         .transpose()?;
-    let query = ReadyQuery::new(now, limit).with_estimate(estimate);
-    let ready = if let Some(db) = flag_value(args, "--db") {
+    let risk = flag_value(args, "--risk")
+        .map(parse_risk_flag)
+        .transpose()?;
+    let priority = flag_value(args, "--priority")
+        .map(parse_priority_flag)
+        .transpose()?;
+    let query = ReadyQuery::new(now, limit)
+        .with_repositories(repo.clone())
+        .with_estimate(estimate)
+        .with_risk(risk)
+        .with_priority(priority);
+    let raw_after = flag_value(args, "--after");
+    let payload = if let Some(db) = flag_value(args, "--db") {
+        let after = raw_after
+            .map(|raw| ReadyCursor::decode_for_query(raw, &query))
+            .transpose()
+            .map_err(|err| ShellError::Invalid(err.to_string()))?;
         let store = open_store(db)?;
-        json!(store.list_ready(query).map_err(store_err)?)
+        let page = store
+            .list_ready_page_after(query.clone(), after.as_ref())
+            .map_err(store_err)?;
+        ready_page_json(&page)
     } else if let Some(client) = remote_env.client() {
         let mut url = format!("/api/v1/cards/ready?limit={limit}");
+        if !repo.is_empty() {
+            url.push_str(&format!("&repo={}", urlencode(&repo.join(","))));
+        }
         if let Some(estimate) = estimate {
             url.push_str(&format!("&estimate={}", estimate.as_str()));
         }
-        let page = client.get(&url).map_err(remote_err)?;
-        list_page_cards(page)?
+        if let Some(risk) = risk {
+            url.push_str(&format!("&risk={}", risk.as_str()));
+        }
+        if let Some(priority) = priority {
+            url.push_str(&format!("&priority={}", priority.as_str()));
+        }
+        if let Some(after) = raw_after {
+            url.push_str(&format!("&after={}", urlencode(after)));
+        }
+        client.get(&url).map_err(remote_err)?
     } else {
         return Err(ShellError::Invalid(
             "list-ready requires --db or POWDER_API_BASE_URL; set POWDER_API_KEY too for api-key deployments".to_string(),
         ));
     };
-
+    if json_output {
+        return serde_json::to_string(&payload).map_err(|err| ShellError::Store(err.to_string()));
+    }
     let mut out = String::new();
-    for card in json_array(&ready)? {
+    for card in json_array(
+        payload
+            .get("cards")
+            .ok_or_else(|| ShellError::Store("ready response missing cards array".to_string()))?,
+    )? {
         out.push_str(&format!(
             "{}\t{}\t{}\n",
             json_string(card, "id")?,
@@ -1037,6 +1091,21 @@ fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError>
         return Err(missing_transport("search"));
     };
     serde_json::to_string(&payload).map_err(|err| ShellError::Store(err.to_string()))
+}
+
+fn ready_page_json(page: &powder_store::CardListPage) -> Value {
+    let mut payload = json!({
+        "cards": page.cards,
+        "total_count": page.total_count,
+        "has_more": page.next_after.is_some(),
+    });
+    if !page.cycle_card_ids.is_empty() {
+        payload["cycle_card_ids"] = json!(page.cycle_card_ids);
+    }
+    if let Some(next_after) = page.ready_cursor.as_ref() {
+        payload["next_after"] = json!(next_after);
+    }
+    payload
 }
 
 /// Enumerate cards by status/repo, not just ready-eligible ones -- a card
@@ -1232,7 +1301,7 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
         .transpose()?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     let repository = store
-        .upsert_repository(
+        .upsert_repository_with_authority(
             RepositoryUpsert {
                 name,
                 aliases: aliases_flag(args),
@@ -1241,6 +1310,7 @@ fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
                 import_provenance: flag_value(args, "--import-provenance").map(str::to_string),
             },
             now,
+            &admin_authority(args),
         )
         .map_err(store_err)?;
     to_pretty_json(&repository)
@@ -1250,10 +1320,14 @@ fn repository_merge_alias(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let alias = required_flag(args, "--alias")?;
     let target = required_flag(args, "--into")?;
-    let actor = flag_value(args, "--actor").unwrap_or("operator");
+    let auth = admin_authority(args);
+    if let Some(actor) = flag_value(args, "--actor") {
+        auth.require_identity(actor)
+            .map_err(|err| ShellError::Store(err.to_string()))?;
+    }
     let mut store = open_store(required_flag(args, "--db")?)?;
     let outcome = store
-        .merge_repository_alias(alias, target, actor, now)
+        .merge_repository_alias_with_authority(alias, target, &auth, now)
         .map_err(store_err)?;
     to_pretty_json(&outcome)
 }
@@ -1264,7 +1338,9 @@ fn repository_delete(args: &[String]) -> Result<String, ShellError> {
         .copied()
         .ok_or_else(|| ShellError::Invalid("repository-delete requires a name".to_string()))?;
     let mut store = open_store(required_flag(args, "--db")?)?;
-    store.delete_repository(name).map_err(store_err)?;
+    store
+        .delete_repository_with_authority(name, &admin_authority(args))
+        .map_err(store_err)?;
     Ok(format!("deleted\t{name}\n"))
 }
 
@@ -1276,11 +1352,13 @@ fn repository_delete(args: &[String]) -> Result<String, ShellError> {
 /// file, the same shape as `key-create`/`key-list`/`key-revoke`.
 fn repository_normalize(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
-    let actor = flag_value(args, "--actor").unwrap_or("operator");
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let outcome = store
-        .normalize_repository_strings(actor, now)
-        .map_err(store_err)?;
+    let outcome = {
+        let auth = admin_authority(args);
+        let mut store = open_store(required_flag(args, "--db")?)?;
+        store
+            .normalize_repository_strings_with_authority(&auth, now)
+            .map_err(store_err)?
+    };
     to_pretty_json(&outcome)
 }
 
@@ -1586,7 +1664,7 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .check_criterion(&card_id, criterion, actor, checked, now)
+            .check_criterion_as(&card_id, criterion, actor, checked, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1615,7 +1693,7 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
     let (link_card_id, link_id) = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         let link = store
-            .add_link(&card_id, label, url, now)
+            .add_link_as(&card_id, label, url, now, &authority(args))
             .map_err(store_err)?;
         (link.card_id.to_string(), link.id.to_string())
     } else if let Some(client) = remote_env.client() {
@@ -1641,7 +1719,7 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     let comment = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .add_comment(&card_id, author, body, now)
+            .add_comment_as(&card_id, author, body, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1680,7 +1758,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         json!(store
-            .append_work_log(&card_id, agent, attribution, body, now)
+            .append_work_log_as(&card_id, agent, attribution, body, now, &authority(args))
             .map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         client
@@ -1993,7 +2071,17 @@ fn criterion_flag(args: &[String]) -> Result<usize, ShellError> {
 fn authority(args: &[String]) -> Authority {
     match flag_value(args, "--actor") {
         Some(name) => Authority::actor(name, has_flag(args, "--admin")),
-        None => Authority::unchecked(),
+        None => Authority::actor("operator", true),
+    }
+}
+
+/// Repository registry writes are operator/admin mutations. Direct SQLite
+/// callers retain the local operator default, while an explicit actor must
+/// carry the admin capability rather than being inferred from its label.
+fn admin_authority(args: &[String]) -> Authority {
+    match flag_value(args, "--actor") {
+        Some(name) => Authority::actor(name, has_flag(args, "--admin")),
+        None => Authority::actor("operator", true),
     }
 }
 
@@ -2808,6 +2896,7 @@ mod tests {
             "0",
             "--actor",
             "operator",
+            "--admin",
         ]))
         .unwrap();
         assert_eq!(checked, "criterion\tproof-plan\t0\tchecked\n");
@@ -3012,6 +3101,7 @@ mod tests {
             "canary",
             "--actor",
             "operator",
+            "--admin",
         ]))
         .unwrap();
         assert!(merged.contains("\"rehomed_cards\": 1"));
@@ -3069,6 +3159,7 @@ mod tests {
             &db,
             "--actor",
             "operator",
+            "--admin",
         ]))
         .unwrap();
         assert!(output.contains("\"scanned\": 1"), "output was: {output}");
