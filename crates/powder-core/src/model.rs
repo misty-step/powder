@@ -2668,7 +2668,7 @@ mod tests {
 
     #[test]
     fn operation_matrix_is_exhaustive_and_declarative() {
-        assert_eq!(Operation::ALL.len(), 29);
+        assert_eq!(Operation::ALL.len(), 30);
         for operation in Operation::ALL {
             let rule = operation.rule();
             assert_eq!(rule.operation, operation);
