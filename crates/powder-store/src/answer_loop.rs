@@ -117,7 +117,7 @@ impl Store {
     pub fn list_awaiting_input(&self, limit: usize) -> Result<Vec<AwaitingInput>> {
         let mut statement = self.connection.prepare(
             "SELECT runs.id, runs.card_id, runs.state, runs.principal, runs.role, runs.agent,
-             runs.claim_expires_at, runs.proof, runs.created_at, runs.updated_at
+             runs.claim_expires_at, runs.proof, runs.telemetry_attempt_count, runs.telemetry_input_tokens, runs.telemetry_output_tokens, runs.telemetry_reasoning_tokens, runs.telemetry_estimated_cost_usd_micros, runs.telemetry_duration_ms, runs.telemetry_pricing_version, runs.telemetry_outcome, runs.telemetry_unattributed_attempt_count, runs.created_at, runs.updated_at
              FROM runs
              JOIN cards ON cards.id = runs.card_id
                        AND cards.claim_run_id = runs.id
@@ -147,7 +147,7 @@ impl Store {
     pub fn list_approvals(&self, limit: usize) -> Result<Vec<ApprovalQueueRow>> {
         let mut statement = self.connection.prepare(
             "SELECT DISTINCT runs.id, runs.card_id, runs.state, runs.principal, runs.role, runs.agent,
-             runs.claim_expires_at, runs.proof, runs.created_at, runs.updated_at
+             runs.claim_expires_at, runs.proof, runs.telemetry_attempt_count, runs.telemetry_input_tokens, runs.telemetry_output_tokens, runs.telemetry_reasoning_tokens, runs.telemetry_estimated_cost_usd_micros, runs.telemetry_duration_ms, runs.telemetry_pricing_version, runs.telemetry_outcome, runs.telemetry_unattributed_attempt_count, runs.created_at, runs.updated_at
              FROM runs
              JOIN cards ON cards.id = runs.card_id
                        AND cards.claim_run_id = runs.id
@@ -468,6 +468,7 @@ fn load_runs_for_card(
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
+                 telemetry_attempt_count, telemetry_input_tokens, telemetry_output_tokens, telemetry_reasoning_tokens, telemetry_estimated_cost_usd_micros, telemetry_duration_ms, telemetry_pricing_version, telemetry_outcome, telemetry_unattributed_attempt_count,
                  created_at, updated_at
                  FROM runs
                  WHERE card_id = ?1
@@ -481,6 +482,7 @@ fn load_runs_for_card(
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
+                 telemetry_attempt_count, telemetry_input_tokens, telemetry_output_tokens, telemetry_reasoning_tokens, telemetry_estimated_cost_usd_micros, telemetry_duration_ms, telemetry_pricing_version, telemetry_outcome, telemetry_unattributed_attempt_count,
                  created_at, updated_at
                  FROM runs
                  WHERE card_id = ?1

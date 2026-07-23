@@ -180,6 +180,7 @@ pub enum Operation {
     HeartbeatClaim,
     TransferClaim,
     WorkLog,
+    RecordRunTelemetry,
     AddLink,
     AddComment,
     RequestInput,
@@ -223,7 +224,7 @@ pub struct OperationRule {
 }
 
 impl Operation {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::CreateCard,
         Self::PatchCard,
         Self::CheckCriterion,
@@ -237,6 +238,7 @@ impl Operation {
         Self::HeartbeatClaim,
         Self::TransferClaim,
         Self::WorkLog,
+        Self::RecordRunTelemetry,
         Self::AddLink,
         Self::AddComment,
         Self::RequestInput,
@@ -282,6 +284,7 @@ impl Operation {
                 (Execute, Run, Worker, Keyed)
             }
             Self::WorkLog | Self::AddLink => (Execute, Card, Worker, Keyed),
+            Self::RecordRunTelemetry => (Execute, Run, RunIdentity, Keyed),
             Self::AddComment => (Execute, None, Principal, Keyed),
             Self::AttachImage | Self::DetachImage => (Execute, Card, Principal, Keyed),
             Self::RequestInput | Self::AnswerInput => (Execute, Run, RunIdentity, Keyed),
@@ -332,6 +335,7 @@ impl Operation {
             Self::HeartbeatClaim => "heartbeat_claim",
             Self::TransferClaim => "transfer_claim",
             Self::WorkLog => "work_log",
+            Self::RecordRunTelemetry => "record_run_telemetry",
             Self::AddLink => "add_link",
             Self::AddComment => "add_comment",
             Self::RequestInput => "request_input",
@@ -1645,8 +1649,100 @@ pub struct Run {
     pub claim_expires_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<String>,
+    /// Bounded scalar telemetry summary; detailed attempts remain normalized in the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<RunTelemetrySummary>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RunTelemetrySummary {
+    pub attempt_count: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub estimated_cost_usd_micros: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub pricing_version: Option<String>,
+    pub outcome: Option<String>,
+    pub unattributed_attempt_count: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RunTelemetryAttemptInput {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub harness: Option<String>,
+    pub reasoning: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
+    pub estimated_cost_usd_micros: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub outcome: Option<String>,
+    pub pricing_version: Option<String>,
+    pub input_rate_usd_per_million_micros: Option<i64>,
+    pub output_rate_usd_per_million_micros: Option<i64>,
+    pub reasoning_rate_usd_per_million_micros: Option<i64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RunTelemetryWrite {
+    #[serde(default)]
+    pub attempts: Vec<RunTelemetryAttemptInput>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTelemetryReceipt {
+    pub run_id: RunId,
+    pub principal: String,
+    pub attempt_count: i64,
+    pub telemetry: RunTelemetrySummary,
+    pub replayed: bool,
+}
+
+impl RunTelemetryReceipt {
+    /// Carry the outer keyed-operation replay bit into the domain receipt.
+    pub fn with_replayed(mut self, replayed: bool) -> Self {
+        self.replayed = replayed;
+        self
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTelemetryAggregateQuery {
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub limit: usize,
+}
+impl Default for RunTelemetryAggregateQuery {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            model: None,
+            provider: None,
+            limit: 100,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTelemetryAggregateRow {
+    pub agent: String,
+    pub model: String,
+    pub provider: String,
+    pub unattributed: bool,
+    pub runs: i64,
+    pub attempts: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub estimated_cost_usd_micros: i64,
+    pub duration_ms: i64,
+    pub outcome_mix: std::collections::BTreeMap<String, i64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTelemetryAggregate {
+    pub rows: Vec<RunTelemetryAggregateRow>,
+    pub total_rows: i64,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2572,7 +2668,7 @@ mod tests {
 
     #[test]
     fn operation_matrix_is_exhaustive_and_declarative() {
-        assert_eq!(Operation::ALL.len(), 29);
+        assert_eq!(Operation::ALL.len(), 30);
         for operation in Operation::ALL {
             let rule = operation.rule();
             assert_eq!(rule.operation, operation);

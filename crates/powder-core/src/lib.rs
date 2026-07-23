@@ -18,7 +18,9 @@ pub use model::{
     CriterionProof, DenialClass, DetailLevel, DomainError, EpicEvidence, EpicFreshness, EpicState,
     Estimate, EvidenceKind, IdempotencyMode, IdentityRequirement, Link, LinkId, Operation,
     OperationCapability, OperationRule, PrincipalRole, Priority, Risk, Run, RunDetail, RunId,
-    RunState, WorkLogEntry,
+    RunState, RunTelemetryAggregate, RunTelemetryAggregateQuery, RunTelemetryAggregateRow,
+    RunTelemetryAttemptInput, RunTelemetryReceipt, RunTelemetrySummary, RunTelemetryWrite,
+    WorkLogEntry,
 };
 pub use queries::{ClaimReceipt, ReadyCursor, ReadyQuery};
 pub use ready_order::{

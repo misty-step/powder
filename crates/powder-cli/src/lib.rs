@@ -5,15 +5,15 @@ use powder_core::{
     normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
     parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
     CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyCursor, ReadyQuery, Risk,
-    RunId,
+    RunId, RunTelemetryAggregateQuery, RunTelemetryAttemptInput, RunTelemetryWrite,
 };
 use powder_shell::{
     detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
     namespace_cards_for_repo, unix_now, ParsedCard, ShellError,
 };
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, KeyedOperationContext, RepositoryTier, RepositoryUpsert,
-    RepositoryVisibility, SearchQuery, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, KeyedOperationContext, PricingConfig, RepositoryTier,
+    RepositoryUpsert, RepositoryVisibility, SearchQuery, Store, StoreError,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -54,6 +54,8 @@ pub const COMMANDS: &[&str] = &[
     "heartbeat",
     "get-card",
     "get-run",
+    "record-run-telemetry",
+    "run-telemetry-aggregate",
     "list-approvals",
     "list-awaiting-input",
     "answer-input",
@@ -151,6 +153,12 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest, remote_env),
         [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
         [command, rest @ ..] if command == "get-run" => get_run(rest),
+        [command, rest @ ..] if command == "record-run-telemetry" => {
+            record_run_telemetry(rest, remote_env)
+        }
+        [command, rest @ ..] if command == "run-telemetry-aggregate" => {
+            run_telemetry_aggregate(rest, remote_env)
+        }
         [command, rest @ ..] if command == "list-approvals" => list_approvals(rest, remote_env),
         [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
         [command, rest @ ..] if command == "answer-input" => answer_input(rest, remote_env),
@@ -334,6 +342,8 @@ pub fn help() -> String {
     );
     help.push_str("  powder release-claim 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder get-card 001 --db ./data/powder.db\n");
+    help.push_str("  powder record-run-telemetry run-id --db ./data/powder.db --attempts \"[{\\\"model\\\":\\\"example\\\",\\\"input_tokens\\\":100}]\" --idempotency-key telemetry-1\n");
+    help.push_str("  powder run-telemetry-aggregate --db ./data/powder.db [--agent agent] [--model model] [--limit 100]\n");
     help.push_str("  powder list-approvals --db ./data/powder.db\n");
     help.push_str("  powder list-awaiting-input --db ./data/powder.db\n");
     help.push_str(
@@ -1648,6 +1658,78 @@ fn get_run(args: &[String]) -> Result<String, ShellError> {
         .map_err(store_err)?
         .ok_or_else(|| ShellError::NotFound(format!("run not found: {run_id}")))?;
     to_pretty_json(&detail)
+}
+
+fn record_run_telemetry(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let run_id = positional(args)
+        .first()
+        .copied()
+        .ok_or_else(|| ShellError::Invalid("record-run-telemetry requires a run id".to_string()))
+        .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
+    let attempts: Vec<RunTelemetryAttemptInput> =
+        serde_json::from_str(flag_value(args, "--attempts").unwrap_or("[]"))
+            .map_err(|e| ShellError::Invalid(format!("invalid --attempts JSON: {e}")))?;
+    let write = RunTelemetryWrite { attempts };
+    let key = idempotency_key(args)?;
+    let value = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let pricing = PricingConfig::from_env().map_err(store_err)?;
+        let outcome = store
+            .record_run_telemetry_with_pricing(
+                &run_id,
+                &write,
+                unix_now(),
+                &key,
+                &authority(args),
+                pricing.as_ref(),
+            )
+            .map_err(store_err)?;
+        serde_json::to_value(outcome.value.with_replayed(outcome.replayed))
+            .map_err(|e| ShellError::Store(e.to_string()))?
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post_with_key(
+                &format!("/api/v1/runs/{}/telemetry", run_id.as_str()),
+                serde_json::to_value(&write).map_err(|e| ShellError::Invalid(e.to_string()))?,
+                &key,
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("record-run-telemetry"));
+    };
+    to_pretty_json(&value)
+}
+
+fn run_telemetry_aggregate(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let query = RunTelemetryAggregateQuery {
+        agent: flag_value(args, "--agent").map(str::to_owned),
+        model: flag_value(args, "--model").map(str::to_owned),
+        provider: flag_value(args, "--provider").map(str::to_owned),
+        limit: parse_limit(args).unwrap_or(100),
+    };
+    let value = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        serde_json::to_value(store.run_telemetry_aggregate(&query).map_err(store_err)?)
+            .map_err(|e| ShellError::Store(e.to_string()))?
+    } else if let Some(client) = remote_env.client() {
+        let mut path = format!("/api/v1/runs/telemetry/aggregate?limit={}", query.limit);
+        if let Some(v) = query.agent.as_deref() {
+            path.push_str("&agent=");
+            path.push_str(&urlencode(v));
+        }
+        if let Some(v) = query.model.as_deref() {
+            path.push_str("&model=");
+            path.push_str(&urlencode(v));
+        }
+        if let Some(v) = query.provider.as_deref() {
+            path.push_str("&provider=");
+            path.push_str(&urlencode(v));
+        }
+        client.get(&path).map_err(remote_err)?
+    } else {
+        return Err(missing_transport("run-telemetry-aggregate"));
+    };
+    to_pretty_json(&value)
 }
 
 fn list_approvals(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {

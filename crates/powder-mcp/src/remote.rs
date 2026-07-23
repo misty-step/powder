@@ -342,6 +342,24 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                     )
                 })?
         }
+        "record_run_telemetry" => {
+            let run = run_id(args, "run_id")?;
+            let body = json!({"attempts": args["attempts"]});
+            client.post_with_key(
+                &format!("/api/v1/runs/{run}/telemetry"),
+                body,
+                required_remote_idempotency_key(args)?,
+            )?
+        }
+        "run_telemetry_aggregate" => {
+            let mut query = format!("limit={}", args["limit"].as_u64().unwrap_or(100));
+            for key in ["agent", "model", "provider"] {
+                if let Some(value) = optional_str(args, key) {
+                    query.push_str(&format!("&{key}={}", urlencode(value)));
+                }
+            }
+            client.get(&format!("/api/v1/runs/telemetry/aggregate?{query}"))?
+        }
         "list_awaiting_input" => {
             let limit = args["limit"].as_u64().unwrap_or(20);
             client.get(&format!("/api/v1/runs/awaiting-input?limit={limit}"))?["awaiting"].clone()
