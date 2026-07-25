@@ -52,7 +52,7 @@ sweep with `list_cards label:papercut` (MCP) or
 
 ## Expected MCP Tools
 
-Default agent persona (23 tools):
+Default agent persona (25 tools):
 
 - `list_ready`: return claimable cards from active repositories, ordered so
   no card appears after another card in the response it transitively
@@ -113,6 +113,8 @@ Default agent persona (23 tools):
   state. `detail` defaults to `concise` (newest-first, most recent 20 per
   history section plus totals/hint when truncated); pass `detail: detailed`
   for full history.
+- `record_run_telemetry`: write a run-scoped telemetry payload with `attempts` (normalized provider/model/harness/reasoning rows) and an optional scalar `summary`. All fields are nullable for version skew; caller authentication and an `idempotency_key` are required. Replays of the same key/payload return the stored receipt byte-for-byte; a different payload is an explicit conflict.
+- `run_telemetry_aggregate`: read SQL aggregates by agent/model/provider with runs, attempts, input/output/reasoning tokens, estimated cost in USD micros, duration, and outcome mix. Missing provider/model attribution is grouped as `(unattributed)` and flagged. Reads are bounded by `limit`; clients never scan all runs.
 - `list_awaiting_input`: list runs paused for human or agent input.
 - `list_approvals`: list awaiting-input runs with card title, the latest
   question text, run id, and approval-prefixed packet links -- a
@@ -171,6 +173,16 @@ Admin add-on when `POWDER_MCP_TOOLSETS=admin` or `all` (9 tools; 32 tools total)
 - `list_dead_letters`: list webhook deliveries that exhausted retry attempts.
 - `tail_events`: read durable card events after an optional sequence cursor.
 - `list_keys`: list API-key metadata without raw secrets or hashes.
+
+## Run telemetry contract
+
+The same telemetry contract is available on all faces:
+
+- HTTP: `POST /api/v1/runs/{id}/telemetry` with `attempts` and optional `summary`, plus the required `Idempotency-Key` header; `GET /api/v1/runs/telemetry/aggregate` accepts `agent`, `model`, `provider`, and bounded `limit` query parameters.
+- CLI: `powder record-run-telemetry <run-id> --db <path> --attempts <json> --idempotency-key <key>` or remote mode via `POWDER_API_BASE_URL`; aggregate with `powder run-telemetry-aggregate --db <path>` or remote mode.
+- MCP: `record_run_telemetry` and `run_telemetry_aggregate` use the same fields and transport authority.
+
+Token fields are integer counts. Estimated cost is `estimated_cost_usd_micros` (one USD = 1,000,000 micros). Pricing never contains model constants: configure `POWDER_PRICING_FILE` or `POWDER_PRICING_JSON` with a version and rates. The selected pricing version and rates are snapshotted on each normalized attempt, while run reads expose only the bounded summary (attempt count, totals, outcome, pricing version, and missing-attribution count).
 
 ## Instance CLI
 

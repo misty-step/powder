@@ -276,6 +276,20 @@ pub const ROUTES: &[ApiRoute] = &[
         body_shape: None,
     },
     ApiRoute {
+        method: "POST",
+        path: "/api/v1/runs/{id}/telemetry",
+        intent: "record normalized run telemetry attempts with caller-keyed idempotency, persisted pricing snapshot, attribution, and audit evidence",
+        policy: Some(Operation::RecordRunTelemetry.rule()),
+        body_shape: Some(r#"{"attempts":[{"model":"..."}],"idempotency_key":"caller-generated"} -- at least one normalized attempt is required; scalar run telemetry is derived from these attempts"#),
+    },
+    ApiRoute {
+        method: "GET",
+        path: "/api/v1/runs/telemetry/aggregate",
+        intent: "aggregate run telemetry in SQL by agent/provider/model with token, cost, duration, and outcome mix; missing attribution is explicit; optional agent/model/provider/limit filters",
+        policy: None,
+        body_shape: None,
+    },
+    ApiRoute {
         method: "GET",
         path: "/api/v1/runs/{id}",
         intent: "read one run with activity, card, links, and comments; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
