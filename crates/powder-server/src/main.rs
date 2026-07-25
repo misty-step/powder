@@ -1184,7 +1184,6 @@ async fn list_ready(
         &page.cycle_card_ids,
         page.next_after,
         page.ready_cursor,
-        true,
     )))
 }
 
@@ -1267,7 +1266,6 @@ async fn list_cards(
         &page.cycle_card_ids,
         page.next_after,
         None,
-        false,
     )))
 }
 
@@ -1278,16 +1276,12 @@ fn card_list_page_json(
     cycle_card_ids: &[CardId],
     next_after: Option<CardId>,
     ready_cursor: Option<String>,
-    is_ready: bool,
 ) -> serde_json::Value {
-    // Ready cursor walks use `next_after` as the only continuation signal:
-    // `total_count` is the full match count on every page. Plain list-cards
-    // calls retain the hidden-terminal signal in `total_count > cards.len()`.
-    let has_more = if is_ready {
-        next_after.is_some()
-    } else {
-        total_count > cards.len() || next_after.is_some()
-    };
+    // The store emits `next_after` only when another card exists beyond this
+    // page. Derive both pagination fields from that one signal so they cannot
+    // disagree on a final page, including when the match count is larger than
+    // the page because this request resumes after a prior cursor.
+    let has_more = next_after.is_some();
     let mut payload = json!({
         "cards": cards,
         "total_count": total_count,
