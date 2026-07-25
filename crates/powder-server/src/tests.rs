@@ -1358,9 +1358,9 @@ async fn list_cards_after_param_omitted_matches_first_page_and_continues_with_no
     assert_eq!(third.status(), StatusCode::OK);
     let third = response_json(third).await;
     assert_eq!(ids(&third), vec!["cont-5"]);
-    // Plain list_cards keeps its full-match total semantics, including
-    // terminal/hidden matches; Ready cursor walks use next_after authority.
-    assert_eq!(third["has_more"], true);
+    // The final partial page has no continuation cursor and must report that
+    // no further page exists.
+    assert_eq!(third["has_more"], false);
     assert!(
         third.get("next_after").is_none(),
         "the last page must omit next_after: {third}"
@@ -1387,6 +1387,73 @@ async fn list_cards_after_param_omitted_matches_first_page_and_continues_with_no
         .await
         .unwrap();
     assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Exact multiples use the same cursor-derived continuation rule: the first
+/// full page has a cursor and reports more results, while the final full page
+/// has no cursor and reports that the walk is complete. No empty follow-up
+/// request is needed.
+#[tokio::test]
+async fn list_cards_exact_multiple_limit_ends_without_empty_page() {
+    let (state, raw_key) = test_state(AuthMode::ApiKey);
+    {
+        let mut store = state.store.lock().unwrap();
+        let cards = (0..200)
+            .map(|index| {
+                let id = format!("multiple-{index:03}");
+                Card::new(
+                    CardId::new(id.clone()).unwrap(),
+                    format!("Card {id}"),
+                    "do it",
+                )
+                .unwrap()
+                .with_status(CardStatus::Backlog)
+                .with_priority(Priority::P2)
+                .with_created_at(index)
+            })
+            .collect();
+        store.import_cards(cards).unwrap();
+    }
+    let app = app(state);
+
+    let first = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            "/api/v1/cards?limit=100",
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = response_json(first).await;
+    assert_eq!(first["cards"].as_array().unwrap().len(), 100);
+    assert_eq!(first["total_count"], 200);
+    assert_eq!(first["has_more"], true);
+    let next_after = first["next_after"]
+        .as_str()
+        .expect("first full page must carry a continuation cursor")
+        .to_string();
+
+    let second = app
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/cards?limit=100&after={next_after}"),
+            Some(&raw_key),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = response_json(second).await;
+    assert_eq!(second["cards"].as_array().unwrap().len(), 100);
+    assert_eq!(second["total_count"], 200);
+    assert_eq!(second["has_more"], false);
+    assert!(
+        second.get("next_after").is_none(),
+        "final full page must omit next_after: {second}"
+    );
 }
 
 /// `/api/v1/cards/ready` counterpart to
@@ -1525,9 +1592,9 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
 /// dispatch path can apply the same default terminal exclusion as local
 /// (store-backed) MCP mode -- the exclusion must happen server-side, since
 /// the server truncates to `limit` before any client could post-filter.
-/// Defaulting to `true` keeps every existing HTTP caller's behavior
-/// byte-for-byte unchanged (including the absence of the additive
-/// `excluded_terminal_count` field, which appears only when nonzero).
+/// Defaulting to `true` keeps every existing HTTP caller's card membership
+/// behavior byte-for-byte unchanged; pagination metadata remains cursor-based,
+/// including when terminal cards are excluded.
 #[tokio::test]
 async fn list_cards_include_terminal_param_hides_terminal_server_side_and_defaults_to_true() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -1592,7 +1659,11 @@ async fn list_cards_include_terminal_param_hides_terminal_server_side_and_defaul
     let excluded = response_json(excluded).await;
     assert_eq!(ids_from(&excluded), vec!["ready-1".to_string()]);
     assert_eq!(excluded["total_count"], 2);
-    assert_eq!(excluded["has_more"], true);
+    assert_eq!(excluded["has_more"], false);
+    assert!(
+        excluded.get("next_after").is_none(),
+        "hidden terminal cards do not create a continuation page: {excluded}"
+    );
     assert_eq!(excluded["excluded_terminal_count"], 1);
 
     // Explicit include_terminal=true: same as the default.
