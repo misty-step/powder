@@ -287,18 +287,8 @@ impl RemoteClient {
                 .into_json()
                 .map_err(|err| RemoteError::Parse(err.to_string())),
             Err(ureq::Error::Status(status, response)) => {
-                let (message, denial_class) = response
-                    .into_json::<Value>()
-                    .ok()
-                    .map(|body| {
-                        let message = body["error"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| format!("http {status}"));
-                        let denial_class = body["denial_class"].as_str().map(str::to_owned);
-                        (message, denial_class)
-                    })
-                    .unwrap_or_else(|| (format!("http {status}"), None));
+                let body = response.into_string().unwrap_or_default();
+                let (message, denial_class) = status_error_details(status, &body);
                 Err(RemoteError::Status {
                     status,
                     message,
@@ -354,6 +344,55 @@ fn resolve_key_cmd(cmd: &str) -> Option<String> {
 
 fn key_prefix(key: &str) -> String {
     key.chars().take(KEY_PREFIX_LEN).collect()
+}
+
+const MAX_STATUS_ERROR_CHARS: usize = 300;
+
+fn status_error_details(status: u16, body: &str) -> (String, Option<String>) {
+    let trimmed = body.trim();
+    let parsed = serde_json::from_str::<Value>(trimmed).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(json_error_message)
+                .or_else(|| value.get("message").and_then(json_error_message))
+        })
+        .or_else(|| (!trimmed.is_empty()).then(|| trimmed.to_string()))
+        .map(|message| truncate_status_error(&message))
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| format!("http {status}"));
+    let denial_class = parsed
+        .as_ref()
+        .and_then(|value| value.get("denial_class"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    (message, denial_class)
+}
+
+fn json_error_message(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_owned).or_else(|| {
+        value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn truncate_status_error(message: &str) -> String {
+    let message = message.trim();
+    let mut chars = message.chars();
+    let truncated: String = chars.by_ref().take(MAX_STATUS_ERROR_CHARS).collect();
+    if chars.next().is_some() {
+        truncated
+            .chars()
+            .take(MAX_STATUS_ERROR_CHARS.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect()
+    } else {
+        truncated
+    }
 }
 
 fn render_status_error(status: u16, message: &str, denial_class: Option<&str>) -> String {
@@ -898,6 +937,17 @@ mod tests {
         let legacy = socket_error_response(403, r#"{"error":"forbidden"}"#);
         assert_eq!(null_class, "http 403: forbidden");
         assert_eq!(legacy, null_class);
+    }
+
+    #[test]
+    fn socket_status_errors_use_message_or_raw_body_with_a_bound() {
+        let message = socket_error_response(403, r#"{"message":"policy denied this mutation"}"#);
+        assert_eq!(message, "http 403: policy denied this mutation");
+
+        let raw_body = format!("plain response {}", "x".repeat(400));
+        let raw = socket_error_response(403, &raw_body);
+        assert_eq!(raw.chars().count(), "http 403: ".chars().count() + 300);
+        assert!(raw.starts_with("http 403: plain response "));
     }
 
     #[test]

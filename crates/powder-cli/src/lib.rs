@@ -73,6 +73,308 @@ pub const COMMANDS: &[&str] = &[
     "dead-letter-replay",
     "event-tail",
 ];
+const INIT_DB_FLAGS: &[&str] = &["--db", "--show-secret"];
+const KEY_CREATE_FLAGS: &[&str] = &["--db", "--name", "--scope", "--show-secret", "--redacted"];
+const KEY_LIST_FLAGS: &[&str] = &["--db"];
+const KEY_REVOKE_FLAGS: &[&str] = &["--db"];
+const IMPORT_GITHUB_ISSUES_FLAGS: &[&str] = &["--db", "--repo", "--dry-run"];
+const REPAIR_CRITERIA_FLAGS: &[&str] = &["--db", "--repo", "--apply", "--actor"];
+const CREATE_CARD_FLAGS: &[&str] = &[
+    "--db",
+    "--id",
+    "--title",
+    "--body",
+    "--acceptance",
+    "--proof-plan",
+    "--status",
+    "--priority",
+    "--estimate",
+    "--risk",
+    "--related",
+    "--blocks",
+    "--blocked-by",
+    "--parent",
+    "--repo",
+    "--actor",
+    "--idempotency-key",
+];
+const UPDATE_CARD_FLAGS: &[&str] = &[
+    "--db",
+    "--title",
+    "--body",
+    "--acceptance",
+    "--proof-plan",
+    "--status",
+    "--priority",
+    "--estimate",
+    "--risk",
+    "--labels",
+    "--actor",
+    "--idempotency-key",
+];
+const UPDATE_RELATIONS_FLAGS: &[&str] = &[
+    "--db",
+    "--related",
+    "--blocks",
+    "--blocked-by",
+    "--actor",
+    "--idempotency-key",
+];
+const RELATIONS_DOCTOR_FLAGS: &[&str] = &["--db", "--repair"];
+const SET_PARENT_FLAGS: &[&str] = &[
+    "--db",
+    "--parent",
+    "--clear",
+    "--actor",
+    "--idempotency-key",
+];
+const LIST_READY_FLAGS: &[&str] = &[
+    "--db",
+    "--limit",
+    "--json",
+    "--repo",
+    "--estimate",
+    "--risk",
+    "--priority",
+    "--after",
+];
+const LIST_CARDS_FLAGS: &[&str] = &[
+    "--db",
+    "--limit",
+    "--status",
+    "--estimate",
+    "--repo",
+    "--label",
+];
+const BOARD_ROLLUPS_FLAGS: &[&str] = &["--db", "--limit", "--after", "--include-hidden", "--json"];
+const SEARCH_FLAGS: &[&str] = &[
+    "--db",
+    "--q",
+    "--limit",
+    "--json",
+    "--status",
+    "--priority",
+    "--estimate",
+    "--risk",
+    "--source-kind",
+    "--source",
+    "--source-field",
+    "--repo",
+    "--label",
+    "--source-created-after",
+    "--source-created-before",
+    "--created-after",
+    "--created-before",
+    "--updated-after",
+    "--updated-before",
+    "--after",
+];
+const PAPERCUT_FLAGS: &[&str] = &[
+    "--db",
+    "--agent",
+    "--service",
+    "--model",
+    "--harness",
+    "--idempotency-key",
+];
+const REPOSITORY_LIST_FLAGS: &[&str] = &["--db", "--include-hidden"];
+const REPOSITORY_GET_FLAGS: &[&str] = &["--db"];
+const REPOSITORY_UPSERT_FLAGS: &[&str] = &[
+    "--db",
+    "--name",
+    "--aliases",
+    "--visibility",
+    "--tier",
+    "--import-provenance",
+    "--actor",
+    "--idempotency-key",
+];
+const REPOSITORY_MERGE_ALIAS_FLAGS: &[&str] =
+    &["--db", "--alias", "--into", "--actor", "--idempotency-key"];
+const REPOSITORY_DELETE_FLAGS: &[&str] = &["--db", "--actor", "--idempotency-key"];
+const REPOSITORY_NORMALIZE_FLAGS: &[&str] = &["--db", "--actor", "--idempotency-key"];
+const REPOSITORY_DOCTOR_FLAGS: &[&str] = &["--db"];
+const CLAIM_FLAGS: &[&str] = &["--db", "--agent", "--ttl", "--actor"];
+const RELEASE_CLAIM_FLAGS: &[&str] = &["--db", "--run", "--actor", "--idempotency-key"];
+const RENEW_CLAIM_FLAGS: &[&str] = &["--db", "--run", "--ttl", "--actor", "--idempotency-key"];
+const TRANSFER_CLAIM_FLAGS: &[&str] = &[
+    "--db",
+    "--run",
+    "--to-agent",
+    "--ttl",
+    "--actor",
+    "--idempotency-key",
+];
+const HEARTBEAT_FLAGS: &[&str] = &["--db", "--run", "--actor", "--idempotency-key"];
+const GET_CARD_FLAGS: &[&str] = &["--db"];
+const GET_RUN_FLAGS: &[&str] = &["--db"];
+const RECORD_RUN_TELEMETRY_FLAGS: &[&str] = &["--db", "--attempts", "--actor", "--idempotency-key"];
+const RUN_TELEMETRY_AGGREGATE_FLAGS: &[&str] =
+    &["--db", "--agent", "--model", "--provider", "--limit"];
+const LIST_APPROVALS_FLAGS: &[&str] = &["--db", "--limit"];
+const LIST_AWAITING_INPUT_FLAGS: &[&str] = &["--db", "--limit"];
+const ANSWER_INPUT_FLAGS: &[&str] = &["--db", "--actor", "--answer", "--idempotency-key"];
+const UPDATE_STATUS_FLAGS: &[&str] = &["--db", "--status", "--actor", "--idempotency-key"];
+const CHECK_CRITERION_FLAGS: &[&str] = &[
+    "--db",
+    "--criterion",
+    "--actor",
+    "--unchecked",
+    "--idempotency-key",
+    "--principal",
+];
+const ADD_LINK_FLAGS: &[&str] = &[
+    "--db",
+    "--label",
+    "--url",
+    "--idempotency-key",
+    "--principal",
+];
+const ADD_COMMENT_FLAGS: &[&str] = &[
+    "--db",
+    "--author",
+    "--body",
+    "--idempotency-key",
+    "--principal",
+];
+const APPEND_WORK_LOG_FLAGS: &[&str] = &[
+    "--db",
+    "--agent",
+    "--body",
+    "--model",
+    "--reasoning",
+    "--harness",
+    "--run-id",
+    "--idempotency-key",
+    "--principal",
+];
+const REQUEST_INPUT_FLAGS: &[&str] = &["--db", "--question", "--actor", "--idempotency-key"];
+const COMPLETE_CARD_FLAGS: &[&str] = &[
+    "--db",
+    "--proof",
+    "--criterion-proof",
+    "--actor",
+    "--idempotency-key",
+];
+const SUBSCRIPTION_CREATE_FLAGS: &[&str] = &["--db", "--url", "--event-filter", "--show-secret"];
+const SUBSCRIPTION_LIST_FLAGS: &[&str] = &["--db"];
+const SUBSCRIPTION_DISABLE_FLAGS: &[&str] = &["--db", "--idempotency-key"];
+const DEAD_LETTER_LIST_FLAGS: &[&str] = &["--db", "--limit"];
+const DEAD_LETTER_REPLAY_FLAGS: &[&str] = &["--db", "--subscription", "--idempotency-key"];
+const EVENT_TAIL_FLAGS: &[&str] = &["--db", "--after", "--limit"];
+
+fn known_flags(command: &str) -> &'static [&'static str] {
+    match command {
+        "init-db" => INIT_DB_FLAGS,
+        "key-create" => KEY_CREATE_FLAGS,
+        "key-list" => KEY_LIST_FLAGS,
+        "key-revoke" => KEY_REVOKE_FLAGS,
+        "import-github-issues" => IMPORT_GITHUB_ISSUES_FLAGS,
+        "repair-criteria" => REPAIR_CRITERIA_FLAGS,
+        "create-card" => CREATE_CARD_FLAGS,
+        "update-card" => UPDATE_CARD_FLAGS,
+        "update-relations" => UPDATE_RELATIONS_FLAGS,
+        "relations-doctor" => RELATIONS_DOCTOR_FLAGS,
+        "set-parent" => SET_PARENT_FLAGS,
+        "list-ready" => LIST_READY_FLAGS,
+        "list-cards" => LIST_CARDS_FLAGS,
+        "board-rollups" => BOARD_ROLLUPS_FLAGS,
+        "search" => SEARCH_FLAGS,
+        "papercut" => PAPERCUT_FLAGS,
+        "repository-list" => REPOSITORY_LIST_FLAGS,
+        "repository-get" => REPOSITORY_GET_FLAGS,
+        "repository-upsert" => REPOSITORY_UPSERT_FLAGS,
+        "repository-merge-alias" => REPOSITORY_MERGE_ALIAS_FLAGS,
+        "repository-delete" => REPOSITORY_DELETE_FLAGS,
+        "repository-normalize" => REPOSITORY_NORMALIZE_FLAGS,
+        "repository-doctor" => REPOSITORY_DOCTOR_FLAGS,
+        "claim" => CLAIM_FLAGS,
+        "release-claim" => RELEASE_CLAIM_FLAGS,
+        "renew-claim" => RENEW_CLAIM_FLAGS,
+        "transfer-claim" => TRANSFER_CLAIM_FLAGS,
+        "heartbeat" => HEARTBEAT_FLAGS,
+        "get-card" => GET_CARD_FLAGS,
+        "get-run" => GET_RUN_FLAGS,
+        "record-run-telemetry" => RECORD_RUN_TELEMETRY_FLAGS,
+        "run-telemetry-aggregate" => RUN_TELEMETRY_AGGREGATE_FLAGS,
+        "list-approvals" => LIST_APPROVALS_FLAGS,
+        "list-awaiting-input" => LIST_AWAITING_INPUT_FLAGS,
+        "answer-input" => ANSWER_INPUT_FLAGS,
+        "update-status" => UPDATE_STATUS_FLAGS,
+        "check-criterion" => CHECK_CRITERION_FLAGS,
+        "add-link" => ADD_LINK_FLAGS,
+        "add-comment" => ADD_COMMENT_FLAGS,
+        "append-work-log" => APPEND_WORK_LOG_FLAGS,
+        "request-input" => REQUEST_INPUT_FLAGS,
+        "complete-card" => COMPLETE_CARD_FLAGS,
+        "subscription-create" => SUBSCRIPTION_CREATE_FLAGS,
+        "subscription-list" => SUBSCRIPTION_LIST_FLAGS,
+        "subscription-disable" => SUBSCRIPTION_DISABLE_FLAGS,
+        "dead-letter-list" => DEAD_LETTER_LIST_FLAGS,
+        "dead-letter-replay" => DEAD_LETTER_REPLAY_FLAGS,
+        "event-tail" => EVENT_TAIL_FLAGS,
+        _ => &[],
+    }
+}
+
+fn validate_flags(command: &str, args: &[String]) -> Result<(), ShellError> {
+    let known = known_flags(command);
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if !arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        if !known.contains(&flag) {
+            let suggestion = suggest_flag(flag, known)
+                .map(|candidate| format!("; did you mean {candidate}?"))
+                .unwrap_or_default();
+            return Err(ShellError::Invalid(format!(
+                "unknown flag {flag} for {command}{suggestion}"
+            )));
+        }
+        index += if !arg.contains('=')
+            && flag_takes_value(flag)
+            && args
+                .get(index + 1)
+                .is_some_and(|value| !value.starts_with("--"))
+        {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(())
+}
+
+fn suggest_flag<'a>(flag: &str, known: &'a [&'a str]) -> Option<&'a str> {
+    if flag == "--criteria" && known.contains(&"--acceptance") {
+        return Some("--acceptance");
+    }
+    known.iter().copied().find(|candidate| {
+        candidate.starts_with(flag)
+            || flag.starts_with(candidate)
+            || edit_distance(flag, candidate) <= 2
+    })
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.as_bytes();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, left_byte) in left.as_bytes().iter().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (column, right_byte) in right.iter().enumerate() {
+            current[column + 1] = (current[column] + 1)
+                .min(previous[column + 1] + 1)
+                .min(previous[column] + usize::from(left_byte != right_byte));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
 
 #[derive(Debug, Clone, Default)]
 struct RemoteEnv {
@@ -117,6 +419,13 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
 
 fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     reject_admin_flag(args)?;
+    if let Some(command) = args
+        .first()
+        .map(String::as_str)
+        .filter(|command| COMMANDS.contains(command))
+    {
+        validate_flags(command, &args[1..])?;
+    }
     match args {
         [] => Ok(help()),
         [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
@@ -370,9 +679,6 @@ pub fn help() -> String {
     help.push_str("  powder dead-letter-list --db ./data/powder.db\n");
     help.push_str("  powder dead-letter-replay --db ./data/powder.db --idempotency-key replay-001 [--subscription sub-id]\n");
     help.push_str("  powder event-tail --db ./data/powder.db --after 0 --limit 20\n");
-    help.push_str(
-        "  powder update-status 001 --db ./data/powder.db --status in_progress --actor codex\n\n",
-    );
     help.push_str(
         "authority:\n  local mutations use POWDER_PRINCIPAL (or the fixed trusted local-cli admin principal). \
          --actor, --author, and --agent are semantic audit labels only; they never grant authority. \
@@ -2532,7 +2838,8 @@ fn positional(args: &[String]) -> Vec<&str> {
 fn flag_takes_value(flag: &str) -> bool {
     !matches!(
         flag,
-        "--dry-run"
+        "--clear"
+            | "--dry-run"
             | "--show-secret"
             | "--redacted"
             | "--include-hidden"
@@ -2625,6 +2932,56 @@ mod tests {
         assert!(COMMANDS.contains(&"dead-letter-list"));
         assert!(COMMANDS.contains(&"dead-letter-replay"));
         assert!(COMMANDS.contains(&"event-tail"));
+    }
+
+    #[test]
+    fn cli_rejects_unknown_create_card_flags_with_command_and_flag() {
+        let error = run_with_env(
+            &args([
+                "create-card",
+                "--id",
+                "x",
+                "--title",
+                "t",
+                "--body",
+                "b",
+                "--mystery",
+                "value",
+            ]),
+            &remote_env(None, None),
+        )
+        .expect_err("unknown flags must fail before transport selection");
+
+        assert!(matches!(
+            error,
+            ShellError::Invalid(message)
+                if message == "unknown flag --mystery for create-card"
+        ));
+    }
+
+    #[test]
+    fn cli_suggests_acceptance_for_criteria_near_miss() {
+        let error = run_with_env(
+            &args([
+                "create-card",
+                "--id",
+                "x",
+                "--title",
+                "t",
+                "--body",
+                "b",
+                "--criteria",
+                "criterion",
+            ]),
+            &remote_env(None, None),
+        )
+        .expect_err("the retired near-miss flag must fail");
+
+        assert!(matches!(
+            error,
+            ShellError::Invalid(message)
+                if message == "unknown flag --criteria for create-card; did you mean --acceptance?"
+        ));
     }
 
     #[test]
@@ -2942,6 +3299,26 @@ mod tests {
             requests[0].authorization.as_deref(),
             Some("Bearer sk_powder_search")
         );
+    }
+
+    #[test]
+    fn cli_remote_http_error_surfaces_body_and_stays_an_error() {
+        let (base_url, _recorded) = spawn_test_server(vec![(
+            403,
+            json!({"error": "status changes require an operator policy approval"}),
+        )]);
+
+        let error = run_with_env(
+            &args(["update-card", "card-1", "--status", "ready"]),
+            &remote_env(Some(&base_url), Some("sk_powder_test")),
+        )
+        .expect_err("a non-2xx response must remain a CLI error");
+
+        assert!(matches!(
+            error,
+            ShellError::Forbidden(message)
+                if message == "status changes require an operator policy approval"
+        ));
     }
 
     #[test]
