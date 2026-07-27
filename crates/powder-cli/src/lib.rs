@@ -323,15 +323,30 @@ fn known_flags(command: &str) -> &'static [&'static str] {
 fn validate_flags(command: &str, args: &[String]) -> Result<(), ShellError> {
     let known = known_flags(command);
     let mut index = 0;
+    let mut options = true;
+    let mut positionals = 0;
     while index < args.len() {
         let arg = &args[index];
-        if !arg.starts_with('-') {
+        if options && arg == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if !options || !arg.starts_with('-') {
+            positionals += 1;
             index += 1;
             continue;
         }
 
         let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
         if !known.contains(&flag) {
+            let is_hyphenated_positional =
+                positionals == 0 && matches!(command, "papercut" | "search") && arg.len() > 1;
+            if is_hyphenated_positional {
+                positionals += 1;
+                index += 1;
+                continue;
+            }
             let suggestion = suggest_flag(flag, known)
                 .map(|candidate| format!("; did you mean {candidate}?"))
                 .unwrap_or_default();
@@ -339,12 +354,7 @@ fn validate_flags(command: &str, args: &[String]) -> Result<(), ShellError> {
                 "unknown flag {flag} for {command}{suggestion}"
             )));
         }
-        index += if !arg.contains('=')
-            && flag_takes_value(flag)
-            && args
-                .get(index + 1)
-                .is_some_and(|value| !value.starts_with("--"))
-        {
+        index += if !arg.contains('=') && flag_takes_value(flag) {
             2
         } else {
             1
@@ -1317,7 +1327,7 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
 /// Search cards and indexed comments/work logs. The JSON envelope is shared with
 /// the HTTP and MCP surfaces; --json is accepted explicitly for scripts.
 fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let positionals = positional(args);
+    let positionals = positional_preserving_leading_hyphen(args, known_flags("search"));
     if positionals.len() > 1 {
         return Err(ShellError::Invalid(
             "search accepts one positional query; quote multi-word queries or use --q".to_string(),
@@ -2814,8 +2824,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 /// Every value of a repeatable flag, in argument order. `flag_value` takes
-/// only the first occurrence, which silently discarded later `--acceptance`
-/// criteria (powder-cli-repeated-acceptance).
+/// only the first occurrence, which silently discards later repeatable values.
 fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
     args.iter()
         .enumerate()
@@ -2828,9 +2837,13 @@ fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
 fn positional(args: &[String]) -> Vec<&str> {
     let mut values = Vec::new();
     let mut index = 0;
+    let mut options = true;
     while index < args.len() {
         let arg = &args[index];
-        if arg.starts_with("--") {
+        if options && arg == "--" {
+            options = false;
+            index += 1;
+        } else if options && arg.starts_with("--") {
             index += if flag_takes_value(arg) { 2 } else { 1 };
         } else {
             values.push(arg.as_str());
@@ -2838,6 +2851,19 @@ fn positional(args: &[String]) -> Vec<&str> {
         }
     }
     values
+}
+
+fn positional_preserving_leading_hyphen<'a>(args: &'a [String], known: &[&str]) -> Vec<&'a str> {
+    if args.first().is_some_and(|arg| {
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        arg.starts_with("--") && arg != "--" && !known.contains(&flag)
+    }) {
+        let mut values = vec![args[0].as_str()];
+        values.extend(positional(&args[1..]));
+        values
+    } else {
+        positional(args)
+    }
 }
 
 fn flag_takes_value(flag: &str) -> bool {
@@ -2855,7 +2881,7 @@ fn flag_takes_value(flag: &str) -> bool {
 }
 
 fn body_from_positionals(args: &[String]) -> Result<String, ShellError> {
-    let words = positional(args);
+    let words = positional_preserving_leading_hyphen(args, known_flags("papercut"));
     if words.is_empty() {
         return Err(ShellError::Invalid(
             "papercut requires a body; pass it as the first argument".to_string(),
@@ -3009,6 +3035,27 @@ mod tests {
             ShellError::Invalid(message)
                 if message == "unknown flag --idempotency-key for subscription-disable"
         ));
+    }
+
+    #[test]
+    fn cli_preserves_hyphenated_positionals_and_supports_end_of_options() {
+        let hyphenated_body = args(["--retry the failed request"]);
+        assert_eq!(
+            positional_preserving_leading_hyphen(&hyphenated_body, known_flags("papercut")),
+            vec!["--retry the failed request"]
+        );
+        validate_flags("papercut", &hyphenated_body).unwrap();
+
+        let hyphenated_query = args(["--retry the failed search"]);
+        assert_eq!(
+            positional_preserving_leading_hyphen(&hyphenated_query, known_flags("search")),
+            vec!["--retry the failed search"]
+        );
+        validate_flags("search", &hyphenated_query).unwrap();
+
+        let after_options = args(["--", "--id"]);
+        assert_eq!(positional(&after_options), vec!["--id"]);
+        validate_flags("create-card", &after_options).unwrap();
     }
 
     #[test]
