@@ -283,6 +283,16 @@ impl RemoteClient {
             None => request.call(),
         };
         match response {
+            Ok(response) if !(200..300).contains(&response.status()) => {
+                let status = response.status();
+                let body = response.into_string().unwrap_or_default();
+                let (message, denial_class) = status_error_details(status, &body);
+                Err(RemoteError::Status {
+                    status,
+                    message,
+                    denial_class,
+                })
+            }
             Ok(response) => response
                 .into_json()
                 .map_err(|err| RemoteError::Parse(err.to_string())),
@@ -948,6 +958,12 @@ mod tests {
         let raw = socket_error_response(403, &raw_body);
         assert_eq!(raw.chars().count(), "http 403: ".chars().count() + 300);
         assert!(raw.starts_with("http 403: plain response "));
+    }
+
+    #[test]
+    fn socket_final_three_xx_status_remains_an_error() {
+        let error = socket_error_response(300, r#"{"error":"policy denied this mutation"}"#);
+        assert_eq!(error, "http 300: policy denied this mutation");
     }
 
     #[test]

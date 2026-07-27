@@ -7,8 +7,38 @@ use std::{
 
 #[test]
 fn remote_http_errors_surface_body_and_exit_nonzero() {
+    let output = run_remote_update(403, r#"{"error":"policy denies this status change"}"#);
+
+    assert!(
+        !output.status.success(),
+        "HTTP errors must fail the process"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("policy denies this status change"),
+        "stderr should include the server reason: {stderr}"
+    );
+}
+
+#[test]
+fn final_three_xx_http_errors_surface_body_and_exit_nonzero() {
+    let output = run_remote_update(300, r#"{"error":"policy denies this redirect"}"#);
+
+    assert!(
+        !output.status.success(),
+        "final 3xx responses must fail the process"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("policy denies this redirect"),
+        "stderr should include the server reason: {stderr}"
+    );
+}
+
+fn run_remote_update(status: u16, response_body: &str) -> std::process::Output {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let address = listener.local_addr().expect("test server address");
+    let response_body = response_body.to_owned();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept CLI request");
         let mut reader = BufReader::new(stream.try_clone().expect("clone request stream"));
@@ -30,9 +60,8 @@ fn remote_http_errors_surface_body_and_exit_nonzero() {
         let mut body = vec![0; content_length];
         reader.read_exact(&mut body).expect("read request body");
 
-        let response_body = r#"{"error":"policy denies this status change"}"#;
         let response = format!(
-            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             response_body.len(),
             response_body
         );
@@ -48,14 +77,5 @@ fn remote_http_errors_surface_body_and_exit_nonzero() {
         .output()
         .expect("run powder CLI");
     server.join().expect("test server must finish");
-
-    assert!(
-        !output.status.success(),
-        "HTTP errors must fail the process"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("policy denies this status change"),
-        "stderr should include the server reason: {stderr}"
-    );
+    output
 }
