@@ -73,6 +73,9 @@ pub const COMMANDS: &[&str] = &[
     "dead-letter-replay",
     "event-tail",
 ];
+// `--actor` is a deliberately accepted semantic audit label on local mutation
+// commands. It never supplies the trusted authority and may be unused by a
+// command whose audit record is fully determined by that authority.
 const INIT_DB_FLAGS: &[&str] = &["--db", "--show-secret"];
 const KEY_CREATE_FLAGS: &[&str] = &["--db", "--name", "--scope", "--show-secret", "--redacted"];
 const KEY_LIST_FLAGS: &[&str] = &["--db"];
@@ -258,7 +261,7 @@ const COMPLETE_CARD_FLAGS: &[&str] = &[
 ];
 const SUBSCRIPTION_CREATE_FLAGS: &[&str] = &["--db", "--url", "--event-filter", "--show-secret"];
 const SUBSCRIPTION_LIST_FLAGS: &[&str] = &["--db"];
-const SUBSCRIPTION_DISABLE_FLAGS: &[&str] = &["--db", "--idempotency-key"];
+const SUBSCRIPTION_DISABLE_FLAGS: &[&str] = &["--db"];
 const DEAD_LETTER_LIST_FLAGS: &[&str] = &["--db", "--limit"];
 const DEAD_LETTER_REPLAY_FLAGS: &[&str] = &["--db", "--subscription", "--idempotency-key"];
 const EVENT_TAIL_FLAGS: &[&str] = &["--db", "--after", "--limit"];
@@ -658,7 +661,9 @@ pub fn help() -> String {
     help.push_str(
         "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
     );
-    help.push_str("  powder update-status 001 --db ./data/powder.db --status in_progress\n");
+    help.push_str(
+        "  powder update-status 001 --db ./data/powder.db --status in_progress --actor codex\n",
+    );
     help.push_str(
         "  powder check-criterion 001 --db ./data/powder.db --criterion 0 --actor operator [--unchecked]\n",
     );
@@ -2981,6 +2986,28 @@ mod tests {
             error,
             ShellError::Invalid(message)
                 if message == "unknown flag --criteria for create-card; did you mean --acceptance?"
+        ));
+    }
+
+    #[test]
+    fn cli_rejects_unconsumed_subscription_disable_flags() {
+        let error = run_with_env(
+            &args([
+                "subscription-disable",
+                "subscription-1",
+                "--db",
+                "/tmp/not-opened.db",
+                "--idempotency-key",
+                "replay-1",
+            ]),
+            &remote_env(None, None),
+        )
+        .expect_err("unsupported flags must fail before opening the database");
+
+        assert!(matches!(
+            error,
+            ShellError::Invalid(message)
+                if message == "unknown flag --idempotency-key for subscription-disable"
         ));
     }
 
