@@ -73,6 +73,8 @@ const els = {
   quickAddMessage: document.getElementById("quick-add-message"),
   quickAddAttachments: document.getElementById("quick-add-attachments"),
   quickAddAttachmentList: document.getElementById("quick-add-attachment-list"),
+  quickAddSubmit: document.getElementById("quick-add-submit"),
+  attachmentRetryBanner: document.getElementById("attachment-retry-banner"),
   detailConnection: document.getElementById("detail-connection-status"),
   detailBoardLink: document.getElementById("detail-board-link"),
   detailHomeLink: document.getElementById("detail-home-link"),
@@ -177,6 +179,8 @@ const state = {
 
 let railShare = 24;
 let quickAddFiles = [];
+let quickAddSubmitting = false;
+let pendingAttachmentRetries = new Map();
 let toastTimer = null;
 let silentRetryTimer = null;
 let statusChangeSeq = 0;
@@ -1565,7 +1569,7 @@ function syncRepoCombo(query, open) {
       const classes = [index === repoComboActive ? "is-active" : "", repo ? "" : "pw-combo-none"]
         .filter(Boolean)
         .join(" ");
-      return `<li id="quick-add-repo-opt-${index}" role="option" data-repo="${escapeHtml(repo)}"${index === repoComboActive ? ' aria-selected="true"' : ""}${classes ? ` class="${classes}"` : ""}>${repo ? escapeHtml(repo) : "no repo · general"}</li>`;
+      return `<li id="quick-add-repo-opt-${index}" role="option" data-repo="${escapeHtml(repo)}"${index === repoComboActive ? ' aria-selected="true"' : ""}${classes ? ` class="${classes}"` : ""}>${repo ? escapeHtml(repo) : "no repo · General"}</li>`;
     })
     .join("");
   const show = Boolean(open) && matches.length > 0;
@@ -1591,6 +1595,8 @@ function showQuickAdd() {
   renderQuickAddRepoOptions();
   els.quickAddPanel.hidden = false;
   els.quickAddToggle.setAttribute("aria-expanded", "true");
+  // A freshly opened panel never carries a stale error from a prior attempt.
+  els.quickAddMessage.textContent = "";
   els.quickAddTitle.focus();
 }
 
@@ -1599,8 +1605,20 @@ function hideQuickAdd() {
   els.quickAddToggle.setAttribute("aria-expanded", "false");
 }
 
+const SUPPORTED_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 function isImageFile(file) {
-  return Boolean(file && String(file.type || "").toLowerCase().startsWith("image/"));
+  return Boolean(file && SUPPORTED_IMAGE_MIMES.has(String(file.type || "").toLowerCase()));
+}
+
+const QUICK_ADD_MAX_IMAGES = 2;
+const QUICK_ADD_MAX_IMAGE_BYTES = 10 * 1024 * 1024; // matches server MAX_ATTACHMENT_BYTES
+
+// Returns { accepted, rejected } so the caller can report why a file was
+// turned away without silently dropping it.
+function validateQuickAddFile(file) {
+  if (!isImageFile(file)) return { ok: false, reason: "unsupported image type (PNG, JPEG, WebP, or GIF only)" };
+  if (file.size > QUICK_ADD_MAX_IMAGE_BYTES) return { ok: false, reason: "exceeds 10 MB" };
+  return { ok: true };
 }
 
 function attachmentFilesFromClipboard(clipboard) {
@@ -1610,7 +1628,7 @@ function attachmentFilesFromClipboard(clipboard) {
     if (isImageFile(file)) files.push(file);
   }
   for (const item of clipboard.items || []) {
-    if (item.kind === "file" && item.type.startsWith("image/")) {
+    if (item.kind === "file" && SUPPORTED_IMAGE_MIMES.has(String(item.type || "").toLowerCase())) {
       const file = item.getAsFile();
       if (file) files.push(file);
     }
@@ -1619,9 +1637,18 @@ function attachmentFilesFromClipboard(clipboard) {
 }
 
 function mergeQuickAddFiles(files) {
-  const images = files.filter(isImageFile);
   const seen = new Set(quickAddFiles.map((file) => file.name + ":" + file.size + ":" + file.lastModified));
-  for (const file of images) {
+  const rejected = [];
+  for (const file of files) {
+    if (quickAddFiles.length >= QUICK_ADD_MAX_IMAGES) {
+      rejected.push({ file, reason: "limit is " + QUICK_ADD_MAX_IMAGES });
+      continue;
+    }
+    const check = validateQuickAddFile(file);
+    if (!check.ok) {
+      rejected.push({ file, reason: check.reason });
+      continue;
+    }
     const key = file.name + ":" + file.size + ":" + file.lastModified;
     if (!seen.has(key)) {
       quickAddFiles.push(file);
@@ -1629,12 +1656,23 @@ function mergeQuickAddFiles(files) {
     }
   }
   renderQuickAddAttachments();
+  return rejected;
+}
+
+function removeQuickAddFile(index) {
+  quickAddFiles.splice(index, 1);
+  if (els.quickAddAttachments) els.quickAddAttachments.value = "";
+  renderQuickAddAttachments();
 }
 
 function renderQuickAddAttachments() {
   if (!els.quickAddAttachmentList) return;
   els.quickAddAttachmentList.innerHTML = quickAddFiles
-    .map((file, index) => '<li><span>' + escapeHtml(file.name || ("image-" + (index + 1))) + '</span><span class="pw-chrome">' + Math.ceil(file.size / 1024) + ' KB</span></li>')
+    .map((file, index) => {
+      const name = escapeHtml(file.name || ("image-" + (index + 1)));
+      const size = Math.ceil(file.size / 1024) + " KB";
+      return '<li><span>' + name + '</span><span class="pw-chrome">' + size + '</span><button type="button" class="pw-quick-add-remove" data-remove="' + index + '" aria-label="Remove ' + name + '">&times;</button></li>';
+    })
     .join("");
 }
 
@@ -1642,6 +1680,14 @@ function clearQuickAddFiles() {
   quickAddFiles = [];
   if (els.quickAddAttachments) els.quickAddAttachments.value = "";
   renderQuickAddAttachments();
+}
+
+function setQuickAddSubmitting(busy) {
+  quickAddSubmitting = busy;
+  if (els.quickAddSubmit) {
+    els.quickAddSubmit.disabled = busy;
+    els.quickAddSubmit.textContent = busy ? "Saving…" : "Save";
+  }
 }
 
 function quickAddCardId(repo) {
@@ -1669,6 +1715,79 @@ async function uploadQuickAddFiles(cardId, files) {
     .filter(Boolean);
 }
 
+function renderPendingRetries() {
+  const banner = els.attachmentRetryBanner;
+  if (!banner) return;
+  if (!pendingAttachmentRetries.size) {
+    banner.hidden = true;
+    banner.innerHTML = "";
+    return;
+  }
+  banner.hidden = false;
+  banner.innerHTML = [...pendingAttachmentRetries.entries()].map(([cardId, entry]) => {
+    const title = escapeHtml(entry.title || cardId);
+    const busy = entry.retrying;
+    const fileList = entry.files.map((f, i) => {
+      const name = escapeHtml(f.file.name || ("image-" + (i + 1)));
+      const size = Math.ceil(f.file.size / 1024) + " KB";
+      return '<li><span>' + name + '</span><span class="pw-chrome">' + size + '</span>' +
+        '<button type="button" class="pw-quick-add-remove pw-retry-remove" data-retry-card="' + escapeHtml(cardId) + '" data-retry-index="' + i + '" aria-label="Remove ' + name + '"' + (busy ? " disabled" : "") + '>&times;</button></li>';
+    }).join("");
+    // Truthful headline: an in-flight upload is not a failure; only the
+    // terminal state may say FAILED (the banner is aria-live).
+    return '<div class="pw-retry-entry" data-retry-card="' + escapeHtml(cardId) + '">' +
+      '<p class="pw-retry-label"><span class="pw-chrome">' + (busy ? "UPLOADING IMAGES" : "UPLOAD FAILED") + '</span> ' + title + '</p>' +
+      '<ul class="pw-retry-files">' + fileList + '</ul>' +
+      '<div class="pw-retry-actions">' +
+      '<button type="button" class="pw-button pw-button-compact pw-retry-upload" data-retry-card="' + escapeHtml(cardId) + '"' + (busy ? " disabled" : "") + '>' + (busy ? "Uploading…" : "Retry upload") + '</button>' +
+      '<button type="button" class="pw-button pw-button-quiet pw-button-compact pw-retry-dismiss" data-retry-card="' + escapeHtml(cardId) + '"' + (busy ? " disabled" : "") + '>Dismiss</button>' +
+      '</div></div>';
+  }).join("");
+}
+
+async function retryCardAttachments(cardId) {
+  const entry = pendingAttachmentRetries.get(cardId);
+  if (!entry || entry.retrying) return;
+  entry.retrying = true;
+  renderPendingRetries();
+  try {
+    const files = entry.files.map((f) => f.file);
+    const failures = await uploadQuickAddFiles(cardId, files);
+    if (!failures.length) {
+      pendingAttachmentRetries.delete(cardId);
+      showToast("Images attached.", "ok");
+      loadBoard({ silent: true });
+    } else {
+      entry.files = failures.map((f) => ({ file: f.file }));
+      const failed = failures.length;
+      showToast(failed + " " + (failed === 1 ? "image" : "images") + " still failed to upload.", "warn");
+    }
+    renderPendingRetries();
+  } catch (err) {
+    showToast("Retry failed: " + (err.message || err), "warn");
+  } finally {
+    entry.retrying = false;
+    renderPendingRetries();
+  }
+}
+
+function dismissCardAttachmentRetry(cardId) {
+  pendingAttachmentRetries.delete(cardId);
+  renderPendingRetries();
+}
+
+function removeRetryFile(cardId, index) {
+  const entry = pendingAttachmentRetries.get(cardId);
+  // Locked while an upload is in flight: removing a file mid-flight would
+  // let the failure rewrite resurrect it when the entry is rebuilt.
+  if (!entry || entry.retrying) return;
+  entry.files.splice(index, 1);
+  if (!entry.files.length) {
+    pendingAttachmentRetries.delete(cardId);
+  }
+  renderPendingRetries();
+}
+
 function showToast(message, kind = "info") {
   if (!els.toast) return;
   els.toast.hidden = false;
@@ -1680,13 +1799,34 @@ function showToast(message, kind = "info") {
   }, 6500);
 }
 
+// Roll an unconfirmed optimistic quick-add card back out of client state.
+// State cleanup is unconditional; the board re-render is best-effort so a
+// faulting render() cannot strand the draft restore that follows --
+// state.cards is already clean, so the next successful render cannot
+// resurrect the card.
+function rollbackQuickAddOptimistic(cardId) {
+  pendingOptimisticIds.delete(cardId);
+  state.cards = state.cards.filter((card) => card.id !== cardId);
+  pendingAttachmentRetries.delete(cardId);
+  renderPendingRetries();
+  try {
+    buildFilters();
+    render();
+  } catch (err) {
+    // State is already clean; a persistently broken render surfaces through
+    // the outer error handlers, never as a ghost card.
+  }
+}
+
 async function createCardFromQuickAdd(form) {
+  if (quickAddSubmitting) return;
   const enteredTitle = els.quickAddTitle.value.trim();
   const body = els.quickAddBody.value.trim();
   const firstLine = body.split(/\r?\n/, 1)[0].trim();
   const title = enteredTitle || firstLine.slice(0, 160);
   if (!title) {
-    els.quickAddMessage.textContent = "Add a title or a line of ramble first.";
+    els.quickAddMessage.textContent = "Add a title or a description first.";
+    els.quickAddTitle.focus();
     return;
   }
   // Resolve typed text against the known repositories -- the combobox is an
@@ -1706,63 +1846,85 @@ async function createCardFromQuickAdd(form) {
       return;
     }
   }
-  const attachments = quickAddFiles.slice();
-  const now = Math.floor(Date.now() / 1000);
-  const payload = {
-    id: quickAddCardId(repo),
-    title,
-    body,
-    acceptance: [],
-    status: "backlog",
-    ...(repo ? { repo } : {}),
-  };
-  // Optimistic: the card lands on the board instantly; the POST confirms in
-  // the background and a failure rolls it back with the draft restored.
-  pendingOptimisticIds.add(payload.id);
-  state.cards = [
-    normalizeCard({ ...payload, priority: "p2", created_at: now, updated_at: now }),
-    ...state.cards,
-  ];
-  form.reset();
-  clearQuickAddFiles();
-  hideQuickAdd();
-  els.quickAddMessage.textContent = "";
-  buildFilters();
-  render();
+  setQuickAddSubmitting(true);
   try {
-    await apiJson("/api/v1/cards", {
-      method: "POST",
-      idempotencyKey: createMutationReceipt(),
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  } catch (err) {
+    const attachments = quickAddFiles.slice();
+    const now = Math.floor(Date.now() / 1000);
+    const payload = {
+      id: quickAddCardId(repo),
+      title,
+      body,
+      acceptance: [],
+      status: "backlog",
+      ...(repo ? { repo } : {}),
+    };
+    // Optimistic: the card lands on the board instantly; the POST confirms in
+    // the background. One transaction-like sequence owns the insert through
+    // the POST: any exception before confirmation -- in buildFilters/render
+    // or in apiJson -- rolls the card back out of client state and restores
+    // the draft, so a fault can never leave a ghost card behind.
+    try {
+      pendingOptimisticIds.add(payload.id);
+      state.cards = [
+        normalizeCard({ ...payload, priority: "p2", created_at: now, updated_at: now }),
+        ...state.cards,
+      ];
+      form.reset();
+      clearQuickAddFiles();
+      hideQuickAdd();
+      els.quickAddMessage.textContent = "";
+      if (attachments.length) {
+        pendingAttachmentRetries.set(payload.id, { files: attachments.map((f) => ({ file: f })), title, retrying: true });
+        renderPendingRetries();
+      }
+      buildFilters();
+      render();
+      await apiJson("/api/v1/cards", {
+        method: "POST",
+        idempotencyKey: createMutationReceipt(),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      rollbackQuickAddOptimistic(payload.id);
+      showQuickAdd();
+      els.quickAddTitle.value = enteredTitle;
+      els.quickAddBody.value = body;
+      els.quickAddRepo.value = repo;
+      els.quickAddRepoInput.value = repo;
+      quickAddFiles = attachments;
+      renderQuickAddAttachments();
+      els.quickAddMessage.textContent = "Failed: " + (err.message || err);
+      return;
+    }
     pendingOptimisticIds.delete(payload.id);
-    state.cards = state.cards.filter((card) => card.id !== payload.id);
-    buildFilters();
-    render();
-    showQuickAdd();
-    els.quickAddTitle.value = enteredTitle;
-    els.quickAddBody.value = body;
-    els.quickAddRepo.value = repo;
-    els.quickAddRepoInput.value = repo;
-    quickAddFiles = attachments;
-    renderQuickAddAttachments();
-    els.quickAddMessage.textContent = "Failed: " + (err.message || err);
-    return;
+    let uploadFailures = [];
+    if (attachments.length) {
+      uploadFailures = await uploadQuickAddFiles(payload.id, attachments);
+    }
+    const entry = pendingAttachmentRetries.get(payload.id);
+    if (entry) entry.retrying = false;
+    if (uploadFailures.length) {
+      const failed = uploadFailures.length;
+      const total = attachments.length;
+      pendingAttachmentRetries.set(payload.id, { files: uploadFailures.map((f) => ({ file: f.file })), title, retrying: false });
+      renderPendingRetries();
+      if (failed < total) {
+        showToast(total - failed + " of " + total + " images attached; " + failed + " failed to upload.", "warn");
+      } else {
+        showToast("Filed, but " + failed + " " + (failed === 1 ? "image" : "images") + " could not upload. Retry below.", "warn");
+      }
+    } else {
+      pendingAttachmentRetries.delete(payload.id);
+      renderPendingRetries();
+      if (attachments.length) {
+        showToast(attachments.length + " " + (attachments.length === 1 ? "image" : "images") + " attached.", "ok");
+      }
+    }
+    loadBoard({ silent: true });
+  } finally {
+    setQuickAddSubmitting(false);
   }
-  pendingOptimisticIds.delete(payload.id);
-  let uploadFailures = [];
-  if (attachments.length) {
-    uploadFailures = await uploadQuickAddFiles(payload.id, attachments);
-  }
-  if (uploadFailures.length) {
-    const suffix = uploadFailures.length === 1 ? "image" : "images";
-    showToast("Card filed, but " + uploadFailures.length + " " + suffix + " could not be uploaded. Attachments are unavailable on this server.", "warn");
-  } else if (attachments.length) {
-    showToast(attachments.length + " " + (attachments.length === 1 ? "image" : "images") + " attached.", "ok");
-  }
-  loadBoard({ silent: true });
 }
 
 async function mergeRepositoryAlias(form) {
@@ -2978,19 +3140,52 @@ els.quickAddCancel.addEventListener("click", () => {
   hideQuickAdd();
 });
 els.quickAddAttachments?.addEventListener("change", (event) => {
-  mergeQuickAddFiles([...event.target.files]);
+  const rejected = mergeQuickAddFiles([...event.target.files]);
+  if (rejected.length) {
+    const details = rejected.map((r) => r.file.name + " (" + r.reason + ")").join(", ");
+    els.quickAddMessage.textContent = "Rejected: " + details;
+  } else {
+    els.quickAddMessage.textContent = "";
+  }
+});
+els.quickAddAttachmentList?.addEventListener("click", (event) => {
+  const btn = event.target.closest("[data-remove]");
+  if (!btn) return;
+  removeQuickAddFile(Number(btn.dataset.remove));
+});
+els.attachmentRetryBanner?.addEventListener("click", (event) => {
+  const retryBtn = event.target.closest(".pw-retry-upload");
+  if (retryBtn) {
+    retryCardAttachments(retryBtn.dataset.retryCard);
+    return;
+  }
+  const dismissBtn = event.target.closest(".pw-retry-dismiss");
+  if (dismissBtn) {
+    dismissCardAttachmentRetry(dismissBtn.dataset.retryCard);
+    return;
+  }
+  const removeBtn = event.target.closest(".pw-retry-remove");
+  if (removeBtn) {
+    removeRetryFile(removeBtn.dataset.retryCard, Number(removeBtn.dataset.retryIndex));
+  }
 });
 els.quickAddForm.addEventListener("paste", (event) => {
   const files = attachmentFilesFromClipboard(event.clipboardData);
   if (!files.length) return;
   event.preventDefault();
-  mergeQuickAddFiles(files);
-  els.quickAddMessage.textContent = files.length === 1 ? "Pasted 1 image." : "Pasted " + files.length + " images.";
+  const rejected = mergeQuickAddFiles(files);
+  if (rejected.length) {
+    const details = rejected.map((r) => r.file.name + " (" + r.reason + ")").join(", ");
+    els.quickAddMessage.textContent = "Rejected: " + details;
+  } else {
+    els.quickAddMessage.textContent = files.length === 1 ? "Pasted 1 image." : "Pasted " + files.length + " images.";
+  }
 });
 els.quickAddForm.addEventListener("submit", (event) => {
   event.preventDefault();
   createCardFromQuickAdd(event.currentTarget).catch((err) => {
     els.quickAddMessage.textContent = `Failed: ${err.message || err}`;
+    if (quickAddSubmitting) setQuickAddSubmitting(false);
   });
 });
 els.quickAddRepoInput?.addEventListener("input", () => {

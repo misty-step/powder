@@ -1532,6 +1532,8 @@ fn ratified_repository_tier_seed_marks_active_backburner_and_archived_repos() ->
 
     let powder = store.get_repository("powder")?.expect("powder seed");
     assert_eq!(powder.tier, RepositoryTier::Active);
+    let roster = store.get_repository("roster")?.expect("roster seed");
+    assert_eq!(roster.tier, RepositoryTier::Archived);
     let sploot = store.get_repository("sploot")?.expect("sploot seed");
     assert_eq!(sploot.tier, RepositoryTier::Backburner);
     let atlas = store.get_repository("atlas")?.expect("atlas seed");
