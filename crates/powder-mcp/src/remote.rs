@@ -141,6 +141,17 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
                 json!({"status": status}),
             )?
         }
+        "update_relations" => {
+            let id = card_id(args, "card_id")?;
+            client.post(
+                &format!("/api/v1/cards/{id}/relations"),
+                json!({
+                    "related": args["related"].as_array().cloned().unwrap_or_default(),
+                    "blocks": args["blocks"].as_array().cloned().unwrap_or_default(),
+                    "blocked_by": args["blocked_by"].as_array().cloned().unwrap_or_default(),
+                }),
+            )?
+        }
         "add_link" => {
             let id = card_id(args, "card_id")?;
             let label = required_str(args, "label")?;
@@ -169,11 +180,11 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
         }
         "complete_card" => {
             let id = card_id(args, "card_id")?;
-            let proof = required_str(args, "proof")?;
-            client.post(
-                &format!("/api/v1/cards/{id}/complete"),
-                json!({"proof": proof}),
-            )?
+            let mut body = json!({});
+            if let Some(proof) = args["proof"].as_str() {
+                body["proof"] = json!(proof);
+            }
+            client.post(&format!("/api/v1/cards/{id}/complete"), body)?
         }
         other => return Err(format!("unknown tool: {other}")),
     };

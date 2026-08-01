@@ -15,6 +15,7 @@ pub const COMMANDS: &[&str] = &[
     "import-repo",
     "import-github-issues",
     "create-card",
+    "update-relations",
     "list-ready",
     "list-cards",
     "claim",
@@ -44,6 +45,7 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
         [command, rest @ ..] if command == "import-repo" => import_repo(rest),
         [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest),
+        [command, rest @ ..] if command == "update-relations" => update_relations(rest),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest),
         [command, rest @ ..] if command == "claim" => claim(rest),
@@ -89,6 +91,9 @@ pub fn help() -> String {
     help.push_str(
         "  powder list-cards --db ./data/powder.db --status blocked --repo misty-step/example\n",
     );
+    help.push_str(
+        "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000\n",
+    );
     help.push_str("  powder claim 001 --db ./data/powder.db --agent codex\n");
     help.push_str("  powder heartbeat 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder renew-claim 001 --db ./data/powder.db --run run-id --ttl 3600\n");
@@ -103,16 +108,16 @@ pub fn help() -> String {
         "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
     );
     help.push_str(
-        "  powder complete-card 001 --db ./data/powder.db --proof https://example.test/proof\n",
+        "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof]\n",
     );
     help.push_str(
         "  powder update-status 001 --db ./data/powder.db --status running --actor codex\n\n",
     );
     help.push_str(
-        "claim-holder enforcement:\n  add --actor <name> (and --admin to bypass ownership) to \
-         claim/release-claim/renew-claim/heartbeat/update-status/request-input/complete-card \
-         to check the caller against the card's claim holder, matching HTTP/MCP authority \
-         errors. Omitting --actor keeps prior direct-DB-access trust (no enforcement).\n\n",
+        "authority:\n  add --actor <name> to audit status, relation, and completion changes. \
+         Claim impersonation and lease mutations (release/renew/heartbeat/request-input) still \
+         check the caller against the claim holder unless --admin is supplied. Omitting --actor \
+         keeps direct-DB-access trust and records unchecked audit events.\n\n",
     );
     help.push_str("api contract:\n");
     help.push_str(&powder_api::route_summary());
@@ -343,19 +348,48 @@ fn create_card(args: &[String]) -> Result<String, ShellError> {
         .and_then(Priority::parse)
         .unwrap_or_default();
     let mut store = open_store(required_flag(args, "--db")?)?;
-    let card = Card::new(CardId::new(id).map_err(ShellError::from)?, title, body)
+    let mut card = Card::new(CardId::new(id).map_err(ShellError::from)?, title, body)
         .map_err(ShellError::from)?
         .with_status(status)
         .with_priority(priority)
         .with_acceptance(acceptance)
         .with_created_at(now);
+    card.related = card_ids_flag(args, "--related")?;
+    card.blocks = card_ids_flag(args, "--blocks")?;
+    card.blocked_by = card_ids_flag(args, "--blocked-by")?;
     let card = store.upsert_card(card).map_err(store_err)?;
+    store
+        .record_card_event(
+            &card.id,
+            "create",
+            &authority(args).actor_label(),
+            "created card",
+            now,
+        )
+        .map_err(store_err)?;
     Ok(format!(
         "created\t{}\t{}\t{}\n",
         card.id,
         card.priority.as_str(),
         card.status.as_str()
     ))
+}
+
+fn update_relations(args: &[String]) -> Result<String, ShellError> {
+    let now = unix_now();
+    let card_id = positional_card_id(args, "update-relations")?;
+    let mut store = open_store(required_flag(args, "--db")?)?;
+    let card = store
+        .update_relations(
+            &card_id,
+            card_ids_flag(args, "--related")?,
+            card_ids_flag(args, "--blocks")?,
+            card_ids_flag(args, "--blocked-by")?,
+            now,
+            &authority(args),
+        )
+        .map_err(store_err)?;
+    Ok(format!("relations\t{}\n", card.id))
 }
 
 fn list_ready(args: &[String]) -> Result<String, ShellError> {
@@ -586,7 +620,7 @@ fn request_input(args: &[String]) -> Result<String, ShellError> {
 fn complete_card(args: &[String]) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "complete-card")?;
-    let proof = required_flag(args, "--proof")?;
+    let proof = flag_value(args, "--proof");
     let mut store = open_store(required_flag(args, "--db")?)?;
     let card = store
         .complete_card(&card_id, proof, now, &authority(args))
@@ -614,6 +648,16 @@ fn positional_card_id(args: &[String], command: &str) -> Result<CardId, ShellErr
 
 fn required_run_flag(args: &[String]) -> Result<RunId, ShellError> {
     required_flag(args, "--run").and_then(|id| RunId::new(id).map_err(ShellError::from))
+}
+
+fn card_ids_flag(args: &[String], flag: &'static str) -> Result<Vec<CardId>, ShellError> {
+    flag_value(args, flag)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| CardId::new(value).map_err(ShellError::from))
+        .collect()
 }
 
 /// Build the `Authority` a mutation is checked against from `--actor` (and
@@ -702,6 +746,7 @@ mod tests {
         assert!(COMMANDS.contains(&"import-github-issues"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"list-cards"));
+        assert!(COMMANDS.contains(&"update-relations"));
         assert!(COMMANDS.contains(&"claim"));
         assert!(COMMANDS.contains(&"release-claim"));
         assert!(COMMANDS.contains(&"renew-claim"));
@@ -1396,7 +1441,7 @@ mod tests {
         ]))
         .unwrap();
 
-        let denied = run(&args([
+        let status = run(&args([
             "update-status",
             "holder-test",
             "--db",
@@ -1406,37 +1451,77 @@ mod tests {
             "--actor",
             "intruder",
         ]))
-        .unwrap_err();
-        assert!(matches!(denied, ShellError::Forbidden(_)));
-        assert!(denied.to_string().contains("intruder"));
-
-        // an admin actor bypasses claim ownership.
-        run(&args([
-            "update-status",
-            "holder-test",
-            "--db",
-            &db,
-            "--status",
-            "running",
-            "--actor",
-            "operator",
-            "--admin",
-        ]))
         .unwrap();
+        assert!(status.contains("status\tholder-test\trunning"));
 
-        // the real holder is unaffected by the rejected intrusion.
         let completed = run(&args([
             "complete-card",
             "holder-test",
             "--db",
             &db,
-            "--proof",
-            "https://example.test/proof",
             "--actor",
-            "codex",
+            "intruder",
         ]))
         .unwrap();
         assert!(completed.contains("completed\tholder-test\tdone"));
+        let card = run(&args(["get-card", "holder-test", "--db", &db])).unwrap();
+        assert!(card.contains("\"actor\": \"intruder\""));
+        assert!(card.contains("running -> done"));
+    }
+
+    #[test]
+    fn cli_updates_relations_and_get_card_shows_them() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-relations-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        run(&args([
+            "create-card",
+            "--db",
+            &db,
+            "--id",
+            "relation-test",
+            "--title",
+            "Relation test",
+            "--acceptance",
+            "proof exists",
+            "--status",
+            "ready",
+            "--related",
+            "peer-a,peer-b",
+            "--blocks",
+            "child-a",
+            "--blocked-by",
+            "parent-a",
+        ]))
+        .unwrap();
+        let updated = run(&args([
+            "update-relations",
+            "relation-test",
+            "--db",
+            &db,
+            "--related",
+            "peer-c",
+            "--blocks",
+            "",
+            "--blocked-by",
+            "parent-a,parent-b",
+            "--actor",
+            "operator",
+        ]))
+        .unwrap();
+        assert!(updated.contains("relations\trelation-test"));
+
+        let card = run(&args(["get-card", "relation-test", "--db", &db])).unwrap();
+        assert!(card.contains("\"related\": [\n      \"peer-c\""));
+        assert!(card.contains("\"blocked_by\": [\n      \"parent-a\""));
+        assert!(card.contains("\"actor\": \"operator\""));
     }
 
     #[test]

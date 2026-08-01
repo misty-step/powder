@@ -118,6 +118,13 @@ impl Authority {
             },
         }
     }
+
+    pub fn actor_label(&self) -> String {
+        match self {
+            Self::Unchecked => "unchecked".to_string(),
+            Self::Actor { display_name, .. } => display_name.clone(),
+        }
+    }
 }
 
 macro_rules! id_type {
@@ -158,6 +165,7 @@ macro_rules! id_type {
 id_type!(CardId, "card_id");
 id_type!(RunId, "run_id");
 id_type!(ActivityId, "activity_id");
+id_type!(CardEventId, "card_event_id");
 id_type!(LinkId, "link_id");
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -240,37 +248,13 @@ impl CardStatus {
     }
 
     pub fn can_transition_to(self, next: Self) -> bool {
-        if self == next {
-            return true;
-        }
-
-        matches!(
-            (self, next),
-            (Self::Backlog, Self::Ready | Self::Blocked | Self::Abandoned)
-                | (Self::Ready, Self::Claimed | Self::Blocked | Self::Abandoned)
-                | (
-                    Self::Claimed,
-                    Self::Running
-                        | Self::AwaitingInput
-                        | Self::Ready
-                        | Self::Blocked
-                        | Self::Abandoned
-                )
-                | (
-                    Self::Running,
-                    Self::AwaitingInput | Self::Ready | Self::Blocked | Self::Abandoned
-                )
-                | (
-                    Self::AwaitingInput,
-                    Self::Running | Self::Ready | Self::Blocked | Self::Abandoned
-                )
-                | (Self::Blocked, Self::Ready | Self::Abandoned)
-                | (Self::Done, Self::Shipped)
-        )
+        let _ = next;
+        true
     }
 
     pub fn can_complete(self) -> bool {
-        matches!(self, Self::Claimed | Self::Running | Self::AwaitingInput)
+        let _ = self;
+        true
     }
 
     pub fn validate_transition(self, next: Self) -> Result<(), DomainError> {
@@ -388,6 +372,8 @@ pub struct Card {
     pub priority: Priority,
     pub labels: Vec<String>,
     pub assignee: Option<String>,
+    pub related: Vec<CardId>,
+    pub blocks: Vec<CardId>,
     pub blocked_by: Vec<CardId>,
     pub repo: Option<String>,
     pub workspace_path: Option<String>,
@@ -414,6 +400,8 @@ impl Card {
             priority: Priority::default(),
             labels: Vec::new(),
             assignee: None,
+            related: Vec::new(),
+            blocks: Vec::new(),
             blocked_by: Vec::new(),
             repo: None,
             workspace_path: None,
@@ -578,6 +566,19 @@ impl Card {
         Ok(released_claim)
     }
 
+    pub fn apply_relations(
+        &mut self,
+        related: Vec<CardId>,
+        blocks: Vec<CardId>,
+        blocked_by: Vec<CardId>,
+        now: i64,
+    ) {
+        self.related = related;
+        self.blocks = blocks;
+        self.blocked_by = blocked_by;
+        self.updated_at = now;
+    }
+
     pub fn release_claim(&mut self, run_id: &RunId, now: i64) -> Result<Claim, DomainError> {
         self.status.validate_transition(CardStatus::Ready)?;
         let claim = self.matching_active_claim(run_id, now)?.clone();
@@ -650,6 +651,16 @@ pub struct Activity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardEvent {
+    pub id: CardEventId,
+    pub card_id: CardId,
+    pub event_type: String,
+    pub actor: String,
+    pub payload: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
     pub id: LinkId,
     pub card_id: CardId,
@@ -671,6 +682,7 @@ pub struct CardDetail {
     pub card: Card,
     pub runs: Vec<Run>,
     pub activities: Vec<Activity>,
+    pub events: Vec<CardEvent>,
     pub links: Vec<Link>,
     pub comments: Vec<Comment>,
 }
