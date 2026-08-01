@@ -1163,7 +1163,7 @@ impl RepositoryRecord {
 // written -- a fresh install or disaster-recovery restore should not
 // silently regress to a superseded map.
 const RATIFIED_REPOSITORY_TIERS: &[(&str, RepositoryTier)] = &[
-    ("roster", RepositoryTier::Active),
+    ("roster", RepositoryTier::Archived),
     ("bitterblossom", RepositoryTier::Active),
     ("powder", RepositoryTier::Active),
     ("canary", RepositoryTier::Active),
