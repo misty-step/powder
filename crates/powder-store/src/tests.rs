@@ -1,6 +1,7 @@
 use powder_core::{
     AcceptanceCriterion, Authority, Card, CardId, CardSource, CardStatus, CriterionProof,
-    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RunId, RunState,
+    DetailLevel, DomainError, Estimate, Priority, ReadyQuery, RepositoryName, Risk, RunId,
+    RunState,
 };
 
 use crate::schema::SCHEMA;
@@ -1301,6 +1302,83 @@ fn list_ready_includes_ready_cards_from_every_repository_tier() -> Result<()> {
 /// `blocks` edges requiring the opposite sequence. `list_ready` must honor
 /// the topological constraint over the id tiebreak, and report no cycle.
 #[test]
+fn list_ready_filters_repo_estimate_risk_priority_and_reports_stale_cursor_after_departure(
+) -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    for name in ["repo-a", "repo-b"] {
+        store.upsert_repository(
+            RepositoryUpsert {
+                name: name.to_string(),
+                aliases: None,
+                visibility: None,
+                tier: None,
+                import_provenance: None,
+            },
+            1,
+        )?;
+    }
+
+    let mut first = ready_card("filter-1", 1)
+        .with_priority(Priority::P0)
+        .with_estimate(Some(Estimate::S))
+        .with_risk(Some(Risk::Low));
+    first.repo = Some("repo-a".to_string());
+    let mut second = ready_card("filter-2", 2)
+        .with_priority(Priority::P0)
+        .with_estimate(Some(Estimate::S))
+        .with_risk(Some(Risk::Low));
+    second.repo = Some("repo-a".to_string());
+    let mut missing_risk = ready_card("filter-missing-risk", 3)
+        .with_priority(Priority::P0)
+        .with_estimate(Some(Estimate::S));
+    missing_risk.repo = Some("repo-a".to_string());
+    let mut other_repo = ready_card("filter-other-repo", 4)
+        .with_priority(Priority::P0)
+        .with_estimate(Some(Estimate::S))
+        .with_risk(Some(Risk::Low));
+    other_repo.repo = Some("repo-b".to_string());
+    store.import_cards(vec![first, second, missing_risk, other_repo])?;
+
+    let query = ReadyQuery::new(20, 1)
+        .with_repositories([RepositoryName::new("repo-a")?])
+        .with_estimate(Some(Estimate::S))
+        .with_risk(Some(Risk::Low))
+        .with_priority(Some(Priority::P0));
+    let first_page = store.list_ready_page(query.clone())?;
+    assert_eq!(
+        first_page
+            .cards
+            .iter()
+            .map(|card| card.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["filter-1"]
+    );
+    let after = first_page.next_after.clone().expect("second matching card");
+
+    let mut departed = store.get_card(&CardId::new("filter-1")?)?.expect("card");
+    departed.status = CardStatus::Done;
+    store.import_cards(vec![departed])?;
+    let stale = store
+        .list_ready_page_after(query.clone(), Some(&after))
+        .unwrap_err();
+    assert!(stale
+        .to_string()
+        .contains("stale or filtered-out continuation token"));
+    let restarted = store.list_ready_page(query)?;
+    assert_eq!(
+        restarted
+            .cards
+            .iter()
+            .map(|card| card.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["filter-2"]
+    );
+    assert!(restarted.cycle_card_ids.is_empty());
+    Ok(())
+}
+
+#[test]
 fn list_ready_orders_topologically_over_blocks_among_tied_eligible_cards() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
@@ -1983,11 +2061,7 @@ fn migration_15_to_16_drops_autonomy_from_existing_databases() -> Result<()> {
     assert!(review_card.is_ready_at(20, |_| false));
 
     let ready_ids = store
-        .list_ready(ReadyQuery {
-            now: 20,
-            limit: 10,
-            estimate: None,
-        })?
+        .list_ready(ReadyQuery::new(20, 10))?
         .into_iter()
         .map(|card| card.id.to_string())
         .collect::<Vec<_>>();
@@ -2885,6 +2959,87 @@ fn bootstrap_seed_only_discloses_once() -> Result<()> {
     assert!(first.is_some());
     assert!(second.is_none());
     assert_eq!(store.active_api_key_count()?, 1);
+    Ok(())
+}
+
+#[test]
+fn bootstrap_seed_rolls_back_on_file_prepare_failure_and_recovers() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let missing_path = std::env::temp_dir()
+        .join(format!(
+            "powder-bootstrap-missing-{}",
+            nanoid::nanoid!(8, &API_KEY_ALPHABET)
+        ))
+        .join("bootstrap-key");
+    let failed = store.apply_initial_seed_with(
+        1,
+        |key| std::fs::write(&missing_path, &key.raw_key).map_err(StoreError::from),
+        |_| {
+            let _ = std::fs::remove_file(&missing_path);
+        },
+    );
+    assert!(failed.is_err());
+    assert!(!missing_path.exists());
+    assert_eq!(store.active_api_key_count()?, 0);
+
+    let recovery_path = std::env::temp_dir().join(format!(
+        "powder-bootstrap-recovery-{}",
+        nanoid::nanoid!(8, &API_KEY_ALPHABET)
+    ));
+    let recovered = store
+        .apply_initial_seed_with(
+            2,
+            |key| std::fs::write(&recovery_path, &key.raw_key).map_err(StoreError::from),
+            |_| {
+                let _ = std::fs::remove_file(&recovery_path);
+            },
+        )?
+        .expect("seed should remain available after prepare failure");
+    assert_eq!(std::fs::read_to_string(&recovery_path)?, recovered.raw_key);
+    assert!(store.verify_api_key(&recovered.raw_key, 3)?.is_some());
+    std::fs::remove_file(recovery_path)?;
+    Ok(())
+}
+
+#[test]
+fn bootstrap_seed_removes_file_when_database_commit_fails() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    store.connection.execute_batch(
+        "CREATE TABLE commit_parent (id INTEGER PRIMARY KEY);
+         CREATE TABLE commit_child (id INTEGER PRIMARY KEY REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TRIGGER seed_commit_failure AFTER INSERT ON seed_runs
+         BEGIN INSERT INTO commit_child(id) VALUES (1); END;",
+    )?;
+    let key_path = std::env::temp_dir().join(format!(
+        "powder-bootstrap-commit-{}",
+        nanoid::nanoid!(8, &API_KEY_ALPHABET)
+    ));
+    let failed = store.apply_initial_seed_with(
+        1,
+        |key| std::fs::write(&key_path, &key.raw_key).map_err(StoreError::from),
+        |_| {
+            let _ = std::fs::remove_file(&key_path);
+        },
+    );
+    assert!(
+        failed.is_err(),
+        "deferred foreign key must fail transaction commit"
+    );
+    assert!(
+        !key_path.exists(),
+        "prepared file must be removed after commit failure"
+    );
+    assert_eq!(store.active_api_key_count()?, 0);
+
+    store.connection.execute_batch(
+        "DROP TRIGGER seed_commit_failure; DROP TABLE commit_child; DROP TABLE commit_parent;",
+    )?;
+    let recovered = store
+        .apply_initial_seed(2)?
+        .expect("seed should be retryable");
+    assert!(store.verify_api_key(&recovered.raw_key, 3)?.is_some());
     Ok(())
 }
 

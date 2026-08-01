@@ -18,6 +18,8 @@ pub struct ListPage {
     pub cards: Vec<Value>,
     pub total_count: usize,
     pub has_more: bool,
+    pub cycle_card_ids: Vec<CardId>,
+    pub next_after: Option<String>,
 }
 
 /// Same length as `powder_store::identity::API_KEY_PREFIX_LEN` -- the
@@ -307,10 +309,14 @@ pub fn parse_list_page(response: Value) -> Result<ListPage, String> {
         .get("has_more")
         .and_then(Value::as_bool)
         .ok_or_else(|| "remote list response missing has_more".to_string())?;
+    let cycle_card_ids = parse_cycle_card_ids(&response)?;
+    let next_after = parse_next_after(&response)?;
     Ok(ListPage {
         cards,
         total_count,
         has_more,
+        cycle_card_ids,
+        next_after,
     })
 }
 
@@ -414,6 +420,44 @@ impl ClientCardSummary {
     }
 }
 
+fn parse_cycle_card_ids(response: &Value) -> Result<Vec<CardId>, String> {
+    let Some(raw) = response.get("cycle_card_ids") else {
+        return Ok(Vec::new());
+    };
+    let values = raw
+        .as_array()
+        .ok_or_else(|| "remote list response cycle_card_ids must be an array".to_string())?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    "remote list response cycle_card_ids must contain strings".to_string()
+                })
+                .and_then(|id| {
+                    CardId::new(id)
+                        .map_err(|err| format!("remote list response invalid cycle card id: {err}"))
+                })
+        })
+        .collect()
+}
+
+fn parse_next_after(response: &Value) -> Result<Option<String>, String> {
+    response
+        .get("next_after")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|cursor| !cursor.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    "remote list response next_after must be a non-empty string".to_string()
+                })
+        })
+        .transpose()
+}
+
 /// A decoded `list_ready` / `list_cards` response page.
 #[derive(Debug, Clone)]
 pub struct CardSummaryPage {
@@ -421,6 +465,8 @@ pub struct CardSummaryPage {
     pub total_count: usize,
     pub has_more: bool,
     pub excluded_terminal_count: usize,
+    pub cycle_card_ids: Vec<CardId>,
+    pub next_after: Option<String>,
 }
 
 /// Decode a list response into client-card summaries, tolerating unknown
@@ -452,11 +498,15 @@ pub fn parse_card_summary_page(response: Value) -> Result<CardSummaryPage, Strin
     for card in &mut cards {
         card.compute_criteria_counts();
     }
+    let cycle_card_ids = parse_cycle_card_ids(&response)?;
+    let next_after = parse_next_after(&response)?;
     Ok(CardSummaryPage {
         cards,
         total_count,
         has_more,
         excluded_terminal_count,
+        cycle_card_ids,
+        next_after,
     })
 }
 
