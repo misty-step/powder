@@ -505,11 +505,16 @@ struct RawParentRow {
     repo: Option<String>,
 }
 
-fn raw_parent_rows(connection: &Connection) -> Result<Vec<RawParentRow>> {
-    let mut statement =
-        connection.prepare("SELECT rowid, id, parent, repo FROM cards ORDER BY rowid")?;
+fn raw_parent_rows(connection: &Connection, include_hidden: bool) -> Result<Vec<RawParentRow>> {
+    let mut statement = connection.prepare(
+        "SELECT c.rowid, c.id, c.parent, c.repo
+         FROM cards c
+         LEFT JOIN repositories r ON r.name = c.repo
+         WHERE ?1 OR COALESCE(r.visibility, 'visible') = 'visible'
+         ORDER BY c.rowid",
+    )?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([include_hidden as i64], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Value>(1)?,
@@ -658,8 +663,8 @@ fn classify_parent_coverage(
     }
 }
 
-fn scan_parent_graph(connection: &Connection) -> Result<ParentGraphReport> {
-    let rows = raw_parent_rows(connection)?;
+fn scan_parent_graph(connection: &Connection, include_hidden: bool) -> Result<ParentGraphReport> {
+    let rows = raw_parent_rows(connection, include_hidden)?;
     let mut ids = HashSet::new();
     let mut parents = HashMap::new();
     let mut invalid_parent_cards = HashSet::new();
@@ -809,7 +814,13 @@ impl Store {
     /// Return raw parent-edge diagnostics and the full-board coverage
     /// classification shared by the relations doctor and rollup queries.
     pub fn parent_graph_report(&self) -> Result<ParentGraphReport> {
-        scan_parent_graph(&self.connection)
+        scan_parent_graph(&self.connection, true)
+    }
+
+    /// Return parent graph coverage for the same visible repository scope as a
+    /// board read. The relations doctor keeps using the global report above.
+    pub fn parent_graph_report_scoped(&self, include_hidden: bool) -> Result<ParentGraphReport> {
+        scan_parent_graph(&self.connection, include_hidden)
     }
 
     /// Report relation symmetry plus parent-edge drift. Parent findings are
@@ -828,7 +839,7 @@ impl Store {
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let parent_report = scan_parent_graph(&transaction)?;
+            let parent_report = scan_parent_graph(&transaction, true)?;
             let cards = load_relation_cards(&transaction)?;
             let mut issues = find_relation_issues(&cards);
             for issue in &mut issues {
@@ -864,7 +875,7 @@ impl Store {
                 repaired: true,
             });
         }
-        let parent_report = scan_parent_graph(&self.connection)?;
+        let parent_report = scan_parent_graph(&self.connection, true)?;
         let cards = load_relation_cards(&self.connection)?;
         let issues = find_relation_issues(&cards);
         Ok(RelationsDoctorReport {
