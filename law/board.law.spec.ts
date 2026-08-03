@@ -82,7 +82,20 @@ async function waitForSettled(page: Page) {
 
 async function boot(page: Page, mode: (typeof MODES)[number], path = "/board") {
   const errors = collectConsoleErrors(page);
-  await page.addInitScript((m) => localStorage.setItem("pw-mode", m), mode);
+  await page.addInitScript(({ selectedMode, view }) => {
+    localStorage.setItem("pw-mode", selectedMode);
+    if (!sessionStorage.getItem("powder-board-state")) {
+      sessionStorage.setItem("powder-board-state", JSON.stringify({ view }));
+    }
+  }, { selectedMode: mode, view: "both" });
+  await page.goto(path);
+  await waitForSettled(page);
+  return errors;
+}
+
+async function bootFresh(page: Page, mode: (typeof MODES)[number], path = "/board") {
+  const errors = collectConsoleErrors(page);
+  await page.addInitScript((selectedMode) => localStorage.setItem("pw-mode", selectedMode), mode);
   await page.goto(path);
   await waitForSettled(page);
   return errors;
@@ -232,6 +245,7 @@ for (const mode of MODES) {
     await card.waitFor({ state: "visible" });
     await expect(card).toHaveAttribute("href", "/c/001");
     await card.click();
+
     await expect(page).toHaveURL(/\/c\/001$/);
     await expect(page.locator("#powder-card-app")).toBeVisible();
     await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
@@ -243,6 +257,60 @@ for (const mode of MODES) {
   });
 
 }
+test("board · fresh session lands on the Overview rollups view", async ({ page }) => {
+  const errors = await bootFresh(page, "light");
+  await expect(page.locator("#tab-overview")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#main")).toHaveAttribute("data-view", "overview");
+  await expect(page.locator("#overview")).toBeVisible();
+  await assertBoard(page, errors);
+});
+
+test("board · saved Both view still wins over the Overview default", async ({ page }) => {
+  const errors = await boot(page, "light");
+  await expect(page.locator("#tab-both")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#main")).toHaveAttribute("data-view", "both");
+  await assertBoard(page, errors);
+});
+
+test("board · Overview epic rows show counts and freshness and open detail", async ({ page }) => {
+  const errors = await bootFresh(page, "light");
+  const epic = page.locator(".pw-rollup-row").filter({ hasText: "Epic: ship the hierarchy view" });
+  await expect(epic).toBeVisible();
+  await expect(epic).toContainText("ready 1");
+  await expect(epic).toContainText("done 1");
+  await expect(epic).toContainText("criteria 1/2");
+  await expect(epic).toContainText("0 active claims");
+  await expect(epic.locator(".pw-rollup-age")).toContainText("updated");
+  await expect(epic).toContainText("epic-hierarchy");
+  await epic.click();
+  await expect(page).toHaveURL(/\/c\/epic-hierarchy$/);
+  await expect(page.locator("#detail-body")).toContainText("EPIC PROGRESS");
+  await assertBoard(page, errors);
+});
+
+test("board · Overview unsorted row applies its repository filter", async ({ page }) => {
+  const errors = await bootFresh(page, "light");
+  const unsorted = page.locator(".pw-rollup-row[data-rollup-repo='powder']");
+  await expect(unsorted).toContainText("powder · Unsorted");
+  await unsorted.click();
+  await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#main")).toHaveAttribute("data-view", "board");
+  await expect(page.locator("#fg-repo [data-repo='powder']")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("#board")).toContainText("Repo-scoped example card");
+  await assertBoard(page, errors);
+});
+
+test("board · Overview rollup fetch failure stays inline and leaves raw board usable", async ({ page }) => {
+  await page.route("**/api/v1/board/rollups**", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "not-json" }),
+  );
+  const errors = await bootFresh(page, "light");
+  await expect(page.locator("#overview .pw-empty")).toContainText("Overview unavailable");
+  await page.locator("#tab-board").click();
+  await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#lane-ready")).toContainText("Lifecycle example card");
+  await assertBoard(page, errors);
+});
 
 // powder-ui-keyboard-firstrun: card-level keyboard nav -- j/k roving focus
 // across every visible card link, Enter opens the focused card's detail
@@ -801,7 +869,9 @@ test("board · a zero-card repository is hidden until the show-empty toggle is u
   // showAllTiers -- navigate out to a card (which saves board state) and
   // back to the board (which restores it), then confirm the toggle is
   // still engaged instead of silently reset.
-  await page.locator("[data-card-link]").first().click();
+  await page.locator("#tab-board").click();
+  await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
+  await page.locator("#board [data-card-link]").first().click();
   await expect(page.locator("#powder-card-app")).toBeVisible();
   await page.locator("#detail-board-link").click();
   await expect(page.locator("#powder-board-app")).toBeVisible();

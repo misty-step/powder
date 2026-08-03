@@ -115,9 +115,11 @@ const els = {
   main: document.getElementById("main"),
   tabs: document.getElementById("tabs"),
   indicator: document.getElementById("ind"),
+  tabOverview: document.getElementById("tab-overview"),
   tabBacklog: document.getElementById("tab-backlog"),
   tabBoth: document.getElementById("tab-both"),
   tabBoard: document.getElementById("tab-board"),
+  overview: document.getElementById("overview"),
   board: document.getElementById("board"),
   laneSwitch: document.getElementById("lane-switch"),
   railList: document.getElementById("rail-list"),
@@ -146,6 +148,14 @@ const state = {
   readyCards: [],
   readyMeta: { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null },
   repositories: [],
+  // Rollups are an independent overview surface. A failed rollup request
+  // must not reject the raw board fetch.
+  rollups: [],
+  rollupCoverage: null,
+  rollupHasMore: false,
+  rollupNextAfter: null,
+  rollupError: "",
+  rollupLoading: false,
   // powder-board-lane-fetch-cascade: statsTotals backs the lane header
   // counts unconditionally (board_stats is a plain SQL GROUP BY/COUNT(*),
   // immune to the PAGE_LIMIT cap); cardFetchErrors tracks which raw
@@ -155,7 +165,7 @@ const state = {
   cardFetchErrors: {},
   detailCache: new Map(),
   selectedId: null,
-  view: "both",
+  view: "overview",
   showAllTiers: false,
   showEmptyRepos: false,
   loading: true,
@@ -340,88 +350,6 @@ async function refreshReadyForFilters() {
   }
 }
 
-function groupedSearchMatches(matches) {
-  const groups = new Map();
-  for (const match of Array.isArray(matches) ? matches : []) {
-    const card = match && match.card;
-    if (!card || !card.id) continue;
-    const rank = Number(match.rank);
-    const candidate = {
-      card: normalizeCard(card),
-      rank: Number.isFinite(rank) ? rank : Number.POSITIVE_INFINITY,
-      source_kind: String(match.source_kind || "cards"),
-      source_field: String(match.source_field || ""),
-      source_created_at: Number(match.source_created_at || 0),
-      snippet: String(match.snippet || ""),
-    };
-    const previous = groups.get(String(card.id));
-    if (!previous || candidate.rank < previous.rank) groups.set(String(card.id), candidate);
-  }
-  return [...groups.values()].sort((left, right) => left.rank - right.rank || left.card.id.localeCompare(right.card.id));
-}
-
-function renderSearchStatus() {
-  if (!els.searchStatus) return;
-  const query = state.filters.search.trim();
-  const count = groupedSearchMatches(state.searchMatches).length;
-  const totalCount = Number.isFinite(state.searchTotalCount)
-    ? state.searchTotalCount
-    : count;
-  els.searchStatus.textContent = !query
-    ? ""
-    : state.searchLoading
-      ? "Searching…"
-      : state.searchError
-        ? "Search error: " + state.searchError
-        : state.searchHasMore
-          ? `first ${count} of ${totalCount} matches`
-          : count + " result" + (count === 1 ? "" : "s");
-  els.searchStatus.dataset.state = state.searchError ? "error" : state.searchLoading ? "loading" : "ready";
-}
-
-async function requestTextSearch(query) {
-  const normalized = query.trim();
-  const seq = ++searchRequestSeq;
-  state.searchError = "";
-  if (!normalized) {
-    state.searchLoading = false;
-    state.searchMatches = [];
-    state.searchTotalCount = 0;
-    state.searchHasMore = false;
-    state.searchNextAfter = null;
-    renderSearchStatus();
-    render();
-    return;
-  }
-  state.searchLoading = true;
-  renderSearchStatus();
-  render();
-  try {
-    const params = new URLSearchParams({ q: normalized, limit: "100" });
-    const data = await apiJson("/api/v1/cards/search?" + params.toString());
-    if (seq !== searchRequestSeq) return;
-    state.searchMatches = Array.isArray(data.matches) ? data.matches : [];
-    state.searchTotalCount = Number.isInteger(data.total_count) && data.total_count >= 0
-      ? data.total_count
-      : state.searchMatches.length;
-    state.searchHasMore = data.has_more === true;
-    state.searchNextAfter = typeof data.next_after === "string" ? data.next_after : null;
-    state.searchLoading = false;
-    state.searchError = "";
-    renderSearchStatus();
-    render();
-  } catch (err) {
-    if (seq !== searchRequestSeq) return;
-    state.searchLoading = false;
-    state.searchMatches = [];
-    state.searchTotalCount = 0;
-    state.searchHasMore = false;
-    state.searchNextAfter = null;
-    state.searchError = err?.message || String(err);
-    renderSearchStatus();
-    render();
-  }
-}
 
 function groupedSearchMatches(matches) {
   const groups = new Map();
@@ -647,7 +575,7 @@ function renderHomeLink(homeUrl) {
 // lane header count unconditionally, decoupled from whether that lane's
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
-  const [results, readyResult, repositoryData, statsTotals] = await Promise.all([
+  const [results, readyResult, repositoryData, statsTotals, rollupsResult] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
         const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
@@ -657,6 +585,9 @@ async function fetchBoardData() {
     drainReadyPages().catch((error) => ({ error })),
     apiJson("/api/v1/repositories?include_hidden=true"),
     fetchBoardStats(),
+    fetchBoardRollups()
+      .then((data) => ({ data }))
+      .catch((error) => ({ error })),
   ]);
   const cardGroups = [];
   const cardFetchErrors = {};
@@ -665,6 +596,7 @@ async function fetchBoardData() {
     else cardFetchErrors[RAW_STATUSES[index]] = result.reason?.message || String(result.reason);
   });
   if (readyResult.error) cardFetchErrors.ready = readyResult.error.message || String(readyResult.error);
+  const rollups = rollupsResult.data || {};
   return {
     cards: dedupeCards(cardGroups.flat()).map(normalizeCard),
     readyCards: readyResult.error ? [] : readyResult.cards.map(normalizeCard),
@@ -672,6 +604,11 @@ async function fetchBoardData() {
     repositories: normalizeRepositories(repositoryData.repositories || []),
     statsTotals,
     cardFetchErrors,
+    rollups: Array.isArray(rollups.rollups) ? rollups.rollups : [],
+    rollupCoverage: rollups.coverage || null,
+    rollupHasMore: rollups.has_more === true,
+    rollupNextAfter: typeof rollups.next_after === "string" ? rollups.next_after : null,
+    rollupError: rollupsResult.error ? rollupsResult.error.message || String(rollupsResult.error) : "",
   };
 }
 
@@ -688,6 +625,31 @@ async function fetchBoardStats() {
     return (data && data.totals) || {};
   } catch (_err) {
     return {};
+  }
+}
+
+async function fetchBoardRollups(after = null) {
+  const params = new URLSearchParams({ limit: "100" });
+  if (after) params.set("after", after);
+  return apiJson(`/api/v1/board/rollups?${params.toString()}`);
+}
+
+async function loadMoreRollups() {
+  if (!state.rollupHasMore || state.rollupLoading) return;
+  state.rollupLoading = true;
+  renderOverview();
+  try {
+    const data = await fetchBoardRollups(state.rollupNextAfter);
+    state.rollups = [...state.rollups, ...(Array.isArray(data.rollups) ? data.rollups : [])];
+    state.rollupCoverage = data.coverage || state.rollupCoverage;
+    state.rollupHasMore = data.has_more === true;
+    state.rollupNextAfter = typeof data.next_after === "string" ? data.next_after : null;
+    state.rollupError = "";
+  } catch (error) {
+    state.rollupError = error?.message || String(error);
+  } finally {
+    state.rollupLoading = false;
+    renderOverview();
   }
 }
 
@@ -710,6 +672,11 @@ async function loadBoard(options = {}) {
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
+    state.rollups = data.rollups || [];
+    state.rollupCoverage = data.rollupCoverage || null;
+    state.rollupHasMore = data.rollupHasMore === true;
+    state.rollupNextAfter = data.rollupNextAfter || null;
+    state.rollupError = data.rollupError || "";
     state.loading = false;
     state.error = "";
     state.errorKind = "";
@@ -817,6 +784,11 @@ async function refreshLive() {
     state.repositories = data.repositories;
     state.statsTotals = data.statsTotals;
     state.cardFetchErrors = data.cardFetchErrors;
+    state.rollups = data.rollups || [];
+    state.rollupCoverage = data.rollupCoverage || null;
+    state.rollupHasMore = data.rollupHasMore === true;
+    state.rollupNextAfter = data.rollupNextAfter || null;
+    state.rollupError = data.rollupError || "";
     state.detailCache.clear();
     buildFilters();
     renderRepositorySettings();
@@ -2123,6 +2095,124 @@ function laneStatTotal(displayLaneName) {
   return 0;
 }
 
+function relativeAge(seconds) {
+  const timestamp = Number(seconds);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "age unknown";
+  const age = Math.max(0, Date.now() / 1000 - timestamp);
+  if (age < 60) return "just now";
+  if (age < 3600) return `${Math.floor(age / 60)}m ago`;
+  if (age < 86400) return `${Math.floor(age / 3600)}h ago`;
+  if (age < 2_592_000) return `${Math.floor(age / 86400)}d ago`;
+  if (age < 31_536_000) return `${Math.floor(age / 2_592_000)}mo ago`;
+  return `${Math.floor(age / 31_536_000)}y ago`;
+}
+
+function rollupStatusCountsHTML(counts) {
+  const known = RAW_STATUSES.filter((status) => counts && counts[status]);
+  const extra = Object.keys(counts || {}).filter((status) => !RAW_STATUSES.includes(status));
+  return [...known, ...extra]
+    .map((status) => {
+      const count = Number(counts[status]);
+      return `<span class="pw-chip">${escapeHtml(statusText(status))} ${escapeHtml(String(Number.isFinite(count) ? count : 0))}</span>`;
+    })
+    .join("");
+}
+
+function rollupFreshnessHTML(freshness) {
+  if (!freshness) return `<span class="pw-rollup-age">updated age unknown</span>`;
+  const oldest = Number(freshness.oldest_update);
+  const newest = Number(freshness.newest_update);
+  const staleEnd =
+    Number.isFinite(oldest) &&
+    Number.isFinite(newest) &&
+    Math.abs(newest - oldest) >= 86400
+      ? ` · oldest ${escapeHtml(relativeAge(oldest))}`
+      : "";
+  return `<span class="pw-rollup-age">updated ${escapeHtml(relativeAge(newest))}${staleEnd}</span>`;
+}
+
+function rollupRowHTML(rollup) {
+  const kind = String(rollup.kind || "");
+  const criteria = `${Number(rollup.criteria_checked) || 0}/${Number(rollup.criteria_total) || 0}`;
+  const claims = Number(rollup.active_claims) || 0;
+  const chips = rollupStatusCountsHTML(rollup.status_counts);
+  const stats = `
+    <span class="pw-rollup-stat">criteria ${escapeHtml(criteria)}</span>
+    <span class="pw-rollup-stat">${escapeHtml(String(claims))} active claim${claims === 1 ? "" : "s"}</span>
+    ${rollupFreshnessHTML(rollup.freshness)}
+  `;
+  if (kind === "epic") {
+    const cardId = String(rollup.card_id || "");
+    const title = String(rollup.title || cardId);
+    return `
+      <a class="pw-rollup-row" href="${escapeHtml(cardHref(cardId))}" data-card-link>
+        <span class="pw-rollup-main">
+          <span class="pw-rollup-kicker">EPIC</span>
+          <span class="pw-rollup-title">${escapeHtml(title)}</span>
+          <span class="pw-rollup-id">${escapeHtml(cardId)}</span>
+        </span>
+        <span class="pw-rollup-details">
+          <span class="pw-repo-counts">${chips}</span>
+          <span class="pw-rollup-stats">${stats}</span>
+        </span>
+      </a>
+    `;
+  }
+  const repo = rollup.repo ? canonicalRepoLabel(rollup.repo) : "General";
+  const filterRepo = rollup.repo ? canonicalRepoLabel(rollup.repo) || "general" : "general";
+  return `
+    <button class="pw-rollup-row" type="button" data-rollup-repo="${escapeHtml(filterRepo)}">
+      <span class="pw-rollup-main">
+        <span class="pw-rollup-kicker">UNSORTED</span>
+        <span class="pw-rollup-title">${escapeHtml(repo)} · Unsorted</span>
+      </span>
+      <span class="pw-rollup-details">
+        <span class="pw-repo-counts">${chips}</span>
+        <span class="pw-rollup-stats">${stats}</span>
+      </span>
+    </button>
+  `;
+}
+
+function rollupCoverageWarningHTML(coverage) {
+  if (!coverage || (coverage.complete !== false && Number(coverage.parent_issue_count) <= 0)) return "";
+  const total = Number(coverage.total_cards) || 0;
+  const accounted = Number(coverage.accounted_cards) || 0;
+  const unaccounted = Math.max(0, total - accounted);
+  const dangling = Number(coverage.parent_issue_count) || 0;
+  return `<p class="pw-epic-warn"><svg class="pw-icon" aria-hidden="true"><use href="#i-alert"></use></svg>${escapeHtml(String(unaccounted))} unaccounted card${unaccounted === 1 ? "" : "s"}; ${escapeHtml(String(dangling))} dangling parent issue${dangling === 1 ? "" : "s"}.</p>`;
+}
+
+function renderOverview() {
+  if (!els.overview) return;
+  if (state.rollupError) {
+    els.overview.innerHTML = empty(`Overview unavailable: ${state.rollupError}`);
+    return;
+  }
+  const rows = state.rollups.map(rollupRowHTML).join("");
+  const more = state.rollupHasMore
+    ? `<button class="pw-button pw-button-quiet pw-rollup-more" type="button" data-rollup-load-more${state.rollupLoading ? " disabled" : ""}>${state.rollupLoading ? "Loading…" : "Load more"}</button>`
+    : "";
+  els.overview.innerHTML = `
+    <header class="pw-overview-head">
+      <p class="pw-section-head">OVERVIEW</p>
+      <p class="pw-chrome">EPICS AND UNSORTED WORK</p>
+    </header>
+    ${rollupCoverageWarningHTML(state.rollupCoverage)}
+    ${rows || empty("No epics or unsorted cards.")}
+    ${more}
+  `;
+}
+
+function selectRollupRepo(repo) {
+  state.filters.repos = new Set([repo]);
+  saveBoardState();
+  buildFilters();
+  setView("board");
+  render();
+  void refreshReadyForFilters();
+}
+
 function render() {
   if (state.loading) {
     renderLoading();
@@ -2134,6 +2224,7 @@ function render() {
   }
 
   renderSearchStatus();
+  renderOverview();
   const buckets = bucket();
   const failedLanes = failedDisplayLanes();
   els.laneReady.innerHTML = failedLanes.has("ready")
@@ -2159,6 +2250,7 @@ function render() {
 
 function renderLoading() {
   const loading = '<div class="pw-skel" aria-hidden="true"><i></i><i></i><i></i></div>';
+  els.overview.innerHTML = loading;
   els.railList.innerHTML = loading;
   els.laneReady.innerHTML = loading;
   els.laneInProgress.innerHTML = loading;
@@ -2178,6 +2270,7 @@ function renderFailure() {
       <p>${escapeHtml(state.error)}</p>
     </div>
   `;
+  els.overview.innerHTML = message;
   els.railList.innerHTML = message;
   els.laneReady.innerHTML = message;
   els.laneInProgress.innerHTML = message;
@@ -2199,7 +2292,8 @@ function renderRail(cards) {
     groups.push(
       `<a id="${escapeHtml(anchorId(card.id))}" class="pw-rail-row" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
         <span class="pw-rail-id">${escapeHtml(card.id)} · ${escapeHtml(cleanPriority(card.priority))}</span>
-        ${escapeHtml(card.title)}
+        <span class="pw-rail-title">${escapeHtml(card.title)}</span>
+        <span class="pw-rail-age">${escapeHtml(relativeAge(card.updated_at))}</span>
       </a>`,
     );
   }
@@ -2256,7 +2350,7 @@ function restoreBoardState() {
     const raw = sessionStorage.getItem(BOARD_STATE_KEY);
     if (!raw) return;
     const saved = JSON.parse(raw);
-    if (["backlog", "both", "board"].includes(saved.view)) {
+    if (["overview", "backlog", "both", "board"].includes(saved.view)) {
       state.view = saved.view;
     }
     if (Number.isFinite(saved.railShare)) {
@@ -2822,16 +2916,17 @@ function toggleFilters(force) {
 }
 
 function setView(view) {
-  const targetShare = { backlog: 100, both: 24, board: 0 }[view] ?? 24;
-  state.view = ["backlog", "both", "board"].includes(view) ? view : "both";
-  els.main.dataset.view = view;
+  const targetShare = { overview: 24, backlog: 100, both: 24, board: 0 }[view] ?? 24;
+  state.view = ["overview", "backlog", "both", "board"].includes(view) ? view : "overview";
+  els.main.dataset.view = state.view;
   const tabs = {
+    overview: els.tabOverview,
     backlog: els.tabBacklog,
     both: els.tabBoth,
     board: els.tabBoard,
   };
   for (const [key, tab] of Object.entries(tabs)) {
-    tab.setAttribute("aria-selected", String(key === view));
+    tab.setAttribute("aria-selected", String(key === state.view));
   }
   // powder-903: the rail/board split used to be animated frame-by-frame in
   // JS (a `requestAnimationFrame` loop writing `--pw-rail-share` every
@@ -2846,6 +2941,7 @@ function setView(view) {
   // prefers-reduced-motion via a plain CSS media query instead of a JS
   // branch.
   setRailShare(targetShare);
+  saveBoardState();
   placeIndicator();
 }
 
@@ -3113,9 +3209,19 @@ els.sort.addEventListener("change", (event) => {
   state.filters.sort = event.target.value;
   render();
 });
+els.tabOverview.addEventListener("click", () => setView("overview"));
 els.tabBacklog.addEventListener("click", () => setView("backlog"));
 els.tabBoth.addEventListener("click", () => setView("both"));
 els.tabBoard.addEventListener("click", () => setView("board"));
+els.overview.addEventListener("click", (event) => {
+  const loadMore = event.target.closest("[data-rollup-load-more]");
+  if (loadMore) {
+    void loadMoreRollups();
+    return;
+  }
+  const row = event.target.closest("[data-rollup-repo]");
+  if (row) selectRollupRepo(row.dataset.rollupRepo);
+});
 els.laneSwitch.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-lane]");
   if (!button) return;

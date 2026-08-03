@@ -49,6 +49,26 @@ card carries the `papercut` label. If `service` matches a repository entity
 the card is homed there; otherwise a `service:<name>` label is added. Grooms
 sweep with `list_cards label:papercut` (MCP) or
 `powder list-cards --label papercut` (CLI).
+Leave `repo` unset for cross-repo work, process work, operations, and any
+work without one home repository. These cards land in the `General`
+catch-all bucket.
+
+## Groom cadence
+
+The curator runs this sweep outside Powder. Powder never enforces lifecycle.
+
+1. Read backlog pages with `list_cards` using `status: backlog` and a normal
+   limit. Apply `updated_before=<threshold>` to each card's `updated_at`.
+   The CLI form is `powder list-cards --status backlog --updated-before
+   <threshold>`; its time flags filter only the fetched page.
+2. Review each stale card. Call `update_card` with `status: abandoned`. Add a
+   comment that names the sweep and records the audit result. Powder audits
+   the change, and the curator can revive the card. Never hard-delete a card.
+3. Flag contract violations. List `ready` and `in_progress` cards. Inspect
+   each card's claim state with `get_card`. Count cards with no active claim.
+4. Emit one operator digest with the stale, abandoned, and claim-violation
+   counts.
+
 
 ## Expected MCP Tools
 
