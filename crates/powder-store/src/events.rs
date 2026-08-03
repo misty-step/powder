@@ -396,9 +396,25 @@ impl Store {
     /// Counts dead-lettered deliveries without paging through them --
     /// `/readyz` needs only the count to compare against its backlog
     /// threshold, not the payloads `list_dead_letter_deliveries` fetches.
+    ///
+    /// Only deliveries on *enabled* subscriptions count. A disabled
+    /// subscription's dead letters are parked: `replay_dead_letters` skips
+    /// them and the delivery loop never picks them up, so no operator
+    /// action short of re-enabling the subscription can drain them.
+    /// Counting parked rows kept `/readyz` red forever after an operator
+    /// deliberately disabled a structurally broken receiver -- observed
+    /// live 2026-08-03 (87 parked letters on a DNS-dead receiver).
+    /// Disabling a subscription now truthfully removes its backlog from
+    /// the readiness gate while `list_dead_letter_deliveries` still shows
+    /// every row.
     pub fn count_dead_letter_deliveries(&self) -> Result<i64> {
         Ok(self.connection.query_row(
-            "SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'dead_letter'",
+            "SELECT COUNT(*)
+             FROM webhook_deliveries deliveries
+             JOIN event_subscriptions subscriptions
+               ON subscriptions.id = deliveries.subscription_id
+             WHERE deliveries.status = 'dead_letter'
+               AND subscriptions.disabled_at IS NULL",
             [],
             |row| row.get(0),
         )?)

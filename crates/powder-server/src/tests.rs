@@ -5370,7 +5370,8 @@ async fn readyz_fails_when_dead_letter_backlog_meets_threshold() {
     let app = app(state.clone());
 
     let (webhook_url, _receiver) = spawn_webhook_capture(1, 500);
-    app.clone()
+    let created = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/events/subscriptions",
@@ -5379,6 +5380,10 @@ async fn readyz_fails_when_dead_letter_backlog_meets_threshold() {
         ))
         .await
         .unwrap();
+    let subscription_id = response_json(created).await["subscription"]["id"]
+        .as_str()
+        .expect("subscription id")
+        .to_string();
     app.clone()
         .oneshot(json_request(
             Method::POST,
@@ -5416,6 +5421,7 @@ async fn readyz_fails_when_dead_letter_backlog_meets_threshold() {
     }
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -5430,6 +5436,37 @@ async fn readyz_fails_when_dead_letter_backlog_meets_threshold() {
     assert_eq!(body["ok"], false);
     assert_eq!(body["dead_letter_count"], 1);
     assert_eq!(body["dead_letter_threshold"], 1);
+
+    // Disabling the structurally broken subscription parks its dead
+    // letters: `replay_dead_letters` skips them and the delivery loop never
+    // drains them, so they are no longer operator-actionable and must stop
+    // tripping the readiness gate (observed live 2026-08-03: 87 parked
+    // letters on a DNS-dead receiver kept `/readyz` red forever).
+    let disabled = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/events/subscriptions/{subscription_id}/disable"),
+            Some(&raw_key),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let recovered = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let recovered_body = response_json(recovered).await;
+    assert_eq!(recovered_body["ok"], true);
+    assert_eq!(recovered_body["dead_letter_count"], 0);
 }
 
 /// A poisoned store mutex is recovered (not fatal) -- ordinary routes keep

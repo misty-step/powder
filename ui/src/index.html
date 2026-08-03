@@ -69,8 +69,9 @@
       <span class="pw-name">POWDER</span>
     </div>
     <nav class="pw-tabs" id="tabs" role="tablist" aria-label="views">
+      <button id="tab-overview" type="button" role="tab" aria-selected="true">Overview</button>
       <button id="tab-backlog" type="button" role="tab" aria-selected="false">Backlog</button>
-      <button id="tab-both" type="button" role="tab" aria-selected="true">Both</button>
+      <button id="tab-both" type="button" role="tab" aria-selected="false">Both</button>
       <button id="tab-board" type="button" role="tab" aria-selected="false">Board</button>
       <span class="pw-nav-ind" id="ind"></span>
     </nav>
@@ -223,7 +224,8 @@
     <button class="pw-filter-clear" id="filter-clear" type="button">clear</button>
   </div>
 
-  <div class="pw-main" id="main" data-view="both">
+  <div class="pw-main" id="main" data-view="overview">
+    <section class="pw-overview" id="overview" aria-label="overview"></section>
     <aside class="pw-rail-wrap" aria-label="backlog">
       <div class="pw-rail-inner">
         <div class="pw-rail-head">

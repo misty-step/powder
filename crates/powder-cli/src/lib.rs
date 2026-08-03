@@ -148,6 +148,8 @@ const LIST_CARDS_FLAGS: &[&str] = &[
     "--estimate",
     "--repo",
     "--label",
+    "--updated-after",
+    "--updated-before",
 ];
 const BOARD_ROLLUPS_FLAGS: &[&str] = &["--db", "--limit", "--after", "--include-hidden", "--json"];
 const SEARCH_FLAGS: &[&str] = &[
@@ -621,7 +623,10 @@ pub fn help() -> String {
         "  powder update-card canary-001 --db ./data/powder.db --acceptance \"a\" --acceptance \"b\"  (repeatable; replaces the full criteria list)\n",
     );
     help.push_str(
-        "  powder list-cards --db ./data/powder.db --status ready --repo misty-step/example\n",
+        "  powder list-cards --db ./data/powder.db --status ready --repo misty-step/example --updated-after 1754000000 --updated-before 1754003600\n",
+    );
+    help.push_str(
+        "  Time flags on list-cards use Unix seconds and filter only the fetched page. Request more pages for a complete sweep.\n",
     );
     help.push_str(
         "  powder board-rollups --json --db ./data/powder.db --limit 20 [--after e:epic] [--include-hidden]\n",
@@ -1350,14 +1355,7 @@ fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError>
     let risk = flag_value(args, "--risk")
         .map(parse_risk_flag)
         .transpose()?;
-    let parse_time = |flag: &'static str| -> Result<Option<i64>, ShellError> {
-        flag_value(args, flag)
-            .map(|raw| {
-                raw.parse::<i64>()
-                    .map_err(|err| ShellError::Invalid(format!("invalid {flag}: {err}")))
-            })
-            .transpose()
-    };
+    let parse_time = |flag: &'static str| parse_unix_time_flag(args, flag);
     let source_kind = flag_value(args, "--source-kind")
         .or_else(|| flag_value(args, "--source"))
         .map(str::to_string);
@@ -1487,6 +1485,8 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         .transpose()?;
     let repo = flag_value(args, "--repo").map(str::to_string);
     let label = flag_value(args, "--label").map(str::to_string);
+    let updated_after = parse_unix_time_flag(args, "--updated-after")?;
+    let updated_before = parse_unix_time_flag(args, "--updated-before")?;
     let cards = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         let filter = CardFilter {
@@ -1499,7 +1499,9 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
             // existing whole-board behavior unchanged.
             include_terminal: true,
         };
-        json!(store.list_cards(&filter, limit).map_err(store_err)?)
+        let mut cards = json!(store.list_cards(&filter, limit).map_err(store_err)?);
+        filter_cards_by_updated_at(&mut cards, updated_after, updated_before);
+        cards
     } else if let Some(client) = remote_env.client() {
         let mut query = format!("limit={limit}");
         if let Some(status) = status {
@@ -1514,10 +1516,13 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         if let Some(label) = &label {
             query.push_str(&format!("&label={}", urlencode(label)));
         }
-        let page = client
-            .get(&format!("/api/v1/cards?{query}"))
-            .map_err(remote_err)?;
-        list_page_cards(page)?
+        let mut cards = list_page_cards(
+            client
+                .get(&format!("/api/v1/cards?{query}"))
+                .map_err(remote_err)?,
+        )?;
+        filter_cards_by_updated_at(&mut cards, updated_after, updated_before);
+        cards
     } else {
         return Err(missing_transport("list-cards"));
     };
@@ -2766,6 +2771,26 @@ fn list_page_cards(value: Value) -> Result<Value, ShellError> {
     Ok(Value::Array(page.cards))
 }
 
+fn filter_cards_by_updated_at(
+    cards: &mut Value,
+    updated_after: Option<i64>,
+    updated_before: Option<i64>,
+) {
+    if updated_after.is_none() && updated_before.is_none() {
+        return;
+    }
+    let Some(cards) = cards.as_array_mut() else {
+        return;
+    };
+    cards.retain(|card| {
+        let Some(updated_at) = card.get("updated_at").and_then(Value::as_i64) else {
+            return false;
+        };
+        updated_after.is_none_or(|threshold| updated_at >= threshold)
+            && updated_before.is_none_or(|threshold| updated_at <= threshold)
+    });
+}
+
 fn json_string(value: &Value, field: &'static str) -> Result<String, ShellError> {
     value
         .get(field)
@@ -2806,6 +2831,17 @@ fn optional_ttl(args: &[String]) -> Result<u64, ShellError> {
 
 fn parse_limit(args: &[String]) -> Option<usize> {
     flag_value(args, "--limit").and_then(|value| value.parse::<usize>().ok())
+}
+
+fn parse_unix_time_flag(args: &[String], flag: &'static str) -> Result<Option<i64>, ShellError> {
+    if !has_flag(args, flag) {
+        return Ok(None);
+    }
+    let raw =
+        flag_value(args, flag).ok_or_else(|| ShellError::Invalid(format!("missing {flag}")))?;
+    raw.parse::<i64>()
+        .map(Some)
+        .map_err(|err| ShellError::Invalid(format!("invalid {flag}: {err}")))
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
@@ -3061,6 +3097,8 @@ mod tests {
     #[test]
     fn cli_help_examples_only_advertise_current_statuses() {
         let help = help();
+        assert!(help.contains("--updated-after"));
+        assert!(help.contains("--updated-before"));
         let status_values = help
             .lines()
             .filter_map(|line| {
@@ -3775,6 +3813,71 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, ShellError::Invalid(_)));
+    }
+
+    #[test]
+    fn cli_list_cards_filters_by_updated_at_on_the_fetched_page() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-list-cards-updated-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+
+        run(&args(["init-db", "--db", &db])).unwrap();
+        for (id, title) in [("stale-1", "Stale ticket"), ("fresh-1", "Fresh ticket")] {
+            run(&args([
+                "create-card",
+                "--db",
+                &db,
+                "--id",
+                id,
+                "--title",
+                title,
+                "--status",
+                "backlog",
+            ]))
+            .unwrap();
+        }
+        let mut store = open_store(&db).unwrap();
+        for (id, updated_at) in [("stale-1", 100), ("fresh-1", 200)] {
+            let card_id = CardId::new(id).unwrap();
+            let mut card = store.get_card(&card_id).unwrap().unwrap();
+            card.updated_at = updated_at;
+            store
+                .upsert_card_with_events(card, "test", updated_at)
+                .unwrap();
+        }
+
+        let stale = run(&args([
+            "list-cards",
+            "--db",
+            &db,
+            "--updated-before",
+            "150",
+        ]))
+        .unwrap();
+        assert!(stale.contains("stale-1"));
+        assert!(!stale.contains("fresh-1"));
+
+        let fresh = run(&args(["list-cards", "--db", &db, "--updated-after", "150"])).unwrap();
+        assert!(fresh.contains("fresh-1"));
+        assert!(!fresh.contains("stale-1"));
+
+        let invalid = run(&args([
+            "list-cards",
+            "--db",
+            &db,
+            "--updated-before",
+            "not-a-time",
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            invalid,
+            ShellError::Invalid(message) if message.starts_with("invalid --updated-before:")
+        ));
     }
 
     #[test]
@@ -5227,6 +5330,37 @@ mod tests {
             requests[0].path,
             "/api/v1/board/rollups?limit=1&include_hidden=false&after=e%3Aepic"
         );
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
+        );
+    }
+
+    #[test]
+    fn cli_list_cards_remote_filters_updated_at_on_the_fetched_page() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "cards": [
+                    {"id": "stale-remote", "priority": "p1", "status": "backlog", "title": "Stale remote", "updated_at": 100},
+                    {"id": "fresh-remote", "priority": "p2", "status": "backlog", "title": "Fresh remote", "updated_at": 200}
+                ],
+                "total_count": 2,
+                "has_more": false
+            }),
+        )]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+        let output = run_with_env(
+            &args(["list-cards", "--limit", "2", "--updated-before", "150"]),
+            &env,
+        )
+        .unwrap();
+        assert!(output.contains("stale-remote"));
+        assert!(!output.contains("fresh-remote"));
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v1/cards?limit=2");
         assert_eq!(
             requests[0].authorization.as_deref(),
             Some("Bearer sk_powder_test")

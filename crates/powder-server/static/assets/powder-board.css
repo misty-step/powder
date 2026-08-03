@@ -1093,6 +1093,115 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   display: grid;
 }
 
+.pw-main[data-view="overview"] {
+  display: block;
+  overflow-y: auto;
+}
+
+.pw-main[data-view="overview"] .pw-overview {
+  display: block;
+}
+
+.pw-main[data-view="overview"] .pw-rail-wrap, .pw-main[data-view="overview"] .pw-board {
+  display: none;
+}
+
+.pw-overview {
+  box-sizing: border-box;
+  max-width: 58rem;
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 2rem 2.2rem;
+  display: none;
+}
+
+.pw-overview-head {
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  display: flex;
+}
+
+.pw-overview-head p {
+  margin: 0;
+}
+
+.pw-rollup-row {
+  box-sizing: border-box;
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  width: 100%;
+  color: var(--color-ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  background: none;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 1rem 0;
+  text-decoration: none;
+  display: flex;
+}
+
+.pw-rollup-row:hover, .pw-rollup-row:focus-visible {
+  color: var(--color-ink);
+  background: var(--color-wash);
+}
+
+.pw-rollup-main, .pw-rollup-details {
+  align-items: center;
+  display: flex;
+}
+
+.pw-rollup-main {
+  flex: 1;
+  gap: .6rem;
+  min-width: 12rem;
+}
+
+.pw-rollup-kicker, .pw-rollup-id, .pw-rollup-age, .pw-rollup-stat {
+  color: var(--color-muted);
+  font-size: var(--text-sm);
+}
+
+.pw-rollup-kicker, .pw-rollup-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.pw-rollup-kicker {
+  color: var(--color-faint);
+  letter-spacing: .06em;
+}
+
+.pw-rollup-title {
+  font-weight: var(--pw-weight-medium);
+}
+
+.pw-rollup-details {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: .7rem;
+}
+
+.pw-rollup-details .pw-repo-counts, .pw-rollup-stats {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: .45rem;
+  display: flex;
+}
+
+.pw-rollup-stat {
+  white-space: nowrap;
+}
+
+.pw-rollup-more {
+  margin-top: 1rem;
+}
+
 .pw-rail-wrap {
   border-right: 1px solid var(--color-line);
   min-width: 0;
@@ -1184,6 +1293,17 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   font-family: var(--font-mono);
   letter-spacing: .06em;
   color: var(--color-faint);
+  font-size: 11px;
+  display: block;
+}
+
+.pw-rail-title {
+  display: block;
+}
+
+.pw-rail-age {
+  color: var(--color-faint);
+  font-family: var(--font-mono);
   font-size: 11px;
   display: block;
 }
@@ -1996,6 +2116,25 @@ html:not([data-pw-route="card"]) .pw-detail-app {
     min-width: var(--pw-touch-target);
     min-height: var(--pw-touch-target);
     height: var(--pw-touch-target);
+  }
+
+  .pw-overview {
+    padding: 1.2rem;
+  }
+
+  .pw-rollup-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+
+  .pw-rollup-main {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .pw-rollup-details {
+    justify-content: flex-start;
   }
 
   .pw-filters {
