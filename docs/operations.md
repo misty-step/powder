@@ -309,7 +309,14 @@ claim lifecycle, card authoring, comments, links, answer-loop writes, and key
 management always require a bearer key in `api-key` mode. Use
 `tailscale-header` only behind a trusted ingress that injects one of the
 supported tailnet identity headers and strips spoofed client-supplied identity
-headers. Use `none` only for local development.
+headers. Use `none` for local development or for a deployment whose entire
+network perimeter is the authorization boundary: the server accepts `none`
+only on a loopback bind, so every path to it must traverse a private ingress
+(for example a tailnet-only `tailscale serve` proxy). The operator's
+production instance runs this posture intentionally -- see
+`docs/production-deploy.md`. In `none` mode every request (including admin
+routes) is authorized as `anonymous`; attribution rides in request payload
+actor fields, not the auth principal.
 
 ### Trust boundary for `tailscale-header` auth (powder-tailnet-backstop)
 
