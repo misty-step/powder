@@ -19,7 +19,7 @@ const STORAGE_KEY = "powder-api-key";
 const BOARD_STATE_KEY = "powder-board-state";
 const BOARD_CACHE_KEY = "powder-board-cache";
 const KEY_MINT_COMMAND =
-  "powder key-create --db /data/powder.db --name operator --scope admin --show-secret";
+  "powder key-create --db <path-to-powder.db> --name operator --scope admin --show-secret";
 
 // powder-epic-answer-board: live board updates over SSE (GET
 // /api/v1/events/tail). Simplest honest design (see PR design notes) --
@@ -92,10 +92,13 @@ const els = {
   repoCreateVisibility: document.getElementById("repo-create-visibility"),
   repoCreateTier: document.getElementById("repo-create-tier"),
   settingsToggle: document.getElementById("settings-toggle"),
+  repoSettings: document.getElementById("repo-settings"),
   apiKeyForm: document.getElementById("api-key-form"),
   apiKeyInput: document.getElementById("api-key-input"),
   clearApiKey: document.getElementById("clear-api-key"),
   pasteApiKey: document.getElementById("paste-api-key"),
+  saveApiKey: document.getElementById("save-api-key"),
+  mintHint: document.getElementById("mint-hint"),
   authIntro: document.getElementById("auth-intro"),
   authMessage: document.getElementById("auth-message"),
   mintCommand: document.getElementById("mint-command"),
@@ -144,6 +147,10 @@ const state = {
   authMode: "unknown",
   publicReads: null,
   needsSetup: false,
+  // True after a board read came back 401/403: this browser cannot read the
+  // instance, so the settings drawer collapses to a focused connect card
+  // (the repository editor is unusable and misleading in that state).
+  readDenied: false,
   cards: [],
   readyCards: [],
   readyMeta: { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null },
@@ -680,6 +687,12 @@ async function loadBoard(options = {}) {
     state.loading = false;
     state.error = "";
     state.errorKind = "";
+    if (state.readDenied) {
+      state.readDenied = false;
+      renderAuthIntro();
+      renderLiveIndicator();
+      if (!els.authPanel.hidden) showAuth();
+    }
     state.detailCache.clear();
     saveBoardCache();
     updateSuccessConnection();
@@ -696,7 +709,9 @@ async function loadBoard(options = {}) {
       const failure = classifyFailure(err);
       updateConnection(failure.connectionKind, failure.connectionLabel);
       if (failure.kind === "auth") {
-        showAuth(failure.action);
+        state.readDenied = true;
+        showAuth();
+        renderLiveIndicator();
       } else if (!silentRetryTimer) {
         silentRetryTimer = setTimeout(() => {
           silentRetryTimer = null;
@@ -711,7 +726,11 @@ async function loadBoard(options = {}) {
     state.errorKind = failure.kind;
     state.repositories = [];
     updateConnection(failure.connectionKind, failure.connectionLabel);
-    if (failure.kind === "auth") showAuth(failure.action);
+    if (failure.kind === "auth") {
+      state.readDenied = true;
+      showAuth();
+      renderLiveIndicator();
+    }
     render();
   }
 }
@@ -1011,6 +1030,15 @@ function updateLiveIndicator(nextState) {
 
 function renderLiveIndicator() {
   if (!els.liveIndicator) return;
+  if (state.readDenied) {
+    // A tail socket opened before an enforcement flip can stay connected
+    // while every read 401s; "live" beside "auth needed" reads as a
+    // contradiction, so board health wins here.
+    els.liveIndicator.dataset.state = "idle";
+    els.liveIndicator.textContent = "paused";
+    els.liveIndicator.title = "reads denied; connect to resume live updates";
+    return;
+  }
   if (liveState === "offline") {
     els.liveIndicator.dataset.state = "offline";
     els.liveIndicator.textContent = "offline · retrying…";
@@ -1083,12 +1111,14 @@ function classifyFailure(err) {
   const status = Number(err?.status || 0);
   const message = err?.message || String(err);
   if (status === 401 || status === 403) {
+    // The raw server denial (wire header names, trust-boundary internals)
+    // stays in the network log; operators get the observed fact, and the
+    // connect card in showAuth() carries the one available action.
     return {
       kind: "auth",
       connectionKind: "auth",
       connectionLabel: "auth needed",
-      message,
-      action: "This deployment requires trusted ingress identity or a valid key for this read.",
+      message: "This instance denied the read.",
     };
   }
   if (message === "Failed to fetch" || message.includes("NetworkError")) {
@@ -1097,7 +1127,6 @@ function classifyFailure(err) {
       connectionKind: "error",
       connectionLabel: "unreachable",
       message: "Powder API is unreachable from this browser.",
-      action: "Check the private network, DNS, and powder-server process.",
     };
   }
   return {
@@ -1105,7 +1134,6 @@ function classifyFailure(err) {
     connectionKind: "error",
     connectionLabel: "error",
     message,
-    action: "Refresh the board or inspect powder-server logs.",
   };
 }
 
@@ -1113,6 +1141,11 @@ function showAuth(message) {
   els.authPanel.hidden = false;
   els.settingsToggle.setAttribute("aria-expanded", "true");
   els.apiKeyInput.value = state.apiKey;
+  // A browser whose reads are denied cannot list, create, or edit
+  // repositories -- collapse the drawer to a focused connect card instead
+  // of an inert editor.
+  els.repoSettings.hidden = state.readDenied;
+  renderAuthIntro();
   renderAuthState(message);
 }
 
@@ -1123,8 +1156,24 @@ function hideAuth() {
 }
 
 function renderAuthState(message = "") {
+  // The one-click recovery path carries the visual weight while the field
+  // is empty on a denied read; a bare "save" submit there just refetches
+  // into the same denial.
+  const connectPrimary = state.readDenied && !state.apiKey && !els.pasteApiKey.hidden;
+  els.pasteApiKey.classList.toggle("pw-button-quiet", !connectPrimary);
+  els.saveApiKey.classList.toggle("pw-button-quiet", connectPrimary);
+  // The mint hint only earns its place when a key is actually part of this
+  // deployment's flow; beside perimeter-trust copy it reads as a
+  // contradiction.
+  els.mintHint.hidden = !(state.authMode === "api_key" || state.readDenied);
   if (message) {
     els.authMessage.textContent = message;
+  } else if (state.readDenied) {
+    // The intro carries the failure and the instruction; repeating either
+    // here would say the same thing twice on one card.
+    els.authMessage.textContent = state.apiKey
+      ? "The saved key was denied for this read. Paste a different key."
+      : "";
   } else if (state.apiKey) {
     els.authMessage.textContent = "Key saved. Requests from this browser will use it.";
   } else if (state.needsSetup) {
@@ -1136,8 +1185,8 @@ function renderAuthState(message = "") {
     els.authMessage.textContent =
       "No key saved. Paste a key here when you need write actions.";
   } else {
-    els.authMessage.textContent =
-      "This deployment does not require a stored API key.";
+    // Perimeter-trust modes: the intro already says no key is needed.
+    els.authMessage.textContent = "";
   }
 }
 
@@ -1149,7 +1198,13 @@ function renderAuthState(message = "") {
 // instead of an assumption baked into markup.
 function renderAuthIntro() {
   if (!els.authIntro) return;
-  if (state.authMode === "unknown") {
+  if (state.readDenied && state.authMode !== "api_key") {
+    // State only what the client observed: a 401/403 cannot distinguish
+    // "browser outside the trusted ingress" from "ingress not configured",
+    // so no ingress-topology story here.
+    els.authIntro.textContent =
+      "This instance denied the read. Paste a valid API key to connect.";
+  } else if (state.authMode === "unknown") {
     els.authIntro.textContent = "Checking this instance's access requirements...";
   } else if (state.authMode !== "api_key") {
     els.authIntro.textContent =
@@ -1159,7 +1214,7 @@ function renderAuthIntro() {
       "This instance allows unauthenticated reads from its private network. Paste an API key to enable write actions.";
   } else {
     els.authIntro.textContent =
-      "This instance requires an API key for all access, including reads. Paste one below to connect.";
+      "This instance requires an API key for all access, including reads. Paste one here to connect.";
   }
 }
 
@@ -2264,10 +2319,17 @@ function renderLoading() {
 }
 
 function renderFailure() {
+  // Denied reads keep exactly one auth surface: the connect card. The lanes
+  // get a quiet pointer, not a second differently-phrased copy of the
+  // failure (raw server denials stay in the network log).
+  const body =
+    state.errorKind === "auth"
+      ? "<p>Connect with an API key to load the board.</p>"
+      : `<p><svg class="pw-icon pw-err" aria-hidden="true"><use href="#i-alert"></use></svg> ${escapeHtml(state.errorKind || "error")}</p>
+      <p>${escapeHtml(state.error)}</p>`;
   const message = `
     <div class="pw-empty">
-      <p><svg class="pw-icon pw-err" aria-hidden="true"><use href="#i-alert"></use></svg> ${escapeHtml(state.errorKind || "error")}</p>
-      <p>${escapeHtml(state.error)}</p>
+      ${body}
     </div>
   `;
   els.overview.innerHTML = message;

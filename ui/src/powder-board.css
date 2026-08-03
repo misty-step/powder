@@ -502,15 +502,52 @@ html:not([data-pw-route='card']) .pw-detail-app {
   font-size: 11px;
 }
 
+/* Wrapping flex, not a fixed 3-column grid: the drawer's sections (intro,
+   repository editor, key form) have large intrinsic minimums, and rigid
+   tracks made them overlap at ordinary desktop widths (operator report,
+   2026-08-03). Every section can shrink (min-width: 0) and wraps to its
+   own row when it cannot. */
 .pw-auth {
-  flex: none;
-  display: grid;
-  grid-template-columns: minmax(16rem, 1fr) minmax(18rem, 1.1fr) auto;
-  gap: 1em;
+  /* 0 1 auto + min-height 0 + overflow-y: on a phone the open drawer can
+     be taller than the viewport, and with the app shell overflow:hidden
+     there is no outer scroll path -- the drawer must scroll itself or its
+     lower controls are unreachable (design-critic finding, 2026-08-03). */
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1em 2em;
   align-items: start;
   padding: 0.8em 2em;
   border-bottom: 1px solid var(--color-line);
   background: var(--color-surface-sunken);
+}
+
+/* Fields need a silhouette on the sunken band: the hairline border alone
+   is ~1.08:1 against it, so empty inputs read as floating placeholder
+   text. Same treatment the mint code block already uses. */
+.pw-auth .pw-input,
+.pw-auth .pw-sort {
+  background: var(--color-surface);
+}
+
+.pw-auth .pw-button-quiet:hover {
+  background: var(--color-surface);
+}
+
+.pw-auth > * {
+  min-width: 0;
+}
+
+.pw-auth > div {
+  flex: 1 1 20rem;
+}
+
+/* The repository editor always gets a full row -- its five-field create
+   grid never fits beside the key form. */
+.pw-repo-settings {
+  flex: 1 1 100%;
 }
 
 .pw-auth[hidden] {
@@ -540,13 +577,28 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-auth-form {
+  flex: 2 1 26rem;
   display: flex;
+  flex-wrap: wrap;
   align-items: end;
   gap: 0.8em;
 }
 
 .pw-auth-form label {
-  min-width: 18rem;
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+.pw-auth-form .pw-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* The status line reads as a caption under the whole form, never as a
+   flex item squeezed beside the buttons. */
+#auth-message {
+  flex: 1 1 100%;
+  margin: 0;
 }
 
 .pw-auth-form .pw-chrome {
@@ -574,7 +626,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-repo-list {
-  max-height: 9.5rem;
+  /* Tall enough for one full row (edit + merge forms are always expanded,
+     ~14rem); 9.5rem clipped every row mid-form. */
+  max-height: min(24rem, 50vh);
   overflow-y: auto;
 }
 
@@ -611,7 +665,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-repo-edit,
 .pw-repo-merge {
   display: grid;
-  grid-template-columns: repeat(4, minmax(7rem, 1fr)) auto;
+  /* One track per field plus an auto track per action -- an undersized
+     track count wraps save/delete into full-column-width bars that read
+     as stray banners under an unrelated field. */
+  grid-template-columns: repeat(5, minmax(7rem, 1fr)) auto;
   gap: 0.55em;
   align-items: end;
 }
@@ -623,7 +680,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-repo-edit {
-  grid-template-columns: minmax(8rem, 1.2fr) minmax(8rem, 1.2fr) minmax(6rem, 0.7fr) auto auto;
+  grid-template-columns: minmax(8rem, 1.2fr) minmax(8rem, 1.2fr) minmax(6rem, 0.7fr) minmax(6rem, 0.7fr) auto auto;
   margin-top: 0.45em;
 }
 
@@ -2209,12 +2266,14 @@ html:not([data-pw-route='card']) .pw-detail-app {
   }
 
   .pw-auth {
-    grid-template-columns: minmax(0, 1fr);
     padding-inline: 1.2rem;
   }
 
-  .pw-auth-form {
-    flex-wrap: wrap;
+  /* Same touch grammar as the sibling quick-add panel. */
+  .pw-auth .pw-button,
+  .pw-auth .pw-input,
+  .pw-auth .pw-sort {
+    min-height: var(--pw-touch-target);
   }
 
   .pw-repo-create,

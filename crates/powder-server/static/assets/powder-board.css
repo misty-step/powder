@@ -632,12 +632,30 @@ html:not([data-pw-route="card"]) .pw-detail-app {
 .pw-auth {
   border-bottom: 1px solid var(--color-line);
   background: var(--color-surface-sunken);
-  flex: none;
-  grid-template-columns: minmax(16rem, 1fr) minmax(18rem, 1.1fr) auto;
+  flex-wrap: wrap;
+  flex: 0 auto;
   align-items: start;
-  gap: 1em;
+  gap: 1em 2em;
+  min-height: 0;
   padding: .8em 2em;
-  display: grid;
+  display: flex;
+  overflow-y: auto;
+}
+
+.pw-auth .pw-input, .pw-auth .pw-sort, .pw-auth .pw-button-quiet:hover {
+  background: var(--color-surface);
+}
+
+.pw-auth > * {
+  min-width: 0;
+}
+
+.pw-auth > div {
+  flex: 20rem;
+}
+
+.pw-repo-settings {
+  flex: 100%;
 }
 
 .pw-auth[hidden] {
@@ -667,13 +685,26 @@ html:not([data-pw-route="card"]) .pw-detail-app {
 }
 
 .pw-auth-form {
+  flex-wrap: wrap;
+  flex: 2 26rem;
   align-items: end;
   gap: .8em;
   display: flex;
 }
 
 .pw-auth-form label {
-  min-width: 18rem;
+  flex: 14rem;
+  min-width: 0;
+}
+
+.pw-auth-form .pw-input {
+  box-sizing: border-box;
+  width: 100%;
+}
+
+#auth-message {
+  flex: 100%;
+  margin: 0;
 }
 
 .pw-auth-form .pw-chrome {
@@ -698,7 +729,7 @@ html:not([data-pw-route="card"]) .pw-detail-app {
 }
 
 .pw-repo-list {
-  max-height: 9.5rem;
+  max-height: min(24rem, 50vh);
   overflow-y: auto;
 }
 
@@ -720,7 +751,7 @@ html:not([data-pw-route="card"]) .pw-detail-app {
 }
 
 .pw-repo-create, .pw-repo-edit, .pw-repo-merge {
-  grid-template-columns: repeat(4, minmax(7rem, 1fr)) auto;
+  grid-template-columns: repeat(5, minmax(7rem, 1fr)) auto;
   align-items: end;
   gap: .55em;
   display: grid;
@@ -733,7 +764,7 @@ html:not([data-pw-route="card"]) .pw-detail-app {
 }
 
 .pw-repo-edit {
-  grid-template-columns: minmax(8rem, 1.2fr) minmax(8rem, 1.2fr) minmax(6rem, .7fr) auto auto;
+  grid-template-columns: minmax(8rem, 1.2fr) minmax(8rem, 1.2fr) minmax(6rem, .7fr) minmax(6rem, .7fr) auto auto;
   margin-top: .45em;
 }
 
@@ -2201,12 +2232,11 @@ html:not([data-pw-route="card"]) .pw-detail-app {
   }
 
   .pw-auth {
-    grid-template-columns: minmax(0, 1fr);
     padding-inline: 1.2rem;
   }
 
-  .pw-auth-form {
-    flex-wrap: wrap;
+  .pw-auth .pw-button, .pw-auth .pw-input, .pw-auth .pw-sort {
+    min-height: var(--pw-touch-target);
   }
 
   .pw-repo-create, .pw-repo-edit, .pw-repo-merge {

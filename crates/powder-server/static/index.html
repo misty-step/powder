@@ -133,13 +133,25 @@
     <div>
       <p id="auth-intro" class="pw-item">Checking this instance's access requirements&hellip;</p>
       <p class="pw-chrome">Connection: <span id="connection-status" class="pw-connection" data-kind="loading">loading</span></p>
-      <p class="pw-chrome">Need a key? Mint one on the instance with:</p>
-      <span class="pw-mint-cmd">
-        <code id="mint-command">powder key-create --db /data/powder.db --name operator --scope admin --show-secret</code>
-        <button id="copy-mint-command" class="pw-button pw-button-quiet pw-button-compact" type="button">copy</button>
-      </span>
+      <div id="mint-hint" hidden>
+        <p class="pw-chrome">Need a key? Mint one on the instance with:</p>
+        <span class="pw-mint-cmd">
+          <code id="mint-command">powder key-create --db &lt;path-to-powder.db&gt; --name operator --scope admin --show-secret</code>
+          <button id="copy-mint-command" class="pw-button pw-button-quiet pw-button-compact" type="button">copy</button>
+        </span>
+      </div>
     </div>
-    <section class="pw-repo-settings" aria-label="repository settings">
+    <form id="api-key-form" class="pw-auth-form">
+      <label>
+        <span class="pw-chrome">API key</span>
+        <input id="api-key-input" class="pw-input" type="password" autocomplete="off" placeholder="paste key">
+      </label>
+      <button id="paste-api-key" class="pw-button pw-button-quiet pw-button-compact" type="button" hidden>paste &amp; connect</button>
+      <button id="save-api-key" class="pw-button pw-button-compact" type="submit">save</button>
+      <button id="clear-api-key" class="pw-button pw-button-quiet pw-button-compact" type="button">clear</button>
+      <p id="auth-message" class="pw-chrome"></p>
+    </form>
+    <section id="repo-settings" class="pw-repo-settings" aria-label="repository settings">
       <div class="pw-settings-head">
         <p class="pw-section-head">REPOSITORIES</p>
         <span class="pw-settings-head-meta">
@@ -179,16 +191,6 @@
       </form>
       <div id="repo-settings-list" class="pw-repo-list" aria-live="polite"></div>
     </section>
-    <form id="api-key-form" class="pw-auth-form">
-      <label>
-        <span class="pw-chrome">API key</span>
-        <input id="api-key-input" class="pw-input" type="password" autocomplete="off" placeholder="paste key">
-      </label>
-      <button id="paste-api-key" class="pw-button pw-button-quiet pw-button-compact" type="button" hidden>paste &amp; connect</button>
-      <button class="pw-button pw-button-compact" type="submit">save</button>
-      <button id="clear-api-key" class="pw-button pw-button-quiet pw-button-compact" type="button">clear</button>
-      <p id="auth-message" class="pw-chrome"></p>
-    </form>
   </section>
 
   <div class="pw-filters" id="filters">
