@@ -3227,7 +3227,10 @@ async fn board_shell_serves_from_root_board_and_card_routes_without_auth() {
     assert!(root.contains(r#"id="powder-board-app""#));
     assert!(root.contains("/assets/powder-board.js"));
     assert!(root.contains(r#"id="auth-intro""#));
-    assert!(root.contains("powder key-create --db /data/powder.db --name operator"));
+    // Placeholder path, not an asserted deployment layout: the UI stopped
+    // claiming /data/powder.db for every instance (design-critic finding,
+    // 2026-08-03).
+    assert!(root.contains("powder key-create --db &lt;path-to-powder.db&gt; --name operator"));
     assert!(root.contains(r#"id="settings-toggle""#));
     assert!(root.contains(r#"id="repo-settings-list""#));
     assert!(root.contains(r#"id="powder-card-app""#));

@@ -312,6 +312,75 @@ test("board · Overview rollup fetch failure stays inline and leaves raw board u
   await assertBoard(page, errors);
 });
 
+// Operator report 2026-08-03: a browser outside the trusted ingress hit a
+// jumbled auth screen -- the repository editor rendered inert beside the key
+// form, columns overlapped at desktop width, and the intro claimed no key is
+// needed while every read was being denied. This locks the denied-read state
+// to a focused connect card: repo editor hidden, copy consistent, no overlap.
+test("board · denied reads collapse settings to a connect card without overlap", async ({ page }) => {
+  await page.route("**/api/v1/**", (route) => {
+    if (route.request().url().includes("/api/v1/onboarding")) {
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ auth_mode: "tailscale_header", public_reads: false, needs_setup: false }),
+      });
+    }
+    return route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({
+        denial_class: "unauthenticated",
+        error: "x-powder-proxy-secret is not configured; identity headers are not trusted",
+      }),
+    });
+  });
+  const errors = collectConsoleErrors(page);
+  await page.goto("/board");
+  await expect(page.locator("#auth-panel")).toBeVisible();
+  await expect(page.locator("#repo-settings")).toBeHidden();
+  await expect(page.locator("#auth-intro")).toContainText(
+    "This instance denied the read. Paste a valid API key to connect.",
+  );
+  await expect(page.locator("#auth-intro")).not.toContainText("does not require");
+  // One auth surface: no duplicate instruction under the form, the mint
+  // hint is offered, lanes point at the connect card without leaking the
+  // raw server denial, and the header never claims "live" beside it.
+  await expect(page.locator("#auth-message")).toHaveText("");
+  await expect(page.locator("#mint-hint")).toBeVisible();
+  await expect(page.locator("#overview .pw-empty")).toContainText(
+    "Connect with an API key to load the board.",
+  );
+  await expect(page.locator("#overview .pw-empty")).not.toContainText("x-powder-proxy-secret");
+  await expect(page.locator("#live-indicator")).not.toHaveText("live");
+  // Layout truth, not copy: every visible child stays inside the panel box,
+  // no two children overlap, and the page gains no horizontal scroll.
+  const layout = await page.evaluate(() => {
+    const panel = document.getElementById("auth-panel")!;
+    const panelBox = panel.getBoundingClientRect();
+    const kids = [...panel.children]
+      .filter((child) => getComputedStyle(child).display !== "none")
+      .map((child) => child.getBoundingClientRect());
+    return {
+      outside: kids.some((box) => box.right > panelBox.right + 1 || box.left < panelBox.left - 1),
+      overlap: kids.some((a, i) =>
+        kids.some(
+          (b, j) =>
+            j > i &&
+            a.left < b.right - 1 &&
+            b.left < a.right - 1 &&
+            a.top < b.bottom - 1 &&
+            b.top < a.bottom - 1,
+        ),
+      ),
+      hscroll: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+    };
+  });
+  expect(layout).toEqual({ outside: false, overlap: false, hscroll: false });
+  const noise = errors.filter((message) => !/status of 401/.test(message));
+  expect(noise, "console must stay clean beyond the denied reads").toEqual([]);
+});
+
 // powder-ui-keyboard-firstrun: card-level keyboard nav -- j/k roving focus
 // across every visible card link, Enter opens the focused card's detail
 // route (the browser's own anchor activation, not reimplemented), Escape
