@@ -72,4 +72,81 @@ cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-hierarchy-child-b
 cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-mismatch --title "Epic: mismatch example" --acceptance "children complete" --status done >/dev/null
 cargo run -q -p powder-cli -- create-card --db "$DB" --id epic-mismatch-child-a --title "Child: still running" --acceptance "work finishes" --status ready --parent epic-mismatch >/dev/null
 
+# powder-ui-overview-hierarchy: pathological rollup shapes mirroring
+# production, so the Overview alignment law judges real layout pressure
+# (long titles, long slug ids, six-status chip clusters, wide criteria
+# fractions, stale freshness) instead of toy data. Deliberate constraints:
+#   - no trailing numeric id segment anywhere (repo_from_numeric_card_id_prefix
+#     would auto-assign repos and disturb the general-bucket assumptions above)
+#   - no --estimate/--risk flags, so the facet-filter law specs never match
+#     these cards
+#   - bulk calls go through the already-built binary, not `cargo run`, so ~60
+#     seeding calls stay well inside the Playwright webServer boot timeout.
+POWDER_BIN="$ROOT/target/debug/powder"
+cargo build -q -p powder-cli
+
+# (a)+(b)+(c): a 9+ word 'EPIC: '-prefixed title, long slug ids, and six
+# children covering five distinct statuses plus awaiting input.
+"$POWDER_BIN" create-card --db "$DB" --id crucible-capability-decomposition-eval --title "EPIC: retire dead products and consolidate every overlapping capability evaluation surface" --acceptance "dead products retired" --status ready >/dev/null
+for child_status in backlog ready in_progress awaiting_input done shipped; do
+  "$POWDER_BIN" create-card --db "$DB" --id "crucible-child-$child_status" --title "Crucible child ($child_status)" --acceptance "child lands" --status "$child_status" --parent crucible-capability-decomposition-eval >/dev/null
+done
+
+# (b)+(e)+(f): long slug id, a 10/56 criteria fraction, and a 6d/12d
+# freshness spread. updated_at has no CLI setter, so the backdate is one
+# direct SQL statement after all writes to those rows are done.
+"$POWDER_BIN" create-card --db "$DB" --id estate-digitalocean-only-cutover --title "EPIC: cut the estate over to DigitalOcean-only hosting with zero downtime" --acceptance "estate cut over" --status ready >/dev/null
+ESTATE_CRITERIA=()
+for i in $(seq 1 56); do ESTATE_CRITERIA+=(--acceptance "runbook step $i"); done
+"$POWDER_BIN" create-card --db "$DB" --id estate-cutover-runbook --title "Cutover runbook" --status in_progress --parent estate-digitalocean-only-cutover "${ESTATE_CRITERIA[@]}" >/dev/null
+for i in $(seq 0 9); do
+  "$POWDER_BIN" check-criterion estate-cutover-runbook --db "$DB" --criterion "$i" --actor law-gate-agent >/dev/null
+done
+"$POWDER_BIN" create-card --db "$DB" --id estate-cutover-dns --title "DNS flip" --status ready --parent estate-digitalocean-only-cutover >/dev/null
+python3 - "$DB" <<'EOF'
+import sqlite3, sys, time
+now = int(time.time())
+db = sqlite3.connect(sys.argv[1])
+db.execute("UPDATE cards SET updated_at = ? WHERE id = 'estate-cutover-runbook'", (now - 6 * 86400,))
+db.execute("UPDATE cards SET updated_at = ? WHERE id = 'estate-cutover-dns'", (now - 12 * 86400,))
+db.commit()
+db.close()
+EOF
+
+# (e): a 21/30 criteria fraction.
+"$POWDER_BIN" create-card --db "$DB" --id powder-overview-visual-hierarchy --title "EPIC: rebuild the Overview rollup visual hierarchy beyond the Linear bar" --acceptance "overview reads clean" --status ready >/dev/null
+OVERVIEW_CRITERIA=()
+for i in $(seq 1 30); do OVERVIEW_CRITERIA+=(--acceptance "grid criterion $i"); done
+"$POWDER_BIN" create-card --db "$DB" --id overview-hierarchy-grid --title "Shared column grid" --status ready --parent powder-overview-visual-hierarchy "${OVERVIEW_CRITERIA[@]}" >/dev/null
+for i in $(seq 0 20); do
+  "$POWDER_BIN" check-criterion overview-hierarchy-grid --db "$DB" --criterion "$i" --actor law-gate-agent >/dev/null
+done
+
+# List depth: five more epics so the alignment law measures rows with
+# varied title lengths, chip counts, and meta widths. The lowercase 'Epic:'
+# on agent-vault-retirement proves the render-time prefix strip is
+# case-insensitive.
+"$POWDER_BIN" create-card --db "$DB" --id law-gate-hardening --title "EPIC: harden the law gate so visual drift fails CI before review" --acceptance "drift fails CI" --status ready >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id law-gate-alignment-probe --title "Alignment probe" --acceptance "probe measures offsets" --status ready --parent law-gate-hardening >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id law-gate-contrast-probe --title "Contrast probe" --acceptance "contrast measured" --status done --parent law-gate-hardening >/dev/null
+
+"$POWDER_BIN" create-card --db "$DB" --id agent-vault-retirement --title "Epic: retire Agent Vault so Mint is the only credential broker" --acceptance "vault retired" --status ready >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id vault-callers-cutover --title "Cut vault callers to Mint" --acceptance "callers moved" --status in_progress --parent agent-vault-retirement >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id vault-docs-sweep --title "Sweep vault docs" --acceptance "docs swept" --status backlog --parent agent-vault-retirement >/dev/null
+
+"$POWDER_BIN" create-card --db "$DB" --id rollout-gate-telemetry --title "EPIC: emit rollout gate telemetry for every ship decision" --acceptance "telemetry emitted" --status ready >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id rollout-telemetry-schema --title "Telemetry schema" --acceptance "schema ratified" --status done --parent rollout-gate-telemetry >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id rollout-telemetry-dashboard --title "Telemetry dashboard" --acceptance "dashboard live" --status abandoned --parent rollout-gate-telemetry >/dev/null
+
+"$POWDER_BIN" create-card --db "$DB" --id docs-null-repo-cleanup --title "EPIC: sweep null-repo docs into their owning repositories" --acceptance "docs owned" --status ready >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id docs-null-repo-audit --title "Audit null-repo docs" --acceptance "audit filed" --status ready --parent docs-null-repo-cleanup >/dev/null
+
+"$POWDER_BIN" create-card --db "$DB" --id cli-freshness-surface --title "EPIC: surface card freshness across the CLI list views" --acceptance "freshness listed" --status ready >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id cli-freshness-flag --title "Freshness flag" --acceptance "flag shipped" --status backlog --parent cli-freshness-surface >/dev/null
+
+# (d): a second Unsorted repository bucket beside the existing powder row.
+"$POWDER_BIN" repository-upsert --db "$DB" --name misty-step/estate --visibility visible --tier active >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id estate-unscoped-backup --title "Unscoped backup audit" --acceptance "audit filed" --status backlog --repo misty-step/estate >/dev/null
+"$POWDER_BIN" create-card --db "$DB" --id estate-unscoped-metrics --title "Unscoped metrics sweep" --acceptance "metrics swept" --status ready --repo misty-step/estate >/dev/null
+
 exec cargo run -q -p powder-server

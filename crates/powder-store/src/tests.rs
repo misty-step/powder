@@ -4173,6 +4173,55 @@ fn patch_card_preserves_protected_metadata_and_claim() -> Result<()> {
 }
 
 #[test]
+fn patch_card_status_change_emits_the_same_outbound_event_as_update_status() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = sourced_card("patch-status-event", 2, "sha256:v1");
+    card.status = CardStatus::Backlog;
+    store.import_cards(vec![card])?;
+
+    store.patch_card_as(
+        &CardId::new("patch-status-event")?,
+        CardPatch {
+            status: Some(CardStatus::Ready),
+            ..Default::default()
+        },
+        &Authority::principal("operator", true),
+        20,
+    )?;
+
+    let tail = store.list_event_tail(0, 10)?;
+    assert_eq!(
+        tail.iter()
+            .filter(|entry| entry.event.event_type == "moved-to-ready"
+                && entry.event.card.id.as_str() == "patch-status-event")
+            .count(),
+        1,
+        "a PATCH status flip must reach the event tail exactly like /status"
+    );
+
+    // A no-op status patch (same value) must NOT emit a transition event.
+    store.patch_card_as(
+        &CardId::new("patch-status-event")?,
+        CardPatch {
+            status: Some(CardStatus::Ready),
+            ..Default::default()
+        },
+        &Authority::principal("operator", true),
+        30,
+    )?;
+    let tail = store.list_event_tail(0, 10)?;
+    assert_eq!(
+        tail.iter()
+            .filter(|entry| entry.event.event_type == "moved-to-ready")
+            .count(),
+        1,
+        "patching the identical status again must stay silent"
+    );
+    Ok(())
+}
+
+#[test]
 fn patch_card_can_set_and_clear_repo() -> Result<()> {
     let mut store = Store::open_in_memory()?;
     store.migrate()?;
