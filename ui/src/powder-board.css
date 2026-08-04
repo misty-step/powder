@@ -327,8 +327,11 @@ textarea.pw-input {
 }
 
 .pw-crumbs [aria-current] {
-  color: var(--color-ink);
-  font-weight: var(--pw-weight-medium);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--pw-weight-regular);
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
 }
 
 .pw-trail-who {
@@ -353,9 +356,10 @@ textarea.pw-input {
 .pw-chip-estimate {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+  letter-spacing: 0.06em;
   color: var(--color-muted);
   border: var(--pw-line-width) solid var(--color-line);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-0);
   padding: 0 0.35em;
   line-height: 1.5;
 }
@@ -363,8 +367,9 @@ textarea.pw-input {
 .pw-chip-risk {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+  letter-spacing: 0.06em;
   border: var(--pw-line-width) solid var(--color-warn);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-0);
   padding: 0 0.35em;
   line-height: 1.5;
   color: var(--color-warn);
@@ -388,10 +393,6 @@ html:not([data-pw-route='card']) .pw-detail-app {
   background: var(--color-surface);
 }
 
-.pw-vt-mode::view-transition-old(root),
-.pw-vt-mode::view-transition-new(root) {
-  animation-duration: 240ms;
-}
 
 .pw-top {
   flex: none;
@@ -1086,35 +1087,42 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-overview {
   display: none;
-  max-width: 58rem;
+  max-width: 84rem;
   min-height: 100%;
   box-sizing: border-box;
   margin: 0 auto;
   padding: 2rem 2.2rem;
 }
 
-.pw-overview-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 1rem;
-  margin-bottom: 1rem;
+
+/* powder-ui-overview-hierarchy: one shared five-column grid aligns every
+   rollup row. Section captions replace the repeated per-row kind rail. */
+.pw-rollup-section + .pw-rollup-section {
+  margin-top: 1.4rem;
 }
 
-.pw-overview-head p {
-  margin: 0;
+.pw-rollup-section > .pw-caption {
+  margin: 0 0 0.55rem;
+  color: var(--color-muted);
+}
+
+.pw-rollup-row:first-child {
+  border-top: var(--pw-line-width) solid var(--color-line);
 }
 
 .pw-rollup-row {
-  display: flex;
-  width: 100%;
-  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 19rem 6rem 6rem 7.5rem;
+  column-gap: 0.75rem;
   align-items: center;
-  justify-content: space-between;
-  gap: 1.5rem;
-  padding: 1rem 0;
+  width: calc(100% + 1rem);
+  min-height: var(--pw-touch-target);
+  box-sizing: border-box;
+  padding: 0.65rem 0.5rem;
+  margin-block: 0;
+  margin-inline: -0.5rem;
   border: 0;
-  border-top: 1px solid var(--color-line);
+  border-bottom: var(--pw-line-width) solid var(--color-line);
   background: transparent;
   color: var(--color-ink);
   font: inherit;
@@ -1126,65 +1134,155 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-rollup-row:hover,
 .pw-rollup-row:focus-visible {
   color: var(--color-ink);
-  background: var(--color-wash);
+  background: var(--color-surface-sunken);
 }
 
-.pw-rollup-main,
-.pw-rollup-details {
-  display: flex;
-  align-items: center;
-}
 
 .pw-rollup-main {
-  min-width: 12rem;
-  flex: 1;
-  gap: 0.6rem;
-}
-
-.pw-rollup-kicker,
-.pw-rollup-id,
-.pw-rollup-age,
-.pw-rollup-stat {
-  color: var(--color-muted);
-  font-size: var(--text-sm);
-}
-
-.pw-rollup-kicker,
-.pw-rollup-id {
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-
-.pw-rollup-kicker {
-  color: var(--color-faint);
-  letter-spacing: 0.06em;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
 }
 
 .pw-rollup-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font-size: var(--text-md);
+  font-weight: var(--pw-weight-medium);
+  line-height: 1.35;
+  color: var(--color-ink);
+}
+
+.pw-rollup-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pw-rollup-id:empty {
+  min-height: 1.45em;
+}
+
+.pw-rollup-chips {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.25rem;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.pw-rollup-chip,
+.pw-rollup-chip-more {
+  display: inline-flex;
+  align-items: baseline;
+  flex: none;
+  gap: 0.5em;
+  box-sizing: border-box;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  border: var(--pw-line-width) solid currentcolor;
+  padding: 0.12em 0.55em;
+  color: var(--color-muted);
+}
+
+.pw-rollup-chip[hidden],
+.pw-rollup-chip-more[hidden] {
+  display: none;
+}
+
+/* Live work carries more ink weight than terminal states; awaiting input
+   is the one status that asks something of the operator. */
+.pw-chip[data-status='ready'],
+.pw-chip[data-status='in_progress'],
+.pw-rollup-chip[data-status='ready'],
+.pw-rollup-chip[data-status='in_progress'] {
+  color: var(--color-ink);
+}
+
+.pw-chip[data-status='awaiting_input'],
+.pw-rollup-chip[data-status='awaiting_input'] {
+  color: var(--color-warn);
+}
+
+
+.pw-rollup-meta {
+  display: contents;
+}
+
+.pw-rollup-criteria,
+.pw-rollup-claims,
+.pw-rollup-age {
+  justify-self: stretch;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.pw-rollup-meta-label {
+  color: var(--color-muted);
+}
+
+.pw-rollup-frac {
+  color: var(--color-ink);
   font-weight: var(--pw-weight-medium);
 }
 
-.pw-rollup-details {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 0.7rem;
+.pw-rollup-claims {
+  color: var(--color-muted);
 }
 
-.pw-rollup-details .pw-repo-counts,
-.pw-rollup-stats {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 0.45rem;
-}
 
-.pw-rollup-stat {
-  white-space: nowrap;
+/* Freshness stays secondary but meets the same contrast floor as other meta. */
+.pw-rollup-age {
+  color: var(--color-muted);
+  font-size: var(--text-xs);
 }
 
 .pw-rollup-more {
   margin-top: 1rem;
+}
+
+.pw-overview > .pw-epic-warn {
+  margin: 0 0 1.4rem;
+}
+
+/* Rollup rows restack before the fixed meta tracks can starve the title:
+   title/id, chips, then meta on one line. The desktop rule keeps the 44px
+   touch target. */
+@media (max-width: 1050px) {
+  .pw-rollup-row {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0.4rem;
+    padding: 0.8rem 0.5rem;
+  }
+
+
+  .pw-rollup-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem 1rem;
+  }
+
+  .pw-rollup-criteria,
+  .pw-rollup-claims,
+  .pw-rollup-age {
+    text-align: left;
+  }
 }
 
 .pw-rail-wrap {
@@ -1285,7 +1383,7 @@ html:not([data-pw-route='card']) .pw-detail-app {
   font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.06em;
-  color: var(--color-faint);
+  color: var(--color-muted);
 }
 .pw-rail-title {
   display: block;
@@ -1415,6 +1513,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 .pw-card-top .pw-id {
   flex: 1;
   min-width: 0;
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
 }
 
 .pw-card-t {
@@ -1510,8 +1611,10 @@ html:not([data-pw-route='card']) .pw-detail-app {
 }
 
 .pw-done-id {
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--color-faint);
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
   white-space: nowrap;
 }
 
@@ -2095,7 +2198,9 @@ html:not([data-pw-route='card']) .pw-detail-app {
 
 .pw-cmdk-item-id {
   flex: none;
-  color: var(--color-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+  color: var(--color-muted);
 }
 
 .pw-cmdk-item-source,
@@ -2166,21 +2271,6 @@ html:not([data-pw-route='card']) .pw-detail-app {
   }
   .pw-overview {
     padding: 1.2rem;
-  }
-
-  .pw-rollup-row {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 0.6rem;
-  }
-
-  .pw-rollup-main {
-    min-width: 0;
-    width: 100%;
-  }
-
-  .pw-rollup-details {
-    justify-content: flex-start;
   }
 
   .pw-filters {

@@ -33,6 +33,34 @@ async function assertBoard(page: Page, consoleErrors: string[]) {
   expect(consoleErrors, "console must be clean").toEqual([]);
 }
 
+async function assertRollupChipsFit(page: Page) {
+  await page.evaluate(() => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    requestAnimationFrame(() => resolve());
+    return promise;
+  });
+  const measurements = await page.locator(".pw-rollup-row").evaluateAll((rows) =>
+    rows.map((row, index) => {
+      const chips = row.querySelector<HTMLElement>(".pw-rollup-chips");
+      return {
+        label:
+          row.getAttribute("data-id") ||
+          row.getAttribute("data-rollup-repo") ||
+          `row ${index}`,
+        scrollWidth: chips?.scrollWidth ?? -1,
+        clientWidth: chips?.clientWidth ?? -2,
+      };
+    }),
+  );
+  expect(measurements.length, "the Overview renders rollup rows").toBeGreaterThan(0);
+  for (const measurement of measurements) {
+    expect(
+      measurement.scrollWidth,
+      `${measurement.label} status chips fit inside their cell`,
+    ).toBeLessThanOrEqual(measurement.clientWidth);
+  }
+}
+
 /* the law gate, wired against powder's own served board UI (crates/
    powder-server, at /board) — no-page-scroll and clean-console invariants,
    proven on the real UI instead of eyeballed per PR. playwright.config.ts
@@ -123,6 +151,9 @@ for (const mode of MODES) {
       "href",
       "https://sanctum.example.test",
     );
+    await page.locator("#tab-overview").click();
+    await expect(page.locator("#overview")).toBeVisible();
+    await assertRollupChipsFit(page);
     await assertBoard(page, errors);
   });
 
@@ -274,16 +305,23 @@ test("board · saved Both view still wins over the Overview default", async ({ p
 
 test("board · Overview epic rows show counts and freshness and open detail", async ({ page }) => {
   const errors = await bootFresh(page, "light");
-  const epic = page.locator(".pw-rollup-row").filter({ hasText: "Epic: ship the hierarchy view" });
+  const captions = page.locator(".pw-rollup-section > .pw-caption");
+  await expect(captions).toHaveText(["EPICS", "UNSORTED"]);
+
+  const epic = page.locator(".pw-rollup-row").filter({ hasText: "ship the hierarchy view" });
   await expect(epic).toBeVisible();
+  await expect(epic).toHaveAttribute("data-id", "epic-hierarchy");
   await expect(epic).toContainText("ready 1");
   await expect(epic).toContainText("done 1");
   await expect(epic).toContainText("criteria 1/2");
-  await expect(epic).toContainText("0 active claims");
-  await expect(epic.locator(".pw-rollup-age")).toContainText("updated");
+  await expect(epic.locator(".pw-rollup-claims")).toHaveText("—");
+  await expect(epic).toHaveAttribute("aria-label", /0 active claims/);
+  await expect(epic.locator(".pw-rollup-age")).toHaveText(/^updated /);
+  await expect(epic.locator(".pw-rollup-age")).not.toContainText("oldest");
   await expect(epic).toContainText("epic-hierarchy");
   await epic.click();
   await expect(page).toHaveURL(/\/c\/epic-hierarchy$/);
+  await expect(page.locator(".pw-detail-title")).toHaveText("ship the hierarchy view");
   await expect(page.locator("#detail-body")).toContainText("EPIC PROGRESS");
   await assertBoard(page, errors);
 });
@@ -291,7 +329,19 @@ test("board · Overview epic rows show counts and freshness and open detail", as
 test("board · Overview unsorted row applies its repository filter", async ({ page }) => {
   const errors = await bootFresh(page, "light");
   const unsorted = page.locator(".pw-rollup-row[data-rollup-repo='powder']");
-  await expect(unsorted).toContainText("powder · Unsorted");
+  await expect(unsorted.locator(".pw-rollup-title")).toHaveText("powder");
+  await expect(unsorted).not.toContainText("Unsorted");
+  const general = page.locator(".pw-rollup-row[data-rollup-repo='general']");
+  await expect(general.locator(".pw-rollup-id")).toHaveCount(1);
+  await expect(general.locator(".pw-rollup-id")).toBeEmpty();
+  const [generalHeight, repositoryHeight] = await Promise.all([
+    general.evaluate((el) => el.getBoundingClientRect().height),
+    unsorted.evaluate((el) => el.getBoundingClientRect().height),
+  ]);
+  expect(
+    Math.abs(generalHeight - repositoryHeight),
+    "the empty General slug slot preserves the repository-row pitch",
+  ).toBeLessThanOrEqual(1);
   await unsorted.click();
   await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
   await expect(page.locator("#main")).toHaveAttribute("data-view", "board");
@@ -309,6 +359,187 @@ test("board · Overview rollup fetch failure stays inline and leaves raw board u
   await page.locator("#tab-board").click();
   await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
   await expect(page.locator("#lane-ready")).toContainText("Lifecycle example card");
+  await assertBoard(page, errors);
+});
+
+// powder-ui-overview-hierarchy: production-width rows share one five-column
+// grid across both captioned sections. The fixture supplies long titles,
+// six-status chip clusters, wide criteria fractions, and stale freshness.
+test("board · Overview · rollup rows share one aligned column grid (powder-ui-overview-hierarchy)", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1462, height: 950 });
+  const errors = await bootFresh(page, "light");
+  const rows = page.locator(".pw-rollup-row");
+  await expect(rows.first()).toBeVisible();
+  const rowCount = await rows.count();
+  expect(rowCount, "the fixture renders a deep rollup list").toBeGreaterThanOrEqual(8);
+  await assertRollupChipsFit(page);
+
+  const captions = page.locator(".pw-rollup-section > .pw-caption");
+  await expect(captions).toHaveText(["EPICS", "UNSORTED"]);
+
+  // Track edges, not glyph edges: every measured cell stretches across its
+  // grid track, so each column's left x stays identical across both sections.
+  const CELL_SELECTOR =
+    ":scope > .pw-rollup-main, :scope > .pw-rollup-chips, :scope .pw-rollup-criteria, :scope .pw-rollup-claims, :scope .pw-rollup-age";
+  const columnXs = await rows.evaluateAll(
+    (els, selector) =>
+      els.map((row) =>
+        Array.from(row.querySelectorAll(selector)).map((cell) =>
+          Math.round(cell.getBoundingClientRect().left),
+        ),
+      ),
+    CELL_SELECTOR,
+  );
+  const [reference] = columnXs;
+  expect(reference.length, "a row exposes all five grid cells").toBe(5);
+  columnXs.forEach((xs, rowIndex) => {
+    expect(xs.length, `row ${rowIndex} exposes every grid cell`).toBe(reference.length);
+    xs.forEach((x, column) => {
+      expect(
+        Math.abs(x - reference[column]),
+        `row ${rowIndex} column ${column} left edge aligns with the first row`,
+      ).toBeLessThanOrEqual(1);
+    });
+  });
+  const captionXs = await captions.evaluateAll((els) =>
+    els.map((caption) => Math.round(caption.getBoundingClientRect().left)),
+  );
+  captionXs.forEach((x) => {
+    expect(Math.abs(x - reference[0]), "row content keeps the caption x-offset").toBeLessThanOrEqual(
+      1,
+    );
+  });
+  const titleTrackWidth = await rows
+    .first()
+    .locator(".pw-rollup-main")
+    .evaluate((el) => el.getBoundingClientRect().width);
+  expect(titleTrackWidth, "the title track owns at least 540px at production width").toBeGreaterThan(
+    540,
+  );
+
+
+  // Titles clamp to at most two lines even for the 9+ word pathological
+  // title; ids never wrap to a second line.
+  for (const title of await page.locator(".pw-rollup-title").all()) {
+    const box = await title.boundingBox();
+    const lineHeight = await title.evaluate((el) =>
+      parseFloat(getComputedStyle(el).lineHeight),
+    );
+    expect(box!.height / lineHeight, "title line-clamp is at most two lines").toBeLessThanOrEqual(
+      2.05,
+    );
+  }
+  for (const id of await page.locator(".pw-rollup-id").all()) {
+    const box = await id.boundingBox();
+    const lineHeight = await id.evaluate((el) => parseFloat(getComputedStyle(el).lineHeight));
+    expect(box!.height, "card id stays on one line").toBeLessThanOrEqual(lineHeight + 1);
+  }
+
+  // The pathological epic: 'EPIC:' prefix stripped from the display title,
+  // chips in fixed pipeline order, and the six-status cluster collapsed
+  // into a titled "+N" chip instead of wrapping.
+  const crucible = rows.filter({ hasText: "crucible-capability-decomposition-eval" });
+  await expect(crucible.locator(".pw-rollup-title")).not.toContainText("EPIC:");
+  await expect(crucible.locator(".pw-rollup-title")).toContainText("retire dead products");
+  const vault = rows.filter({ hasText: "agent-vault-retirement" });
+  await expect(vault.locator(".pw-rollup-title")).not.toContainText("Epic:");
+  await expect(vault.locator(".pw-rollup-title")).toContainText("retire Agent Vault");
+
+  const chipStatuses = await crucible
+    .locator(".pw-rollup-chip:not([hidden])")
+    .evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.status || ""));
+  const ORDER = [
+    "backlog",
+    "ready",
+    "in_progress",
+    "awaiting_input",
+    "done",
+    "shipped",
+    "abandoned",
+  ];
+  const indices = chipStatuses.map((status) => ORDER.indexOf(status));
+  expect(
+    indices.every((value, index) => index === 0 || value > indices[index - 1]),
+    `visible chips follow the fixed status order, got ${chipStatuses.join(", ")}`,
+  ).toBe(true);
+  expect(chipStatuses, "in-progress work survives the last-resort collapse").toContain("in_progress");
+  // The 19rem chip track (design-critic round 3) keeps the actionable
+  // awaiting-input chip visible at production width; only lower-priority
+  // statuses fold into +N.
+  expect(chipStatuses, "awaiting input stays visible at production width").toContain("awaiting_input");
+  const more = crucible.locator(".pw-rollup-chip-more");
+  await expect(more).toBeVisible();
+  expect(await more.getAttribute("title")).toContain("shipped 1");
+  expect(await more.getAttribute("title")).not.toContain("awaiting input");
+  await expect(crucible).toHaveAttribute("aria-label", /shipped 1/);
+  expect(
+    await more.evaluate((el) => ({
+      tag: el.tagName,
+      role: el.getAttribute("role"),
+      tabIndex: (el as HTMLElement).tabIndex,
+    })),
+    "the disclosure count remains a non-interactive span",
+  ).toEqual({ tag: "SPAN", role: null, tabIndex: -1 });
+
+  // Wide fractions and stale freshness render in their own columns.
+  const estate = rows.filter({ hasText: "estate-digitalocean-only-cutover" });
+  await expect(estate.locator(".pw-rollup-frac")).toHaveText("10/56");
+  await expect(estate.locator(".pw-rollup-age")).toHaveText(/updated \d+d ago/);
+  await expect(estate.locator(".pw-rollup-age")).not.toContainText("oldest");
+  await expect(estate.locator(".pw-rollup-age")).toHaveAttribute(
+    "title",
+    /oldest update \d+d ago/,
+  );
+  const overview = rows.filter({ hasText: "powder-overview-visual-hierarchy" });
+  await expect(overview.locator(".pw-rollup-frac")).toHaveText("21/30");
+  await assertBoard(page, errors);
+});
+
+test("board · mobile-390 · Overview rollup rows restack without horizontal scroll (powder-ui-overview-hierarchy)", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 900 });
+  const errors = await bootFresh(page, "light");
+  const first = page.locator(".pw-rollup-row").first();
+  await expect(first).toBeVisible();
+  await assertRollupChipsFit(page);
+  const [generalMainHeight, repositoryMainHeight] = await Promise.all([
+    page
+      .locator(".pw-rollup-row[data-rollup-repo='general'] .pw-rollup-main")
+      .evaluate((el) => el.getBoundingClientRect().height),
+    page
+      .locator(".pw-rollup-row[data-rollup-repo='powder'] .pw-rollup-main")
+      .evaluate((el) => el.getBoundingClientRect().height),
+  ]);
+  expect(
+    Math.abs(generalMainHeight - repositoryMainHeight),
+    "the mobile General title block preserves the repository-row pitch",
+  ).toBeLessThanOrEqual(1);
+  const overflow = await page
+    .locator("#overview")
+    .evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+  expect(overflow, "the Overview never scrolls horizontally at 390px").toBe(false);
+
+  // Restacked: chips sit below the title block, meta wraps onto its own
+  // line, and the row keeps its 44px touch target.
+  const titleBox = (await first.locator(".pw-rollup-title").boundingBox())!;
+  const chipsBox = (await first.locator(".pw-rollup-chips").boundingBox())!;
+  expect(
+    chipsBox.y,
+    "chips restack below the title at 390px",
+  ).toBeGreaterThanOrEqual(titleBox.y + titleBox.height - 1);
+  const rowHeight = await first.evaluate((el) => el.getBoundingClientRect().height);
+  expect(rowHeight, "row keeps the 44px touch target").toBeGreaterThanOrEqual(44);
+  const crucible = page
+    .locator(".pw-rollup-row")
+    .filter({ hasText: "crucible-capability-decomposition-eval" });
+  const flexWrap = await crucible
+    .locator(".pw-rollup-chips")
+    .evaluate((el) => getComputedStyle(el).flexWrap);
+  expect(flexWrap, "mobile chips stay on one line").toBe("nowrap");
+  await expect(crucible.locator(".pw-rollup-chip-more")).toBeVisible();
   await assertBoard(page, errors);
 });
 
@@ -506,6 +737,46 @@ for (const mode of MODES) {
   });
 }
 
+test("board · empty default Overview renders the first-run welcome", async ({ page }) => {
+  const errors = await bootFresh(page, "light", `${EMPTY_BASE_URL}/board`);
+  await expect(page.locator("#tab-overview")).toHaveAttribute("aria-selected", "true");
+  const overview = page.locator("#overview");
+  await expect(overview).toContainText("Welcome");
+  await expect(overview).toContainText("powder key-create");
+  const nudge = overview.locator("[data-firstrun-file-card]");
+  await expect(nudge).toBeVisible();
+  await nudge.click();
+  await expect(page.locator("#quick-add-panel")).toBeVisible();
+  await assertBoard(page, errors);
+});
+
+test("board · one display-title helper strips EPIC labels across card surfaces", async ({
+  page,
+}) => {
+  const errors = await bootFresh(page, "light");
+  await expect(
+    page.locator(".pw-rollup-row[data-id='epic-hierarchy'] .pw-rollup-title"),
+  ).toHaveText("ship the hierarchy view");
+
+  await page.locator("#tab-board").click();
+  await expect(page.locator("#lane-ready [data-id='epic-hierarchy'] .pw-card-t")).toHaveText(
+    "ship the hierarchy view",
+  );
+  await expect(page.locator("#lane-done [data-id='epic-mismatch'] .pw-done-t")).toHaveText(
+    "mismatch example",
+  );
+
+  await page.locator("#cmdk-toggle").click();
+  await page.locator("#cmdk-input").fill("ship the hierarchy view");
+  await expect(page.locator(".pw-cmdk-item-title").first()).toHaveText("ship the hierarchy view");
+  await page.keyboard.press("Escape");
+
+  await page.locator("#lane-ready [data-id='epic-hierarchy']").click();
+  await expect(page).toHaveURL(/\/c\/epic-hierarchy$/);
+  await expect(page.locator(".pw-detail-title")).toHaveText("ship the hierarchy view");
+  await assertBoard(page, errors);
+});
+
 for (const mode of MODES) {
   test(`board · ${mode} · a filter matching nothing names the active filters (powder-ui-keyboard-firstrun)`, async ({
     page,
@@ -594,12 +865,16 @@ for (const mode of MODES) {
     await expect(page.locator("#detail-body")).toContainText(
       "1/2 criteria checked across 2 children",
     );
-    await expect(
-      page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", { hasText: "done 1" }),
-    ).toBeVisible();
-    await expect(
-      page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", { hasText: "ready 1" }),
-    ).toBeVisible();
+    const doneChip = page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", {
+      hasText: "done 1",
+    });
+    const readyChip = page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", {
+      hasText: "ready 1",
+    });
+    await expect(doneChip).toBeVisible();
+    await expect(doneChip).toHaveAttribute("data-status", "done");
+    await expect(readyChip).toBeVisible();
+    await expect(readyChip).toHaveAttribute("data-status", "ready");
     // evidence carries child provenance (child id + label), not just a bare link
     await expect(page.locator("#detail-body")).toContainText("epic-hierarchy-child-a · proof");
     await expect(page.locator("#detail-body")).toContainText("https://example.test/pr/1");
@@ -846,6 +1121,41 @@ test("board · live updates over SSE refresh the board in place (powder-epic-ans
     timeout: 5_000,
   });
 
+  await assertBoard(page, errors);
+});
+
+test("board · child live updates highlight the parent epic rollup", async ({ page }) => {
+  const errors = await bootFresh(page, "light");
+  await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
+    timeout: 15_000,
+  });
+
+  const childId = "epic-hierarchy-child-b";
+  const parent = page.locator(".pw-rollup-row[data-id='epic-hierarchy']");
+  await expect(parent).toBeVisible();
+  const originalResponse = await page.request.get(`/api/v1/cards/${childId}`);
+  expect(originalResponse.ok(), "the fixture child detail loads").toBe(true);
+  const originalStatus = (await originalResponse.json()).card.status as string;
+  const changedStatus = originalStatus === "done" ? "ready" : "done";
+  const receipt = Date.now();
+  let mutated = false;
+  try {
+    const changed = await page.request.post(`/api/v1/cards/${childId}/status`, {
+      headers: { "Idempotency-Key": `law-gate-epic-highlight:${receipt}:change` },
+      data: { status: changedStatus },
+    });
+    mutated = changed.ok();
+    expect(mutated, "the fixture child status changes").toBe(true);
+    await expect(parent).toHaveClass(/pw-card-live-changed/, { timeout: 15_000 });
+  } finally {
+    if (mutated) {
+      const restored = await page.request.post(`/api/v1/cards/${childId}/status`, {
+        headers: { "Idempotency-Key": `law-gate-epic-highlight:${receipt}:restore` },
+        data: { status: originalStatus },
+      });
+      expect(restored.ok(), "the fixture child status is restored").toBe(true);
+    }
+  }
   await assertBoard(page, errors);
 });
 

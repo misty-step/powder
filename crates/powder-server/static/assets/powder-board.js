@@ -821,11 +821,14 @@ async function refreshLive() {
 
 function changedCardIds(previous, next) {
   const before = new Map(previous.map((card) => [card.id, card.updated_at]));
-  const changed = [];
+  const changed = new Set();
   for (const card of next) {
-    if (before.get(card.id) !== card.updated_at) changed.push(card.id);
+    if (before.get(card.id) !== card.updated_at) {
+      changed.add(card.id);
+      if (card.parent) changed.add(card.parent);
+    }
   }
-  return changed;
+  return [...changed];
 }
 
 // A plain, non-animated highlight: add the class, hold it for a fixed
@@ -1350,11 +1353,14 @@ function repositoryRowHTML(summary) {
   `;
 }
 
+function statusChipHTML(status, count) {
+  return `<span class="pw-chip" data-status="${escapeHtml(status)}">${escapeHtml(statusText(status))} ${escapeHtml(String(count))}</span>`;
+}
+
 function statusCountsHTML(counts) {
-  const order = RAW_STATUSES;
-  const chips = order
+  const chips = RAW_STATUSES
     .filter((status) => counts[status])
-    .map((status) => `<span class="pw-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`);
+    .map((status) => statusChipHTML(status, counts[status]));
   return chips.length ? `<p class="pw-repo-counts">${chips.join("")}</p>` : "";
 }
 
@@ -1752,7 +1758,7 @@ function renderPendingRetries() {
   }
   banner.hidden = false;
   banner.innerHTML = [...pendingAttachmentRetries.entries()].map(([cardId, entry]) => {
-    const title = escapeHtml(entry.title || cardId);
+    const title = escapeHtml(displayTitle(entry.title, cardId));
     const busy = entry.retrying;
     const fileList = entry.files.map((f, i) => {
       const name = escapeHtml(f.file.name || ("image-" + (i + 1)));
@@ -2087,7 +2093,7 @@ function firstRunEmptyHTML(rich) {
   return `
     <div class="pw-empty pw-empty-firstrun">
       <p class="pw-section-head">Welcome -- this board is empty.</p>
-      <p>File your first card with the <strong>file card</strong> button above, or mint a write key and use the CLI:</p>
+      <p>File your first card with the <strong>add</strong> button above, or mint a write key and use the CLI:</p>
       <code>${escapeHtml(KEY_MINT_COMMAND)}</code>
       <p><button type="button" class="pw-button pw-button-compact" data-firstrun-file-card>file the first card</button></p>
     </div>
@@ -2162,28 +2168,133 @@ function relativeAge(seconds) {
   return `${Math.floor(age / 31_536_000)}y ago`;
 }
 
+// Rollup chips use RAW_STATUSES, the same display order as every other
+// status-count surface. Layout collapse has its own priority in
+// fitRollupChips so display order and survival priority cannot drift.
+
+function rollupCount(counts, status) {
+  const count = Number(counts && counts[status]);
+  return Number.isFinite(count) && count > 0 ? count : 0;
+}
+
 function rollupStatusCountsHTML(counts) {
-  const known = RAW_STATUSES.filter((status) => counts && counts[status]);
-  const extra = Object.keys(counts || {}).filter((status) => !RAW_STATUSES.includes(status));
-  return [...known, ...extra]
-    .map((status) => {
-      const count = Number(counts[status]);
-      return `<span class="pw-chip">${escapeHtml(statusText(status))} ${escapeHtml(String(Number.isFinite(count) ? count : 0))}</span>`;
-    })
-    .join("");
+  const chips = [];
+  const overflow = [];
+  for (const status of RAW_STATUSES) {
+    const count = rollupCount(counts, status);
+    if (count > 0) {
+      chips.push(
+        `<span class="pw-rollup-chip" data-status="${escapeHtml(status)}">${escapeHtml(statusText(status))} ${escapeHtml(String(count))}</span>`,
+      );
+    }
+  }
+  // Unknown statuses never widen the fixed chip track: they pre-collapse
+  // into the overflow chip, named in its title. fitRollupChips may add
+  // layout-collapsed chips on top of this base.
+  for (const status of Object.keys(counts || {})) {
+    if (RAW_STATUSES.includes(status)) continue;
+    const count = rollupCount(counts, status);
+    if (count > 0) overflow.push(`${statusText(status)} ${count}`);
+  }
+  chips.push(
+    `<span class="pw-rollup-chip-more" aria-hidden="true" data-base-count="${overflow.length}" data-base-title="${escapeHtml(overflow.join(" · "))}"${overflow.length ? ` title="${escapeHtml(overflow.join(" · "))}"` : " hidden"}>+${overflow.length}</span>`,
+  );
+  return chips.join("");
+}
+
+// Layout pass over one chips cell: hide chips without removing them, so a
+// later refit on resize or font load can restore them. Hidden labels fold
+// into the "+N" chip's count and title.
+function fitRollupChips(container) {
+  const more = container.querySelector(".pw-rollup-chip-more");
+  if (!more) return;
+  const chips = [...container.querySelectorAll(".pw-rollup-chip")];
+  const baseCount = Number(more.dataset.baseCount) || 0;
+  const baseTitle = more.dataset.baseTitle || "";
+  for (const chip of chips) chip.hidden = false;
+
+  // Terminal states collapse first, followed by backlog and ready. Awaiting
+  // input and live work collapse only as a last resort so "+N" always fits.
+  const collapsePriority = ["abandoned", "shipped", "done", "backlog", "ready", "awaiting_input", "in_progress"];
+  const candidates = collapsePriority
+    .map((status) => chips.find((chip) => chip.dataset.status === status))
+    .filter(Boolean);
+  const collapsed = [];
+  for (;;) {
+    const total = collapsed.length + baseCount;
+    more.hidden = total === 0;
+    more.textContent = `+${total}`;
+    if (container.scrollWidth <= container.clientWidth + 1) break;
+    const chip = candidates.find((candidate) => !candidate.hidden);
+    if (!chip) break;
+    chip.hidden = true;
+    collapsed.push(chip.textContent.trim());
+  }
+
+  const labels = [...collapsed, ...(baseTitle ? [baseTitle] : [])];
+  const total = collapsed.length + baseCount;
+  more.hidden = total === 0;
+  more.textContent = `+${total}`;
+  if (labels.length) more.title = labels.join(" · ");
+  else more.removeAttribute("title");
+}
+
+function fitAllRollupChips() {
+  if (!els.overview) return;
+  for (const container of els.overview.querySelectorAll(".pw-rollup-chips")) {
+    fitRollupChips(container);
+  }
+}
+
+function rollupFreshnessMeta(freshness) {
+  if (!freshness) return { text: "updated age unknown", oldest: "" };
+  const oldest = Number(freshness.oldest_update);
+  const newest = Number(freshness.newest_update);
+  const hasSpread =
+    Number.isFinite(oldest) &&
+    Number.isFinite(newest) &&
+    Math.abs(newest - oldest) >= 86400;
+  return {
+    text: `updated ${relativeAge(newest)}`,
+    oldest: hasSpread ? `oldest update ${relativeAge(oldest)}` : "",
+  };
 }
 
 function rollupFreshnessHTML(freshness) {
-  if (!freshness) return `<span class="pw-rollup-age">updated age unknown</span>`;
-  const oldest = Number(freshness.oldest_update);
-  const newest = Number(freshness.newest_update);
-  const staleEnd =
-    Number.isFinite(oldest) &&
-    Number.isFinite(newest) &&
-    Math.abs(newest - oldest) >= 86400
-      ? ` · oldest ${escapeHtml(relativeAge(oldest))}`
-      : "";
-  return `<span class="pw-rollup-age">updated ${escapeHtml(relativeAge(newest))}${staleEnd}</span>`;
+  return `<span class="pw-rollup-age"${freshness.oldest ? ` title="${escapeHtml(freshness.oldest)}"` : ""}>${escapeHtml(freshness.text)}</span>`;
+}
+
+// Stored titles stay untouched. Every card-title surface uses this one
+// render-time transform so a leading "EPIC:" label never leaks into display.
+function displayTitle(title, fallback) {
+  const display = String(title || "").replace(/^epic:\s*/i, "").trim();
+  return display || String(fallback || "");
+}
+
+function rollupStatusAriaLabel(counts) {
+  const known = RAW_STATUSES.filter((status) => rollupCount(counts, status) > 0).map(
+    (status) => `${statusText(status)} ${rollupCount(counts, status)}`,
+  );
+  const unknown = Object.keys(counts || {})
+    .filter((status) => !RAW_STATUSES.includes(status) && rollupCount(counts, status) > 0)
+    .sort()
+    .map((status) => `${statusText(status)} ${rollupCount(counts, status)}`);
+  return [...known, ...unknown].join(", ");
+}
+
+function rollupRowAriaLabel(title, identifier, counts, criteria, claims, freshness) {
+  const statuses = rollupStatusAriaLabel(counts);
+  return [
+    title,
+    identifier && identifier !== title ? identifier : "",
+    statuses ? `statuses ${statuses}` : "",
+    `criteria ${criteria}`,
+    `${claims} active claim${claims === 1 ? "" : "s"}`,
+    freshness.text,
+    freshness.oldest,
+  ]
+    .filter(Boolean)
+    .join(". ");
 }
 
 function rollupRowHTML(rollup) {
@@ -2191,40 +2302,59 @@ function rollupRowHTML(rollup) {
   const criteria = `${Number(rollup.criteria_checked) || 0}/${Number(rollup.criteria_total) || 0}`;
   const claims = Number(rollup.active_claims) || 0;
   const chips = rollupStatusCountsHTML(rollup.status_counts);
-  const stats = `
-    <span class="pw-rollup-stat">criteria ${escapeHtml(criteria)}</span>
-    <span class="pw-rollup-stat">${escapeHtml(String(claims))} active claim${claims === 1 ? "" : "s"}</span>
-    ${rollupFreshnessHTML(rollup.freshness)}
+  const freshness = rollupFreshnessMeta(rollup.freshness);
+  const claimsText = claims ? `${claims} active claim${claims === 1 ? "" : "s"}` : "&mdash;";
+  // The meta wrapper is display:contents on desktop: its three cells are
+  // direct grid items of the shared row grid, so their track edges align
+  // with every other row. On mobile it becomes one flex line.
+  const meta = `
+    <span class="pw-rollup-meta">
+      <span class="pw-rollup-criteria"><span class="pw-rollup-meta-label">criteria</span> <span class="pw-rollup-frac">${escapeHtml(criteria)}</span></span>
+      <span class="pw-rollup-claims">${claimsText}</span>
+      ${rollupFreshnessHTML(freshness)}
+    </span>
   `;
   if (kind === "epic") {
     const cardId = String(rollup.card_id || "");
-    const title = String(rollup.title || cardId);
+    const title = displayTitle(rollup.title, cardId);
+    const ariaLabel = rollupRowAriaLabel(
+      title,
+      cardId,
+      rollup.status_counts,
+      criteria,
+      claims,
+      freshness,
+    );
     return `
-      <a class="pw-rollup-row" href="${escapeHtml(cardHref(cardId))}" data-card-link>
+      <a class="pw-rollup-row" href="${escapeHtml(cardHref(cardId))}" data-id="${escapeHtml(cardId)}" data-card-link aria-label="${escapeHtml(ariaLabel)}">
         <span class="pw-rollup-main">
-          <span class="pw-rollup-kicker">EPIC</span>
           <span class="pw-rollup-title">${escapeHtml(title)}</span>
           <span class="pw-rollup-id">${escapeHtml(cardId)}</span>
         </span>
-        <span class="pw-rollup-details">
-          <span class="pw-repo-counts">${chips}</span>
-          <span class="pw-rollup-stats">${stats}</span>
-        </span>
+        <span class="pw-rollup-chips">${chips}</span>
+        ${meta}
       </a>
     `;
   }
   const repo = rollup.repo ? canonicalRepoLabel(rollup.repo) : "General";
   const filterRepo = rollup.repo ? canonicalRepoLabel(rollup.repo) || "general" : "general";
+  const repoSlug = rollup.repo ? String(rollup.repo) : "";
+  const ariaLabel = rollupRowAriaLabel(
+    repo,
+    repoSlug,
+    rollup.status_counts,
+    criteria,
+    claims,
+    freshness,
+  );
   return `
-    <button class="pw-rollup-row" type="button" data-rollup-repo="${escapeHtml(filterRepo)}">
+    <button class="pw-rollup-row" type="button" data-rollup-repo="${escapeHtml(filterRepo)}" aria-label="${escapeHtml(ariaLabel)}">
       <span class="pw-rollup-main">
-        <span class="pw-rollup-kicker">UNSORTED</span>
-        <span class="pw-rollup-title">${escapeHtml(repo)} · Unsorted</span>
+        <span class="pw-rollup-title">${escapeHtml(repo)}</span>
+        <span class="pw-rollup-id">${escapeHtml(repoSlug)}</span>
       </span>
-      <span class="pw-rollup-details">
-        <span class="pw-repo-counts">${chips}</span>
-        <span class="pw-rollup-stats">${stats}</span>
-      </span>
+      <span class="pw-rollup-chips">${chips}</span>
+      ${meta}
     </button>
   `;
 }
@@ -2244,19 +2374,29 @@ function renderOverview() {
     els.overview.innerHTML = empty(`Overview unavailable: ${state.rollupError}`);
     return;
   }
-  const rows = state.rollups.map(rollupRowHTML).join("");
+  const sections = [
+    ["overview-epics-caption", "EPICS", state.rollups.filter((rollup) => rollup.kind === "epic")],
+    ["overview-unsorted-caption", "UNSORTED", state.rollups.filter((rollup) => rollup.kind !== "epic")],
+  ]
+    .filter(([, , rollups]) => rollups.length)
+    .map(
+      ([captionId, caption, rollups]) => `
+        <section class="pw-rollup-section" aria-labelledby="${captionId}">
+          <p class="pw-caption" id="${captionId}">${caption}</p>
+          <div class="pw-rollup-list">${rollups.map(rollupRowHTML).join("")}</div>
+        </section>
+      `,
+    )
+    .join("");
   const more = state.rollupHasMore
     ? `<button class="pw-button pw-button-quiet pw-rollup-more" type="button" data-rollup-load-more${state.rollupLoading ? " disabled" : ""}>${state.rollupLoading ? "Loading…" : "Load more"}</button>`
     : "";
   els.overview.innerHTML = `
-    <header class="pw-overview-head">
-      <p class="pw-section-head">OVERVIEW</p>
-      <p class="pw-chrome">EPICS AND UNSORTED WORK</p>
-    </header>
     ${rollupCoverageWarningHTML(state.rollupCoverage)}
-    ${rows || empty("No epics or unsorted cards.")}
+    ${sections || boardEmptyCopy("in overview", true)}
     ${more}
   `;
+  fitAllRollupChips();
 }
 
 function selectRollupRepo(repo) {
@@ -2354,7 +2494,7 @@ function renderRail(cards) {
     groups.push(
       `<a id="${escapeHtml(anchorId(card.id))}" class="pw-rail-row" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
         <span class="pw-rail-id">${escapeHtml(card.id)} · ${escapeHtml(cleanPriority(card.priority))}</span>
-        <span class="pw-rail-title">${escapeHtml(card.title)}</span>
+        <span class="pw-rail-title">${escapeHtml(displayTitle(card.title, card.id))}</span>
         <span class="pw-rail-age">${escapeHtml(relativeAge(card.updated_at))}</span>
       </a>`,
     );
@@ -2451,7 +2591,7 @@ function cardHTML(card) {
       <span class="pw-card-top">${repoIcon(card.repoKey, `pw-cat-${meta.cat}`)}
         <span class="pw-id">${escapeHtml(card.id)}</span><span>${escapeHtml(cleanPriority(card.priority))}</span>
       </span>
-      <span class="pw-card-t">${escapeHtml(card.title)}</span>
+      <span class="pw-card-t">${escapeHtml(displayTitle(card.title, card.id))}</span>
       <p class="pw-card-meta">${statusGlyph(card.status)}${claim}</p>
       ${card.estimate || card.risk ? `<p class="pw-card-chips">${card.estimate ? `<span class="pw-chip-estimate">${escapeHtml(card.estimate)}</span>` : ""}${card.risk ? `<span class="pw-chip-risk" data-risk="${escapeHtml(card.risk)}">${escapeHtml(card.risk)}</span>` : ""}</p>` : ""}
       ${relations ? `<p class="pw-rel-badges">${relations}</p>` : ""}
@@ -2479,7 +2619,7 @@ function doneRowHTML(card) {
   return `
     <a id="${escapeHtml(anchorId(card.id))}" class="pw-done-row" href="${escapeHtml(cardHref(card.id))}" data-id="${escapeHtml(card.id)}" data-card-link>
       <span class="pw-g"><svg class="pw-icon pw-ok" aria-hidden="true"><use href="#i-check"></use></svg></span>
-      <span class="pw-done-t">${escapeHtml(card.title)}</span>
+      <span class="pw-done-t">${escapeHtml(displayTitle(card.title, card.id))}</span>
       <span class="pw-done-id pw-num">${escapeHtml(card.id)}</span>
     </a>
   `;
@@ -2627,7 +2767,7 @@ function detailHTML(card, detail = {}) {
   parts.push(`
     <section class="pw-detail-hero">
       <nav class="pw-crumbs" aria-label="card path"><ol><li><span>${repoIcon(normalized.repoKey, `pw-cat-${meta.cat}`)} ${escapeHtml(normalized.repoKey)}</span></li><li><span aria-current="page">${escapeHtml(normalized.id)}</span></li>${parentBadge}</ol></nav>
-      <p class="pw-detail-title pw-strong">${escapeHtml(normalized.title)}</p>
+      <p class="pw-detail-title pw-strong">${escapeHtml(displayTitle(normalized.title, normalized.id))}</p>
       <p class="pw-detail-meta">
         <span class="pw-st">${statusGlyph(normalized.status)}${escapeHtml(statusText(normalized.status))}</span>
         <select class="pw-sort pw-status-change" id="detail-status-change" data-card-id="${escapeHtml(normalized.id)}" aria-label="change status">
@@ -2703,12 +2843,8 @@ function relationsHTML(card) {
 // `get_card_detail` already returns it fully populated; this just renders
 // what was previously discarded.
 function epicStateHTML(epicState) {
-  const order = RAW_STATUSES;
   const counts = epicState.status_counts || {};
-  const countChips = order
-    .filter((status) => counts[status])
-    .map((status) => `<span class="pw-chip">${escapeHtml(statusText(status))} ${counts[status]}</span>`)
-    .join("");
+  const countChips = statusCountsHTML(counts);
   const mismatches = (epicState.mismatches || [])
     .map(
       (text) =>
@@ -2733,7 +2869,7 @@ function epicStateHTML(epicState) {
       : "";
   return `
     <p class="pw-epic-progress">${epicState.criteria_checked}/${epicState.criteria_total} criteria checked across ${epicState.children_total} ${epicState.children_total === 1 ? "child" : "children"} · ${epicState.active_claims} active claim${epicState.active_claims === 1 ? "" : "s"}</p>
-    ${countChips ? `<p class="pw-repo-counts">${countChips}</p>` : ""}
+    ${countChips}
     ${mismatches}
     ${freshness}
     ${evidenceRows || evidenceMore ? `<div class="pw-epic-evidence">${evidenceRows}${evidenceMore}</div>` : ""}
@@ -2753,7 +2889,7 @@ function childrenHTML(children, childrenTotal) {
         <li class="pw-acc-item${child.status === "done" || child.status === "shipped" ? " is-checked" : ""}">
           ${glyph || `<span class="pw-g"></span>`}
           <span>
-            <a class="pw-rel-id" href="${escapeHtml(cardHref(child.id))}">${escapeHtml(child.id)}</a> ${escapeHtml(child.title)}
+            <a class="pw-rel-id" href="${escapeHtml(cardHref(child.id))}">${escapeHtml(child.id)}</a> ${escapeHtml(displayTitle(child.title, child.id))}
             <br><span class="pw-muted">${escapeHtml(statusText(child.status))} · ${child.criteria_checked}/${child.criteria_total} criteria${child.claim?.agent ? ` · ${escapeHtml(child.claim.agent)}` : ""}</span>
           </span>
         </li>
@@ -3005,6 +3141,7 @@ function setView(view) {
   setRailShare(targetShare);
   saveBoardState();
   placeIndicator();
+  if (state.view === "overview") scheduleRollupChipFit();
 }
 
 const BOARD_LANES = ["ready", "inprogress", "done"];
@@ -3205,7 +3342,7 @@ function renderPaletteList() {
         : "";
       return '<li id="cmdk-opt-' + index + '" role="option" aria-selected="' + (index === paletteActiveIndex) + '" class="pw-cmdk-item' + (index === paletteActiveIndex ? ' is-active' : '') + '" data-index="' + index + '">' +
         '<span class="pw-cmdk-item-id pw-num">' + escapeHtml(card.id) + '</span>' +
-        '<span class="pw-cmdk-item-title">' + escapeHtml(card.title) + '</span>' +
+        '<span class="pw-cmdk-item-title">' + escapeHtml(displayTitle(card.title, card.id)) + '</span>' +
         '<span class="pw-cmdk-item-source">' + escapeHtml(provenance) + '</span>' + snippet + '</li>';
     }).join("");
   }
@@ -3284,6 +3421,21 @@ els.overview.addEventListener("click", (event) => {
   const row = event.target.closest("[data-rollup-repo]");
   if (row) selectRollupRepo(row.dataset.rollupRepo);
 });
+// Chip collapse is measured against the rendered track, so it must re-run
+// when the track or the metrics move: viewport resizes and late webfont
+// arrival both shift chip widths.
+let rollupFitFrame = 0;
+function scheduleRollupChipFit() {
+  if (rollupFitFrame) return;
+  rollupFitFrame = requestAnimationFrame(() => {
+    rollupFitFrame = 0;
+    fitAllRollupChips();
+  });
+}
+window.addEventListener("resize", scheduleRollupChipFit);
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(scheduleRollupChipFit).catch(() => {});
+}
 els.laneSwitch.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-lane]");
   if (!button) return;

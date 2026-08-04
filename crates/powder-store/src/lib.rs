@@ -5240,7 +5240,11 @@ fn patch_card_in_transaction(
         card.labels = clean_string_list(labels);
         patched_fields.push("labels");
     }
+    let mut status_change = None;
     if let Some(status) = patch.status {
+        if status != card.status {
+            status_change = Some((card.status, status));
+        }
         card.status = status;
         patched_fields.push("status");
     }
@@ -5262,6 +5266,31 @@ fn patch_card_in_transaction(
         now,
         authority,
     )?;
+    // A status flip through PATCH is the same observable transition as
+    // /status: webhooks and the SSE tail must see it (a live board otherwise
+    // sits silently stale while flagged "live" -- design-critic finding,
+    // 2026-08-03).
+    if let Some((previous, status)) = status_change {
+        if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
+            events::append_outbound_card_event_with_authority(
+                transaction,
+                &card,
+                event_type,
+                authority,
+                json!({"previous_status": previous.as_str(), "status": status.as_str()}),
+                now,
+            )?;
+        }
+        if status.is_terminal() && !previous.is_terminal() {
+            append_parent_rollup_event_with_authority(
+                transaction,
+                &card,
+                authority,
+                &format!("child {card_id} reached {}", status.as_str()),
+                now,
+            )?;
+        }
+    }
     load_card(transaction, card_id)
 }
 
