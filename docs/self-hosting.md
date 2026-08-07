@@ -5,10 +5,9 @@ copy-pasteable path to a running instance: the two endorsed install paths
 (Docker, release binary), a deploy-target matrix, the full env-var reference,
 webhooks, and backup/restore.
 
-For CLI/MCP remote-mode transport, key rotation, the field-note generator,
-and where *this repo's own operator* runs production (a separate concern
-from "how do I self-host my own instance"), see
-[`docs/operations.md`](operations.md).
+For CLI remote-mode transport, key rotation, the field-note generator, and
+where *this repo's own operator* runs production (a separate concern from
+"how do I self-host my own instance"), see [`docs/operations.md`](operations.md).
 
 Every command below was executed verbatim against this repo at the time this
 document was written (2026-07-14) — see the "verified" notes per section.
@@ -66,8 +65,8 @@ POWDER_DB_PATH=./data/powder.db POWDER_BOOTSTRAP_KEY_FILE=./data/powder-bootstra
 ```
 
 Swap the tarball name for `powder-x86_64-unknown-linux-gnu.tar.gz` or
-`powder-aarch64-unknown-linux-gnu.tar.gz` on Linux. The tarball also
-contains the `powder` CLI and `powder-mcp` binaries.
+`powder-aarch64-unknown-linux-gnu.tar.gz` on Linux. The tarball contains the
+`powder` CLI and `powder-server` binaries.
 
 **Verified 2026-07-14**: downloaded the real `v0.1.0` release asset
 (`powder-aarch64-apple-darwin.tar.gz`) from
@@ -427,23 +426,16 @@ current evidence for any deployment other than the one it names.
 > Those commands require the box and are the lead's to run; nothing in this
 > repo exercises them.
 
-## CLI/MCP against a remote deployment
+## CLI against a remote deployment
 
 Set `POWDER_API_BASE_URL` (and `POWDER_API_KEY` for `api-key` deployments) to
-point the `powder` CLI and `powder-mcp` at a deployed server instead of a
-local SQLite file. Full remote-mode command coverage, MCP tool-set gating,
-and key-rotation lore live in
-[`docs/operations.md`](operations.md#cli-remote-mode-transport).
+point the `powder` CLI at a deployed server instead of a local SQLite file.
+Full remote-mode command coverage and key-rotation guidance live in
+[`docs/operations.md`](operations.md#agent-cli-workflow).
 
+### CLI authority
 
-### Local CLI and MCP authority
-
-A local `powder` mutation uses the trusted process principal from `POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin principal is used. `--actor`, `--author`, and `--agent` are semantic labels only. The CLI rejects `--admin`; authority cannot be selected through command arguments.
-
-### Local MCP authority
-
-A local `powder-mcp` process must receive identity from its trusted launch/session,
-not from tool arguments. Set `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent` or `admin` alongside
-`POWDER_DB_PATH`. If either value is missing or invalid, local mutations fail with
-`unauthenticated`; the process never falls back to `operator` or `Unchecked`. MCP `actor`,
-`agent`, and answer labels remain semantic audit data and cannot grant authority.
+A local `powder` mutation uses the trusted process principal from
+`POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin principal is used.
+`--actor`, `--author`, and `--agent` are semantic labels only. The CLI rejects
+`--admin`; authority cannot be selected through command arguments.

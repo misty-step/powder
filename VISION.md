@@ -6,7 +6,7 @@ history.
 
 The repository ships the application. A deployed instance owns the data.
 Operators bring their own backlog, store it in their own SQLite database, and
-connect their own agents, runners, and humans through Powder's API, CLI, MCP,
+connect their own agents, runners, and humans through Powder's API, CLI,
 and skill surfaces.
 
 Powder should feel like the narrow missing tool between "a chat thread full of
@@ -71,16 +71,17 @@ one SQLite database, one plain-Linux-host deployment target (production runs on
 a DigitalOcean droplet), optional Litestream replication, health/readiness
 routes, first-run onboarding, and configuration through environment variables.
 
-**One semantic contract.** HTTP, CLI, MCP, and the shipped skill are adapters
-over the same domain language: cards, runs, activity, audit events, claims,
+**One semantic contract.** HTTP, CLI, and the shipped skill are adapters over
+the same domain language: cards, runs, activity, audit events, claims,
 relations, links, comments, ready work, input requests, and optional proof.
+Agents use the CLI plus `SKILL.md`; HTTP serves the UI and integrations.
 
 **A board, not a runner.** Powder stores work, locks, session state, timelines,
 events, and evidence. Codex, Herdr, Sprites, cron jobs, Bitterblossom agents,
 or other dispatchers may claim work from Powder and execute elsewhere, but the
 dispatch loop and every model call are outside the core.
 
-**A human face on the same state.** The API/MCP/CLI contract comes first, but
+**A human face on the same state.** The API/CLI contract comes first, but
 the product should still feel excellent to operate. The human UI is a thin
 layer over the same cards, claims, timelines, relations, blockers,
 awaiting-input states, and proof links that agents consume -- never a
@@ -91,7 +92,7 @@ continuously and without it being an event -- a raw ticket-by-ticket board
 stops being legible to a human, so the default human view becomes live
 rollups (epics, themes, velocity) computed from the same card graph, with
 raw per-ticket browsing one click away, not the landing page. Agents keep
-raw, full-fidelity access through the API/CLI/MCP contract regardless of
+raw, full-fidelity access through the API/CLI contract regardless of
 what the human default renders (operator ruling, 2026-07-17: see
 `powder-epic-first-human-board`).
 At every scale the human face gains a durable answer loop (operator ruling,
@@ -118,7 +119,7 @@ a deployed database and must not be committed here.
    actor, time, and change even when proof is absent.
 4. **Human input is a state.** Awaiting a decision is part of the run model,
    not a buried comment convention.
-5. **Adapters stay thin.** Business rules live in `powder-core`; API, CLI, MCP,
+5. **Adapters stay thin.** Business rules live in `powder-core`; API, CLI,
    and skill surfaces should not grow separate semantics.
 6. **Private by deployment, public by repo.** Powder is a public product for
    private instances, tailnet-friendly auth, and bring-your-own-data operation.
@@ -148,14 +149,9 @@ yet trustworthy enough for a fleet to depend on:
   that principal distinct from the declared worker label and unique run id, so
   one orchestrator credential can coordinate many workers without lying in the
   audit trail or minting a key per persona.
-- `powder-cli` can initialize an instance database, create cards, list ready
-  work, claim, transition, and complete cards.
-- `powder-mcp` exposes the full agent toolset (23 default tools plus a
-  9-tool admin add-on (32 tools total) gated by `POWDER_MCP_TOOLSETS`) over stdio using the
-  same domain model; it uses SQLite when `POWDER_DB_PATH` is set, or a
-  deployed instance over HTTP when `POWDER_API_BASE_URL`/`POWDER_API_KEY`
-  are set instead. See `SKILL.md`'s "Expected MCP Tools" for the current
-  list.
+- `powder-cli` is the agent face: initialize an instance database, list ready
+  work, claim, update, and complete cards locally (`--db`) or against a deployed
+  server (`POWDER_API_BASE_URL` / `POWDER_API_KEY`). See `SKILL.md`.
 - `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
   first-run onboarding state, API-key auth, and tailnet/none modes.
 - Docker, systemd, Litestream, and env examples follow the Canary-style
@@ -163,7 +159,7 @@ yet trustworthy enough for a fleet to depend on:
   the self-hoster reference in `docs/self-hosting.md`.
 
 The important remaining gaps are not polish. The audit trail needs to stay
-consistent across SQLite, HTTP, CLI, MCP, and the Kanban board; relations and
+consistent across SQLite, HTTP, CLI, and the Kanban board; relations and
 webhooks need live-operator proof; the answer loop, real identity and
 authority, private-ingress conformance, deterministic event emission, and a
 Kanban surface must keep making the same state legible to humans.
@@ -174,7 +170,7 @@ Kanban surface must keep making the same state legible to humans.
 - No dispatch daemon inside `powder-core`.
 - No model calls inside Powder.
 - No hidden dependency on Gradient, Hermes, or any one operator's `kanban.db`.
-- No one-to-one REST-to-MCP wrapper dump that obscures agent intent.
+- No MCP agent face; agents use the CLI and skill only.
 - No hosted multi-tenant SaaS assumption in the product core.
 - No feature-parity Linear clone before the agent-first contract is solid.
 

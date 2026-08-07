@@ -91,9 +91,9 @@ impl std::error::Error for DomainError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
     /// No identity enforcement: trusted single-operator CLI usage or an
-    /// explicitly auth-disabled loopback HTTP surface. Local MCP must provide
-    /// transport authority; a missing MCP principal is an unauthenticated error,
-    /// never an implicit Unchecked mutation.
+    /// explicitly auth-disabled loopback HTTP surface. Other callers must
+    /// provide transport authority; a missing principal is an unauthenticated
+    /// error, never an implicit Unchecked mutation.
     Unchecked,
     Principal {
         name: String,
@@ -364,8 +364,8 @@ impl OperationCapability {
     }
 }
 
-/// Stable denial classes let HTTP, CLI, MCP, and UI render the same result
-/// without parsing human-facing error strings.
+/// Stable denial classes let HTTP, CLI, and UI render the same result without
+/// parsing human-facing error strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DenialClass {

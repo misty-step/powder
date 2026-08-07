@@ -11,8 +11,8 @@ fn repo_root() -> PathBuf {
 
 /// powder-workstation-cli-convergence: `scripts/install-workstation.sh` is
 /// the repo-owned convergence path for the operator's workstation
-/// `~/.cargo/bin/powder{,-mcp,-server}` -- wired in here the same way
-/// `doctor_contract.rs` already wires `test/powder-remote-doctor.sh` in, so
+/// `~/.cargo/bin/powder` and optional `powder-server` -- wired in here the same
+/// way `doctor_contract.rs` already wires `test/powder-remote-doctor.sh` in, so
 /// it runs on every `cargo test --workspace` instead of only when someone
 /// remembers to invoke it by hand. `test/install-workstation.sh` fakes
 /// `git`/`cargo`/`curl` (a real build here would take minutes and the

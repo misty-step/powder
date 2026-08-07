@@ -5,7 +5,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 
-RUN cargo build --release --locked -p powder-server -p powder-cli -p powder-mcp
+RUN cargo build --release --locked -p powder-server -p powder-cli
 
 FROM debian:bookworm-slim
 
@@ -23,10 +23,9 @@ RUN useradd --create-home app && \
 
 COPY --from=build --chown=app:app /app/target/release/powder-server /app/bin/powder-server
 COPY --from=build --chown=app:app /app/target/release/powder /app/bin/powder
-COPY --from=build --chown=app:app /app/target/release/powder-mcp /app/bin/powder-mcp
 COPY --chown=app:app litestream.yml /etc/litestream.yml
 COPY --chown=app:app bin/entrypoint.sh /app/bin/entrypoint.sh
-RUN chmod +x /app/bin/entrypoint.sh /app/bin/powder-server /app/bin/powder /app/bin/powder-mcp
+RUN chmod +x /app/bin/entrypoint.sh /app/bin/powder-server /app/bin/powder
 
 USER app
 

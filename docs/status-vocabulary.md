@@ -82,10 +82,10 @@ complete principalized metadata shape, and the legacy `actors` table is gone.
 | `abandoned` | `abandoned` | Unchanged. |
 
 The retired names (`claimed`, `running`, `blocked`) are **rejected** by
-`update_status`/`create_card`/list filters on every face (HTTP, CLI, MCP)
-with an error naming the current vocabulary -- never silently aliased onto a
-surviving status. `in-progress`/`in_progress` and `pending` (a long-standing
-alias for `backlog`) still parse; they were never statuses of their own.
+`update_status`/`create_card`/list filters on HTTP and CLI with an error naming
+the current vocabulary -- never silently aliased onto a surviving status.
+`in-progress`/`in_progress` and `pending` (a long-standing alias for `backlog`)
+still parse; they were never statuses of their own.
 
 ## Terminal Outcomes Stay Distinguishable
 

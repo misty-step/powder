@@ -458,13 +458,9 @@ struct ListCardsParams {
     estimate: Option<String>,
     label: Option<String>,
     limit: Option<usize>,
-    /// powder-mcp-unfiltered-enumeration: `false` hides
-    /// done/shipped/abandoned cards when no explicit `status` is requested
-    /// (an explicit `status` always wins; see `CardFilter`). Defaults to
-    /// `true`, so HTTP callers that never send it keep the historical
-    /// whole-board behavior byte-for-byte unchanged; the remote MCP
-    /// dispatch path sends `false` for an unfiltered `list_cards` so remote
-    /// mode matches local (store-backed) MCP mode.
+    /// `include_terminal` controls whether terminal cards are included when
+    /// no explicit `status` is requested. An explicit status always wins.
+    /// The default keeps the historical whole-board behavior unchanged.
     include_terminal: Option<bool>,
     /// powder-cards-api-paged-continuation: the `next_after` id from a
     /// prior response on this same (filter-identical) query, letting a
@@ -726,10 +722,10 @@ struct TailParams {
 
 /// Mirrors `powder_cli::version()`'s format exactly (`crates/powder-cli/
 /// src/lib.rs`) so `scripts/install-workstation.sh` can print one
-/// consistent before/after shape across `powder`, `powder-mcp`, and
-/// `powder-server`. `/readyz`'s `version`/`git_sha` fields are the same two
-/// compile-time constants, surfaced over HTTP for a caller with no shell on
-/// the box (powder-workstation-cli-convergence).
+/// consistent before/after shape across `powder` and `powder-server`.
+/// `/readyz`'s `version`/`git_sha` fields are the same two compile-time
+/// constants, surfaced over HTTP for a caller with no shell on the box
+/// (powder-workstation-cli-convergence).
 fn version() -> String {
     let dirty = env!("POWDER_SERVER_GIT_DIRTY") == "true";
     format!(
@@ -745,9 +741,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // powder-workstation-cli-convergence: a plain `--version`/`version`/
     // `-v` argument prints and exits before touching config/env/the store,
     // so `scripts/install-workstation.sh` can check a freshly `cargo
-    // install`ed `powder-server` binary the same inert way it already
-    // checks `powder version` and `powder-mcp version`, without starting a
-    // listener.
+    // install`ed `powder-server` binary the same inert way it checks
+    // `powder version`, without starting a listener.
     if let Some(arg) = std::env::args().nth(1) {
         if arg == "version" || arg == "--version" || arg == "-v" {
             print!("{}", version());
@@ -1297,8 +1292,7 @@ fn card_list_page_json(
     // Additive, opt-in-only field: nonzero exactly when the caller sent
     // `include_terminal=false` and terminal cards were held back, so the
     // historical response shape for every existing caller is unchanged.
-    // Remote MCP dispatch uses it to build an accurate "hidden vs. beyond
-    // limit" hint (see powder-mcp's list_cards_hint).
+    // It lets clients distinguish hidden cards from cards beyond the limit.
     if excluded_terminal_count > 0 {
         payload["excluded_terminal_count"] = json!(excluded_terminal_count);
     }

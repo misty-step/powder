@@ -319,13 +319,10 @@ fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() -> Res
     Ok(())
 }
 
-/// powder-mcp-unfiltered-enumeration: `include_terminal: false` hides
-/// `Done`/`Shipped`/`Abandoned` cards from an unfiltered (`status: None`)
-/// query while `total_count` still reports every card that matched the
-/// *other* explicit filters -- the store-level half of the MCP-facing
-/// contract (`powder-mcp` builds the envelope on top of this). An explicit
-/// `status` filter is authoritative and always wins over
-/// `include_terminal`.
+/// `include_terminal: false` hides `Done`/`Shipped`/`Abandoned` cards from an
+/// unfiltered (`status: None`) query while `total_count` still reports every
+/// card matched by the other explicit filters. An explicit `status` filter is
+/// authoritative and always wins over `include_terminal`.
 #[test]
 fn list_cards_page_include_terminal_hides_terminal_cards_but_total_count_still_counts_them(
 ) -> Result<()> {
@@ -854,7 +851,7 @@ fn upsert_card_returns_the_canonical_repo_label_it_persists() -> Result<()> {
 }
 
 /// powder-904: `create_card_with_events` is the `create_card` write path
-/// (MCP/API/CLI all funnel through it); an alias or org-prefixed repo string
+/// (HTTP and CLI funnel through it); an alias or org-prefixed repo string
 /// must land canonical in the `cards.repo` column itself, not merely resolve
 /// canonical on read via `resolve_repository_name`. Query the raw column
 /// directly (bypassing `card_from_record`'s read-time resolution) so this
@@ -7284,30 +7281,11 @@ fn field_note_generator_replays_real_2026_07_04_fleet_completions() -> Result<()
     });
     store.migrate()?;
 
-    // Real, substantive text: the actual comment this lane posted to the
-    // live `powder-922` card tonight (pulled via `powder get-card
-    // powder-922`), 1167 characters of genuine drafting material -- exactly
-    // the shape the design law wants a lane to eventually pass as `proof`.
+    // Rich proof text exercises the field-note threshold and stays synthetic;
+    // product history does not belong in this persistence contract test.
     let real_substantive_proof =
-        "Shipped in PR #71 (merged 626a1f1). Added `update_card` MCP tool (store + \
-        remote), parity with existing `POST/PATCH /api/v1/cards/{id}`: title, body, \
-        acceptance, proof_plan, status, priority, labels all editable. `create_card` \
-        already existed pre-lane. `initialize` now returns `serverInfo.baseUrl` in \
-        remote mode so a caller can diff it against their own POWDER_API_BASE_URL -- \
-        root cause of the observed divergence is that a registered MCP subprocess \
-        resolves POWDER_API_BASE_URL from its own launch env (e.g. `~/.secrets`), \
-        which can differ from an interactive shell's export; documented in SKILL.md \
-        and README.md. Tests: crates/powder-mcp/src/lib.rs \
-        (mcp_update_card_patches_title_body_and_acceptance, \
-        remote_initialize_reports_the_deployment_it_is_actually_bound_to), \
-        crates/powder-mcp/src/remote.rs \
-        (update_card_sends_patch_with_only_the_supplied_fields). Full groom \
-        (create+relate+comment) is provable via the existing \
-        create_card/update_relations/add_comment tools plus the new update_card; all \
-        exercised in the test suite. Full gate green: cargo fmt --all -- --check, \
-        cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace \
-        (191 tests).";
-    assert_eq!(real_substantive_proof.len(), 1167);
+        "Shipped in a reviewed change. The CLI and HTTP surfaces now expose the same card update contract: title, body, acceptance, proof plan, status, priority, and labels remain editable. The remote client reports its deployment URL so an operator can compare it with POWDER_API_BASE_URL before a lane starts. The change includes create, relate, comment, and update coverage, with the complete behavior exercised in the test suite. The gate is green: formatting, clippy, and the workspace tests all pass for this fixture.";
+    assert!(real_substantive_proof.len() >= 120);
 
     let qualifying_id = CardId::new("replay-real-substantive")?;
     store.create_card_with_events(

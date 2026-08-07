@@ -27,7 +27,7 @@ plain string.
 
 | event_type | emitted when | change fields |
 | --- | --- | --- |
-| `card-created` | a card is created through API, CLI, MCP, or import helpers that opt into event emission | `source` |
+| `card-created` | a card is created through API, CLI, or import helpers that opt into event emission | `source` |
 | `moved-to-ready` | a card's status becomes `ready`, including explicit release to ready | `previous_status`, `status`, or release metadata |
 | `awaiting-input` | a run asks for input and the card moves to `awaiting_input` | `run_id`, `question` |
 | `claim-expired` | Powder observes an expired active claim while reclaiming the card | `principal`, `run_id`, `agent`, `expired_at` |

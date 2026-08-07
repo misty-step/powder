@@ -38,6 +38,7 @@ pub const COMMANDS: &[&str] = &[
     "list-ready",
     "list-cards",
     "board-rollups",
+    "board-stats",
     "epic-velocity",
     "search",
     "papercut",
@@ -153,6 +154,7 @@ const LIST_CARDS_FLAGS: &[&str] = &[
     "--updated-before",
 ];
 const BOARD_ROLLUPS_FLAGS: &[&str] = &["--db", "--limit", "--after", "--include-hidden", "--json"];
+const BOARD_STATS_FLAGS: &[&str] = &["--db", "--repo", "--include-hidden", "--json"];
 const EPIC_VELOCITY_FLAGS: &[&str] = &["--db", "--periods", "--period-days", "--json"];
 const SEARCH_FLAGS: &[&str] = &[
     "--db",
@@ -286,6 +288,7 @@ fn known_flags(command: &str) -> &'static [&'static str] {
         "list-ready" => LIST_READY_FLAGS,
         "list-cards" => LIST_CARDS_FLAGS,
         "board-rollups" => BOARD_ROLLUPS_FLAGS,
+        "board-stats" => BOARD_STATS_FLAGS,
         "epic-velocity" => EPIC_VELOCITY_FLAGS,
         "search" => SEARCH_FLAGS,
         "papercut" => PAPERCUT_FLAGS,
@@ -436,6 +439,28 @@ pub fn run(args: &[String]) -> Result<String, ShellError> {
 }
 
 fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    if args.is_empty() {
+        return Ok(help());
+    }
+    if args[0] == "help" {
+        match args.get(1).map(String::as_str) {
+            None | Some("--help") | Some("-h") => return Ok(help()),
+            Some(command) if COMMANDS.contains(&command) => return command_help(command),
+            Some(command) => {
+                return Err(ShellError::Invalid(format!("unknown command: {command}")))
+            }
+        }
+    }
+    if let Some(command) = args
+        .first()
+        .map(String::as_str)
+        .filter(|command| COMMANDS.contains(command))
+    {
+        if help_requested(command, &args[1..]) {
+            return command_help(command);
+        }
+    }
+
     reject_admin_flag(args)?;
     if let Some(command) = args
         .first()
@@ -446,7 +471,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
     }
     match args {
         [] => Ok(help()),
-        [command] if command == "help" || command == "--help" || command == "-h" => Ok(help()),
+        [command] if command == "--help" || command == "-h" => Ok(help()),
         [command] if command == "version" || command == "--version" || command == "-v" => {
             Ok(version_with_remote_env(remote_env))
         }
@@ -458,12 +483,13 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "repair-criteria" => repair_criteria(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
         [command, rest @ ..] if command == "update-card" => update_card(rest, remote_env),
-        [command, rest @ ..] if command == "update-relations" => update_relations(rest),
+        [command, rest @ ..] if command == "update-relations" => update_relations(rest, remote_env),
         [command, rest @ ..] if command == "relations-doctor" => relations_doctor(rest),
-        [command, rest @ ..] if command == "set-parent" => set_parent(rest),
+        [command, rest @ ..] if command == "set-parent" => set_parent(rest, remote_env),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
         [command, rest @ ..] if command == "board-rollups" => board_rollups(rest, remote_env),
+        [command, rest @ ..] if command == "board-stats" => board_stats(rest, remote_env),
         [command, rest @ ..] if command == "epic-velocity" => epic_velocity(rest, remote_env),
         [command, rest @ ..] if command == "search" => search(rest, remote_env),
         [command, rest @ ..] if command == "papercut" => papercut(rest, remote_env),
@@ -480,7 +506,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "transfer-claim" => transfer_claim(rest, remote_env),
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest, remote_env),
         [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
-        [command, rest @ ..] if command == "get-run" => get_run(rest),
+        [command, rest @ ..] if command == "get-run" => get_run(rest, remote_env),
         [command, rest @ ..] if command == "record-run-telemetry" => {
             record_run_telemetry(rest, remote_env)
         }
@@ -488,7 +514,9 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
             run_telemetry_aggregate(rest, remote_env)
         }
         [command, rest @ ..] if command == "list-approvals" => list_approvals(rest, remote_env),
-        [command, rest @ ..] if command == "list-awaiting-input" => list_awaiting_input(rest),
+        [command, rest @ ..] if command == "list-awaiting-input" => {
+            list_awaiting_input(rest, remote_env)
+        }
         [command, rest @ ..] if command == "answer-input" => answer_input(rest, remote_env),
         [command, rest @ ..] if command == "update-status" => update_status(rest, remote_env),
         [command, rest @ ..] if command == "check-criterion" => check_criterion(rest, remote_env),
@@ -505,6 +533,47 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "event-tail" => event_tail(rest),
         [command, ..] => Err(ShellError::Invalid(format!("unknown command: {command}"))),
     }
+}
+
+fn help_requested(command: &str, args: &[String]) -> bool {
+    let known = known_flags(command);
+    let mut index = 0;
+    let options = true;
+    while index < args.len() {
+        let arg = &args[index];
+        if options && arg == "--" {
+            break;
+        }
+        if options && (arg == "--help" || arg == "-h") {
+            return true;
+        }
+        if options && arg.starts_with('-') {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if known.contains(&flag) && !arg.contains('=') && flag_takes_value(flag) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn command_help(command: &str) -> Result<String, ShellError> {
+    if !COMMANDS.contains(&command) {
+        return Err(ShellError::Invalid(format!("unknown command: {command}")));
+    }
+    let flags = known_flags(command);
+    let flags = if flags.is_empty() {
+        "(none)".to_string()
+    } else {
+        flags.join(", ")
+    };
+    Ok(format!(
+        "usage: powder {command} [arguments] [options]\n\nRun the {command} command.\nflags: {flags}\n"
+    ))
 }
 
 /// Reports the installed binary's build provenance so a lane can catch a
@@ -634,6 +703,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder board-rollups --json --db ./data/powder.db --limit 20 [--after e:epic] [--include-hidden]\n",
+    );
+    help.push_str(
+        "  powder board-stats --json --db ./data/powder.db [--repo misty-step/example] [--include-hidden]\n",
     );
     help.push_str(
         "  powder epic-velocity <card-id> --json [--db ./data/powder.db] [--periods 8] [--period-days 7]\n",
@@ -1173,21 +1245,41 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
     ))
 }
 
-fn update_relations(args: &[String]) -> Result<String, ShellError> {
+fn update_relations(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "update-relations")?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let card = store
-        .update_relations_keyed(
-            &card_id,
-            card_ids_flag(args, "--related")?,
-            card_ids_flag(args, "--blocks")?,
-            card_ids_flag(args, "--blocked-by")?,
-            KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
-        )
-        .map_err(store_err)?
-        .value;
-    Ok(format!("relations\t{}\n", card.id))
+    let related = card_ids_flag(args, "--related")?;
+    let blocks = card_ids_flag(args, "--blocks")?;
+    let blocked_by = card_ids_flag(args, "--blocked-by")?;
+    let card = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let card = store
+            .update_relations_keyed(
+                &card_id,
+                related,
+                blocks,
+                blocked_by,
+                KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
+            )
+            .map_err(store_err)?
+            .value;
+        json!({ "id": card.id })
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post_with_key(
+                &format!("/api/v1/cards/{card_id}/relations"),
+                json!({
+                    "related": card_id_values(&related),
+                    "blocks": card_id_values(&blocks),
+                    "blocked_by": card_id_values(&blocked_by),
+                }),
+                &idempotency_key(args)?,
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("update-relations"));
+    };
+    Ok(format!("relations\t{}\n", json_string(&card, "id")?))
 }
 
 /// Report (or, with `--repair`, fix) cards whose `blocks`/`blocked_by`/
@@ -1208,9 +1300,7 @@ fn relations_doctor(args: &[String]) -> Result<String, ShellError> {
     to_pretty_json(&report)
 }
 
-/// `set-parent <id> --parent <parent-id>` links; `set-parent <id> --clear`
-/// clears the edge.
-fn set_parent(args: &[String]) -> Result<String, ShellError> {
+fn set_parent(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "set-parent")?;
     let parent = match (flag_value(args, "--parent"), has_flag(args, "--clear")) {
@@ -1224,24 +1314,38 @@ fn set_parent(args: &[String]) -> Result<String, ShellError> {
             ))
         }
     };
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let card = store
-        .set_parent_keyed(
-            &card_id,
-            parent,
-            now,
-            &idempotency_key(args)?,
-            &authority(args),
-        )
-        .map_err(store_err)?
-        .value;
+    let parent_wire = parent.as_ref().map(|parent| parent.as_str().to_string());
+    let card = if let Some(db) = flag_value(args, "--db") {
+        let mut store = open_store(db)?;
+        let card = store
+            .set_parent_keyed(
+                &card_id,
+                parent,
+                now,
+                &idempotency_key(args)?,
+                &authority(args),
+            )
+            .map_err(store_err)?
+            .value;
+        json!({
+            "id": card.id,
+            "parent": card.parent.map(|parent| parent.as_str().to_string()),
+        })
+    } else if let Some(client) = remote_env.client() {
+        client
+            .post_with_key(
+                &format!("/api/v1/cards/{card_id}/parent"),
+                json!({ "parent": parent_wire }),
+                &idempotency_key(args)?,
+            )
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("set-parent"));
+    };
     Ok(format!(
         "parent\t{}\t{}\n",
-        card.id,
-        card.parent
-            .as_ref()
-            .map(|parent| parent.as_str())
-            .unwrap_or("none")
+        json_string(&card, "id")?,
+        card.get("parent").and_then(Value::as_str).unwrap_or("none")
     ))
 }
 
@@ -1337,7 +1441,7 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
 }
 
 /// Search cards and indexed comments/work logs. The JSON envelope is shared with
-/// the HTTP and MCP surfaces; --json is accepted explicitly for scripts.
+/// the HTTP surface; --json is accepted explicitly for scripts.
 fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let positionals = positional_preserving_leading_hyphen(args, known_flags("search"));
     if positionals.len() > 1 {
@@ -1501,7 +1605,7 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
             estimate,
             repo: repo.clone(),
             label: label.clone(),
-            // powder-mcp-unfiltered-enumeration: only the MCP `list_cards`
+            // list-cards terminal exclusion:
             // tool defaults to hiding terminal cards; the CLI keeps its
             // existing whole-board behavior unchanged.
             include_terminal: true,
@@ -1580,6 +1684,35 @@ fn board_rollups(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("board-rollups"));
+    };
+    to_pretty_json(&value)
+}
+/// Return compact board counts over local SQLite or the authenticated HTTP API.
+fn board_stats(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let include_hidden = has_flag(args, "--include-hidden");
+    let repo = flag_value(args, "--repo").map(str::to_string);
+    let value = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        serde_json::to_value(
+            store
+                .board_stats(powder_store::BoardStatsQuery {
+                    repo,
+                    include_hidden,
+                    now: unix_now(),
+                })
+                .map_err(store_err)?,
+        )
+        .map_err(|error| ShellError::Invalid(error.to_string()))?
+    } else if let Some(client) = remote_env.client() {
+        let mut query = format!("include_hidden={include_hidden}");
+        if let Some(repo) = repo {
+            query.push_str(&format!("&repo={}", urlencode(&repo)));
+        }
+        client
+            .get(&format!("/api/v1/stats?{query}"))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("board-stats"));
     };
     to_pretty_json(&value)
 }
@@ -2015,18 +2148,28 @@ fn get_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
         Err(missing_transport("get-card"))
     }
 }
-
-fn get_run(args: &[String]) -> Result<String, ShellError> {
+fn get_run(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let run_id = positional(args)
         .first()
         .copied()
         .ok_or_else(|| ShellError::Invalid("get-run requires a run id".to_string()))
         .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
-    let store = open_store(required_flag(args, "--db")?)?;
-    let detail = store
-        .get_run_detail(&run_id, DetailLevel::Detailed)
-        .map_err(store_err)?
-        .ok_or_else(|| ShellError::NotFound(format!("run not found: {run_id}")))?;
+    let detail = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        serde_json::to_value(
+            store
+                .get_run_detail(&run_id, DetailLevel::Detailed)
+                .map_err(store_err)?
+                .ok_or_else(|| ShellError::NotFound(format!("run not found: {run_id}")))?,
+        )
+        .map_err(|error| ShellError::Store(error.to_string()))?
+    } else if let Some(client) = remote_env.client() {
+        client
+            .get(&format!("/api/v1/runs/{run_id}?detail=detailed"))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("get-run"));
+    };
     to_pretty_json(&detail)
 }
 
@@ -2118,12 +2261,21 @@ fn list_approvals(args: &[String], remote_env: &RemoteEnv) -> Result<String, She
     to_pretty_json(&serde_json::json!({ "approvals": approvals }))
 }
 
-fn list_awaiting_input(args: &[String]) -> Result<String, ShellError> {
-    let store = open_store(required_flag(args, "--db")?)?;
-    let awaiting = store
-        .list_awaiting_input(parse_limit(args).unwrap_or(20))
-        .map_err(store_err)?;
-    to_pretty_json(&serde_json::json!({ "awaiting": awaiting }))
+fn list_awaiting_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let limit = parse_limit(args).unwrap_or(20);
+    let value = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        json!({
+            "awaiting": store.list_awaiting_input(limit).map_err(store_err)?
+        })
+    } else if let Some(client) = remote_env.client() {
+        client
+            .get(&format!("/api/v1/runs/awaiting-input?limit={limit}"))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("list-awaiting-input"));
+    };
+    to_pretty_json(&value)
 }
 
 fn answer_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -3006,6 +3158,7 @@ mod tests {
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"list-cards"));
         assert!(COMMANDS.contains(&"board-rollups"));
+        assert!(COMMANDS.contains(&"board-stats"));
         assert!(COMMANDS.contains(&"repository-list"));
         assert!(COMMANDS.contains(&"repository-get"));
         assert!(COMMANDS.contains(&"repository-upsert"));
@@ -3043,6 +3196,57 @@ mod tests {
         assert!(COMMANDS.contains(&"dead-letter-list"));
         assert!(COMMANDS.contains(&"dead-letter-replay"));
         assert!(COMMANDS.contains(&"event-tail"));
+    }
+
+    #[test]
+    fn help_complete_card_without_db_prints_usage() {
+        let output =
+            run_with_env(&args(["complete-card", "--help"]), &remote_env(None, None)).unwrap();
+        assert!(output.contains("usage: powder complete-card"), "{output}");
+        assert!(output.contains("complete-card"), "{output}");
+    }
+
+    #[test]
+    fn help_complete_card_with_card_does_not_mutate() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-help-complete-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        let env = remote_env(None, None);
+        run_with_env(&args(["init-db", "--db", &db]), &env).unwrap();
+        run_with_env(
+            &args([
+                "create-card",
+                "--db",
+                &db,
+                "--id",
+                "help-card",
+                "--title",
+                "Help card",
+                "--acceptance",
+                "proof exists",
+                "--status",
+                "in_progress",
+            ]),
+            &env,
+        )
+        .unwrap();
+
+        let output = run_with_env(
+            &args(["complete-card", "help-card", "--db", &db, "--help"]),
+            &env,
+        )
+        .unwrap();
+        assert!(output.contains("usage: powder complete-card"), "{output}");
+
+        let card = run_with_env(&args(["get-card", "help-card", "--db", &db]), &env).unwrap();
+        let detail: Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(detail["card"]["status"], "in_progress");
+        let _ = std::fs::remove_file(db);
     }
 
     #[test]
@@ -6148,6 +6352,107 @@ Serve grid thumbnails instead of full originals.\n\n\
         assert_eq!(payload["coverage"]["total_cards"], 2);
         assert_eq!(payload["coverage"]["accounted_cards"], 2);
         assert_eq!(payload["rollups"][0]["kind"], "unsorted");
+    }
+
+    #[test]
+    fn board_stats_json_reads_local_store() {
+        let db = std::env::temp_dir().join(format!(
+            "powder-cli-stats-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = db.to_string_lossy().to_string();
+        let env = remote_env(None, None);
+        run_with_env(&args(["init-db", "--db", &db]), &env).unwrap();
+        for id in ["stats-a", "stats-b"] {
+            run_with_env(
+                &args([
+                    "create-card",
+                    "--db",
+                    &db,
+                    "--id",
+                    id,
+                    "--title",
+                    "Stats card",
+                    "--acceptance",
+                    "proof exists",
+                ]),
+                &env,
+            )
+            .unwrap();
+        }
+        let output = run_with_env(&args(["board-stats", "--db", &db, "--json"]), &env).unwrap();
+        let payload: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["totals"]["cards"], 2);
+        assert_eq!(payload["totals"]["ready"], 2);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn cli_remote_mode_uses_http_for_relations_parent_and_runs() {
+        let (base_url, recorded) = spawn_test_server(vec![
+            (200, json!({"id": "rel-a", "status": "ready"})),
+            (
+                200,
+                json!({"id": "child-a", "parent": "rel-a", "status": "ready"}),
+            ),
+            (
+                200,
+                json!({"state": "active", "card_id": "rel-a", "answer": "Approved"}),
+            ),
+            (200, json!({"awaiting": [{"id": "run-a"}]})),
+        ]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+
+        let relations = run_with_env(
+            &args([
+                "update-relations",
+                "rel-a",
+                "--related",
+                "rel-b",
+                "--blocks",
+                "rel-c",
+                "--idempotency-key",
+                "rel-key",
+            ]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(relations, "relations\trel-a\n");
+
+        let parent =
+            run_with_env(&args(["set-parent", "child-a", "--parent", "rel-a"]), &env).unwrap();
+        assert_eq!(parent, "parent\tchild-a\trel-a\n");
+
+        let run = run_with_env(&args(["get-run", "run-a"]), &env).unwrap();
+        assert!(run.contains("\"state\": \"active\""));
+
+        let awaiting = run_with_env(&args(["list-awaiting-input"]), &env).unwrap();
+        assert!(awaiting.contains("\"awaiting\""));
+        assert!(awaiting.contains("run-a"));
+
+        let requests = recorded.lock().unwrap();
+        let paths = requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "POST /api/v1/cards/rel-a/relations",
+                "POST /api/v1/cards/child-a/parent",
+                "GET /api/v1/runs/run-a?detail=detailed",
+                "GET /api/v1/runs/awaiting-input?limit=20",
+            ]
+        );
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"related": ["rel-b"], "blocks": ["rel-c"], "blocked_by": []}))
+        );
+        assert_eq!(requests[0].idempotency_key.as_deref(), Some("rel-key"));
+        assert_eq!(requests[1].body, Some(json!({"parent": "rel-a"})));
     }
 
     #[test]

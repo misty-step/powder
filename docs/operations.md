@@ -1,10 +1,9 @@
 # Operations
 
 This is the operator/runbook reference for a deployed Powder instance:
-remote-mode transport details, MCP registration and key-rotation lore, the
-self-hosting deployment shape, and the field-note/canary/mobile-key knobs.
-It was relocated here from the README (which now stays a short pitch +
-quickstart) verbatim -- nothing here was rewritten, only moved.
+remote CLI transport, key rotation, the self-hosting deployment shape, and the
+field-note/canary/mobile-key knobs.
+It was relocated here from the README, which stays a short pitch and quickstart.
 
 For the five-minute path to a running instance, see the
 [README quickstart](../README.md#quickstart). For where the operator's own
@@ -13,14 +12,14 @@ production instance actually runs, see
 
 ## Workstation binary installation
 
-The canonical local install location for `powder`, `powder-mcp`, and (if you
-run it locally) `powder-server` is `~/.cargo/bin` -- the same directory
-`cargo install --path` has always used, and the directory a normal `cargo
-install` puts first on `PATH`. There is exactly one supported way to bring
-those binaries in sync with a checkout:
+The canonical local install location for `powder` and (if you run it locally)
+`powder-server` is `~/.cargo/bin` -- the same directory `cargo install --path`
+has always used, and the directory a normal `cargo install` puts first on
+`PATH`. There is exactly one supported way to bring those binaries in sync
+with a checkout:
 
 ```sh
-scripts/install-workstation.sh                # builds powder + powder-mcp from HEAD
+scripts/install-workstation.sh                # builds powder from HEAD
 scripts/install-workstation.sh --with-server   # also installs powder-server
 scripts/install-workstation.sh --verify        # installs, then proves the installed
                                                 # binary keeps every repeated
@@ -131,26 +130,12 @@ See [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks) for a full
 `subscription-create` -> trigger an event -> `event-tail`/`dead-letter-list`
 readback walkthrough against a real local server.
 
-MCP can also run against a local or deployed `powder-server` over HTTP instead
-of opening SQLite directly:
+## Agent CLI workflow
 
-MCP claim lifecycle operations are consolidated under `manage_claim` with an
-`action` enum (`claim`, `renew`, `heartbeat`, `release`, `transfer`). This is a
-pre-1.0 MCP break: the former `claim_card`, `renew_claim`, `heartbeat`,
-`release_claim`, and `transfer_claim` tools are removed from `tools/list`.
-
-By default, `powder-mcp` advertises the 23-tool agent persona only: card discovery,
-card/runs reads, card creation/update, status/relations/criteria writes,
-claim management, comments, work logs, links, input requests/answers,
-completion, and `list_repositories` for repo filters. Operator/admin tools are
-hidden from both `tools/list` and `tools/call`: `create_event_subscription`,
-`list_event_subscriptions`, `disable_event_subscription`, `list_dead_letters`,
-`tail_events`, `list_keys`, `upsert_repository`, `delete_repository`, and
-`merge_repository_alias`. Set `POWDER_MCP_TOOLSETS=admin` or
-`POWDER_MCP_TOOLSETS=all` before starting the MCP subprocess to add those
-admin tools to the same server registration (32 tools total, including the 9-tool admin add-on). The value is read once at startup
-for MCP client cache stability; changing it requires restarting `powder-mcp`.
-A hidden-tool call returns an error naming `POWDER_MCP_TOOLSETS`.
+Agents use the `powder` CLI in local SQLite mode or against a deployed server.
+Set `POWDER_API_BASE_URL` and, for `api-key` deployments, `POWDER_API_KEY` to
+select remote mode. `--db` always wins when supplied. Read [`SKILL.md`](../SKILL.md)
+for the command contract and the required lifecycle sequence.
 
 ```sh
 DB=/tmp/powder-http-smoke/powder.db
@@ -162,96 +147,27 @@ POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 ca
 # in another shell
 export POWDER_API_BASE_URL=http://127.0.0.1:4017
 export POWDER_API_KEY="$KEY"
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_ready","arguments":{"limit":1}}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manage_claim","arguments":{"card_id":"smoke-proof","action":"claim","agent":"codex","ttl_seconds":60}}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"complete_card","arguments":{"card_id":"smoke-proof","proof":"http://example.test/proof"}}}' \
-  | cargo run -q -p powder-mcp
+powder list-ready --limit 1
+powder claim smoke-proof --agent codex
+powder complete-card smoke-proof --proof https://example.test/proof
 ```
 
-A registered MCP subprocess resolves `POWDER_API_BASE_URL` from its own launch
-environment (e.g. sourced from `~/.secrets` in a `bash -lc` wrapper), which can
-silently diverge from an operator's interactive shell. `initialize` reports
-`result.serverInfo.baseUrl`, so a caller can confirm the two faces agree
-instead of guessing at deployment drift from intermittent connection errors.
+`powder version` reports the installed binary's build commit. With
+`POWDER_API_BASE_URL` set, it compares that commit with the deployed server's
+`/readyz` value and prints a `DRIFT` line when they differ. A stale or
+unreachable server produces a note, not a local command failure.
 
-A long-lived `powder-mcp` subprocess also captures `POWDER_API_KEY` once, at
-boot; rotating the key does not change the running process's environment, so
-it keeps sending the old value until something restarts it (powder-944).
-Restarting the MCP client always fixes this. To avoid the restart, set
-`POWDER_API_KEY_CMD` to a shell command that prints a fresh key on stdout
-(e.g. `security find-generic-password -a "$USER" -s powder-api-key -w`);
-`powder-mcp` runs it once at boot and again on every `401` epoch -- not just
-the first one for the life of the process -- transparently retrying with
-whatever key that produces if it differs from the one that just failed. A
-second (or third) rotation later in the same long-lived subprocess self-heals
-the same way. `POWDER_API_KEY` remains the plain
-fallback and is unchanged when `POWDER_API_KEY_CMD` is unset. A `401` that
-survives the retry (or has no `POWDER_API_KEY_CMD` to retry with) names the
-key prefix `powder-mcp` used and says to restart the client or configure
-`POWDER_API_KEY_CMD`; three or more consecutive `404`s on tool calls get a
-distinct steer toward a stale `POWDER_API_BASE_URL` (a deployment host
-cutover, powder-965's class of incident) instead.
+The CLI retries a request once with a fresh value from `POWDER_API_KEY_CMD`
+when the active key enters a new `401` failure epoch. It keeps the plain
+`POWDER_API_KEY` value as the fallback. Repeated `404` responses identify a
+stale `POWDER_API_BASE_URL` after the configured threshold.
 
-The repo also includes a deterministic MCP tool-use eval harness. It creates
-throwaway fixture SQLite DBs, starts the real `powder-mcp` binary over stdio,
-runs four scripted scenarios, and prints one compact baseline table. `response
-chars` is the total visible tool-result JSON text, plus JSON-RPC error message
-text for recovery scenarios:
+Agents that talk to the HTTP API directly can read `GET /api/v1/routes` for
+the full route contract. The CLI remains the supported agent face because it
+keeps transport, output, and lifecycle commands consistent.
 
-```sh
-cargo build -q -p powder-mcp --bin powder-mcp
-cargo run -q -p powder-mcp --example eval
-```
-
-Set `POWDER_MCP_BIN=/path/to/powder-mcp` to force a specific binary. The
-integration test runs the same harness without any LLM calls:
-
-```sh
-cargo test -p powder-mcp --test tool_use_eval
-```
-
-To add a scenario, extend `crates/powder-mcp/src/eval_harness.rs` with a seed
-function, a stdio tool-call script, and persisted end-state assertions, then
-add the scenario to `run_eval`. Keep setup synthetic and repo-local: fixture
-data is written only to temp SQLite DBs, never to checked-in backlog data.
-
-Agents that talk to the HTTP API directly, without the CLI or MCP, can read
-`GET /api/v1/routes` for the full route contract with example request bodies
-naming required fields -- `POST /api/v1/cards` and
-`GET /api/v1/board/rollups` and `POST /api/v1/cards/{id}/links` are two routes agents have previously had to
-trial-and-error against raw serde deserialize errors.
-
-`update_card`/`PATCH /api/v1/cards/{id}` patches title, body, acceptance,
-proof_plan, status, priority, or labels on an existing card without
-replacing protected lifecycle or source metadata; it requires an admin-scope
-key.
-
-Harness Kit's `factory-mcps` materializer expects Powder's remote MCP entry to
-provide the HTTP environment rather than a local DB when used by factory
-profiles:
-
-```yaml
-- id: powder
-  app: Powder
-  source_repo: misty-step/powder
-  product_skill: misty-powder
-  status: available
-  required_env_any:
-    - [POWDER_API_BASE_URL, POWDER_API_KEY]
-    - [POWDER_DB_PATH]
-  env_sources:
-    - name: POWDER_API_BASE_URL
-      op_ref: op://Agents/POWDER_ENDPOINT/URL
-    - name: POWDER_API_KEY
-      op_ref: op://Agents/POWDER_API_KEY__bridge/credential
-  codex:
-    server_name: powder
-    command: bash
-    args:
-      - -lc
-      - cd /path/to/powder && exec cargo run --locked -q -p powder-mcp
-```
+For paging, webhook operations, key rotation, and production deployment,
+continue with the sections below and [`docs/self-hosting.md`](self-hosting.md).
 
 ## Paging `/api/v1/cards` and `/api/v1/cards/ready` beyond `limit` (powder-cards-api-paged-continuation)
 
@@ -267,7 +183,7 @@ Ready pages use a durable, store-backed v3 snapshot cursor. Its URL token contai
 
 The captured Ready order is immutable. A card claimed, deleted, or otherwise no longer eligible before a later page is skipped without moving the cursor backwards or requiring the departed anchor. Cards that become eligible after page one are appended after the captured positions in the current dependency order. This gives a lossless walk: no duplicate or omission from departures, cycles remain reported, and mid-walk arrivals do not reorder already captured work. Retrying the same cursor is deterministic because the position is carried in the token, not mutable shared state.
 
-Ready pagination uses only opaque v3 `after` cursors bound to the query filters and a durable SQLite snapshot. CLI and MCP local calls decode the same v3 value before entering Store; remote calls forward it unchanged. A bare card ID is rejected rather than guessed, so a departed anchor cannot duplicate or skip work.
+Ready pagination uses only opaque v3 `after` cursors bound to the query filters and a durable SQLite snapshot. CLI local calls decode the same v3 value before entering Store; remote calls forward it unchanged. A bare card ID is rejected rather than guessed, so a departed anchor cannot duplicate or skip work.
 
 Ready `has_more` and `next_after` are position-aware. Continue while `next_after` is present; `total_count` reports the current eligible count and may change as claims or arrivals occur. Plain `/api/v1/cards` continuation retains its existing card-id behavior and does not receive Ready snapshot semantics.
 
@@ -515,11 +431,3 @@ admin key can touch.
 ## Search contract
 
 `GET /api/v1/cards/search` and `powder search --json` use the same store-backed query. Pass `q` plus optional `source_kind`/`source_field`, status, repo, label, priority, estimate, risk, `created_after`/`created_before`, `updated_after`/`updated_before`, `limit`, and opaque `after`. Search includes card title/body/criteria, comments, and work logs. A single term is exact-or-prefix; multiple terms are unordered within an FTS window. Hyphen and underscore compounds are exact tokens, so sub-token searches are intentionally limited; snippets are plain untrusted text and clients must escape them before HTML. Cursors are bound to the query and filter fingerprint; reusing one with changed filters returns an invalid-cursor error. A valid cursor is an offset into the deterministic result ordering, so concurrent inserts, edits, or deletes can shift later pages; restart the search when a live board changes.
-
-
-### MCP process identity
-
-For local MCP, configure `POWDER_MCP_PRINCIPAL` and `POWDER_MCP_ROLE=agent|admin` in the
-trusted process environment. The local dispatcher passes that authority into every
-Store mutation. It rejects missing identity as `unauthenticated`; caller-supplied
-`actor`, `agent`, or `answered_by` fields never select the principal or role.

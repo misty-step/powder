@@ -21,14 +21,14 @@ trap 'rm -rf "$TMP"' EXIT
 
 FAKEREPO="$TMP/reporoot"
 FAKES="$TMP/fakebin"
-mkdir -p "$FAKEREPO/scripts" "$FAKEREPO/crates/powder-cli" "$FAKEREPO/crates/powder-mcp" \
+mkdir -p "$FAKEREPO/scripts" "$FAKEREPO/crates/powder-cli" \
   "$FAKEREPO/crates/powder-server" "$FAKES"
 cp "$REAL_SCRIPT" "$FAKEREPO/scripts/install-workstation.sh"
 chmod +x "$FAKEREPO/scripts/install-workstation.sh"
 
-# Fake `powder`/`powder-mcp`/`powder-server`: cargo (below) installs a copy
-# of this under the right binary name, so `version` and the `--verify`
-# create-card/get-card round trip both work without a real store.
+# Fake `powder`/`powder-server`: cargo (below) installs a copy of this under
+# the right binary name, so `version` and the `--verify` create-card/get-card
+# round trip both work without a real store.
 # POWDER_TEST_SIMULATE_BUG=1 reproduces the historical
 # powder-cli-repeated-acceptance regression on purpose, to prove `--verify`
 # actually catches it rather than rubber-stamping.
@@ -191,21 +191,20 @@ run_install CARGO_INSTALL_ROOT="$TMP/root-dirty-allowed" POWDER_TEST_CARGO_LOG="
 grep -q 'crates/powder-cli' "$cargo_log"
 rm -f "$FAKEREPO/.dirty-marker"
 
-# 3. Clean tree, no tag, default flags: installs powder + powder-mcp, not
-# powder-server; prints before/after.
+# 3. Clean tree, no tag, default flags: installs powder, not powder-server;
+# prints before/after.
 cargo_log="$TMP/cargo-default.log"
 : >"$cargo_log"
 out="$(run_install CARGO_INSTALL_ROOT="$TMP/root-default" POWDER_TEST_CARGO_LOG="$cargo_log" --)"
 grep -q 'crates/powder-cli' "$cargo_log"
-grep -q 'crates/powder-mcp' "$cargo_log"
 if grep -q 'crates/powder-server' "$cargo_log"; then
-  echo "must not install powder-server without --with-server" >&2
+  echo "default install must not install powder-server" >&2
   exit 1
 fi
+[[ "$(wc -l <"$cargo_log")" -eq 1 ]]
 grep -q '^before:$' <<<"$out"
 grep -q '^after:$' <<<"$out"
 grep -q 'powder 0.1.0 (git' <<<"$out"
-grep -q 'powder-mcp 0.1.0 (git' <<<"$out"
 
 # 4. --with-server also installs powder-server.
 cargo_log="$TMP/cargo-with-server.log"
@@ -255,11 +254,10 @@ if [[ -n "$triple" ]]; then
   stage="$reldir/stage"
   mkdir -p "$stage"
   cp "$TEMPLATE" "$stage/powder"
-  cp "$TEMPLATE" "$stage/powder-mcp"
   cp "$TEMPLATE" "$stage/powder-server"
   chmod +x "$stage"/*
   tarball="powder-$triple.tar.gz"
-  (cd "$stage" && tar -czf "$reldir/$tarball" powder powder-mcp powder-server)
+  (cd "$stage" && tar -czf "$reldir/$tarball" powder powder-server)
   (cd "$reldir" && shasum -a 256 "$tarball" >"$tarball.sha256")
 
   cargo_log="$TMP/cargo-tag-release.log"
@@ -295,17 +293,17 @@ run_install CARGO_INSTALL_ROOT="$TMP/root-precedence" CARGO_HOME="$TMP/cargo-hom
 
 # 11. A mid-loop install failure must not die silently between the before
 # and after reports: it names the crate that failed and prints the partial
-# state, so the operator can see powder was replaced while powder-mcp
+# state, so the operator can see powder was replaced while powder-server
 # stayed stale.
-if run_install CARGO_INSTALL_ROOT="$TMP/root-midfail" POWDER_TEST_CARGO_FAIL_CRATE=powder-mcp \
-  -- >"$TMP/midfail.out" 2>&1; then
+if run_install CARGO_INSTALL_ROOT="$TMP/root-midfail" POWDER_TEST_CARGO_FAIL_CRATE=powder-server \
+  -- --with-server >"$TMP/midfail.out" 2>&1; then
   echo "expected a mid-loop cargo failure to fail the script" >&2
   exit 1
 fi
-grep -q 'FAILED installing powder-mcp' "$TMP/midfail.out"
+grep -q 'FAILED installing powder-server' "$TMP/midfail.out"
 grep -q 'after (partial):' "$TMP/midfail.out"
 grep -q 'powder 0.1.0 (git' "$TMP/midfail.out"
-grep -q 'powder-mcp: not installed' "$TMP/midfail.out"
+grep -q 'powder-server: not installed' "$TMP/midfail.out"
 
 # 12. Unknown flags are rejected with a clear message, not silently ignored.
 if run_install CARGO_INSTALL_ROOT="$TMP/root-badflag" -- --not-a-real-flag \

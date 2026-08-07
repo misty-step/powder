@@ -746,20 +746,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "powder-mcp"
-version = "0.1.0"
-dependencies = [
- "powder-api",
- "powder-core",
- "powder-mcp",
- "powder-shell",
- "powder-store",
- "serde",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "powder-server"
 version = "0.1.0"
 dependencies = [
@@ -770,7 +756,6 @@ dependencies = [
  "powder-api",
  "powder-cli",
  "powder-core",
- "powder-mcp",
  "powder-shell",
  "powder-store",
  "serde",
