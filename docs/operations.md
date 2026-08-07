@@ -98,6 +98,11 @@ never an error.
 | `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
 | `answer-input` | SQLite run resume | `POST /api/v1/runs/{id}/answer` | `answered-input\trun_id\tcard_id` |
 | `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
+| `update-relations` | SQLite relation write | `POST /api/v1/cards/{id}/relations` | `relations\tid` |
+| `set-parent` | SQLite parent write | `POST /api/v1/cards/{id}/parent` | `parent\tid\tparent|none` |
+| `get-run` | SQLite run detail | `GET /api/v1/runs/{id}?detail=detailed` | JSON run detail |
+| `list-awaiting-input` | SQLite awaiting list | `GET /api/v1/runs/awaiting-input?limit=` | JSON `{awaiting}` |
+| `board-stats` | SQLite board counts | `GET /api/v1/stats` | JSON totals/repos |
 
 Rollup `coverage` is the full visibility-scoped parent-graph classification/reachability envelope. A row's `status_counts` covers only its root epic's direct children or its parentless leaf itself (parentless leaves are grouped into repository `Unsorted` rows), so nested-epic row sums do not have to equal `coverage.accounted_cards`.
 
@@ -105,19 +110,16 @@ Local SQLite CLI mutations authenticate as the trusted process principal from `P
 
 When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
 command, the CLI exits with a one-line transport error instead of silently
-falling back to ephemeral state. `update-relations`, `set-parent`, `get-run`,
-`list-awaiting-input`, `repository-*`, `import-github-issues`,
-`key-*`, `subscription-*`, `dead-letter-list`, and `event-tail` remain
-`--db`-only (bulk/admin operations, hierarchy/webhook management, or reads
-with no remote-mode demand yet); omitting `--db` on those still fails with a
-bare `missing --db`.
+falling back to ephemeral state. Admin and bulk commands (`repository-*`,
+`import-github-issues`, `key-*`, `subscription-*`, `dead-letter-list`,
+`event-tail`, `relations-doctor`) remain `--db`-only; omitting `--db` on those
+still fails with a bare `missing --db`.
 
 Commands with no remote-mode transport, verified against `COMMANDS` in
 `crates/powder-cli/src/lib.rs`:
 
 | Command | Purpose | Example |
 | --- | --- | --- |
-| `set-parent` | Link or clear a card's explicit `parent` edge (epic decomposition) | `powder set-parent 002 --db ./data/powder.db --parent 001` / `powder set-parent 002 --db ./data/powder.db --clear` |
 | `repository-get` | Read one repository entity by canonical name or alias | `powder repository-get canary --db ./data/powder.db` |
 | `repository-delete` | Delete an unused repository entity and its aliases | `powder repository-delete canary --db ./data/powder.db` |
 | `subscription-create` | Register a signed webhook subscription (prints the signing secret once with `--show-secret`) | `powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret` |
