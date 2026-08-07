@@ -1587,14 +1587,13 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
     assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
 }
 
-/// powder-mcp-unfiltered-enumeration (rev-125 fix): `GET /api/v1/cards`
-/// accepts an optional `include_terminal` query param so the remote MCP
-/// dispatch path can apply the same default terminal exclusion as local
-/// (store-backed) MCP mode -- the exclusion must happen server-side, since
-/// the server truncates to `limit` before any client could post-filter.
-/// Defaulting to `true` keeps every existing HTTP caller's card membership
-/// behavior byte-for-byte unchanged; pagination metadata remains cursor-based,
-/// including when terminal cards are excluded.
+/// `GET /api/v1/cards` accepts an optional `include_terminal` query param so
+/// callers can choose whether an unfiltered list includes terminal cards. The
+/// exclusion happens server-side because the server truncates to `limit`
+/// before a client could post-filter. Defaulting to `true` keeps every
+/// existing HTTP caller's card membership behavior byte-for-byte unchanged;
+/// pagination metadata remains cursor-based, including when terminal cards are
+/// excluded.
 #[tokio::test]
 async fn list_cards_include_terminal_param_hides_terminal_server_side_and_defaults_to_true() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -1867,21 +1866,19 @@ async fn list_and_ready_routes_carry_full_criteria_text_not_a_clipped_preview() 
     assert_eq!(ready_card["criteria"][0]["text"], long_criterion);
 }
 
-/// powder-epic-ready-plan: MCP, HTTP, and CLI must expose the exact same
-/// `list_ready` ordering `Store::list_ready_page` computes -- none of the
-/// three faces may re-sort or otherwise diverge from it. Seeds a fixture
-/// combining all three ready-plan behaviors in one pass -- a 3-level
-/// `blocked_by` chain that stays excluded past its own direct blocker
-/// (eligibility is unchanged: direct-blocker-only), a tied `blocks` chain
-/// that must reverse the id tiebreak, and a `blocks` cycle that must fall
-/// back to the stable order and get named -- into one on-disk sqlite file,
-/// then drives all three faces against fresh `Store` handles opened on
-/// that same file (in-memory sqlite cannot be reopened from a second
-/// handle, so this uses a real temp file the way a real self-hosted
-/// deployment's CLI/MCP/HTTP faces would all point at the same
-/// `POWDER_DB_PATH`).
+/// HTTP and CLI must expose the exact same `list_ready` ordering
+/// `Store::list_ready_page` computes -- neither face may re-sort or otherwise
+/// diverge from it. Seeds a fixture combining all ready-plan behaviors in one
+/// pass -- a 3-level `blocked_by` chain that stays excluded past its own
+/// direct blocker (eligibility is unchanged: direct-blocker-only), a tied
+/// `blocks` chain that must reverse the id tiebreak, and a `blocks` cycle that
+/// must fall back to the stable order and get named -- into one on-disk sqlite
+/// file, then drives both faces against fresh `Store` handles opened on that
+/// same file (in-memory sqlite cannot be reopened from a second handle, so
+/// this uses a real temp file the way a real self-hosted deployment's CLI and
+/// HTTP faces would all point at the same `POWDER_DB_PATH`).
 #[tokio::test]
-async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
+async fn list_ready_ordering_matches_across_http_and_cli() {
     let db_path = std::env::temp_dir().join(format!(
         "powder-server-ready-parity-{}.db",
         std::time::SystemTime::now()
@@ -1910,9 +1907,7 @@ async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
         "cycle-y",
     ];
 
-    // Store face -- also what CLI `--db` mode and in-process MCP dispatch
-    // both call directly, so this is the ground truth the other faces are
-    // checked against.
+    // Store face -- the ground truth that the CLI `--db` mode calls directly.
     let store_ids = {
         let store = Store::open(&db_path).unwrap();
         let page = store
@@ -1979,38 +1974,6 @@ async fn list_ready_ordering_matches_across_http_mcp_and_cli() {
         http_cycle_ids,
         vec!["cycle-x", "cycle-y"],
         "http cycle annotation"
-    );
-
-    // MCP face (in-process store dispatch, the same code path a locally
-    // registered MCP subprocess uses).
-    let mut mcp_store = Store::open(&db_path).unwrap();
-    let mcp_response = powder_mcp::call_tool_store(
-        &mut mcp_store,
-        "list_ready",
-        &json!({"limit": 20}),
-        unix_now(),
-    )
-    .unwrap();
-    let mcp_text = mcp_response["content"][0]["text"].as_str().unwrap();
-    let mcp_payload: serde_json::Value = serde_json::from_str(mcp_text).unwrap();
-    let mcp_ids = mcp_payload["cards"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|card| card["id"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(mcp_ids, expected_ids, "mcp face");
-    let mut mcp_cycle_ids = mcp_payload["cycle_card_ids"]
-        .as_array()
-        .expect("mcp cycle_card_ids present")
-        .iter()
-        .map(|id| id.as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    mcp_cycle_ids.sort();
-    assert_eq!(
-        mcp_cycle_ids,
-        vec!["cycle-x", "cycle-y"],
-        "mcp cycle annotation"
     );
 
     // CLI face (in-process, `--db` transport -- the same path a locally

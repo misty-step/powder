@@ -47,7 +47,7 @@ jobs:
       - name: Build release binaries
         run: |
           cargo zigbuild --release --locked --target ${{ matrix.target }} \
-            -p powder-server -p powder-cli -p powder-mcp
+            -p powder-server -p powder-cli
 
       - name: Package tarball + checksum
         run: |
@@ -55,9 +55,9 @@ jobs:
           STAGE="dist/${{ matrix.target }}"
           mkdir -p "$STAGE"
           BIN_DIR="target/${{ matrix.target }}/release"
-          cp "$BIN_DIR/powder-server" "$BIN_DIR/powder" "$BIN_DIR/powder-mcp" "$STAGE/"
+          cp "$BIN_DIR/powder-server" "$BIN_DIR/powder" "$STAGE/"
           TARBALL="powder-${{ matrix.target }}.tar.gz"
-          tar -C "$STAGE" -czf "$TARBALL" powder-server powder powder-mcp
+          tar -C "$STAGE" -czf "$TARBALL" powder-server powder
           sha256sum "$TARBALL" > "$TARBALL.sha256"
 
       - name: Upload artifact
@@ -87,7 +87,7 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release --locked --target aarch64-apple-darwin \
-            -p powder-server -p powder-cli -p powder-mcp
+            -p powder-server -p powder-cli
 
       - name: Package tarball + checksum
         run: |
@@ -95,9 +95,9 @@ jobs:
           STAGE="dist/aarch64-apple-darwin"
           mkdir -p "$STAGE"
           BIN_DIR="target/aarch64-apple-darwin/release"
-          cp "$BIN_DIR/powder-server" "$BIN_DIR/powder" "$BIN_DIR/powder-mcp" "$STAGE/"
+          cp "$BIN_DIR/powder-server" "$BIN_DIR/powder" "$STAGE/"
           TARBALL="powder-aarch64-apple-darwin.tar.gz"
-          tar -C "$STAGE" -czf "$TARBALL" powder-server powder powder-mcp
+          tar -C "$STAGE" -czf "$TARBALL" powder-server powder
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
 
       - name: Upload artifact

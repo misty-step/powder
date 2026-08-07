@@ -290,13 +290,6 @@ own org -- the operator's production never touches it.
   that references "the deployed instance" means the Sanctum-hosted
   DigitalOcean box above, unless `POWDER_API_BASE_URL` is explicitly pointed
   elsewhere.
-- **Stale-client warning** (observed 2026-07-09): long-lived MCP
-  subprocesses resolve `POWDER_API_BASE_URL` once at startup. When the box's
-  tailnet hostname changes (as it did in the Fly→DO cutover), running
-  sessions keep calling the dead origin and fail with opaque 404s until
-  restarted. If the MCP face 404s while direct `curl` against the current
-  env var succeeds, restart the MCP client. powder-944 tracks the durable
-  fix.
 
 ## Field-note generator env target (powder-921 residual)
 

@@ -124,9 +124,9 @@ silently drift from what's in this README.
   and backup/restore. Production runs one Rust service on a DigitalOcean droplet
   with SQLite at `/data` on a host volume; WAL is enabled, Litestream is optional,
   and ingress is through the tailnet.
-- [Operations](docs/operations.md) — auth modes, key rotation, remote-mode
-  CLI/MCP transport, and production runbook lore.
-- [MCP contract](SKILL.md) — the shipped agent-facing usage contract.
+- [Operations](docs/operations.md) — auth modes, key rotation, remote CLI
+  transport, and production runbook lore.
+- [SKILL.md](SKILL.md) — the shipped CLI-based agent usage contract.
 - [`VISION.md`](VISION.md) — product direction and scope.
 - [`docs/release.md`](docs/release.md) — tag/Cargo version policy and Landmark notes path.
 - [`AGENTS.md`](AGENTS.md) — repo contract: architecture boundaries, gates,
@@ -145,12 +145,11 @@ The repo ships the application. A deployment owns the data.
   card lifecycle operations.
 - `powder-api`: HTTP/API contract surface.
 - `powder-cli`: human and agent command-line face.
-- `powder-mcp`: MCP tool contract for agents.
 - `powder-server`: single deployable HTTP app.
 - `SKILL.md`: shipped agent-facing usage contract.
 
 The dispatch daemon is not part of the core. It will consume the board through
-the API/MCP/CLI surfaces and run agents elsewhere.
+the API or CLI and run agents elsewhere.
 
 Repository identity is operator-facing entity data, not loose card strings.
 Each repository has a canonical short name, aliases, visibility, tier
@@ -204,12 +203,10 @@ cargo run -q -p powder-cli -- complete-card smoke-proof --db "$DB" --criterion-p
 cargo run -q -p powder-cli -- repository-list --db "$DB" --include-hidden
 cargo run -q -p powder-cli -- repository-upsert --db "$DB" --name canary --aliases misty-step/canary --tier active
 cargo run -q -p powder-cli -- repository-merge-alias --db "$DB" --alias misty-step/canary --into canary --actor operator
-POWDER_DB_PATH="$DB" cargo run -q -p powder-mcp
 ```
 
-For remote-mode CLI/MCP transport, key rotation, and everything else an
-operator needs to run a deployment, see
-[`docs/operations.md`](docs/operations.md).
+For remote-mode CLI transport, key rotation, and everything else an operator
+needs to run a deployment, see [`docs/operations.md`](docs/operations.md).
 
 ## Gate
 

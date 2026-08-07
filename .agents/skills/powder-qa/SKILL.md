@@ -2,12 +2,11 @@
 name: powder-qa
 description: |
   QA Powder changes by exercising the real workspace gate and the live card
-  lifecycle, not just unit tests. Powder is a self-hosted Rust work board:
-  `powder-server` (HTTP API), `powder` CLI, `powder-mcp` (MCP), all over one
-  SQLite store. "Tests pass" is not QA for a claim/lease/lifecycle change.
+  `powder-server` (HTTP API), and `powder` CLI over one SQLite store. "Tests
+  pass" is not QA for a claim/lease/lifecycle change.
   Use when: "QA this", "verify the feature", "smoke test powder", "check the
   gate", "test powder", "run the card lifecycle". Trigger: /powder-qa.
-argument-hint: "[gate|cli-lifecycle|http|mcp]"
+argument-hint: "[gate|cli-lifecycle|http]"
 ---
 
 <!--
@@ -31,10 +30,10 @@ warnings && cargo test --workspace` is the deterministic gate — this exact
 sequence runs in CI (`.github/workflows/ci.yml`, `Rust CI / fmt-clippy-test`,
 required by `master` branch protection). It is **necessary but not sufficient**:
 unit tests exercise fixtures, not the live claim/lease/lifecycle path across
-CLI ↔ store ↔ API, and not the MCP tool surface an agent actually calls. Do
-not confuse this generated QA skill with the repo's own root `SKILL.md`,
-which is the *product* skill written for agents that use a deployed Powder
-instance as a work board — this skill is for agents building Powder itself.
+CLI ↔ store ↔ API. Do not confuse this generated QA skill with the repo's own
+root `SKILL.md`, which is the *product* skill written for agents that use a
+deployed Powder instance as a work board — this skill is for agents building
+Powder itself.
 
 ## Surfaces
 
@@ -42,7 +41,6 @@ instance as a work board — this skill is for agents building Powder itself.
 |---|---|---|
 | `crates/powder-core`, `powder-shell`, `powder-store` | Domain rules, adapters, SQLite persistence | `cargo test --workspace` (or `-p <crate>` narrowed) |
 | `crates/powder-api`, `powder-cli` | `powder` CLI over the card/run lifecycle | Local CLI smoke below against a throwaway DB |
-| `crates/powder-mcp` | MCP tool contract | `POWDER_DB_PATH=<db> cargo run -q -p powder-mcp`, then register with a harness and replay a tool call |
 | `crates/powder-server` | HTTP API, single deployable app | `POWDER_DB_PATH=<db> cargo run -p powder-server`, then `/healthz` + `/readyz` |
 
 ## Commands
@@ -100,23 +98,18 @@ curl -s localhost:4000/readyz
   `powder-server`, drives a crash + reclaim race, and asserts the audit
   trail. A change to claim/lease semantics that breaks this is a real
   regression, not a flaky test.
-- **`mint-key`-equivalent / DB targeting**: every CLI/MCP/server invocation
-  must point at the *same* `--db`/`POWDER_DB_PATH` — Powder is a single
-  SQLite writer per instance, same footgun class as Canary's single-writer
-  invariant.
+- **DB targeting**: every CLI/server invocation must point at the same
+  `--db`/`POWDER_DB_PATH` — Powder is a single SQLite writer per instance,
+  the same footgun class as any single-writer service.
 - **Never commit real card/run/claim/instance data** to this repo. A throwaway
   `/tmp` DB populated through `create-card` is the correct target for any live
   smoke.
-- **MCP requires an explicit persistence mode.** Set `POWDER_DB_PATH` for a
-  local QA run; startup fails closed when neither a DB nor remote API is
-  configured.
 - **`api-key` mode binds claims to the authenticated actor** — a
   request-body `agent` value is only accepted when it matches that actor;
-  do not "QA" auth by spoofing a different agent name in the body.
+  do not QA auth by spoofing a different agent name in the body.
 
 ## Report
 
 Return: **verdict** (PASS / FAIL / UNVERIFIED) · exact command(s) run ·
-surface exercised (gate / CLI lifecycle / HTTP / MCP) · artifact inspected
-(gate output, CLI JSON responses, `/healthz`+`/readyz` bodies) · what was NOT
-covered.
+surface exercised (gate / CLI lifecycle / HTTP) · artifact inspected (gate
+output, CLI JSON responses, `/healthz`+`/readyz` bodies) · what was NOT covered.

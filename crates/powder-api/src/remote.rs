@@ -44,9 +44,8 @@ const STALE_BASE_URL_404_STREAK: u32 = 3;
 /// doctor exists to classify a wedged server. 8 seconds matches the
 /// doctor's own `curl --max-time 8` convention
 /// (`bin/powder-remote-doctor.sh`). Safe for every RemoteClient caller:
-/// CLI remote mode and MCP remote mode are both plain request/response
-/// JSON (even `tail_events` is a paged GET, not a long poll), so no
-/// endpoint legitimately needs an unbounded read.
+/// CLI remote mode uses plain request/response JSON, so no endpoint
+/// legitimately needs an unbounded read.
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Tightened from ureq's 30-second default: this client only ever talks
@@ -89,7 +88,7 @@ impl RemoteClient {
     /// on success) and again on every `401` epoch -- not a single-shot
     /// budget spent once for the life of the process, but a fresh
     /// re-resolve attempt each time the currently active key newly starts
-    /// failing auth, so a long-lived MCP subprocess self-heals across any
+    /// failing auth, so a long-lived CLI process self-heals across any
     /// number of key rotations, not just the first (powder-944, hardened
     /// by powder-key-reresolve-per-epoch). A resolve that returns the same
     /// key already in use is a no-op retry (dedupe: a genuinely revoked
@@ -117,9 +116,8 @@ impl RemoteClient {
         }
     }
 
-    /// The deployment this client talks to. Surfaced through MCP's
-    /// `initialize` response so a caller can compare it against their own
-    /// `POWDER_API_BASE_URL` and prove the two faces agree, instead of
+    /// The deployment this client talks to. The CLI can compare this URL with
+    /// its own `POWDER_API_BASE_URL` to prove the two faces agree, instead of
     /// guessing at deployment drift from intermittent connection errors.
     pub fn base_url(&self) -> &str {
         &self.base_url
@@ -419,7 +417,7 @@ fn diagnosable_401(message: &str, key: Option<&str>) -> String {
     let prefix = key.map(key_prefix).unwrap_or_else(|| "none".to_string());
     format!(
         "{message} (key prefix used: {prefix}; key may have been rotated; \
-         restart this MCP client or configure POWDER_API_KEY_CMD)"
+         retry with POWDER_API_KEY_CMD)"
     )
 }
 
@@ -427,7 +425,7 @@ fn maybe_append_stale_base_url_steer(message: String, streak: u32) -> String {
     if streak > STALE_BASE_URL_404_STREAK {
         format!(
             "{message} (repeated 404s -- POWDER_API_BASE_URL may be stale (host cutover?); \
-             restart this MCP client)"
+             retry after updating the CLI environment)"
         )
     } else {
         message
@@ -753,7 +751,7 @@ mod tests {
         );
         let fourth = maybe_append_stale_base_url_steer("http 404: not found".to_string(), 4);
         assert!(fourth.contains("POWDER_API_BASE_URL may be stale"));
-        assert!(fourth.contains("restart this MCP client"));
+        assert!(fourth.contains("retry after updating the CLI environment"));
     }
 
     /// Unknown status values must degrade only that card, never abort the
@@ -937,7 +935,7 @@ mod tests {
         );
         assert_eq!(
             error,
-            "http 401: invalid bearer token [denial_class=unauthenticated] (key prefix used: sk_powder_te; key may have been rotated; restart this MCP client or configure POWDER_API_KEY_CMD)"
+            "http 401: invalid bearer token [denial_class=unauthenticated] (key prefix used: sk_powder_te; key may have been rotated; retry with POWDER_API_KEY_CMD)"
         );
     }
 

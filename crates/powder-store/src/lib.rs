@@ -337,21 +337,10 @@ const FIELD_NOTE_REVIEW_REPO: &str = "content";
 const FIELD_NOTE_DRAFT_LABEL: &str = "field-note-draft";
 
 /// Filter for [`Store::list_cards`]: `None` on either field means
-/// unfiltered on that dimension.
-///
-/// `include_terminal` decides whether `Done`/`Shipped`/`Abandoned` cards are
-/// eligible when no explicit `status` is requested (an explicit `status`
-/// always wins -- asking for `status: done` returns `done` cards regardless
-/// of this flag; see `list_cards_page`). It defaults to `true` (the
-/// pre-powder-mcp-unfiltered-enumeration behavior: an unfiltered query sees
-/// the whole board, terminal cards included) so every existing caller of
-/// `CardFilter::default()` -- the HTTP `list_cards` route, the `powder
-/// list-cards` CLI command, and the plain-store test suite -- keeps its
-/// current behavior unchanged. Only `powder-mcp`'s `list_cards` tool opts
-/// into `include_terminal: false` by default, because an agent enumerating
-/// "what's on the board" with no filter is far more likely to be surprised
-/// by a done/shipped/abandoned card silently filling its result window than
-/// to be relying on seeing one.
+/// unfiltered on that dimension. `include_terminal` controls whether
+/// `Done`/`Shipped`/`Abandoned` cards are included when no explicit `status`
+/// is requested. An explicit status always wins, and the default includes
+/// terminal cards so the CLI and HTTP list the whole board.
 #[derive(Debug, Clone)]
 pub struct CardFilter {
     pub status: Option<CardStatus>,
@@ -378,13 +367,9 @@ pub struct CardListPage {
     pub cards: Vec<Card>,
     pub total_count: usize,
     /// How many of `total_count` were held back by
-    /// [`CardFilter::include_terminal`]`: false` (always 0 when the filter
-    /// includes terminal cards, when an explicit `status` was requested, or
-    /// for `list_ready`). Kept separate so an envelope can distinguish "more
-    /// matches beyond `limit` -- raise the limit" from "matches hidden by
-    /// the terminal exclusion -- pass `include_terminal: true`": raising the
-    /// limit does nothing for the latter, and a hint that conflates the two
-    /// sends an agent in a loop.
+    /// [`CardFilter::include_terminal`] being false. This stays separate so
+    /// an envelope can distinguish matches beyond `limit` from cards hidden by
+    /// the terminal filter.
     pub excluded_terminal_count: usize,
     /// powder-epic-ready-plan: ids from `cards`' *full eligible set* (before
     /// `limit` truncation, mirroring how `total_count` already describes
@@ -3124,10 +3109,8 @@ impl Store {
         })
     }
 
-    /// Raw count of every card in the store, ignoring every filter
-    /// dimension -- used by `powder-mcp`'s `list_cards` envelope to tell a
-    /// caller whose filtered query matched zero cards how large the board
-    /// actually is, so a narrow filter never reads as an empty board.
+    /// Raw count of every card in the store, ignoring every filter dimension.
+    /// Callers use it when they need the board size independent of a query.
     pub fn card_count(&self) -> Result<usize> {
         Ok(self
             .connection
@@ -4784,7 +4767,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                 DomainError::validation(
                     "repo",
                     format!(
-                        "unregistered repo \"{repo}\": register it first via POST /api/v1/repositories (or the repository-upsert CLI/MCP command)"
+                            "unregistered repo \"{repo}\": register it first via POST /api/v1/repositories (or the repository-upsert CLI command)"
                     ),
                 )
                 .into()

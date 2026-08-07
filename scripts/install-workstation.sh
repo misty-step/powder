@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # powder-workstation-cli-convergence: converges the operator's workstation
-# executables (~/.cargo/bin/powder, ~/.cargo/bin/powder-mcp, and optionally
-# ~/.cargo/bin/powder-server) with the current checkout.
+# executables (~/.cargo/bin/powder and optionally ~/.cargo/bin/powder-server)
+# with the current checkout.
 #
 # The incident this closes: the workstation `powder` binary sat at 0.1.0
 # git 1d1ded8 while the checkout had moved to 414ac7f, silently missing a
@@ -96,7 +96,6 @@ report_version() {
 report_installed() {
   printf '%s:\n' "$1"
   report_version powder "$INSTALL_DIR/powder"
-  report_version powder-mcp "$INSTALL_DIR/powder-mcp"
   if [[ "$WITH_SERVER" == "1" ]]; then
     report_version powder-server "$INSTALL_DIR/powder-server"
   fi
@@ -121,7 +120,7 @@ platform_triple() {
 
 install_from_source() {
   echo "installing from source at $HEAD_SHA..."
-  local crates=(powder-cli powder-mcp)
+  local crates=(powder-cli)
   [[ "$WITH_SERVER" == "1" ]] && crates+=(powder-server)
   for crate in "${crates[@]}"; do
     # --force: the workspace crate version stays "0.1.0" across commits (it
@@ -132,8 +131,8 @@ install_from_source() {
     # own committed Cargo.lock. --target-dir: share this workspace's normal
     # target/ across all crates this loop installs, instead of `cargo
     # install`'s own default of an isolated build dir per invocation --
-    # cuts a 3-binary install from three full dependency-graph compiles
-    # (powder-core, tokio, rustls, sqlite... each duplicated three times)
+    # cuts a two-binary install from two full dependency-graph compiles
+    # (powder-core, tokio, rustls, sqlite... each duplicated twice)
     # down to one.
     if ! cargo install --path "crates/$crate" --locked --force --target-dir "$ROOT/target"; then
       # A mid-loop failure leaves the workstation partially converged
@@ -179,7 +178,6 @@ install_from_release() {
   tar -C "$tmp" -xzf "$tmp/$tarball"
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$tmp/powder" "$INSTALL_DIR/powder"
-  install -m 0755 "$tmp/powder-mcp" "$INSTALL_DIR/powder-mcp"
   if [[ "$WITH_SERVER" == "1" ]]; then
     install -m 0755 "$tmp/powder-server" "$INSTALL_DIR/powder-server"
   fi

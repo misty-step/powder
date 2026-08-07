@@ -6,7 +6,7 @@
     <title>Get started with Powder</title>
     <meta
       name="description"
-      content="Install Powder, start a local SQLite-backed board, and register the MCP face."
+      content="Install Powder, start a local SQLite-backed board, and use the CLI with the shipped agent skill."
     />
     <script>
       try {
@@ -80,8 +80,9 @@
         <article class="ae-doc msk-page" aria-labelledby="get-started-title">
           <h1 id="get-started-title">Get started</h1>
           <p class="ae-lede">
-            Install the CLI and MCP binaries from this checkout, then point them
-            at either a local SQLite database or a deployed Powder server.
+            Install the CLI from this checkout, then use the shipped skill to
+            work against either a local SQLite database or a deployed Powder
+            server.
           </p>
           <p>
             Building from source is not required.
@@ -98,7 +99,6 @@
             <pre><code>git clone https://github.com/misty-step/powder.git
 cd powder
 cargo install --path crates/powder-cli
-cargo install --path crates/powder-mcp
 cargo install --path crates/powder-server
 powder version</code></pre>
           </section>
@@ -113,18 +113,20 @@ powder list-ready --db "$DB" --limit 10
 POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 powder-server</code></pre>
           </section>
 
-          <section class="msk-section" aria-labelledby="mcp-title">
-            <h2 id="mcp-title">Register MCP</h2>
+          <section class="msk-section" aria-labelledby="remote-title">
+            <h2 id="remote-title">Use the CLI remotely</h2>
             <p>
-              For local SQLite mode, launch the MCP server with
-              <code>POWDER_DB_PATH</code>. For remote mode, use
-              <code>POWDER_API_BASE_URL</code> and <code>POWDER_API_KEY</code>.
+              Set <code>POWDER_API_BASE_URL</code> and
+              <code>POWDER_API_KEY</code> to point the CLI at a deployed
+              server. Read
+              <a href="https://github.com/misty-step/powder/blob/master/SKILL.md"
+                >SKILL.md</a
+              > for the agent command contract.
             </p>
-            <pre><code>POWDER_DB_PATH=./data/powder.db powder-mcp
-
-POWDER_API_BASE_URL=http://127.0.0.1:4017 \
-POWDER_API_KEY=&lt;bootstrap-key&gt; \
-powder-mcp</code></pre>
+            <pre><code>export POWDER_API_BASE_URL=http://127.0.0.1:4017
+export POWDER_API_KEY=&lt;bootstrap-key&gt;
+powder list-ready --limit 10
+powder claim first-card --agent codex</code></pre>
           </section>
 
           <section class="msk-section" aria-labelledby="docs-title">

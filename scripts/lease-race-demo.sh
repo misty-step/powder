@@ -31,9 +31,8 @@
 #     codex-agent's claim and work-log, plus human-with-curl's claim and
 #     completion, all carry the right identity in the trail.
 #   - Actor A ("codex-agent") and Actor B ("human-with-curl") are both driven
-#     over plain curl against the HTTP API -- deliberately not powder-mcp --
-#     because the point of the demo is that *any* actor speaking the same
-#     API can reclaim a dead agent's work, not that MCP specifically can.
+#     over plain curl against the HTTP API because the point of the demo is that
+#     any actor speaking the same API can reclaim a dead agent's work.
 #   - Requires curl and jq (both preinstalled on GitHub-hosted ubuntu-latest
 #     runners; install jq locally if missing -- `brew install jq` /
 #     `apt-get install jq`).
