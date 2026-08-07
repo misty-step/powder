@@ -63,8 +63,23 @@ impl Store {
             || comments.truncated()
             || work_log.truncated()
             || children_total.is_some_and(|total| total > children.len());
-        let (transitive_blocked_by, blocked_by_cycle) =
-            transitive_blocked_by_for(&self.connection, &card)?;
+        // Eligibility needs blocker terminality only when blocked_by is
+        // non-empty; the transitive walk shares that same board scan.
+        let (claim_eligibility, transitive_blocked_by, blocked_by_cycle) =
+            if card.blocked_by.is_empty() {
+                (card.claim_eligibility(now, |_| false), Vec::new(), false)
+            } else {
+                let board_cards = load_all_cards(&self.connection)?;
+                let statuses: HashMap<_, _> = board_cards
+                    .iter()
+                    .map(|c| (c.id.clone(), c.status))
+                    .collect();
+                let eligibility = card.claim_eligibility(now, |id| {
+                    statuses.get(id).is_some_and(|status| status.is_terminal())
+                });
+                let (transitive, cycle) = transitive_blocked_by_from_board(&card, &board_cards);
+                (eligibility, transitive, cycle)
+            };
 
         let compact_after_secs = std::env::var("POWDER_TERMINAL_COMPACT_AFTER_SECS")
             .ok()
@@ -221,6 +236,7 @@ impl Store {
             epic_state,
             transitive_blocked_by,
             blocked_by_cycle,
+            claim_eligibility,
             hint,
         }))
     }
@@ -444,14 +460,13 @@ fn answer_input_in_transaction(
 /// walk loops back to `card` -- comes from [`powder_core::transitive_blocked_by`];
 /// this just supplies its board-shaped closures from one scan, the same
 /// fail-closed-on-a-missing-id convention `list_ready_page` already uses.
-fn transitive_blocked_by_for(
-    connection: &Connection,
+fn transitive_blocked_by_from_board(
     card: &powder_core::Card,
-) -> Result<(Vec<CardId>, bool)> {
+    all_cards: &[powder_core::Card],
+) -> (Vec<CardId>, bool) {
     if card.blocked_by.is_empty() {
-        return Ok((Vec::new(), false));
+        return (Vec::new(), false);
     }
-    let all_cards = load_all_cards(connection)?;
     let blocked_by_of: HashMap<CardId, Vec<CardId>> = all_cards
         .iter()
         .map(|c| (c.id.clone(), c.blocked_by.clone()))
@@ -465,7 +480,7 @@ fn transitive_blocked_by_for(
         |id| blocked_by_of.get(id).cloned(),
         |id| terminal_of.get(id).copied().unwrap_or(false),
     );
-    Ok((result.blocker_ids, result.cycle))
+    (result.blocker_ids, result.cycle)
 }
 
 struct DetailSection<T> {

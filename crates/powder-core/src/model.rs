@@ -1342,51 +1342,102 @@ impl Card {
     /// single ineligible card's blocker chain past depth 1 for
     /// `CardDetail::transitive_blocked_by` so "why is this blocked" never
     /// goes silent past one hop.
-    pub fn claim_readiness(
+    pub fn claim_eligibility(
         &self,
         now: i64,
         blocker_is_terminal: impl Fn(&CardId) -> bool,
-    ) -> Result<(), DomainError> {
+    ) -> ClaimEligibility {
         if self.acceptance.is_empty() {
-            return Err(DomainError::conflict(format!(
-                "card {} has no acceptance criteria; add them via update (acceptance: [...]) before claiming",
-                self.id
-            )));
+            return ClaimEligibility::excluded(
+                ClaimEligibilityCode::NoAcceptance,
+                format!(
+                    "card {} has no acceptance criteria; add them via update (acceptance: [...]) before claiming",
+                    self.id
+                ),
+                Vec::new(),
+            );
         }
 
         let unresolved = self
             .blocked_by
             .iter()
             .filter(|id| !blocker_is_terminal(id))
-            .map(CardId::as_str)
+            .cloned()
             .collect::<Vec<_>>();
         if !unresolved.is_empty() {
-            return Err(DomainError::conflict(format!(
-                "card {} is blocked by unresolved cards: {}",
-                self.id,
-                unresolved.join(", ")
-            )));
+            let joined = unresolved
+                .iter()
+                .map(CardId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return ClaimEligibility::excluded(
+                ClaimEligibilityCode::UnresolvedBlockers,
+                format!(
+                    "card {} is blocked by unresolved cards: {}",
+                    self.id, joined
+                ),
+                unresolved,
+            );
         }
 
-        let status_ready = match self.status {
-            CardStatus::Ready => self
-                .claim
-                .as_ref()
-                .is_none_or(|claim| claim.is_expired(now)),
-            CardStatus::InProgress => self
-                .claim
-                .as_ref()
-                .is_some_and(|claim| claim.is_expired(now)),
-            _ => false,
-        };
-        if !status_ready {
-            return Err(DomainError::conflict(format!(
-                "card {} is not ready to claim",
-                self.id
-            )));
+        match self.status {
+            CardStatus::Ready => match self.claim.as_ref() {
+                Some(claim) if !claim.is_expired(now) => ClaimEligibility::excluded(
+                    ClaimEligibilityCode::ActiveClaim,
+                    format!(
+                        "card {} already has an active claim held by {}",
+                        self.id, claim.agent
+                    ),
+                    Vec::new(),
+                ),
+                _ => ClaimEligibility::eligible_ok(&self.id),
+            },
+            CardStatus::InProgress => match self.claim.as_ref() {
+                Some(claim) if claim.is_expired(now) => ClaimEligibility::eligible_ok(&self.id),
+                Some(claim) => ClaimEligibility::excluded(
+                    ClaimEligibilityCode::InProgressClaimNotExpired,
+                    format!(
+                        "card {} is in_progress with an unexpired claim held by {}",
+                        self.id, claim.agent
+                    ),
+                    Vec::new(),
+                ),
+                None => ClaimEligibility::excluded(
+                    ClaimEligibilityCode::StatusNotClaimable,
+                    format!(
+                        "card {} is in_progress without a claim and is not ready to claim",
+                        self.id
+                    ),
+                    Vec::new(),
+                ),
+            },
+            _ => ClaimEligibility::excluded(
+                ClaimEligibilityCode::StatusNotClaimable,
+                format!(
+                    "card {} is not ready to claim (status {})",
+                    self.id,
+                    self.status.as_str()
+                ),
+                Vec::new(),
+            ),
         }
+    }
 
-        Ok(())
+    /// Single seam that decides claim eligibility. Returns `Ok(())` when
+    /// [`claim_eligibility`](Self::claim_eligibility) is eligible; otherwise
+    /// returns the same human message carried on that packet so claim
+    /// rejections stay diagnosable without a second code path.
+    pub fn claim_readiness(
+        &self,
+        now: i64,
+        blocker_is_terminal: impl Fn(&CardId) -> bool,
+    ) -> Result<(), DomainError> {
+        let eligibility = self.claim_eligibility(now, blocker_is_terminal);
+        if eligibility.eligible {
+            Ok(())
+        } else {
+            Err(DomainError::conflict(eligibility.message))
+        }
     }
 
     /// `blocker_is_terminal` answers, for one blocker id, whether that
@@ -1396,7 +1447,7 @@ impl Card {
     /// `blocked_by` is *not yet* terminal; once every blocker resolves, the
     /// card is eligible again with no edit to `blocked_by` required.
     pub fn is_ready_at(&self, now: i64, blocker_is_terminal: impl Fn(&CardId) -> bool) -> bool {
-        self.claim_readiness(now, blocker_is_terminal).is_ok()
+        self.claim_eligibility(now, blocker_is_terminal).eligible
     }
 
     pub fn can_be_claimed_at(
@@ -1884,6 +1935,71 @@ pub struct TerminalSummary {
     pub body_truncated: bool,
 }
 
+/// Machine-readable reason a card is or is not claimable right now.
+///
+/// powder-ready-queue-eligibility-truth: `status=ready` is an operator lane
+/// label; claimability is a separate derived fact. Callers that only scan
+/// `list_cards?status=ready` or the board Ready column cannot see why
+/// `list_ready` omitted a card. This packet is that reason, computed by the
+/// same rules as [`Card::claim_readiness`] and always attached to
+/// [`CardDetail`] so a factory reconciler can log it without re-deriving
+/// eligibility from scattered fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimEligibilityCode {
+    Eligible,
+    NoAcceptance,
+    UnresolvedBlockers,
+    ActiveClaim,
+    StatusNotClaimable,
+    InProgressClaimNotExpired,
+}
+
+impl ClaimEligibilityCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::NoAcceptance => "no_acceptance",
+            Self::UnresolvedBlockers => "unresolved_blockers",
+            Self::ActiveClaim => "active_claim",
+            Self::StatusNotClaimable => "status_not_claimable",
+            Self::InProgressClaimNotExpired => "in_progress_claim_not_expired",
+        }
+    }
+}
+
+/// Inspectable claimability for one card at one clock reading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimEligibility {
+    pub eligible: bool,
+    pub code: ClaimEligibilityCode,
+    pub message: String,
+    /// Direct unresolved `blocked_by` ids when `code` is
+    /// `unresolved_blockers`; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<CardId>,
+}
+
+impl ClaimEligibility {
+    fn eligible_ok(card_id: &CardId) -> Self {
+        Self {
+            eligible: true,
+            code: ClaimEligibilityCode::Eligible,
+            message: format!("card {card_id} is eligible to claim"),
+            blockers: Vec::new(),
+        }
+    }
+
+    fn excluded(code: ClaimEligibilityCode, message: String, blockers: Vec<CardId>) -> Self {
+        Self {
+            eligible: false,
+            code,
+            message,
+            blockers,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardDetail {
     pub card: Card,
@@ -1935,6 +2051,9 @@ pub struct CardDetail {
     /// Surfaced here rather than silently truncating the walk or hanging.
     #[serde(default, skip_serializing_if = "is_false")]
     pub blocked_by_cycle: bool,
+    /// Always present: whether this card is claimable right now and why
+    /// not, using the same rules as `list_ready` eligibility.
+    pub claim_eligibility: ClaimEligibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -2609,6 +2728,9 @@ mod tests {
     #[test]
     fn claim_readiness_names_missing_acceptance_criteria() {
         let card = card("001", CardStatus::Ready);
+        let eligibility = card.claim_eligibility(10, |_| true);
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.code, ClaimEligibilityCode::NoAcceptance);
         let err = card.claim_readiness(10, |_| true).unwrap_err();
         assert_eq!(
             err,
@@ -2623,6 +2745,9 @@ mod tests {
         let mut card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
         card.blocked_by = vec![CardId::new("002").unwrap(), CardId::new("003").unwrap()];
 
+        let eligibility = card.claim_eligibility(10, |id| id.as_str() == "003");
+        assert_eq!(eligibility.code, ClaimEligibilityCode::UnresolvedBlockers);
+        assert_eq!(eligibility.blockers, vec![CardId::new("002").unwrap()]);
         let err = card
             .claim_readiness(10, |id| id.as_str() == "003")
             .unwrap_err();
@@ -2635,14 +2760,51 @@ mod tests {
     #[test]
     fn claim_readiness_falls_back_to_generic_message_for_wrong_status() {
         let card = card("001", CardStatus::Backlog).with_acceptance(["prove it".to_string()]);
+        let eligibility = card.claim_eligibility(10, |_| true);
+        assert_eq!(eligibility.code, ClaimEligibilityCode::StatusNotClaimable);
         let err = card.claim_readiness(10, |_| true).unwrap_err();
-        assert_eq!(err, DomainError::conflict("card 001 is not ready to claim"));
+        assert_eq!(
+            err,
+            DomainError::conflict("card 001 is not ready to claim (status backlog)")
+        );
     }
 
     #[test]
     fn claim_readiness_ok_when_criteria_present_and_unblocked() {
         let card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
         assert!(card.claim_readiness(10, |_| true).is_ok());
+    }
+
+    #[test]
+    fn claim_eligibility_names_active_claim_on_ready_card() {
+        let mut card = card("001", CardStatus::Ready).with_acceptance(["prove it".to_string()]);
+        card.claim = Some(Claim {
+            principal: "principal-a".to_string(),
+            agent: "agent-a".to_string(),
+            run_id: RunId::new("run-1").unwrap(),
+            acquired_at: 0,
+            expires_at: 100,
+        });
+        let eligibility = card.claim_eligibility(50, |_| true);
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.code, ClaimEligibilityCode::ActiveClaim);
+        assert!(eligibility.message.contains("agent-a"));
+    }
+
+    #[test]
+    fn claim_eligibility_allows_expired_in_progress_reclaim() {
+        let mut card =
+            card("001", CardStatus::InProgress).with_acceptance(["prove it".to_string()]);
+        card.claim = Some(Claim {
+            principal: "principal-a".to_string(),
+            agent: "agent-a".to_string(),
+            run_id: RunId::new("run-1").unwrap(),
+            acquired_at: 0,
+            expires_at: 10,
+        });
+        let eligibility = card.claim_eligibility(50, |_| true);
+        assert!(eligibility.eligible);
+        assert_eq!(eligibility.code, ClaimEligibilityCode::Eligible);
     }
 
     #[test]

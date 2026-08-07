@@ -78,13 +78,16 @@ Default agent persona (26 tools):
   no card appears after another card in the response it transitively
   blocks (topological over `blocks`/`blocked_by` among the returned set),
   ties broken by priority, age, and identifier; optionally filtered by
-  `estimate` (`S`/`M`/`L`/`XL`). Eligibility itself stays direct-blocker-only
-  (unchanged). Only the true members of a `blocks`/`blocked_by` cycle lose
-  topological ordering: they are emitted as a group in the tie-break order
-  at the cycle's own position and named in an additive `cycle_card_ids`
-  field (computed over the full eligible set, before `limit` truncation);
-  cards downstream of a cycle stay dependency-ordered after it. `get_card`'s
-  `transitive_blocked_by`/`blocked_by_cycle` fields explain a *blocked*
+  `estimate` (`S`/`M`/`L`/`XL`) and by `repo` (comma-separated allowlist of
+  exact canonical short slugs or registered aliases -- never substring
+  match). Eligibility itself stays direct-blocker-only (unchanged). Only
+  the true members of a `blocks`/`blocked_by` cycle lose topological
+  ordering: they are emitted as a group in the tie-break order at the
+  cycle's own position and named in an additive `cycle_card_ids` field
+  (computed over the full eligible set, before `limit` truncation); cards
+  downstream of a cycle stay dependency-ordered after it. `get_card`'s
+  `claim_eligibility` packet explains why a card is missing from this
+  queue; `transitive_blocked_by`/`blocked_by_cycle` explain a blocked
   card's chain past one hop.
 - `list_cards`: enumerate cards by optional status/repo/`estimate`/`label`
   filter, including cards `list_ready` never surfaces -- `backlog`, cards with
@@ -123,13 +126,17 @@ Default agent persona (26 tools):
   principal.
   This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
   `heartbeat`, `release_claim`, and `transfer_claim` tools.
-- `get_card`: read one card with runs, activities, links, comments, and claim
-  state; a parent card also returns bounded child summaries plus a
-  deterministic `epic_state` rollup packet (status counts, acceptance sums,
-  child evidence with provenance, freshness, and parent/child mismatch
-  flags). `detail` defaults to `concise` (newest-first, most recent 20 per
-  history section plus totals/hint when truncated); pass `detail: detailed`
-  for full history.
+- `get_card`: read one card with runs, activities, links, comments, claim
+  state, and always-present `claim_eligibility`
+  (`eligible`/`code`/`message`/`blockers`) using the same rules as
+  `list_ready`. Codes: `eligible`, `no_acceptance`, `unresolved_blockers`,
+  `active_claim`, `status_not_claimable`, `in_progress_claim_not_expired`.
+  A parent card also returns bounded child summaries plus a deterministic
+  `epic_state` rollup packet (status counts, acceptance sums, child
+  evidence with provenance, freshness, and parent/child mismatch flags).
+  `detail` defaults to `concise` (newest-first, most recent 20 per history
+  section plus totals/hint when truncated); pass `detail: detailed` for
+  full history.
 - `get_run`: read one run with its card, activities, links, comments, and run
   state. `detail` defaults to `concise` (newest-first, most recent 20 per
   history section plus totals/hint when truncated); pass `detail: detailed`

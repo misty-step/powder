@@ -2017,6 +2017,135 @@ fn list_ready_includes_ready_cards_from_every_repository_tier() -> Result<()> {
     Ok(())
 }
 
+/// powder-ready-queue-eligibility-truth: list_ready repo filter is exact on
+/// the canonical short slug (and registered aliases), never a substring
+/// match. A filter for `bitterblossom` must not return `memory-engine` or
+/// any other repo, and `misty-step/canary` must match cards stored as
+/// `canary`.
+#[test]
+fn list_ready_repo_filter_is_exact_canonical_slug() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "bitterblossom".to_string(),
+            aliases: None,
+            visibility: Some(RepositoryVisibility::Visible),
+            tier: Some(RepositoryTier::Active),
+            import_provenance: Some("manual".to_string()),
+        },
+        1,
+    )?;
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "memory-engine".to_string(),
+            aliases: None,
+            visibility: Some(RepositoryVisibility::Visible),
+            tier: Some(RepositoryTier::Active),
+            import_provenance: Some("manual".to_string()),
+        },
+        1,
+    )?;
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "canary".to_string(),
+            aliases: Some(vec!["misty-step/canary".to_string()]),
+            visibility: Some(RepositoryVisibility::Visible),
+            tier: Some(RepositoryTier::Active),
+            import_provenance: Some("manual".to_string()),
+        },
+        1,
+    )?;
+    store.upsert_repository(
+        RepositoryUpsert {
+            name: "powder".to_string(),
+            aliases: None,
+            visibility: Some(RepositoryVisibility::Visible),
+            tier: Some(RepositoryTier::Active),
+            import_provenance: Some("manual".to_string()),
+        },
+        1,
+    )?;
+
+    let mut bitter = ready_card("bitterblossom-circuit", 10);
+    bitter.repo = Some("bitterblossom".to_string());
+    let mut memory = ready_card("memory-engine-056", 11);
+    memory.repo = Some("memory-engine".to_string());
+    let mut canary_short = ready_card("canary-ready-short", 12);
+    canary_short.repo = Some("canary".to_string());
+    let mut canary_full = ready_card("canary-ready-full", 13);
+    canary_full.repo = Some("misty-step/canary".to_string());
+    let mut powder = ready_card("powder-ready-exact", 14);
+    powder.repo = Some("powder".to_string());
+    // Null-repo numeric id prefix is an intentional exact-prefix fallback.
+    let mut numeric = ready_card("bitterblossom-001", 15);
+    numeric.repo = None;
+    store.import_cards(vec![
+        bitter,
+        memory,
+        canary_short,
+        canary_full,
+        powder,
+        numeric,
+    ])?;
+
+    let bb = store
+        .list_ready(ReadyQuery::new(20, 20).with_repositories(["bitterblossom".to_string()]))?;
+    let bb_ids = bb.iter().map(|c| c.id.as_str()).collect::<Vec<_>>();
+    assert_eq!(bb_ids, vec!["bitterblossom-circuit", "bitterblossom-001"]);
+    assert!(!bb.iter().any(|c| c.id.as_str() == "memory-engine-056"));
+
+    let canary =
+        store.list_ready(ReadyQuery::new(20, 20).with_repositories(["canary".to_string()]))?;
+    let canary_ids = canary.iter().map(|c| c.id.as_str()).collect::<Vec<_>>();
+    assert_eq!(canary_ids, vec!["canary-ready-short", "canary-ready-full"]);
+
+    let canary_alias = store
+        .list_ready(ReadyQuery::new(20, 20).with_repositories(["misty-step/canary".to_string()]))?;
+    let alias_ids = canary_alias
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(alias_ids, vec!["canary-ready-short", "canary-ready-full"]);
+
+    let powder_only =
+        store.list_ready(ReadyQuery::new(20, 20).with_repositories(["powder".to_string()]))?;
+    assert_eq!(
+        powder_only
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["powder-ready-exact"]
+    );
+    Ok(())
+}
+
+#[test]
+fn get_card_detail_exposes_no_acceptance_claim_eligibility() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let mut card = ready_card("no-oracle", 10);
+    card.acceptance.clear();
+    card.criteria.clear();
+    card.status = CardStatus::Ready;
+    store.import_cards(vec![card])?;
+
+    let detail = store
+        .get_card_detail(&CardId::new("no-oracle")?, DetailLevel::Concise, 10)?
+        .expect("card");
+    assert!(!detail.claim_eligibility.eligible);
+    assert_eq!(
+        detail.claim_eligibility.code,
+        powder_core::ClaimEligibilityCode::NoAcceptance
+    );
+    assert!(store
+        .list_ready(ReadyQuery::new(10, 10))?
+        .iter()
+        .all(|c| c.id.as_str() != "no-oracle"));
+    Ok(())
+}
+
 /// powder-epic-ready-plan: three eligible siblings tied on priority and age
 /// -- the historical sort would emit them in id order (a, m, z) -- carry
 /// `blocks` edges requiring the opposite sequence. `list_ready` must honor
@@ -2114,6 +2243,15 @@ fn three_level_blocked_by_chain_eligibility_stays_direct_blocker_only() -> Resul
     assert_eq!(detail.transitive_blocked_by.len(), 1);
     assert_eq!(detail.transitive_blocked_by[0].as_str(), "chain-1");
     assert!(!detail.blocked_by_cycle);
+    assert!(!detail.claim_eligibility.eligible);
+    assert_eq!(
+        detail.claim_eligibility.code,
+        powder_core::ClaimEligibilityCode::UnresolvedBlockers
+    );
+    assert_eq!(
+        detail.claim_eligibility.blockers,
+        vec![CardId::new("chain-2")?]
+    );
 
     // Resolve chain-1 -- chain-2 is immediately eligible (unchanged
     // existing behavior), but chain-3 stays excluded because chain-2
@@ -2135,6 +2273,11 @@ fn three_level_blocked_by_chain_eligibility_stays_direct_blocker_only() -> Resul
         .expect("chain-3 exists");
     assert!(detail.transitive_blocked_by.is_empty());
     assert!(!detail.blocked_by_cycle);
+    assert!(!detail.claim_eligibility.eligible);
+    assert_eq!(
+        detail.claim_eligibility.code,
+        powder_core::ClaimEligibilityCode::UnresolvedBlockers
+    );
     Ok(())
 }
 

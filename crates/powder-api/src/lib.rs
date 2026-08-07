@@ -45,7 +45,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
-        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional estimate query param (S|M|L|XL); response is {cards,total_count,has_more,cycle_card_ids?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional estimate (S|M|L|XL) and repo (comma-separated exact canonical short slugs or registered aliases, never substring) query params; response is {cards,total_count,has_more,cycle_card_ids?}; a status=ready card missing here carries claim_eligibility on GET /api/v1/cards/{id}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         policy: None,
         body_shape: None,
     },
@@ -145,7 +145,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/{id}",
-        intent: "read one card with runs, activity, links, comments, and claim state; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "read one card with runs, activity, links, comments, claim state, and always-present claim_eligibility (eligible/code/message/blockers) using the same rules as list_ready; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         policy: None,
         body_shape: None,
     },
