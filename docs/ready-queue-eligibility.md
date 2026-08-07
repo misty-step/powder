@@ -6,14 +6,16 @@ claim eligibility right now.
 
 ## Why a ready card may be missing from the queue
 
-Call `get_card` / `GET /api/v1/cards/{id}`. Every detail response includes:
+Call `get_card` / `GET /api/v1/cards/{id}`. Every detail response includes a
+`claim_eligibility` object. `eligible`, `code` are always present. `message`
+is present when ineligible. `blockers` is present only for
+`unresolved_blockers`.
 
 ```json
 "claim_eligibility": {
   "eligible": false,
   "code": "no_acceptance",
-  "message": "card example has no acceptance criteria; add them via update (acceptance: [...]) before claiming",
-  "blockers": []
+  "message": "card example has no acceptance criteria; add them via update (acceptance: [...]) before claiming"
 }
 ```
 

@@ -145,7 +145,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/{id}",
-        intent: "read one card with runs, activity, links, comments, claim state, and always-present claim_eligibility (eligible/code/message/blockers) using the same rules as list_ready; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "read one card with runs, activity, links, comments, claim state, and always-present claim_eligibility (eligible/code; message when ineligible; blockers only for unresolved_blockers) using the same rules as list_ready; optional query detail=concise|detailed defaults to concise, returning the newest-first, most recent 20 per history section plus totals/hint when truncated; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         policy: None,
         body_shape: None,
     },
