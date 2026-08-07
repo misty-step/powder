@@ -38,6 +38,7 @@ pub const COMMANDS: &[&str] = &[
     "list-ready",
     "list-cards",
     "board-rollups",
+    "epic-velocity",
     "search",
     "papercut",
     "repository-list",
@@ -152,6 +153,7 @@ const LIST_CARDS_FLAGS: &[&str] = &[
     "--updated-before",
 ];
 const BOARD_ROLLUPS_FLAGS: &[&str] = &["--db", "--limit", "--after", "--include-hidden", "--json"];
+const EPIC_VELOCITY_FLAGS: &[&str] = &["--db", "--periods", "--period-days", "--json"];
 const SEARCH_FLAGS: &[&str] = &[
     "--db",
     "--q",
@@ -284,6 +286,7 @@ fn known_flags(command: &str) -> &'static [&'static str] {
         "list-ready" => LIST_READY_FLAGS,
         "list-cards" => LIST_CARDS_FLAGS,
         "board-rollups" => BOARD_ROLLUPS_FLAGS,
+        "epic-velocity" => EPIC_VELOCITY_FLAGS,
         "search" => SEARCH_FLAGS,
         "papercut" => PAPERCUT_FLAGS,
         "repository-list" => REPOSITORY_LIST_FLAGS,
@@ -461,6 +464,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
         [command, rest @ ..] if command == "board-rollups" => board_rollups(rest, remote_env),
+        [command, rest @ ..] if command == "epic-velocity" => epic_velocity(rest, remote_env),
         [command, rest @ ..] if command == "search" => search(rest, remote_env),
         [command, rest @ ..] if command == "papercut" => papercut(rest, remote_env),
         [command, rest @ ..] if command == "repository-list" => repository_list(rest),
@@ -630,6 +634,9 @@ pub fn help() -> String {
     );
     help.push_str(
         "  powder board-rollups --json --db ./data/powder.db --limit 20 [--after e:epic] [--include-hidden]\n",
+    );
+    help.push_str(
+        "  powder epic-velocity <card-id> --json [--db ./data/powder.db] [--periods 8] [--period-days 7]\n",
     );
     help.push_str(
         "  powder papercut 'too many tokens to file a simple bug' --agent codex [--service canary]\n",
@@ -1573,6 +1580,43 @@ fn board_rollups(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
             .map_err(remote_err)?
     } else {
         return Err(missing_transport("board-rollups"));
+    };
+    to_pretty_json(&value)
+}
+
+/// Per-epic direct-child completion velocity over trailing fixed periods.
+fn epic_velocity(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
+    let card_id = positional_card_id(args, "epic-velocity")?;
+    let periods = flag_value(args, "--periods")
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| ShellError::Invalid("--periods must be a positive integer".into()))
+        })
+        .transpose()?
+        .unwrap_or(8);
+    let period_days = flag_value(args, "--period-days")
+        .map(|raw| {
+            raw.parse::<u64>()
+                .map_err(|_| ShellError::Invalid("--period-days must be a positive integer".into()))
+        })
+        .transpose()?
+        .unwrap_or(7);
+    let value = if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        let velocity = store
+            .epic_velocity(&card_id, unix_now(), periods, period_days)
+            .map_err(store_err)?
+            .ok_or_else(|| ShellError::Invalid(format!("card {card_id} not found")))?;
+        serde_json::to_value(velocity).map_err(|error| ShellError::Invalid(error.to_string()))?
+    } else if let Some(client) = remote_env.client() {
+        client
+            .get(&format!(
+                "/api/v1/cards/{}/velocity?periods={periods}&period_days={period_days}",
+                urlencode(card_id.as_str())
+            ))
+            .map_err(remote_err)?
+    } else {
+        return Err(missing_transport("epic-velocity"));
     };
     to_pretty_json(&value)
 }

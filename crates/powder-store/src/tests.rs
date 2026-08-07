@@ -9174,3 +9174,123 @@ fn run_telemetry_rejects_negative_and_overflow_values() -> Result<()> {
     std::fs::remove_file(path).ok();
     Ok(())
 }
+
+#[test]
+fn aged_terminal_concise_detail_compacts_body_and_detailed_stays_full() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let card_id = CardId::new("terminal-summary")?;
+    let body = "x".repeat(300);
+    store.import_cards(vec![Card::new(
+        card_id.clone(),
+        "Terminal summary",
+        body.clone(),
+    )?
+    .with_acceptance(vec!["criterion".to_string()])
+    .with_status(CardStatus::Done)
+    .with_created_at(1)
+    .with_updated_at(1)])?;
+
+    let concise = store
+        .get_card_detail(&card_id, DetailLevel::Concise, 2_000_000)?
+        .expect("terminal detail");
+    let summary = concise.terminal_summary.expect("terminal summary");
+    assert_eq!(summary.status, CardStatus::Done);
+    assert_eq!(summary.closed_at, 1);
+    assert_eq!(summary.title, "Terminal summary");
+    assert_eq!(summary.criteria_checked, 0);
+    assert_eq!(summary.criteria_total, 1);
+    assert!(summary.body_truncated);
+    assert_eq!(concise.card.body.chars().count(), 281);
+    assert!(concise.card.body.ends_with('…'));
+    assert!(concise.runs.is_empty());
+    assert!(concise.activities.is_empty());
+    assert!(concise.events.is_empty());
+    assert!(concise.links.is_empty());
+    assert!(concise.comments.is_empty());
+    assert!(concise.work_log.is_empty());
+    assert!(concise
+        .hint
+        .as_deref()
+        .is_some_and(|hint| hint.contains("detail:\"detailed\"")));
+
+    let detailed = store
+        .get_card_detail(&card_id, DetailLevel::Detailed, 2_000_000)?
+        .expect("terminal detail");
+    assert!(detailed.terminal_summary.is_none());
+    assert_eq!(detailed.card.body, body);
+
+    let young_id = CardId::new("young-terminal")?;
+    store.import_cards(vec![Card::new(
+        young_id.clone(),
+        "Young terminal",
+        "short",
+    )?
+    .with_status(CardStatus::Shipped)
+    .with_created_at(2_000_000)
+    .with_updated_at(2_000_000)])?;
+    let young = store
+        .get_card_detail(&young_id, DetailLevel::Concise, 2_000_001)?
+        .expect("young terminal detail");
+    assert!(young.terminal_summary.is_none());
+    assert_eq!(young.card.body, "short");
+    Ok(())
+}
+
+#[test]
+fn epic_velocity_zero_fills_periods_and_separates_abandoned_children() -> Result<()> {
+    let mut store = Store::open_in_memory()?;
+    store.migrate()?;
+    let epic_id = CardId::new("velocity-epic")?;
+    let now = 8 * 86_400;
+    let child = |id: &str, status: CardStatus, updated_at: i64| {
+        Card::new(CardId::new(id).unwrap(), id, "child")
+            .unwrap()
+            .with_parent(Some(epic_id.clone()))
+            .with_status(status)
+            .with_created_at(updated_at)
+            .with_updated_at(updated_at)
+    };
+    store.import_cards(vec![
+        Card::new(epic_id.clone(), "Velocity epic", "epic")?.with_created_at(0),
+        child("velocity-done-old", CardStatus::Done, 86_400),
+        child("velocity-shipped", CardStatus::Shipped, 3 * 86_400),
+        child("velocity-abandoned", CardStatus::Abandoned, 5 * 86_400),
+        child("velocity-done-new", CardStatus::Done, 7 * 86_400),
+        child("velocity-too-old", CardStatus::Done, -86_400),
+        Card::new(CardId::new("velocity-grandchild")?, "Grandchild", "nested")?
+            .with_parent(Some(CardId::new("velocity-done-new")?))
+            .with_status(CardStatus::Done)
+            .with_created_at(7 * 86_400)
+            .with_updated_at(7 * 86_400),
+    ])?;
+
+    let velocity = store
+        .epic_velocity(&epic_id, now, 4, 2)
+        .expect("velocity query")
+        .expect("epic exists");
+    assert_eq!(velocity.card_id, epic_id);
+    assert_eq!(velocity.period_days, 2);
+    assert_eq!(velocity.periods.len(), 4);
+    assert_eq!(
+        velocity
+            .periods
+            .iter()
+            .map(|period| (period.completed_children, period.abandoned_children))
+            .collect::<Vec<_>>(),
+        vec![(1, 0), (1, 0), (0, 1), (1, 0)]
+    );
+    assert_eq!(velocity.periods[0].period_start, 0);
+    assert_eq!(velocity.periods[0].period_end, 2 * 86_400);
+    assert_eq!(velocity.periods[3].period_end, now);
+
+    assert!(store
+        .epic_velocity(&CardId::new("missing-epic")?, now, 8, 7)?
+        .is_none());
+    let clamped = store
+        .epic_velocity(&epic_id, now, 0, 0)?
+        .expect("epic exists");
+    assert_eq!(clamped.periods.len(), 1);
+    assert_eq!(clamped.period_days, 1);
+    Ok(())
+}

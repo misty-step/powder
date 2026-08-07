@@ -217,6 +217,21 @@ pub struct SearchPage {
     pub next_after: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EpicVelocityPeriod {
+    pub period_start: i64,
+    pub period_end: i64,
+    pub completed_children: usize,
+    pub abandoned_children: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EpicVelocity {
+    pub card_id: CardId,
+    pub period_days: u64,
+    pub periods: Vec<EpicVelocityPeriod>,
+}
+
 /// Validates every schema-v17 key-to-actor mapping before the migration can
 /// create, drop, or rewrite any table. Revoked keys are intentionally included:
 /// silently deleting a revoked credential would still make the migration
@@ -3415,6 +3430,72 @@ impl Store {
             next_after,
             coverage,
         })
+    }
+
+    /// Return chronological fixed-width completion buckets for an epic's
+    /// direct terminal children. Empty periods remain in the result so a
+    /// caller can render a stable velocity chart without filling gaps.
+    pub fn epic_velocity(
+        &self,
+        epic_id: &CardId,
+        now: i64,
+        periods: usize,
+        period_days: u64,
+    ) -> Result<Option<EpicVelocity>> {
+        if self.get_card(epic_id)?.is_none() {
+            return Ok(None);
+        }
+        let period_count = periods.clamp(1, 52);
+        let period_days = period_days.clamp(1, 366);
+        let period_seconds = (period_days * 86_400) as i64;
+        let total_seconds = period_seconds.saturating_mul(period_count as i64);
+        let oldest_start = now.saturating_sub(total_seconds);
+        let mut buckets = (0..period_count)
+            .map(|index| {
+                let period_start =
+                    oldest_start.saturating_add(period_seconds.saturating_mul(index as i64));
+                let period_end = if index + 1 == period_count {
+                    now
+                } else {
+                    period_start.saturating_add(period_seconds)
+                };
+                EpicVelocityPeriod {
+                    period_start,
+                    period_end,
+                    completed_children: 0,
+                    abandoned_children: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut statement = self.connection.prepare(
+            "SELECT status, updated_at
+             FROM cards
+             WHERE parent = ?1
+               AND status IN ('done', 'shipped', 'abandoned')
+               AND updated_at >= ?2
+               AND updated_at <= ?3",
+        )?;
+        let children = statement
+            .query_map(params![epic_id.as_str(), oldest_start, now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (status, updated_at) in children {
+            let offset = updated_at.saturating_sub(oldest_start);
+            let index =
+                (offset / period_seconds).min(period_count.saturating_sub(1) as i64) as usize;
+            match status.as_str() {
+                "done" | "shipped" => buckets[index].completed_children += 1,
+                "abandoned" => buckets[index].abandoned_children += 1,
+                _ => {}
+            }
+        }
+        Ok(Some(EpicVelocity {
+            card_id: epic_id.clone(),
+            period_days,
+            periods: buckets,
+        }))
     }
 
     pub fn claim_card(

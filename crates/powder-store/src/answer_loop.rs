@@ -4,7 +4,7 @@ use powder_core::{
     Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
     CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DetailLevel, DomainError,
     EpicEvidence, EpicState, EvidenceKind, Link, LinkId, Operation, Run, RunDetail, RunId,
-    RunState, WorkLogEntry,
+    RunState, TerminalSummary, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -15,6 +15,8 @@ use super::{
 
 const CONCISE_DETAIL_LIMIT: i64 = 20;
 const DETAIL_HINT: &str = "History truncated; pass detail:\"detailed\" for full history.";
+const TERMINAL_COMPACT_AFTER_SECS: u64 = 1_209_600;
+const TERMINAL_BODY_LIMIT: usize = 280;
 
 impl Store {
     /// Read one card plus its history sections.
@@ -28,7 +30,7 @@ impl Store {
         detail: DetailLevel,
         now: i64,
     ) -> Result<Option<CardDetail>> {
-        let Some(card) = self.get_card(card_id)? else {
+        let Some(mut card) = self.get_card(card_id)? else {
             return Ok(None);
         };
         let runs = load_runs_for_card(&self.connection, card_id, detail)?;
@@ -63,27 +65,163 @@ impl Store {
             || children_total.is_some_and(|total| total > children.len());
         let (transitive_blocked_by, blocked_by_cycle) =
             transitive_blocked_by_for(&self.connection, &card)?;
+
+        let compact_after_secs = std::env::var("POWDER_TERMINAL_COMPACT_AFTER_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(TERMINAL_COMPACT_AFTER_SECS);
+        let terminal_age = now.saturating_sub(card.updated_at).max(0) as u64;
+        let compact_terminal = detail == DetailLevel::Concise
+            && card.status.is_terminal()
+            && (compact_after_secs == 0 || terminal_age >= compact_after_secs);
+        let (terminal_summary, summary_hint, compact_sections) = if compact_terminal {
+            let body_truncated = card.body.chars().count() > TERMINAL_BODY_LIMIT;
+            let run_count = runs.total.unwrap_or(runs.items.len());
+            let comment_count = comments.total.unwrap_or(comments.items.len());
+            let link_count = links.total.unwrap_or(links.items.len());
+            let activity_count = activities.total.unwrap_or(activities.items.len());
+            let event_count = events.total.unwrap_or(events.items.len());
+            let work_log_count = work_log.total.unwrap_or(work_log.items.len());
+            let proof_run_count = count_runs_with_proof(&self.connection, card_id)?;
+            let summary = TerminalSummary {
+                status: card.status,
+                closed_at: card.updated_at,
+                title: card.title.clone(),
+                repo: card.repo.clone(),
+                parent: card.parent.clone(),
+                criteria_checked: card
+                    .criteria
+                    .iter()
+                    .filter(|criterion| {
+                        criterion.checked_at.is_some() || criterion.checked_by.is_some()
+                    })
+                    .count(),
+                criteria_total: card.criteria.len(),
+                proof_link_count: link_count.saturating_add(proof_run_count),
+                run_count,
+                comment_count,
+                body_truncated,
+            };
+            if body_truncated {
+                let prefix = card
+                    .body
+                    .chars()
+                    .take(TERMINAL_BODY_LIMIT)
+                    .collect::<String>();
+                card.body = format!("{prefix}…");
+            }
+            // Compact default path keeps counts only; full history is
+            // detail=detailed. Totals stay set so agents see volume.
+            (
+                Some(summary),
+                true,
+                Some((
+                    run_count,
+                    activity_count,
+                    event_count,
+                    link_count,
+                    comment_count,
+                    work_log_count,
+                )),
+            )
+        } else {
+            (None, false, None)
+        };
+        let (
+            runs_items,
+            runs_total,
+            activities_items,
+            activities_total,
+            events_items,
+            events_total,
+            links_items,
+            links_total,
+            comments_items,
+            comments_total,
+            work_log_items,
+            work_log_total,
+            history_truncated,
+        ) = if let Some((
+            run_count,
+            activity_count,
+            event_count,
+            link_count,
+            comment_count,
+            work_log_count,
+        )) = compact_sections
+        {
+            (
+                Vec::new(),
+                Some(run_count),
+                Vec::new(),
+                Some(activity_count),
+                Vec::new(),
+                Some(event_count),
+                Vec::new(),
+                Some(link_count),
+                Vec::new(),
+                Some(comment_count),
+                Vec::new(),
+                Some(work_log_count),
+                run_count
+                    + activity_count
+                    + event_count
+                    + link_count
+                    + comment_count
+                    + work_log_count
+                    > 0
+                    || truncated,
+            )
+        } else {
+            (
+                runs.items,
+                runs.total,
+                activities.items,
+                activities.total,
+                events.items,
+                events.total,
+                links.items,
+                links.total,
+                comments.items,
+                comments.total,
+                work_log.items,
+                work_log.total,
+                truncated,
+            )
+        };
+        let hint = match (detail_hint(history_truncated), summary_hint) {
+            (Some(history), true) => Some(format!(
+                "{history} Terminal history compacted; pass detail:\"detailed\" for full body and history."
+            )),
+            (Some(history), false) => Some(history),
+            (None, true) => Some(
+                "Terminal history compacted; pass detail:\"detailed\" for full body and history."
+                    .to_string(),
+            ),
+            (None, false) => None,
+        };
         Ok(Some(CardDetail {
-            runs: runs.items,
-            runs_total: runs.total,
-            activities: activities.items,
-            activities_total: activities.total,
-            events: events.items,
-            events_total: events.total,
-            links: links.items,
-            links_total: links.total,
-            comments: comments.items,
-            comments_total: comments.total,
-            work_log: work_log.items,
-            work_log_total: work_log.total,
+            card,
+            terminal_summary,
+            runs: runs_items,
+            runs_total,
+            activities: activities_items,
+            activities_total,
+            events: events_items,
+            events_total,
+            links: links_items,
+            links_total,
+            comments: comments_items,
+            comments_total,
+            work_log: work_log_items,
+            work_log_total,
             attachments,
             children,
             children_total,
             epic_state,
             transitive_blocked_by,
             blocked_by_cycle,
-            hint: detail_hint(truncated),
-            card,
+            hint,
         }))
     }
 
@@ -514,6 +652,15 @@ fn load_runs_for_card(
 fn count_runs_for_card(connection: &Connection, card_id: &CardId) -> Result<usize> {
     let total: i64 = connection.query_row(
         "SELECT COUNT(*) FROM runs WHERE card_id = ?1",
+        [card_id.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(total as usize)
+}
+
+fn count_runs_with_proof(connection: &Connection, card_id: &CardId) -> Result<usize> {
+    let total: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM runs WHERE card_id = ?1 AND proof IS NOT NULL",
         [card_id.as_str()],
         |row| row.get(0),
     )?;

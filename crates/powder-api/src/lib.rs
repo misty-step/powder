@@ -86,6 +86,13 @@ pub const ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "GET",
+        path: "/api/v1/cards/{id}/velocity",
+        intent: "return per-epic direct-child completion velocity buckets (done/shipped vs abandoned) over trailing periods; optional periods (default 8) and period_days (default 7) query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        policy: None,
+        body_shape: None,
+    },
+    ApiRoute {
+        method: "GET",
         path: "/api/v1/repositories",
         intent: "list repository entities with aliases, visibility, tier, import provenance, and status counts; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         policy: None,

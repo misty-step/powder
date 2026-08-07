@@ -171,6 +171,15 @@ pub fn call_tool_remote(client: &RemoteClient, name: &str, args: &Value) -> Resu
             }
             client.get(&format!("/api/v1/board/rollups?{query}"))?
         }
+        "epic_velocity" => {
+            let card_id = required_str(args, "card_id")?;
+            let periods = args["periods"].as_u64().unwrap_or(8);
+            let period_days = args["period_days"].as_u64().unwrap_or(7);
+            client.get(&format!(
+                "/api/v1/cards/{}/velocity?periods={periods}&period_days={period_days}",
+                urlencode(card_id)
+            ))?
+        }
         "create_card" => {
             let id = required_str(args, "id")?;
             let title = required_str(args, "title")?;
