@@ -128,6 +128,7 @@ silently drift from what's in this README.
   CLI/MCP transport, and production runbook lore.
 - [MCP contract](SKILL.md) — the shipped agent-facing usage contract.
 - [`VISION.md`](VISION.md) — product direction and scope.
+- [`docs/release.md`](docs/release.md) — tag/Cargo version policy and Landmark notes path.
 - [`AGENTS.md`](AGENTS.md) — repo contract: architecture boundaries, gates,
   red lines.
 
