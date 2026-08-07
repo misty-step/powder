@@ -15,6 +15,9 @@ const RAW_STATUSES = [
 ];
 
 const PAGE_LIMIT = 1000;
+// powder-terminal-compaction: DONE lane is evidence strip, not full archive.
+const TERMINAL_LANE_LIMIT = 30;
+const TERMINAL_STATUSES = new Set(["done", "shipped", "abandoned"]);
 const STORAGE_KEY = "powder-api-key";
 const BOARD_STATE_KEY = "powder-board-state";
 const BOARD_CACHE_KEY = "powder-board-cache";
@@ -175,6 +178,7 @@ const state = {
   view: "overview",
   showAllTiers: false,
   showEmptyRepos: false,
+  showAllTerminal: false,
   loading: true,
   error: "",
   errorKind: "",
@@ -582,11 +586,25 @@ function renderHomeLink(homeUrl) {
 // lane header count unconditionally, decoupled from whether that lane's
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
+  const terminalFetchLimit = state.showAllTerminal
+    ? PAGE_LIMIT
+    : Math.max(TERMINAL_LANE_LIMIT * 10, 100);
   const [results, readyResult, repositoryData, statsTotals, rollupsResult] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
-        const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
-        return listPageCards(data, status);
+        const limit = TERMINAL_STATUSES.has(status) ? terminalFetchLimit : PAGE_LIMIT;
+        const data = await apiJson(`/api/v1/cards?status=${status}&limit=${limit}`);
+        let cards = listPageCards(data, status);
+        if (TERMINAL_STATUSES.has(status) && !state.showAllTerminal) {
+          cards = [...cards]
+            .sort((left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0))
+            .slice(0, TERMINAL_LANE_LIMIT);
+        } else if (TERMINAL_STATUSES.has(status)) {
+          cards = [...cards].sort(
+            (left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0),
+          );
+        }
+        return cards;
       }),
     ),
     drainReadyPages().catch((error) => ({ error })),
@@ -2063,7 +2081,9 @@ function bucket() {
     ready: state.readyCards.filter(passesReady),
     blocked: sorted(visible.filter((card) => card.displayStatus === "ready" && hasUnresolvedBlocker(card, cardsById))),
     inProgress: sorted(visible.filter((card) => card.displayStatus === "in_progress")),
-    done: sorted(visible.filter((card) => card.displayStatus === "done")),
+    done: visible
+      .filter((card) => card.displayStatus === "done")
+      .sort((left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0)),
   };
 }
 
@@ -2431,9 +2451,10 @@ function render() {
   els.laneInProgress.innerHTML = failedLanes.has("in_progress")
     ? laneFailureHTML("in_progress")
     : buckets.inProgress.map(cardHTML).join("") || boardEmptyCopy("in flight");
-  els.laneDone.innerHTML = failedLanes.has("done")
+  const doneBody = failedLanes.has("done")
     ? laneFailureHTML("done")
     : buckets.done.map(doneRowHTML).join("") || boardEmptyCopy("shipped");
+  els.laneDone.innerHTML = doneBody + terminalLaneControlHTML();
   if (failedLanes.has("backlog") && !state.filters.search.trim()) {
     els.railList.innerHTML = laneFailureHTML("backlog");
   } else {
@@ -2623,6 +2644,51 @@ function doneRowHTML(card) {
       <span class="pw-done-id pw-num">${escapeHtml(card.id)}</span>
     </a>
   `;
+}
+
+function terminalLaneTotal() {
+  return laneStatTotal("done");
+}
+
+function terminalLaneControlHTML() {
+  const total = terminalLaneTotal();
+  const shown = state.cards.filter((card) => TERMINAL_STATUSES.has(card.status)).length;
+  if (!total) return "";
+  if (state.showAllTerminal) {
+    return `<button type="button" class="pw-button pw-button-quiet pw-terminal-more" data-terminal-toggle="recent">Show recent only (${TERMINAL_LANE_LIMIT})</button>`;
+  }
+  if (total <= shown) return "";
+  const hidden = Math.max(total - shown, 0);
+  return `<button type="button" class="pw-button pw-button-quiet pw-terminal-more" data-terminal-toggle="all">Show older terminal (${hidden})</button>`;
+}
+
+async function setShowAllTerminal(next) {
+  state.showAllTerminal = Boolean(next);
+  state.loading = true;
+  render();
+  try {
+    const data = await fetchBoardData();
+    state.cards = data.cards;
+    state.readyCards = data.readyCards;
+    state.readyMeta = data.readyMeta;
+    state.repositories = data.repositories;
+    state.statsTotals = data.statsTotals;
+    state.cardFetchErrors = data.cardFetchErrors;
+    state.rollups = data.rollups || [];
+    state.rollupCoverage = data.rollupCoverage || null;
+    state.rollupHasMore = data.rollupHasMore === true;
+    state.rollupNextAfter = data.rollupNextAfter || null;
+    state.rollupError = data.rollupError || "";
+    state.loading = false;
+    state.error = "";
+    state.errorKind = "";
+    buildFilters();
+    render();
+  } catch (error) {
+    state.loading = false;
+    state.error = error?.message || String(error);
+    render();
+  }
 }
 
 function statusText(status) {
@@ -3440,6 +3506,12 @@ els.laneSwitch.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-lane]");
   if (!button) return;
   setLane(button.dataset.lane);
+});
+els.laneDone.addEventListener("click", (event) => {
+  const toggle = event.target.closest("[data-terminal-toggle]");
+  if (!toggle) return;
+  event.preventDefault();
+  void setShowAllTerminal(toggle.getAttribute("data-terminal-toggle") === "all");
 });
 els.settingsToggle.addEventListener("click", () => {
   if (els.authPanel.hidden) showAuth();

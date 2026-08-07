@@ -497,6 +497,12 @@ struct BoardRollupsParams {
     include_hidden: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EpicVelocityParams {
+    periods: Option<usize>,
+    period_days: Option<u64>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct DetailParams {
     detail: Option<DetailLevel>,
@@ -902,6 +908,7 @@ fn app(state: AppState) -> Router {
         .route("/api/v1/routes", get(routes))
         .route("/api/v1/stats", get(board_stats))
         .route("/api/v1/board/rollups", get(board_rollups))
+        .route("/api/v1/cards/{id}/velocity", get(epic_velocity))
         .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
         .route("/api/v1/cards/search", get(search_cards))
@@ -1360,6 +1367,25 @@ async fn board_rollups(
         include_hidden,
     })?;
     Ok(Json(json!(rollups)))
+}
+
+async fn epic_velocity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<EpicVelocityParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_read(&state, &headers)?;
+    let card_id = CardId::new(id)?;
+    let velocity = lock_store(&state)?
+        .epic_velocity(
+            &card_id,
+            unix_now(),
+            params.periods.unwrap_or(8),
+            params.period_days.unwrap_or(7),
+        )?
+        .ok_or_else(|| powder_core::DomainError::not_found("card", card_id.to_string()))?;
+    Ok(Json(json!(velocity)))
 }
 
 async fn list_repositories(

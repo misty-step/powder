@@ -1868,8 +1868,27 @@ impl DetailLevel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSummary {
+    pub status: CardStatus,
+    pub closed_at: i64,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<CardId>,
+    pub criteria_checked: usize,
+    pub criteria_total: usize,
+    pub proof_link_count: usize,
+    pub run_count: usize,
+    pub comment_count: usize,
+    pub body_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardDetail {
     pub card: Card,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_summary: Option<TerminalSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<Run>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

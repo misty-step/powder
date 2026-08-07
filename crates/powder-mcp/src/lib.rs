@@ -69,6 +69,11 @@ pub const TOOLS: &[ToolDef] = &[
         input_schema: r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1},"after":{"type":"string"},"include_hidden":{"type":"boolean"}}}"#,
     },
     ToolDef {
+        name: "epic_velocity",
+        description: "Return per-epic direct-child completion velocity: trailing fixed periods of done/shipped vs abandoned counts. Use before judging whether an epic is moving. periods default 8, period_days default 7.",
+        input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"periods":{"type":"integer","minimum":1},"period_days":{"type":"integer","minimum":1}}}"#,
+    },
+    ToolDef {
         name: "create_card",
         description: "Create one card with optional acceptance criteria, proof plan, relations, parent (decomposing an epic), repository, estimate, risk, and initial status; omit repo for cross-repo or process work so the card lands in the General catch-all; returns a minimal ack; get_card for full state. related/blocks/blocked_by set at creation mirror reciprocally onto each named peer that already exists (related is symmetric; blocks/blocked_by mirror each other); a peer id that doesn't exist yet is tolerated and simply not mirrored.",
         input_schema: r#"{"type":"object","required":["id","title","idempotency_key"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"acceptance":{"type":"array","items":{"type":"string"}},"proof_plan":{"type":"array","items":{"type":"string"}},"status":{"type":"string","enum":["backlog","ready","in_progress","awaiting_input","done","shipped","abandoned"]},"priority":{"type":"string","enum":["P0","P1","P2","P3"]},"estimate":{"type":"string","enum":["S","M","L","XL"]},"risk":{"type":"string","enum":["low","medium","high"]},"labels":{"type":"array","items":{"type":"string"}},"repo":{"type":"string"},"related":{"type":"array","items":{"type":"string"}},"blocks":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"string"}},"parent":{"type":"string"},"actor":{"type":"string"},"idempotency_key":{"type":"string","description":"caller-generated; reuse only when retrying same intent"}}}"#,
@@ -555,6 +560,16 @@ pub fn call_tool_store_with_authority(
                 })
                 .map_err(to_string)?;
             json!(page)
+        }
+        "epic_velocity" => {
+            let card_id = CardId::new(required_str(args, "card_id")?).map_err(to_string)?;
+            let periods = args["periods"].as_u64().unwrap_or(8) as usize;
+            let period_days = args["period_days"].as_u64().unwrap_or(7);
+            let velocity = store
+                .epic_velocity(&card_id, now, periods, period_days)
+                .map_err(to_string)?
+                .ok_or_else(|| format!("card not found: {card_id}"))?;
+            json!(velocity)
         }
         "create_card" => {
             let id = CardId::new(required_str(args, "id")?).map_err(to_string)?;
@@ -1753,7 +1768,7 @@ mod tests {
 
         let default_listed = tool_defs_json_for(Toolset::Default);
         let default_tools = default_listed.as_array().unwrap();
-        assert_eq!(default_tools.len(), 25);
+        assert_eq!(default_tools.len(), 26);
 
         let listed = tool_defs_json_for(Toolset::WithAdmin);
         let tools = listed.as_array().unwrap();
@@ -1937,6 +1952,7 @@ mod tests {
                 "search_cards",
                 "board_stats",
                 "board_rollups",
+                "epic_velocity",
                 "create_card",
                 "update_card",
                 "list_repositories",
@@ -1959,7 +1975,7 @@ mod tests {
                 "complete_card",
             ]
         );
-        assert_eq!(default_names.len(), 25);
+        assert_eq!(default_names.len(), 26);
         for admin_tool in ADMIN_TOOL_NAMES {
             assert!(
                 !default_names.contains(admin_tool),
@@ -1971,7 +1987,7 @@ mod tests {
             admin_names,
             TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>()
         );
-        assert_eq!(admin_names.len(), 34);
+        assert_eq!(admin_names.len(), 35);
         assert!(admin_names.contains(&"upsert_repository"));
         assert!(admin_names.contains(&"merge_repository_alias"));
         assert!(admin_names.contains(&"delete_repository"));

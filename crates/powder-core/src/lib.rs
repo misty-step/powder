@@ -20,7 +20,7 @@ pub use model::{
     OperationCapability, OperationRule, PrincipalRole, Priority, Risk, Run, RunDetail, RunId,
     RunState, RunTelemetryAggregate, RunTelemetryAggregateQuery, RunTelemetryAggregateRow,
     RunTelemetryAttemptInput, RunTelemetryReceipt, RunTelemetrySummary, RunTelemetryWrite,
-    WorkLogEntry,
+    TerminalSummary, WorkLogEntry,
 };
 pub use queries::{ClaimReceipt, ReadyCursor, ReadyQuery};
 pub use ready_order::{
