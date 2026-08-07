@@ -587,22 +587,13 @@ function renderHomeLink(homeUrl) {
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
   // list_cards sorts by ready_sort (priority/created/id), not updated_at.
-  // Pull up to PAGE_LIMIT per terminal status, then take newest-updated strip
-  // client-side so "recent" is honest within the board page bound.
+  // Pull PAGE_LIMIT per terminal status, merge, sort newest-updated, then
+  // apply one strip cap so DONE shows TERMINAL_LANE_LIMIT total rows.
   const [results, readyResult, repositoryData, statsTotals, rollupsResult] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
         const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
-        let cards = listPageCards(data, status);
-        if (TERMINAL_STATUSES.has(status)) {
-          cards = [...cards].sort(
-            (left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0),
-          );
-          if (!state.showAllTerminal) {
-            cards = cards.slice(0, TERMINAL_LANE_LIMIT);
-          }
-        }
-        return cards;
+        return listPageCards(data, status);
       }),
     ),
     drainReadyPages().catch((error) => ({ error })),
@@ -620,8 +611,22 @@ async function fetchBoardData() {
   });
   if (readyResult.error) cardFetchErrors.ready = readyResult.error.message || String(readyResult.error);
   const rollups = rollupsResult.data || {};
+  const openCards = [];
+  const terminalCards = [];
+  for (const group of cardGroups) {
+    for (const card of group) {
+      if (TERMINAL_STATUSES.has(card.status)) terminalCards.push(card);
+      else openCards.push(card);
+    }
+  }
+  terminalCards.sort(
+    (left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0),
+  );
+  const terminalShown = state.showAllTerminal
+    ? terminalCards
+    : terminalCards.slice(0, TERMINAL_LANE_LIMIT);
   return {
-    cards: dedupeCards(cardGroups.flat()).map(normalizeCard),
+    cards: dedupeCards([...openCards, ...terminalShown]).map(normalizeCard),
     readyCards: readyResult.error ? [] : readyResult.cards.map(normalizeCard),
     readyMeta: readyResult.error ? { total_count: 0, cycle_card_ids: [], has_more: false, next_after: null } : readyResult.metadata,
     repositories: normalizeRepositories(repositoryData.repositories || []),
