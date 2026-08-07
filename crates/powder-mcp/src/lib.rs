@@ -110,7 +110,7 @@ pub const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_card",
-        description: "Read one card with runs, activities, links, comments, and claim state; a parent card also returns bounded child summaries and a deterministic epic_state rollup packet. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
+        description: "Read one card with runs, activities, links, comments, claim state, and always-present claim_eligibility (eligible/code/message/blockers) using the same rules as list_ready. A parent card also returns bounded child summaries and a deterministic epic_state rollup packet. detail defaults to concise: newest-first, most recent 20 per history section plus totals/hint when truncated; detailed returns full history.",
         input_schema: r#"{"type":"object","required":["card_id"],"properties":{"card_id":{"type":"string"},"detail":{"type":"string","enum":["concise","detailed"]}}}"#,
     },
     ToolDef {
