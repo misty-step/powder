@@ -586,23 +586,21 @@ function renderHomeLink(homeUrl) {
 // lane header count unconditionally, decoupled from whether that lane's
 // card-list fetch succeeded (see renderCounts/laneStatTotal).
 async function fetchBoardData() {
-  const terminalFetchLimit = state.showAllTerminal
-    ? PAGE_LIMIT
-    : Math.max(TERMINAL_LANE_LIMIT * 10, 100);
+  // list_cards sorts by ready_sort (priority/created/id), not updated_at.
+  // Pull up to PAGE_LIMIT per terminal status, then take newest-updated strip
+  // client-side so "recent" is honest within the board page bound.
   const [results, readyResult, repositoryData, statsTotals, rollupsResult] = await Promise.all([
     Promise.allSettled(
       RAW_STATUSES.map(async (status) => {
-        const limit = TERMINAL_STATUSES.has(status) ? terminalFetchLimit : PAGE_LIMIT;
-        const data = await apiJson(`/api/v1/cards?status=${status}&limit=${limit}`);
+        const data = await apiJson(`/api/v1/cards?status=${status}&limit=${PAGE_LIMIT}`);
         let cards = listPageCards(data, status);
-        if (TERMINAL_STATUSES.has(status) && !state.showAllTerminal) {
-          cards = [...cards]
-            .sort((left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0))
-            .slice(0, TERMINAL_LANE_LIMIT);
-        } else if (TERMINAL_STATUSES.has(status)) {
+        if (TERMINAL_STATUSES.has(status)) {
           cards = [...cards].sort(
             (left, right) => (Number(right.updated_at) || 0) - (Number(left.updated_at) || 0),
           );
+          if (!state.showAllTerminal) {
+            cards = cards.slice(0, TERMINAL_LANE_LIMIT);
+          }
         }
         return cards;
       }),
