@@ -127,16 +127,16 @@ Default agent persona (26 tools):
   This pre-1.0 MCP break removed the old `claim_card`, `renew_claim`,
   `heartbeat`, `release_claim`, and `transfer_claim` tools.
 - `get_card`: read one card with runs, activities, links, comments, claim
-  state, and always-present `claim_eligibility`
-  (`eligible`/`code`/`message`/`blockers`) using the same rules as
-  `list_ready`. Codes: `eligible`, `no_acceptance`, `unresolved_blockers`,
-  `active_claim`, `status_not_claimable`, `in_progress_claim_not_expired`.
-  A parent card also returns bounded child summaries plus a deterministic
-  `epic_state` rollup packet (status counts, acceptance sums, child
-  evidence with provenance, freshness, and parent/child mismatch flags).
-  `detail` defaults to `concise` (newest-first, most recent 20 per history
-  section plus totals/hint when truncated); pass `detail: detailed` for
-  full history.
+  state, and always-present `claim_eligibility` (`eligible`/`code`;
+  `message` when ineligible; `blockers` only for `unresolved_blockers`)
+  using the same rules as `list_ready`. Codes: `eligible`, `no_acceptance`,
+  `unresolved_blockers`, `active_claim`, `status_not_claimable`,
+  `in_progress_claim_not_expired`. A parent card also returns bounded child
+  summaries plus a deterministic `epic_state` rollup packet (status counts,
+  acceptance sums, child evidence with provenance, freshness, and
+  parent/child mismatch flags). `detail` defaults to `concise`
+  (newest-first, most recent 20 per history section plus totals/hint when
+  truncated); pass `detail: detailed` for full history.
 - `get_run`: read one run with its card, activities, links, comments, and run
   state. `detail` defaults to `concise` (newest-first, most recent 20 per
   history section plus totals/hint when truncated); pass `detail: detailed`

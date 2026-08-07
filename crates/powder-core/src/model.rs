@@ -1390,10 +1390,10 @@ impl Card {
                     ),
                     Vec::new(),
                 ),
-                _ => ClaimEligibility::eligible_ok(&self.id),
+                _ => ClaimEligibility::eligible_ok(),
             },
             CardStatus::InProgress => match self.claim.as_ref() {
-                Some(claim) if claim.is_expired(now) => ClaimEligibility::eligible_ok(&self.id),
+                Some(claim) if claim.is_expired(now) => ClaimEligibility::eligible_ok(),
                 Some(claim) => ClaimEligibility::excluded(
                     ClaimEligibilityCode::InProgressClaimNotExpired,
                     format!(
@@ -1973,19 +1973,21 @@ impl ClaimEligibilityCode {
 pub struct ClaimEligibility {
     pub eligible: bool,
     pub code: ClaimEligibilityCode,
+    /// Human reason when ineligible; empty when `eligible` is true.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
     /// Direct unresolved `blocked_by` ids when `code` is
-    /// `unresolved_blockers`; empty otherwise.
+    /// `unresolved_blockers`; omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<CardId>,
 }
 
 impl ClaimEligibility {
-    fn eligible_ok(card_id: &CardId) -> Self {
+    fn eligible_ok() -> Self {
         Self {
             eligible: true,
             code: ClaimEligibilityCode::Eligible,
-            message: format!("card {card_id} is eligible to claim"),
+            message: String::new(),
             blockers: Vec::new(),
         }
     }
