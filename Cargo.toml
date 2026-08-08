@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
   "crates/powder-core",
-  "crates/powder-shell",
   "crates/powder-store",
   "crates/powder-api",
   "crates/powder-cli",

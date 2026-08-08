@@ -13,12 +13,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    body::Bytes,
-    extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::{
         header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
         request::Parts,
@@ -31,24 +30,19 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use hmac::{Hmac, Mac};
 #[cfg(test)]
 use powder_core::Priority;
 use powder_core::{
-    canonical_repo_label, normalize_acceptance, normalize_labels, normalize_relations,
-    parse_estimate, parse_priority, parse_risk, parse_status, Authority, Card, CardField,
-    CardFieldError, CardId, CardStatus, DenialClass, DetailLevel, PapercutReport, ReadyCursor,
-    ReadyQuery, RunId, RunTelemetryAggregateQuery, RunTelemetryAttemptInput, RunTelemetryWrite,
+    normalize_acceptance, normalize_labels, normalize_relations, parse_priority, parse_status,
+    Authority, Card, CardField, CardFieldError, CardId, CardStatus, DenialClass, DetailLevel,
+    ReadyCursor, ReadyQuery, RunId,
 };
-use powder_shell::unix_now;
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, FieldNoteConfig,
-    KeyedOperationContext, PricingConfig, RepositoryTier, RepositoryUpsert, RepositoryVisibility,
-    SearchQuery, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, CriterionProofInput, KeyedOperationContext, SearchQuery,
+    Store, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 #[cfg(unix)]
@@ -56,31 +50,20 @@ use std::os::unix::fs::OpenOptionsExt;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
-mod canary;
-
 const DEFAULT_DB_PATH: &str = "/data/powder.db";
 const DEFAULT_PORT: u16 = 4000;
-/// Defaults for the field-note seed generator (powder-921): a bare
-/// `POWDER_FIELD_NOTE_REPOS` with no other overrides gets a sane length
-/// floor and the design law's own "~7" weekly budget rather than forcing
-/// every deployment that wants this to also spell out the other two knobs.
-const DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS: usize = 120;
-const DEFAULT_FIELD_NOTE_WEEKLY_BUDGET: usize = 7;
-const SIGNATURE_HEADER: &str = "X-Signature-256";
-const DELIVERY_BATCH_LIMIT: usize = 25;
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 /// Header a trusted tailnet ingress sets to prove a `tailscale-header`-mode
 /// request actually passed through it, when `POWDER_TAILNET_PROXY_SECRET` is
 /// configured. See `authorize()` and docs/operations.md's trust-boundary
 /// section.
 const PROXY_SECRET_HEADER: &str = "x-powder-proxy-secret";
-/// `/readyz`'s dead-letter-backlog gate (powder-epic-truthful-ops): a
-/// handful of dead letters is normal operational noise (a receiver blipped
-/// for six minutes); a backlog in the hundreds means webhooks are
-/// structurally broken (bad URL, revoked credential on the receiving end)
-/// and an operator should be paged, not just able to `dead-letter-list` and
-/// notice eventually. 100 is a starting default, not a measured threshold --
-/// tune via `POWDER_READYZ_DEAD_LETTER_THRESHOLD` per deployment.
-const DEFAULT_READYZ_DEAD_LETTER_THRESHOLD: i64 = 100;
 
 #[derive(Clone)]
 struct AppState {
@@ -107,26 +90,20 @@ struct AppState {
 struct Config {
     db_path: PathBuf,
     auth_mode: AuthMode,
-    public_base_url: Option<String>,
-    home_url: Option<String>,
     bind_addr: SocketAddr,
     /// Optional one-shot file for the first-run admin key.
     /// The file is created with mode 0600 and never logged.
     bootstrap_key_file: Option<PathBuf>,
-    field_note: FieldNoteConfig,
     /// Secret shared only by the trusted ingress and this process. Without it,
     /// identity headers are rejected and only bearer-token fallback remains.
     tailnet_proxy_secret: Option<String>,
     /// Exact forwarded identities allowed to use admin-only routes. An empty
     /// list is fail-closed; there is no global "all tailnet users" switch.
     tailnet_admin_principals: Vec<String>,
-    /// `/readyz`'s dead-letter backlog gate. See
-    /// `DEFAULT_READYZ_DEAD_LETTER_THRESHOLD`.
-    dead_letter_ready_threshold: i64,
     /// Read posture override for `api-key` mode (powder-public-read-posture).
     /// When `false` (default), read routes require a valid bearer token in
     /// `api-key` mode. When `true`, read routes are reachable without a key,
-    /// preserving the historical Flycast/tailnet private-perimeter behavior.
+    /// preserving a trusted private-perimeter deployment.
     /// `tailscale-header` and `none` modes are unaffected.
     public_reads: bool,
 }
@@ -142,9 +119,9 @@ enum AuthMode {
 impl AuthMode {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "api-key" | "agent-api-key" | "shared-secret" => Some(Self::ApiKey),
-            "tailscale-header" | "tailnet" => Some(Self::TailscaleHeader),
-            "none" | "disabled" => Some(Self::None),
+            "api-key" => Some(Self::ApiKey),
+            "tailscale-header" => Some(Self::TailscaleHeader),
+            "none" => Some(Self::None),
             _ => None,
         }
     }
@@ -165,13 +142,6 @@ impl Config {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect::<BTreeMap<_, _>>();
-        let retired_import_dir = concat!("POWDER_", "IMPORT_FILES_DIR");
-        if vars.contains_key(retired_import_dir) {
-            return Err(ConfigError::new(
-                retired_import_dir,
-                "retired; remove the repository-ingestion setting",
-            ));
-        }
         let db_path = env_value(&vars, "POWDER_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
@@ -202,7 +172,6 @@ impl Config {
             })?,
             None => SocketAddr::from(([127, 0, 0, 1], port)),
         };
-        let field_note = field_note_config_from_env(&vars)?;
         let tailnet_proxy_secret = match vars.get("POWDER_TAILNET_PROXY_SECRET") {
             Some(value) if value.trim().is_empty() => {
                 return Err(ConfigError::new(
@@ -235,16 +204,6 @@ impl Config {
             ));
         }
         let tailnet_admin_principals = parse_tailnet_admin_principals(&vars)?;
-        let dead_letter_ready_threshold =
-            match env_value(&vars, "POWDER_READYZ_DEAD_LETTER_THRESHOLD") {
-                Some(value) => value.parse::<i64>().map_err(|err| {
-                    ConfigError::new(
-                        "POWDER_READYZ_DEAD_LETTER_THRESHOLD",
-                        format!("expected i64: {err}"),
-                    )
-                })?,
-                None => DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
-            };
         let public_reads = parse_bool(
             "POWDER_PUBLIC_READS",
             env_value(&vars, "POWDER_PUBLIC_READS"),
@@ -260,59 +219,13 @@ impl Config {
         Ok(Self {
             db_path,
             auth_mode,
-            public_base_url: env_value(&vars, "POWDER_PUBLIC_BASE_URL").map(ToOwned::to_owned),
-            home_url: env_value(&vars, "POWDER_HOME_URL").map(ToOwned::to_owned),
             bind_addr,
             bootstrap_key_file: env_value(&vars, "POWDER_BOOTSTRAP_KEY_FILE").map(PathBuf::from),
-            field_note,
             tailnet_proxy_secret,
             tailnet_admin_principals,
-            dead_letter_ready_threshold,
             public_reads,
         })
     }
-}
-
-/// Reads the field-note seed generator's three knobs (powder-921). An empty
-/// or absent `POWDER_FIELD_NOTE_REPOS` yields an empty allowlist, which
-/// leaves the generator permanently inert (every completion fails the repo
-/// gate) -- the same "no config, no behavior change" default every other
-/// deployment of Powder gets.
-fn field_note_config_from_env(
-    vars: &BTreeMap<String, String>,
-) -> Result<FieldNoteConfig, ConfigError> {
-    let repo_allowlist = env_value(vars, "POWDER_FIELD_NOTE_REPOS")
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    let proof_min_chars = match env_value(vars, "POWDER_FIELD_NOTE_PROOF_MIN_CHARS") {
-        Some(value) => value.parse::<usize>().map_err(|err| {
-            ConfigError::new(
-                "POWDER_FIELD_NOTE_PROOF_MIN_CHARS",
-                format!("expected usize: {err}"),
-            )
-        })?,
-        None => DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS,
-    };
-    let weekly_budget = match env_value(vars, "POWDER_FIELD_NOTE_WEEKLY_BUDGET") {
-        Some(value) => value.parse::<usize>().map_err(|err| {
-            ConfigError::new(
-                "POWDER_FIELD_NOTE_WEEKLY_BUDGET",
-                format!("expected usize: {err}"),
-            )
-        })?,
-        None => DEFAULT_FIELD_NOTE_WEEKLY_BUDGET,
-    };
-    Ok(FieldNoteConfig {
-        repo_allowlist,
-        proof_min_chars,
-        weekly_budget,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,20 +257,14 @@ struct Health {
     service: &'static str,
 }
 
-// `Ready` and `Onboarding` are served unauthenticated (Fly's own health
-// checker and first-run onboarding both run before any API key exists), so
-// neither includes `db_path`: it is a server-filesystem implementation
-// detail with no operational value to a caller and no reason to be legible
-// to an unauthenticated request. `schema_version` alone already proves the
+// `Ready` and `Onboarding` are served unauthenticated because health probes
+// and first-run onboarding run before any API key exists. Neither includes
+// `db_path`: it is a server-filesystem implementation detail with no
+// operational value to a caller and no reason to be legible to an
+// unauthenticated request. `schema_version` alone already proves the
 // database is open and migrated.
 //
-// powder-epic-truthful-ops: `ok` used to mean only "the store answered a
-// `SELECT 1`" -- true even against a read-only file, a schema several
-// versions behind, or a webhook backlog nobody is draining. `ok` now means
-// every one of `writable`, `schema_version == schema_version_expected`,
-// `dead_letter_count < dead_letter_threshold`, and `poison_count == 0`
-// holds; each is still reported individually so an operator (or an alert
-// rule) can see *which* gate failed instead of a bare false.
+// Readiness reports storage, schema, and recovered mutex state.
 #[derive(Debug, Serialize)]
 struct Ready {
     ok: bool,
@@ -369,8 +276,6 @@ struct Ready {
     /// failure), distinct from `ok` so a caller can tell "the DB answered
     /// but isn't currently writable" apart from "the DB didn't answer".
     writable: bool,
-    dead_letter_count: Option<i64>,
-    dead_letter_threshold: i64,
     /// See `AppState::poison_count`. Always present (unlike the DB-derived
     /// fields above) since it never requires a store lock to read.
     poison_count: u64,
@@ -399,29 +304,13 @@ struct Onboarding {
     /// wrong once a deployment flips reads to enforced (powder-public-read-posture;
     /// the flag defaults to `false`, i.e. enforced).
     public_reads: bool,
-    public_base_url: Option<String>,
-    /// A URL the board renders as a plain text link back to a deployment's
-    /// own portal/home surface (powder-942: 6 of 9 Sanctum destinations had
-    /// no route home, and the proxy layer cannot inject one -- vendored
-    /// surfaces get clobbered on pin sync, so the affordance has to live in
-    /// the app's own served UI). Absent by default; self-hosters with no
-    /// portal to link back to see no change. Set via `POWDER_HOME_URL`.
-    home_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReadyParams {
     limit: Option<usize>,
     repo: Option<String>,
-    estimate: Option<String>,
-    risk: Option<String>,
     priority: Option<String>,
-    /// powder-cards-api-paged-continuation: resume past a prior response's
-    /// opaque `next_after` cursor instead of only ever seeing the first
-    /// `limit` cards of the same order. Ready cursors bind query filters and
-    /// preserve the prior order snapshot. See `ListCardsParams::after` for
-    /// the full interim-vs-scale-proof-pagination distinction, which applies
-    /// identically here.
     after: Option<String>,
 }
 
@@ -429,25 +318,16 @@ struct ReadyParams {
 #[serde(deny_unknown_fields)]
 struct SearchParams {
     q: Option<String>,
-    source: Option<String>,
-    source_kind: Option<String>,
-    source_field: Option<String>,
     status: Option<String>,
     repo: Option<String>,
     label: Option<String>,
     priority: Option<String>,
-    estimate: Option<String>,
-    risk: Option<String>,
     limit: Option<usize>,
     after: Option<String>,
-    source_created_after: Option<String>,
-    source_created_before: Option<String>,
     created_after: Option<String>,
     created_before: Option<String>,
     updated_after: Option<String>,
     updated_before: Option<String>,
-    from: Option<String>,
-    to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,58 +335,15 @@ struct SearchParams {
 struct ListCardsParams {
     status: Option<String>,
     repo: Option<String>,
-    estimate: Option<String>,
     label: Option<String>,
     limit: Option<usize>,
-    /// `include_terminal` controls whether terminal cards are included when
-    /// no explicit `status` is requested. An explicit status always wins.
-    /// The default keeps the historical whole-board behavior unchanged.
     include_terminal: Option<bool>,
-    /// powder-cards-api-paged-continuation: the `next_after` id from a
-    /// prior response on this same (filter-identical) query, letting a
-    /// caller reach cards beyond `limit` instead of only ever seeing the
-    /// first page. Omitting it reproduces the historical first-page
-    /// response exactly -- this is purely additive.
-    ///
-    /// This is an *interim* continuation over an already fully-computed,
-    /// already-ordered in-memory list: `Store::list_cards_page_after`
-    /// still does a full unfiltered table scan and rebuilds that whole
-    /// list from scratch on every call, `after` or not. It bounds
-    /// response *payload size*, letting a caller reach cards beyond
-    /// `limit` -- it does **not** bound per-request DB/CPU cost. The
-    /// separate, deliberately-deferred
-    /// `powder-store-sql-pushed-list-filtering` card is what pushes the
-    /// filtering/ordering into SQL to fix that.
     after: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BoardStatsParams {
-    repo: Option<String>,
-    include_hidden: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BoardRollupsParams {
-    limit: Option<usize>,
-    after: Option<String>,
-    include_hidden: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EpicVelocityParams {
-    periods: Option<usize>,
-    period_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct DetailParams {
     detail: Option<DetailLevel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListRepositoriesParams {
-    include_hidden: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,24 +356,12 @@ struct CreateCardRequest {
     proof_plan: Option<Vec<String>>,
     status: Option<String>,
     priority: Option<String>,
-    estimate: Option<String>,
-    risk: Option<String>,
     labels: Option<Vec<String>>,
     repo: Option<String>,
     related: Option<Vec<String>>,
     blocks: Option<Vec<String>>,
     blocked_by: Option<Vec<String>>,
     parent: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilePapercutRequest {
-    agent: String,
-    body: String,
-    service: Option<String>,
-    model: Option<String>,
-    harness: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,25 +373,18 @@ struct PatchCardRequest {
     proof_plan: Option<Vec<String>>,
     status: Option<String>,
     priority: Option<String>,
-    estimate: Option<String>,
-    risk: Option<String>,
     labels: Option<Vec<String>>,
-    /// Repository reassignment (powder-repo-hygiene), admin-gated in
-    /// `patch_card`. Absent -- don't touch. `""` (or any string that
-    /// canonicalizes to empty, e.g. all whitespace) -- clear to repo-less,
-    /// same convention the quick-add combobox already uses client-side for
-    /// "no repo · local". Anything else -- set to its canonical label.
-    repo: Option<String>,
+    #[serde(default)]
+    repo: Option<Option<String>>,
 }
 
 impl PatchCardRequest {
     fn into_patch(self) -> Result<CardPatch, ApiError> {
         let status = self.status.as_deref().map(parse_status).transpose()?;
         let priority = self.priority.as_deref().map(parse_priority).transpose()?;
-        let estimate = self.estimate.as_deref().map(parse_estimate).transpose()?;
-        let risk = self.risk.as_deref().map(parse_risk).transpose()?;
-        let repo = self.repo.map(|raw| canonical_repo_label(&raw));
-
+        let repo = self
+            .repo
+            .map(|value| value.and_then(|raw| (!raw.trim().is_empty()).then_some(raw)));
         Ok(CardPatch {
             title: self.title,
             body: self.body,
@@ -574,8 +392,6 @@ impl PatchCardRequest {
             proof_plan: self.proof_plan,
             status,
             priority,
-            estimate,
-            risk,
             labels: self.labels.map(normalize_labels),
             repo,
         })
@@ -591,21 +407,7 @@ struct CriterionRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct RepositoryRequest {
-    name: Option<String>,
-    aliases: Option<Vec<String>>,
-    visibility: Option<String>,
-    tier: Option<String>,
-    import_provenance: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RepositoryMergeRequest {
-    alias: String,
-    actor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClaimRequest {
     // Required, not `Option`: the authenticated principal and semantic worker
     // are deliberately different identities. A caller must always declare
@@ -663,9 +465,6 @@ struct CommentRequest {
 #[serde(deny_unknown_fields)]
 struct WorkLogRequest {
     agent: String,
-    model: Option<String>,
-    reasoning: Option<String>,
-    harness: Option<String>,
     run_id: Option<String>,
     body: String,
 }
@@ -691,26 +490,6 @@ struct CompleteRequest {
 struct CriterionProofRequest {
     criterion: usize,
     url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct EventSubscriptionRequest {
-    url: String,
-    event_filter: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunTelemetryRequest {
-    #[serde(default)]
-    attempts: Vec<RunTelemetryAttemptInput>,
-}
-#[derive(Debug, Deserialize, Default)]
-struct RunTelemetryAggregateParams {
-    agent: Option<String>,
-    model: Option<String>,
-    provider: Option<String>,
-    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,8 +533,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // *no logging at all* when `RUST_LOG` was unset -- the common case for
     // an operator who just followed the quickstart -- so a running instance
     // was silent by default even though `tracing::info!`/`tracing::warn!`
-    // calls exist throughout this file (the webhook-delivery-failure warn,
-    // the startup line below, TraceLayer's own request logging). `RUST_LOG`
+    // calls exist throughout this file (startup and request tracing). `RUST_LOG`
     // still wins when set; only the fallback changes, from "nothing" to
     // "info".
     tracing_subscriber::fmt()
@@ -768,19 +546,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env().inspect_err(|err| {
         let msg = err.to_string();
         tracing::error!("{msg}");
-        canary::report_error("powder.config", &msg);
     })?;
-    let mut store = Store::open(&config.db_path)
-        .inspect_err(|err| {
-            let msg = format!("store open {}: {err:#}", config.db_path.display());
-            tracing::error!("{msg}");
-            canary::report_error("powder.store.open", &msg);
-        })?
-        .with_field_note_config(config.field_note.clone());
+    let mut store = Store::open(&config.db_path).inspect_err(|err| {
+        let msg = format!("store open {}: {err:#}", config.db_path.display());
+        tracing::error!("{msg}");
+    })?;
     store.migrate().inspect_err(|err| {
         let msg = format!("store migrate: {err:#}");
         tracing::error!("{msg}");
-        canary::report_error("powder.store.migrate", &msg);
     })?;
     let bootstrap_key_file = config.bootstrap_key_file.clone();
     let bootstrap_file_created = Cell::new(false);
@@ -827,7 +600,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schema_version = store.schema_version().inspect_err(|err| {
         let msg = format!("store schema_version: {err:#}");
         tracing::error!("{msg}");
-        canary::report_error("powder.store.schema_version", &msg);
     })?;
     let (event_notify_tx, event_notify_rx) = tokio::sync::watch::channel(0i64);
     let state = AppState {
@@ -858,26 +630,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "powder-server starting"
     );
 
-    tokio::spawn(delivery_loop(state.clone()));
     let app = app(state);
 
-    // `[::]` is a single dual-stack socket on Fly's guest kernel (confirmed
-    // live: it accepts both a literal IPv4-loopback connection and traffic
-    // over `fly proxy`/`.internal`, which is IPv6-only private networking).
-    // `fly deploy` prints a "not listening on 0.0.0.0" warning for this bind
-    // regardless, because its scanner only checks `/proc/net/tcp` (the v4
-    // table) and dual-stack v6 sockets never appear there even though they
-    // serve v4 traffic fine — a known cosmetic false positive, not a real
-    // reachability gap. Don't switch to `0.0.0.0` to silence it: that binds
-    // v4-only and breaks the private (Flycast/`.internal`) path instead.
     let listener = TcpListener::bind(addr).await.inspect_err(|err| {
         let msg = format!("bind {addr}: {err:#}");
         tracing::error!("{msg}");
-        canary::report_error("powder.bind", &msg);
     })?;
-
-    canary::check_in();
-    canary::start_health_loop();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -885,7 +643,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .inspect_err(|err| {
             let msg = format!("server: {err:#}");
             tracing::error!("{msg}");
-            canary::report_error("powder.serve", &msg);
         })?;
     Ok(())
 }
@@ -901,77 +658,27 @@ fn app(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/api/v1/onboarding", get(onboarding))
         .route("/api/v1/routes", get(routes))
-        .route("/api/v1/stats", get(board_stats))
-        .route("/api/v1/board/rollups", get(board_rollups))
-        .route("/api/v1/cards/{id}/velocity", get(epic_velocity))
-        .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/cards", post(create_card).get(list_cards))
-        .route("/api/v1/cards/search", get(search_cards))
-        .route("/api/v1/cards/papercut", post(file_papercut))
-        .route("/api/v1/cards/ready", get(list_ready))
-        .route(
-            "/api/v1/repositories",
-            post(upsert_repository).get(list_repositories),
-        )
-        .route(
-            "/api/v1/repositories/normalize",
-            post(normalize_repositories),
-        )
-        .route(
-            "/api/v1/repositories/{name}",
-            get(get_repository)
-                .post(update_repository)
-                .delete(delete_repository),
-        )
-        .route(
-            "/api/v1/repositories/{name}/merge-alias",
-            post(merge_repository_alias),
-        )
         .route("/api/v1/cards/{id}", get(get_card).patch(patch_card))
         .route("/api/v1/cards/{id}/claim", post(claim_card))
         .route("/api/v1/cards/{id}/release", post(release_claim))
         .route("/api/v1/cards/{id}/renew", post(renew_claim))
         .route("/api/v1/cards/{id}/heartbeat", post(heartbeat_claim))
+        .route("/api/v1/cards/search", get(search_cards))
+        .route("/api/v1/cards/ready", get(list_ready))
         .route("/api/v1/cards/{id}/transfer", post(transfer_claim))
         .route("/api/v1/cards/{id}/status", post(update_status))
         .route("/api/v1/cards/{id}/relations", post(update_relations))
         .route("/api/v1/cards/{id}/parent", post(set_parent))
         .route("/api/v1/cards/{id}/criteria/check", post(check_criterion))
         .route("/api/v1/cards/{id}/links", post(add_link))
-        .route(
-            "/api/v1/cards/{id}/attachments",
-            post(upload_attachment).layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES)),
-        )
-        .route(
-            "/api/v1/cards/{id}/attachments/{attachment_id}",
-            axum::routing::delete(detach_attachment),
-        )
-        .route("/api/v1/attachments/{id}", get(get_attachment))
         .route("/api/v1/cards/{id}/comments", post(add_comment))
         .route("/api/v1/cards/{id}/work-log", post(append_work_log))
         .route("/api/v1/cards/{id}/complete", post(complete_card))
         .route("/api/v1/runs/awaiting-input", get(list_awaiting_input))
-        .route(
-            "/api/v1/runs/telemetry/aggregate",
-            get(run_telemetry_aggregate),
-        )
         .route("/api/v1/runs/{id}", get(get_run))
-        .route("/api/v1/runs/{id}/telemetry", post(record_run_telemetry))
         .route("/api/v1/runs/{id}/input", post(request_input))
         .route("/api/v1/runs/{id}/answer", post(answer_input))
-        .route(
-            "/api/v1/events/subscriptions",
-            post(create_event_subscription).get(list_event_subscriptions),
-        )
-        .route(
-            "/api/v1/events/subscriptions/{id}/disable",
-            post(disable_event_subscription),
-        )
-        .route("/api/v1/events/dead-letter", get(list_dead_letters))
-        .route(
-            "/api/v1/events/dead-letter/replay",
-            post(replay_dead_letters),
-        )
         .route("/api/v1/events/tail", get(tail_events))
         .route("/api/v1/keys", get(list_keys).post(create_key))
         .route("/api/v1/keys/{id}/revoke", post(revoke_key))
@@ -1053,29 +760,23 @@ async fn healthz() -> Json<Health> {
     })
 }
 
-/// Gates readiness on four independent checks (powder-epic-truthful-ops):
-/// the DB accepts a write lock, its schema is exactly `SCHEMA_VERSION` (not
-/// merely "some version `PRAGMA user_version` returns"), the dead-letter
-/// backlog is under `dead_letter_ready_threshold`, and no store-mutex
-/// poisoning has been recovered from. `/healthz` stays a trivial liveness
-/// probe on purpose -- this is the only route that can turn "the process is
-/// running" into "and it should be receiving traffic".
+/// Gates readiness on storage, schema, and mutex health. `/healthz` stays a
+/// trivial liveness probe so `/readyz` can fail when the service cannot safely
+/// receive work.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let poison_count = state.poison_count.load(Ordering::SeqCst);
     let result = (|| {
         let store = lock_store(&state)?;
         store.writable_probe()?;
         let schema_version = store.schema_version()?;
-        let dead_letter_count = store.count_dead_letter_deliveries()?;
-        Ok::<_, ApiError>((schema_version, dead_letter_count))
+        Ok::<_, ApiError>(schema_version)
     })();
 
     match result {
-        Ok((schema_version, dead_letter_count)) => {
+        Ok(schema_version) => {
             let schema_ok = schema_version == powder_store::SCHEMA_VERSION;
-            let dead_letter_ok = dead_letter_count < state.config.dead_letter_ready_threshold;
             let poison_ok = poison_count == 0;
-            let ok = schema_ok && dead_letter_ok && poison_ok;
+            let ok = schema_ok && poison_ok;
             (
                 if ok {
                     StatusCode::OK
@@ -1088,8 +789,6 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
                     schema_version: Some(schema_version),
                     schema_version_expected: powder_store::SCHEMA_VERSION,
                     writable: true,
-                    dead_letter_count: Some(dead_letter_count),
-                    dead_letter_threshold: state.config.dead_letter_ready_threshold,
                     poison_count,
                     version: env!("CARGO_PKG_VERSION"),
                     git_sha: env!("POWDER_SERVER_GIT_SHA"),
@@ -1104,8 +803,6 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
                 schema_version: None,
                 schema_version_expected: powder_store::SCHEMA_VERSION,
                 writable: false,
-                dead_letter_count: None,
-                dead_letter_threshold: state.config.dead_letter_ready_threshold,
                 poison_count,
                 version: env!("CARGO_PKG_VERSION"),
                 git_sha: env!("POWDER_SERVER_GIT_SHA"),
@@ -1121,8 +818,6 @@ async fn onboarding(State(state): State<AppState>) -> Result<Json<Onboarding>, A
         bootstrap_key_configured: active_keys > 0,
         auth_mode: state.config.auth_mode,
         public_reads: state.config.public_reads,
-        public_base_url: state.config.public_base_url.clone(),
-        home_url: state.config.home_url.clone(),
     }))
 }
 
@@ -1165,13 +860,9 @@ async fn list_ready(
         .as_deref()
         .map(parse_repository_filter)
         .transpose()?;
-    let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
-    let risk = params.risk.as_deref().map(parse_risk).transpose()?;
     let priority = params.priority.as_deref().map(parse_priority).transpose()?;
     let query = ReadyQuery::new(unix_now(), limit)
         .with_repositories(repo.unwrap_or_default())
-        .with_estimate(estimate)
-        .with_risk(risk)
         .with_priority(priority);
     let after = params
         .after
@@ -1206,29 +897,18 @@ async fn search_cards(
     };
     let status = params.status.as_deref().map(parse_status).transpose()?;
     let priority = params.priority.as_deref().map(parse_priority).transpose()?;
-    let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
-    let risk = params.risk.as_deref().map(parse_risk).transpose()?;
-    let source_kind = params.source_kind.or(params.source);
-    let created_after = params.created_after.or(params.from);
-    let created_before = params.created_before.or(params.to);
     let q = params
         .q
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ApiError::bad_request("search requires q"))?;
     let query = SearchQuery {
         q,
-        source_kind,
-        source_field: params.source_field,
         status,
         repo: params.repo,
         label: params.label,
         priority,
-        estimate,
-        risk,
-        source_created_after: parse_time("source_created_after", params.source_created_after)?,
-        source_created_before: parse_time("source_created_before", params.source_created_before)?,
-        created_after: parse_time("created_after", created_after)?,
-        created_before: parse_time("created_before", created_before)?,
+        created_after: parse_time("created_after", params.created_after)?,
+        created_before: parse_time("created_before", params.created_before)?,
         updated_after: parse_time("updated_after", params.updated_after)?,
         updated_before: parse_time("updated_before", params.updated_before)?,
         limit: params.limit.unwrap_or(20).max(1),
@@ -1240,7 +920,7 @@ async fn search_cards(
     ))
 }
 
-/// Enumerate cards by status/repo, not just ready-eligible ones -- `blocked`,
+/// Enumerate cards by status/repo, not just ready-eligible ones.
 /// `review`, and `done` cards are otherwise invisible without opening the
 /// database file directly.
 async fn list_cards(
@@ -1250,12 +930,10 @@ async fn list_cards(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_read(&state, &headers)?;
     let status = params.status.as_deref().map(parse_status).transpose()?;
-    let estimate = params.estimate.as_deref().map(parse_estimate).transpose()?;
     let limit = params.limit.unwrap_or(20).max(1);
     let after = params.after.as_deref().map(CardId::new).transpose()?;
     let filter = CardFilter {
         status,
-        estimate,
         repo: params.repo,
         label: params.label,
         include_terminal: params.include_terminal.unwrap_or(true),
@@ -1313,203 +991,6 @@ fn card_list_page_json(
     payload
 }
 
-async fn list_approvals(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<ReadyParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let limit = params.limit.unwrap_or(20).max(1);
-    let approvals = lock_store(&state)?.list_approvals(limit)?;
-    Ok(Json(json!({ "approvals": approvals })))
-}
-
-async fn board_stats(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<BoardStatsParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let include_hidden = params.include_hidden.unwrap_or(false);
-    if include_hidden {
-        require_admin(&state, &headers)?;
-    } else {
-        authorize_read(&state, &headers)?;
-    }
-    let stats = lock_store(&state)?.board_stats(powder_store::BoardStatsQuery {
-        repo: params.repo,
-        include_hidden,
-        now: unix_now(),
-    })?;
-    Ok(Json(json!(stats)))
-}
-
-async fn board_rollups(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<BoardRollupsParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let include_hidden = params.include_hidden.unwrap_or(false);
-    if include_hidden {
-        require_admin(&state, &headers)?;
-    } else {
-        authorize_read(&state, &headers)?;
-    }
-    let rollups = lock_store(&state)?.board_rollups(powder_store::BoardRollupsQuery {
-        limit: params.limit.unwrap_or(20).clamp(1, 100),
-        after: params.after,
-        now: unix_now(),
-        include_hidden,
-    })?;
-    Ok(Json(json!(rollups)))
-}
-
-async fn epic_velocity(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(params): Query<EpicVelocityParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let card_id = CardId::new(id)?;
-    let velocity = lock_store(&state)?
-        .epic_velocity(
-            &card_id,
-            unix_now(),
-            params.periods.unwrap_or(8),
-            params.period_days.unwrap_or(7),
-        )?
-        .ok_or_else(|| powder_core::DomainError::not_found("card", card_id.to_string()))?;
-    Ok(Json(json!(velocity)))
-}
-
-async fn list_repositories(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<ListRepositoriesParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let include_hidden = params.include_hidden.unwrap_or(false);
-    if include_hidden {
-        require_admin(&state, &headers)?;
-    } else {
-        authorize_read(&state, &headers)?;
-    }
-    let repositories = if include_hidden {
-        lock_store(&state)?.list_repositories_with_hidden()?
-    } else {
-        lock_store(&state)?.list_repositories()?
-    };
-    Ok(Json(json!({ "repositories": repositories })))
-}
-
-async fn get_repository(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let repository = lock_store(&state)?
-        .get_repository(&name)?
-        .ok_or_else(|| powder_core::DomainError::not_found("repository", name))?;
-    Ok(Json(json!(repository)))
-}
-
-async fn upsert_repository(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    headers: HeaderMap,
-    Json(request): Json<RepositoryRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let name = request
-        .name
-        .clone()
-        .ok_or_else(|| ApiError::bad_request("repository name is required"))?;
-    let idempotency_key = required_idempotency_key(&headers)?;
-    let repository = lock_store(&state)?
-        .upsert_repository_with_authority_keyed(
-            repository_upsert(name, request)?,
-            unix_now(),
-            idempotency_key,
-            &actor.authority(),
-        )?
-        .value;
-    Ok(Json(json!(repository)))
-}
-
-async fn update_repository(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<RepositoryRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let repository_name = request.name.clone().unwrap_or(name);
-    let idempotency_key = required_idempotency_key(&headers)?;
-    let repository = lock_store(&state)?
-        .upsert_repository_with_authority_keyed(
-            repository_upsert(repository_name, request)?,
-            unix_now(),
-            idempotency_key,
-            &actor.authority(),
-        )?
-        .value;
-    Ok(Json(json!(repository)))
-}
-
-async fn normalize_repositories(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
-    let outcome = lock_store(&state)?
-        .normalize_repository_strings_with_authority_keyed(
-            &actor.authority(),
-            unix_now(),
-            idempotency_key,
-        )?
-        .value;
-    Ok(Json(json!(outcome)))
-}
-
-async fn delete_repository(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
-    lock_store(&state)?.delete_repository_with_authority_keyed(
-        &name,
-        unix_now(),
-        idempotency_key,
-        &actor.authority(),
-    )?;
-    Ok(Json(json!({ "deleted": true, "repository": name })))
-}
-
-async fn merge_repository_alias(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<RepositoryMergeRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(requested_actor) = request.actor.as_deref() {
-        actor.authority().require_identity(requested_actor)?;
-    }
-    let idempotency_key = required_idempotency_key(&headers)?;
-    let outcome = lock_store(&state)?
-        .merge_repository_alias_with_authority_keyed(
-            &request.alias,
-            &name,
-            &actor.authority(),
-            unix_now(),
-            idempotency_key,
-        )?
-        .value;
-    Ok(Json(json!(outcome)))
-}
-
 async fn get_card(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1554,12 +1035,6 @@ async fn create_card(
         .map(parse_priority)
         .transpose()?
         .unwrap_or_default();
-    let estimate = request
-        .estimate
-        .as_deref()
-        .map(parse_estimate)
-        .transpose()?;
-    let risk = request.risk.as_deref().map(parse_risk).transpose()?;
     let card_id = CardId::new(request.id)?;
     let mut card = Card::new(
         card_id.clone(),
@@ -1568,8 +1043,6 @@ async fn create_card(
     )?
     .with_status(status)
     .with_priority(priority)
-    .with_estimate(estimate)
-    .with_risk(risk)
     .with_acceptance(acceptance)
     .with_proof_plan(request.proof_plan.unwrap_or_default())
     .with_created_at(now);
@@ -1592,49 +1065,6 @@ async fn create_card(
             json!("no acceptance criteria; the card cannot be claimed until it carries an oracle");
     }
     Ok(Json(payload))
-}
-
-async fn file_papercut(
-    State(state): State<AppState>,
-    AuthActor(actor): AuthActor,
-    headers: HeaderMap,
-    Json(request): Json<FilePapercutRequest>,
-) -> Result<Json<Value>, ApiError> {
-    // Papercut is a CreateCard delivery. Derive its generated id from the
-    // caller-owned key and transport principal so the retry has the same
-    // payload while the key remains scoped by the atomic receipt.
-    let idempotency_key = required_idempotency_key(&headers)?;
-    let now = unix_now();
-    let report = PapercutReport {
-        agent: request.agent,
-        body: request.body,
-        service: request.service,
-        model: request.model,
-        harness: request.harness,
-    };
-    let card = {
-        let mut store = lock_store(&state)?;
-        let resolved_repo = report
-            .service
-            .as_deref()
-            .map(|service| store.get_repository(service))
-            .transpose()?
-            .flatten()
-            .map(|summary| summary.repo);
-        let seed = format!("{}:{idempotency_key}", actor.authority().actor_label());
-        let digest = Sha256::digest(seed.as_bytes());
-        let id = CardId::new(format!("papercut-{}", hex::encode(&digest[..6])))?;
-        let card = powder_core::papercut::file_papercut(report, resolved_repo.as_deref(), now, id)?;
-        store
-            .create_card_with_events_as_keyed(card, idempotency_key, &actor.authority(), now)?
-            .value
-    };
-    Ok(Json(json!({
-        "id": card.id.as_str(),
-        "title": card.title,
-        "status": card.status.as_str(),
-        "labels": card.labels,
-    })))
 }
 
 async fn patch_card(
@@ -1868,82 +1298,6 @@ async fn check_criterion(
     Ok(Json(card))
 }
 
-const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-
-async fn upload_attachment(
-    State(state): State<AppState>,
-    AuthActor(authenticated): AuthActor,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let mime = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| is_supported_image_mime(value))
-        .ok_or_else(|| ApiError::unsupported_media_type("unsupported image MIME type"))?;
-    let filename = headers
-        .get("x-attachment-filename")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("attachment");
-    let card_id = CardId::new(id)?;
-    let idempotency_key = required_idempotency_key(&headers)?;
-    let attachment = lock_store(&state)?
-        .attach_image_as_keyed(
-            &card_id,
-            body.as_ref(),
-            mime,
-            filename,
-            KeyedOperationContext::new(unix_now(), idempotency_key, &authenticated.authority()),
-        )?
-        .value;
-    Ok(Json(json!({
-        "id": attachment.id,
-        "filename": attachment.filename,
-        "mime": attachment.mime,
-        "size": attachment.size,
-    })))
-}
-
-async fn get_attachment(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Response, ApiError> {
-    authorize_read(&state, &headers)?;
-    let (mime, bytes) = lock_store(&state)?
-        .attachment_blob(&id)?
-        .ok_or_else(|| powder_core::DomainError::not_found("attachment", id.clone()))?;
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, mime)
-        .header(CACHE_CONTROL, "public, max-age=31536000, immutable")
-        .body(axum::body::Body::from(bytes))
-        .map_err(|error| ApiError::internal(format!("building attachment response: {error}")))
-}
-
-async fn detach_attachment(
-    State(state): State<AppState>,
-    AuthActor(authenticated): AuthActor,
-    Path((id, attachment_id)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let card_id = CardId::new(id.clone())?;
-    let idempotency_key = required_idempotency_key(&headers)?;
-    lock_store(&state)?.detach_as_keyed(
-        &card_id,
-        &attachment_id,
-        unix_now(),
-        idempotency_key,
-        &authenticated.authority(),
-    )?;
-    Ok(Json(
-        json!({ "deleted": true, "card_id": id, "attachment_id": attachment_id }),
-    ))
-}
-
 async fn add_link(
     State(state): State<AppState>,
     AuthActor(authenticated): AuthActor,
@@ -1996,18 +1350,12 @@ async fn append_work_log(
     Json(request): Json<WorkLogRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let card_id = CardId::new(id)?;
-    let attribution = powder_store::WorkLogAttribution {
-        model: request.model.as_deref(),
-        reasoning: request.reasoning.as_deref(),
-        harness: request.harness.as_deref(),
-        run_id: request.run_id.as_deref(),
-    };
     let idempotency_key = required_idempotency_key(&headers)?;
     let entry = lock_store(&state)?
         .append_work_log_as_keyed(
             &card_id,
             &request.agent,
-            attribution,
+            request.run_id.as_deref(),
             &request.body,
             KeyedOperationContext::new(unix_now(), idempotency_key, &authenticated.authority()),
         )?
@@ -2056,48 +1404,6 @@ async fn answer_input(
         )?
         .value;
     Ok(Json(json!(run)))
-}
-
-async fn record_run_telemetry(
-    State(state): State<AppState>,
-    AuthActor(actor): AuthActor,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(request): Json<RunTelemetryRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let run_id = RunId::new(id)?;
-    let write = RunTelemetryWrite {
-        attempts: request.attempts,
-    };
-    let key = required_idempotency_key(&headers)?;
-    let pricing = PricingConfig::from_env()
-        .map_err(|err| ApiError::internal(format!("pricing config: {err}")))?;
-    let outcome = lock_store(&state)?.record_run_telemetry_with_pricing(
-        &run_id,
-        &write,
-        unix_now(),
-        key,
-        &actor.authority(),
-        pricing.as_ref(),
-    )?;
-    Ok(Json(json!(outcome.value.with_replayed(outcome.replayed))))
-}
-
-async fn run_telemetry_aggregate(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<RunTelemetryAggregateParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_read(&state, &headers)?;
-    let query = RunTelemetryAggregateQuery {
-        agent: params.agent,
-        model: params.model,
-        provider: params.provider,
-        limit: params.limit.unwrap_or(100),
-    };
-    Ok(Json(json!(
-        lock_store(&state)?.run_telemetry_aggregate(&query)?
-    )))
 }
 
 async fn get_run(
@@ -2155,82 +1461,6 @@ async fn complete_card(
     Ok(Json(card))
 }
 
-async fn create_event_subscription(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    Json(request): Json<EventSubscriptionRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let created = lock_store(&state)?.create_event_subscription_with_authority(
-        &request.url,
-        request.event_filter.unwrap_or_default(),
-        unix_now(),
-        &actor.authority(),
-    )?;
-    Ok(Json(json!(created)))
-}
-
-async fn list_event_subscriptions(
-    State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let subscriptions = lock_store(&state)?.list_event_subscriptions()?;
-    Ok(Json(json!({ "subscriptions": subscriptions })))
-}
-
-async fn disable_event_subscription(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let subscription = lock_store(&state)?.disable_event_subscription_with_authority(
-        &id,
-        unix_now(),
-        &actor.authority(),
-    )?;
-    Ok(Json(json!(subscription)))
-}
-
-async fn list_dead_letters(
-    State(state): State<AppState>,
-    AdminActor(_actor): AdminActor,
-    Query(params): Query<ReadyParams>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let dead_letters =
-        lock_store(&state)?.list_dead_letter_deliveries(params.limit.unwrap_or(20))?;
-    Ok(Json(json!({ "dead_letters": dead_letters })))
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DeadLetterReplayRequest {
-    subscription_id: Option<String>,
-}
-
-/// Requeues dead-lettered webhook deliveries so the delivery loop retries
-/// them on its next tick (powder-epic-truthful-ops): the extended backoff
-/// schedule on `WEBHOOK_MAX_ATTEMPTS` still gives up after ~5.7 minutes, and
-/// a receiver that was down for longer than that has no other way back into
-/// delivery short of an operator manually requeuing it. Admin-scoped like
-/// every other operator-only route (`list_keys`, repository management) --
-/// this is a bulk, unaudited-per-delivery mutation, not a single card's
-/// authored change.
-async fn replay_dead_letters(
-    State(state): State<AppState>,
-    AdminActor(actor): AdminActor,
-    headers: HeaderMap,
-    Json(request): Json<DeadLetterReplayRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let idempotency_key = required_idempotency_key(&headers)?;
-    let replayed = lock_store(&state)?
-        .replay_dead_letters_with_authority_keyed(
-            request.subscription_id.as_deref(),
-            unix_now(),
-            idempotency_key,
-            &actor.authority(),
-        )?
-        .value;
-    Ok(Json(json!({ "replayed": replayed })))
-}
-
 async fn tail_events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2243,7 +1473,15 @@ async fn tail_events(
     let stream_state = state.clone();
     let mut watch_rx = state.event_watch.clone();
     let stream = async_stream::stream! {
-        loop {
+        'stream: loop {
+            if live && authorize_read(&stream_state, &headers).is_err() {
+                yield Ok::<_, Infallible>(
+                    Event::default()
+                        .event("error")
+                        .data(json!({"error": "authentication required"}).to_string()),
+                );
+                break 'stream;
+            }
             let events = match lock_store(&stream_state)
                 .and_then(|store| store.list_event_tail(cursor, limit).map_err(ApiError::from))
             {
@@ -2251,7 +1489,7 @@ async fn tail_events(
                 Err(err) => {
                     let body = json!({"error": err.message}).to_string();
                     yield Ok::<_, Infallible>(Event::default().event("error").data(body));
-                    break;
+                    break 'stream;
                 }
             };
             // A short page (fewer rows than `limit`) means this read caught
@@ -2261,6 +1499,14 @@ async fn tail_events(
             // right away instead of idling.
             let caught_up = events.len() < limit;
             for item in events {
+                if live && authorize_read(&stream_state, &headers).is_err() {
+                    yield Ok::<_, Infallible>(
+                        Event::default()
+                            .event("error")
+                            .data(json!({"error": "authentication required"}).to_string()),
+                    );
+                    break 'stream;
+                }
                 cursor = item.sequence;
                 let event_type = item.event.event_type.clone();
                 let data = match serde_json::to_string(&item.event) {
@@ -2275,23 +1521,18 @@ async fn tail_events(
                 );
             }
             if !live {
-                break;
+                break 'stream;
             }
             if caught_up {
-                // Idle until `event_notify_loop` observes a new row, or a
-                // bounded fallback tick in case a notification is ever
-                // coalesced away -- `watch` only retains the latest value,
-                // so this is purely a wake hint. The next loop iteration's
-                // `list_event_tail(cursor, ..)` is the actual source of
-                // truth and can never miss an event regardless of when (or
-                // whether) this wakes. If the sender is gone (the notify
-                // task died, or a test fixture never spawned one),
-                // `changed()` returns Err *immediately* -- degrade to a
-                // plain slow poll instead of spinning a hot loop on it.
-                if let Ok(Err(_sender_gone)) =
-                    tokio::time::timeout(Duration::from_secs(20), watch_rx.changed()).await
-                {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                // Recheck auth on a bounded poll even when no notification
+                // arrives, so revocation closes an idle stream promptly.
+                tokio::select! {
+                    changed = watch_rx.changed() => {
+                        if changed.is_err() {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 }
             }
         }
@@ -2392,9 +1633,16 @@ async fn create_key(
 async fn revoke_key(
     State(state): State<AppState>,
     AdminActor(actor): AdminActor,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    lock_store(&state)?.revoke_api_key_with_authority(&id, unix_now(), &actor.authority())?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    lock_store(&state)?.revoke_api_key_keyed(
+        &id,
+        unix_now(),
+        idempotency_key,
+        &actor.authority(),
+    )?;
     Ok(Json(json!({ "id": id, "revoked": true })))
 }
 
@@ -2568,13 +1816,8 @@ fn authorize_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError>
     }
 }
 
-/// Gate operator/admin-only routes (bulk import, repository management, key
-/// management) that are not scoped to any single claim and so cannot be
-/// checked via claim ownership. Agent-scoped API keys are rejected; trusted
-/// tailnet callers and disabled auth pass through. Single-card authoring
-/// (powder-925) and single-card field patches (powder-ruling-patch-scope)
-/// moved to `authorize()` -- they're reviewable one card at a time and fully
-/// audited, unlike bulk import.
+/// Gate operator/admin-only routes for key management that
+/// are not scoped to a single claim and so cannot use claim ownership.
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActor, ApiError> {
     let actor = authorize(state, headers)?;
     if !actor.enforces_identity || actor.is_admin {
@@ -2582,8 +1825,8 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActo
     } else {
         // Name the presented key (or tailnet identity) and the scope it was
         // missing rather than a bare "admin scope required" -- an operator
-        // staring at a 403 needs to know *which* credential came up short
-        // without grepping logs (powder-918).
+        // staring at a 403 needs to know which credential came up short
+        // without grepping logs.
         let presented = match actor.key_prefix.as_deref() {
             Some(prefix) => format!("{} (key prefix {prefix})", actor.principal),
             None => actor.principal.clone(),
@@ -2592,13 +1835,6 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AuthorizedActo
             "{presented} requires admin scope"
         )))
     }
-}
-
-fn is_supported_image_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
-    )
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -2663,35 +1899,6 @@ fn card_ids(raw: Option<Vec<String>>, field: CardField) -> Result<Vec<CardId>, A
     normalize_relations(field, raw.unwrap_or_default()).map_err(ApiError::from)
 }
 
-fn repository_upsert(
-    name: String,
-    request: RepositoryRequest,
-) -> Result<RepositoryUpsert, ApiError> {
-    let visibility = request
-        .visibility
-        .as_deref()
-        .map(|raw| {
-            RepositoryVisibility::parse(raw)
-                .ok_or_else(|| ApiError::bad_request(format!("invalid visibility: {raw}")))
-        })
-        .transpose()?;
-    let tier = request
-        .tier
-        .as_deref()
-        .map(|raw| {
-            RepositoryTier::parse(raw)
-                .ok_or_else(|| ApiError::bad_request(format!("invalid tier: {raw}")))
-        })
-        .transpose()?;
-    Ok(RepositoryUpsert {
-        name,
-        aliases: request.aliases,
-        visibility,
-        tier,
-        import_provenance: request.import_provenance,
-    })
-}
-
 /// powder-sse-notify: the sole poller of `outbound_events` for live
 /// updates. Every `tail_events` SSE connection used to run this exact poll
 /// independently every 500ms while idle -- fine for one connection, but
@@ -2722,102 +1929,6 @@ async fn event_notify_loop(state: AppState, tx: tokio::sync::watch::Sender<i64>)
             let _ = tx.send(latest);
         }
     }
-}
-
-async fn delivery_loop(state: AppState) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    loop {
-        interval.tick().await;
-        if let Err(err) = deliver_due_webhooks_once(&state, unix_now()).await {
-            tracing::warn!("webhook delivery loop failed: {}", err.message);
-        }
-    }
-}
-
-async fn deliver_due_webhooks_once(state: &AppState, now: i64) -> Result<usize, ApiError> {
-    let deliveries = {
-        let store = lock_store(state)?;
-        store.due_webhook_deliveries(now, DELIVERY_BATCH_LIMIT)?
-    };
-    let mut attempted = 0;
-    for delivery in deliveries {
-        attempted += 1;
-        let delivery_id = delivery.id.clone();
-        match send_webhook_delivery(delivery).await {
-            DeliveryResult::Success(status) => {
-                lock_store(state)?.record_webhook_delivery_success(&delivery_id, status, now)?;
-            }
-            DeliveryResult::Failure { status, error } => {
-                tracing::warn!("webhook delivery failed: {error}");
-                lock_store(state)?.record_webhook_delivery_failure(
-                    &delivery_id,
-                    status,
-                    &error,
-                    now,
-                )?;
-            }
-        }
-    }
-    Ok(attempted)
-}
-
-enum DeliveryResult {
-    Success(u16),
-    Failure { status: Option<u16>, error: String },
-}
-
-async fn send_webhook_delivery(delivery: powder_store::WebhookDelivery) -> DeliveryResult {
-    let result = tokio::task::spawn_blocking(move || {
-        let signature =
-            compute_signature(&delivery.signing_secret, delivery.payload_json.as_bytes())?;
-        let response = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .post(&delivery.url)
-            .set("Content-Type", "application/json")
-            .set(SIGNATURE_HEADER, &signature)
-            .send_string(&delivery.payload_json);
-        match response {
-            Ok(response) if (200..=299).contains(&response.status()) => {
-                Ok(DeliveryResult::Success(response.status()))
-            }
-            Ok(response) => Ok(DeliveryResult::Failure {
-                status: Some(response.status()),
-                error: format!("http {}", response.status()),
-            }),
-            Err(ureq::Error::Status(status, _)) => Ok(DeliveryResult::Failure {
-                status: Some(status),
-                error: format!("http {status}"),
-            }),
-            Err(ureq::Error::Transport(err)) => Ok(DeliveryResult::Failure {
-                status: None,
-                error: err.to_string(),
-            }),
-        }
-    })
-    .await;
-
-    match result {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => DeliveryResult::Failure {
-            status: None,
-            error,
-        },
-        Err(error) => DeliveryResult::Failure {
-            status: None,
-            error: error.to_string(),
-        },
-    }
-}
-
-fn compute_signature(secret: &str, body: &[u8]) -> Result<String, String> {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|err| err.to_string())?;
-    mac.update(body);
-    Ok(format!(
-        "sha256={}",
-        hex::encode(mac.finalize().into_bytes())
-    ))
 }
 
 /// powder-epic-truthful-ops: a poisoned `Mutex<Store>` used to mean a
@@ -2876,14 +1987,6 @@ impl ApiError {
         }
     }
 
-    fn unsupported_media_type(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            message: message.into(),
-            denial_class: None,
-        }
-    }
-
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
@@ -2934,7 +2037,8 @@ impl From<powder_core::DomainError> for ApiError {
     fn from(value: powder_core::DomainError) -> Self {
         let denial_class = value.denial_class();
         match value {
-            powder_core::DomainError::Validation { .. } => Self {
+            powder_core::DomainError::Validation { .. }
+            | powder_core::DomainError::EventData { .. } => Self {
                 status: StatusCode::BAD_REQUEST,
                 message: value.to_string(),
                 denial_class,

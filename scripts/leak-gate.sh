@@ -2,22 +2,8 @@
 # powder-ci-leak-gate: fails CI when a commit introduces a secret shape or an
 # operator-topology literal into the tracked tree.
 #
-# Design note (repo-local script vs. gitleaks-action):
-# This gate is a repo-local script rather than a third-party action (e.g.
-# zricethezav/gitleaks-action) for three reasons:
-#   - The patterns that matter here are Powder-specific (sk_powder_/
-#     whsec_powder_ key shapes, our tailnet hostname convention, our card
-#     export JSON shape). A generic gitleaks ruleset doesn't know any of
-#     this out of the box, so we would still have to hand-author a custom
-#     gitleaks TOML -- at which point the action buys nothing but an extra
-#     external dependency to pin, trust, and bump.
-#   - The card requires an anti-theater self-test (plant one fixture per
-#     violation class, assert the detector fires). That's a few lines for a
-#     script we own; it's awkward to bolt onto a third-party action's own
-#     report format and exit-code contract.
-#   - Patterns and the allowlist live in this file, in this repo, reviewed
-#     like any other diff -- no separate config-file format to learn or
-#     keep in sync with an action's schema.
+# This repo-owned gate scans tracked files for secret shapes and operator
+# topology literals. Its self-test plants one fixture per detector class.
 #
 # Modes:
 #   scripts/leak-gate.sh --self-test
@@ -54,7 +40,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 SK_POWDER_RE='sk_powder_[A-Za-z0-9_-]{20,}'
-WHSEC_POWDER_RE='whsec_powder_[A-Za-z0-9_-]{20,}'
 BEARER_RE='[Bb]earer[[:space:]]+[A-Za-z0-9_.-]{24,}'
 API_KEY_RE='[Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]"'"'"']*[:=][[:space:]"'"'"']*[A-Za-z0-9_-]{24,}'
 TAILNET_RE='[a-z0-9-]+\.tail[a-z0-9]+\.ts\.net'
@@ -109,7 +94,6 @@ scan_content() {
     done < <(grep -nEI "$pattern" "$file" 2>/dev/null || true)
   done <<PATTERNS
 sk_powder_key|$SK_POWDER_RE
-whsec_powder_key|$WHSEC_POWDER_RE
 bearer_literal|$BEARER_RE
 api_key_literal|$API_KEY_RE
 tailnet_hostname|$TAILNET_RE
@@ -180,10 +164,6 @@ self_test() {
     >"$tmp/leaked_key.rs"
   assert_flagged "$tmp/leaked_key.rs" "sk_powder_key" || failures=$((failures + 1))
 
-  # 2. Powder webhook signing-secret shape.
-  printf 'let leaked = "whsec_powder_%s";\n' "$(printf 'b%.0s' $(seq 1 24))" \
-    >"$tmp/leaked_whsec.rs"
-  assert_flagged "$tmp/leaked_whsec.rs" "whsec_powder_key" || failures=$((failures + 1))
 
   # 3. Generic bearer-token literal.
   printf 'Authorization: Bearer %s\n' "$(printf 'c%.0s' $(seq 1 32))" \

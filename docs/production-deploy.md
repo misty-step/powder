@@ -1,26 +1,29 @@
-# Where production Powder actually runs (powder-937)
+# Where production Powder runs
 
-Two independent lanes (powder-921, misty-step-906) found the checked-in
-`fly.toml` in this repo names a Fly app (`powder`) that is **not** production:
-the fleet-wide board every agent actually reads and writes lives behind a
-companion box. Nobody working from this repo alone could find the real deploy
-path. This document is that path.
+Production Powder runs as a private `powder-server` app on an operator-owned
+DigitalOcean droplet. It is reached through the tailnet, never a public URL.
+This document records the production path for operators who need to deploy a
+merged Powder change or restore its SQLite database.
 
-> **Hosting ruling (operator, 2026-07-09): the fleet is off Fly and on
-> DigitalOcean.** The supervising box is a DigitalOcean droplet. Fly remains
-> only for explicitly retained exceptions (Fly Sprites); nothing in this
-> repo's deploy path touches Fly anymore. Any Fly-shaped instruction you find
-> in older docs, cards, or the checked-in `fly.toml` is historical reference
-> for standalone self-hosters, not the operator's production path.
+The live origin comes from `POWDER_API_BASE_URL`; this repository does not carry
+the private hostname. The process binds a loopback port inside the supervisor,
+the database lives on the droplet's `/data` volume, and Litestream replicates it
+to the operator's S3-compatible storage.
+
+Verify the live instance before relying on this document:
+
+```sh
+curl -s "$POWDER_API_BASE_URL/healthz"
+tailscale ssh root@<box-hostname>
+```
 
 ## The real production instance
 
 Powder is supervised as a private app on a
 [Sanctum](https://github.com/misty-step/sanctum) box -- a separate,
 operator-owned **DigitalOcean droplet** that supervises several small apps
-privately over Tailscale (Fly-hosted 2026-07-04 to 2026-07-09, DigitalOcean
-canonical since the 2026-07-09 migration). It is reached only over Tailscale,
-never a public URL:
+privately over Tailscale since the 2026-07-09 migration. It is reached only
+over Tailscale, never a public URL:
 
 - **Origin:** the box's own private tailnet hostname on port `10001` -- the
   operator's `POWDER_API_BASE_URL` env var is the live source of truth for
@@ -45,7 +48,6 @@ never a public URL:
   POWDER_DB_PATH=<path under Sanctum's /data volume>
   POWDER_BIND_ADDR=127.0.0.1:<port>
   POWDER_AUTH_MODE=none
-  POWDER_PUBLIC_BASE_URL=<the box's tailnet origin, see above>
   ```
 
   **Do not "fix" this back to `api-key` or `tailscale-header`.** A 2026-08-03
@@ -93,8 +95,9 @@ tailscale ssh root@<box-hostname>   # the droplet is on the tailnet; ssh works f
 
 ## Deploying a code change to production
 
-The box runs plain host binaries -- there is no image build and no Fly step.
-Shipping a merged powder PR to the live instance (verified 2026-07-09):
+The box runs plain host binaries; there is no container-image step in this
+production path. Shipping a merged Powder change to the live instance (verified
+2026-07-09):
 
 1. **Cross-compile from a checkout at the merged `master` SHA** (the box
    carries no toolchain, deliberately):
@@ -134,7 +137,7 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
      && chmod +x /usr/local/bin/powder-server /usr/local/bin/powder \
      && pkill -x powder-server'   # supervisor respawns it on the new binary
    curl -s "$POWDER_API_BASE_URL/healthz"   # verify it came back
-   curl -s "$POWDER_API_BASE_URL/readyz"    # confirm schema/writable/dead-letter/poison gates are all green
+   curl -s "$POWDER_API_BASE_URL/readyz"    # confirm schema/writable/poison gates are green
    ```
 
    `powder-server.prev`/`powder.prev` are the binaries this deploy just
@@ -168,7 +171,7 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    record of the deployed SHA (verified 2026-07-13). The running instance's
    own startup log line (`powder-server starting`, `journalctl -u
    sanctum`) now carries `version`/`git_sha` for exactly this purpose
-   (powder-epic-truthful-ops) -- read it back over SSH as a second,
+   (`powder-deploy-provenance`) -- read it back over SSH as a second,
    independent confirmation of what actually booted, rather than trusting
    the deploy script alone.
 6. **One-time after the reciprocal-relations deploy (PR #136): repair
@@ -197,10 +200,22 @@ Shipping a merged powder PR to the live instance (verified 2026-07-09):
    touched card; a clean second run reports zero issues. This step is a one-time
    backfill for relation mirrors, not a recurring deploy step — it can be
    dropped from this runbook once the live board reports clean.
-7. **Post-deploy checklist item (lead, not this task):** re-verify the
-   Canary heartbeat against the live box after the swap. This is a manual
-   step for whoever drove the deploy to do against the real instance --
-   nothing in this repo can exercise it.
+7. **Post-deploy checklist item:** verify `/healthz` and `/readyz` after the
+   supervisor respawns the process. The checks must report the expected schema,
+   writable database, and clean readiness state.
+
+## Backup, restore drill, and rollback
+
+The generic Litestream plus S3 restore procedure is documented once,
+provider-agnostically, in
+[`docs/self-hosting.md#backup-and-restore-litestream--s3`](self-hosting.md#backup-and-restore-litestream--s3).
+
+This section gives the production-box commands an operator runs over SSH. It
+requires the live box and is not part of a local checkout gate.
+- **Litestream itself is supervisor-owned**, not this repository's standalone
+  configuration. The live supervisor replicates the production SQLite path to
+  S3-compatible storage. Read that configuration on the box before running a
+  drill so the command uses the active config and database path.
 
 > **Poison counter is cleared only by a restart.** If `/readyz` reports
 > `poison_count` > 0 (a request handler panicked and the store mutex was
@@ -219,100 +234,3 @@ the steps above happen. `powder version` on a locally installed CLI reports
 the commit *your local build* came from; it says nothing about what commit
 the deployed instance is running.
 
-## Backup, restore drill, and rollback (powder-epic-truthful-ops)
-
-The generic Litestream + S3 restore procedure -- what gets replicated, how
-`bin/entrypoint.sh` auto-restores on boot, how to run a non-destructive
-drill -- is documented once, provider-agnostically, in
-[`docs/self-hosting.md#backup-and-restore-litestream--s3`](self-hosting.md#backup-and-restore-litestream--s3).
-[`docs/litestream-restore-drill.md`](litestream-restore-drill.md) is a
-tombstone: it recorded a real drill run against the now-destroyed Fly app
-and is not current evidence for anything running today.
-
-**This section is the DO-box-specific version of that drill** -- the
-commands an operator actually runs over `ssh` against the Sanctum box, not
-against a local checkout. It requires the box; nothing here can be exercised
-from this repo alone, and it is not part of this PR's own gate.
-
-- **Litestream itself is Sanctum-owned**, not this repo's `litestream.yml`
-  (that file, like `fly.toml`, is the standalone self-hoster's reference
-  config -- see "The checked-in Fly config: disposition" below). The box
-  runs its own Litestream config, replicating the production SQLite path to
-  DigitalOcean Spaces continuously. Read that config on the box (its exact
-  path is Sanctum's own concern, not tracked in this repo per powder-951)
-  before running the drill below, so `-config` points at what's actually
-  running.
-
-- **Non-destructive restore drill**, run over `ssh root@<box>` (or via
-  `tailscale ssh root@<box>` from an operator machine, per "Verify before
-  trusting this document" above):
-
-  ```sh
-  # 1. Restore the latest replicated generation to a scratch path -- never
-  #    the live DB path -- so the drill cannot touch what's currently
-  #    serving traffic.
-  litestream restore -if-replica-exists \
-    -o /tmp/powder-restore-drill.db \
-    -config <the box's own litestream config path> \
-    <the box's live POWDER_DB_PATH>
-
-  # 2. Prove the restored file is a real, current Powder database with a
-  #    readback, not just "the file exists" -- pick any card id known to
-  #    exist on the live board.
-  powder get-card <a-known-card-id> --db /tmp/powder-restore-drill.db
-
-  # 3. Clean up -- this was a drill, not a real restore.
-  rm -f /tmp/powder-restore-drill.db
-  ```
-
-  A successful step 2 (the card's real title/status/acceptance come back,
-  not an error) is the drill's pass condition. If it fails, Litestream's
-  replication itself is broken and needs attention before the next real
-  incident needs it.
-
-- **Restoring for real** (not a drill) replaces the live `POWDER_DB_PATH`
-  file with a restored generation and requires stopping `powder-server`
-  first (`pkill -x powder-server`; the supervisor will respawn it against
-  whatever file is at that path when it comes back) -- run the same
-  `litestream restore` command from step 1 above but with `-o` pointed at
-  the real `POWDER_DB_PATH` instead of a scratch path, after moving the
-  current (corrupt/lost) file aside rather than deleting it outright.
-
-## The checked-in Fly config: disposition
-
-The `powder` Fly app that `fly.toml`/README once described was **destroyed
-2026-07-07** after its data migrated to the Sanctum-hosted instance, and the
-fleet left Fly entirely on 2026-07-09. `fly.toml` is kept only as a reference
-implementation for anyone self-hosting Powder standalone on Fly under their
-own org -- the operator's production never touches it.
-
-- It must **never** be assumed live. Every agent and every doc in this repo
-  that references "the deployed instance" means the Sanctum-hosted
-  DigitalOcean box above, unless `POWDER_API_BASE_URL` is explicitly pointed
-  elsewhere.
-
-## Field-note generator env target (powder-921 residual)
-
-The field-note draft generator (`Store::with_field_note_config`,
-`crates/powder-server/src/main.rs`) is opt-in and reads:
-
-- `POWDER_FIELD_NOTE_REPOS` (comma-separated allowlist; unset/empty = fully
-  inert, the default)
-- `POWDER_FIELD_NOTE_PROOF_MIN_CHARS` (optional override)
-- `POWDER_FIELD_NOTE_WEEKLY_BUDGET` (optional override)
-
-Enabling it in production means adding these to the **same** `[[app]]` env
-block in Sanctum's own supervisor config documented above, then redeploying
-Sanctum per the steps above -- there is no separate config surface for this
-repo's own `fly.toml` to carry, since that app is not what serves production
-traffic.
-
-## Home affordance (powder-942)
-
-`POWDER_HOME_URL` (unset by default) makes the board render a plain text
-link back to that URL in its always-visible chrome (footer on the board
-view, header on the card-detail view) -- built for exactly this deployment
-shape, where Powder is its own tailnet origin and a separate portal root
-lives at a different one. Setting it in production is the same env-target
-pattern as the field-note generator above: add `POWDER_HOME_URL=<the box's
-portal root>` to the same `[[app]]` env block, then redeploy Sanctum.

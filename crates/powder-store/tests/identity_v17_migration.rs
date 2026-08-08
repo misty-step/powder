@@ -327,9 +327,7 @@ fn sanitized_production_shaped_snapshot_migrates_38_keys_exactly() {
         .with_status(CardStatus::Ready)
         .with_acceptance(["migration remains lossless".to_string()])
         .with_created_at(500);
-        store
-            .import_cards(vec![card])
-            .expect("import snapshot card");
+        store.upsert_card(card).expect("upsert snapshot card");
         let claim = store
             .claim_card(
                 &card_id,

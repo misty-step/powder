@@ -31,9 +31,8 @@ claim TTL: 2s | poll timeout: 10s
 {"id":"lease-race-demo-1784055446","status":"done"}
 ----------------------------------------------------------------------
 [readback] fetching card detail (detail=detailed) for the runs/work-log trail
-[readback] fetching the outbound event tail (this is where claim-expired/completed live --
-           they are webhook-delivery events, not the card_events audit rows, so a card
-           detail read alone does not show them; GET /api/v1/events/tail does)
+[readback] fetching the ordered event tail (claim-expired/completed live in this feed)
+           card detail also keeps the attributed audit trail; GET /api/v1/events/tail does
 ----------------------------------------------------------------------
 === Race transcript (from the audit trail, not narration) ===
 at           actor            event

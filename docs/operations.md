@@ -1,143 +1,77 @@
 # Operations
 
-This is the operator/runbook reference for a deployed Powder instance:
-remote CLI transport, key rotation, the self-hosting deployment shape, and the
-field-note/canary/mobile-key knobs.
-It was relocated here from the README, which stays a short pitch and quickstart.
+This is the operator runbook for a deployed Powder instance. It covers
+workstation binaries, remote CLI transport, authentication, ready/search
+paging, input and proof, and production operations.
 
-For the five-minute path to a running instance, see the
-[README quickstart](../README.md#quickstart). For where the operator's own
-production instance actually runs, see
-[`docs/production-deploy.md`](production-deploy.md).
+For the install path and backup/restore procedure, see
+[`docs/self-hosting.md`](self-hosting.md). For the operator's private
+DigitalOcean instance, see [`docs/production-deploy.md`](production-deploy.md).
 
 ## Workstation binary installation
 
-The canonical local install location for `powder` and (if you run it locally)
-`powder-server` is `~/.cargo/bin` -- the same directory `cargo install --path`
-has always used, and the directory a normal `cargo install` puts first on
-`PATH`. There is exactly one supported way to bring those binaries in sync
-with a checkout:
+The canonical local install location for `powder` and, when needed,
+`powder-server` is `~/.cargo/bin`. Keep those binaries aligned with the
+checkout through the repository script:
 
 ```sh
-scripts/install-workstation.sh                # builds powder from HEAD
-scripts/install-workstation.sh --with-server   # also installs powder-server
-scripts/install-workstation.sh --verify        # installs, then proves the installed
-                                                # binary keeps every repeated
-                                                # --acceptance criterion (see below)
+scripts/install-workstation.sh
+scripts/install-workstation.sh --with-server
+scripts/install-workstation.sh --verify
 ```
 
-It refuses to run against a dirty working tree (`--allow-dirty` overrides
-that), prints the before/after `version` of each binary it touches, and on a
-checkout whose `HEAD` is exactly a published release tag, installs the
-matching checksummed release tarball (see `.github/workflows/release.yml`)
-instead of building from source -- falling back to a source build with a
-clear notice if no published asset matches the local platform. It is
-idempotent: running it again with nothing to update is a no-op past the
-before/after report.
+The script reports the before and after `powder version`, refuses a dirty tree
+unless `--allow-dirty` is set, and uses a matching release asset at an exact
+release tag. It is idempotent. `--verify` exercises repeated acceptance
+criteria through the freshly installed binary, not only checkout tests.
 
-This exists because a workstation `powder` binary can silently drift behind
-the checkout it was built from: `cargo install`'s own version check treats an
-unchanged crate version (this workspace's crates stay at `0.1.0` between
-releases) as "nothing to do," so a plain re-run of the historical `cargo
-install --path crates/powder-cli` command can look like it worked while
-actually reinstalling nothing. A stale binary built before a merged fix has
-no way to announce that it predates the fix -- which is exactly how a live
-card once lost four `--acceptance` criteria to a bug (`powder-cli-repeated-
-acceptance`) that had already been fixed in the checkout for days. `--verify`
-reproduces that exact regression class through the freshly installed binary
-itself (not just `cargo test` inside the checkout) as a final proof step.
-
-`powder version` also reports this drift directly, not just at install time:
-with `POWDER_API_BASE_URL` set, it fetches the deployed server's own
-`version`/`git_sha` (from `/readyz`) and prints a `DRIFT` line when they
-disagree with the installed binary's own build commit, so a stale local
-binary is visible from the same command a lane already runs before claiming
-work -- see the `powder version` note just below.
+`powder version` reports the build git SHA. With `POWDER_API_BASE_URL` set, it
+also compares that SHA with the deployed server's `/readyz` value and prints a
+`DRIFT` note when they differ. An unreachable server produces a note, not a
+local command failure.
 
 ## CLI remote-mode transport
 
-The CLI can target either SQLite directly or a deployed `powder-server`. The
-production instance is run by a companion box, not this repo's own checked-in
-Fly app (destroyed 2026-07-07 after its data was verified migrated) -- see
-[`docs/production-deploy.md`](production-deploy.md) for where it
-actually lives, how a merged PR here reaches it, and how to mint an agent key
-against it.
+The CLI targets either SQLite directly or a deployed `powder-server`. Set
+`POWDER_API_BASE_URL` and, for `api-key` deployments, `POWDER_API_KEY`.
+`--db` always wins when supplied.
 
-In remote mode, set `POWDER_API_BASE_URL` and, for `api-key` deployments,
-`POWDER_API_KEY`; `--db` always wins when supplied. Run `powder version`
-before a lane starts: it reports the exact git commit the installed binary
-was built from (`scripts/install-workstation.sh` after every pull keeps it
-current -- see "Workstation binary installation" above), so a stale
-`~/.cargo/bin/powder` that predates a command's remote-mode support is
-obvious up front instead of surfacing mid-lane as a bare `missing --db` on a
-command the checkout has long since covered. With `POWDER_API_BASE_URL` set,
-`powder version` also compares the installed binary's git commit against the
-deployed server's own (from `/readyz`) and prints a `DRIFT` line on
-mismatch -- unreachable or too-old a server just degrades to a plain note,
-never an error.
-
-| Command | `--db` transport | Remote env transport | Output shape |
-| --- | --- | --- | --- |
+| Command | Local transport | Remote transport | Output |
+|---|---|---|---|
 | `list-ready` | SQLite query | `GET /api/v1/cards/ready` | `id\tpriority\ttitle` or `no-ready-cards` |
 | `list-cards` | SQLite query | `GET /api/v1/cards` | `id\tpriority\tstatus\ttitle` or `no-cards` |
-| `board-rollups --json` | SQLite aggregate query | `GET /api/v1/board/rollups` | Pretty JSON `{rollups,total_count,has_more,next_after?,coverage}` |
-| `search --json` | SQLite FTS query | `GET /api/v1/cards/search` | `{matches,total_count,has_more,next_after?}` JSON |
-| `get-card` | SQLite detail read | `GET /api/v1/cards/{id}` | Pretty JSON detail |
-| `create-card` | SQLite create-only write | `POST /api/v1/cards` | `created\tid\tpriority\tstatus` |
-| `update-card` | SQLite patch write | `PATCH /api/v1/cards/{id}` | `updated\tid\tpriority\tstatus` |
-| `list-approvals` | SQLite approval queue read | `GET /api/v1/approvals` | Pretty JSON approval queue |
-| `claim` | SQLite claim lifecycle | `POST /api/v1/cards/{id}/claim` | `claimed\tcard_id\trun_id\texpires_at` |
-| `heartbeat` | SQLite lease liveness | `POST /api/v1/cards/{id}/heartbeat` | `heartbeat\tcard_id\trun_id\texpires_at` |
-| `renew-claim` | SQLite lease extension | `POST /api/v1/cards/{id}/renew` | `renewed\tcard_id\trun_id\texpires_at` |
-| `release-claim` | SQLite lease release | `POST /api/v1/cards/{id}/release` | `released\tcard_id\trun_id` |
-| `update-status` | SQLite status lifecycle | `POST /api/v1/cards/{id}/status` | `status\tid\tstatus` |
-| `check-criterion` | SQLite criterion write | `POST /api/v1/cards/{id}/criteria/check` | `criterion\tid\tindex\tchecked|unchecked` |
-| `add-link` | SQLite link write | `POST /api/v1/cards/{id}/links` | `link\tcard_id\tid` |
-| `add-comment` | SQLite comment write | `POST /api/v1/cards/{id}/comments` | `comment\tcard_id\tauthor\tbody` |
-| `append-work-log` | SQLite work_log write | `POST /api/v1/cards/{id}/work-log` | `work-log\tcard_id\tagent\tbody` |
-| `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | `awaiting-input\trun_id\tcard_id` |
-| `answer-input` | SQLite run resume | `POST /api/v1/runs/{id}/answer` | `answered-input\trun_id\tcard_id` |
-| `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | `completed\tid\tstatus` |
-| `update-relations` | SQLite relation write | `POST /api/v1/cards/{id}/relations` | `relations\tid` |
-| `set-parent` | SQLite parent write | `POST /api/v1/cards/{id}/parent` | `parent\tid\tparent|none` |
-| `get-run` | SQLite run detail | `GET /api/v1/runs/{id}?detail=detailed` | JSON run detail |
-| `list-awaiting-input` | SQLite awaiting list | `GET /api/v1/runs/awaiting-input?limit=` | JSON `{awaiting}` |
-| `board-stats` | SQLite board counts | `GET /api/v1/stats` | JSON totals/repos |
+| `search --json` | SQLite FTS query | `GET /api/v1/cards/search` | JSON matches and cursor |
+| `get-card` | SQLite detail | `GET /api/v1/cards/{id}` | JSON detail |
+| `create-card` | SQLite write | `POST /api/v1/cards` | created card |
+| `update-card` | SQLite write | `PATCH /api/v1/cards/{id}` | updated card |
+| `claim` | SQLite claim | `POST /api/v1/cards/{id}/claim` | card, run, expiry |
+| `heartbeat` | SQLite liveness | `POST /api/v1/cards/{id}/heartbeat` | card, run, expiry |
+| `renew-claim` | SQLite lease | `POST /api/v1/cards/{id}/renew` | card, run, expiry |
+| `release-claim` | SQLite release | `POST /api/v1/cards/{id}/release` | card and run |
+| `update-status` | SQLite status | `POST /api/v1/cards/{id}/status` | card and status |
+| `check-criterion` | SQLite criterion | `POST /api/v1/cards/{id}/criteria/check` | criterion result |
+| `add-link` | SQLite link | `POST /api/v1/cards/{id}/links` | link id |
+| `add-comment` | SQLite comment | `POST /api/v1/cards/{id}/comments` | comment |
+| `append-work-log` | SQLite work log | `POST /api/v1/cards/{id}/work-log` | work log |
+| `request-input` | SQLite run pause | `POST /api/v1/runs/{id}/input` | awaiting-input |
+| `answer-input` | SQLite run resume | `POST /api/v1/runs/{id}/answer` | answered-input |
+| `complete-card` | SQLite completion | `POST /api/v1/cards/{id}/complete` | completed card |
+| `update-relations` | SQLite relations | `POST /api/v1/cards/{id}/relations` | relation result |
+| `set-parent` | SQLite parent edge | `POST /api/v1/cards/{id}/parent` | parent result |
+| `get-run` | SQLite run detail | `GET /api/v1/runs/{id}?detail=detailed` | typed run detail |
+| `list-awaiting-input` | SQLite awaiting list | `GET /api/v1/runs/awaiting-input?limit=` | awaiting runs |
+| `event-tail` | SQLite event tail | `GET /api/v1/events/tail` via SSE | ordered events |
 
-Rollup `coverage` is the full visibility-scoped parent-graph classification/reachability envelope. A row's `status_counts` covers only its root epic's direct children or its parentless leaf itself (parentless leaves are grouped into repository `Unsorted` rows), so nested-epic row sums do not have to equal `coverage.accounted_cards`.
+When neither `--db` nor `POWDER_API_BASE_URL` is available, a remote-capable
+command exits with a transport error. It never falls back to ephemeral state.
+The CLI remains the supported agent face; HTTP is for integrations and the UI.
 
-Local SQLite CLI mutations authenticate as the trusted process principal from `POWDER_PRINCIPAL`; when unset, the fixed `local-cli` admin process principal is used. `--actor`, `--author`, and `--agent` are semantic audit labels only, and `--admin` is rejected.
-
-When neither `--db` nor `POWDER_API_BASE_URL` is available for a remote-capable
-command, the CLI exits with a one-line transport error instead of silently
-falling back to ephemeral state. Admin and bulk commands (`repository-*`,
-`import-github-issues`, `key-*`, `subscription-*`, `dead-letter-list`,
-`event-tail`, `relations-doctor`) remain `--db`-only; omitting `--db` on those
-still fails with a bare `missing --db`.
-
-Commands with no remote-mode transport, verified against `COMMANDS` in
-`crates/powder-cli/src/lib.rs`:
-
-| Command | Purpose | Example |
-| --- | --- | --- |
-| `repository-get` | Read one repository entity by canonical name or alias | `powder repository-get canary --db ./data/powder.db` |
-| `repository-delete` | Delete an unused repository entity and its aliases | `powder repository-delete canary --db ./data/powder.db` |
-| `subscription-create` | Register a signed webhook subscription (prints the signing secret once with `--show-secret`) | `powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret` |
-| `subscription-list` | List webhook subscriptions without disclosing signing secrets | `powder subscription-list --db ./data/powder.db` |
-| `subscription-disable` | Disable a subscription while preserving its delivery history | `powder subscription-disable sub-id --db ./data/powder.db` |
-| `dead-letter-list` | List webhook deliveries that exhausted retry attempts | `powder dead-letter-list --db ./data/powder.db` |
-| `event-tail` | Page through durable outbound card events (the same feed `GET /api/v1/events/tail` streams as SSE) after a given sequence number | `powder event-tail --db ./data/powder.db --after 0 --limit 20` |
-
-See [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks) for a full
-`subscription-create` -> trigger an event -> `event-tail`/`dead-letter-list`
-readback walkthrough against a real local server.
+Local SQLite mutations use the trusted process principal from
+`POWDER_PRINCIPAL`, or the fixed local CLI principal when unset. `--actor`,
+`--author`, and `--agent` are semantic audit labels. `--admin` is not a
+mutation escape hatch.
 
 ## Agent CLI workflow
-
-Agents use the `powder` CLI in local SQLite mode or against a deployed server.
-Set `POWDER_API_BASE_URL` and, for `api-key` deployments, `POWDER_API_KEY` to
-select remote mode. `--db` always wins when supplied. Read [`SKILL.md`](../SKILL.md)
-for the command contract and the required lifecycle sequence.
 
 ```sh
 DB=/tmp/powder-http-smoke/powder.db
@@ -145,291 +79,74 @@ mkdir -p "$(dirname "$DB")"
 KEY=$(cargo run -q -p powder-cli -- init-db --db "$DB" --show-secret | awk -F '\t' '/bootstrap-key/ {print $4}')
 cargo run -q -p powder-cli -- create-card --db "$DB" --id smoke-proof --title "HTTP smoke" --acceptance "lifecycle works" --status ready
 POWDER_DB_PATH="$DB" POWDER_AUTH_MODE=api-key POWDER_BIND_ADDR=127.0.0.1:4017 cargo run -q -p powder-server
+```
 
-# in another shell
+In another shell:
+
+```sh
 export POWDER_API_BASE_URL=http://127.0.0.1:4017
 export POWDER_API_KEY="$KEY"
 powder list-ready --limit 1
 powder claim smoke-proof --agent codex
+powder request-input "<run-id>" --question "Approve completion?"
+powder answer-input "<run-id>" --actor operator --answer approved
 powder complete-card smoke-proof --proof https://example.test/proof
 ```
 
-`powder version` reports the installed binary's build commit. With
-`POWDER_API_BASE_URL` set, it compares that commit with the deployed server's
-`/readyz` value and prints a `DRIFT` line when they differ. A stale or
-unreachable server produces a note, not a local command failure.
+## Ready paging
 
-The CLI retries a request once with a fresh value from `POWDER_API_KEY_CMD`
-when the active key enters a new `401` failure epoch. It keeps the plain
-`POWDER_API_KEY` value as the fallback. Repeated `404` responses identify a
-stale `POWDER_API_BASE_URL` after the configured threshold.
+`/api/v1/cards` and `/api/v1/cards/ready` cap one response at `limit` cards.
+Pass the opaque `next_after` value to continue:
 
-Agents that talk to the HTTP API directly can read `GET /api/v1/routes` for
-the full route contract. The CLI remains the supported agent face because it
-keeps transport, output, and lifecycle commands consistent.
-
-For paging, webhook operations, key rotation, and production deployment,
-continue with the sections below and [`docs/self-hosting.md`](self-hosting.md).
-
-## Paging `/api/v1/cards` and `/api/v1/cards/ready` beyond `limit` (powder-cards-api-paged-continuation)
-
-Both list routes cap one response to `limit` cards (default 20). Callers may pass the response's opaque `next_after` value to reach later pages:
-
-```
+```text
 GET /api/v1/cards?limit=20
-GET /api/v1/cards?limit=20&after=<next_after-from-the-previous-response>
-GET /api/v1/cards/ready?limit=20&after=<next_after-from-the-previous-response>
+GET /api/v1/cards?limit=20&after=<next-after>
+GET /api/v1/cards/ready?limit=20&after=<next-after>
 ```
 
-Ready pages use a durable, store-backed v3 snapshot cursor. Its URL token contains only the query-filter fingerprint, an opaque snapshot identifier, and a bounded position; it never contains card IDs or the eligible set. The snapshot is persisted in SQLite, survives process restart, binds repository/estimate/risk/priority filters, and expires after a bounded retention window. Expired, unknown, malformed, or query-mismatched cursors return `400 Bad Request`.
+Ready pages use a durable SQLite snapshot cursor bound to the query filters.
+The captured order is immutable. Cards that leave eligibility are skipped
+without moving the cursor backwards. Cards that arrive during the walk are
+appended after captured positions. Malformed, expired, unknown, or
+filter-mismatched cursors return `400 Bad Request`.
 
-The captured Ready order is immutable. A card claimed, deleted, or otherwise no longer eligible before a later page is skipped without moving the cursor backwards or requiring the departed anchor. Cards that become eligible after page one are appended after the captured positions in the current dependency order. This gives a lossless walk: no duplicate or omission from departures, cycles remain reported, and mid-walk arrivals do not reorder already captured work. Retrying the same cursor is deterministic because the position is carried in the token, not mutable shared state.
+The optional Card `repo` filter is an exact string filter. It is not a
+repository registry or alias lookup.
 
-Ready pagination uses only opaque v3 `after` cursors bound to the query filters and a durable SQLite snapshot. CLI local calls decode the same v3 value before entering Store; remote calls forward it unchanged. A bare card ID is rejected rather than guessed, so a departed anchor cannot duplicate or skip work.
+## Authentication trust boundary
 
-Ready `has_more` and `next_after` are position-aware. Continue while `next_after` is present; `total_count` reports the current eligible count and may change as claims or arrivals occur. Plain `/api/v1/cards` continuation retains its existing card-id behavior and does not receive Ready snapshot semantics.
+In `api-key` mode, read routes require `Authorization: Bearer <key>` unless
+`POWDER_PUBLIC_READS=true` is set on a loopback bind. Mutations always require a
+key. Non-loopback listeners reject keyless-read mode.
 
-## Self-Hosting
+In `tailscale-header` mode, the trusted ingress must strip all supported
+identity headers from client requests and set exactly one from its verified
+peer identity. Configure `POWDER_TAILNET_PROXY_SECRET`; Powder rejects missing
+or mismatched proxy secrets before it reads an identity header. Configure admin
+scope with exact `POWDER_TAILNET_ADMIN_PRINCIPALS` values.
 
-For the copy-pasteable quickstart (Docker, release binary, bare-host +
-systemd, Fly), the full env-var reference, and the backup/restore story, see
-[`docs/self-hosting.md`](self-hosting.md). This section stays focused on the
-production posture and lore specific to this repo's own history.
+In `none` mode, the private network boundary is the authorization boundary.
+Powder accepts `none` only on a loopback bind. The operator production instance
+uses a private tailnet ingress and follows this rule intentionally.
 
-Powder follows the Canary-style deployment pattern:
+## Search and input
 
-- one Rust service image
-- SQLite database at `POWDER_DB_PATH`
-- dual-stack/private-Fly listener at `POWDER_BIND_ADDR`
-- Fly volume mounted at `/data`
-- optional Litestream replication to Fly Tigris
-- `/healthz`, `/readyz`, and `/api/v1/onboarding`
-- auth configured by env (`api-key`, `tailscale-header`, or `none`)
-- change webhooks configured at runtime via `POST /api/v1/events/subscriptions`
-  (`powder subscription-create`), not an env var -- see
-  [`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks)
-- first-run bootstrap API key written once to the configured 0600
-  `POWDER_BOOTSTRAP_KEY_FILE`; raw key bytes are never logged
+`GET /api/v1/cards/search` and `powder search --json` use the same SQLite FTS
+query. Search covers card title, body, criteria, comments, and work logs. It
+supports status, exact `repo`, label, date, `limit`, and opaque cursor filters. Escape snippets before rendering them as HTML.
 
-Local setup (there is no dotenv loader -- `cp .env.example .env` alone does
-nothing until the file is loaded into the process environment):
+Use `list-awaiting-input` to find typed run questions. Use `request-input` to
+append a typed question and pause the run. Use `answer-input` to append the
+typed response and resume the run. Use links and proof fields for reviewable
+evidence. Do not upload attachments or copy sessions into Powder.
 
-```sh
-set -a; source .env; set +a
-POWDER_DB_PATH=./data/powder.db cargo run -p powder-server
-```
+## Production operations
 
-Board read routes require `Authorization: Bearer <key>` in `api-key` mode
-unless `POWDER_PUBLIC_READS=true` is explicitly set on a loopback bind.
-Non-loopback listeners reject that combination before listen, regardless of an
-upstream private perimeter. Mutations, card status and relation changes,
-claim lifecycle, card authoring, comments, links, answer-loop writes, and key
-management always require a bearer key in `api-key` mode. Use
-`tailscale-header` only behind a trusted ingress that injects one of the
-supported tailnet identity headers and strips spoofed client-supplied identity
-headers. Use `none` for local development or for a deployment whose entire
-network perimeter is the authorization boundary: the server accepts `none`
-only on a loopback bind, so every path to it must traverse a private ingress
-(for example a tailnet-only `tailscale serve` proxy). The operator's
-production instance runs this posture intentionally -- see
-`docs/production-deploy.md`. In `none` mode every request (including admin
-routes) is authorized as `anonymous`; attribution rides in request payload
-actor fields, not the auth principal.
+Production runs one `powder-server` process on an operator-owned DigitalOcean
+host. SQLite lives on a host volume with WAL enabled. Litestream replication is
+optional and uses the active S3-compatible endpoint. Verify the live process
+with `/healthz` and `/readyz` after each deployment.
 
-### Trust boundary for `tailscale-header` auth (powder-tailnet-backstop)
-
-`tailscale-header` mode trusts any request bearing one of four identity
-headers (`Tailscale-User-Login`, `X-Tailscale-User-Login`,
-`Tailscale-User-Name`, `X-Forwarded-User`) as an authenticated actor. That is
-only as safe as the ingress in front of `powder-server`: the proxy must
-
-- **strip** all four identity headers from anything a client sends itself,
-  so a request cannot forge an identity by setting the header before the
-  proxy would have;
-- **set** exactly one of the four headers itself, sourced only from its own
-  verified tailnet peer identity (e.g. Tailscale Serve's own
-  `Tailscale-User-Login`), never copied from request-supplied data.
-
-`powder-server` cannot independently verify a header its process boundary
-receives came from that proxy rather than a client that reached it directly
-(a misrouted request, a bypassed ingress, a proxy misconfiguration). Set
-`POWDER_TAILNET_PROXY_SECRET` to add an in-code backstop for that gap: when
-set, every `tailscale-header`-mode request must also carry a matching
-`X-Powder-Proxy-Secret` header (compared in constant time), and requests
-missing it or carrying the wrong value are rejected with `401` before the
-identity header is even consulted. Configure the trusted proxy to set this
-header on every request it forwards, from a value only it and
-`powder-server` know. The proxy secret is required whenever identity headers are used; leaving it
-unset rejects identity-header authentication instead of trusting spoofable
-headers.
-
-**Bearer-token fallback for callers that never reach the identity header
-(powder-tailnet-bearer-fallback).** A request self-originated from the box
-to its own tailnet hostname -- a co-hosted service calling `powder-server`
-back through `tailscale serve`, e.g. Glass calling Powder with a
-Mint-brokered key -- does not traverse the peer-identity handshake that
-populates the four headers above; it never gets one. `authorize()` falls
-back to verifying a bearer token (the same check `api-key` mode uses)
-whenever a `tailscale-header`-mode request carries `Authorization: Bearer
-<key>` and no identity header, so a minted API key still authenticates that
-caller instead of being silently locked out. Identity headers still win
-when both are present; the fallback only activates when no identity header
-is on the request at all. `authorize_read` shares the same `authorize()`
-call for both modes' checks, so this fallback covers reads and writes
-identically.
-
-`POWDER_TAILNET_ADMIN_PRINCIPALS` controls admin scope for
-`tailscale-header` identities. It is a comma-separated list of exact forwarded
-identities; unset and wildcard values are fail-closed. `POWDER_TAILNET_ADMIN`
-is retired and rejected at startup. Every identity-header request also needs a
-matching `POWDER_TAILNET_PROXY_SECRET`; callers without an identity header may
-use a valid bearer key as the explicit same-box fallback.
-
-**Fail-closed read posture (powder-public-read-posture, 2026-07-15):**
-`api-key` mode now requires a valid bearer key for every read route by
-default. The legacy keyless-read behavior is preserved only under the explicit escape
-hatch `POWDER_PUBLIC_READS=true` on a loopback bind. Non-loopback listeners
-reject that combination before listen; a private upstream perimeter does not
-change Powder's direct trust boundary. New deployments should leave it unset.
-
-**Rollout runbook for an existing private-perimeter instance:**
-
-1. Keep non-loopback ingress authenticated; do not set `POWDER_PUBLIC_READS=true`
-   on a private perimeter.
-2. Inventory every keyless reader (board UI phone clients, Glass, dashboard
-   panels, automation cron jobs) and mint a scoped key for each over
-   `POST /api/v1/keys` (admin scope required). The raw secret prints once.
-3. Reconfigure each reader to send `Authorization: Bearer <key>`.
-4. Remove `POWDER_PUBLIC_READS=true` from the deployment env and restart.
-5. Verify with curl: a keyless `GET /api/v1/cards` must now return `401`, and
-   a request with a valid key returns `200`. A revoked key must return `401`
-   on reads as well as mutations.
-
-`tailscale-header` and `none` auth modes are unchanged.
-
-API keys authenticate a neutral principal. Claims and runs separately record
-that principal, the explicit request-body `agent` worker label, and the unique
-`run_id`. One integration principal may therefore coordinate multiple workers
-without per-worker credentials; lease mutations authorize against the
-principal that acquired the run, while operator-facing claim state continues
-to name the worker. Key scope controls route access only and carries no
-human-versus-agent classification.
-
-Powder is audit-first, not lifecycle-enforcing: any authorized actor may set any
-card status in one call. Claims remain useful leases for coordination, but
-status correction and completion do not require the actor to hold the claim or
-provide proof. Card create/update/status/claim-expiry/completion changes are
-delivered to any URL registered via `POST /api/v1/events/subscriptions`
-(`powder subscription-create --url ... [--event-filter ...]`), each with its
-own HMAC signing secret and independent retry/dead-letter tracking -- see
-[`docs/self-hosting.md#webhooks`](self-hosting.md#webhooks) for the full
-contract and a working local example.
-
-### Field-note seed generator (powder-921)
-
-On a qualifying completion, spawn exactly one draft card carrying the `proof`
-field verbatim as raw drafting material, into a shared review-queue pseudo-repo
-(`repo=content`) every other content generator is meant to feed. Draft cards
-always have empty `acceptance`, so [`Card::is_ready_at`] already excludes them
-from `list_ready` and normal claim dispatch -- no separate exclusion mechanism
-to keep in sync. Disabled by default; every completion behaves exactly as
-before unless `POWDER_FIELD_NOTE_REPOS` is set.
-
-```sh
-POWDER_FIELD_NOTE_REPOS=powder,crucible,bitterblossom   # comma-separated allowlist; unset or empty disables the generator
-POWDER_FIELD_NOTE_PROOF_MIN_CHARS=120                    # default; trimmed proof length floor
-POWDER_FIELD_NOTE_WEEKLY_BUDGET=7                        # default; hard cap on drafts in the trailing 7 days
-```
-
-Both gates are deterministic per the content-harness design law
-(misty-step-912): a repo not on the allowlist, a `proof` shorter than the
-floor, or a weekly budget already spent all produce nothing -- eligibility is
-never a model judgment call.
-
-Canary self-report: `crates/powder-server/src/canary.rs` posts a `powder`
-check-in every 60s and ad hoc error reports to canary-obs, gated on two Fly
-secrets — `CANARY_ENDPOINT` (e.g. `https://canary-obs.fly.dev`) and
-`CANARY_INGEST_KEY` (a scoped `ingest-only` key bound to service `powder`,
-minted via canary's `POST /api/v1/keys`). Both must be set or
-`canary::enabled()` silently no-ops. The check-in name is `powder`; canary
-needs a matching monitor (`POST /api/v1/monitors` with `"name":"powder"`) or
-check-ins 404.
-
-Fly instance shape for a self-hosted deployment:
-
-```sh
-fly apps create powder --org misty-step
-fly volumes create powder_data --size 1 --region iad --app powder
-fly deploy --app powder
-```
-
-The default `fly.toml` keeps one machine warm, mounts `/data`, listens on
-`[::]:4000` for Fly private IPv6, checks `/healthz` and `/readyz`, and sets
-`POWDER_PUBLIC_BASE_URL` to `https://powder.internal` for a tailnet-fronted
-instance. A private host can expose `http://powder.internal:4000`
-through Tailscale Serve while Powder keeps its own database and secrets on its
-Fly volume. Misty Step's current operator instance is hosted by Sanctum rather
-than the checked-in `powder` Fly app; verify the active deployment with
-`POWDER_API_BASE_URL` before treating the template app name as live -- see
-[`docs/production-deploy.md`](production-deploy.md) for exactly where
-that instance runs, how a merged PR here actually reaches it, and this app's
-disposition (destroyed 2026-07-07 -- `fly.toml`'s header explains why and
-prevents accidentally re-creating it as a decoy). The Fly profile redacts the
-first bootstrap key
-in logs; create an operator-held key over SSH with `powder key-create --db
-/data/powder.db --name operator --scope admin --show-secret` and store it in
-a secret manager.
-
-Set `POWDER_HOME_URL` (unset by default) to render a plain text link back to
-that URL in the board's always-visible chrome -- for a deployment fronted by
-a portal/home surface Powder itself doesn't own (powder-942). Self-hosters
-with no such portal leave it unset and see no change.
-
-### API key lifecycle: minting, storage, and what's recoverable (powder-918)
-
-**Durable key-drop convention: hand-out-at-mint-only.** `powder key-create`
-and `powder init-db --show-secret` print a raw secret exactly once, at the
-moment of minting, and the store never persists it (see below) -- there is no
-"look it up later" recovery path. Capture it directly into the *consumer's*
-own secret store (macOS/Linux keychain, 1Password, a CI secret store) in the
-same breath as minting it. Do not park a raw key anywhere on the box itself as
-a hand-off mechanism -- not a dotfile, not `/tmp`, not `/var/run`. **Incident
-(2026-07-04):** a key was left in `/var/run` to hand off between processes;
-`/var/run` is `tmpfs` and is wiped on every reboot and every supervisor
-restart, so the key silently vanished on the next deploy and had to be
-re-minted. If a key needs to reach a second consumer, mint a fresh key for
-that consumer and hand it out at mint time again -- never try to relay an
-already-minted raw value you no longer hold.
-
-Because there is no durable drop location, `key-create` refuses to mint at
-all unless the caller passes exactly one of `--show-secret` (print the raw
-key once, with a store-it-now warning) or `--redacted` (explicit
-acknowledgment that the secret will be discarded). Minting with neither flag
-used to silently print `redacted` and throw the only copy away; refusing is
-the honest behavior; a default that prints secrets unasked is worse.
-
-See [docs/self-hosting.md](self-hosting.md#secrets-at-rest) for what is and isn't recoverable at rest.
-
-### A scoped key for the board UI on a phone (powder-925)
-
-The board's write actions (quick-add a card, change a card's status, claim,
-comment, complete) only need `agent` scope, not `admin` -- `admin` is
-reserved for repository management and key management, neither
-of which the board UI's phone surface exposes. Mint a dedicated,
-independently-revocable `agent`-scope key for this instead of pasting the
-admin key into Safari:
-
-```sh
-powder key-create --db /data/powder.db --name operator-mobile --scope agent --show-secret
-```
-
-Paste the printed key into the board's settings panel (the gear icon) --
-it's held in the browser's `localStorage`, sent only as a `Bearer` header,
-and never appears in the URL or a QR code. Because it's a distinct key
-(not the admin key), losing the phone or leaking the key only costs a
-`powder key-revoke <id>` against that one key, not against everything the
-admin key can touch.
-
-## Search contract
-
-`GET /api/v1/cards/search` and `powder search --json` use the same store-backed query. Pass `q` plus optional `source_kind`/`source_field`, status, repo, label, priority, estimate, risk, `created_after`/`created_before`, `updated_after`/`updated_before`, `limit`, and opaque `after`. Search includes card title/body/criteria, comments, and work logs. A single term is exact-or-prefix; multiple terms are unordered within an FTS window. Hyphen and underscore compounds are exact tokens, so sub-token searches are intentionally limited; snippets are plain untrusted text and clients must escape them before HTML. Cursors are bound to the query and filter fingerprint; reusing one with changed filters returns an invalid-cursor error. A valid cursor is an offset into the deterministic result ordering, so concurrent inserts, edits, or deletes can shift later pages; restart the search when a live board changes.
+Use a WAL-safe database snapshot before a binary or schema change. Run the
+non-destructive restore drill in `docs/self-hosting.md` against a scratch path
+and read back a known card before trusting the replica.

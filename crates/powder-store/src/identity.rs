@@ -2,8 +2,10 @@ use bcrypt::verify;
 use powder_core::{Authority, Operation};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
-use super::{non_empty, DomainError, Result, Store, StoreError, API_KEY_ALPHABET};
-
+use super::{
+    non_empty, DomainError, IdempotencyOutcome, KeyedOperationContext, Result, Store, StoreError,
+    API_KEY_ALPHABET,
+};
 const API_KEY_PREFIX_LEN: usize = 12;
 const BOOTSTRAP_SEED: &str = "initial_config_v1";
 const DUMMY_BCRYPT_HASH: &str = "$2b$12$C6UzMDM.H6dfI/f/IKcEeO6H9G7Qe0eeDVF2.oTu.2R4z.0/t6j2K";
@@ -126,18 +128,6 @@ impl Store {
             return Err(error.into());
         }
         Ok(Some(key))
-    }
-
-    pub fn initial_seed_applied(&self) -> Result<bool> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT 1 FROM seed_runs WHERE seed_name = ?1 LIMIT 1",
-                [BOOTSTRAP_SEED],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
     }
 
     /// Seed the first admin key without an external disclosure step.
@@ -307,6 +297,26 @@ impl Store {
         revoke_api_key_in_transaction(&transaction, key_id, now)?;
         transaction.commit()?;
         Ok(())
+    }
+    /// Revoke one API key through the shared keyed receipt boundary.
+    pub fn revoke_api_key_keyed(
+        &mut self,
+        key_id: &str,
+        now: i64,
+        idempotency_key: &str,
+        authority: &Authority,
+    ) -> Result<IdempotencyOutcome<()>> {
+        let payload = (key_id, true);
+        self.with_keyed_operation(
+            Operation::RevokeApiKey,
+            format!("api-key:{key_id}"),
+            &payload,
+            KeyedOperationContext::new(now, idempotency_key, authority),
+            |transaction| {
+                revoke_api_key_in_transaction(transaction, key_id, now)?;
+                Ok(())
+            },
+        )
     }
 }
 

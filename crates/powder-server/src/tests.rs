@@ -2,19 +2,11 @@ use super::*;
 use axum::{
     body::{to_bytes, Body},
     http::{
-        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_TYPE},
         Method, Request, StatusCode,
     },
 };
-use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
-    time::Duration,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower::ServiceExt;
 
 #[test]
@@ -32,62 +24,24 @@ fn config_defaults_to_api_key_auth_and_data_path() {
         !config.public_reads,
         "api-key mode must default to authenticated reads"
     );
-    assert!(
-        config.field_note.repo_allowlist.is_empty(),
-        "no POWDER_FIELD_NOTE_REPOS means the generator stays inert"
-    );
-    assert_eq!(
-        config.field_note.proof_min_chars,
-        DEFAULT_FIELD_NOTE_PROOF_MIN_CHARS
-    );
-    assert_eq!(
-        config.field_note.weekly_budget,
-        DEFAULT_FIELD_NOTE_WEEKLY_BUDGET
-    );
 }
 
 #[test]
-fn config_parses_field_note_generator_env_vars() {
-    let config = Config::from_pairs([
-        ("POWDER_FIELD_NOTE_REPOS", " misty-step/powder, crucible ,"),
-        ("POWDER_FIELD_NOTE_PROOF_MIN_CHARS", "80"),
-        ("POWDER_FIELD_NOTE_WEEKLY_BUDGET", "3"),
-    ])
-    .unwrap();
-
-    assert_eq!(
-        config.field_note.repo_allowlist,
-        vec!["misty-step/powder".to_string(), "crucible".to_string()],
-        "blank entries from trailing commas/whitespace must not become a spurious allowlist member"
-    );
-    assert_eq!(config.field_note.proof_min_chars, 80);
-    assert_eq!(config.field_note.weekly_budget, 3);
-}
-
-#[test]
-fn config_rejects_a_non_numeric_field_note_proof_min_chars() {
-    let err =
-        Config::from_pairs([("POWDER_FIELD_NOTE_PROOF_MIN_CHARS", "not-a-number")]).unwrap_err();
-    assert_eq!(err.variable, "POWDER_FIELD_NOTE_PROOF_MIN_CHARS");
-}
-
-#[test]
-fn config_rejects_the_retired_import_files_setting() {
-    let retired_import_dir = concat!("POWDER_", "IMPORT_FILES_DIR");
-    let err = Config::from_pairs([(retired_import_dir, "/tmp/retired")]).unwrap_err();
-
-    assert_eq!(err.variable, retired_import_dir);
-    assert!(err.message.contains("retired"));
-}
-
-#[test]
-fn config_accepts_tailnet_and_none_modes() {
-    let tailnet = Config::from_pairs([("POWDER_AUTH_MODE", "tailnet")]).unwrap();
+fn config_accepts_canonical_tailnet_and_none_modes() {
+    let tailnet = Config::from_pairs([("POWDER_AUTH_MODE", "tailscale-header")]).unwrap();
     let none = Config::from_pairs([("POWDER_AUTH_MODE", "none")]).unwrap();
 
     assert_eq!(tailnet.auth_mode, AuthMode::TailscaleHeader);
     assert!(tailnet.bootstrap_key_file.is_none());
     assert_eq!(none.auth_mode, AuthMode::None);
+}
+
+#[test]
+fn config_rejects_retired_auth_mode_aliases() {
+    for value in ["agent-api-key", "shared-secret", "tailnet", "disabled"] {
+        let error = Config::from_pairs([("POWDER_AUTH_MODE", value)]).unwrap_err();
+        assert_eq!(error.variable, "POWDER_AUTH_MODE");
+    }
 }
 
 #[test]
@@ -141,24 +95,6 @@ fn config_defaults_public_reads_to_false_and_accepts_escape_hatch() {
 
     let err = Config::from_pairs([("POWDER_PUBLIC_READS", "yes")]).unwrap_err();
     assert_eq!(err.variable, "POWDER_PUBLIC_READS");
-}
-
-#[test]
-fn config_defaults_dead_letter_ready_threshold_and_accepts_an_override() {
-    let default = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
-    assert_eq!(
-        default.dead_letter_ready_threshold,
-        DEFAULT_READYZ_DEAD_LETTER_THRESHOLD
-    );
-
-    let overridden = Config::from_pairs([("POWDER_READYZ_DEAD_LETTER_THRESHOLD", "5")]).unwrap();
-    assert_eq!(overridden.dead_letter_ready_threshold, 5);
-}
-
-#[test]
-fn config_rejects_a_non_numeric_dead_letter_ready_threshold() {
-    let err = Config::from_pairs([("POWDER_READYZ_DEAD_LETTER_THRESHOLD", "lots")]).unwrap_err();
-    assert_eq!(err.variable, "POWDER_READYZ_DEAD_LETTER_THRESHOLD");
 }
 
 #[test]
@@ -277,18 +213,6 @@ fn config_retires_log_bootstrap_disclosure() {
     assert!(err.message.contains("retired"));
 }
 
-#[test]
-fn config_home_url_is_absent_by_default_and_configurable() {
-    let config = Config::from_pairs(Vec::<(String, String)>::new()).unwrap();
-    assert!(config.home_url.is_none());
-
-    let config = Config::from_pairs([("POWDER_HOME_URL", "https://sanctum.example.test")]).unwrap();
-    assert_eq!(
-        config.home_url.as_deref(),
-        Some("https://sanctum.example.test")
-    );
-}
-
 #[tokio::test]
 async fn create_card_with_empty_acceptance_never_defaults_to_ready() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
@@ -368,46 +292,7 @@ async fn create_card_with_acceptance_defaults_to_ready_and_explicit_status_overr
 }
 
 #[tokio::test]
-async fn create_card_leaves_repo_null_for_a_numeric_id_but_id_derived_filtering_still_finds_it() {
-    // powder-repo-registry-tightness: a numeric card-id suffix (e.g.
-    // "misty-step-906") must never silently attach an inferred repo -- that
-    // was exactly how stray repository rows got born. The card stays
-    // repo:null. Read-time filtering still tolerates matching such a
-    // repo-less card by its id-derived repo (see
-    // `list_cards_page_after`'s filter), so it stays discoverable without
-    // ever creating a repository row for it.
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
 
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"misty-step-906","title":"Filed from API","acceptance":["proof"],"status":"ready"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-    let created = response_json(created).await;
-    assert!(created["repo"].is_null(), "created was: {created}");
-
-    let listed = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?repo=misty-step",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(listed.status(), StatusCode::OK);
-    let listed = response_json(listed).await;
-    assert_eq!(listed["cards"][0]["id"], "misty-step-906");
-}
-
-#[tokio::test]
 async fn create_card_rejects_unknown_fields_by_name() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -430,27 +315,16 @@ async fn create_card_rejects_unknown_fields_by_name() {
 }
 
 #[tokio::test]
-async fn create_card_rejects_invalid_enum_fields_with_canonical_messages() {
-    // Seam contract (PR #165 / F1): invalid priority on the HTTP face 400s with
-    // the canonical message instead of silently defaulting to P2; estimate and
-    // risk follow the same seam.
+async fn create_card_rejects_invalid_priority_with_canonical_message() {
+    // Invalid priority on the HTTP face returns the canonical message instead
+    // of silently defaulting to P2.
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
-    for (body, expected) in [
-        (
-            r#"{"id":"invalid-priority-card","title":"Filed from API","acceptance":["proof"],"priority":"urgent"}"#,
-            r#"invalid priority "urgent"; valid: P0|P1|P2|P3"#,
-        ),
-        (
-            r#"{"id":"invalid-estimate-card","title":"Filed from API","acceptance":["proof"],"estimate":"huge"}"#,
-            r#"invalid estimate "huge"; valid: S|M|L|XL"#,
-        ),
-        (
-            r#"{"id":"invalid-risk-card","title":"Filed from API","acceptance":["proof"],"risk":"extreme"}"#,
-            r#"invalid risk "extreme"; valid: low|medium|high"#,
-        ),
-    ] {
+    for (body, expected) in [(
+        r#"{"id":"invalid-priority-card","title":"Filed from API","acceptance":["proof"],"priority":"urgent"}"#,
+        r#"invalid priority "urgent"; valid: P0|P1|P2|P3"#,
+    )] {
         let response = app
             .clone()
             .oneshot(json_request(
@@ -485,36 +359,7 @@ async fn create_card_rejects_invalid_enum_fields_with_canonical_messages() {
 }
 
 #[tokio::test]
-async fn create_card_rejects_repo_conflicting_with_numeric_id_prefix() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
 
-    let response = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"misty-step-906","title":"Filed from API","acceptance":["proof"],"status":"ready","repo":"bitterblossom"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-    let listed = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?repo=bitterblossom",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let listed = response_json(listed).await;
-    assert_eq!(listed["cards"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
 async fn create_card_rejects_an_existing_id_without_replacing_the_card() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
@@ -681,12 +526,12 @@ async fn patch_card_updates_only_present_fields_and_preserves_created_at_and_cla
         .unwrap();
     let detail = response_json(detail).await;
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
-        event["event_type"] == "patch" && event["payload"].as_str().unwrap().contains("title")
+        event["event_type"] == "patch" && event["change"].to_string().contains("title")
     }));
 }
 
 #[tokio::test]
-async fn patch_card_repo_is_admin_gated_canonicalized_and_clearable() {
+async fn patch_card_repo_is_admin_gated_opaque_and_clearable() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state
         .store
@@ -746,7 +591,7 @@ async fn patch_card_repo_is_admin_gated_canonicalized_and_clearable() {
         .unwrap();
     assert_eq!(scoped_forbidden.status(), StatusCode::FORBIDDEN);
 
-    // Admin can move it, and an alias slug canonicalizes at write time.
+    // Admin can move it while preserving the exact repo string.
     let moved = app
         .clone()
         .oneshot(json_request(
@@ -759,7 +604,7 @@ async fn patch_card_repo_is_admin_gated_canonicalized_and_clearable() {
         .unwrap();
     assert_eq!(moved.status(), StatusCode::OK);
     let moved = response_json(moved).await;
-    assert_eq!(moved["repo"], "canary");
+    assert_eq!(moved["repo"], "misty-step/canary");
 
     // Admin can also clear it back to repo-less with an empty string.
     let cleared = app
@@ -861,90 +706,8 @@ async fn criteria_and_proof_plan_round_trip_and_audit_without_enforcing_completi
             && event["actor"] == "operator"
             && event["principal"] == "bootstrap"
             && event["role"] == "admin"
-            && event["payload"].as_str().unwrap().contains("checked")
+            && event["change"].to_string().contains("checked")
     }));
-}
-
-/// powder-921's actual production path: an agent completes a card over the
-/// same HTTP API real fleet lanes use, and -- with the generator configured
-/// -- a draft field-note card appears in the shared review queue (`repo:
-/// content`), excluded from `list_ready`, without ever going through the
-/// `Store` unit tests directly.
-#[tokio::test]
-async fn a_qualifying_http_completion_spawns_a_field_note_draft_in_the_review_queue() {
-    let (state, raw_key) = test_state_with_field_note(
-        AuthMode::ApiKey,
-        FieldNoteConfig {
-            repo_allowlist: vec!["misty-step/powder".to_string()],
-            proof_min_chars: 40,
-            weekly_budget: 7,
-        },
-    );
-    let app = app(state);
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"http-field-note-source","title":"Ship the thing","acceptance":["done"],"status":"in_progress","repo":"misty-step/powder"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-
-    let complete = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/http-field-note-source/complete",
-            Some(&raw_key),
-            r#"{"proof":"Shipped remote-mode support for the full claim lifecycle so campaign lanes never fall back to raw curl for lease maintenance again."}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(complete.status(), StatusCode::OK);
-
-    let queue = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?repo=content",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let queue = response_json(queue).await;
-    let cards = queue["cards"].as_array().unwrap();
-    assert_eq!(
-        cards.len(),
-        1,
-        "exactly one draft for one qualifying completion"
-    );
-    assert_eq!(cards[0]["id"], "field-note-http-field-note-source");
-    assert_eq!(cards[0]["status"], "backlog");
-    assert!(cards[0].get("acceptance").is_none());
-
-    let ready = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards/ready?limit=50",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let ready = response_json(ready).await;
-    assert!(
-        !ready["cards"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|card| card["id"] == "field-note-http-field-note-source"),
-        "a draft with no acceptance criteria must never reach the ready queue"
-    );
 }
 
 #[tokio::test]
@@ -996,7 +759,7 @@ async fn card_relations_round_trip_through_http_api() {
         .unwrap();
     let detail = response_json(detail).await;
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
-        event["event_type"] == "relations" && event["payload"].to_string().contains("rel-note")
+        event["event_type"] == "relations" && event["change"].to_string().contains("rel-note")
     }));
 }
 
@@ -1050,10 +813,7 @@ async fn card_relations_reciprocity_visible_on_both_sides_via_http_api() {
     let peer = response_json(peer).await;
     assert_eq!(peer["card"]["blocks"][0], "recip-a");
     assert!(peer["events"].as_array().unwrap().iter().any(|event| {
-        event["event_type"] == "relations"
-            && event["payload"]
-                .to_string()
-                .contains("mirrored add blocks recip-a")
+        event["event_type"] == "relations" && event["change"].to_string().contains("recip-a")
     }));
 
     // Removing the edge from recip-a's side unmirrors it from recip-b too.
@@ -1100,18 +860,6 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .await
         .unwrap();
     assert_eq!(in_progress.status(), StatusCode::OK);
-
-    let other_repo = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/repositories",
-            Some(&raw_key),
-            r#"{"name":"misty-step/other"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(other_repo.status(), StatusCode::OK);
 
     let created = app
         .clone()
@@ -1187,7 +935,7 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .clone()
         .oneshot(json_request(
             Method::GET,
-            "/api/v1/cards?repo=other",
+            "/api/v1/cards?repo=misty-step/other",
             Some(&raw_key),
             "",
         ))
@@ -1195,43 +943,7 @@ async fn list_cards_filters_by_status_and_repo_and_enumerates_non_ready_cards() 
         .unwrap();
     let other_repo = response_json(other_repo).await;
     assert_eq!(ids_from(&other_repo), vec!["other-001".to_string()]);
-    assert_eq!(other_repo["cards"][0]["repo"], "other");
-
-    let other_repo_alias = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?repo=misty-step/other",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let other_repo_alias = response_json(other_repo_alias).await;
-    assert_eq!(ids_from(&other_repo_alias), vec!["other-001".to_string()]);
-    assert_eq!(other_repo_alias["cards"][0]["repo"], "other");
-
-    let repositories = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/repositories",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(repositories.status(), StatusCode::OK);
-    let repositories = response_json(repositories).await;
-    let other = repositories["repositories"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|repository| repository["repo"] == "other")
-        .expect("other repository summary");
-    assert_eq!(other["repo"], "other");
-    assert_eq!(other["aliases"], json!(["misty-step/other"]));
-    assert_eq!(other["card_count"], 1);
+    assert_eq!(other_repo["cards"][0]["repo"], "misty-step/other");
 
     let invalid_status = app
         .clone()
@@ -1289,7 +1001,7 @@ async fn list_cards_after_param_omitted_matches_first_page_and_continues_with_no
                 .with_status(CardStatus::Backlog)
                 .with_priority(Priority::P2)
                 .with_created_at(created_at);
-            store.import_cards(vec![card]).unwrap();
+            store.upsert_card(card).unwrap();
         }
     }
     let app = app(state);
@@ -1398,7 +1110,7 @@ async fn list_cards_exact_multiple_limit_ends_without_empty_page() {
     let (state, raw_key) = test_state(AuthMode::ApiKey);
     {
         let mut store = state.store.lock().unwrap();
-        let cards = (0..200)
+        let cards: Vec<Card> = (0..200)
             .map(|index| {
                 let id = format!("multiple-{index:03}");
                 Card::new(
@@ -1412,7 +1124,9 @@ async fn list_cards_exact_multiple_limit_ends_without_empty_page() {
                 .with_created_at(index)
             })
             .collect();
-        store.import_cards(cards).unwrap();
+        for card in cards {
+            store.upsert_card(card).unwrap();
+        }
     }
     let app = app(state);
 
@@ -1479,7 +1193,7 @@ async fn list_ready_after_param_omitted_matches_first_page_and_continues_with_no
                 .with_priority(Priority::P2)
                 .with_acceptance(["proof exists".to_string()])
                 .with_created_at(created_at);
-            store.import_cards(vec![card]).unwrap();
+            store.upsert_card(card).unwrap();
         }
     }
     let app = app(state);
@@ -1742,43 +1456,6 @@ async fn list_cards_filters_by_label() {
     assert_eq!(papercuts["total_count"], 1);
 }
 
-#[tokio::test]
-async fn file_papercut_creates_a_backlog_card_with_label() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let filed = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/papercut",
-            Some(&raw_key),
-            r#"{"agent":"codex","body":"too many tokens just to report a typo"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(filed.status(), StatusCode::OK);
-    let filed = response_json(filed).await;
-    assert!(filed["id"].as_str().unwrap().starts_with("papercut-"));
-    assert_eq!(filed["status"], "backlog");
-    assert!(filed["labels"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("papercut")));
-
-    let listed = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?label=papercut",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let listed = response_json(listed).await;
-    assert_eq!(listed["total_count"], 1);
-}
-
 /// powder-966: an agent judging chewability from a list response must see
 /// the same acceptance-criterion text `get_card` would show, not a clipped
 /// preview. `GET /api/v1/cards` and `GET /api/v1/cards/ready` both serialize
@@ -1929,14 +1606,10 @@ async fn list_ready_ordering_matches_across_http_and_cli() {
                 config: Arc::new(Config {
                     db_path: db_path.clone(),
                     auth_mode: AuthMode::ApiKey,
-                    public_base_url: None,
-                    home_url: None,
                     bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
                     bootstrap_key_file: None,
-                    field_note: FieldNoteConfig::default(),
                     tailnet_proxy_secret: None,
                     tailnet_admin_principals: vec!["operator".to_string()],
-                    dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
                     public_reads: false,
                 }),
                 store: Arc::new(Mutex::new(store)),
@@ -2011,11 +1684,11 @@ fn seed_ready_order_fixture(store: &mut Store) {
     cycle_x.blocks = vec![CardId::new("cycle-y").unwrap()];
     cycle_y.blocks = vec![CardId::new("cycle-x").unwrap()];
 
-    store
-        .import_cards(vec![
-            chain_1, chain_2, chain_3, sibling_a, sibling_m, sibling_z, cycle_x, cycle_y,
-        ])
-        .unwrap();
+    for card in [
+        chain_1, chain_2, chain_3, sibling_a, sibling_m, sibling_z, cycle_x, cycle_y,
+    ] {
+        store.upsert_card(card).unwrap();
+    }
 }
 
 fn ready_order_fixture_card(id: &str, priority: Priority, created_at: i64) -> Card {
@@ -2025,873 +1698,6 @@ fn ready_order_fixture_card(id: &str, priority: Priority, created_at: i64) -> Ca
         .with_priority(priority)
         .with_acceptance(["proof exists".to_string()])
         .with_created_at(created_at)
-}
-
-/// Estimate round-trips through create, patch, get, and the estimate filter
-/// on both list surfaces.
-#[tokio::test]
-async fn estimate_round_trips_through_create_patch_and_filters_list_and_ready() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"sized-card","title":"Sized card","acceptance":["proof"],"status":"ready","estimate":"M"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-    let created = response_json(created).await;
-    assert_eq!(created["estimate"], "m");
-
-    let filtered_out = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?estimate=S",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let filtered_out = response_json(filtered_out).await;
-    assert!(!filtered_out["cards"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|card| card["id"] == "sized-card"));
-
-    let filtered_in = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?estimate=M",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let filtered_in = response_json(filtered_in).await;
-    assert!(filtered_in["cards"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|card| card["id"] == "sized-card"));
-
-    let ready_filtered = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards/ready?estimate=M",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let ready_filtered = response_json(ready_filtered).await;
-    assert!(ready_filtered["cards"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|card| card["id"] == "sized-card"));
-
-    let patched = app
-        .clone()
-        .oneshot(json_request(
-            Method::PATCH,
-            "/api/v1/cards/sized-card",
-            Some(&raw_key),
-            r#"{"estimate":"XL"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(patched.status(), StatusCode::OK);
-    let patched = response_json(patched).await;
-    assert_eq!(patched["estimate"], "xl");
-
-    let invalid = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"bad-estimate","title":"t","acceptance":["x"],"estimate":"huge"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-}
-
-/// Risk round-trips through create, get, patch, and list; absent risk
-/// stays None (no default invented), and an invalid value is a 400 naming
-/// the allowed values -- same contract shape as `estimate`'s round-trip
-/// test above, the orthogonal axis powder-risk-signal-field adds.
-#[tokio::test]
-async fn risk_round_trips_through_create_get_patch_and_list() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"risky-card","title":"Risky card","acceptance":["proof"],"status":"ready","risk":"low"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-    let created = response_json(created).await;
-    assert_eq!(created["risk"], "low");
-
-    let fetched = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards/risky-card",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(fetched.status(), StatusCode::OK);
-    let fetched = response_json(fetched).await;
-    assert_eq!(fetched["card"]["risk"], "low");
-
-    let listed = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards?limit=50",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let listed = response_json(listed).await;
-    let listed_card = listed["cards"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|card| card["id"] == "risky-card")
-        .expect("risky-card present in list_cards");
-    assert_eq!(listed_card["risk"], "low");
-
-    let patched = app
-        .clone()
-        .oneshot(json_request(
-            Method::PATCH,
-            "/api/v1/cards/risky-card",
-            Some(&raw_key),
-            r#"{"risk":"high"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(patched.status(), StatusCode::OK);
-    let patched = response_json(patched).await;
-    assert_eq!(patched["risk"], "high");
-
-    let no_risk = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"no-risk-card","title":"No risk card","acceptance":["proof"]}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(no_risk.status(), StatusCode::OK);
-    let no_risk = response_json(no_risk).await;
-    assert!(
-        no_risk.get("risk").is_none() || no_risk["risk"].is_null(),
-        "absent risk must stay None, not a fabricated default: {no_risk:?}"
-    );
-
-    let invalid = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"bad-risk","title":"t","acceptance":["x"],"risk":"catastrophic"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-    let invalid = response_json(invalid).await;
-    let message = invalid["error"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("low") && message.contains("medium") && message.contains("high"),
-        "400 must name the allowed risk values: {message}"
-    );
-}
-
-#[tokio::test]
-async fn board_stats_route_returns_compact_counts_without_listing_cards() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let stats_repo = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/repositories",
-            Some(&admin_key),
-            r#"{"name":"stats-repo","visibility":"visible","tier":"active"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(stats_repo.status(), StatusCode::OK);
-
-    let hidden = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/repositories",
-            Some(&admin_key),
-            r#"{"name":"secret-stats","visibility":"hidden","tier":"active"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(hidden.status(), StatusCode::OK);
-
-    for body in [
-        r#"{"id":"stats-ready","title":"Ready","acceptance":["proof"],"status":"ready","repo":"stats-repo"}"#,
-        r#"{"id":"stats-in-progress","title":"In progress","acceptance":["proof"],"status":"in_progress","repo":"stats-repo"}"#,
-        r#"{"id":"secret-stats-ready","title":"Hidden","acceptance":["proof"],"status":"ready","repo":"secret-stats"}"#,
-    ] {
-        let created = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards",
-                Some(&admin_key),
-                body,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(created.status(), StatusCode::OK);
-    }
-
-    let stats = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/stats?repo=stats-repo",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(stats.status(), StatusCode::OK);
-    let stats = response_json(stats).await;
-    assert_eq!(stats["totals"]["cards"], 2);
-    assert_eq!(stats["totals"]["ready"], 1);
-    assert_eq!(stats["totals"]["in_progress"], 1);
-    assert_eq!(stats["repos"][0]["repo"], "stats-repo");
-
-    let default_stats = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/stats",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let default_stats = response_json(default_stats).await;
-    assert_eq!(default_stats["totals"]["cards"], 2);
-
-    let with_hidden = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/stats?include_hidden=true",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let with_hidden = response_json(with_hidden).await;
-    assert_eq!(with_hidden["totals"]["cards"], 3);
-    assert!(with_hidden["repos"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|row| row["repo"] == "secret-stats"));
-}
-
-#[tokio::test]
-async fn board_rollups_route_returns_global_page_and_coverage() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-    for body in [
-        r#"{"id":"http-epic","title":"Epic","acceptance":["proof"]}"#,
-        r#"{"id":"http-child","title":"Child","acceptance":["proof"],"status":"done","parent":"http-epic"}"#,
-        r#"{"id":"http-leaf","title":"Leaf","acceptance":["proof"]}"#,
-    ] {
-        let response = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards",
-                Some(&admin_key),
-                body,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-    let response = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/board/rollups?limit=1",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let page = response_json(response).await;
-    assert_eq!(page["total_count"], 2);
-    assert_eq!(page["coverage"]["total_cards"], 3);
-    assert_eq!(page["coverage"]["accounted_cards"], 3);
-    assert!(page["coverage"]["complete"].as_bool().unwrap());
-    assert_eq!(page["rollups"].as_array().unwrap().len(), 1);
-    assert!(page["has_more"].as_bool().unwrap());
-}
-
-#[tokio::test]
-async fn board_rollups_enforce_read_auth_and_hidden_scope_matrix() {
-    async fn seed_rollup_fixture(app: &AppState, admin_key: &str) {
-        let router = super::app(app.clone());
-        let hidden_repo = router
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/repositories",
-                Some(admin_key),
-                r#"{"name":"secret-rollups","visibility":"hidden","tier":"active"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(hidden_repo.status(), StatusCode::OK);
-        for body in [
-            r#"{"id":"hidden-parent","title":"Hidden parent","acceptance":["proof"],"status":"ready","repo":"secret-rollups"}"#,
-            r#"{"id":"public-rollup","title":"Public rollup","acceptance":["proof"],"status":"ready"}"#,
-            r#"{"id":"secret-rollup","title":"Secret rollup","acceptance":["proof"],"status":"ready","repo":"secret-rollups"}"#,
-            r#"{"id":"visible-child","title":"Visible child","acceptance":["proof"],"status":"ready","parent":"hidden-parent"}"#,
-        ] {
-            let created = router
-                .clone()
-                .oneshot(json_request(
-                    Method::POST,
-                    "/api/v1/cards",
-                    Some(admin_key),
-                    body,
-                ))
-                .await
-                .unwrap();
-            assert_eq!(created.status(), StatusCode::OK);
-        }
-    }
-
-    let (private_state, private_admin_key) = test_state(AuthMode::ApiKey);
-    let private_agent_key = private_state
-        .store
-        .lock()
-        .unwrap()
-        .create_api_key("rollup-reader", ApiKeyScope::Agent, 1)
-        .unwrap()
-        .raw_key;
-    seed_rollup_fixture(&private_state, &private_admin_key).await;
-    let mut admin_dangling = ready_order_fixture_card("admin-dangling", Priority::P2, 5)
-        .with_parent(Some(CardId::new("missing-admin-parent").unwrap()));
-    admin_dangling.repo = Some("secret-rollups".to_string());
-    private_state
-        .store
-        .lock()
-        .unwrap()
-        .import_cards(vec![admin_dangling])
-        .unwrap();
-    let private_app = app(private_state);
-
-    let no_bearer = private_app
-        .clone()
-        .oneshot(json_request(Method::GET, "/api/v1/board/rollups", None, ""))
-        .await
-        .unwrap();
-    assert_eq!(no_bearer.status(), StatusCode::UNAUTHORIZED);
-
-    let non_admin_hidden = private_app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/board/rollups?include_hidden=true",
-            Some(&private_agent_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(non_admin_hidden.status(), StatusCode::FORBIDDEN);
-
-    let admin_hidden = private_app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/board/rollups?include_hidden=true",
-            Some(&private_admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(admin_hidden.status(), StatusCode::OK);
-    let admin_hidden = response_json(admin_hidden).await;
-    assert_eq!(admin_hidden["coverage"]["total_cards"], 5);
-    assert_eq!(admin_hidden["coverage"]["accounted_cards"], 4);
-    assert_eq!(admin_hidden["coverage"]["parent_issue_count"], 1);
-    let admin_status_sum: u64 = admin_hidden["rollups"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|row| row["status_counts"].as_object().unwrap().values())
-        .map(|count| count.as_u64().unwrap())
-        .sum();
-    assert_eq!(
-        admin_status_sum + admin_hidden["coverage"]["root_epics"].as_u64().unwrap(),
-        admin_hidden["coverage"]["accounted_cards"]
-            .as_u64()
-            .unwrap(),
-    );
-    assert!(!admin_hidden["coverage"]["complete"].as_bool().unwrap());
-    let admin_hidden_body = serde_json::to_string(&admin_hidden).unwrap();
-    assert!(admin_hidden_body.contains("secret-rollups"));
-    assert!(!admin_hidden_body.contains("admin-dangling"));
-    assert!(admin_hidden_body.contains("\"title\":\"Unsorted\""));
-    assert!(!admin_hidden_body.contains("\"card_id\":\"secret-rollup\""));
-
-    let (public_state, public_admin_key) = test_state_with_public_reads(AuthMode::ApiKey, true);
-    seed_rollup_fixture(&public_state, &public_admin_key).await;
-    let public_app = app(public_state);
-
-    let public_default = public_app
-        .clone()
-        .oneshot(json_request(Method::GET, "/api/v1/board/rollups", None, ""))
-        .await
-        .unwrap();
-    assert_eq!(public_default.status(), StatusCode::OK);
-    let public_default = response_json(public_default).await;
-    assert_eq!(public_default["coverage"]["total_cards"], 2);
-    assert_eq!(public_default["coverage"]["accounted_cards"], 2);
-    assert_eq!(public_default["coverage"]["unsorted_cards"], 2);
-    assert_eq!(public_default["coverage"]["parent_issue_count"], 0);
-    assert!(public_default["coverage"]["complete"].as_bool().unwrap());
-    assert_eq!(public_default["rollups"][0]["title"], "General");
-    assert_eq!(public_default["rollups"][0]["status_counts"]["ready"], 2);
-    let public_default_body = serde_json::to_string(&public_default).unwrap();
-    assert!(!public_default_body.contains("hidden-parent"));
-    assert!(!public_default_body.contains("secret-rollups"));
-
-    let public_hidden_without_admin = public_app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/board/rollups?include_hidden=true",
-            None,
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        public_hidden_without_admin.status(),
-        StatusCode::UNAUTHORIZED
-    );
-
-    let public_hidden_admin = public_app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/board/rollups?include_hidden=true",
-            Some(&public_admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(public_hidden_admin.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn hidden_read_queries_require_admin_across_stats_and_repositories() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let agent_key = state
-        .store
-        .lock()
-        .unwrap()
-        .create_api_key("agent", ApiKeyScope::Agent, 1)
-        .unwrap()
-        .raw_key;
-    let app = app(state);
-    for (path, key, expected) in [
-        (
-            "/api/v1/stats?include_hidden=true",
-            Some(agent_key.as_str()),
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            "/api/v1/repositories?include_hidden=true",
-            Some(agent_key.as_str()),
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            "/api/v1/stats?include_hidden=true",
-            None,
-            StatusCode::UNAUTHORIZED,
-        ),
-        (
-            "/api/v1/repositories?include_hidden=true",
-            None,
-            StatusCode::UNAUTHORIZED,
-        ),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(json_request(Method::GET, path, key, ""))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), expected, "hidden read {path}");
-    }
-    for path in [
-        "/api/v1/stats?include_hidden=true",
-        "/api/v1/repositories?include_hidden=true",
-    ] {
-        let response = app
-            .clone()
-            .oneshot(json_request(Method::GET, path, Some(&admin_key), ""))
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "admin hidden read {path}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn repository_settings_crud_and_alias_merge_are_admin_gated() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/repositories",
-            Some(&admin_key),
-            r#"{"name":"misty-step/canary","aliases":["canary-app"],"visibility":"visible","import_provenance":"manual"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-    let created = response_json(created).await;
-    assert_eq!(created["name"], "canary");
-    assert_eq!(
-        created["aliases"],
-        json!(["canary-app", "misty-step/canary"])
-    );
-    assert_eq!(created["import_provenance"], "manual");
-
-    let read_by_alias = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/repositories/canary-app",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(read_by_alias.status(), StatusCode::OK);
-    assert_eq!(response_json(read_by_alias).await["name"], "canary");
-
-    let hidden = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/repositories/canary",
-            Some(&admin_key),
-            r#"{"aliases":["canary-app","misty-step/canary"],"visibility":"hidden"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(hidden.status(), StatusCode::OK);
-
-    let visible_list = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/repositories",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let visible_list = response_json(visible_list).await;
-    assert!(!visible_list["repositories"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|repository| repository["name"] == "canary"));
-
-    let hidden_list = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/repositories?include_hidden=true",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    let hidden_list = response_json(hidden_list).await;
-    let canary = hidden_list["repositories"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|repository| repository["name"] == "canary")
-        .expect("hidden canary repository");
-    assert_eq!(canary["visibility"], "hidden");
-
-    let legacy_repo = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/repositories",
-            Some(&admin_key),
-            r#"{"name":"legacy-canary"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(legacy_repo.status(), StatusCode::OK);
-
-    let legacy = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&admin_key),
-            r#"{"id":"legacy-canary","title":"Legacy canary","acceptance":["proof"],"status":"ready","repo":"legacy-canary"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(legacy.status(), StatusCode::OK);
-
-    let merged = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/repositories/canary/merge-alias",
-            Some(&admin_key),
-            r#"{"alias":"legacy-canary","actor":"operator"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(merged.status(), StatusCode::OK);
-    let merged = response_json(merged).await;
-    assert_eq!(merged["rehomed_cards"], 1);
-
-    let detail = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/cards/legacy-canary",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(detail.status(), StatusCode::OK);
-    let detail = response_json(detail).await;
-    assert_eq!(detail["card"]["repo"], "canary");
-    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
-        event["event_type"] == "repository"
-            && event["actor"] == "bootstrap"
-            && event["payload"]
-                .as_str()
-                .unwrap()
-                .contains("legacy-canary -> canary")
-    }));
-
-    let delete_used = app
-        .clone()
-        .oneshot(json_request(
-            Method::DELETE,
-            "/api/v1/repositories/canary",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(delete_used.status(), StatusCode::CONFLICT);
-
-    let deleted_unused = app
-        .oneshot(json_request(
-            Method::DELETE,
-            "/api/v1/repositories/canary-app",
-            Some(&admin_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        deleted_unused.status(),
-        StatusCode::CONFLICT,
-        "aliases resolve to the canonical repository, so delete stays card-count safe"
-    );
-}
-
-#[tokio::test]
-async fn ready_promotion_and_claim_succeed_in_backburner_repository() {
-    let (state, admin_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&admin_key),
-            r#"{"id":"sploot-freeze","title":"Freeze","acceptance":["proof"],"status":"backlog","repo":"sploot"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-
-    let promoted = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/sploot-freeze/status",
-            Some(&admin_key),
-            r#"{"status":"ready"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(promoted.status(), StatusCode::OK);
-    let promoted = response_json(promoted).await;
-    assert_eq!(promoted["status"], "ready");
-
-    let claimed = app
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/sploot-freeze/claim",
-            Some(&admin_key),
-            r#"{"agent":"agent-a","ttl_seconds":60}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(claimed.status(), StatusCode::OK);
-    let claimed = response_json(claimed).await;
-    assert_eq!(claimed["agent"], "agent-a");
-}
-
-#[tokio::test]
-async fn subscriptions_manage_signed_moved_to_ready_delivery() {
-    let (webhook_url, receiver) = spawn_webhook_capture(1, 200);
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state.clone());
-
-    let created_subscription = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/events/subscriptions",
-            Some(&raw_key),
-            &format!(r#"{{"url":"{webhook_url}","event_filter":["moved-to-ready"]}}"#),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created_subscription.status(), StatusCode::OK);
-    let created_subscription = response_json(created_subscription).await;
-    let signing_secret = created_subscription["signing_secret"].as_str().unwrap();
-    assert!(signing_secret.starts_with("whsec_powder_"));
-    let subscription_id = created_subscription["subscription"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let listed = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/events/subscriptions",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(listed.status(), StatusCode::OK);
-    let listed = response_json(listed).await;
-    assert_eq!(listed["subscriptions"][0]["id"], subscription_id);
-    assert!(
-        !listed.to_string().contains(signing_secret),
-        "list response must not disclose the signing secret"
-    );
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"hooked","title":"Hooked","acceptance":["proof"],"status":"backlog"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-
-    let status = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/hooked/status",
-            Some(&raw_key),
-            r#"{"status":"ready"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(status.status(), StatusCode::OK);
-
-    let attempted = deliver_due_webhooks_once(&state, unix_now() + 10)
-        .await
-        .unwrap();
-    assert_eq!(attempted, 1);
-
-    let received = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    let expected_signature = compute_signature(signing_secret, received.body.as_bytes()).unwrap();
-    assert_eq!(
-        received.signature.as_deref(),
-        Some(expected_signature.as_str())
-    );
-    assert_eq!(received.json["schema_version"], "powder.card_event.v1");
-    assert_eq!(received.json["event_type"], "moved-to-ready");
-    assert_eq!(received.json["card"]["status"], "ready");
-
-    let disabled = app
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/events/subscriptions/{subscription_id}/disable"),
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(disabled.status(), StatusCode::OK);
-    let disabled = response_json(disabled).await;
-    assert!(disabled["disabled_at"].is_number());
 }
 
 #[tokio::test]
@@ -2945,150 +1751,53 @@ async fn sse_tail_replays_card_events_as_event_stream() {
     assert!(body.contains("event: moved-to-ready"));
     assert!(body.contains(r#""schema_version":"powder.card_event.v1""#));
 }
-
 #[tokio::test]
-async fn forced_webhook_failures_retry_to_dead_letter_view() {
-    // 6 attempts total on the extended backoff schedule (1s, 4s, 16s, 64s,
-    // 256s between attempts; see `WEBHOOK_MAX_ATTEMPTS`).
-    let (webhook_url, receiver) = spawn_webhook_capture(6, 500);
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state.clone());
-
-    let created_subscription = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/events/subscriptions",
-            Some(&raw_key),
-            &format!(r#"{{"url":"{webhook_url}","event_filter":["completed"]}}"#),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created_subscription.status(), StatusCode::OK);
-
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"dlq-card","title":"DLQ Card","acceptance":["proof"],"status":"ready"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(created.status(), StatusCode::OK);
-
-    let completed = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/dlq-card/complete",
-            Some(&raw_key),
-            "{}",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(completed.status(), StatusCode::OK);
-
-    let base = unix_now() + 10;
-    for offset in [0_i64, 1, 5, 21, 85, 341] {
-        assert_eq!(
-            deliver_due_webhooks_once(&state, base + offset)
-                .await
-                .unwrap(),
-            1,
-            "delivery should be due at offset {offset}s"
-        );
-    }
-    for _ in 0..6 {
-        let received = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(received.json["event_type"], "completed");
-    }
-
-    let dead = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/events/dead-letter",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(dead.status(), StatusCode::OK);
-    let dead = response_json(dead).await;
-    assert_eq!(dead["dead_letters"][0]["event_type"], "completed");
-    assert_eq!(dead["dead_letters"][0]["attempt_count"], 6);
-    assert_eq!(dead["dead_letters"][0]["last_status"], 500);
-
-    // Non-admin callers cannot replay dead letters.
+async fn live_sse_stops_after_bearer_key_revocation() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
     let agent_key = state
         .store
         .lock()
         .unwrap()
-        .create_api_key("codex", ApiKeyScope::Agent, 1)
-        .unwrap()
-        .raw_key;
-    let forbidden = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/events/dead-letter/replay",
-            Some(&agent_key),
-            "{}",
-        ))
-        .await
+        .create_api_key("tail-agent", ApiKeyScope::Agent, 2)
         .unwrap();
-    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    let app = app(state.clone());
 
-    // An admin replay requeues the dead letter; it shows up as due again
-    // and is gone from the dead-letter view.
-    let replayed = app
+    let response = app
         .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/events/dead-letter/replay",
-            Some(&raw_key),
-            "{}",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(replayed.status(), StatusCode::OK);
-    let replayed = response_json(replayed).await;
-    assert_eq!(replayed["replayed"], 1);
-
-    let dead_after = app
         .oneshot(json_request(
             Method::GET,
-            "/api/v1/events/dead-letter",
-            Some(&raw_key),
+            "/api/v1/events/tail?live=true",
+            Some(&agent_key.raw_key),
             "",
         ))
         .await
         .unwrap();
-    let dead_after = response_json(dead_after).await;
-    assert_eq!(dead_after["dead_letters"].as_array().unwrap().len(), 0);
-    assert_eq!(
-        deliver_due_webhooks_once(&state, base + 341).await.unwrap(),
-        1,
-        "replayed delivery should be immediately due again"
-    );
-}
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_task = tokio::spawn(response_text(response));
 
-#[test]
-fn demo_style_receiver_rejects_bad_signature() {
-    let (url, receiver) = spawn_verifying_webhook("receiver-secret");
-    let err = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .set(SIGNATURE_HEADER, "sha256=bad")
-        .send_string(r#"{"schema_version":"powder.card_event.v1"}"#)
-        .unwrap_err();
-    match err {
-        ureq::Error::Status(status, _) => assert_eq!(status, 401),
-        other => panic!("expected 401 rejection, got {other}"),
-    }
-    let received = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(received.signature.as_deref(), Some("sha256=bad"));
+    state
+        .store
+        .lock()
+        .unwrap()
+        .revoke_api_key(&agent_key.id, 3)
+        .unwrap();
+    let after_revoke = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards",
+            Some(&admin_key),
+            r#"{"id":"stream-after-revoke","title":"must not stream","acceptance":["proof"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after_revoke.status(), StatusCode::OK);
+
+    let body = tokio::time::timeout(std::time::Duration::from_secs(3), body_task)
+        .await
+        .expect("revoked live stream must terminate promptly")
+        .expect("stream task must finish");
+    assert!(body.contains("authentication required"));
+    assert!(!body.contains("stream-after-revoke"));
 }
 
 #[tokio::test]
@@ -3114,9 +1823,7 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
         "/api/v1/cards/ready",
         "/api/v1/cards",
         "/api/v1/cards?status=ready",
-        "/api/v1/approvals",
         "/api/v1/cards/board-readable",
-        "/api/v1/board/rollups",
     ] {
         let response = app
             .clone()
@@ -3134,31 +1841,11 @@ async fn api_key_mode_serves_read_routes_without_bearer_for_private_board() {
             StatusCode::OK,
             "POWDER_PUBLIC_READS=true board read route {route} should not need a bearer token"
         );
-        if route == "/api/v1/approvals" {
-            let body = response_text(response).await;
-            assert!(body.contains("\"approvals\":[]") || body.contains("\"approvals\": []"));
-        } else if route == "/api/v1/board/rollups" {
-            // Parentless cards intentionally aggregate into a General row with
-            // no card id; prove this seeded card is accounted for semantically.
-            let page = response_json(response).await;
-            assert_eq!(page["total_count"], 1);
-            assert_eq!(page["coverage"]["total_cards"], 1);
-            assert_eq!(page["coverage"]["accounted_cards"], 1);
-            assert_eq!(page["coverage"]["unsorted_cards"], 1);
-            let ready_cards: u64 = page["rollups"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|row| row["status_counts"]["ready"].as_u64().unwrap_or_default())
-                .sum();
-            assert_eq!(ready_cards, 1);
-        } else {
-            let body = response_text(response).await;
-            assert!(
-                body.contains("board-readable"),
-                "read route {route} should expose the seeded card"
-            );
-        }
+        let body = response_text(response).await;
+        assert!(
+            body.contains("board-readable"),
+            "read route {route} should expose the seeded card"
+        );
     }
 }
 
@@ -3194,10 +1881,9 @@ async fn board_shell_serves_from_root_board_and_card_routes_without_auth() {
     // claiming /data/powder.db for every instance (design-critic finding,
     // 2026-08-03).
     assert!(root.contains("powder key-create --db &lt;path-to-powder.db&gt; --name operator"));
-    assert!(root.contains(r#"id="settings-toggle""#));
-    assert!(root.contains(r#"id="repo-settings-list""#));
+    assert!(root.contains(r#"id="quick-add-toggle""#));
+    assert!(root.contains(r#"id="filter-toggle""#));
     assert!(root.contains(r#"id="powder-card-app""#));
-    assert!(root.contains(r#"data-pw-route"#));
     assert!(root.contains(r#"id="i-dot""#));
     assert!(root.contains(r#"id="i-proof""#));
     assert!(!root.contains(r#"id="api-key-toggle""#));
@@ -3322,7 +2008,7 @@ async fn board_assets_are_served_with_specific_content_types() {
         "card rows must link to /c/{{card_id}} for Bridge deep links"
     );
     assert!(
-        script.contains("function loadCardRoute(options = {})"),
+        script.contains("async function loadCardRoute("),
         "card detail routes must render from the same static asset"
     );
     assert!(script.contains("function classifyFailure("));
@@ -3332,17 +2018,10 @@ async fn board_assets_are_served_with_specific_content_types() {
     assert!(script.contains("function acceptanceHTML("));
     assert!(script.contains("function proofEvidenceHTML("));
     assert!(script.contains("proof_plan"));
-    assert!(script.contains("proof_links"));
     assert!(script.contains("BOARD_STATE_KEY"));
-    assert!(script.contains("function renderRepositorySettings("));
-    assert!(script.contains("function canonicalRepoLabel("));
     assert!(script.contains("function relationBadges("));
-    // powder-903: the board <-> backlog <-> both view switch is a plain CSS
-    // transition (see powder-board.css) driven by one instant style write,
-    // not a per-frame JS animation loop.
-    assert!(script.contains("function setRailShare("));
-    assert!(script.contains("function setView("));
-    assert!(!script.contains("function animateRailShare("));
+    assert!(script.contains("async function drainCards("));
+    assert!(script.contains("function setLane("));
     assert!(script.contains("write key needed"));
     assert!(!script.contains("read-only"));
 
@@ -3357,12 +2036,9 @@ async fn board_assets_are_served_with_specific_content_types() {
         .await
         .unwrap();
     let css = response_text(css).await;
-    assert!(css.contains("--pw-rail-share: 24%;"));
-    assert!(css.contains(
-        "grid-template-columns: minmax(0, var(--pw-rail-share)) minmax(0, calc(100% - var(--pw-rail-share)));"
-    ));
-    assert!(css.contains(".pw-auth[hidden]"));
-    assert!(css.contains(".pw-repo-row"));
+    assert!(css.contains("grid-template-columns: minmax(12rem, 24%) 1fr;"));
+    assert!(css.contains(".pw-panel[hidden]"));
+    assert!(css.contains(".pw-card"));
     assert!(css.contains(".pw-rel-badge"));
     assert!(css.contains(".pw-detail-app"));
     assert!(css.contains(".pw-detail-grid"));
@@ -3707,19 +2383,17 @@ async fn append_work_log_appears_in_get_card_immediately() {
             Method::POST,
             "/api/v1/cards/worklogged/work-log",
             Some(&raw_key),
-            r#"{"agent":"sonnet-powder-943","model":"claude-sonnet-5","reasoning":"high","harness":"Claude Code","body":"digging into the schema"}"#,
+            r#"{"agent":"sonnet-powder-943","body":"digging into the schema"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(entry.status(), StatusCode::OK);
     let entry = response_json(entry).await;
     assert_eq!(entry["agent"], "sonnet-powder-943");
-    assert_eq!(entry["model"], "claude-sonnet-5");
     assert_eq!(entry["body"], "digging into the schema");
 
-    // Missing the one required attribution field (`agent`) hits the same
-    // 422 legibility bar as any other required JSON field on this API
-    // (powder-943 criterion 2, mirroring the comments route's author/body).
+    // Missing `agent` hits the same 422 legibility bar as other required
+    // fields.
     let missing_agent = app
         .clone()
         .oneshot(json_request(
@@ -3754,22 +2428,20 @@ async fn api_get_card_defaults_to_concise_and_accepts_detailed_detail() {
         let mut store = lock_store(&state).unwrap();
         let card_id = CardId::new("api-worklog-heavy").unwrap();
         store
-            .import_cards(vec![Card::new(
-                card_id.clone(),
-                "API worklog heavy",
-                "body",
+            .upsert_card(
+                Card::new(card_id.clone(), "API worklog heavy", "body")
+                    .unwrap()
+                    .with_status(CardStatus::Ready)
+                    .with_acceptance(["proof exists".to_string()])
+                    .with_created_at(1),
             )
-            .unwrap()
-            .with_status(CardStatus::Ready)
-            .with_acceptance(["proof exists".to_string()])
-            .with_created_at(1)])
             .unwrap();
         for index in 0..55 {
             store
                 .append_work_log(
                     &card_id,
                     "codex",
-                    powder_store::WorkLogAttribution::default(),
+                    None,
                     &format!("entry-{index:02}"),
                     100 + index,
                 )
@@ -4131,6 +2803,31 @@ async fn admin_key_claim_without_explicit_agent_is_rejected_not_silently_self_as
     assert_eq!(detail["card"]["status"], "ready");
     assert!(detail["card"].get("claim").is_none());
 }
+#[tokio::test]
+async fn claim_rejects_retired_principal_field() {
+    let (state, admin_key) = test_state(AuthMode::ApiKey);
+    let app = app(state);
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/claim-principal-field",
+            Some(&admin_key),
+            r#"{"id":"claim-principal-field","title":"t","acceptance":["x"],"status":"ready"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/cards/claim-principal-field/claim",
+            Some(&admin_key),
+            r#"{"agent":"codex","principal":"retired","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
 
 #[tokio::test]
 async fn api_key_auth_allows_claim_renew_heartbeat_and_release() {
@@ -4452,38 +3149,6 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
         .unwrap();
     assert_eq!(input.status(), StatusCode::OK);
 
-    let linked = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/api-answer/links",
-            Some(&raw_key),
-            r#"{"label":"approval/packet","url":"https://example.test/packet"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(linked.status(), StatusCode::OK);
-
-    let approvals = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/approvals",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(approvals.status(), StatusCode::OK);
-    let approvals = response_json(approvals).await;
-    assert_eq!(approvals["approvals"][0]["card_id"], "api-answer");
-    assert_eq!(approvals["approvals"][0]["run_id"], run_id);
-    assert_eq!(approvals["approvals"][0]["question"], "Approve completion?");
-    assert_eq!(
-        approvals["approvals"][0]["packet_links"][0]["url"],
-        "https://example.test/packet"
-    );
-
     let awaiting = app
         .clone()
         .oneshot(
@@ -4538,22 +3203,6 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
         .unwrap();
     assert_eq!(answer.status(), StatusCode::OK);
 
-    let approvals = app
-        .clone()
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/approvals",
-            Some(&raw_key),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(approvals.status(), StatusCode::OK);
-    assert!(response_json(approvals).await["approvals"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-
     let run = app
         .oneshot(
             Request::builder()
@@ -4586,11 +3235,11 @@ async fn http_answer_loop_reads_and_resumes_awaiting_input() {
 }
 
 #[tokio::test]
-async fn parent_route_links_children_and_detail_returns_epic_state() {
+async fn parent_route_links_children_and_detail_returns_children() {
     let (state, admin_key) = test_state(AuthMode::ApiKey);
     let app = app(state);
 
-    for (id, title) in [("epic-http", "Epic"), ("child-http-b", "Child B")] {
+    for (id, title) in [("parent-http", "Parent"), ("child-http-b", "Child B")] {
         let created = app
             .clone()
             .oneshot(json_request(
@@ -4606,40 +3255,36 @@ async fn parent_route_links_children_and_detail_returns_epic_state() {
         assert_eq!(created.status(), StatusCode::OK);
     }
 
-    // Born decomposed: parent set at creation.
     let born = app
         .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards",
             Some(&admin_key),
-            r#"{"id":"child-http-a","title":"Child A","acceptance":["proof"],"status":"ready","parent":"epic-http"}"#,
+            r#"{"id":"child-http-a","title":"Child A","acceptance":["proof"],"status":"ready","parent":"parent-http"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(born.status(), StatusCode::OK);
 
-    // Linked after the fact via the parent route.
     let linked = app
         .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/cards/child-http-b/parent",
             Some(&admin_key),
-            r#"{"parent":"epic-http"}"#,
+            r#"{"parent":"parent-http"}"#,
         ))
         .await
         .unwrap();
     assert_eq!(linked.status(), StatusCode::OK);
-    let linked = response_json(linked).await;
-    assert_eq!(linked["parent"], "epic-http");
+    assert_eq!(response_json(linked).await["parent"], "parent-http");
 
-    // A cycle is rejected.
     let cycle = app
         .clone()
         .oneshot(json_request(
             Method::POST,
-            "/api/v1/cards/epic-http/parent",
+            "/api/v1/cards/parent-http/parent",
             Some(&admin_key),
             r#"{"parent":"child-http-a"}"#,
         ))
@@ -4647,34 +3292,10 @@ async fn parent_route_links_children_and_detail_returns_epic_state() {
         .unwrap();
     assert_eq!(cycle.status(), StatusCode::CONFLICT);
 
-    // Complete one child, then the parent read carries children + packet.
-    let claimed = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/child-http-a/claim",
-            Some(&admin_key),
-            r#"{"agent":"lane-a","ttl_seconds":600}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(claimed.status(), StatusCode::OK);
-    let completed = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/child-http-a/complete",
-            Some(&admin_key),
-            r#"{"proof":"merged and verified"}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(completed.status(), StatusCode::OK);
-
     let detail = app
         .oneshot(json_request(
             Method::GET,
-            "/api/v1/cards/epic-http?detail=detailed",
+            "/api/v1/cards/parent-http?detail=detailed",
             Some(&admin_key),
             "",
         ))
@@ -4683,22 +3304,6 @@ async fn parent_route_links_children_and_detail_returns_epic_state() {
     let detail = response_json(detail).await;
     assert_eq!(detail["children_total"], 2);
     assert_eq!(detail["children"].as_array().unwrap().len(), 2);
-    assert_eq!(detail["epic_state"]["children_total"], 2);
-    assert_eq!(detail["epic_state"]["status_counts"]["done"], 1);
-    assert!(detail["epic_state"]["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|entry| entry["reference"] == "merged and verified"
-            && entry["child_id"] == "child-http-a"));
-    // Child completion cannot complete the epic; drift is surfaced, not
-    // forbidden.
-    assert_eq!(detail["card"]["status"], "ready");
-    assert!(detail["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|event| event["event_type"] == "rollup"));
 }
 
 #[tokio::test]
@@ -4793,10 +3398,10 @@ async fn agent_scoped_key_can_patch_card_fields_and_the_patch_is_audited() {
     assert!(detail["events"].as_array().unwrap().iter().any(|event| {
         event["event_type"] == "patch"
             && event["actor"] == "lead-daybook"
-            && event["payload"]
-                .as_str()
-                .unwrap()
-                .contains("title, body, acceptance, priority")
+            && event["change"].to_string().contains("title")
+            && event["change"].to_string().contains("body")
+            && event["change"].to_string().contains("acceptance")
+            && event["change"].to_string().contains("priority")
     }));
 }
 
@@ -4958,17 +3563,48 @@ async fn admin_can_list_and_revoke_a_key_which_then_loses_access_immediately() {
         .unwrap();
     assert_eq!(still_works.status(), StatusCode::OK);
 
+    let revoke_uri = format!("/api/v1/keys/{agent_key_id}/revoke");
     let revoked = app
         .clone()
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/keys/{agent_key_id}/revoke"),
-            Some(&admin_key),
-            "{}",
-        ))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&revoke_uri)
+                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
+                .header("Idempotency-Key", "revoke-agent-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::OK);
+    let replay = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&revoke_uri)
+                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
+                .header("Idempotency-Key", "revoke-agent-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let missing_header = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&revoke_uri)
+                .header(AUTHORIZATION, format!("Bearer {admin_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_header.status(), StatusCode::BAD_REQUEST);
 
     let rejected = app
         .oneshot(json_request(
@@ -5240,7 +3876,7 @@ async fn non_holder_agent_key_cannot_mutate_lease_or_card_corrections() {
     let detail = response_json(detail).await;
     assert_eq!(detail["card"]["status"], "in_progress");
     assert!(!detail["events"].as_array().unwrap().iter().any(|event| {
-        event["actor"] == "intruder" && event["payload"].to_string().contains("done")
+        event["actor"] == "intruder" && event["change"].to_string().contains("done")
     }));
 }
 
@@ -5265,8 +3901,8 @@ async fn healthz_readyz_and_onboarding_are_unauthenticated_and_never_leak_the_db
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "{path} must stay reachable without a bearer token (Fly's own health \
-             checker and first-run onboarding both run before any key exists)"
+            "{path} must stay reachable without a bearer token (health probes and first-run \
+             onboarding run before any key exists)"
         );
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8_lossy(&bytes);
@@ -5304,135 +3940,12 @@ async fn readyz_reports_every_gate_when_healthy() {
         body["schema_version_expected"],
         powder_store::SCHEMA_VERSION
     );
-    assert_eq!(body["dead_letter_count"], 0);
-    assert_eq!(
-        body["dead_letter_threshold"],
-        DEFAULT_READYZ_DEAD_LETTER_THRESHOLD
-    );
     assert_eq!(body["poison_count"], 0);
     // powder-workstation-cli-convergence: `powder version` compares these
     // against the installed CLI's own build sha to surface a DRIFT warning;
     // prove they are the real compile-time constants, not placeholders.
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["git_sha"], env!("POWDER_SERVER_GIT_SHA"));
-}
-
-/// The dead-letter backlog gate trips `/readyz` to 503 once the count meets
-/// (not just exceeds) the configured threshold -- `POWDER_READYZ_DEAD_LETTER_
-/// THRESHOLD` set to 1 here so a single dead letter is enough to prove the
-/// comparison, rather than needing to drive 100 real deliveries to failure.
-#[tokio::test]
-async fn readyz_fails_when_dead_letter_backlog_meets_threshold() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let state = AppState {
-        config: Arc::new(Config {
-            dead_letter_ready_threshold: 1,
-            ..(*state.config).clone()
-        }),
-        store: state.store,
-        poison_count: state.poison_count,
-        event_watch: state.event_watch,
-    };
-    let app = app(state.clone());
-
-    let (webhook_url, _receiver) = spawn_webhook_capture(1, 500);
-    let created = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/events/subscriptions",
-            Some(&raw_key),
-            &format!(r#"{{"url":"{webhook_url}","event_filter":["completed"]}}"#),
-        ))
-        .await
-        .unwrap();
-    let subscription_id = response_json(created).await["subscription"]["id"]
-        .as_str()
-        .expect("subscription id")
-        .to_string();
-    app.clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"readyz-dlq","title":"Readyz DLQ","acceptance":["proof"],"status":"ready"}"#,
-        ))
-        .await
-        .unwrap();
-    app.clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards/readyz-dlq/complete",
-            Some(&raw_key),
-            "{}",
-        ))
-        .await
-        .unwrap();
-
-    // Drive the single delivery straight to dead-letter directly through
-    // the store, rather than replaying the full 6-attempt/341s HTTP
-    // backoff schedule already covered by
-    // `forced_webhook_failures_retry_to_dead_letter_view`.
-    {
-        let mut store = state.store.lock().unwrap();
-        let now = unix_now();
-        for due in store.due_webhook_deliveries(now, 10).unwrap() {
-            for attempt in 0..6 {
-                let _ = attempt;
-                store
-                    .record_webhook_delivery_failure(&due.id, Some(500), "forced", now)
-                    .unwrap();
-            }
-        }
-    }
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/readyz")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = response_json(response).await;
-    assert_eq!(body["ok"], false);
-    assert_eq!(body["dead_letter_count"], 1);
-    assert_eq!(body["dead_letter_threshold"], 1);
-
-    // Disabling the structurally broken subscription parks its dead
-    // letters: `replay_dead_letters` skips them and the delivery loop never
-    // drains them, so they are no longer operator-actionable and must stop
-    // tripping the readiness gate (observed live 2026-08-03: 87 parked
-    // letters on a DNS-dead receiver kept `/readyz` red forever).
-    let disabled = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            &format!("/api/v1/events/subscriptions/{subscription_id}/disable"),
-            Some(&raw_key),
-            "{}",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(disabled.status(), StatusCode::OK);
-    let recovered = app
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/readyz")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(recovered.status(), StatusCode::OK);
-    let recovered_body = response_json(recovered).await;
-    assert_eq!(recovered_body["ok"], true);
-    assert_eq!(recovered_body["dead_letter_count"], 0);
 }
 
 /// A poisoned store mutex is recovered (not fatal) -- ordinary routes keep
@@ -5483,42 +3996,6 @@ async fn poisoned_store_mutex_is_recovered_and_flagged_not_ready() {
     let body = response_json(response).await;
     assert_eq!(body["ok"], false);
     assert!(body["poison_count"].as_u64().unwrap() >= 1);
-}
-
-/// powder-942: the board's home affordance is driven by onboarding's
-/// `home_url`, absent by default and present when `POWDER_HOME_URL` is set --
-/// the board's JS decides whether to render a link at all from this field.
-#[tokio::test]
-async fn onboarding_surfaces_configured_home_url_and_omits_it_by_default() {
-    let (state, _) = test_state(AuthMode::None);
-    let without_home_url = app(state);
-    let response = without_home_url
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/onboarding")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = response_json(response).await;
-    assert!(body["home_url"].is_null());
-
-    let (state, _) = test_state_with_home_url(AuthMode::None, "https://sanctum.example.test");
-    let with_home_url = app(state);
-    let response = with_home_url
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/api/v1/onboarding")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = response_json(response).await;
-    assert_eq!(body["home_url"], "https://sanctum.example.test");
 }
 
 /// The board UI's `#auth-intro` banner (2026-07-16 dogfood: a stale static
@@ -5824,6 +4301,7 @@ async fn api_key_mode_public_reads_escape_hatch_allows_keyless_reads() {
     let app = app(state.clone());
 
     let keyless = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -5836,6 +4314,19 @@ async fn api_key_mode_public_reads_escape_hatch_allows_keyless_reads() {
     assert_eq!(keyless.status(), StatusCode::OK);
     let body = response_json(keyless).await;
     assert_eq!(body["cards"].as_array().unwrap().len(), 1);
+
+    let tail = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/events/tail")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tail.status(), StatusCode::OK);
+    assert!(response_text(tail).await.contains("pub-read"));
 }
 
 /// powder-public-read-posture, rider 1: authentication must run before body
@@ -6142,7 +4633,7 @@ async fn search_http_requires_auth_and_matches_cli_contract() {
     let found = app
         .oneshot(json_request(
             Method::GET,
-            "/api/v1/cards/search?q=needle&source_kind=cards&status=backlog&limit=1",
+            "/api/v1/cards/search?q=needle&status=backlog&limit=1",
             Some(&raw_key),
             "",
         ))
@@ -6168,14 +4659,10 @@ fn test_state_with_public_reads(auth_mode: AuthMode, public_reads: bool) -> (App
         config: Arc::new(Config {
             db_path: PathBuf::from(":memory:"),
             auth_mode,
-            public_base_url: None,
-            home_url: None,
-            bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
             bootstrap_key_file: None,
-            field_note: FieldNoteConfig::default(),
+            bind_addr: SocketAddr::from(([0_u16, 0, 0, 0, 0, 0, 0, 0], DEFAULT_PORT)),
             tailnet_proxy_secret: None,
             tailnet_admin_principals: vec!["operator".to_string()],
-            dead_letter_ready_threshold: DEFAULT_READYZ_DEAD_LETTER_THRESHOLD,
             public_reads,
         }),
         store: Arc::new(Mutex::new(store)),
@@ -6183,48 +4670,6 @@ fn test_state_with_public_reads(auth_mode: AuthMode, public_reads: bool) -> (App
         event_watch: tokio::sync::watch::channel(0i64).1,
     };
     (state, key.raw_key)
-}
-
-/// Same as [`test_state`], but with the field-note seed generator opted in --
-/// proves powder-921's HTTP path the same way a real deployed instance would
-/// see it, not just the `Store` unit tests.
-fn test_state_with_field_note(
-    auth_mode: AuthMode,
-    field_note: FieldNoteConfig,
-) -> (AppState, String) {
-    let (state, key) = test_state(auth_mode);
-    let store = Arc::into_inner(state.store)
-        .expect("sole owner before first request")
-        .into_inner()
-        .unwrap()
-        .with_field_note_config(field_note.clone());
-    let state = AppState {
-        config: Arc::new(Config {
-            field_note,
-            ..(*state.config).clone()
-        }),
-        store: Arc::new(Mutex::new(store)),
-        poison_count: state.poison_count,
-        event_watch: state.event_watch,
-    };
-    (state, key)
-}
-
-/// Same as [`test_state`], but with `POWDER_HOME_URL` configured -- proves
-/// powder-942's onboarding round trip against the HTTP path a real deployed
-/// instance's board JS actually reads.
-fn test_state_with_home_url(auth_mode: AuthMode, home_url: &str) -> (AppState, String) {
-    let (state, key) = test_state(auth_mode);
-    let state = AppState {
-        config: Arc::new(Config {
-            home_url: Some(home_url.to_string()),
-            ..(*state.config).clone()
-        }),
-        store: state.store,
-        poison_count: state.poison_count,
-        event_watch: state.event_watch,
-    };
-    (state, key)
 }
 
 /// `tailscale-header` auth state with the powder-tailnet-backstop knobs
@@ -6246,122 +4691,6 @@ fn test_state_with_tailnet_backstop(proxy_secret: Option<&str>, tailnet_admin: b
         poison_count: state.poison_count,
         event_watch: state.event_watch,
     }
-}
-
-#[derive(Debug)]
-struct CapturedWebhook {
-    signature: Option<String>,
-    body: String,
-    json: serde_json::Value,
-}
-
-fn spawn_webhook_capture(
-    count: usize,
-    response_status: u16,
-) -> (String, mpsc::Receiver<CapturedWebhook>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
-    let (sender, receiver) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        for stream in listener.incoming().take(count) {
-            let mut stream = stream.unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).unwrap();
-            let mut content_length = 0usize;
-            let mut signature = None;
-            loop {
-                let mut header = String::new();
-                reader.read_line(&mut header).unwrap();
-                if header == "\r\n" || header.is_empty() {
-                    break;
-                }
-                if let Some(value) = header.strip_prefix("Content-Length:") {
-                    content_length = value.trim().parse().unwrap();
-                }
-                let lower = header.to_ascii_lowercase();
-                if lower.starts_with("x-signature-256:") {
-                    signature = header
-                        .split_once(':')
-                        .map(|(_, value)| value.trim().to_string());
-                }
-            }
-            let mut body = vec![0; content_length];
-            reader.read_exact(&mut body).unwrap();
-            let body = String::from_utf8(body).unwrap();
-            sender
-                .send(CapturedWebhook {
-                    signature,
-                    json: serde_json::from_str(&body).unwrap(),
-                    body,
-                })
-                .unwrap();
-
-            let reason = if response_status == 200 {
-                "OK"
-            } else {
-                "Error"
-            };
-            let response = format!(
-                "HTTP/1.1 {response_status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        }
-    });
-
-    (url, receiver)
-}
-
-fn spawn_verifying_webhook(secret: &'static str) -> (String, mpsc::Receiver<CapturedWebhook>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
-    let (sender, receiver) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).unwrap();
-        let mut content_length = 0usize;
-        let mut signature = None;
-        loop {
-            let mut header = String::new();
-            reader.read_line(&mut header).unwrap();
-            if header == "\r\n" || header.is_empty() {
-                break;
-            }
-            if let Some(value) = header.strip_prefix("Content-Length:") {
-                content_length = value.trim().parse().unwrap();
-            }
-            let lower = header.to_ascii_lowercase();
-            if lower.starts_with("x-signature-256:") {
-                signature = header
-                    .split_once(':')
-                    .map(|(_, value)| value.trim().to_string());
-            }
-        }
-        let mut body = vec![0; content_length];
-        reader.read_exact(&mut body).unwrap();
-        let expected = compute_signature(secret, &body).unwrap();
-        let accepted = signature.as_deref() == Some(expected.as_str());
-        let body = String::from_utf8(body).unwrap();
-        sender
-            .send(CapturedWebhook {
-                signature,
-                json: serde_json::from_str(&body).unwrap_or_else(|_| json!({})),
-                body,
-            })
-            .unwrap();
-        let status = if accepted { 200 } else { 401 };
-        let reason = if accepted { "OK" } else { "Unauthorized" };
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
-        );
-        stream.write_all(response.as_bytes()).unwrap();
-    });
-
-    (url, receiver)
 }
 
 static TEST_IDEMPOTENCY_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -6513,310 +4842,4 @@ fn tailnet_mode_prefers_the_identity_header_over_a_bearer_token_when_both_are_pr
         actor.key_prefix.is_none(),
         "the identity header path must win, not the bearer-token fallback"
     );
-}
-
-#[tokio::test]
-async fn attachments_http_upload_fetch_round_trip_and_card_detail() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-    let create = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"attachment-round-trip","title":"attachments","acceptance":["x"]}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(create.status(), StatusCode::OK);
-
-    let bytes = b"synthetic-png-bytes".to_vec();
-    let upload = app
-        .clone()
-        .oneshot(raw_attachment_request(
-            Method::POST,
-            "/api/v1/cards/attachment-round-trip/attachments",
-            Some(&raw_key),
-            Some("attachment-upload-round-trip"),
-            "image/png",
-            Some("diagram.png"),
-            bytes.clone(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(upload.status(), StatusCode::OK);
-    let metadata = response_json(upload).await;
-    assert_eq!(metadata["filename"], "diagram.png");
-    assert_eq!(metadata["mime"], "image/png");
-    assert_eq!(metadata["size"], bytes.len());
-    assert!(metadata.get("created_at").is_none());
-    let attachment_id = metadata["id"].as_str().unwrap().to_owned();
-
-    let fetched = app
-        .clone()
-        .oneshot(authorized_empty_request(
-            Method::GET,
-            &format!("/api/v1/attachments/{attachment_id}"),
-            &raw_key,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(fetched.status(), StatusCode::OK);
-    assert_eq!(fetched.headers()[CONTENT_TYPE], "image/png");
-    assert_eq!(
-        fetched.headers()[CACHE_CONTROL],
-        "public, max-age=31536000, immutable"
-    );
-    let fetched_bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(fetched_bytes.as_ref(), bytes.as_slice());
-
-    let detail = app
-        .oneshot(authorized_empty_request(
-            Method::GET,
-            "/api/v1/cards/attachment-round-trip?detail=detailed",
-            &raw_key,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(detail.status(), StatusCode::OK);
-    let detail = response_json(detail).await;
-    assert_eq!(detail["attachments"][0]["id"], attachment_id);
-    assert_eq!(detail["attachments"][0]["filename"], "diagram.png");
-    assert_eq!(detail["attachments"][0]["mime"], "image/png");
-    assert_eq!(detail["attachments"][0]["size"], bytes.len());
-    assert!(detail["events"].as_array().unwrap().iter().any(|event| {
-        event["subject_kind"] == "attachment"
-            && event["subject_id"] == attachment_id
-            && event["principal"].is_string()
-    }));
-}
-
-#[tokio::test]
-async fn attachments_dedupe_across_cards_and_detach_garbage_collects_blob() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-    for id in ["attachment-dedupe-a", "attachment-dedupe-b"] {
-        let response = app
-            .clone()
-            .oneshot(json_request(
-                Method::POST,
-                "/api/v1/cards",
-                Some(&raw_key),
-                &format!(r#"{{"id":"{id}","title":"{id}","acceptance":["x"]}}"#),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-    let bytes = b"same-image".to_vec();
-    let first = app
-        .clone()
-        .oneshot(raw_attachment_request(
-            Method::POST,
-            "/api/v1/cards/attachment-dedupe-a/attachments",
-            Some(&raw_key),
-            Some("attachment-upload-dedupe-a"),
-            "image/webp",
-            Some("first.webp"),
-            bytes.clone(),
-        ))
-        .await
-        .unwrap();
-    let first = response_json(first).await;
-    let attachment_id = first["id"].as_str().unwrap().to_owned();
-    let second = app
-        .clone()
-        .oneshot(raw_attachment_request(
-            Method::POST,
-            "/api/v1/cards/attachment-dedupe-b/attachments",
-            Some(&raw_key),
-            Some("attachment-upload-dedupe-b"),
-            "image/webp",
-            Some("second.webp"),
-            bytes,
-        ))
-        .await
-        .unwrap();
-    let second = response_json(second).await;
-    assert_eq!(second["id"], attachment_id);
-
-    let detach_first = app
-        .clone()
-        .oneshot(authorized_keyed_empty_request(
-            Method::DELETE,
-            &format!("/api/v1/cards/attachment-dedupe-a/attachments/{attachment_id}"),
-            &raw_key,
-            "attachment-detach-dedupe-a",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(detach_first.status(), StatusCode::OK);
-    let shared_blob = app
-        .clone()
-        .oneshot(authorized_empty_request(
-            Method::GET,
-            &format!("/api/v1/attachments/{attachment_id}"),
-            &raw_key,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(shared_blob.status(), StatusCode::OK);
-
-    let detach_second = app
-        .clone()
-        .oneshot(authorized_keyed_empty_request(
-            Method::DELETE,
-            &format!("/api/v1/cards/attachment-dedupe-b/attachments/{attachment_id}"),
-            &raw_key,
-            "attachment-detach-dedupe-b",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(detach_second.status(), StatusCode::OK);
-    let collected = app
-        .oneshot(authorized_empty_request(
-            Method::GET,
-            &format!("/api/v1/attachments/{attachment_id}"),
-            &raw_key,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(collected.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn attachments_reject_oversize_and_non_image_mime() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-    let create = app
-        .clone()
-        .oneshot(json_request(
-            Method::POST,
-            "/api/v1/cards",
-            Some(&raw_key),
-            r#"{"id":"attachment-bounds","title":"attachments","acceptance":["x"]}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(create.status(), StatusCode::OK);
-    let oversize = app
-        .clone()
-        .oneshot(raw_attachment_request(
-            Method::POST,
-            "/api/v1/cards/attachment-bounds/attachments",
-            Some(&raw_key),
-            Some("attachment-upload-oversize"),
-            "image/png",
-            None,
-            vec![0_u8; 10 * 1024 * 1024 + 1],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(oversize.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let bad_mime = app
-        .oneshot(raw_attachment_request(
-            Method::POST,
-            "/api/v1/cards/attachment-bounds/attachments",
-            Some(&raw_key),
-            Some("attachment-upload-bad-mime"),
-            "text/plain",
-            None,
-            b"not-an-image".to_vec(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(bad_mime.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-}
-
-#[tokio::test]
-async fn attachments_require_auth_and_report_unknown_resources() {
-    let (state, raw_key) = test_state(AuthMode::ApiKey);
-    let app = app(state);
-    let unauthenticated = app
-        .clone()
-        .oneshot(raw_attachment_request(
-            Method::POST,
-            "/api/v1/cards/missing/attachments",
-            None,
-            None,
-            "image/png",
-            None,
-            b"bytes".to_vec(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
-    let unknown_card = app
-        .clone()
-        .oneshot(raw_attachment_request(
-            Method::POST,
-            "/api/v1/cards/missing/attachments",
-            Some(&raw_key),
-            Some("attachment-upload-unknown-card"),
-            "image/png",
-            None,
-            b"bytes".to_vec(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(unknown_card.status(), StatusCode::NOT_FOUND);
-    let unknown_attachment = app
-        .oneshot(authorized_empty_request(
-            Method::GET,
-            "/api/v1/attachments/does-not-exist",
-            &raw_key,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(unknown_attachment.status(), StatusCode::NOT_FOUND);
-}
-
-fn raw_attachment_request(
-    method: Method,
-    uri: &str,
-    raw_key: Option<&str>,
-    idempotency_key: Option<&str>,
-    mime: &str,
-    filename: Option<&str>,
-    bytes: Vec<u8>,
-) -> Request<Body> {
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("Content-Type", mime);
-    if let Some(filename) = filename {
-        builder = builder.header("X-Attachment-Filename", filename);
-    }
-    if let Some(raw_key) = raw_key {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {raw_key}"));
-    }
-    if let Some(idempotency_key) = idempotency_key {
-        builder = builder.header("Idempotency-Key", idempotency_key);
-    }
-    builder.body(Body::from(bytes)).unwrap()
-}
-
-fn authorized_empty_request(method: Method, uri: &str, raw_key: &str) -> Request<Body> {
-    Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(AUTHORIZATION, format!("Bearer {raw_key}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
-fn authorized_keyed_empty_request(
-    method: Method,
-    uri: &str,
-    raw_key: &str,
-    idempotency_key: &str,
-) -> Request<Body> {
-    Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(AUTHORIZATION, format!("Bearer {raw_key}"))
-        .header("Idempotency-Key", idempotency_key)
-        .body(Body::empty())
-        .unwrap()
 }

@@ -1,17 +1,16 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
 };
 
 use powder_core::{
-    canonical_repo_label, canonical_repo_matches, repo_from_numeric_card_id_prefix,
-    AcceptanceCriterion, Activity, ActivityId, ActivityType, AttachmentMeta, Authority, Card,
-    CardEvent, CardEventId, CardId, CardSource, CardStatus, CardSummary, Claim, ClaimReceipt,
-    Comment, CriterionProof, DenialClass, DomainError, EpicFreshness, EpicState, Estimate, Link,
-    LinkId, Operation, Priority, ReadyCursor, ReadyQuery, Risk, Run, RunId, RunState, WorkLogEntry,
+    AcceptanceCriterion, Activity, ActivityId, ActivityType, Authority, Card, CardEvent,
+    CardEventChange, CardEventId, CardEventType, CardId, CardStatus, CardSummary, Claim,
+    ClaimReceipt, Comment, CriterionProof, DenialClass, DomainError, Link, LinkId, Operation,
+    Priority, ReadyCursor, ReadyQuery, Run, RunId, RunState, WorkLogEntry,
 };
 use rusqlite::{
     functions::{Context, FunctionFlags},
@@ -27,37 +26,19 @@ mod answer_loop;
 mod events;
 mod identity;
 mod relations;
-mod repositories;
 mod schema;
 mod secrets;
-mod telemetry;
 #[cfg(test)]
 mod tests;
 
-pub use events::{
-    CardEventEnvelope, DeadLetterDelivery, EventSubscription, EventSubscriptionCreated,
-    EventTailItem, WebhookDelivery, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES,
-};
+pub use events::{CardEventEnvelope, EventTailItem, CARD_EVENT_SCHEMA_VERSION, EVENT_TYPES};
 pub use identity::{ApiKeyCreated, ApiKeyScope, ApiKeySummary, VerifiedApiKey};
 use relations::{list_delta, mirror_delta_with_authority, mirror_initial_relations_with_authority};
 pub use relations::{
-    ParentCoverageAssignment, ParentCoverageBucket, ParentCoverageReport, ParentDoctorIssue,
-    ParentGraphReport, ParentIssueKind, RelationField, RelationIssueKind, RelationsDoctorIssue,
-    RelationsDoctorReport,
+    ParentDoctorIssue, ParentGraphReport, ParentIssueKind, RelationField, RelationIssueKind,
+    RelationsDoctorIssue, RelationsDoctorReport,
 };
-use repositories::{resolve_registered_repository_for_write, resolve_repository_name};
-pub use repositories::{
-    RepositoryDoctorEntry, RepositoryDoctorReport, RepositoryMergeOutcome,
-    RepositoryNormalizeChange, RepositoryNormalizeOutcome, RepositorySummary, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility,
-};
-/// The current on-disk schema version `Store::migrate` converges to.
-/// Public so a caller (`/readyz`'s schema-match gate is the motivating one)
-/// can compare a database's actual `schema_version()` against what this
-/// build of `powder-store` expects, rather than only being able to ask "did
-/// migration succeed" after the fact.
 pub use schema::SCHEMA_VERSION;
-pub use telemetry::{PricingConfig, PricingRate};
 
 use schema::{
     CARD_COLUMNS, CARD_SELECT_ALL_SQL, CARD_SELECT_SQL, MIGRATE_10_TO_11, MIGRATE_11_TO_12,
@@ -99,7 +80,6 @@ pub enum StoreError {
 
 pub struct Store {
     connection: Connection,
-    field_note_config: Option<FieldNoteConfig>,
 }
 
 /// Durable request identity for a keyed mutation. The digest is computed from
@@ -179,16 +159,10 @@ impl<'a> KeyedOperationContext<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     pub q: String,
-    pub source_kind: Option<String>,
-    pub source_field: Option<String>,
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
     pub label: Option<String>,
     pub priority: Option<Priority>,
-    pub estimate: Option<Estimate>,
-    pub risk: Option<Risk>,
-    pub source_created_after: Option<i64>,
-    pub source_created_before: Option<i64>,
     pub created_after: Option<i64>,
     pub created_before: Option<i64>,
     pub updated_after: Option<i64>,
@@ -196,7 +170,6 @@ pub struct SearchQuery {
     pub limit: usize,
     pub after: Option<String>,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchResult {
     pub card: CardSummary,
@@ -215,21 +188,6 @@ pub struct SearchPage {
     pub has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_after: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EpicVelocityPeriod {
-    pub period_start: i64,
-    pub period_end: i64,
-    pub completed_children: usize,
-    pub abandoned_children: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EpicVelocity {
-    pub card_id: CardId,
-    pub period_days: u64,
-    pub periods: Vec<EpicVelocityPeriod>,
 }
 
 /// Validates every schema-v17 key-to-actor mapping before the migration can
@@ -292,60 +250,11 @@ fn preflight_schema_17_key_actors(transaction: &Transaction<'_>) -> Result<()> {
     }
 }
 
-/// Config for the field-note seed generator (powder-921, content-harness
-/// epic misty-step-912, generator #1): on a qualifying completion, spawn
-/// exactly one draft card carrying the `proof` field verbatim as raw
-/// drafting material. `None` (the default for every `Store` unless a
-/// deployment opts in via [`Store::with_field_note_config`]) means the
-/// generator never runs -- self-hosters of Powder who never configure this
-/// see no behavior change from completing a card.
-///
-/// Both gates are deterministic per the content-harness design law
-/// (misty-step-912): eligibility is never a model judgment call, only
-/// `repo_allowlist` membership, a proof length floor, and a hard weekly cap.
-#[derive(Debug, Clone, Default)]
-pub struct FieldNoteConfig {
-    /// Canonical repo names (as returned by `card.repo`) eligible to spawn
-    /// drafts. A card with no repo, or a repo not in this list, never
-    /// qualifies -- there is no "surprise" way to start narrating a repo.
-    pub repo_allowlist: Vec<String>,
-    /// Minimum trimmed character count of the `proof` field for it to count
-    /// as substantive raw material rather than a bare link or "done".
-    pub proof_min_chars: usize,
-    /// Hard cap on drafts spawned by this generator in the trailing 7 days.
-    /// Once reached, further qualifying completions produce nothing until
-    /// the window rolls forward -- the discard-unseen half of the design
-    /// law's weekly budget, enforced here rather than left to the review
-    /// queue to triage after the fact.
-    pub weekly_budget: usize,
-}
-
-/// One week in seconds, for the field-note weekly budget window.
-const FIELD_NOTE_BUDGET_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
-
-/// The dedicated pseudo-repo every content-harness generator's drafts land
-/// in, regardless of the source card's own repo -- "one review queue every
-/// generator feeds" (misty-step-912) is implemented as one shared, filterable
-/// repo tag rather than a bespoke queue table.
-const FIELD_NOTE_REVIEW_REPO: &str = "content";
-
-/// The label that marks a card as a content-harness draft. Combined with
-/// always-empty `acceptance`, this is what keeps drafts out of `list_ready`:
-/// [`Card::is_ready_at`] already refuses any card with no acceptance
-/// criteria, so a draft can never be claimed or dispatched without a second
-/// exclusion mechanism to keep in sync.
-const FIELD_NOTE_DRAFT_LABEL: &str = "field-note-draft";
-
-/// Filter for [`Store::list_cards`]: `None` on either field means
-/// unfiltered on that dimension. `include_terminal` controls whether
-/// `Done`/`Shipped`/`Abandoned` cards are included when no explicit `status`
-/// is requested. An explicit status always wins, and the default includes
-/// terminal cards so the CLI and HTTP list the whole board.
+/// Filter for [`Store::list_cards`].
 #[derive(Debug, Clone)]
 pub struct CardFilter {
     pub status: Option<CardStatus>,
     pub repo: Option<String>,
-    pub estimate: Option<Estimate>,
     pub label: Option<String>,
     pub include_terminal: bool,
 }
@@ -355,14 +264,12 @@ impl Default for CardFilter {
         CardFilter {
             status: None,
             repo: None,
-            estimate: None,
             label: None,
             include_terminal: true,
         }
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CardListPage {
     pub cards: Vec<Card>,
     pub total_count: usize,
@@ -404,152 +311,6 @@ pub struct CardListPage {
     pub ready_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct BoardStatsQuery {
-    pub repo: Option<String>,
-    pub include_hidden: bool,
-    pub now: i64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct BoardStats {
-    pub totals: BoardStatsCounts,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub repos: Vec<BoardStatsRepo>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct BoardStatsRepo {
-    pub repo: Option<String>,
-    #[serde(flatten)]
-    pub counts: BoardStatsCounts,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct BoardStatsCounts {
-    pub cards: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub backlog: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub ready: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub in_progress: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub awaiting_input: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub done: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub shipped: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub abandoned: usize,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub active_claims: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BoardRollupStatusCounts(pub BTreeMap<String, usize>);
-
-impl std::ops::Deref for BoardRollupStatusCounts {
-    type Target = BTreeMap<String, usize>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Serialize for BoardRollupStatusCounts {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-        const KNOWN: [&str; 7] = [
-            "backlog",
-            "ready",
-            "in_progress",
-            "awaiting_input",
-            "done",
-            "shipped",
-            "abandoned",
-        ];
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for key in KNOWN {
-            if let Some(value) = self.0.get(key) {
-                map.serialize_entry(key, value)?;
-            }
-        }
-        for (key, value) in &self.0 {
-            if !KNOWN.contains(&key.as_str()) {
-                map.serialize_entry(key, value)?;
-            }
-        }
-        map.end()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BoardRollup {
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub card_id: Option<CardId>,
-    pub repo: Option<String>,
-    pub title: String,
-    pub status_counts: BoardRollupStatusCounts,
-    pub criteria_checked: usize,
-    pub criteria_total: usize,
-    pub active_claims: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub freshness: Option<EpicFreshness>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct BoardRollupCoverage {
-    pub total_cards: usize,
-    pub accounted_cards: usize,
-    pub root_epics: usize,
-    pub unsorted_cards: usize,
-    pub parent_issue_count: usize,
-    pub complete: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct BoardRollups {
-    pub rollups: Vec<BoardRollup>,
-    pub total_count: usize,
-    pub has_more: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_after: Option<String>,
-    pub coverage: BoardRollupCoverage,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct BoardRollupsQuery {
-    pub limit: usize,
-    pub after: Option<String>,
-    pub now: i64,
-    pub include_hidden: bool,
-}
-
-impl BoardStatsCounts {
-    fn add(&mut self, status: CardStatus, cards: usize, active_claims: usize) {
-        self.cards += cards;
-        self.active_claims += active_claims;
-        match status {
-            CardStatus::Backlog => self.backlog += cards,
-            CardStatus::Ready => self.ready += cards,
-            CardStatus::InProgress => self.in_progress += cards,
-            CardStatus::AwaitingInput => self.awaiting_input += cards,
-            CardStatus::Done => self.done += cards,
-            CardStatus::Shipped => self.shipped += cards,
-            CardStatus::Abandoned => self.abandoned += cards,
-        }
-    }
-}
-
-fn is_zero(value: &usize) -> bool {
-    *value == 0
-}
-
 /// Wall-clock seconds, for migration-generated timestamps only. Every
 /// domain-facing write threads `now` in from its caller (so tests stay
 /// deterministic); `migrate()` has no caller-supplied clock to thread
@@ -563,15 +324,8 @@ fn unix_now() -> i64 {
 }
 
 /// Explicit partial update for mutable card fields. Fields left as `None`
-/// are preserved from the stored row; lifecycle/source/workspace fields are
-/// intentionally absent from this shape. `repo` is the one repository-
-/// topology exception (powder-repo-hygiene): admin-gated at the HTTP layer
-/// since it moves a card between board groupings rather than editing the
-/// card's own content, but it lives here rather than behind a bulk-only
-/// endpoint because single-card repo corrections (an orphaned card, a
-/// mis-imported one) don't warrant `merge_repository_alias`'s all-matching-
-/// cards blast radius. `Some(None)` clears the card to repo-less; `None`
-/// (the field left off the patch entirely) leaves it untouched.
+/// are preserved from the stored row. `Some(None)` clears the card's repo;
+/// `None` leaves it unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct CardPatch {
     pub title: Option<String>,
@@ -580,36 +334,19 @@ pub struct CardPatch {
     pub proof_plan: Option<Vec<String>>,
     pub status: Option<CardStatus>,
     pub priority: Option<Priority>,
-    pub estimate: Option<Estimate>,
-    pub risk: Option<Risk>,
     pub labels: Option<Vec<String>>,
     pub repo: Option<Option<String>>,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriterionProofInput {
     pub criterion: usize,
     pub url: String,
 }
 
-/// The optional attribution fields `append_work_log` accepts alongside the
-/// required `agent`: whatever the calling surface (Claude Code, Codex,
-/// a harness) knows about itself. Bundled into one struct rather than four
-/// positional `Option<&str>` parameters so the method stays under clippy's
-/// argument-count lint without losing any field.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WorkLogAttribution<'a> {
-    pub model: Option<&'a str>,
-    pub reasoning: Option<&'a str>,
-    pub harness: Option<&'a str>,
-    pub run_id: Option<&'a str>,
-}
-
 struct MutationAudit<'a> {
     operation: Operation,
-    event_type: &'a str,
+    event_type: CardEventType,
     actor: &'a str,
-    payload: &'a str,
+    change: CardEventChange,
     resource: &'a str,
     semantic_identity: Option<&'a str>,
     run_id: Option<&'a RunId>,
@@ -675,10 +412,7 @@ impl Store {
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
-        let store = Self {
-            connection,
-            field_note_config: None,
-        };
+        let store = Self { connection };
         store.connection.create_scalar_function(
             "powder_card_id_is_canonical",
             1,
@@ -725,7 +459,6 @@ impl Store {
                 0 => {
                     self.connection.execute_batch(SCHEMA)?;
                     self.connection.execute_batch(SEARCH_SCHEMA)?;
-                    self.apply_ratified_repository_tier_seed()?;
                     SCHEMA_VERSION
                 }
                 1 => {
@@ -750,12 +483,10 @@ impl Store {
                 }
                 6 => {
                     self.connection.execute_batch(MIGRATE_6_TO_7)?;
-                    self.backfill_repositories_from_cards()?;
                     7
                 }
                 7 => {
                     self.migrate_7_to_8()?;
-                    self.apply_ratified_repository_tier_seed()?;
                     8
                 }
                 8 => {
@@ -837,6 +568,10 @@ impl Store {
                 27 => {
                     self.migrate_27_to_28()?;
                     28
+                }
+                28 => {
+                    self.migrate_28_to_29()?;
+                    29
                 }
                 _ => return Err(StoreError::UnsupportedSchema(current)),
             };
@@ -1027,31 +762,12 @@ impl Store {
             .map(|cursor| decode_search_cursor(cursor, &fingerprint))
             .transpose()?
             .unwrap_or(0);
-        let source_kind = query
-            .source_kind
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty());
-        let source_field = query
-            .source_field
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty());
-        let source_repo = query.repo.as_deref().and_then(canonical_repo_label);
-        let repo_filter_requested = query.repo.is_some();
-        let source_after = query.source_created_after;
-        let source_before = query.source_created_before;
-        let status = query.status.map(|value| value.as_str());
-        let priority = query.priority.map(|value| value.as_str());
-        let estimate = query.estimate.map(|value| value.as_str());
-        let risk = query.risk.map(|value| value.as_str());
         let label = query
             .label
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty());
-        let prefix = escape_like_prefix(query_text);
-        let id_prefix = format!("{prefix}%");
+        let id_prefix = format!("{}%", escape_like_prefix(query_text));
         let cte = r#"
             WITH matched(source_table, source_field, source_id, card_id, created_at, snippet, match_rank) AS (
                 SELECT source_table, source_field, source_id, card_id, created_at,
@@ -1070,36 +786,17 @@ impl Store {
             )
         "#;
         let filters = r#"
-            WHERE (?4 IS NULL OR
-                   (lower(?4) IN ('card', 'cards') AND m.source_table = 'cards') OR
-                   (lower(?4) IN ('comment', 'comments') AND m.source_table = 'comments') OR
-                   (lower(?4) IN ('worklog', 'work_log', 'work-log', 'work_log_entries')
-                    AND m.source_table = 'work_log_entries') OR
-                   lower(m.source_table) = lower(?4))
-              AND (?5 IS NULL OR lower(m.source_field) = lower(?5))
-              AND (?6 IS NULL OR m.created_at >= ?6)
-              AND (?7 IS NULL OR m.created_at <= ?7)
-              AND (?8 IS NULL OR c.status = ?8)
-              AND (?9 IS NULL OR c.priority = ?9)
-              AND (?10 IS NULL OR c.estimate = ?10)
-              AND (?11 IS NULL OR c.risk = ?11)
-              AND (?12 IS NULL OR c.created_at >= ?12)
-              AND (?13 IS NULL OR c.created_at <= ?13)
-              AND (?14 IS NULL OR c.updated_at >= ?14)
-              AND (?15 IS NULL OR c.updated_at <= ?15)
-              AND (?16 IS NULL OR EXISTS (
+            WHERE (?4 IS NULL OR c.status = ?4)
+              AND (?5 IS NULL OR c.priority = ?5)
+              AND (?6 IS NULL OR c.created_at >= ?6)
+              AND (?7 IS NULL OR c.created_at <= ?7)
+              AND (?8 IS NULL OR c.updated_at >= ?8)
+              AND (?9 IS NULL OR c.updated_at <= ?9)
+              AND (?10 IS NULL OR EXISTS (
                     SELECT 1 FROM json_each(c.labels_json)
-                    WHERE lower(json_each.value) = lower(?16)
+                    WHERE lower(json_each.value) = lower(?10)
                   ))
-              AND (?18 = 0 OR
-                   (?17 IS NOT NULL AND (
-                     lower(rtrim(trim(c.repo), '/')) = lower(?17) OR
-                     lower(rtrim(trim(c.repo), '/')) = lower(?17) || '.git' OR
-                     lower(rtrim(trim(c.repo), '/')) LIKE '%/' || lower(?17) OR
-                     lower(rtrim(trim(c.repo), '/')) LIKE '%/' || lower(?17) || '.git' OR
-                     (c.repo IS NULL AND lower(c.id) LIKE lower(?17) || '-%' AND
-                      substr(c.id, length(?17) + 2) <> '' AND
-                      substr(c.id, length(?17) + 2) NOT GLOB '*[^0-9]*'))))
+              AND (?11 IS NULL OR c.repo = ?11)
         "#;
         let page_sql = format!(
             "{cte} SELECT m.source_table, m.source_field, m.source_id, m.card_id,
@@ -1108,28 +805,21 @@ impl Store {
              JOIN cards c ON c.id = m.card_id
              {filters}
              ORDER BY m.match_rank, m.source_table, m.source_field, m.card_id, m.source_id, m.created_at
-             LIMIT ?19 OFFSET ?20"
+             LIMIT ?12 OFFSET ?13"
         );
         let mut statement = self.connection.prepare(&page_sql)?;
         let mut rows = statement.query(params![
             match_query,
             query_text,
             id_prefix,
-            source_kind,
-            source_field,
-            source_after,
-            source_before,
-            status,
-            priority,
-            estimate,
-            risk,
+            query.status.map(|status| status.as_str()),
+            query.priority.map(|priority| priority.as_str()),
             query.created_after,
             query.created_before,
             query.updated_after,
             query.updated_before,
             label,
-            source_repo.as_deref(),
-            repo_filter_requested,
+            query.repo.as_deref(),
             query.limit as i64,
             offset as i64,
         ])?;
@@ -1164,21 +854,14 @@ impl Store {
                         match_query,
                         query_text,
                         id_prefix,
-                        source_kind,
-                        source_field,
-                        source_after,
-                        source_before,
-                        status,
-                        priority,
-                        estimate,
-                        risk,
+                        query.status.map(|status| status.as_str()),
+                        query.priority.map(|priority| priority.as_str()),
                         query.created_after,
                         query.created_before,
                         query.updated_after,
                         query.updated_before,
                         label,
-                        source_repo.as_deref(),
-                        repo_filter_requested,
+                        query.repo.as_deref(),
                     ],
                     |row| row.get::<_, i64>(0),
                 )? as usize
@@ -1520,30 +1203,34 @@ impl Store {
                     claim_expires_at,
                 )?
                 .is_some();
-                let (new_status, detail) = match old_status.as_str() {
-                    "claimed" | "running" if has_valid_claim => ("in_progress", ""),
-                    "claimed" | "running" if has_acceptance => {
-                        ("ready", " (no valid claim; acceptance oracle present)")
-                    }
-                    "claimed" | "running" => ("backlog", " (no valid claim or acceptance oracle)"),
-                    "blocked" if !has_acceptance => ("backlog", " (empty acceptance)"),
-                    "blocked" if !has_blocked_by => (
-                        "backlog",
-                        " (no blocked_by relations; re-triage before claiming)",
-                    ),
-                    "blocked" => ("ready", ""),
-                    other => (other, ""),
+                let new_status = match old_status.as_str() {
+                    "claimed" | "running" if has_valid_claim => "in_progress",
+                    "claimed" | "running" if has_acceptance => "ready",
+                    "claimed" | "running" => "backlog",
+                    "blocked" if !has_acceptance || !has_blocked_by => "backlog",
+                    "blocked" => "ready",
+                    other => other,
                 };
                 transaction.execute(
                     "UPDATE cards SET status = ?1 WHERE id = ?2",
                     params![new_status, card_id],
                 )?;
+                let current = CardStatus::parse(new_status).ok_or_else(|| {
+                    DomainError::validation("event.status", "invalid migrated status")
+                })?;
+                let previous = match old_status.as_str() {
+                    "claimed" | "running" => CardStatus::InProgress,
+                    "blocked" => current,
+                    other => CardStatus::parse(other).ok_or_else(|| {
+                        DomainError::validation("event.status", "invalid stored status")
+                    })?,
+                };
                 append_card_event(
                     &transaction,
                     &CardId::new(card_id)?,
-                    "status",
+                    CardEventType::Status,
                     "system:status-vocabulary-migration",
-                    &format!("status-vocabulary migration: {old_status} -> {new_status}{detail}"),
+                    CardEventChange::Status { previous, current },
                     now,
                 )?;
             }
@@ -1728,9 +1415,13 @@ impl Store {
                      WHERE e.card_id = c.id
                        AND e.event_type = 'status'
                        AND e.actor = 'system:status-vocabulary-migration'
-                       AND e.payload IN (
-                         'status-vocabulary migration: claimed -> in_progress',
-                         'status-vocabulary migration: running -> in_progress'
+                       AND (
+                         e.payload IN (
+                           'status-vocabulary migration: claimed -> in_progress',
+                           'status-vocabulary migration: running -> in_progress'
+                         )
+                         OR e.payload LIKE '%\"kind\":\"status\"%'
+
                        )
                        AND e.created_at = (
                          SELECT MAX(latest.created_at)
@@ -1807,12 +1498,14 @@ impl Store {
                 append_card_event(
                     &transaction,
                     &CardId::new(card_id)?,
-                    "status",
+                    CardEventType::Status,
                     "system:status-v17-repair",
-                    &format!(
-                        "status-v17 repair: in_progress -> {new_status} \
-                         (claimless v17 migration)"
-                    ),
+                    CardEventChange::Status {
+                        previous: CardStatus::InProgress,
+                        current: CardStatus::parse(new_status).ok_or_else(|| {
+                            DomainError::validation("event.status", "invalid migrated status")
+                        })?,
+                    },
                     now,
                 )?;
             }
@@ -2046,7 +1739,30 @@ impl Store {
                 transaction.execute_batch(sql)?;
             }
         }
+
         transaction.execute_batch("CREATE TABLE IF NOT EXISTS run_telemetry_attempts (id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, provider TEXT, model TEXT, harness TEXT, reasoning TEXT, input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd_micros INTEGER, duration_ms INTEGER, outcome TEXT, pricing_version TEXT, input_rate_usd_per_million_micros INTEGER, output_rate_usd_per_million_micros INTEGER, reasoning_rate_usd_per_million_micros INTEGER, principal TEXT, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_run ON run_telemetry_attempts(run_id, created_at, id); CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_model ON run_telemetry_attempts(model, provider, created_at);")?;
+        transaction.commit()?;
+        Ok(())
+    }
+    /// Normalizes retired typed run and activity spellings in one transaction.
+    /// The optional activities-table guard keeps older partial schemas retryable.
+    fn migrate_28_to_29(&mut self) -> Result<()> {
+        let has_activities = self.table_exists("activities")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE runs SET state = 'active' WHERE state = 'running'",
+            [],
+        )?;
+        if has_activities {
+            transaction.execute(
+                "UPDATE activities
+                 SET activity_type = 'elicitation'
+                 WHERE activity_type = 'question'",
+                [],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -2140,27 +1856,12 @@ impl Store {
         Ok(columns.iter().any(|name| name.eq_ignore_ascii_case(column)))
     }
 
-    /// Opts this `Store` into the field-note seed generator (see
-    /// [`FieldNoteConfig`]). A deployment calls this once at startup, from
-    /// its own env-driven config; nothing else about `Store` changes for
-    /// callers who never call it.
-    pub fn with_field_note_config(mut self, config: FieldNoteConfig) -> Self {
-        self.field_note_config = Some(config);
-        self
-    }
-
-    pub fn readiness_check(&self) -> Result<()> {
-        self.connection.query_row("SELECT 1", [], |_| Ok(()))?;
-        Ok(())
-    }
-
-    /// Proves the database file itself is writable, not just readable --
-    /// `readiness_check`'s bare `SELECT 1` succeeds even against a
-    /// read-only file, a full disk that still permits reads, or a
-    /// replication target mid-restore. `BEGIN IMMEDIATE` acquires SQLite's
-    /// write lock up front (unlike a deferred `BEGIN`, which only acquires
-    /// it on the first write and would let a read-only file pass), so
-    /// failure here means an actual write is currently impossible. The
+    /// Proves the database file itself is writable, not just readable. A
+    /// read-only file, a full disk that still permits reads, or a replication
+    /// target mid-restore can still answer read queries. `BEGIN IMMEDIATE`
+    /// acquires SQLite's write lock up front (unlike a deferred `BEGIN`, which
+    /// only acquires it on the first write and would let a read-only file pass),
+    /// so failure here means an actual write is currently impossible. The
     /// transaction never writes anything and always rolls back -- this is a
     /// probe, not a mutation.
     pub fn writable_probe(&self) -> Result<()> {
@@ -2203,178 +1904,10 @@ impl Store {
             .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?)
     }
 
-    /// Upsert externally sourced cards without clobbering live lifecycle state: a
-    /// card that is claimed, running, awaiting input, or already at a
-    /// terminal outcome keeps its stored status/claim, while its content
-    /// (title, body, acceptance, labels, source digest, ...) still refreshes
-    /// from the incoming source. See [`Card::merge_reimport`].
-    pub fn import_cards(&mut self, cards: Vec<Card>) -> Result<ImportOutcome> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut outcome = ImportOutcome::default();
-        for incoming in cards {
-            match load_card_optional(&transaction, &incoming.id)? {
-                None => {
-                    persist_card(&transaction, &incoming)?;
-                    outcome.created += 1;
-                }
-                Some(current) => {
-                    let class = classify_reimport(&current, &incoming);
-                    let merged = current.merge_reimport(incoming);
-                    outcome.record(class, &current, &merged);
-                    persist_card(&transaction, &merged)?;
-                }
-            }
-        }
-        transaction.commit()?;
-        Ok(outcome)
-    }
-
-    pub fn import_cards_with_events(
-        &mut self,
-        cards: Vec<Card>,
-        actor: &str,
-        now: i64,
-    ) -> Result<ImportOutcome> {
-        self.import_cards_with_events_with_authority(
-            cards,
-            &Authority::actor(actor.to_owned(), false),
-            now,
-        )
-    }
-
-    pub fn import_cards_with_events_with_authority(
-        &mut self,
-        cards: Vec<Card>,
-        authority: &Authority,
-        now: i64,
-    ) -> Result<ImportOutcome> {
-        let actor = non_empty("actor", &authority.actor_label())?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut outcome = ImportOutcome::default();
-        for incoming in cards {
-            match load_card_optional(&transaction, &incoming.id)? {
-                None => {
-                    persist_card(&transaction, &incoming)?;
-                    append_card_event_with_authority(
-                        &transaction,
-                        &incoming.id,
-                        "create",
-                        &actor,
-                        "imported card",
-                        now,
-                        authority,
-                    )?;
-                    events::append_outbound_card_event_with_authority(
-                        &transaction,
-                        &incoming,
-                        "card-created",
-                        authority,
-                        json!({"source": "import"}),
-                        now,
-                    )?;
-                    outcome.created += 1;
-                }
-                Some(current) => {
-                    let class = classify_reimport(&current, &incoming);
-                    let merged = current.merge_reimport(incoming);
-                    let previous = current.status;
-                    outcome.record(class, &current, &merged);
-                    persist_card(&transaction, &merged)?;
-                    if let Some(event_type) =
-                        events::outbound_event_for_status_change(previous, merged.status)
-                    {
-                        append_card_event_with_authority(
-                            &transaction,
-                            &merged.id,
-                            "status",
-                            &actor,
-                            &format!("{} -> {}", previous.as_str(), merged.status.as_str()),
-                            now,
-                            authority,
-                        )?;
-                        events::append_outbound_card_event_with_authority(
-                            &transaction,
-                            &merged,
-                            event_type,
-                            authority,
-                            json!({
-                                "previous_status": previous.as_str(),
-                                "status": merged.status.as_str(),
-                                "source": "import"
-                            }),
-                            now,
-                        )?;
-                    }
-                }
-            }
-        }
-        transaction.commit()?;
-        Ok(outcome)
-    }
-
-    /// Compute what [`Store::import_cards`] would do to `cards` without
-    /// writing anything, so a caller can show a create/update/preserve/
-    /// unchanged report before committing to the upsert. `content_repaired`
-    /// surfaces cards whose source digest is unchanged but whose acceptance
-    /// text differs from what is stored.
-    pub fn preview_import(&self, cards: &[Card]) -> Result<ImportOutcome> {
-        let mut outcome = ImportOutcome::default();
-        for incoming in cards {
-            match load_card_optional(&self.connection, &incoming.id)? {
-                None => outcome.created += 1,
-                Some(current) => {
-                    let class = classify_reimport(&current, incoming);
-                    let merged = current.merge_reimport(incoming.clone());
-                    outcome.record(class, &current, &merged);
-                }
-            }
-        }
-        Ok(outcome)
-    }
-
     pub fn upsert_card(&mut self, card: Card) -> Result<Card> {
         let card_id = card.id.clone();
         persist_card(&self.connection, &card)?;
         load_card(&self.connection, &card_id)
-    }
-
-    pub fn upsert_card_with_events(&mut self, card: Card, actor: &str, now: i64) -> Result<Card> {
-        let actor = non_empty("actor", actor)?;
-        let card_id = card.id.clone();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existed = load_card_optional(&transaction, &card_id)?.is_some();
-        persist_card(&transaction, &card)?;
-        let saved = load_card(&transaction, &card_id)?;
-        append_card_event(
-            &transaction,
-            &saved.id,
-            if existed { "update" } else { "create" },
-            &actor,
-            if existed {
-                "updated card"
-            } else {
-                "created card"
-            },
-            now,
-        )?;
-        if !existed {
-            events::append_outbound_card_event(
-                &transaction,
-                &saved,
-                "card-created",
-                &actor,
-                json!({"source": "create-card"}),
-                now,
-            )?;
-        }
-        transaction.commit()?;
-        Ok(saved)
     }
 
     pub fn create_card_with_events(&mut self, card: Card, actor: &str, now: i64) -> Result<Card> {
@@ -2418,47 +1951,6 @@ impl Store {
         self.with_idempotency(&request, |transaction| {
             create_card_in_transaction(transaction, card, authority, now)
         })
-    }
-
-    /// File a one-call papercut. The report maps deterministically to a
-    /// backlog card labeled `papercut`; if `service` names a known repository
-    /// entity the card is homed there, otherwise it carries a `service:<name>`
-    /// label. The full report body and attribution are preserved, then run
-    /// through the same secret-scrubbing path as comments and work logs.
-    /// Emits a normal `create` audit event with the reporting agent as actor.
-    pub fn file_papercut(
-        &mut self,
-        report: &powder_core::papercut::PapercutReport,
-        actor: &str,
-        now: i64,
-    ) -> Result<Card> {
-        self.file_papercut_as(report, &Authority::actor(actor.to_owned(), false), now)
-    }
-
-    pub fn file_papercut_as(
-        &mut self,
-        report: &powder_core::papercut::PapercutReport,
-        authority: &Authority,
-        now: i64,
-    ) -> Result<Card> {
-        let resolved_repo = report
-            .service
-            .as_deref()
-            .map(|service| self.get_repository(service))
-            .transpose()?
-            .flatten()
-            .map(|summary| summary.repo);
-        let id = CardId::new(format!(
-            "papercut-{}",
-            nanoid::nanoid!(12, &API_KEY_ALPHABET)
-        ))?;
-        let card = powder_core::papercut::file_papercut(
-            report.clone(),
-            resolved_repo.as_deref(),
-            now,
-            id,
-        )?;
-        self.create_card_with_events_as(card, authority, now)
     }
 
     pub fn patch_card(
@@ -2649,9 +2141,11 @@ impl Store {
             append_card_event_with_authority(
                 &transaction,
                 card_id,
-                "repair",
+                CardEventType::Patch,
                 &actor,
-                &format!("repaired {} acceptance criterion(s)", changes.len()),
+                CardEventChange::Patch {
+                    fields: vec!["acceptance".to_string()],
+                },
                 now,
                 authority,
             )?;
@@ -2665,28 +2159,12 @@ impl Store {
         })
     }
 
-    pub fn record_card_event(
-        &mut self,
-        card_id: &CardId,
-        event_type: &str,
-        actor: &str,
-        payload: &str,
-        now: i64,
-    ) -> Result<CardEvent> {
-        if self.get_card(card_id)?.is_none() {
-            return Err(DomainError::not_found("card", card_id.to_string()).into());
-        }
-        append_card_event(&self.connection, card_id, event_type, actor, payload, now)
-    }
-
     pub fn get_card(&self, card_id: &CardId) -> Result<Option<Card>> {
         let record = self
             .connection
             .query_row(CARD_SELECT_SQL, [card_id.as_str()], CardRecord::from_row)
             .optional()?;
-        record
-            .map(|record| card_from_record(&self.connection, record))
-            .transpose()
+        record.map(card_from_record).transpose()
     }
 
     pub fn get_run(&self, run_id: &RunId) -> Result<Option<Run>> {
@@ -2735,17 +2213,6 @@ impl Store {
                 .into());
             }
         }
-        // Resolve caller-supplied repository aliases once at the Store seam.
-        let repository_filters = query
-            .repo
-            .as_ref()
-            .map(|repositories| {
-                repositories
-                    .iter()
-                    .map(|repository| resolve_repository_name(&self.connection, repository))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
         let all_cards = load_all_cards(&self.connection)?;
         let statuses: HashMap<_, _> = all_cards.iter().map(|c| (c.id.clone(), c.status)).collect();
         let mut eligible = Vec::new();
@@ -2755,27 +2222,11 @@ impl Store {
             }) {
                 continue;
             }
-            if repository_filters.as_ref().is_some_and(|repositories| {
-                let card_repo = card
-                    .repo
-                    .as_deref()
-                    .map(ToOwned::to_owned)
-                    .or_else(|| repo_from_numeric_card_id_prefix(card.id.as_str()));
-                !repositories.iter().flatten().any(|repository| {
-                    card_repo.as_deref().is_some_and(|candidate| {
-                        canonical_repo_matches(candidate, repository.as_str())
-                    })
-                })
+            if query.repo.as_ref().is_some_and(|repositories| {
+                !repositories
+                    .iter()
+                    .any(|repository| card.repo.as_deref() == Some(repository))
             }) {
-                continue;
-            }
-            if query
-                .estimate
-                .is_some_and(|estimate| card.estimate != Some(estimate))
-            {
-                continue;
-            }
-            if query.risk.is_some_and(|risk| card.risk != Some(risk)) {
                 continue;
             }
             if query
@@ -3037,39 +2488,20 @@ impl Store {
         limit: usize,
         after: Option<&CardId>,
     ) -> Result<CardListPage> {
-        let repo_filter_requested = filter.repo.is_some();
-        let requested_repo_label = filter.repo.as_deref().and_then(canonical_repo_label);
-        let repo_filter = filter
-            .repo
-            .as_deref()
-            .map(|repo| resolve_repository_name(&self.connection, repo))
-            .transpose()?
-            .flatten()
-            .or(requested_repo_label);
+        let repo_filter = filter.repo.as_deref();
         let mut statement = self.connection.prepare(CARD_SELECT_ALL_SQL)?;
         let records = statement
             .query_map([], CardRecord::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut cards = records
             .into_iter()
-            .map(|record| card_from_record(&self.connection, record))
+            .map(card_from_record)
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter(|card| filter.status.map(|s| card.status == s).unwrap_or(true))
-            .filter(|card| {
-                filter
-                    .estimate
-                    .map(|estimate| card.estimate == Some(estimate))
-                    .unwrap_or(true)
-            })
-            .filter(|card| match repo_filter.as_deref() {
-                Some(repo) => {
-                    card.repo.as_deref() == Some(repo)
-                        || (card.repo.is_none()
-                            && repo_from_numeric_card_id_prefix(card.id.as_str()).as_deref()
-                                == Some(repo))
-                }
-                None => !repo_filter_requested,
+            .filter(|card| match repo_filter {
+                Some(repo) => card.repo.as_deref() == Some(repo),
+                None => true,
             })
             .filter(|card| {
                 filter.label.as_ref().is_none_or(|wanted| {
@@ -3081,7 +2513,7 @@ impl Store {
             })
             .collect::<Vec<_>>();
         // `total_count` reports how many cards match the caller's *explicit*
-        // status/repo/estimate/label filters -- deliberately computed
+        // status/repo/label filters -- deliberately computed
         // before the `include_terminal` exclusion below, so a caller that
         // asks for the whole board (no explicit status) and gets terminal
         // cards silently held back still sees the true match count rather
@@ -3116,369 +2548,6 @@ impl Store {
             .connection
             .query_row("SELECT COUNT(*) FROM cards", [], |row| row.get::<_, i64>(0))?
             as usize)
-    }
-
-    pub fn board_stats(&self, query: BoardStatsQuery) -> Result<BoardStats> {
-        let requested_repo_label = query.repo.as_deref().and_then(canonical_repo_label);
-        let repo_filter = query
-            .repo
-            .as_deref()
-            .map(|repo| resolve_repository_name(&self.connection, repo))
-            .transpose()?
-            .flatten()
-            .or(requested_repo_label);
-
-        let mut statement = self.connection.prepare(
-            "SELECT c.repo,
-                    c.status,
-                    COUNT(*) AS card_count,
-                    SUM(CASE
-                          WHEN c.claim_agent IS NOT NULL
-                           AND c.claim_expires_at > ?1
-                          THEN 1 ELSE 0
-                        END) AS active_claim_count
-             FROM cards c
-             LEFT JOIN repositories r ON r.name = c.repo
-             WHERE (?2 OR COALESCE(r.visibility, 'visible') = 'visible')
-               AND (?3 IS NULL OR c.repo = ?3)
-             GROUP BY c.repo, c.status
-             ORDER BY
-               CASE COALESCE(r.tier, 'backburner')
-                 WHEN 'active' THEN 0
-                 WHEN 'backburner' THEN 1
-                 ELSE 2
-               END,
-               c.repo ASC,
-               c.status ASC",
-        )?;
-        let grouped = statement
-            .query_map(
-                params![query.now, query.include_hidden, repo_filter.as_deref()],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut stats = BoardStats::default();
-        for (repo, raw_status, card_count, active_claim_count) in grouped {
-            let status =
-                CardStatus::parse(&raw_status).ok_or_else(|| StoreError::InvalidStoredValue {
-                    field: "cards.status",
-                    value: raw_status,
-                })?;
-            let card_count = card_count.max(0) as usize;
-            let active_claim_count = active_claim_count.max(0) as usize;
-            stats.totals.add(status, card_count, active_claim_count);
-            if stats.repos.last().is_none_or(|row| row.repo != repo) {
-                stats.repos.push(BoardStatsRepo {
-                    repo: repo.clone(),
-                    counts: BoardStatsCounts::default(),
-                });
-            }
-            stats
-                .repos
-                .last_mut()
-                .expect("board stats row was inserted")
-                .counts
-                .add(status, card_count, active_claim_count);
-        }
-        Ok(stats)
-    }
-
-    /// Return deterministic top-level epic and parentless-leaf rollups using
-    /// SQL aggregation. Parent graph coverage is scanned separately so page
-    /// size never changes the global accounting envelope.
-    pub fn board_rollups(&self, query: BoardRollupsQuery) -> Result<BoardRollups> {
-        let mut statement = self.connection.prepare(
-            r#"
-            WITH visible_cards AS (
-                SELECT CAST(c.id AS TEXT) AS id, CAST(c.title AS TEXT) AS title, c.parent,
-                       CAST(c.repo AS TEXT) AS repo, CAST(c.status AS TEXT) AS status,
-                       CAST(c.criteria_json AS TEXT) AS criteria_json, c.claim_agent,
-                       c.claim_expires_at, CAST(c.updated_at AS INTEGER) AS updated_at
-                FROM cards c
-                LEFT JOIN repositories r ON r.name = c.repo
-                WHERE ?1 OR COALESCE(r.visibility, 'visible') = 'visible'
-            ), scoped_roots AS (
-                SELECT c.*
-                FROM visible_cards c
-                WHERE powder_card_id_is_canonical(c.id)
-                  AND (c.parent IS NULL
-                   OR (
-                       ?1 = 0
-                       AND typeof(c.parent) = 'text'
-                       AND powder_card_id_is_canonical(c.parent)
-                       AND NOT EXISTS (
-                           SELECT 1 FROM visible_cards parent
-                           WHERE parent.id = c.parent
-                       )
-                   )
-                  )
-            )
-            SELECT
-                'epic' AS kind,
-                CAST(p.id AS TEXT) AS card_id,
-                CAST(p.title AS TEXT) AS title,
-                CAST(p.repo AS TEXT) AS repo,
-                CAST(c.status AS TEXT) AS status,
-                COUNT(*) AS card_count,
-                SUM(CASE WHEN json_valid(c.criteria_json) THEN
-                    (SELECT COUNT(*) FROM json_each(c.criteria_json) AS criterion
-                     WHERE json_extract(criterion.value, '$.checked_at') IS NOT NULL
-                        OR json_extract(criterion.value, '$.checked_by') IS NOT NULL)
-                    ELSE 0 END) AS criteria_checked,
-                SUM(CASE WHEN json_valid(c.criteria_json)
-                    THEN json_array_length(c.criteria_json) ELSE 0 END) AS criteria_total,
-                SUM(CASE WHEN c.claim_agent IS NOT NULL
-                              AND c.claim_expires_at > ?2 THEN 1 ELSE 0 END) AS active_claims,
-                MIN(c.updated_at) AS oldest_update,
-                MAX(c.updated_at) AS newest_update
-            FROM scoped_roots p
-            JOIN visible_cards c
-              ON powder_card_id_is_canonical(c.id)
-             AND typeof(c.parent) = 'text'
-             AND powder_card_id_is_canonical(c.parent)
-             AND c.parent = p.id
-            GROUP BY p.id, p.title, p.repo, c.status
-            UNION ALL
-            SELECT
-                'unsorted' AS kind,
-                NULL AS card_id,
-                NULL AS title,
-                CAST(c.repo AS TEXT) AS repo,
-                CAST(c.status AS TEXT) AS status,
-                COUNT(*) AS card_count,
-                SUM(CASE WHEN json_valid(c.criteria_json) THEN
-                    (SELECT COUNT(*) FROM json_each(c.criteria_json) AS criterion
-                     WHERE json_extract(criterion.value, '$.checked_at') IS NOT NULL
-                        OR json_extract(criterion.value, '$.checked_by') IS NOT NULL)
-                    ELSE 0 END) AS criteria_checked,
-                SUM(CASE WHEN json_valid(c.criteria_json)
-                    THEN json_array_length(c.criteria_json) ELSE 0 END) AS criteria_total,
-                SUM(CASE WHEN c.claim_agent IS NOT NULL
-                              AND c.claim_expires_at > ?2 THEN 1 ELSE 0 END) AS active_claims,
-                MIN(c.updated_at) AS oldest_update,
-                MAX(c.updated_at) AS newest_update
-            FROM scoped_roots c
-            WHERE NOT EXISTS (
-                  SELECT 1 FROM visible_cards child
-                  WHERE powder_card_id_is_canonical(child.id)
-                    AND typeof(child.parent) = 'text'
-                    AND powder_card_id_is_canonical(child.parent)
-                    AND child.parent = c.id
-              )
-            GROUP BY c.repo, c.status
-            "#,
-        )?;
-
-        let mut rows = BTreeMap::<String, BoardRollup>::new();
-        let sql_rows =
-            statement.query_map(params![query.include_hidden as i64, query.now], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Option<i64>>(10)?,
-                ))
-            })?;
-        for row in sql_rows {
-            let (
-                kind,
-                raw_card_id,
-                raw_title,
-                repo,
-                status,
-                card_count,
-                criteria_checked,
-                criteria_total,
-                active_claims,
-                oldest_update,
-                newest_update,
-            ) = row?;
-            let card_id = match raw_card_id {
-                Some(raw) => match CardId::new(raw) {
-                    Ok(card_id) => Some(card_id),
-                    Err(_) => continue,
-                },
-                None => None,
-            };
-            let key = match card_id.as_ref() {
-                Some(card_id) => format!("e:{card_id}"),
-                None => format!("u:{}", repo.as_deref().unwrap_or("")),
-            };
-            let rollup = rows.entry(key).or_insert_with(|| BoardRollup {
-                kind: kind.clone(),
-                card_id: card_id.clone(),
-                repo: repo.clone(),
-                title: raw_title.unwrap_or_else(|| {
-                    if repo.is_none() {
-                        "General".to_string()
-                    } else {
-                        "Unsorted".to_string()
-                    }
-                }),
-                status_counts: BoardRollupStatusCounts::default(),
-                criteria_checked: 0,
-                criteria_total: 0,
-                active_claims: 0,
-                freshness: None,
-            });
-            let count = usize::try_from(card_count.max(0)).unwrap_or(usize::MAX);
-            let checked = usize::try_from(criteria_checked.max(0)).unwrap_or(usize::MAX);
-            let total = usize::try_from(criteria_total.max(0)).unwrap_or(usize::MAX);
-            let active = usize::try_from(active_claims.max(0)).unwrap_or(usize::MAX);
-            let status_count = rollup.status_counts.0.entry(status).or_default();
-            *status_count = status_count.saturating_add(count);
-            rollup.criteria_checked = rollup.criteria_checked.saturating_add(checked);
-            rollup.criteria_total = rollup.criteria_total.saturating_add(total);
-            rollup.active_claims = rollup.active_claims.saturating_add(active);
-            if let (Some(oldest_update), Some(newest_update)) = (oldest_update, newest_update) {
-                rollup.freshness = Some(match rollup.freshness {
-                    None => EpicFreshness {
-                        oldest_update,
-                        newest_update,
-                    },
-                    Some(freshness) => EpicFreshness {
-                        oldest_update: freshness.oldest_update.min(oldest_update),
-                        newest_update: freshness.newest_update.max(newest_update),
-                    },
-                });
-            }
-        }
-
-        let rows = rows.into_iter().collect::<Vec<_>>();
-        let total_count = rows.len();
-        let start = match query.after.as_deref() {
-            None => 0,
-            Some(after) => {
-                let index = rows.iter().position(|(key, _)| key == after).ok_or_else(|| {
-                    DomainError::validation(
-                        "after",
-                        format!("rollup {after} is not in the current result set (stale or filtered-out continuation token)"),
-                    )
-                })?;
-                index.saturating_add(1)
-            }
-        };
-        let limit = query.limit.clamp(1, 100);
-        let end = start.saturating_add(limit).min(rows.len());
-        let has_more = end < rows.len();
-        let next_after = has_more.then(|| rows[end.saturating_sub(1)].0.clone());
-        let rollups = rows
-            .iter()
-            .skip(start)
-            .take(limit)
-            .map(|(_, rollup)| rollup.clone())
-            .collect();
-
-        let report = self.parent_graph_report_scoped(query.include_hidden)?;
-        let coverage = BoardRollupCoverage {
-            total_cards: report.coverage.scanned,
-            accounted_cards: report.coverage.classified,
-            root_epics: report
-                .coverage
-                .assignments
-                .iter()
-                .filter(|assignment| {
-                    assignment.bucket == ParentCoverageBucket::EpicAncestor
-                        && assignment.ancestor_id.as_deref() == Some(assignment.card_id.as_str())
-                })
-                .count(),
-            unsorted_cards: report
-                .coverage
-                .assignments
-                .iter()
-                .filter(|assignment| assignment.bucket == ParentCoverageBucket::Unsorted)
-                .count(),
-            parent_issue_count: report.issues.len(),
-            complete: report.coverage.is_complete() && report.issues.is_empty(),
-        };
-        Ok(BoardRollups {
-            rollups,
-            total_count,
-            has_more,
-            next_after,
-            coverage,
-        })
-    }
-
-    /// Return chronological fixed-width completion buckets for an epic's
-    /// direct terminal children. Empty periods remain in the result so a
-    /// caller can render a stable velocity chart without filling gaps.
-    pub fn epic_velocity(
-        &self,
-        epic_id: &CardId,
-        now: i64,
-        periods: usize,
-        period_days: u64,
-    ) -> Result<Option<EpicVelocity>> {
-        if self.get_card(epic_id)?.is_none() {
-            return Ok(None);
-        }
-        let period_count = periods.clamp(1, 52);
-        let period_days = period_days.clamp(1, 366);
-        let period_seconds = (period_days * 86_400) as i64;
-        let total_seconds = period_seconds.saturating_mul(period_count as i64);
-        let oldest_start = now.saturating_sub(total_seconds);
-        let mut buckets = (0..period_count)
-            .map(|index| {
-                let period_start =
-                    oldest_start.saturating_add(period_seconds.saturating_mul(index as i64));
-                let period_end = if index + 1 == period_count {
-                    now
-                } else {
-                    period_start.saturating_add(period_seconds)
-                };
-                EpicVelocityPeriod {
-                    period_start,
-                    period_end,
-                    completed_children: 0,
-                    abandoned_children: 0,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut statement = self.connection.prepare(
-            "SELECT status, updated_at
-             FROM cards
-             WHERE parent = ?1
-               AND status IN ('done', 'shipped', 'abandoned')
-               AND updated_at >= ?2
-               AND updated_at <= ?3",
-        )?;
-        let children = statement
-            .query_map(params![epic_id.as_str(), oldest_start, now], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (status, updated_at) in children {
-            let offset = updated_at.saturating_sub(oldest_start);
-            let index =
-                (offset / period_seconds).min(period_count.saturating_sub(1) as i64) as usize;
-            match status.as_str() {
-                "done" | "shipped" => buckets[index].completed_children += 1,
-                "abandoned" => buckets[index].abandoned_children += 1,
-                _ => {}
-            }
-        }
-        Ok(Some(EpicVelocity {
-            card_id: epic_id.clone(),
-            period_days,
-            periods: buckets,
-        }))
     }
 
     pub fn claim_card(
@@ -3531,14 +2600,15 @@ impl Store {
             events::append_outbound_card_event_with_authority(
                 &transaction,
                 &card,
-                "claim-expired",
+                CardEventType::ClaimExpired,
                 authority,
-                json!({
-                    "principal": expired.principal.as_str(),
-                    "run_id": expired.run_id.as_str(),
-                    "agent": expired.agent.as_str(),
-                    "expired_at": expired.expires_at
-                }),
+                CardEventChange::Claim {
+                    action: powder_core::ClaimEventAction::Expired,
+                    principal: Some(expired.principal.clone()),
+                    run_id: Some(expired.run_id.clone()),
+                    agent: Some(expired.agent.clone()),
+                    expires_at: Some(expired.expires_at),
+                },
                 now,
             )?;
         }
@@ -3572,7 +2642,6 @@ impl Store {
             agent: agent.clone(),
             claim_expires_at: claim.expires_at,
             proof: None,
-            telemetry: None,
             created_at: now,
             updated_at: now,
         };
@@ -3706,10 +2775,8 @@ impl Store {
     }
 
     /// Set or clear a card's explicit parent edge. Validates that the parent
-    /// exists and that the link cannot create a cycle; audits the change on
-    /// the child (`hierarchy`), the new parent (`decompose`), and the old
-    /// parent (`hierarchy`). The parent's own status is never touched --
-    /// decomposition is auditable coordination, not lifecycle.
+    /// exists and that the link cannot create a cycle. Audits the child and
+    /// affected parent cards without changing lifecycle status.
     pub fn set_parent(
         &mut self,
         card_id: &CardId,
@@ -3921,162 +2988,6 @@ impl Store {
         )
     }
 
-    pub fn attach_image(
-        &mut self,
-        card_id: &CardId,
-        bytes: &[u8],
-        mime: &str,
-        filename: &str,
-        principal: &str,
-        now: i64,
-    ) -> Result<AttachmentMeta> {
-        let authority = Authority::actor(principal.to_owned(), false);
-        self.attach_image_as(card_id, bytes, mime, filename, now, &authority)
-    }
-
-    pub fn attach_image_as(
-        &mut self,
-        card_id: &CardId,
-        bytes: &[u8],
-        mime: &str,
-        filename: &str,
-        now: i64,
-        authority: &Authority,
-    ) -> Result<AttachmentMeta> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let attachment = attach_image_in_transaction(
-            &transaction,
-            card_id,
-            bytes,
-            mime,
-            filename,
-            now,
-            authority,
-        )?;
-        transaction.commit()?;
-        Ok(attachment)
-    }
-
-    pub fn attach_image_as_keyed(
-        &mut self,
-        card_id: &CardId,
-        bytes: &[u8],
-        mime: &str,
-        filename: &str,
-        context: KeyedOperationContext<'_>,
-    ) -> Result<IdempotencyOutcome<AttachmentMeta>> {
-        let KeyedOperationContext {
-            now,
-            idempotency_key,
-            authority,
-        } = context;
-        let digest = format!("{:x}", Sha256::digest(bytes));
-        let payload = json!({"digest": digest, "mime": mime, "filename": filename});
-        self.with_keyed_operation(
-            Operation::AttachImage,
-            format!("card:{}", card_id.as_str()),
-            &payload,
-            KeyedOperationContext::new(now, idempotency_key, authority),
-            |transaction| {
-                attach_image_in_transaction(
-                    transaction,
-                    card_id,
-                    bytes,
-                    mime,
-                    filename,
-                    now,
-                    authority,
-                )
-            },
-        )
-    }
-
-    pub fn attachment_blob(&self, id: &str) -> Result<Option<(String, Vec<u8>)>> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT mime, bytes FROM attachments WHERE id = ?1",
-                [id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()?)
-    }
-
-    pub fn detach(
-        &mut self,
-        card_id: &CardId,
-        attachment_id: &str,
-        principal: &str,
-        now: i64,
-    ) -> Result<()> {
-        let authority = Authority::actor(principal.to_owned(), false);
-        self.detach_as(card_id, attachment_id, now, &authority)
-    }
-
-    pub fn detach_as(
-        &mut self,
-        card_id: &CardId,
-        attachment_id: &str,
-        now: i64,
-        authority: &Authority,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        detach_in_transaction(&transaction, card_id, attachment_id, now, authority)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn detach_as_keyed(
-        &mut self,
-        card_id: &CardId,
-        attachment_id: &str,
-        now: i64,
-        idempotency_key: &str,
-        authority: &Authority,
-    ) -> Result<IdempotencyOutcome<()>> {
-        let payload = json!({"attachment_id": attachment_id});
-        self.with_keyed_operation(
-            Operation::DetachImage,
-            format!("card:{}", card_id.as_str()),
-            &payload,
-            KeyedOperationContext::new(now, idempotency_key, authority),
-            |transaction| {
-                detach_in_transaction(transaction, card_id, attachment_id, now, authority)
-            },
-        )
-    }
-
-    pub fn attachments_for_card(&self, card_id: &CardId) -> Result<Vec<AttachmentMeta>> {
-        load_card(&self.connection, card_id)?;
-        let mut statement = self.connection.prepare(
-            "SELECT card_attachments.attachment_id,
-                    card_attachments.filename,
-                    attachments.mime,
-                    attachments.size,
-                    card_attachments.created_at
-             FROM card_attachments
-             JOIN attachments ON attachments.id = card_attachments.attachment_id
-             WHERE card_attachments.card_id = ?1
-             ORDER BY card_attachments.created_at ASC, card_attachments.attachment_id ASC",
-        )?;
-        let attachments = statement
-            .query_map([card_id.as_str()], |row| {
-                Ok(AttachmentMeta {
-                    id: row.get(0)?,
-                    filename: row.get(1)?,
-                    mime: row.get(2)?,
-                    size: row.get(3)?,
-                    created_at: row.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(attachments)
-    }
-
     pub fn add_link(&mut self, card_id: &CardId, label: &str, url: &str, now: i64) -> Result<Link> {
         self.add_link_as(card_id, label, url, now, &Authority::unchecked())
     }
@@ -4146,9 +3057,9 @@ impl Store {
         Ok(comment)
     }
 
-    /// Keyed comment delivery uses the durable operation receipt ledger. The
+    /// Keyed comment writes use the durable operation receipt ledger. The
     /// receipt is committed with the comment and outbound event, so retries
-    /// cannot append a second comment or webhook.
+    /// cannot append a second comment or event.
     pub fn add_comment_as_keyed(
         &mut self,
         card_id: &CardId,
@@ -4173,38 +3084,23 @@ impl Store {
         })
     }
 
-    /// Worker work-log delivery requires the current unexpired card claim for
-    /// authenticated principals, and the semantic agent/run labels must match
-    /// that claim. The labels remain attribution, never capability; trusted
-    /// unchecked callers are retained only for direct local compatibility.
-    /// Every field on `attribution` is whatever the calling surface can supply.
-    /// `body` is scrubbed for known secret shapes before it is ever
-    /// persisted (powder-943 governance ruling: this becomes fleet-retro
-    /// synthesis input, so it gets the same scrub discipline as any other
-    /// agent-output surface, at write time rather than read time).
+    /// Append a typed work-log body with agent and optional run attribution.
     pub fn append_work_log(
         &mut self,
         card_id: &CardId,
         agent: &str,
-        attribution: WorkLogAttribution<'_>,
+        run_id: Option<&str>,
         body: &str,
         now: i64,
     ) -> Result<WorkLogEntry> {
-        self.append_work_log_as(
-            card_id,
-            agent,
-            attribution,
-            body,
-            now,
-            &Authority::unchecked(),
-        )
+        self.append_work_log_as(card_id, agent, run_id, body, now, &Authority::unchecked())
     }
 
     pub fn append_work_log_as(
         &mut self,
         card_id: &CardId,
         agent: &str,
-        attribution: WorkLogAttribution<'_>,
+        run_id: Option<&str>,
         body: &str,
         now: i64,
         authority: &Authority,
@@ -4216,7 +3112,7 @@ impl Store {
             &transaction,
             card_id,
             agent,
-            attribution,
+            run_id,
             body,
             now,
             authority,
@@ -4225,13 +3121,11 @@ impl Store {
         Ok(entry)
     }
 
-    /// Keyed work-log delivery stores the receipt with the work-log row and
-    /// outbound event, making duplicate agent delivery harmless.
     pub fn append_work_log_as_keyed(
         &mut self,
         card_id: &CardId,
         agent: &str,
-        attribution: WorkLogAttribution<'_>,
+        run_id: Option<&str>,
         body: &str,
         context: KeyedOperationContext<'_>,
     ) -> Result<IdempotencyOutcome<WorkLogEntry>> {
@@ -4240,14 +3134,7 @@ impl Store {
             idempotency_key,
             authority,
         } = context;
-        let payload = json!({
-            "agent": agent,
-            "model": attribution.model,
-            "reasoning": attribution.reasoning,
-            "harness": attribution.harness,
-            "run_id": attribution.run_id,
-            "body": body,
-        });
+        let payload = json!({"agent": agent, "run_id": run_id, "body": body});
         let request = IdempotencyRequest::from_payload(
             Operation::WorkLog,
             format!("card:{}", card_id.as_str()),
@@ -4262,7 +3149,7 @@ impl Store {
                 transaction,
                 card_id,
                 agent,
-                attribution,
+                run_id,
                 body,
                 now,
                 authority,
@@ -4317,7 +3204,6 @@ impl Store {
             .map(|value| non_empty_scrubbed("proof", value))
             .transpose()?;
         let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
-        let field_note_config = self.field_note_config.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4326,7 +3212,6 @@ impl Store {
             card_id,
             proof,
             criterion_proofs,
-            field_note_config,
             now,
             authority,
         )?;
@@ -4347,7 +3232,6 @@ impl Store {
             .map(|value| non_empty_scrubbed("proof", value))
             .transpose()?;
         let criterion_proofs = clean_criterion_proofs(criterion_proofs)?;
-        let field_note_config = self.field_note_config.clone();
         let payload = json!({
             "proof": proof,
             "criterion_proofs": criterion_proofs
@@ -4366,138 +3250,12 @@ impl Store {
                     card_id,
                     proof,
                     criterion_proofs,
-                    field_note_config,
                     now,
                     authority,
                 )
             },
         )
     }
-}
-
-/// The field-note seed generator's actual eligibility check and draft spawn
-/// (powder-921). Runs inside `complete_card`'s own transaction, so a draft
-/// either exists durably alongside the completion it came from or not at
-/// all -- never a dangling side effect from a completion that itself rolled
-/// back. Every gate is deterministic per the content-harness design law: no
-/// model call decides eligibility here, only repo membership, a length
-/// floor, and a hard weekly count.
-fn maybe_spawn_field_note_draft(
-    transaction: &rusqlite::Transaction,
-    completed_card: &Card,
-    proof: Option<&str>,
-    config: &FieldNoteConfig,
-    now: i64,
-) -> Result<Option<Card>> {
-    let Some(proof) = proof else {
-        return Ok(None);
-    };
-    let proof = proof.trim();
-    if proof.chars().count() < config.proof_min_chars {
-        return Ok(None);
-    }
-
-    let Some(repo) = completed_card.repo.as_deref() else {
-        return Ok(None);
-    };
-    // `card.repo` is already canonicalized to its short name (e.g. "powder",
-    // not "misty-step/powder") by the time it's stored; canonicalize the
-    // configured allowlist entries the same way `canonical_repo_matches` does
-    // everywhere else in this crate, so an operator can list either spelling.
-    if !config
-        .repo_allowlist
-        .iter()
-        .any(|allowed| canonical_repo_matches(allowed, repo))
-    {
-        return Ok(None);
-    }
-
-    let cutoff = now - FIELD_NOTE_BUDGET_WINDOW_SECONDS;
-    if count_field_note_drafts_since(transaction, cutoff)? >= config.weekly_budget {
-        return Ok(None);
-    }
-
-    // Deterministic id from the source card: a card completes exactly once
-    // (status only ever moves forward to a terminal state), so this can
-    // never collide under normal operation. The existence check is a
-    // defensive idempotency guard, not the primary uniqueness mechanism.
-    let draft_id = CardId::new(format!("field-note-{}", completed_card.id))?;
-    if load_card_optional(transaction, &draft_id)?.is_some() {
-        return Ok(None);
-    }
-
-    let source_links = answer_loop::load_links_for_card(transaction, &completed_card.id)?;
-
-    let mut body = format!(
-        "Seed proof captured verbatim from {} ({repo}) for drafting in the operator voice. \
-         Machine-drafted; not for autopost.\n\n---\n\n{proof}",
-        completed_card.id
-    );
-    if !source_links.is_empty() {
-        body.push_str("\n\n---\nEvidence links:\n");
-        for link in &source_links {
-            body.push_str(&format!("- {}: {}\n", link.label, link.url));
-        }
-    }
-
-    let mut draft = Card::new(
-        draft_id.clone(),
-        format!("Field note seed: {}", completed_card.title),
-        body,
-    )?
-    .with_status(CardStatus::Backlog)
-    .with_created_at(now);
-    draft.labels = vec![FIELD_NOTE_DRAFT_LABEL.to_string()];
-    draft.related = vec![completed_card.id.clone()];
-    draft.repo = Some(FIELD_NOTE_REVIEW_REPO.to_string());
-    draft.updated_at = now;
-
-    persist_card(transaction, &draft)?;
-    append_card_event(
-        transaction,
-        &draft_id,
-        "create",
-        "field-note-generator",
-        &format!("spawned field-note draft from {}", completed_card.id),
-        now,
-    )?;
-    for link in &source_links {
-        insert_link(transaction, &draft_id, &link.label, &link.url, now)?;
-    }
-
-    Ok(Some(draft))
-}
-
-/// How many field-note drafts (identified by [`FIELD_NOTE_REVIEW_REPO`] +
-/// [`FIELD_NOTE_DRAFT_LABEL`]) were created at or after `cutoff`. A full
-/// table scan mirrors the existing `list_ready`/`list_cards` pattern --
-/// Powder's card counts don't warrant a dedicated indexed query for this.
-fn count_field_note_drafts_since(connection: &Connection, cutoff: i64) -> Result<usize> {
-    let mut statement = connection.prepare(CARD_SELECT_ALL_SQL)?;
-    let records = statement
-        .query_map([], CardRecord::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut count = 0;
-    for record in records {
-        let card = card_from_record(connection, record)?;
-        if card.created_at >= cutoff
-            && card.repo.as_deref() == Some(FIELD_NOTE_REVIEW_REPO)
-            && card
-                .labels
-                .iter()
-                .any(|label| label == FIELD_NOTE_DRAFT_LABEL)
-        {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn is_supported_image_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
-    )
 }
 
 fn insert_link(
@@ -4556,9 +3314,13 @@ fn add_link_in_transaction(
             semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
             run_id: card.claim.as_ref().map(|claim| &claim.run_id),
             reason: None,
-            event_type: "link",
+            event_type: CardEventType::Link,
             actor: &actor,
-            payload: "added link",
+            change: CardEventChange::Link {
+                id: Some(link.id.clone()),
+                label: Some(link.label.clone()),
+                url: Some(link.url.clone()),
+            },
             subject_kind: "link",
             subject_id: link.id.as_str(),
             authority,
@@ -4566,124 +3328,6 @@ fn add_link_in_transaction(
         now,
     )?;
     Ok(link)
-}
-
-fn attach_image_in_transaction(
-    transaction: &Transaction<'_>,
-    card_id: &CardId,
-    bytes: &[u8],
-    mime: &str,
-    filename: &str,
-    now: i64,
-    authority: &Authority,
-) -> Result<AttachmentMeta> {
-    let mime = non_empty("mime", mime)?;
-    if !is_supported_image_mime(&mime) {
-        return Err(DomainError::validation(
-            "mime",
-            format!("unsupported image MIME type: {mime}"),
-        )
-        .into());
-    }
-    let filename = non_empty_scrubbed("filename", filename)?;
-    let card = load_card(transaction, card_id)?;
-    authorize_card_operation(authority, Operation::AttachImage, &card, None, None, now)?;
-    let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
-    let id = format!("{:x}", Sha256::digest(bytes));
-    let size = i64::try_from(bytes.len())
-        .map_err(|_| DomainError::validation("bytes", "image is too large to store"))?;
-    transaction.execute(
-        "INSERT INTO attachments (id, mime, size, bytes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(id) DO NOTHING",
-        params![id, mime, size, bytes, now],
-    )?;
-    let (stored_mime, stored_size) = transaction.query_row(
-        "SELECT mime, size FROM attachments WHERE id = ?1",
-        [&id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-    )?;
-    transaction.execute(
-        "INSERT INTO card_attachments
-         (card_id, attachment_id, filename, created_at, principal)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(card_id, attachment_id) DO UPDATE SET
-           filename = excluded.filename, created_at = excluded.created_at,
-           principal = excluded.principal",
-        params![card_id.as_str(), id, filename, now, principal],
-    )?;
-    append_attributed_card_event(
-        transaction,
-        card_id,
-        MutationAudit {
-            operation: Operation::AttachImage,
-            resource: card_id.as_str(),
-            semantic_identity: Some(principal.as_str()),
-            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
-            reason: Some("attachment correction"),
-            event_type: "attachment",
-            actor: &principal,
-            payload: "attached image",
-            subject_kind: "attachment",
-            subject_id: &id,
-            authority,
-        },
-        now,
-    )?;
-    Ok(AttachmentMeta {
-        id,
-        filename,
-        mime: stored_mime,
-        size: stored_size,
-        created_at: now,
-    })
-}
-
-fn detach_in_transaction(
-    transaction: &Transaction<'_>,
-    card_id: &CardId,
-    attachment_id: &str,
-    now: i64,
-    authority: &Authority,
-) -> Result<()> {
-    let attachment_id = non_empty("attachment_id", attachment_id)?;
-    let card = load_card(transaction, card_id)?;
-    authorize_card_operation(authority, Operation::DetachImage, &card, None, None, now)?;
-    let principal = authority.principal_name().unwrap_or("unchecked").to_owned();
-    let removed = transaction.execute(
-        "DELETE FROM card_attachments WHERE card_id = ?1 AND attachment_id = ?2",
-        params![card_id.as_str(), attachment_id],
-    )?;
-    if removed == 0 {
-        return Err(DomainError::not_found("attachment", attachment_id).into());
-    }
-    let referenced: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM card_attachments WHERE attachment_id = ?1",
-        [&attachment_id],
-        |row| row.get(0),
-    )?;
-    if referenced == 0 {
-        transaction.execute("DELETE FROM attachments WHERE id = ?1", [&attachment_id])?;
-    }
-    append_attributed_card_event(
-        transaction,
-        card_id,
-        MutationAudit {
-            operation: Operation::DetachImage,
-            resource: card_id.as_str(),
-            semantic_identity: Some(principal.as_str()),
-            run_id: card.claim.as_ref().map(|claim| &claim.run_id),
-            reason: Some("attachment correction"),
-            event_type: "attachment",
-            actor: &principal,
-            payload: "detached image",
-            subject_kind: "attachment",
-            subject_id: &attachment_id,
-            authority,
-        },
-        now,
-    )?;
-    Ok(())
 }
 
 fn request_input_in_transaction(
@@ -4736,9 +3380,13 @@ fn request_input_in_transaction(
             semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
             run_id: Some(run_id),
             reason: None,
-            event_type: "request-input",
+            event_type: CardEventType::RequestInput,
             actor: &actor,
-            payload: "awaiting input",
+            change: CardEventChange::Input {
+                action: powder_core::InputEventAction::Requested,
+                run_id: Some(run_id.clone()),
+                text: Some(question.clone()),
+            },
             subject_kind: "run",
             subject_id: run_id.as_str(),
             authority,
@@ -4748,32 +3396,20 @@ fn request_input_in_transaction(
     events::append_outbound_card_event_with_authority(
         transaction,
         &card,
-        "awaiting-input",
+        CardEventType::AwaitingInput,
         authority,
-        json!({"run_id": run_id.as_str(), "question": question}),
+        CardEventChange::Input {
+            action: powder_core::InputEventAction::Requested,
+            run_id: Some(run_id.clone()),
+            text: Some(question),
+        },
         now,
     )?;
     Ok(run)
 }
 
 fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
-    let source_path = card.source.as_ref().map(|source| source.path.as_str());
-    let source_digest = card.source.as_ref().map(|source| source.digest.as_str());
-    let repo = card
-        .repo
-        .as_deref()
-        .map(|repo| -> Result<String> {
-            resolve_registered_repository_for_write(connection, repo, card.updated_at)?.ok_or_else(|| {
-                DomainError::validation(
-                    "repo",
-                    format!(
-                            "unregistered repo \"{repo}\": register it first via POST /api/v1/repositories (or the repository-upsert CLI command)"
-                    ),
-                )
-                .into()
-            })
-        })
-        .transpose()?;
+    let repo = card.repo.as_deref();
     let claim_principal = card.claim.as_ref().map(|claim| claim.principal.as_str());
     let claim_agent = card.claim.as_ref().map(|claim| claim.agent.as_str());
     let claim_run_id = card.claim.as_ref().map(|claim| claim.run_id.as_str());
@@ -4783,7 +3419,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
     connection.execute(
         &format!(
             "INSERT INTO cards ({CARD_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                body = excluded.body,
@@ -4792,15 +3428,11 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                proof_plan_json = excluded.proof_plan_json,
                status = excluded.status,
                priority = excluded.priority,
-               estimate = excluded.estimate,
                labels_json = excluded.labels_json,
-               assignee = excluded.assignee,
                related_json = excluded.related_json,
                blocks_json = excluded.blocks_json,
                blocked_by_json = excluded.blocked_by_json,
                repo = excluded.repo,
-               source_path = excluded.source_path,
-               source_digest = excluded.source_digest,
                claim_principal = excluded.claim_principal,
                claim_agent = excluded.claim_agent,
                claim_run_id = excluded.claim_run_id,
@@ -4808,8 +3440,7 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
                claim_expires_at = excluded.claim_expires_at,
                created_at = excluded.created_at,
                updated_at = excluded.updated_at,
-               parent = excluded.parent,
-               risk = excluded.risk"
+               parent = excluded.parent"
         ),
         params![
             card.id.as_str(),
@@ -4820,15 +3451,11 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             to_json(&card.proof_plan)?,
             card.status.as_str(),
             card.priority.as_str(),
-            card.estimate.map(Estimate::as_str),
             to_json(&card.labels)?,
-            card.assignee,
             to_json(&card.related)?,
             to_json(&card.blocks)?,
             to_json(&card.blocked_by)?,
             repo,
-            source_path,
-            source_digest,
             claim_principal,
             claim_agent,
             claim_run_id,
@@ -4837,7 +3464,6 @@ fn persist_card(connection: &Connection, card: &Card) -> Result<()> {
             card.created_at,
             card.updated_at,
             card.parent.as_ref().map(CardId::as_str),
-            card.risk.map(Risk::as_str)
         ],
     )?;
     Ok(())
@@ -4847,10 +3473,8 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
     connection.execute(
         "INSERT INTO runs (
             id, card_id, state, principal, role, agent, claim_expires_at, proof,
-            telemetry_attempt_count, telemetry_input_tokens, telemetry_output_tokens, telemetry_reasoning_tokens,
-            telemetry_estimated_cost_usd_micros, telemetry_duration_ms, telemetry_pricing_version, telemetry_outcome,
-            telemetry_unattributed_attempt_count, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
            card_id = excluded.card_id,
            state = excluded.state,
@@ -4859,7 +3483,6 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
            agent = excluded.agent,
            claim_expires_at = excluded.claim_expires_at,
            proof = excluded.proof,
-           telemetry_attempt_count = excluded.telemetry_attempt_count, telemetry_input_tokens = excluded.telemetry_input_tokens, telemetry_output_tokens = excluded.telemetry_output_tokens, telemetry_reasoning_tokens = excluded.telemetry_reasoning_tokens, telemetry_estimated_cost_usd_micros = excluded.telemetry_estimated_cost_usd_micros, telemetry_duration_ms = excluded.telemetry_duration_ms, telemetry_pricing_version = excluded.telemetry_pricing_version, telemetry_outcome = excluded.telemetry_outcome, telemetry_unattributed_attempt_count = excluded.telemetry_unattributed_attempt_count,
            created_at = excluded.created_at,
            updated_at = excluded.updated_at",
         params![
@@ -4871,20 +3494,58 @@ fn persist_run(connection: &Connection, run: &Run) -> Result<()> {
             run.agent,
             run.claim_expires_at,
             run.proof,
-            run.telemetry.as_ref().map(|t| t.attempt_count),
-            run.telemetry.as_ref().and_then(|t| t.input_tokens),
-            run.telemetry.as_ref().and_then(|t| t.output_tokens),
-            run.telemetry.as_ref().and_then(|t| t.reasoning_tokens),
-            run.telemetry.as_ref().and_then(|t| t.estimated_cost_usd_micros),
-            run.telemetry.as_ref().and_then(|t| t.duration_ms),
-            run.telemetry.as_ref().and_then(|t| t.pricing_version.clone()),
-            run.telemetry.as_ref().and_then(|t| t.outcome.clone()),
-            run.telemetry.as_ref().map(|t| t.unattributed_attempt_count),
             run.created_at,
             run.updated_at
         ],
     )?;
     Ok(())
+}
+struct RunRecord {
+    id: String,
+    card_id: String,
+    state: String,
+    principal: String,
+    role: String,
+    agent: String,
+    claim_expires_at: i64,
+    proof: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl RunRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            card_id: row.get(1)?,
+            state: row.get(2)?,
+            principal: row.get(3)?,
+            role: row.get(4)?,
+            agent: row.get(5)?,
+            claim_expires_at: row.get(6)?,
+            proof: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    fn into_run(self) -> Result<Run> {
+        Ok(Run {
+            id: RunId::new(self.id)?,
+            card_id: CardId::new(self.card_id)?,
+            state: RunState::parse(&self.state).ok_or(StoreError::InvalidStoredValue {
+                field: "runs.state",
+                value: self.state,
+            })?,
+            principal: self.principal,
+            role: self.role,
+            agent: self.agent,
+            claim_expires_at: self.claim_expires_at,
+            proof: self.proof,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
 }
 
 fn append_activity_attributed(
@@ -4927,9 +3588,9 @@ fn append_activity_attributed(
 fn append_card_event(
     connection: &Connection,
     card_id: &CardId,
-    event_type: &str,
+    event_type: CardEventType,
     actor: &str,
-    payload: &str,
+    change: CardEventChange,
     now: i64,
 ) -> Result<CardEvent> {
     append_card_event_with_authority(
@@ -4937,7 +3598,7 @@ fn append_card_event(
         card_id,
         event_type,
         actor,
-        payload,
+        change,
         now,
         &Authority::unchecked(),
     )
@@ -4948,13 +3609,13 @@ fn complete_card_in_transaction(
     card_id: &CardId,
     proof: Option<String>,
     criterion_proofs: Vec<CriterionProofInput>,
-    field_note_config: Option<FieldNoteConfig>,
     now: i64,
     authority: &Authority,
 ) -> Result<Card> {
     let mut card = load_card(transaction, card_id)?;
     authorize_card_operation(authority, Operation::CompleteCard, &card, None, None, now)?;
     let previous = card.status;
+    let criteria: Vec<usize> = criterion_proofs.iter().map(|item| item.criterion).collect();
     let run_id = card.claim.as_ref().map(|claim| claim.run_id.clone());
     card.status = CardStatus::Done;
     card.claim = None;
@@ -4980,11 +3641,7 @@ fn complete_card_in_transaction(
             transaction,
             &run_id,
             ActivityType::Response,
-            proof
-                .as_deref()
-                .map(|value| format!("completed: {value}"))
-                .unwrap_or_else(|| "completed without proof".to_string())
-                .as_str(),
+            proof.as_deref().unwrap_or("completed without proof"),
             authority.principal_name(),
             Some(authority.role_label()),
             now,
@@ -4993,9 +3650,14 @@ fn complete_card_in_transaction(
     append_card_event_with_authority(
         transaction,
         card_id,
-        "status",
+        CardEventType::Status,
         &authority.actor_label(),
-        &format!("{} -> done", previous.as_str()),
+        CardEventChange::Completion {
+            previous,
+            current: CardStatus::Done,
+            proof: proof.clone(),
+            criteria: criteria.clone(),
+        },
         now,
         authority,
     )?;
@@ -5003,29 +3665,16 @@ fn complete_card_in_transaction(
         events::append_outbound_card_event_with_authority(
             transaction,
             &card,
-            "completed",
+            CardEventType::Completed,
             authority,
-            json!({"previous_status": previous.as_str(), "status": card.status.as_str(), "proof": proof, "criteria": card.criteria}),
+            CardEventChange::Completion {
+                previous,
+                current: card.status,
+                proof,
+                criteria,
+            },
             now,
         )?;
-        append_parent_rollup_event_with_authority(
-            transaction,
-            &card,
-            authority,
-            &proof
-                .as_deref()
-                .map(|value| {
-                    format!(
-                        "child {card_id} completed with proof: {}",
-                        EpicState::proof_snippet(value)
-                    )
-                })
-                .unwrap_or_else(|| format!("child {card_id} completed without proof")),
-            now,
-        )?;
-        if let Some(config) = &field_note_config {
-            maybe_spawn_field_note_draft(transaction, &card, proof.as_deref(), config, now)?;
-        }
     }
     Ok(card)
 }
@@ -5050,18 +3699,15 @@ fn set_parent_in_transaction(
     card.updated_at = now;
     persist_card(transaction, &card)?;
     let actor = authority.actor_label();
-    let label = |value: &Option<CardId>| {
-        value
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "none".to_string())
-    };
     append_card_event_with_authority(
         transaction,
         card_id,
-        "hierarchy",
+        CardEventType::Hierarchy,
         &actor,
-        &format!("parent {} -> {}", label(&previous), label(&parent)),
+        CardEventChange::Parent {
+            previous: previous.clone(),
+            current: parent.clone(),
+        },
         now,
         authority,
     )?;
@@ -5070,9 +3716,12 @@ fn set_parent_in_transaction(
             append_card_event_with_authority(
                 transaction,
                 old_parent,
-                "hierarchy",
+                CardEventType::Hierarchy,
                 &actor,
-                &format!("child {card_id} unlinked"),
+                CardEventChange::Parent {
+                    previous: Some(card_id.clone()),
+                    current: None,
+                },
                 now,
                 authority,
             )?;
@@ -5082,9 +3731,12 @@ fn set_parent_in_transaction(
         append_card_event_with_authority(
             transaction,
             new_parent,
-            "decompose",
+            CardEventType::Hierarchy,
             &actor,
-            &format!("child {card_id} linked"),
+            CardEventChange::Parent {
+                previous: None,
+                current: Some(card_id.clone()),
+            },
             now,
             authority,
         )?;
@@ -5119,12 +3771,13 @@ fn update_relations_in_transaction(
     append_card_event_with_authority(
         transaction,
         card_id,
-        "relations",
+        CardEventType::Relations,
         &actor,
-        &format!(
-            "related={:?} blocks={:?} blocked_by={:?}",
-            card.related, card.blocks, card.blocked_by
-        ),
+        CardEventChange::Relations {
+            related: card.related.clone(),
+            blocks: card.blocks.clone(),
+            blocked_by: card.blocked_by.clone(),
+        },
         now,
         authority,
     )?;
@@ -5182,9 +3835,12 @@ fn update_status_in_transaction(
     append_card_event_with_authority(
         transaction,
         card_id,
-        "status",
+        CardEventType::Status,
         &authority.actor_label(),
-        &format!("{} -> {}", previous.as_str(), status.as_str()),
+        CardEventChange::Status {
+            previous,
+            current: status,
+        },
         now,
         authority,
     )?;
@@ -5194,16 +3850,10 @@ fn update_status_in_transaction(
             &card,
             event_type,
             authority,
-            json!({"previous_status": previous.as_str(), "status": status.as_str()}),
-            now,
-        )?;
-    }
-    if status.is_terminal() && !previous.is_terminal() {
-        append_parent_rollup_event_with_authority(
-            transaction,
-            &card,
-            authority,
-            &format!("child {card_id} reached {}", status.as_str()),
+            CardEventChange::Status {
+                previous,
+                current: status,
+            },
             now,
         )?;
     }
@@ -5245,13 +3895,12 @@ fn check_criterion_in_transaction(
             semantic_identity: Some(actor.as_str()),
             run_id: None,
             reason: Some("criterion correction"),
-            event_type: "criterion",
+            event_type: CardEventType::Criterion,
             actor: &actor,
-            payload: &format!(
-                "criterion {} {}",
-                criterion,
-                if checked { "checked" } else { "unchecked" }
-            ),
+            change: CardEventChange::Criterion {
+                index: criterion,
+                checked,
+            },
             subject_kind: "criterion",
             subject_id: &subject_id,
             authority,
@@ -5274,35 +3923,27 @@ fn patch_card_in_transaction(
     let mut patched_fields = Vec::new();
     if let Some(title) = patch.title {
         card.title = non_empty_scrubbed("title", &title)?;
-        patched_fields.push("title");
+        patched_fields.push("title".to_string());
     }
     if let Some(body) = patch.body {
         card.body = secrets::scrub_secrets(&body);
-        patched_fields.push("body");
+        patched_fields.push("body".to_string());
     }
     if let Some(acceptance) = patch.acceptance {
         card = card.with_acceptance(scrub_string_list(acceptance));
-        patched_fields.push("acceptance");
+        patched_fields.push("acceptance".to_string());
     }
     if let Some(proof_plan) = patch.proof_plan {
         card = card.with_proof_plan(scrub_string_list(proof_plan));
-        patched_fields.push("proof_plan");
+        patched_fields.push("proof_plan".to_string());
     }
     if let Some(priority) = patch.priority {
         card.priority = priority;
-        patched_fields.push("priority");
-    }
-    if let Some(estimate) = patch.estimate {
-        card.estimate = Some(estimate);
-        patched_fields.push("estimate");
-    }
-    if let Some(risk) = patch.risk {
-        card.risk = Some(risk);
-        patched_fields.push("risk");
+        patched_fields.push("priority".to_string());
     }
     if let Some(labels) = patch.labels {
         card.labels = clean_string_list(labels);
-        patched_fields.push("labels");
+        patched_fields.push("labels".to_string());
     }
     let mut status_change = None;
     if let Some(status) = patch.status {
@@ -5310,11 +3951,11 @@ fn patch_card_in_transaction(
             status_change = Some((card.status, status));
         }
         card.status = status;
-        patched_fields.push("status");
+        patched_fields.push("status".to_string());
     }
     if let Some(repo) = patch.repo {
         card.repo = repo;
-        patched_fields.push("repo");
+        patched_fields.push("repo".to_string());
     }
     if patched_fields.is_empty() {
         return Ok(card);
@@ -5324,16 +3965,14 @@ fn patch_card_in_transaction(
     append_card_event_with_authority(
         transaction,
         card_id,
-        "patch",
+        CardEventType::Patch,
         &actor,
-        &format!("patched {}", patched_fields.join(", ")),
+        CardEventChange::Patch {
+            fields: patched_fields,
+        },
         now,
         authority,
     )?;
-    // A status flip through PATCH is the same observable transition as
-    // /status: webhooks and the SSE tail must see it (a live board otherwise
-    // sits silently stale while flagged "live" -- design-critic finding,
-    // 2026-08-03).
     if let Some((previous, status)) = status_change {
         if let Some(event_type) = events::outbound_event_for_status_change(previous, status) {
             events::append_outbound_card_event_with_authority(
@@ -5341,16 +3980,10 @@ fn patch_card_in_transaction(
                 &card,
                 event_type,
                 authority,
-                json!({"previous_status": previous.as_str(), "status": status.as_str()}),
-                now,
-            )?;
-        }
-        if status.is_terminal() && !previous.is_terminal() {
-            append_parent_rollup_event_with_authority(
-                transaction,
-                &card,
-                authority,
-                &format!("child {card_id} reached {}", status.as_str()),
+                CardEventChange::Status {
+                    previous,
+                    current: status,
+                },
                 now,
             )?;
         }
@@ -5373,17 +4006,6 @@ fn create_card_in_transaction(
         criterion.text = secrets::scrub_secrets(&criterion.text);
     }
     card.proof_plan = scrub_string_list(std::mem::take(&mut card.proof_plan));
-    if let Some(derived_repo) = repo_from_numeric_card_id_prefix(card_id.as_str()) {
-        if let Some(repo) = card.repo.as_deref() {
-            if !canonical_repo_matches(repo, &derived_repo) {
-                return Err(DomainError::validation(
-                    "repo",
-                    format!("repo {repo} does not match numeric card id prefix {derived_repo}"),
-                )
-                .into());
-            }
-        }
-    }
     if load_card_optional(transaction, &card_id)?.is_some() {
         return Err(DomainError::conflict(format!("card already exists: {card_id}")).into());
     }
@@ -5395,9 +4017,11 @@ fn create_card_in_transaction(
     append_card_event_with_authority(
         transaction,
         &saved.id,
-        "create",
+        CardEventType::Create,
         &actor,
-        "created card",
+        CardEventChange::Create {
+            source: "create-card".to_string(),
+        },
         now,
         authority,
     )?;
@@ -5405,9 +4029,12 @@ fn create_card_in_transaction(
         append_card_event_with_authority(
             transaction,
             parent_id,
-            "decompose",
+            CardEventType::Hierarchy,
             &actor,
-            &format!("child {card_id} created"),
+            CardEventChange::Parent {
+                previous: None,
+                current: Some(card_id.clone()),
+            },
             now,
             authority,
         )?;
@@ -5416,9 +4043,11 @@ fn create_card_in_transaction(
     events::append_outbound_card_event_with_authority(
         transaction,
         &saved,
-        "card-created",
+        CardEventType::CardCreated,
         authority,
-        json!({"source": "create-card"}),
+        CardEventChange::Create {
+            source: "create-card".to_string(),
+        },
         now,
     )?;
     Ok(saved)
@@ -5428,21 +4057,21 @@ fn append_work_log_in_transaction(
     transaction: &Transaction<'_>,
     card_id: &CardId,
     agent: &str,
-    attribution: WorkLogAttribution<'_>,
+    run_id: Option<&str>,
     body: &str,
     now: i64,
     authority: &Authority,
 ) -> Result<WorkLogEntry> {
     let card = load_card(transaction, card_id)?;
-    let run_id = attribution.run_id.map(RunId::new).transpose()?;
+    let run_id = match run_id {
+        Some(raw) => Some(RunId::new(raw)?),
+        None => card.claim.as_ref().map(|claim| claim.run_id.clone()),
+    };
     let id = format!("work-log-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET));
     let entry = WorkLogEntry {
         id: id.clone(),
         card_id: card_id.clone(),
         agent: non_empty("agent", agent)?,
-        model: attribution.model.map(secrets::scrub_secrets),
-        reasoning: attribution.reasoning.map(secrets::scrub_secrets),
-        harness: attribution.harness.map(secrets::scrub_secrets),
         run_id,
         body: non_empty_scrubbed("body", body)?,
         created_at: now,
@@ -5457,15 +4086,12 @@ fn append_work_log_in_transaction(
     )?;
     transaction.execute(
         "INSERT INTO work_log_entries
-         (id, card_id, agent, model, reasoning, harness, run_id, body, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (id, card_id, agent, run_id, body, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             id,
             entry.card_id.as_str(),
             entry.agent,
-            entry.model,
-            entry.reasoning,
-            entry.harness,
             entry.run_id.as_ref().map(RunId::as_str),
             entry.body,
             entry.created_at,
@@ -5480,9 +4106,13 @@ fn append_work_log_in_transaction(
             semantic_identity: Some(entry.agent.as_str()),
             run_id: entry.run_id.as_ref(),
             reason: None,
-            event_type: "work-log",
+            event_type: CardEventType::WorkLog,
             actor: &entry.agent,
-            payload: "appended work log",
+            change: CardEventChange::WorkLog {
+                agent: entry.agent.clone(),
+                run_id: entry.run_id.clone(),
+                body: entry.body.clone(),
+            },
             subject_kind: "work_log",
             subject_id: &entry.id,
             authority,
@@ -5492,13 +4122,13 @@ fn append_work_log_in_transaction(
     events::append_outbound_card_event_for_audit(
         transaction,
         &card,
-        "work-log-appended",
+        CardEventType::WorkLogAppended,
         &entry.agent,
-        json!({
-            "agent": entry.agent.as_str(),
-            "model": entry.model,
-            "harness": entry.harness,
-        }),
+        CardEventChange::WorkLog {
+            agent: entry.agent.clone(),
+            run_id: entry.run_id.clone(),
+            body: entry.body.clone(),
+        },
         now,
         &audit_event,
     )?;
@@ -5548,9 +4178,12 @@ fn add_comment_in_transaction(
             semantic_identity: Some(comment.author.as_str()),
             run_id: None,
             reason: None,
-            event_type: "comment",
+            event_type: CardEventType::Comment,
             actor: &comment.author,
-            payload: "added comment",
+            change: CardEventChange::Comment {
+                author: comment.author.clone(),
+                body: comment.body.clone(),
+            },
             subject_kind: "comment",
             subject_id: &comment.id,
             authority,
@@ -5560,33 +4193,36 @@ fn add_comment_in_transaction(
     events::append_outbound_card_event_for_audit(
         transaction,
         &card,
-        "comment-added",
+        CardEventType::CommentAdded,
         &comment.author,
-        json!({"author": comment.author.as_str(), "body": comment.body.as_str()}),
+        CardEventChange::Comment {
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+        },
         now,
         &audit_event,
     )?;
     Ok(comment)
 }
 
-fn operation_for_event(event_type: &str, payload: &str) -> Option<Operation> {
+fn operation_for_event(event_type: CardEventType) -> Option<Operation> {
     match event_type {
-        "create" => Some(Operation::CreateCard),
-        "patch" | "repair" => Some(Operation::PatchCard),
-        "status" | "rollup" => Some(Operation::UpdateStatus),
-        "relations" => Some(Operation::UpdateRelations),
-        "hierarchy" | "decompose" => Some(Operation::SetParent),
-        "claim" => Some(Operation::ClaimCard),
-        "release" => Some(Operation::ReleaseClaim),
-        "renew" => Some(Operation::RenewClaim),
-        "heartbeat" => Some(Operation::HeartbeatClaim),
-        "transfer" => Some(Operation::TransferClaim),
-        "attachment" if payload.contains("detach") => Some(Operation::DetachImage),
-        "attachment" => Some(Operation::AttachImage),
-        "link" => Some(Operation::AddLink),
-        "comment" => Some(Operation::AddComment),
-        "work-log" => Some(Operation::WorkLog),
-        "complete" => Some(Operation::CompleteCard),
+        CardEventType::Create => Some(Operation::CreateCard),
+        CardEventType::Patch => Some(Operation::PatchCard),
+        CardEventType::Status => Some(Operation::UpdateStatus),
+        CardEventType::Relations => Some(Operation::UpdateRelations),
+        CardEventType::Hierarchy => Some(Operation::SetParent),
+        CardEventType::Claim => Some(Operation::ClaimCard),
+        CardEventType::Release => Some(Operation::ReleaseClaim),
+        CardEventType::Renew => Some(Operation::RenewClaim),
+        CardEventType::Heartbeat => Some(Operation::HeartbeatClaim),
+        CardEventType::Transfer => Some(Operation::TransferClaim),
+        CardEventType::Link => Some(Operation::AddLink),
+        CardEventType::Comment => Some(Operation::AddComment),
+        CardEventType::WorkLog => Some(Operation::WorkLog),
+        CardEventType::RequestInput => Some(Operation::RequestInput),
+        CardEventType::AnswerInput => Some(Operation::AnswerInput),
+        CardEventType::Complete => Some(Operation::CompleteCard),
         _ => None,
     }
 }
@@ -5594,30 +4230,37 @@ fn operation_for_event(event_type: &str, payload: &str) -> Option<Operation> {
 fn append_card_event_with_authority(
     connection: &Connection,
     card_id: &CardId,
-    event_type: &str,
+    event_type: CardEventType,
     actor: &str,
-    payload: &str,
+    change: CardEventChange,
     now: i64,
     authority: &Authority,
 ) -> Result<CardEvent> {
+    if change.is_retired() {
+        return Err(
+            DomainError::validation("change", "retired event variants are read-only").into(),
+        );
+    }
+    let payload = to_json(&change)?;
+    let operation = operation_for_event(event_type);
+    let reason = operation
+        .filter(|operation| operation.rule().audit.reason)
+        .map(|_| payload.clone());
     let event = CardEvent {
         id: CardEventId::new(format!("event-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
         card_id: card_id.clone(),
-        event_type: non_empty("event_type", event_type)?,
+        event_type: non_empty("event_type", event_type.as_str())?,
         actor: non_empty("actor", actor)?,
-        payload: payload.to_owned(),
+        change,
         principal: authority.principal_name().map(str::to_string),
         role: Some(authority.role_label().to_string()),
         subject_kind: None,
         subject_id: None,
-        operation: operation_for_event(event_type, payload)
-            .map(|operation| operation.as_str().to_string()),
+        operation: operation.map(|operation| operation.as_str().to_string()),
         resource: Some(format!("card:{}", card_id.as_str())),
         semantic_identity: Some(actor.to_string()),
         run_id: None,
-        reason: operation_for_event(event_type, payload)
-            .filter(|operation| operation.rule().audit.reason)
-            .map(|_| payload.to_string()),
+        reason,
         created_at: now,
     };
     connection.execute(
@@ -5630,7 +4273,7 @@ fn append_card_event_with_authority(
             event.card_id.as_str(),
             event.event_type.as_str(),
             event.actor.as_str(),
-            event.payload.as_str(),
+            payload,
             event.principal.as_deref(),
             event.role.as_deref(),
             event.operation.as_deref(),
@@ -5650,12 +4293,17 @@ fn append_attributed_card_event(
     audit: MutationAudit<'_>,
     now: i64,
 ) -> Result<CardEvent> {
+    if audit.change.is_retired() {
+        return Err(
+            DomainError::validation("change", "retired event variants are read-only").into(),
+        );
+    }
     let event = CardEvent {
         id: CardEventId::new(format!("event-{}", nanoid::nanoid!(12, &API_KEY_ALPHABET)))?,
         card_id: card_id.clone(),
-        event_type: non_empty("event_type", audit.event_type)?,
+        event_type: non_empty("event_type", audit.event_type.as_str())?,
         actor: non_empty("actor", audit.actor)?,
-        payload: audit.payload.to_owned(),
+        change: audit.change,
         principal: audit.authority.principal_name().map(str::to_string),
         role: Some(audit.authority.role_label().to_string()),
         subject_kind: Some(non_empty("subject_kind", audit.subject_kind)?),
@@ -5667,6 +4315,7 @@ fn append_attributed_card_event(
         reason: audit.reason.map(str::to_string),
         created_at: now,
     };
+    let payload = to_json(&event.change)?;
     connection.execute(
         "INSERT INTO card_events (
            id, card_id, event_type, actor, payload, principal, role,
@@ -5677,7 +4326,7 @@ fn append_attributed_card_event(
             event.card_id.as_str(),
             event.event_type.as_str(),
             event.actor.as_str(),
-            event.payload.as_str(),
+            payload,
             event.principal.as_deref(),
             event.role.as_deref(),
             event.subject_kind.as_deref(),
@@ -5765,9 +4414,12 @@ fn release_claim_in_transaction(
     events::append_outbound_card_event_with_authority(
         transaction,
         &card,
-        "moved-to-ready",
+        CardEventType::MovedToReady,
         authority,
-        json!({"source": "release_claim", "run_id": run_id.as_str()}),
+        CardEventChange::Status {
+            previous: CardStatus::InProgress,
+            current: CardStatus::Ready,
+        },
         now,
     )?;
     Ok(claim_receipt(card_id, &claim))
@@ -5912,14 +4564,14 @@ fn load_card(connection: &Connection, card_id: &CardId) -> Result<Card> {
         .query_row(CARD_SELECT_SQL, [card_id.as_str()], CardRecord::from_row)
         .optional()?
         .ok_or_else(|| DomainError::not_found("card", card_id.to_string()).into())
-        .and_then(|record| card_from_record(connection, record))
+        .and_then(card_from_record)
 }
 
 fn load_card_optional(connection: &Connection, card_id: &CardId) -> Result<Option<Card>> {
     connection
         .query_row(CARD_SELECT_SQL, [card_id.as_str()], CardRecord::from_row)
         .optional()?
-        .map(|record| card_from_record(connection, record))
+        .map(card_from_record)
         .transpose()
 }
 
@@ -5974,8 +4626,6 @@ fn escape_like_prefix(value: &str) -> String {
 fn search_query_fingerprint(query: &SearchQuery) -> String {
     let values = [
         query.q.trim().to_string(),
-        query.source_kind.clone().unwrap_or_default(),
-        query.source_field.clone().unwrap_or_default(),
         query
             .status
             .map(|value| value.as_str().to_string())
@@ -5985,22 +4635,6 @@ fn search_query_fingerprint(query: &SearchQuery) -> String {
         query
             .priority
             .map(|value| value.as_str().to_string())
-            .unwrap_or_default(),
-        query
-            .estimate
-            .map(|value| value.as_str().to_string())
-            .unwrap_or_default(),
-        query
-            .risk
-            .map(|value| value.as_str().to_string())
-            .unwrap_or_default(),
-        query
-            .source_created_after
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        query
-            .source_created_before
-            .map(|value| value.to_string())
             .unwrap_or_default(),
         query
             .created_after
@@ -6056,12 +4690,8 @@ fn decode_search_cursor(raw: &str, expected_fingerprint: &str) -> Result<usize> 
         .map_err(|_| StoreError::InvalidSearchCursor(raw.to_string()))
 }
 
-fn card_from_record(connection: &Connection, record: CardRecord) -> Result<Card> {
-    let mut card = record.into_card()?;
-    if let Some(repo) = card.repo.as_deref() {
-        card.repo = resolve_repository_name(connection, repo)?;
-    }
-    Ok(card)
+fn card_from_record(record: CardRecord) -> Result<Card> {
+    record.into_card()
 }
 
 /// Full unfiltered card scan, one query -- shared by [`Store::list_ready_page`]
@@ -6072,10 +4702,7 @@ pub(crate) fn load_all_cards(connection: &Connection) -> Result<Vec<Card>> {
     let records = statement
         .query_map([], CardRecord::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    records
-        .into_iter()
-        .map(|record| card_from_record(connection, record))
-        .collect()
+    records.into_iter().map(card_from_record).collect()
 }
 
 fn ready_order_digest(cards: &[Card]) -> String {
@@ -6176,75 +4803,6 @@ fn ensure_parent_linkable(
     }
 }
 
-fn append_parent_rollup_event_with_authority(
-    connection: &Connection,
-    child: &Card,
-    authority: &Authority,
-    detail: &str,
-    now: i64,
-) -> Result<()> {
-    let Some(parent_id) = child.parent.as_ref() else {
-        return Ok(());
-    };
-    if load_card_optional(connection, parent_id)?.is_none() {
-        return Ok(());
-    }
-    append_card_event_with_authority(
-        connection,
-        parent_id,
-        "rollup",
-        &authority.actor_label(),
-        detail,
-        now,
-        authority,
-    )?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReimportClass {
-    Preserved,
-    Updated,
-    Unchanged,
-}
-
-fn classify_reimport(current: &Card, incoming: &Card) -> ReimportClass {
-    if current.protects_lifecycle_on_reimport() {
-        return ReimportClass::Preserved;
-    }
-    let current_digest = current.source.as_ref().map(|source| source.digest.as_str());
-    let incoming_digest = incoming
-        .source
-        .as_ref()
-        .map(|source| source.digest.as_str());
-    if current_digest == incoming_digest {
-        ReimportClass::Unchanged
-    } else {
-        ReimportClass::Updated
-    }
-}
-
-/// Counts of what an external-source batch upsert did (or, from
-/// [`Store::preview_import`], would do) to each card: newly created, content
-/// refreshed, lifecycle preserved against a stale reimport, or left
-/// untouched because the source has not changed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ImportOutcome {
-    pub created: usize,
-    pub updated: usize,
-    pub preserved: usize,
-    pub unchanged: usize,
-    /// Cards whose acceptance text actually changed on this reimport even
-    /// though the source digest did not: an adapter fix repairing previously
-    /// malformed criteria on already-sourced cards.
-    /// Scoped to `ReimportClass::Unchanged` specifically -- an ordinary
-    /// source edit changes the digest too (`ReimportClass::Updated`), and
-    /// that acceptance-text delta is expected, not damage, so it must not
-    /// inflate this counter. `preview_import` exposes the repair count before
-    /// a batch is written.
-    pub content_repaired: usize,
-}
-
 /// Report from `Store::repair_criteria`: which criteria changed and whether
 /// checked/proof state was preserved at each position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -6260,23 +4818,6 @@ pub struct CriteriaChange {
     pub previous: String,
     pub current: String,
     pub state_preserved: bool,
-}
-
-impl ImportOutcome {
-    pub fn total(&self) -> usize {
-        self.created + self.updated + self.preserved + self.unchanged
-    }
-
-    fn record(&mut self, class: ReimportClass, current: &Card, merged: &Card) {
-        match class {
-            ReimportClass::Preserved => self.preserved += 1,
-            ReimportClass::Updated => self.updated += 1,
-            ReimportClass::Unchanged => self.unchanged += 1,
-        }
-        if class == ReimportClass::Unchanged && current.acceptance != merged.acceptance {
-            self.content_repaired += 1;
-        }
-    }
 }
 
 fn to_json(value: &impl Serialize) -> Result<String> {
@@ -6430,15 +4971,11 @@ struct CardRecord {
     proof_plan_json: String,
     status: String,
     priority: String,
-    estimate: Option<String>,
     labels_json: String,
-    assignee: Option<String>,
     related_json: String,
     blocks_json: String,
     blocked_by_json: String,
     repo: Option<String>,
-    source_path: Option<String>,
-    source_digest: Option<String>,
     claim_principal: Option<String>,
     claim_agent: Option<String>,
     claim_run_id: Option<String>,
@@ -6447,7 +4984,6 @@ struct CardRecord {
     created_at: i64,
     updated_at: i64,
     parent: Option<String>,
-    risk: Option<String>,
 }
 
 impl CardRecord {
@@ -6461,24 +4997,19 @@ impl CardRecord {
             proof_plan_json: row.get(5)?,
             status: row.get(6)?,
             priority: row.get(7)?,
-            estimate: row.get(8)?,
-            labels_json: row.get(9)?,
-            assignee: row.get(10)?,
-            related_json: row.get(11)?,
-            blocks_json: row.get(12)?,
-            blocked_by_json: row.get(13)?,
-            repo: row.get(14)?,
-            source_path: row.get(15)?,
-            source_digest: row.get(16)?,
-            claim_principal: row.get(17)?,
-            claim_agent: row.get(18)?,
-            claim_run_id: row.get(19)?,
-            claim_acquired_at: row.get(20)?,
-            claim_expires_at: row.get(21)?,
-            created_at: row.get(22)?,
-            updated_at: row.get(23)?,
-            parent: row.get(24)?,
-            risk: row.get(25)?,
+            labels_json: row.get(8)?,
+            related_json: row.get(9)?,
+            blocks_json: row.get(10)?,
+            blocked_by_json: row.get(11)?,
+            repo: row.get(12)?,
+            claim_principal: row.get(13)?,
+            claim_agent: row.get(14)?,
+            claim_run_id: row.get(15)?,
+            claim_acquired_at: row.get(16)?,
+            claim_expires_at: row.get(17)?,
+            created_at: row.get(18)?,
+            updated_at: row.get(19)?,
+            parent: row.get(20)?,
         })
     }
 
@@ -6505,26 +5036,6 @@ impl CardRecord {
                     value: self.priority,
                 },
             )?)
-            .with_estimate(
-                self.estimate
-                    .map(|raw| {
-                        Estimate::parse(&raw).ok_or(StoreError::InvalidStoredValue {
-                            field: "cards.estimate",
-                            value: raw,
-                        })
-                    })
-                    .transpose()?,
-            )
-            .with_risk(
-                self.risk
-                    .map(|raw| {
-                        Risk::parse(&raw).ok_or(StoreError::InvalidStoredValue {
-                            field: "cards.risk",
-                            value: raw,
-                        })
-                    })
-                    .transpose()?,
-            )
             .with_created_at(self.created_at);
         if !oracle.criteria.is_empty() {
             card = card.with_criteria(oracle.criteria);
@@ -6534,99 +5045,13 @@ impl CardRecord {
             self.proof_plan_json,
         )?);
         card.labels = from_json("cards.labels_json", self.labels_json)?;
-        card.assignee = self.assignee;
         card.related = from_json("cards.related_json", self.related_json)?;
         card.blocks = from_json("cards.blocks_json", self.blocks_json)?;
         card.blocked_by = from_json("cards.blocked_by_json", self.blocked_by_json)?;
         card.parent = self.parent.map(CardId::new).transpose()?;
-        card.repo = self.repo.as_deref().and_then(canonical_repo_label);
-        card.source = match (self.source_path, self.source_digest) {
-            (Some(path), Some(digest)) => Some(CardSource { path, digest }),
-            _ => None,
-        };
+        card.repo = self.repo;
         card.claim = claim;
         card.updated_at = self.updated_at;
         Ok(card)
-    }
-}
-
-struct RunRecord {
-    id: String,
-    card_id: String,
-    state: String,
-    principal: String,
-    role: String,
-    agent: String,
-    claim_expires_at: i64,
-    proof: Option<String>,
-    telemetry_attempt_count: Option<i64>,
-    telemetry_input_tokens: Option<i64>,
-    telemetry_output_tokens: Option<i64>,
-    telemetry_reasoning_tokens: Option<i64>,
-    telemetry_estimated_cost_usd_micros: Option<i64>,
-    telemetry_duration_ms: Option<i64>,
-    telemetry_pricing_version: Option<String>,
-    telemetry_outcome: Option<String>,
-    telemetry_unattributed_attempt_count: Option<i64>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-impl RunRecord {
-    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            card_id: row.get(1)?,
-            state: row.get(2)?,
-            principal: row.get(3)?,
-            role: row.get(4)?,
-            agent: row.get(5)?,
-            claim_expires_at: row.get(6)?,
-            proof: row.get(7)?,
-            telemetry_attempt_count: row.get(8)?,
-            telemetry_input_tokens: row.get(9)?,
-            telemetry_output_tokens: row.get(10)?,
-            telemetry_reasoning_tokens: row.get(11)?,
-            telemetry_estimated_cost_usd_micros: row.get(12)?,
-            telemetry_duration_ms: row.get(13)?,
-            telemetry_pricing_version: row.get(14)?,
-            telemetry_outcome: row.get(15)?,
-            telemetry_unattributed_attempt_count: row.get(16)?,
-            created_at: row.get(17)?,
-            updated_at: row.get(18)?,
-        })
-    }
-
-    fn into_run(self) -> Result<Run> {
-        Ok(Run {
-            id: RunId::new(self.id)?,
-            card_id: CardId::new(self.card_id)?,
-            state: RunState::parse(&self.state).ok_or(StoreError::InvalidStoredValue {
-                field: "runs.state",
-                value: self.state,
-            })?,
-            principal: self.principal,
-            role: self.role,
-            agent: self.agent,
-            claim_expires_at: self.claim_expires_at,
-            proof: self.proof,
-            telemetry: self.telemetry_attempt_count.map(|attempt_count| {
-                powder_core::RunTelemetrySummary {
-                    attempt_count,
-                    input_tokens: self.telemetry_input_tokens,
-                    output_tokens: self.telemetry_output_tokens,
-                    reasoning_tokens: self.telemetry_reasoning_tokens,
-                    estimated_cost_usd_micros: self.telemetry_estimated_cost_usd_micros,
-                    duration_ms: self.telemetry_duration_ms,
-                    pricing_version: self.telemetry_pricing_version,
-                    outcome: self.telemetry_outcome,
-                    unattributed_attempt_count: self
-                        .telemetry_unattributed_attempt_count
-                        .unwrap_or(0),
-                }
-            }),
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        })
     }
 }

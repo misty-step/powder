@@ -302,11 +302,10 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
     assert_eq!(status_of("running-042"), "ready");
     assert_eq!(status_of("running-043"), "ready");
 
-    // The migration audit events exist, name both statuses plus the
-    // relation-less re-triage rationale, and are attributed to the
-    // migration rather than any operator/agent actor.
-    let event_for = |card_id: &str| -> (String, String) {
-        connection
+    // Migration events use the canonical typed transition shape and retain
+    // system attribution.
+    let event_for = |card_id: &str| -> (String, serde_json::Value) {
+        let (actor, payload): (String, String) = connection
             .query_row(
                 "SELECT actor, payload FROM card_events
                  WHERE card_id = ?1 AND event_type = 'status'
@@ -314,42 +313,26 @@ fn status_vocabulary_migration_rehearses_against_a_sanitized_snapshot() {
                 [card_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap_or_else(|_| panic!("migration audit event for {card_id}"))
+            .unwrap_or_else(|_| panic!("migration audit event for {card_id}"));
+        (
+            actor,
+            serde_json::from_str(&payload).expect("typed migration event"),
+        )
     };
-    let (event_actor, event_payload) = event_for("blocked-empty-001");
-    assert_eq!(event_actor, "system:status-vocabulary-migration");
-    assert_eq!(
-        event_payload,
-        "status-vocabulary migration: blocked -> backlog (empty acceptance)"
-    );
-    let (_, relation_less_payload) = event_for("blocked-001");
-    assert_eq!(
-        relation_less_payload,
-        "status-vocabulary migration: blocked -> backlog \
-         (no blocked_by relations; re-triage before claiming)"
-    );
-    let (_, relation_payload) = event_for("blocked-live-blocker-001");
-    assert_eq!(
-        relation_payload,
-        "status-vocabulary migration: blocked -> ready"
-    );
-    let (_, active_payload) = event_for("running-001");
-    assert_eq!(
-        active_payload,
-        "status-vocabulary migration: running -> in_progress"
-    );
-    let (_, claimless_payload) = event_for("claimed-008");
-    assert_eq!(
-        claimless_payload,
-        "status-vocabulary migration: claimed -> ready \
-         (no valid claim; acceptance oracle present)"
-    );
-    let (_, no_oracle_payload) = event_for("running-044");
-    assert_eq!(
-        no_oracle_payload,
-        "status-vocabulary migration: running -> backlog \
-         (no valid claim or acceptance oracle)"
-    );
+    for (card_id, previous, current) in [
+        ("blocked-empty-001", "backlog", "backlog"),
+        ("blocked-001", "backlog", "backlog"),
+        ("blocked-live-blocker-001", "ready", "ready"),
+        ("running-001", "in_progress", "in_progress"),
+        ("claimed-008", "in_progress", "ready"),
+        ("running-044", "in_progress", "backlog"),
+    ] {
+        let (actor, payload) = event_for(card_id);
+        assert_eq!(actor, "system:status-vocabulary-migration");
+        assert_eq!(payload["kind"], "status");
+        assert_eq!(payload["previous"], previous, "{card_id} previous");
+        assert_eq!(payload["current"], current, "{card_id} current");
+    }
 
     // powder-status-vocabulary regression (acceptance #3): a former-blocked
     // card whose blocker is still live must NOT surface in list_ready even

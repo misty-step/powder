@@ -4,7 +4,7 @@ dbs:
       - type: s3
         bucket: ${BUCKET_NAME}
         path: powder.db
-        endpoint: https://fly.storage.tigris.dev
-        region: auto
+        endpoint: ${AWS_ENDPOINT_URL}
+        region: ${AWS_REGION}
         force-path-style: true
         snapshot-interval: 1h

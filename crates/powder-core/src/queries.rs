@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::model::{CardId, DomainError, Estimate, Priority, Risk, RunId};
+use crate::model::{CardId, DomainError, Priority, RunId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyQuery {
@@ -10,12 +10,6 @@ pub struct ReadyQuery {
     /// `None` means all repositories. Transport faces parse their wire values
     /// before constructing this typed allowlist.
     pub repo: Option<Vec<String>>,
-    /// `None` means unfiltered; set to self-select for low-complexity work
-    /// without reading full card bodies (powder-964).
-    pub estimate: Option<Estimate>,
-    /// `None` means cards with any risk, including cards whose risk is missing.
-    /// A set value intentionally excludes missing-risk cards.
-    pub risk: Option<Risk>,
     /// `None` means every priority.
     pub priority: Option<Priority>,
 }
@@ -26,8 +20,6 @@ impl ReadyQuery {
             now,
             limit: limit.max(1),
             repo: None,
-            estimate: None,
-            risk: None,
             priority: None,
         }
     }
@@ -38,16 +30,6 @@ impl ReadyQuery {
     {
         let repositories = repositories.into_iter().collect::<Vec<_>>();
         self.repo = (!repositories.is_empty()).then_some(repositories);
-        self
-    }
-
-    pub fn with_estimate(mut self, estimate: Option<Estimate>) -> Self {
-        self.estimate = estimate;
-        self
-    }
-
-    pub fn with_risk(mut self, risk: Option<Risk>) -> Self {
-        self.risk = risk;
         self
     }
 
@@ -158,12 +140,6 @@ impl ReadyQuery {
             None => canonical.push_str("repo=*"),
         }
         canonical.push('|');
-        canonical.push_str("estimate=");
-        canonical.push_str(self.estimate.map(|value| value.as_str()).unwrap_or("*"));
-        canonical.push('|');
-        canonical.push_str("risk=");
-        canonical.push_str(self.risk.map(|value| value.as_str()).unwrap_or("*"));
-        canonical.push('|');
         canonical.push_str("priority=");
         canonical.push_str(self.priority.map(|value| value.as_str()).unwrap_or("*"));
         hex_encode(&Sha256::digest(canonical.as_bytes()))
@@ -200,12 +176,10 @@ mod tests {
     /// the real proof; this just pins the shape here too.
     #[test]
     fn ready_query_and_claim_receipt_public_shape_is_unchanged() {
-        let query = ReadyQuery::new(10, 5).with_estimate(Some(Estimate::S));
+        let query = ReadyQuery::new(10, 5);
         assert_eq!(query.now, 10);
         assert_eq!(query.limit, 5);
-        assert_eq!(query.estimate, Some(Estimate::S));
         assert_eq!(query.repo, None);
-        assert_eq!(query.risk, None);
         assert_eq!(query.priority, None);
 
         let receipt = ClaimReceipt {
