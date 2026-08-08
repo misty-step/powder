@@ -5,10 +5,7 @@ mod remote;
 use powder_core::Operation;
 use powder_core::OperationRule;
 
-pub use remote::{
-    parse_card_summary_page, parse_list_page, urlencode, CardSummaryPage, ClientCardSummary,
-    ClientStatus, ListPage, RemoteClient,
-};
+pub use remote::{parse_list_page, urlencode, ListPage, RemoteClient};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiRoute {
@@ -32,114 +29,28 @@ pub const ROUTES: &[ApiRoute] = &[
         intent: "create one new card in the instance database, rejecting duplicate ids; response includes a hint field when the created card has no acceptance criteria",
         policy: Some(Operation::CreateCard.rule()),
         body_shape: Some(
-            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"risk":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array (an empty array is valid, a bare string is not); every other field is optional and may be omitted entirely; estimate is one of S|M|L|XL; risk is one of low|medium|high; related/blocks/blocked_by are reciprocal -- naming an existing peer card mirrors the reverse edge onto it atomically (related is symmetric, blocks/blocked_by mirror each other); a peer id that doesn't exist is tolerated and simply not mirrored"#,
+            r#"{"id":"...","title":"...","acceptance":[],"body":null,"proof_plan":null,"status":null,"priority":null,"labels":null,"repo":null,"related":null,"blocks":null,"blocked_by":null} -- id, title, and acceptance are required; acceptance is always an array; every other field is optional; relation fields mirror existing peers atomically"#,
         ),
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/search",
-        intent: "search cards and indexed comments/work logs with q, source/status/repo/label/priority/estimate/risk/time filters and opaque cursor pagination; response is {matches,total_count,has_more,next_after?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "search cards and indexed comments and work logs with q, status/repo/label/priority/time filters and opaque cursor pagination; response is {matches,total_count,has_more,next_after?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         policy: None,
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards/ready",
-        intent: "list ready cards for an agent to claim, dependency-ordered (topological over blocks/blocked_by among the returned set, ties broken by priority/age/id; only true cycle members lose topological ordering -- grouped in tie-break order and named in cycle_card_ids, computed before limit truncation -- while cards downstream of a cycle stay dependency-ordered after it); optional estimate (S|M|L|XL) and repo (comma-separated exact canonical short slugs or registered aliases, never substring) query params; response is {cards,total_count,has_more,cycle_card_ids?}; a status=ready card missing here carries claim_eligibility on GET /api/v1/cards/{id}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "list ready cards for an agent to claim in dependency order; optional opaque exact repo and priority filters; response is {cards,total_count,has_more,cycle_card_ids?}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         policy: None,
         body_shape: None,
     },
     ApiRoute {
         method: "GET",
         path: "/api/v1/cards",
-        intent: "list cards by optional status/repo/estimate/label filter; response is {cards,total_count,has_more}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
+        intent: "list cards by optional status/repo/label filter; response is {cards,total_count,has_more}; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
         policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/cards/papercut",
-        intent: "file a one-call papercut report; body fields agent (required) and service/model/harness (optional); response is a minimal ack",
-        policy: Some(Operation::CreateCard.rule()),
-        body_shape: Some(r#"{"agent":"...","body":"...","service":null,"model":null,"harness":null}"#),
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/approvals",
-        intent: "list awaiting-input runs with card title, latest question, run id, and any approval-prefixed packet links; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/stats",
-        intent: "return compact board status counts by repository plus totals; optional repo and include_hidden query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/board/rollups",
-        intent: "return deterministic top-level epic and per-repository Unsorted rollups with status counts for each root epic's direct children or each parentless leaf itself, criteria sums, active claims, freshness, and a full visibility-scoped parent-graph classification/reachability coverage envelope; nested-epic rollup sums need not equal coverage.accounted_cards; optional limit and after query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/cards/{id}/velocity",
-        intent: "return per-epic direct-child completion velocity buckets (done/shipped vs abandoned) over trailing periods; optional periods (default 8) and period_days (default 7) query params; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/repositories",
-        intent: "list repository entities with aliases, visibility, tier, import provenance, and status counts; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/repositories",
-        intent: "create one repository entity; requires authenticated repository-admin authority",
-        policy: Some(Operation::UpsertRepository.rule()),
-        body_shape: Some(
-            r#"{"name":"...","aliases":[],"visibility":"visible","tier":"active","import_provenance":null} -- name is required; every other field is optional"#,
-        ),
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/repositories/normalize",
-        intent: "normalize legacy repository strings across cards and audit every correction",
-        policy: Some(Operation::NormalizeRepositories.rule()),
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/repositories/{name}",
-        intent: "read one repository entity resolved by canonical name or alias; requires auth in api-key mode unless POWDER_PUBLIC_READS=true",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/repositories/{name}",
-        intent: "update one repository entity resolved by canonical name",
-        policy: Some(Operation::UpsertRepository.rule()),
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "DELETE",
-        path: "/api/v1/repositories/{name}",
-        intent: "delete an unused repository entity and its aliases",
-        policy: Some(Operation::DeleteRepository.rule()),
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/repositories/{name}/merge-alias",
-        intent: "merge an alias or duplicate repository string into a canonical repository and audit re-homed cards",
-        policy: Some(Operation::MergeRepositoryAlias.rule()),
         body_shape: None,
     },
     ApiRoute {
@@ -152,10 +63,10 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "PATCH",
         path: "/api/v1/cards/{id}",
-        intent: "patch explicit mutable card fields without replacing protected lifecycle or source metadata",
+        intent: "patch explicit mutable card fields without replacing protected lifecycle or dormant metadata",
         policy: Some(Operation::PatchCard.rule()),
         body_shape: Some(
-            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"estimate":null,"risk":null,"labels":null} -- every field is optional; only the fields present in the body are changed; an authenticated agent must hold the current claim, while an authenticated admin may correct card truth without one; the change is audited with the transport principal and field list; estimate is one of S|M|L|XL; risk is one of low|medium|high"#,
+            r#"{"title":null,"body":null,"acceptance":null,"proof_plan":null,"status":null,"priority":null,"labels":null,"repo":null} -- every field is optional; repo null clears the exact opaque string"#,
         ),
     },
     ApiRoute {
@@ -164,7 +75,7 @@ pub const ROUTES: &[ApiRoute] = &[
         intent: "claim one card and open a run, persisting the authenticated principal separately from the declared worker and run id",
         policy: Some(Operation::ClaimCard.rule()),
         body_shape: Some(
-            r#"{"agent":"...","ttl_seconds":null} -- agent is the required semantic worker label and is never inferred from the authenticated principal; one integration principal may declare multiple workers, and the response/readback includes principal+agent+run_id"#,
+            r#"{"agent":"...","ttl_seconds":null} -- agent is required"#,
         ),
     },
     ApiRoute {
@@ -172,21 +83,21 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/release",
         intent: "release an active claim and make the card ready",
         policy: Some(Operation::ReleaseClaim.rule()),
-        body_shape: None,
+        body_shape: Some(r#"{"run_id":"..."} -- run_id is required"#),
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/renew",
         intent: "extend an active claim lease",
         policy: Some(Operation::RenewClaim.rule()),
-        body_shape: None,
+        body_shape: Some(r#"{"run_id":"...","ttl_seconds":null} -- run_id is required; ttl_seconds is optional"#),
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/heartbeat",
         intent: "record liveness for an active claim",
         policy: Some(Operation::HeartbeatClaim.rule()),
-        body_shape: None,
+        body_shape: Some(r#"{"run_id":"..."} -- run_id is required"#),
     },
     ApiRoute {
         method: "POST",
@@ -202,7 +113,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/status",
         intent: "set a card to any status in one call and record an audit event",
         policy: Some(Operation::UpdateStatus.rule()),
-        body_shape: None,
+        body_shape: Some(r#"{"status":"ready"} -- status is required"#),
     },
     ApiRoute {
         method: "POST",
@@ -214,7 +125,7 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/parent",
-        intent: "set or clear a card's explicit parent edge; the parent card's detail then rolls this child into its bounded children list and deterministic epic_state packet",
+        intent: "set or clear a card's explicit parent edge; parent remains a generic relation and the response includes the bounded children list on parent detail",
         policy: Some(Operation::SetParent.rule()),
         body_shape: Some(
             r#"{"parent":"card-id"} links under a parent; {"parent":null} or {} clears -- rejects a missing parent card, self-parenting, and hierarchy cycles; audited on both cards"#,
@@ -225,7 +136,7 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/cards/{id}/criteria/check",
         intent: "mark one acceptance criterion checked or unchecked and audit actor/time",
         policy: Some(Operation::CheckCriterion.rule()),
-        body_shape: None,
+        body_shape: Some(r#"{"criterion":0,"actor":"...","checked":true} -- criterion and actor are required"#),
     },
     ApiRoute {
         method: "POST",
@@ -235,20 +146,6 @@ pub const ROUTES: &[ApiRoute] = &[
         body_shape: Some(
             r#"{"label":"...","url":"..."} -- both fields are required; the field is "label", not "title""#,
         ),
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/cards/{id}/attachments",
-        intent: "attach an image to a card from a bounded binary request body",
-        policy: Some(Operation::AttachImage.rule()),
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "DELETE",
-        path: "/api/v1/cards/{id}/attachments/{attachment_id}",
-        intent: "detach one image attachment from a card",
-        policy: Some(Operation::DetachImage.rule()),
-        body_shape: None,
     },
     ApiRoute {
         method: "POST",
@@ -262,10 +159,10 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/cards/{id}/work-log",
-        intent: "append a high-frequency, fully-attributed work_log entry while actively working a card (powder-943) -- context, current activity, issues, chain of thought, distinct from the low-frequency human-facing comments field",
+        intent: "append a typed work-log body with agent and optional run attribution",
         policy: Some(Operation::WorkLog.rule()),
         body_shape: Some(
-            r#"{"agent":"...","body":"...","model":null,"reasoning":null,"harness":null,"run_id":null} -- agent and body are required; model/reasoning/harness/run_id are whatever attribution the calling surface can supply; body is scrubbed for known secret shapes server-side before storage"#,
+            r#"{"agent":"...","body":"...","run_id":null} -- agent and body are required"#,
         ),
     },
     ApiRoute {
@@ -273,28 +170,14 @@ pub const ROUTES: &[ApiRoute] = &[
         path: "/api/v1/runs/{id}/input",
         intent: "pause a run for human input",
         policy: Some(Operation::RequestInput.rule()),
-        body_shape: None,
+        body_shape: Some(r#"{"question":"..."} -- question is required"#),
     },
     ApiRoute {
         method: "POST",
         path: "/api/v1/runs/{id}/answer",
         intent: "answer an awaiting-input run and resume it",
         policy: Some(Operation::AnswerInput.rule()),
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/runs/{id}/telemetry",
-        intent: "record normalized run telemetry attempts with caller-keyed idempotency, persisted pricing snapshot, attribution, and audit evidence",
-        policy: Some(Operation::RecordRunTelemetry.rule()),
-        body_shape: Some(r#"{"attempts":[{"model":"..."}],"idempotency_key":"caller-generated"} -- at least one normalized attempt is required; scalar run telemetry is derived from these attempts"#),
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/runs/telemetry/aggregate",
-        intent: "aggregate run telemetry in SQL by agent/provider/model with token, cost, duration, and outcome mix; missing attribution is explicit; optional agent/model/provider/limit filters",
-        policy: None,
-        body_shape: None,
+        body_shape: Some(r#"{"actor":"...","answer":"..."} -- actor and answer are required"#),
     },
     ApiRoute {
         method: "GET",
@@ -316,43 +199,6 @@ pub const ROUTES: &[ApiRoute] = &[
         intent: "mark a card done, optionally recording proof and criterion proof links",
         policy: Some(Operation::CompleteCard.rule()),
         body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/events/subscriptions",
-        intent: "create a signed webhook subscription with a URL and event filter",
-        policy: Some(Operation::CreateSubscription.rule()),
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/events/subscriptions",
-        intent: "list webhook subscriptions without disclosing signing secrets",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/events/subscriptions/{id}/disable",
-        intent: "disable a webhook subscription while preserving delivery history",
-        policy: Some(Operation::DisableSubscription.rule()),
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "GET",
-        path: "/api/v1/events/dead-letter",
-        intent: "list webhook deliveries that exhausted retry attempts",
-        policy: None,
-        body_shape: None,
-    },
-    ApiRoute {
-        method: "POST",
-        path: "/api/v1/events/dead-letter/replay",
-        intent: "requeue dead-lettered webhook deliveries for redelivery (admin scope only)",
-        policy: Some(Operation::ReplayDeadLetter.rule()),
-        body_shape: Some(
-            r#"{"subscription_id":null} -- optional; omit or set null to replay every dead letter across all subscriptions, or set it to replay only one subscription's"#,
-        ),
     },
     ApiRoute {
         method: "GET",
@@ -378,9 +224,9 @@ pub const ROUTES: &[ApiRoute] = &[
     ApiRoute {
         method: "POST",
         path: "/api/v1/keys/{id}/revoke",
-        intent: "revoke an api key so it immediately fails auth on every route, including reads (admin scope only)",
+        intent: "revoke an api key so it immediately fails auth on every route, including reads (admin scope only); requires one Idempotency-Key and replays the same receipt for that key",
         policy: Some(Operation::RevokeApiKey.rule()),
-        body_shape: None,
+        body_shape: Some("{} with required Idempotency-Key header; same key and resource replay the original receipt"),
     },
 ];
 
@@ -432,11 +278,6 @@ mod tests {
         assert!(paths.contains(&"/api/v1/cards"));
         assert!(!paths.contains(&"/api/v1/cards/import"));
         assert!(paths.contains(&"/api/v1/cards/ready"));
-        assert!(paths.contains(&"/api/v1/approvals"));
-        assert!(paths.contains(&"/api/v1/board/rollups"));
-        assert!(paths.contains(&"/api/v1/repositories"));
-        assert!(paths.contains(&"/api/v1/repositories/{name}"));
-        assert!(paths.contains(&"/api/v1/repositories/{name}/merge-alias"));
         assert!(paths.contains(&"/api/v1/cards/{id}/claim"));
         assert!(paths.contains(&"/api/v1/cards/{id}/release"));
         assert!(paths.contains(&"/api/v1/cards/{id}/renew"));
@@ -450,10 +291,6 @@ mod tests {
         assert!(paths.contains(&"/api/v1/runs/awaiting-input"));
         assert!(paths.contains(&"/api/v1/runs/{id}/input"));
         assert!(paths.contains(&"/api/v1/runs/{id}/answer"));
-        assert!(paths.contains(&"/api/v1/events/subscriptions"));
-        assert!(paths.contains(&"/api/v1/events/subscriptions/{id}/disable"));
-        assert!(paths.contains(&"/api/v1/events/dead-letter"));
-        assert!(paths.contains(&"/api/v1/events/dead-letter/replay"));
         assert!(paths.contains(&"/api/v1/events/tail"));
         assert!(paths.contains(&"/api/v1/cards/search"));
         assert!(paths.contains(&"/api/v1/keys"));
@@ -477,21 +314,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("acceptance"));
-
-        let create_repository = json
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|route| route["method"] == "POST" && route["path"] == "/api/v1/repositories")
-            .expect("root repository creation route is documented");
-        assert_eq!(
-            create_repository["policy"]["operation"],
-            Operation::UpsertRepository.as_str()
-        );
-        assert!(create_repository["body_shape"]
-            .as_str()
-            .unwrap()
-            .contains("\"name\""));
 
         let healthz_shaped = json
             .as_array()

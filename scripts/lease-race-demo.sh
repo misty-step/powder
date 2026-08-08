@@ -42,25 +42,6 @@
 # transcript; a captured real run is checked in at
 # docs/lease-race-transcript.txt.
 #
-# Recording design note (powder-lease-proof-demo, honest account of how
-# site/assets/lease-race-demo.svg was produced -- no staged/fabricated
-# terminal output):
-#   1. `python3 -m asciinema rec --command "bash scripts/lease-race-demo.sh"`
-#      recorded a real run of this exact script to an asciicast (.cast) file
-#      -- the timing and every byte of output in the recording are from an
-#      actual execution, not typed/edited after the fact.
-#   2. `npx svg-term-cli --in <cast> --out site/assets/lease-race-demo.svg
-#      --width 82 --height 24 --window --no-cursor` converted that cast into
-#      a self-contained animated SVG (CSS keyframe animation over embedded
-#      <symbol>/<use> frames -- no external JS, safe to embed via a plain
-#      <img> tag in the README and the marketing site).
-#   3. Static SVG/GIF was the documented fallback if asciinema/svg-term were
-#      unavailable; both installed cleanly here (pip install asciinema; npx
-#      svg-term-cli), so the animated recording was used instead of a
-#      hand-built static frame.
-#   Neither tool nor its output is a repo dependency -- both ran as one-off
-#   local conversion steps. Re-run steps 1-2 to refresh the recording after a
-#   meaningful change to this script's output.
 
 set -euo pipefail
 
@@ -252,9 +233,8 @@ rule
 say "[readback] fetching card detail (detail=detailed) for the runs/work-log trail"
 DETAIL="$(curl -fsS "$BASE_URL/api/v1/cards/$CARD_ID?detail=detailed" -H "Authorization: Bearer $KEY")"
 
-say "[readback] fetching the outbound event tail (this is where claim-expired/completed live --"
-say "           they are webhook-delivery events, not the card_events audit rows, so a card"
-say "           detail read alone does not show them; GET /api/v1/events/tail does)"
+say "[readback] fetching the ordered event tail (claim-expired/completed are in this feed)"
+say "           the card detail also keeps the attributed audit trail; GET /api/v1/events/tail does"
 EVENTS_JSON="$(curl -fsS "$BASE_URL/api/v1/events/tail?after=0" -H "Authorization: Bearer $KEY" \
   | grep '^data: ' | sed 's/^data: //' | jq -cs '[.[] | .event // .]')"
 

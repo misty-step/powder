@@ -18,31 +18,10 @@ use regex::Regex;
 static PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     let compile = |re: &str| Regex::new(re).expect("secret pattern is valid regex");
     vec![
-        // Powder's own API key and webhook signing-secret shapes MUST run
-        // before the generic vendor patterns below (powder-epic-truthful-ops
-        // review fix). A Powder key is `sk_powder_<32-char nanoid>`, and the
-        // nanoid alphabet (`API_KEY_ALPHABET`) includes `s`, `k`, and `-`, so
-        // a random body can contain the substring `sk-<20+ alnum>`. If the
-        // generic `openai-key` pattern (`sk-[A-Za-z0-9]{20,}`) ran first it
-        // would splice that substring out of the *middle* of a real Powder
-        // key, redacting only the tail and leaving the `sk_powder_<prefix
-        // chars>` head -- real credential material -- unredacted, while the
-        // `powder-api-key` pattern (now looking at a broken string) never
-        // matched. Specific-before-generic closes that partial-leak gap; it
-        // was the true cause of the intermittently-failing scrub test.
-        //
-        // (`sk_powder_...` / `whsec_powder_...` are minted by
-        // `identity::Store::create_api_key` /
-        // `events::create_event_subscription` with a 32-char nanoid body --
-        // well over the 20-char floor. No `Bearer`/prefix requirement: these
-        // must fire mid-line in a bare env-dump paste like
-        // `POWDER_API_KEY=sk_powder_...`, not only after a header-style
-        // label.)
+        // Powder's own API key shape must run before generic vendor patterns.
+        // The nanoid alphabet allows `sk-` inside a Powder key, so matching
+        // the full key first prevents partial redaction.
         ("powder-api-key", compile(r"sk_powder_[A-Za-z0-9_\-]{20,}")),
-        (
-            "powder-webhook-secret",
-            compile(r"whsec_powder_[A-Za-z0-9_\-]{20,}"),
-        ),
         // `anthropic-key` (prefix `sk-ant-`) before `openai-key` (`sk-`) for
         // the same specific-before-generic reason.
         ("anthropic-key", compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")),
@@ -122,26 +101,6 @@ mod tests {
     /// for its self-test fixtures).
     fn fake_powder_key() -> String {
         format!("sk_powder_{}", "a".repeat(32))
-    }
-
-    fn fake_powder_whsec() -> String {
-        format!("whsec_powder_{}", "b".repeat(32))
-    }
-
-    #[test]
-    fn redacts_a_powder_api_key() {
-        let key = fake_powder_key();
-        let scrubbed = scrub_secrets(&format!("here is the key: {key}"));
-        assert!(!scrubbed.contains(&key));
-        assert!(scrubbed.contains("[REDACTED:powder-api-key]"));
-    }
-
-    #[test]
-    fn redacts_a_powder_webhook_secret() {
-        let secret = fake_powder_whsec();
-        let scrubbed = scrub_secrets(&format!("signing secret: {secret}"));
-        assert!(!scrubbed.contains(&secret));
-        assert!(scrubbed.contains("[REDACTED:powder-webhook-secret]"));
     }
 
     #[test]

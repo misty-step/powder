@@ -1,14 +1,12 @@
 use std::fmt;
 
-use crate::{clean_list, CardId, CardStatus, DomainError, Estimate, Priority, Risk};
+use crate::{clean_list, CardId, CardStatus, DomainError, Priority};
 
 /// A card input field with one canonical validation vocabulary shared by all faces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardField {
     Status,
     Priority,
-    Estimate,
-    Risk,
     Related,
     Blocks,
     BlockedBy,
@@ -21,8 +19,6 @@ impl CardField {
         match self {
             Self::Status => "status",
             Self::Priority => "priority",
-            Self::Estimate => "estimate",
-            Self::Risk => "risk",
             Self::Related => "related",
             Self::Blocks => "blocks",
             Self::BlockedBy => "blocked_by",
@@ -106,26 +102,6 @@ pub fn parse_priority(raw: &str) -> Result<Priority, CardFieldError> {
     })
 }
 
-pub fn parse_estimate(raw: &str) -> Result<Estimate, CardFieldError> {
-    Estimate::parse(raw).ok_or_else(|| {
-        CardFieldError::invalid_value(
-            CardField::Estimate,
-            raw,
-            CardFieldError::valid_values(&Estimate::ALL, |value| value.as_str()),
-        )
-    })
-}
-
-pub fn parse_risk(raw: &str) -> Result<Risk, CardFieldError> {
-    Risk::parse(raw).ok_or_else(|| {
-        CardFieldError::invalid_value(
-            CardField::Risk,
-            raw,
-            CardFieldError::valid_values(&Risk::ALL, |value| value.as_str()),
-        )
-    })
-}
-
 /// Normalize acceptance criteria and labels with the same trim/drop-empty rule
 /// used by the core card model.
 pub fn normalize_card_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -174,12 +150,11 @@ mod tests {
     #[test]
     fn parses_card_enums_and_reports_one_canonical_error() {
         assert_eq!(
-            parse_status(" In-Progress ").unwrap(),
+            parse_status(" in_progress ").unwrap(),
             CardStatus::InProgress
         );
+        assert!(parse_status("In-Progress").is_err());
         assert_eq!(parse_priority("p1").unwrap(), Priority::P1);
-        assert_eq!(parse_estimate("xl").unwrap(), Estimate::Xl);
-        assert_eq!(parse_risk("HIGH").unwrap(), Risk::High);
         assert_eq!(
             parse_priority("urgent").unwrap_err().to_string(),
             "invalid priority \"urgent\"; valid: P0|P1|P2|P3"

@@ -53,7 +53,7 @@ fn statuses(connection: &Connection) -> BTreeMap<String, String> {
 const CARD_NON_STATUS_SQL: &str =
     "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json,
             priority, estimate, labels_json, assignee, related_json, blocks_json,
-            blocked_by_json, repo, source_path, source_digest, claim_principal,
+            blocked_by_json, source_path, source_digest, claim_principal,
             claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
             created_at, updated_at, parent
      FROM cards ORDER BY id";
@@ -141,7 +141,7 @@ fn schema_v19_repairs_only_the_seven_production_derived_incidents() {
     }
     assert_eq!(after_statuses["negative-not-in-progress"], "ready");
 
-    // Every non-status card byte, every run, and all key metadata survive.
+    // Every card field outside status and the later repo normalization, every run, and all key metadata survive.
     assert_eq!(rows(&connection, CARD_NON_STATUS_SQL), before_cards);
     assert_eq!(
         rows(&connection, "SELECT * FROM runs ORDER BY id"),
@@ -205,11 +205,17 @@ fn schema_v19_repairs_only_the_seven_production_derived_incidents() {
             Value::Text(card_id) => card_id,
             other => panic!("repair event card id is not text: {other:?}"),
         };
-        let expected_payload = format!(
-            "status-v17 repair: in_progress -> {} (claimless v17 migration)",
-            after_statuses[card_id]
+        let payload: serde_json::Value =
+            serde_json::from_str(payload).expect("repair payload must be typed JSON");
+        assert_eq!(payload["kind"], "status", "repair kind for {card_id}");
+        assert_eq!(
+            payload["previous"], "in_progress",
+            "previous status for {card_id}"
         );
-        assert_eq!(payload, &expected_payload, "repair payload for {card_id}");
+        assert_eq!(
+            payload["current"], after_statuses[card_id],
+            "current status for {card_id}"
+        );
     }
 
     // The five oracle-bearing repairs are immediately dispatchable; the two

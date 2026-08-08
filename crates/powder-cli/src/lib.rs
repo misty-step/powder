@@ -2,34 +2,74 @@
 
 use powder_api::{parse_list_page, urlencode, RemoteClient};
 use powder_core::{
-    normalize_acceptance, normalize_csv_relations, normalize_labels, parse_estimate,
-    parse_priority, parse_risk, parse_status, Authority, Card, CardField, CardFieldError, CardId,
-    CardStatus, DetailLevel, Estimate, PapercutReport, Priority, ReadyCursor, ReadyQuery, Risk,
-    RunId, RunTelemetryAggregateQuery, RunTelemetryAttemptInput, RunTelemetryWrite,
-};
-use powder_shell::{
-    detect_truncated_criteria, load_github_issues_file, load_markdown_dir,
-    namespace_cards_for_repo, unix_now, ParsedCard, ShellError,
+    normalize_acceptance, normalize_csv_relations, normalize_labels, parse_priority, parse_status,
+    Authority, Card, CardField, CardFieldError, CardId, CardStatus, DetailLevel, DomainError,
+    Priority, ReadyCursor, ReadyQuery, RunId,
 };
 use powder_store::{
-    ApiKeyScope, CardFilter, CardPatch, KeyedOperationContext, PricingConfig, RepositoryTier,
-    RepositoryUpsert, RepositoryVisibility, SearchQuery, Store, StoreError,
+    ApiKeyScope, CardFilter, CardPatch, KeyedOperationContext, SearchQuery, Store, StoreError,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug)]
+pub enum ShellError {
+    NotFound(String),
+    Conflict(String),
+    Invalid(String),
+    Store(String),
+    Forbidden(String),
+}
+
+impl fmt::Display for ShellError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(message)
+            | Self::Conflict(message)
+            | Self::Invalid(message)
+            | Self::Store(message)
+            | Self::Forbidden(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ShellError {}
+
+impl From<DomainError> for ShellError {
+    fn from(value: DomainError) -> Self {
+        match value {
+            DomainError::NotFound { .. } => Self::NotFound(value.to_string()),
+            DomainError::Conflict(_) | DomainError::ClaimExpired(_) => {
+                Self::Conflict(value.to_string())
+            }
+            DomainError::Validation { .. } | DomainError::EventData { .. } => {
+                Self::Invalid(value.to_string())
+            }
+            DomainError::Forbidden(_) | DomainError::AuthorityDenied { .. } => {
+                Self::Forbidden(value.to_string())
+            }
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 static NEXT_IDEMPOTENCY_KEY: AtomicU64 = AtomicU64::new(0);
 
 pub const COMMANDS: &[&str] = &[
+    "help",
     "version",
     "init-db",
     "key-create",
     "key-list",
     "key-revoke",
-    "import-github-issues",
-    "repair-criteria",
     "create-card",
     "update-card",
     "update-relations",
@@ -37,18 +77,7 @@ pub const COMMANDS: &[&str] = &[
     "set-parent",
     "list-ready",
     "list-cards",
-    "board-rollups",
-    "board-stats",
-    "epic-velocity",
     "search",
-    "papercut",
-    "repository-list",
-    "repository-get",
-    "repository-upsert",
-    "repository-merge-alias",
-    "repository-delete",
-    "repository-normalize",
-    "repository-doctor",
     "claim",
     "release-claim",
     "renew-claim",
@@ -56,9 +85,6 @@ pub const COMMANDS: &[&str] = &[
     "heartbeat",
     "get-card",
     "get-run",
-    "record-run-telemetry",
-    "run-telemetry-aggregate",
-    "list-approvals",
     "list-awaiting-input",
     "answer-input",
     "update-status",
@@ -68,11 +94,6 @@ pub const COMMANDS: &[&str] = &[
     "append-work-log",
     "request-input",
     "complete-card",
-    "subscription-create",
-    "subscription-list",
-    "subscription-disable",
-    "dead-letter-list",
-    "dead-letter-replay",
     "event-tail",
 ];
 // `--actor` is a deliberately accepted semantic audit label on local mutation
@@ -81,9 +102,7 @@ pub const COMMANDS: &[&str] = &[
 const INIT_DB_FLAGS: &[&str] = &["--db", "--show-secret"];
 const KEY_CREATE_FLAGS: &[&str] = &["--db", "--name", "--scope", "--show-secret", "--redacted"];
 const KEY_LIST_FLAGS: &[&str] = &["--db"];
-const KEY_REVOKE_FLAGS: &[&str] = &["--db"];
-const IMPORT_GITHUB_ISSUES_FLAGS: &[&str] = &["--db", "--repo", "--dry-run"];
-const REPAIR_CRITERIA_FLAGS: &[&str] = &["--db", "--repo", "--apply", "--actor"];
+const KEY_REVOKE_FLAGS: &[&str] = &["--db", "--idempotency-key"];
 const CREATE_CARD_FLAGS: &[&str] = &[
     "--db",
     "--id",
@@ -93,8 +112,6 @@ const CREATE_CARD_FLAGS: &[&str] = &[
     "--proof-plan",
     "--status",
     "--priority",
-    "--estimate",
-    "--risk",
     "--related",
     "--blocks",
     "--blocked-by",
@@ -111,9 +128,9 @@ const UPDATE_CARD_FLAGS: &[&str] = &[
     "--proof-plan",
     "--status",
     "--priority",
-    "--estimate",
-    "--risk",
     "--labels",
+    "--repo",
+    "--clear-repo",
     "--actor",
     "--idempotency-key",
 ];
@@ -138,8 +155,6 @@ const LIST_READY_FLAGS: &[&str] = &[
     "--limit",
     "--json",
     "--repo",
-    "--estimate",
-    "--risk",
     "--priority",
     "--after",
 ];
@@ -147,15 +162,12 @@ const LIST_CARDS_FLAGS: &[&str] = &[
     "--db",
     "--limit",
     "--status",
-    "--estimate",
     "--repo",
     "--label",
     "--updated-after",
     "--updated-before",
+    "--after",
 ];
-const BOARD_ROLLUPS_FLAGS: &[&str] = &["--db", "--limit", "--after", "--include-hidden", "--json"];
-const BOARD_STATS_FLAGS: &[&str] = &["--db", "--repo", "--include-hidden", "--json"];
-const EPIC_VELOCITY_FLAGS: &[&str] = &["--db", "--periods", "--period-days", "--json"];
 const SEARCH_FLAGS: &[&str] = &[
     "--db",
     "--q",
@@ -163,64 +175,22 @@ const SEARCH_FLAGS: &[&str] = &[
     "--json",
     "--status",
     "--priority",
-    "--estimate",
-    "--risk",
-    "--source-kind",
-    "--source",
-    "--source-field",
     "--repo",
     "--label",
-    "--source-created-after",
-    "--source-created-before",
     "--created-after",
     "--created-before",
     "--updated-after",
     "--updated-before",
     "--after",
 ];
-const PAPERCUT_FLAGS: &[&str] = &[
-    "--db",
-    "--agent",
-    "--service",
-    "--model",
-    "--harness",
-    "--idempotency-key",
-];
-const REPOSITORY_LIST_FLAGS: &[&str] = &["--db", "--include-hidden"];
-const REPOSITORY_GET_FLAGS: &[&str] = &["--db"];
-const REPOSITORY_UPSERT_FLAGS: &[&str] = &[
-    "--db",
-    "--name",
-    "--aliases",
-    "--visibility",
-    "--tier",
-    "--import-provenance",
-    "--actor",
-    "--idempotency-key",
-];
-const REPOSITORY_MERGE_ALIAS_FLAGS: &[&str] =
-    &["--db", "--alias", "--into", "--actor", "--idempotency-key"];
-const REPOSITORY_DELETE_FLAGS: &[&str] = &["--db", "--actor", "--idempotency-key"];
-const REPOSITORY_NORMALIZE_FLAGS: &[&str] = &["--db", "--actor", "--idempotency-key"];
-const REPOSITORY_DOCTOR_FLAGS: &[&str] = &["--db"];
-const CLAIM_FLAGS: &[&str] = &["--db", "--agent", "--ttl", "--actor"];
-const RELEASE_CLAIM_FLAGS: &[&str] = &["--db", "--run", "--actor", "--idempotency-key"];
-const RENEW_CLAIM_FLAGS: &[&str] = &["--db", "--run", "--ttl", "--actor", "--idempotency-key"];
-const TRANSFER_CLAIM_FLAGS: &[&str] = &[
-    "--db",
-    "--run",
-    "--to-agent",
-    "--ttl",
-    "--actor",
-    "--idempotency-key",
-];
+const CLAIM_FLAGS: &[&str] = &["--db", "--agent", "--ttl"];
+const RELEASE_CLAIM_FLAGS: &[&str] = &["--db", "--run", "--idempotency-key"];
+const RENEW_CLAIM_FLAGS: &[&str] = &["--db", "--run", "--ttl", "--idempotency-key"];
+const TRANSFER_CLAIM_FLAGS: &[&str] =
+    &["--db", "--run", "--to-agent", "--ttl", "--idempotency-key"];
 const HEARTBEAT_FLAGS: &[&str] = &["--db", "--run", "--actor", "--idempotency-key"];
 const GET_CARD_FLAGS: &[&str] = &["--db"];
 const GET_RUN_FLAGS: &[&str] = &["--db"];
-const RECORD_RUN_TELEMETRY_FLAGS: &[&str] = &["--db", "--attempts", "--actor", "--idempotency-key"];
-const RUN_TELEMETRY_AGGREGATE_FLAGS: &[&str] =
-    &["--db", "--agent", "--model", "--provider", "--limit"];
-const LIST_APPROVALS_FLAGS: &[&str] = &["--db", "--limit"];
 const LIST_AWAITING_INPUT_FLAGS: &[&str] = &["--db", "--limit"];
 const ANSWER_INPUT_FLAGS: &[&str] = &["--db", "--actor", "--answer", "--idempotency-key"];
 const UPDATE_STATUS_FLAGS: &[&str] = &["--db", "--status", "--actor", "--idempotency-key"];
@@ -230,33 +200,11 @@ const CHECK_CRITERION_FLAGS: &[&str] = &[
     "--actor",
     "--unchecked",
     "--idempotency-key",
-    "--principal",
 ];
-const ADD_LINK_FLAGS: &[&str] = &[
-    "--db",
-    "--label",
-    "--url",
-    "--idempotency-key",
-    "--principal",
-];
-const ADD_COMMENT_FLAGS: &[&str] = &[
-    "--db",
-    "--author",
-    "--body",
-    "--idempotency-key",
-    "--principal",
-];
-const APPEND_WORK_LOG_FLAGS: &[&str] = &[
-    "--db",
-    "--agent",
-    "--body",
-    "--model",
-    "--reasoning",
-    "--harness",
-    "--run-id",
-    "--idempotency-key",
-    "--principal",
-];
+const ADD_LINK_FLAGS: &[&str] = &["--db", "--label", "--url", "--idempotency-key"];
+const ADD_COMMENT_FLAGS: &[&str] = &["--db", "--author", "--body", "--idempotency-key"];
+const APPEND_WORK_LOG_FLAGS: &[&str] =
+    &["--db", "--agent", "--body", "--run-id", "--idempotency-key"];
 const REQUEST_INPUT_FLAGS: &[&str] = &["--db", "--question", "--actor", "--idempotency-key"];
 const COMPLETE_CARD_FLAGS: &[&str] = &[
     "--db",
@@ -265,11 +213,6 @@ const COMPLETE_CARD_FLAGS: &[&str] = &[
     "--actor",
     "--idempotency-key",
 ];
-const SUBSCRIPTION_CREATE_FLAGS: &[&str] = &["--db", "--url", "--event-filter", "--show-secret"];
-const SUBSCRIPTION_LIST_FLAGS: &[&str] = &["--db"];
-const SUBSCRIPTION_DISABLE_FLAGS: &[&str] = &["--db"];
-const DEAD_LETTER_LIST_FLAGS: &[&str] = &["--db", "--limit"];
-const DEAD_LETTER_REPLAY_FLAGS: &[&str] = &["--db", "--subscription", "--idempotency-key"];
 const EVENT_TAIL_FLAGS: &[&str] = &["--db", "--after", "--limit"];
 
 fn known_flags(command: &str) -> &'static [&'static str] {
@@ -278,8 +221,6 @@ fn known_flags(command: &str) -> &'static [&'static str] {
         "key-create" => KEY_CREATE_FLAGS,
         "key-list" => KEY_LIST_FLAGS,
         "key-revoke" => KEY_REVOKE_FLAGS,
-        "import-github-issues" => IMPORT_GITHUB_ISSUES_FLAGS,
-        "repair-criteria" => REPAIR_CRITERIA_FLAGS,
         "create-card" => CREATE_CARD_FLAGS,
         "update-card" => UPDATE_CARD_FLAGS,
         "update-relations" => UPDATE_RELATIONS_FLAGS,
@@ -287,18 +228,7 @@ fn known_flags(command: &str) -> &'static [&'static str] {
         "set-parent" => SET_PARENT_FLAGS,
         "list-ready" => LIST_READY_FLAGS,
         "list-cards" => LIST_CARDS_FLAGS,
-        "board-rollups" => BOARD_ROLLUPS_FLAGS,
-        "board-stats" => BOARD_STATS_FLAGS,
-        "epic-velocity" => EPIC_VELOCITY_FLAGS,
         "search" => SEARCH_FLAGS,
-        "papercut" => PAPERCUT_FLAGS,
-        "repository-list" => REPOSITORY_LIST_FLAGS,
-        "repository-get" => REPOSITORY_GET_FLAGS,
-        "repository-upsert" => REPOSITORY_UPSERT_FLAGS,
-        "repository-merge-alias" => REPOSITORY_MERGE_ALIAS_FLAGS,
-        "repository-delete" => REPOSITORY_DELETE_FLAGS,
-        "repository-normalize" => REPOSITORY_NORMALIZE_FLAGS,
-        "repository-doctor" => REPOSITORY_DOCTOR_FLAGS,
         "claim" => CLAIM_FLAGS,
         "release-claim" => RELEASE_CLAIM_FLAGS,
         "renew-claim" => RENEW_CLAIM_FLAGS,
@@ -306,9 +236,6 @@ fn known_flags(command: &str) -> &'static [&'static str] {
         "heartbeat" => HEARTBEAT_FLAGS,
         "get-card" => GET_CARD_FLAGS,
         "get-run" => GET_RUN_FLAGS,
-        "record-run-telemetry" => RECORD_RUN_TELEMETRY_FLAGS,
-        "run-telemetry-aggregate" => RUN_TELEMETRY_AGGREGATE_FLAGS,
-        "list-approvals" => LIST_APPROVALS_FLAGS,
         "list-awaiting-input" => LIST_AWAITING_INPUT_FLAGS,
         "answer-input" => ANSWER_INPUT_FLAGS,
         "update-status" => UPDATE_STATUS_FLAGS,
@@ -318,11 +245,6 @@ fn known_flags(command: &str) -> &'static [&'static str] {
         "append-work-log" => APPEND_WORK_LOG_FLAGS,
         "request-input" => REQUEST_INPUT_FLAGS,
         "complete-card" => COMPLETE_CARD_FLAGS,
-        "subscription-create" => SUBSCRIPTION_CREATE_FLAGS,
-        "subscription-list" => SUBSCRIPTION_LIST_FLAGS,
-        "subscription-disable" => SUBSCRIPTION_DISABLE_FLAGS,
-        "dead-letter-list" => DEAD_LETTER_LIST_FLAGS,
-        "dead-letter-replay" => DEAD_LETTER_REPLAY_FLAGS,
         "event-tail" => EVENT_TAIL_FLAGS,
         _ => &[],
     }
@@ -332,7 +254,6 @@ fn validate_flags(command: &str, args: &[String]) -> Result<(), ShellError> {
     let known = known_flags(command);
     let mut index = 0;
     let mut options = true;
-    let mut positionals = 0;
     while index < args.len() {
         let arg = &args[index];
         if options && arg == "--" {
@@ -341,17 +262,14 @@ fn validate_flags(command: &str, args: &[String]) -> Result<(), ShellError> {
             continue;
         }
         if !options || !arg.starts_with('-') {
-            positionals += 1;
             index += 1;
             continue;
         }
 
         let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
         if !known.contains(&flag) {
-            let is_hyphenated_positional =
-                positionals == 0 && matches!(command, "papercut" | "search") && arg.len() > 1;
+            let is_hyphenated_positional = index == 0 && command == "search" && arg.len() > 1;
             if is_hyphenated_positional {
-                positionals += 1;
                 index += 1;
                 continue;
             }
@@ -479,8 +397,6 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "key-create" => key_create(rest),
         [command, rest @ ..] if command == "key-list" => key_list(rest),
         [command, rest @ ..] if command == "key-revoke" => key_revoke(rest),
-        [command, rest @ ..] if command == "import-github-issues" => import_github_issues(rest),
-        [command, rest @ ..] if command == "repair-criteria" => repair_criteria(rest),
         [command, rest @ ..] if command == "create-card" => create_card(rest, remote_env),
         [command, rest @ ..] if command == "update-card" => update_card(rest, remote_env),
         [command, rest @ ..] if command == "update-relations" => update_relations(rest, remote_env),
@@ -488,18 +404,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "set-parent" => set_parent(rest, remote_env),
         [command, rest @ ..] if command == "list-ready" => list_ready(rest, remote_env),
         [command, rest @ ..] if command == "list-cards" => list_cards(rest, remote_env),
-        [command, rest @ ..] if command == "board-rollups" => board_rollups(rest, remote_env),
-        [command, rest @ ..] if command == "board-stats" => board_stats(rest, remote_env),
-        [command, rest @ ..] if command == "epic-velocity" => epic_velocity(rest, remote_env),
         [command, rest @ ..] if command == "search" => search(rest, remote_env),
-        [command, rest @ ..] if command == "papercut" => papercut(rest, remote_env),
-        [command, rest @ ..] if command == "repository-list" => repository_list(rest),
-        [command, rest @ ..] if command == "repository-get" => repository_get(rest),
-        [command, rest @ ..] if command == "repository-upsert" => repository_upsert(rest),
-        [command, rest @ ..] if command == "repository-merge-alias" => repository_merge_alias(rest),
-        [command, rest @ ..] if command == "repository-delete" => repository_delete(rest),
-        [command, rest @ ..] if command == "repository-normalize" => repository_normalize(rest),
-        [command, rest @ ..] if command == "repository-doctor" => repository_doctor(rest),
         [command, rest @ ..] if command == "claim" => claim(rest, remote_env),
         [command, rest @ ..] if command == "release-claim" => release_claim(rest, remote_env),
         [command, rest @ ..] if command == "renew-claim" => renew_claim(rest, remote_env),
@@ -507,13 +412,6 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "heartbeat" => heartbeat(rest, remote_env),
         [command, rest @ ..] if command == "get-card" => get_card(rest, remote_env),
         [command, rest @ ..] if command == "get-run" => get_run(rest, remote_env),
-        [command, rest @ ..] if command == "record-run-telemetry" => {
-            record_run_telemetry(rest, remote_env)
-        }
-        [command, rest @ ..] if command == "run-telemetry-aggregate" => {
-            run_telemetry_aggregate(rest, remote_env)
-        }
-        [command, rest @ ..] if command == "list-approvals" => list_approvals(rest, remote_env),
         [command, rest @ ..] if command == "list-awaiting-input" => {
             list_awaiting_input(rest, remote_env)
         }
@@ -525,12 +423,7 @@ fn run_with_remote_env(args: &[String], remote_env: &RemoteEnv) -> Result<String
         [command, rest @ ..] if command == "append-work-log" => append_work_log(rest, remote_env),
         [command, rest @ ..] if command == "request-input" => request_input(rest, remote_env),
         [command, rest @ ..] if command == "complete-card" => complete_card(rest, remote_env),
-        [command, rest @ ..] if command == "subscription-create" => subscription_create(rest),
-        [command, rest @ ..] if command == "subscription-list" => subscription_list(rest),
-        [command, rest @ ..] if command == "subscription-disable" => subscription_disable(rest),
-        [command, rest @ ..] if command == "dead-letter-list" => dead_letter_list(rest),
-        [command, rest @ ..] if command == "dead-letter-replay" => dead_letter_replay(rest),
-        [command, rest @ ..] if command == "event-tail" => event_tail(rest),
+        [command, rest @ ..] if command == "event-tail" => event_tail(rest, remote_env),
         [command, ..] => Err(ShellError::Invalid(format!("unknown command: {command}"))),
     }
 }
@@ -672,19 +565,7 @@ pub fn help() -> String {
          without an explicit choice\n",
     );
     help.push_str("  powder key-list --db ./data/powder.db\n");
-    help.push_str("  powder key-revoke key-id --db ./data/powder.db\n");
-    help.push_str(
-        "  gh issue list --json number,title,body,labels,state,url --repo misty-step/bitterblossom > issues.json\n",
-    );
-    help.push_str(
-        "  powder import-github-issues issues.json --repo misty-step/bitterblossom --db ./data/powder.db\n",
-    );
-    help.push_str(
-        "  powder repair-criteria ./backlog.d --db ./data/powder.db  (dry-run JSONL report)\n",
-    );
-    help.push_str(
-        "  powder repair-criteria ./backlog.d --db ./data/powder.db --repo misty-step/sploot --apply --actor operator\n",
-    );
+    help.push_str("  powder key-revoke key-id --db ./data/powder.db --idempotency-key revoke-1\n");
     help.push_str("  powder list-ready --db ./data/powder.db --limit 10\n");
     help.push_str(
         "  powder create-card --db ./data/powder.db --id canary-001 --title \"Canary task\" --repo misty-step/canary [--proof-plan \"CI + PR\"]\n",
@@ -696,35 +577,7 @@ pub fn help() -> String {
         "  powder update-card canary-001 --db ./data/powder.db --acceptance \"a\" --acceptance \"b\"  (repeatable; replaces the full criteria list)\n",
     );
     help.push_str(
-        "  powder list-cards --db ./data/powder.db --status ready --repo misty-step/example --updated-after 1754000000 --updated-before 1754003600\n",
-    );
-    help.push_str(
-        "  Time flags on list-cards use Unix seconds and filter only the fetched page. Request more pages for a complete sweep.\n",
-    );
-    help.push_str(
-        "  powder board-rollups --json --db ./data/powder.db --limit 20 [--after e:epic] [--include-hidden]\n",
-    );
-    help.push_str(
-        "  powder board-stats --json --db ./data/powder.db [--repo misty-step/example] [--include-hidden]\n",
-    );
-    help.push_str(
-        "  powder epic-velocity <card-id> --json [--db ./data/powder.db] [--periods 8] [--period-days 7]\n",
-    );
-    help.push_str(
-        "  powder papercut 'too many tokens to file a simple bug' --agent codex [--service canary]\n",
-    );
-    help.push_str("  powder repository-list --db ./data/powder.db --include-hidden\n");
-    help.push_str(
-        "  powder repository-upsert --db ./data/powder.db --name canary --aliases misty-step/canary,legacy-canary --visibility visible --tier active --import-provenance manual\n",
-    );
-    help.push_str(
-        "  powder repository-merge-alias --db ./data/powder.db --alias misty-step/canary --into canary --actor operator\n",
-    );
-    help.push_str(
-        "  powder repository-normalize --db ./data/powder.db --actor operator  (one-time sweep: canonicalizes any legacy non-canonical cards.repo rows and audits each change)\n",
-    );
-    help.push_str(
-        "  powder repository-doctor --db ./data/powder.db  (report-only: lists repository rows carrying a legacy auto-create provenance tag for review)\n",
+        "  powder list-cards --db ./data/powder.db --status ready --repo misty-step/example --after cursor\n",
     );
     help.push_str(
         "  powder update-relations 001 --db ./data/powder.db --related 002,003 --blocks 004 --blocked-by 000  (mirrors reciprocally onto 002, 003, and 004 atomically)\n",
@@ -748,9 +601,6 @@ pub fn help() -> String {
     );
     help.push_str("  powder release-claim 001 --db ./data/powder.db --run run-id\n");
     help.push_str("  powder get-card 001 --db ./data/powder.db\n");
-    help.push_str("  powder record-run-telemetry run-id --db ./data/powder.db --attempts \"[{\\\"model\\\":\\\"example\\\",\\\"input_tokens\\\":100}]\" --idempotency-key telemetry-1\n");
-    help.push_str("  powder run-telemetry-aggregate --db ./data/powder.db [--agent agent] [--model model] [--limit 100]\n");
-    help.push_str("  powder list-approvals --db ./data/powder.db\n");
     help.push_str("  powder list-awaiting-input --db ./data/powder.db\n");
     help.push_str(
         "  powder answer-input run-id --db ./data/powder.db --actor operator --answer approved\n",
@@ -765,18 +615,11 @@ pub fn help() -> String {
         "  powder add-comment 001 --db ./data/powder.db --author operator --body \"looks good\"\n",
     );
     help.push_str(
-        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--model claude-sonnet-5] [--reasoning high] [--harness \"Claude Code\"] [--run-id run-id]\n",
+        "  powder append-work-log 001 --db ./data/powder.db --agent codex --body \"tracing the claim expiry bug\" [--run-id run-id]\n",
     );
     help.push_str(
         "  powder complete-card 001 --db ./data/powder.db [--proof https://example.test/proof]\n",
     );
-    help.push_str(
-        "  powder subscription-create --db ./data/powder.db --url http://127.0.0.1:9000/webhook --event-filter moved-to-ready,completed --show-secret\n",
-    );
-    help.push_str("  powder subscription-list --db ./data/powder.db\n");
-    help.push_str("  powder subscription-disable sub-id --db ./data/powder.db\n");
-    help.push_str("  powder dead-letter-list --db ./data/powder.db\n");
-    help.push_str("  powder dead-letter-replay --db ./data/powder.db --idempotency-key replay-001 [--subscription sub-id]\n");
     help.push_str("  powder event-tail --db ./data/powder.db --after 0 --limit 20\n");
     help.push_str(
         "authority:\n  local mutations use POWDER_PRINCIPAL (or the fixed trusted local-cli admin principal). \
@@ -900,143 +743,12 @@ fn key_revoke(args: &[String]) -> Result<String, ShellError> {
         .first()
         .copied()
         .ok_or_else(|| ShellError::Invalid("key-revoke requires a key id".to_string()))?;
+    let idempotency_key = required_idempotency_key(args)?;
     let mut store = open_store(required_flag(args, "--db")?)?;
     store
-        .revoke_api_key_with_authority(key_id, now, &admin_authority(args))
+        .revoke_api_key_keyed(key_id, now, &idempotency_key, &admin_authority(args))
         .map_err(store_err)?;
     Ok(format!("revoked\t{key_id}\n"))
-}
-
-fn outcome_line(outcome: &powder_store::ImportOutcome) -> String {
-    format!(
-        "total={}\tcreated={}\tupdated={}\tpreserved={}\tunchanged={}\tcontent_repaired={}",
-        outcome.total(),
-        outcome.created,
-        outcome.updated,
-        outcome.preserved,
-        outcome.unchanged,
-        outcome.content_repaired
-    )
-}
-
-/// Import a GitHub repo's issues from a local JSON file (the shape produced
-/// by `gh issue list --json number,title,body,labels,state,url`). Powder
-/// never talks to the GitHub API itself; fetching is the operator's own
-/// step, this only maps and imports what's already on disk.
-fn import_github_issues(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let path = positional(args).first().copied().ok_or_else(|| {
-        ShellError::Invalid("import-github-issues requires a JSON file path".to_string())
-    })?;
-    let repo = required_flag(args, "--repo")?;
-    let cards = load_github_issues_file(path, repo, now)?;
-    let mut out = String::new();
-
-    if has_flag(args, "--dry-run") {
-        let store = open_store(required_flag(args, "--db")?)?;
-        let outcome = store.preview_import(&cards).map_err(store_err)?;
-        out.push_str(&format!("dry-run\t{}\n", outcome_line(&outcome)));
-    } else {
-        let mut store = open_store(required_flag(args, "--db")?)?;
-        let outcome = store
-            .import_cards_with_events_with_authority(cards.clone(), &authority(args), now)
-            .map_err(store_err)?;
-        out.push_str(&format!("imported\t{}\n", outcome_line(&outcome)));
-    }
-
-    for card in cards {
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
-            card.id,
-            card.priority.as_str(),
-            card.status.as_str(),
-            card.title
-        ));
-    }
-    Ok(out)
-}
-
-/// Repair acceptance criteria that were truncated by earlier line-naive
-/// Markdown parsers, comparing stored criteria against fresh source files.
-///
-/// Dry-run (default) emits a JSONL report of source-to-stored differences.
-/// `--apply` writes only the criteria text; status, check state, provenance,
-/// comments, relations, and claims are left untouched. `--apply` requires
-/// `--actor`.
-fn repair_criteria(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let source_path = positional(args).first().copied().ok_or_else(|| {
-        ShellError::Invalid("repair-criteria requires a source directory path".to_string())
-    })?;
-    let db = required_flag(args, "--db")?;
-    let apply = has_flag(args, "--apply");
-    let actor = flag_value(args, "--actor");
-    if apply && actor.is_none() {
-        return Err(ShellError::Invalid("--apply requires --actor".to_string()));
-    }
-
-    let mut parsed_by_id = load_markdown_dir(PathBuf::from(source_path), now)
-        .map_err(|err| ShellError::Invalid(err.to_string()))?;
-
-    if let Some(repo) = flag_value(args, "--repo") {
-        let cards: Vec<Card> = parsed_by_id
-            .into_values()
-            .map(|parsed| parsed.card)
-            .collect();
-        let namespaced = namespace_cards_for_repo(cards, repo)?;
-        parsed_by_id = namespaced
-            .into_iter()
-            .map(|card| {
-                (
-                    card.id.to_string(),
-                    ParsedCard {
-                        card,
-                        diagnostics: Vec::new(),
-                    },
-                )
-            })
-            .collect();
-    }
-
-    let mut store = open_store(db)?;
-    let mut out = String::new();
-    for (id, parsed) in parsed_by_id {
-        let card_id = CardId::new(&id).map_err(ShellError::from)?;
-        let Some(stored) = store.get_card(&card_id).map_err(store_err)? else {
-            out.push_str(&format!("missing\t{id}\n"));
-            continue;
-        };
-
-        let truncated = detect_truncated_criteria(&id, &stored.acceptance, &parsed.card.acceptance);
-        if apply {
-            let repair = store
-                .repair_criteria_as(
-                    &card_id,
-                    parsed.card.acceptance.clone(),
-                    &authority(args),
-                    now,
-                )
-                .map_err(store_err)?;
-            out.push_str(
-                &serde_json::to_string(&repair)
-                    .map_err(|err| ShellError::Invalid(err.to_string()))?,
-            );
-        } else {
-            let report = json!({
-                "card_id": id,
-                "dry_run": true,
-                "stored_acceptance": stored.acceptance,
-                "source_acceptance": parsed.card.acceptance,
-                "truncated": truncated,
-            });
-            out.push_str(
-                &serde_json::to_string(&report)
-                    .map_err(|err| ShellError::Invalid(err.to_string()))?,
-            );
-        }
-        out.push('\n');
-    }
-    Ok(out)
 }
 
 fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -1068,12 +780,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .map(parse_priority_flag)
         .transpose()?
         .unwrap_or_default();
-    let estimate = flag_value(args, "--estimate")
-        .map(parse_estimate_flag)
-        .transpose()?;
-    let risk = flag_value(args, "--risk")
-        .map(parse_risk_flag)
-        .transpose()?;
 
     let related = card_ids_flag(args, "--related")?;
     let blocks = card_ids_flag(args, "--blocks")?;
@@ -1093,8 +799,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         .map_err(ShellError::from)?
         .with_status(status)
         .with_priority(priority)
-        .with_estimate(estimate)
-        .with_risk(risk)
         .with_acceptance(acceptance)
         .with_proof_plan(proof_plan.clone())
         .with_created_at(now);
@@ -1133,12 +837,6 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         if let Some(repo) = repo {
             payload["repo"] = json!(repo);
         }
-        if let Some(estimate) = estimate {
-            payload["estimate"] = json!(estimate.as_str());
-        }
-        if let Some(risk) = risk {
-            payload["risk"] = json!(risk.as_str());
-        }
         if let Some(parent) = parent {
             payload["parent"] = json!(parent.as_str());
         }
@@ -1160,6 +858,13 @@ fn create_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
 fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let now = unix_now();
     let card_id = positional_card_id(args, "update-card")?;
+    let repo = flag_value(args, "--repo").map(str::to_string);
+    let clear_repo = has_flag(args, "--clear-repo");
+    if repo.is_some() && clear_repo {
+        return Err(ShellError::Invalid(
+            "--repo and --clear-repo are mutually exclusive".to_string(),
+        ));
+    }
     let patch = CardPatch {
         title: flag_value(args, "--title").map(str::to_string),
         body: flag_value(args, "--body").map(str::to_string),
@@ -1175,14 +880,12 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         priority: flag_value(args, "--priority")
             .map(parse_priority_flag)
             .transpose()?,
-        estimate: flag_value(args, "--estimate")
-            .map(parse_estimate_flag)
-            .transpose()?,
-        risk: flag_value(args, "--risk")
-            .map(parse_risk_flag)
-            .transpose()?,
         labels: flag_value(args, "--labels").map(|raw| normalize_labels(split_csv(raw))),
-        repo: None,
+        repo: if clear_repo {
+            Some(None)
+        } else {
+            repo.map(Some)
+        },
     };
     let card = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
@@ -1217,11 +920,8 @@ fn update_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
         if let Some(priority) = patch.priority {
             payload["priority"] = json!(priority.as_str());
         }
-        if let Some(estimate) = patch.estimate {
-            payload["estimate"] = json!(estimate.as_str());
-        }
-        if let Some(risk) = patch.risk {
-            payload["risk"] = json!(risk.as_str());
+        if let Some(repo) = patch.repo {
+            payload["repo"] = json!(repo);
         }
         if let Some(labels) = patch.labels {
             payload["labels"] = json!(labels);
@@ -1370,19 +1070,11 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         })
         .transpose()?
         .unwrap_or_default();
-    let estimate = flag_value(args, "--estimate")
-        .map(parse_estimate_flag)
-        .transpose()?;
-    let risk = flag_value(args, "--risk")
-        .map(parse_risk_flag)
-        .transpose()?;
     let priority = flag_value(args, "--priority")
         .map(parse_priority_flag)
         .transpose()?;
     let query = ReadyQuery::new(now, limit)
         .with_repositories(repo.clone())
-        .with_estimate(estimate)
-        .with_risk(risk)
         .with_priority(priority);
     let raw_after = flag_value(args, "--after");
     let payload = if let Some(db) = flag_value(args, "--db") {
@@ -1399,12 +1091,6 @@ fn list_ready(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         let mut url = format!("/api/v1/cards/ready?limit={limit}");
         if !repo.is_empty() {
             url.push_str(&format!("&repo={}", urlencode(&repo.join(","))));
-        }
-        if let Some(estimate) = estimate {
-            url.push_str(&format!("&estimate={}", estimate.as_str()));
-        }
-        if let Some(risk) = risk {
-            url.push_str(&format!("&risk={}", risk.as_str()));
         }
         if let Some(priority) = priority {
             url.push_str(&format!("&priority={}", priority.as_str()));
@@ -1449,9 +1135,8 @@ fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError>
             "search accepts one positional query; quote multi-word queries or use --q".to_string(),
         ));
     }
-    let positional_query = positionals.into_iter().next();
     let q = flag_value(args, "--q")
-        .or(positional_query)
+        .or_else(|| positionals.first().copied())
         .ok_or_else(|| ShellError::Invalid("search requires --q <text>".to_string()))?;
     let limit = parse_limit(args).unwrap_or(20).max(1);
     let status = flag_value(args, "--status")
@@ -1460,28 +1145,13 @@ fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError>
     let priority = flag_value(args, "--priority")
         .map(parse_priority_flag)
         .transpose()?;
-    let estimate = flag_value(args, "--estimate")
-        .map(parse_estimate_flag)
-        .transpose()?;
-    let risk = flag_value(args, "--risk")
-        .map(parse_risk_flag)
-        .transpose()?;
     let parse_time = |flag: &'static str| parse_unix_time_flag(args, flag);
-    let source_kind = flag_value(args, "--source-kind")
-        .or_else(|| flag_value(args, "--source"))
-        .map(str::to_string);
     let query = SearchQuery {
         q: q.to_string(),
-        source_kind,
-        source_field: flag_value(args, "--source-field").map(str::to_string),
         status,
         repo: flag_value(args, "--repo").map(str::to_string),
         label: flag_value(args, "--label").map(str::to_string),
         priority,
-        estimate,
-        risk,
-        source_created_after: parse_time("--source-created-after")?,
-        source_created_before: parse_time("--source-created-before")?,
         created_after: parse_time("--created-after")?,
         created_before: parse_time("--created-before")?,
         updated_after: parse_time("--updated-after")?,
@@ -1494,66 +1164,26 @@ fn search(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError>
         json!(store.search_page(&query).map_err(store_err)?)
     } else if let Some(client) = remote_env.client() {
         let mut parts = vec![("q", q.to_string()), ("limit", limit.to_string())];
-        let add = |parts: &mut Vec<(&str, String)>, key: &'static str, value: Option<String>| {
+        let mut add = |key: &'static str, value: Option<String>| {
             if let Some(value) = value {
                 parts.push((key, value));
             }
         };
-        add(&mut parts, "source_kind", query.source_kind.clone());
-        add(&mut parts, "source_field", query.source_field.clone());
+        add("status", status.map(|v| v.as_str().to_string()));
+        add("repo", query.repo.clone());
+        add("label", query.label.clone());
+        add("priority", priority.map(|v| v.as_str().to_string()));
+        add("created_after", query.created_after.map(|v| v.to_string()));
         add(
-            &mut parts,
-            "status",
-            status.map(|value| value.as_str().to_string()),
-        );
-        add(&mut parts, "repo", query.repo.clone());
-        add(&mut parts, "label", query.label.clone());
-        add(
-            &mut parts,
-            "priority",
-            priority.map(|value| value.as_str().to_string()),
-        );
-        add(
-            &mut parts,
-            "estimate",
-            estimate.map(|value| value.as_str().to_string()),
-        );
-        add(
-            &mut parts,
-            "risk",
-            risk.map(|value| value.as_str().to_string()),
-        );
-        add(
-            &mut parts,
-            "source_created_after",
-            query.source_created_after.map(|value| value.to_string()),
-        );
-        add(
-            &mut parts,
-            "source_created_before",
-            query.source_created_before.map(|value| value.to_string()),
-        );
-        add(
-            &mut parts,
-            "created_after",
-            query.created_after.map(|value| value.to_string()),
-        );
-        add(
-            &mut parts,
             "created_before",
-            query.created_before.map(|value| value.to_string()),
+            query.created_before.map(|v| v.to_string()),
         );
+        add("updated_after", query.updated_after.map(|v| v.to_string()));
         add(
-            &mut parts,
-            "updated_after",
-            query.updated_after.map(|value| value.to_string()),
-        );
-        add(
-            &mut parts,
             "updated_before",
-            query.updated_before.map(|value| value.to_string()),
+            query.updated_before.map(|v| v.to_string()),
         );
-        add(&mut parts, "after", query.after.clone());
+        add("after", query.after.clone());
         let query_string = parts
             .into_iter()
             .map(|(key, value)| format!("{key}={}", urlencode(&value)))
@@ -1591,26 +1221,34 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     let status = flag_value(args, "--status")
         .map(parse_status_flag)
         .transpose()?;
-    let estimate = flag_value(args, "--estimate")
-        .map(parse_estimate_flag)
-        .transpose()?;
     let repo = flag_value(args, "--repo").map(str::to_string);
     let label = flag_value(args, "--label").map(str::to_string);
+    let raw_after = flag_value(args, "--after");
+    let after = raw_after
+        .map(CardId::new)
+        .transpose()
+        .map_err(ShellError::from)?;
     let updated_after = parse_unix_time_flag(args, "--updated-after")?;
     let updated_before = parse_unix_time_flag(args, "--updated-before")?;
+    if let (Some(updated_after), Some(updated_before)) = (updated_after, updated_before) {
+        if updated_after > updated_before {
+            return Err(ShellError::Invalid(
+                "--updated-after must be less than or equal to --updated-before".to_string(),
+            ));
+        }
+    }
     let cards = if let Some(db) = flag_value(args, "--db") {
         let store = open_store(db)?;
         let filter = CardFilter {
             status,
-            estimate,
             repo: repo.clone(),
             label: label.clone(),
-            // list-cards terminal exclusion:
-            // tool defaults to hiding terminal cards; the CLI keeps its
-            // existing whole-board behavior unchanged.
             include_terminal: true,
         };
-        let mut cards = json!(store.list_cards(&filter, limit).map_err(store_err)?);
+        let page = store
+            .list_cards_page_after(&filter, limit, after.as_ref())
+            .map_err(store_err)?;
+        let mut cards = json!(page.cards);
         filter_cards_by_updated_at(&mut cards, updated_after, updated_before);
         cards
     } else if let Some(client) = remote_env.client() {
@@ -1618,14 +1256,14 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         if let Some(status) = status {
             query.push_str(&format!("&status={}", status.as_str()));
         }
-        if let Some(estimate) = estimate {
-            query.push_str(&format!("&estimate={}", estimate.as_str()));
-        }
         if let Some(repo) = &repo {
             query.push_str(&format!("&repo={}", urlencode(repo)));
         }
         if let Some(label) = &label {
             query.push_str(&format!("&label={}", urlencode(label)));
+        }
+        if let Some(after) = raw_after {
+            query.push_str(&format!("&after={}", urlencode(after)));
         }
         let mut cards = list_page_cards(
             client
@@ -1637,7 +1275,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
     } else {
         return Err(missing_transport("list-cards"));
     };
-
     let mut out = String::new();
     for card in json_array(&cards)? {
         out.push_str(&format!(
@@ -1652,285 +1289,6 @@ fn list_cards(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellEr
         out.push_str("no-cards\n");
     }
     Ok(out)
-}
-
-/// Return the same bounded board rollup envelope over local SQLite or the
-/// authenticated HTTP API. `--json` is accepted explicitly because
-/// rollups are intended for agent consumption; JSON remains the sole wire shape.
-fn board_rollups(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let limit = parse_limit(args).unwrap_or(20).clamp(1, 100);
-    let after = flag_value(args, "--after").map(str::to_string);
-    let include_hidden = has_flag(args, "--include-hidden");
-    let value = if let Some(db) = flag_value(args, "--db") {
-        let store = open_store(db)?;
-        serde_json::to_value(
-            store
-                .board_rollups(powder_store::BoardRollupsQuery {
-                    limit,
-                    after,
-                    now: unix_now(),
-                    include_hidden,
-                })
-                .map_err(store_err)?,
-        )
-        .map_err(|error| ShellError::Invalid(error.to_string()))?
-    } else if let Some(client) = remote_env.client() {
-        let mut query = format!("limit={limit}&include_hidden={include_hidden}");
-        if let Some(after) = after {
-            query.push_str(&format!("&after={}", urlencode(&after)));
-        }
-        client
-            .get(&format!("/api/v1/board/rollups?{query}"))
-            .map_err(remote_err)?
-    } else {
-        return Err(missing_transport("board-rollups"));
-    };
-    to_pretty_json(&value)
-}
-/// Return compact board counts over local SQLite or the authenticated HTTP API.
-fn board_stats(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let include_hidden = has_flag(args, "--include-hidden");
-    let repo = flag_value(args, "--repo").map(str::to_string);
-    let value = if let Some(db) = flag_value(args, "--db") {
-        let store = open_store(db)?;
-        serde_json::to_value(
-            store
-                .board_stats(powder_store::BoardStatsQuery {
-                    repo,
-                    include_hidden,
-                    now: unix_now(),
-                })
-                .map_err(store_err)?,
-        )
-        .map_err(|error| ShellError::Invalid(error.to_string()))?
-    } else if let Some(client) = remote_env.client() {
-        let mut query = format!("include_hidden={include_hidden}");
-        if let Some(repo) = repo {
-            query.push_str(&format!("&repo={}", urlencode(&repo)));
-        }
-        client
-            .get(&format!("/api/v1/stats?{query}"))
-            .map_err(remote_err)?
-    } else {
-        return Err(missing_transport("board-stats"));
-    };
-    to_pretty_json(&value)
-}
-
-/// Per-epic direct-child completion velocity over trailing fixed periods.
-fn epic_velocity(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let card_id = positional_card_id(args, "epic-velocity")?;
-    let periods = flag_value(args, "--periods")
-        .map(|raw| {
-            raw.parse::<usize>()
-                .map_err(|_| ShellError::Invalid("--periods must be a positive integer".into()))
-        })
-        .transpose()?
-        .unwrap_or(8);
-    let period_days = flag_value(args, "--period-days")
-        .map(|raw| {
-            raw.parse::<u64>()
-                .map_err(|_| ShellError::Invalid("--period-days must be a positive integer".into()))
-        })
-        .transpose()?
-        .unwrap_or(7);
-    let value = if let Some(db) = flag_value(args, "--db") {
-        let store = open_store(db)?;
-        let velocity = store
-            .epic_velocity(&card_id, unix_now(), periods, period_days)
-            .map_err(store_err)?
-            .ok_or_else(|| ShellError::Invalid(format!("card {card_id} not found")))?;
-        serde_json::to_value(velocity).map_err(|error| ShellError::Invalid(error.to_string()))?
-    } else if let Some(client) = remote_env.client() {
-        client
-            .get(&format!(
-                "/api/v1/cards/{}/velocity?periods={periods}&period_days={period_days}",
-                urlencode(card_id.as_str())
-            ))
-            .map_err(remote_err)?
-    } else {
-        return Err(missing_transport("epic-velocity"));
-    };
-    to_pretty_json(&value)
-}
-
-/// File a one-call papercut. The body is every positional argument joined
-/// by spaces (so quoted or unquoted one-liners both work); --agent is
-/// required, --service/--model/--harness are optional attribution.
-fn papercut(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let now = unix_now();
-    let agent = required_flag(args, "--agent")?;
-    let body = body_from_positionals(args)?;
-    let service = flag_value(args, "--service").map(str::to_string);
-    let model = flag_value(args, "--model").map(str::to_string);
-    let harness = flag_value(args, "--harness").map(str::to_string);
-
-    let report = PapercutReport {
-        agent: agent.to_string(),
-        body,
-        service,
-        model,
-        harness,
-    };
-
-    let ack = if let Some(db) = flag_value(args, "--db") {
-        let mut store = open_store(db)?;
-        json!(store
-            .file_papercut(&report, agent, now)
-            .map_err(store_err)?)
-    } else if let Some(client) = remote_env.client() {
-        client
-            .post_with_key(
-                "/api/v1/cards/papercut",
-                json!({
-                    "agent": report.agent,
-                    "body": report.body,
-                    "service": report.service,
-                    "model": report.model,
-                    "harness": report.harness,
-                }),
-                &idempotency_key(args)?,
-            )
-            .map_err(remote_err)?
-    } else {
-        return Err(missing_transport("papercut"));
-    };
-
-    Ok(format!(
-        "papercut\t{}\t{}\t{}\n",
-        json_string(&ack, "id")?,
-        json_string(&ack, "status")?,
-        json_string(&ack, "title")?,
-    ))
-}
-
-fn repository_list(args: &[String]) -> Result<String, ShellError> {
-    let store = open_store(required_flag(args, "--db")?)?;
-    let repositories = if has_flag(args, "--include-hidden") {
-        store.list_repositories_with_hidden().map_err(store_err)?
-    } else {
-        store.list_repositories().map_err(store_err)?
-    };
-    to_pretty_json(&serde_json::json!({ "repositories": repositories }))
-}
-
-fn repository_doctor(args: &[String]) -> Result<String, ShellError> {
-    let store = open_store(required_flag(args, "--db")?)?;
-    let report = store.repository_doctor().map_err(store_err)?;
-    to_pretty_json(&report)
-}
-
-fn repository_get(args: &[String]) -> Result<String, ShellError> {
-    let name = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("repository-get requires a name".to_string()))?;
-    let store = open_store(required_flag(args, "--db")?)?;
-    let repository = store
-        .get_repository(name)
-        .map_err(store_err)?
-        .ok_or_else(|| ShellError::NotFound(format!("repository not found: {name}")))?;
-    to_pretty_json(&repository)
-}
-
-fn repository_upsert(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let name = required_flag(args, "--name")?.to_string();
-    let visibility = flag_value(args, "--visibility")
-        .map(|raw| {
-            RepositoryVisibility::parse(raw)
-                .ok_or_else(|| ShellError::Invalid(format!("invalid --visibility: {raw}")))
-        })
-        .transpose()?;
-    let tier = flag_value(args, "--tier")
-        .map(|raw| {
-            RepositoryTier::parse(raw)
-                .ok_or_else(|| ShellError::Invalid(format!("invalid --tier: {raw}")))
-        })
-        .transpose()?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let repository_outcome = store
-        .upsert_repository_with_authority_keyed(
-            RepositoryUpsert {
-                name,
-                aliases: aliases_flag(args),
-                visibility,
-                tier,
-                import_provenance: flag_value(args, "--import-provenance").map(str::to_string),
-            },
-            now,
-            &idempotency_key(args)?,
-            &admin_authority(args),
-        )
-        .map_err(store_err)?;
-    let mut repository = serde_json::to_value(repository_outcome.value)
-        .map_err(|error| ShellError::Store(error.to_string()))?;
-    repository["replayed"] = json!(repository_outcome.replayed);
-    to_pretty_json(&repository)
-}
-
-fn repository_merge_alias(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let alias = required_flag(args, "--alias")?;
-    let target = required_flag(args, "--into")?;
-    let auth = admin_authority(args);
-    if let Some(actor) = flag_value(args, "--actor") {
-        auth.require_identity(actor)
-            .map_err(|err| ShellError::Store(err.to_string()))?;
-    }
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let outcome = store
-        .merge_repository_alias_with_authority_keyed(
-            alias,
-            target,
-            &auth,
-            now,
-            &idempotency_key(args)?,
-        )
-        .map_err(store_err)?;
-    let mut value = serde_json::to_value(outcome.value)
-        .map_err(|error| ShellError::Store(error.to_string()))?;
-    value["replayed"] = json!(outcome.replayed);
-    to_pretty_json(&value)
-}
-
-fn repository_delete(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let name = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("repository-delete requires a name".to_string()))?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let outcome = store
-        .delete_repository_with_authority_keyed(
-            name,
-            now,
-            &idempotency_key(args)?,
-            &admin_authority(args),
-        )
-        .map_err(store_err)?;
-    Ok(format!("deleted\t{name}\t{}\n", outcome.replayed))
-}
-
-/// powder-904: admin-ish, local-db-only sweep -- normalizes every card
-/// whose stored `repo` column is an alias or org-prefixed string (predating
-/// write-time canonicalization, or written by a path that bypassed it) to
-/// its canonical short name, auditing each change with a card event. No
-/// remote/API-mode equivalent: this reaches into one instance's own SQLite
-/// file, the same shape as `key-create`/`key-list`/`key-revoke`.
-fn repository_normalize(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let outcome = {
-        let auth = admin_authority(args);
-        let mut store = open_store(required_flag(args, "--db")?)?;
-        store
-            .normalize_repository_strings_with_authority_keyed(&auth, now, &idempotency_key(args)?)
-            .map_err(store_err)?
-    };
-    let mut value = serde_json::to_value(outcome.value)
-        .map_err(|error| ShellError::Store(error.to_string()))?;
-    value["replayed"] = json!(outcome.replayed);
-    to_pretty_json(&value)
 }
 
 fn claim(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
@@ -2173,94 +1531,6 @@ fn get_run(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError
     to_pretty_json(&detail)
 }
 
-fn record_run_telemetry(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let run_id = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("record-run-telemetry requires a run id".to_string()))
-        .and_then(|id| RunId::new(id).map_err(ShellError::from))?;
-    let attempts: Vec<RunTelemetryAttemptInput> =
-        serde_json::from_str(flag_value(args, "--attempts").unwrap_or("[]"))
-            .map_err(|e| ShellError::Invalid(format!("invalid --attempts JSON: {e}")))?;
-    let write = RunTelemetryWrite { attempts };
-    let key = idempotency_key(args)?;
-    let value = if let Some(db) = flag_value(args, "--db") {
-        let mut store = open_store(db)?;
-        let pricing = PricingConfig::from_env().map_err(store_err)?;
-        let outcome = store
-            .record_run_telemetry_with_pricing(
-                &run_id,
-                &write,
-                unix_now(),
-                &key,
-                &authority(args),
-                pricing.as_ref(),
-            )
-            .map_err(store_err)?;
-        serde_json::to_value(outcome.value.with_replayed(outcome.replayed))
-            .map_err(|e| ShellError::Store(e.to_string()))?
-    } else if let Some(client) = remote_env.client() {
-        client
-            .post_with_key(
-                &format!("/api/v1/runs/{}/telemetry", run_id.as_str()),
-                serde_json::to_value(&write).map_err(|e| ShellError::Invalid(e.to_string()))?,
-                &key,
-            )
-            .map_err(remote_err)?
-    } else {
-        return Err(missing_transport("record-run-telemetry"));
-    };
-    to_pretty_json(&value)
-}
-
-fn run_telemetry_aggregate(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let query = RunTelemetryAggregateQuery {
-        agent: flag_value(args, "--agent").map(str::to_owned),
-        model: flag_value(args, "--model").map(str::to_owned),
-        provider: flag_value(args, "--provider").map(str::to_owned),
-        limit: parse_limit(args).unwrap_or(100),
-    };
-    let value = if let Some(db) = flag_value(args, "--db") {
-        let store = open_store(db)?;
-        serde_json::to_value(store.run_telemetry_aggregate(&query).map_err(store_err)?)
-            .map_err(|e| ShellError::Store(e.to_string()))?
-    } else if let Some(client) = remote_env.client() {
-        let mut path = format!("/api/v1/runs/telemetry/aggregate?limit={}", query.limit);
-        if let Some(v) = query.agent.as_deref() {
-            path.push_str("&agent=");
-            path.push_str(&urlencode(v));
-        }
-        if let Some(v) = query.model.as_deref() {
-            path.push_str("&model=");
-            path.push_str(&urlencode(v));
-        }
-        if let Some(v) = query.provider.as_deref() {
-            path.push_str("&provider=");
-            path.push_str(&urlencode(v));
-        }
-        client.get(&path).map_err(remote_err)?
-    } else {
-        return Err(missing_transport("run-telemetry-aggregate"));
-    };
-    to_pretty_json(&value)
-}
-
-fn list_approvals(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    let limit = parse_limit(args).unwrap_or(20);
-    let approvals = if let Some(db) = flag_value(args, "--db") {
-        let store = open_store(db)?;
-        json!(store.list_approvals(limit).map_err(store_err)?)
-    } else if let Some(client) = remote_env.client() {
-        client
-            .get(&format!("/api/v1/approvals?limit={limit}"))
-            .map_err(remote_err)?["approvals"]
-            .clone()
-    } else {
-        return Err(missing_transport("list-approvals"));
-    };
-    to_pretty_json(&serde_json::json!({ "approvals": approvals }))
-}
-
 fn list_awaiting_input(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let limit = parse_limit(args).unwrap_or(20);
     let value = if let Some(db) = flag_value(args, "--db") {
@@ -2362,7 +1632,6 @@ fn update_status(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
 }
 
 fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "check-criterion")?;
     let criterion = criterion_flag(args)?;
@@ -2401,7 +1670,6 @@ fn check_criterion(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
 }
 
 fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "add-link")?;
     let label = required_flag(args, "--label")?;
@@ -2436,7 +1704,6 @@ fn add_link(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellErro
 }
 
 fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "add-comment")?;
     let author = required_flag(args, "--author")?;
@@ -2475,21 +1742,11 @@ fn add_comment(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellE
 }
 
 fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
-    reject_principal_flag(args)?;
     let now = unix_now();
     let card_id = positional_card_id(args, "append-work-log")?;
     let agent = required_flag(args, "--agent")?;
     let body = required_flag(args, "--body")?;
-    let model = flag_value(args, "--model");
-    let reasoning = flag_value(args, "--reasoning");
-    let harness = flag_value(args, "--harness");
     let run_id = flag_value(args, "--run-id");
-    let attribution = powder_store::WorkLogAttribution {
-        model,
-        reasoning,
-        harness,
-        run_id,
-    };
     let entry = if let Some(db) = flag_value(args, "--db") {
         let mut store = open_store(db)?;
         keyed_json(
@@ -2497,7 +1754,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
                 .append_work_log_as_keyed(
                     &card_id,
                     agent,
-                    attribution,
+                    run_id,
                     body,
                     KeyedOperationContext::new(now, &idempotency_key(args)?, &authority(args)),
                 )
@@ -2507,14 +1764,7 @@ fn append_work_log(args: &[String], remote_env: &RemoteEnv) -> Result<String, Sh
         client
             .post_with_key(
                 &format!("/api/v1/cards/{card_id}/work-log"),
-                json!({
-                    "agent": agent,
-                    "body": body,
-                    "model": model,
-                    "reasoning": reasoning,
-                    "harness": harness,
-                    "run_id": run_id,
-                }),
+                json!({"agent": agent, "body": body, "run_id": run_id}),
                 &idempotency_key(args)?,
             )
             .map_err(remote_err)?
@@ -2614,101 +1864,23 @@ fn complete_card(args: &[String], remote_env: &RemoteEnv) -> Result<String, Shel
     ))
 }
 
-fn subscription_create(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let url = required_flag(args, "--url")?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let created = store
-        .create_event_subscription_with_authority(
-            url,
-            event_filter_flag(args)?,
-            now,
-            &admin_authority(args),
-        )
-        .map_err(store_err)?;
-    if has_flag(args, "--show-secret") {
-        Ok(format!(
-            "subscription\t{}\t{}\t{}\n",
-            created.subscription.id, created.subscription.url, created.signing_secret
-        ))
-    } else {
-        Ok(format!(
-            "subscription\t{}\t{}\tredacted\n",
-            created.subscription.id, created.subscription.url
-        ))
-    }
-}
-
-fn subscription_list(args: &[String]) -> Result<String, ShellError> {
-    let store = open_store(required_flag(args, "--db")?)?;
-    to_pretty_json(&serde_json::json!({
-        "subscriptions": store.list_event_subscriptions().map_err(store_err)?
-    }))
-}
-
-fn subscription_disable(args: &[String]) -> Result<String, ShellError> {
-    let now = unix_now();
-    let subscription_id = positional(args)
-        .first()
-        .copied()
-        .ok_or_else(|| ShellError::Invalid("subscription-disable requires an id".to_string()))?;
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let subscription = store
-        .disable_event_subscription_with_authority(subscription_id, now, &admin_authority(args))
-        .map_err(store_err)?;
-    Ok(format!(
-        "disabled\t{}\t{}\n",
-        subscription.id,
-        subscription
-            .disabled_at
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "active".to_string())
-    ))
-}
-
-fn dead_letter_list(args: &[String]) -> Result<String, ShellError> {
-    let store = open_store(required_flag(args, "--db")?)?;
-    to_pretty_json(&serde_json::json!({
-        "dead_letters": store
-            .list_dead_letter_deliveries(parse_limit(args).unwrap_or(20))
-            .map_err(store_err)?
-    }))
-}
-
-/// Requeues dead-lettered webhook deliveries so the delivery loop retries
-/// them on its next tick -- see `Store::replay_dead_letters` for why this
-/// exists (the extended 1s/4s/16s/64s/256s backoff still gives up after
-/// ~5.7 minutes). `--db`-only, matching `dead-letter-list` and every other
-/// event-subscription/dead-letter command's transport support -- no remote
-/// mode yet.
-fn dead_letter_replay(args: &[String]) -> Result<String, ShellError> {
-    let mut store = open_store(required_flag(args, "--db")?)?;
-    let subscription_id = flag_value(args, "--subscription");
-    let idempotency_key = required_flag(args, "--idempotency-key")?;
-    let replayed = store
-        .replay_dead_letters_with_authority_keyed(
-            subscription_id,
-            unix_now(),
-            idempotency_key,
-            &admin_authority(args),
-        )
-        .map_err(store_err)?;
-    to_pretty_json(&serde_json::json!({
-        "replayed": replayed.value,
-        "replayed_delivery": replayed.replayed,
-    }))
-}
-
-fn event_tail(args: &[String]) -> Result<String, ShellError> {
-    let store = open_store(required_flag(args, "--db")?)?;
+fn event_tail(args: &[String], remote_env: &RemoteEnv) -> Result<String, ShellError> {
     let after = flag_value(args, "--after")
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
-    to_pretty_json(&serde_json::json!({
-        "events": store
-            .list_event_tail(after, parse_limit(args).unwrap_or(20))
-            .map_err(store_err)?
-    }))
+    let limit = parse_limit(args).unwrap_or(20);
+    if let Some(db) = flag_value(args, "--db") {
+        let store = open_store(db)?;
+        return to_pretty_json(&serde_json::json!({
+            "events": store.list_event_tail(after, limit).map_err(store_err)?
+        }));
+    }
+    if let Some(client) = remote_env.client() {
+        return client
+            .get_text(&format!("/api/v1/events/tail?after={after}&limit={limit}"))
+            .map_err(remote_err);
+    }
+    Err(missing_transport("event-tail"))
 }
 
 fn idempotency_key(args: &[String]) -> Result<String, ShellError> {
@@ -2756,6 +1928,17 @@ fn idempotency_key(args: &[String]) -> Result<String, ShellError> {
         ));
     }
     Ok(first.to_string())
+}
+fn required_idempotency_key(args: &[String]) -> Result<String, ShellError> {
+    if !args
+        .iter()
+        .any(|arg| arg == "--idempotency-key" || arg.starts_with("--idempotency-key="))
+    {
+        return Err(ShellError::Invalid(
+            "key-revoke requires --idempotency-key".to_string(),
+        ));
+    }
+    idempotency_key(args)
 }
 
 fn keyed_json<T: serde::Serialize>(
@@ -2842,34 +2025,12 @@ fn parse_priority_flag(raw: &str) -> Result<Priority, ShellError> {
     parse_priority(raw).map_err(|error| cli_field_error(error, "priority"))
 }
 
-fn parse_estimate_flag(raw: &str) -> Result<Estimate, ShellError> {
-    parse_estimate(raw).map_err(|error| cli_field_error(error, "estimate"))
-}
-
-fn parse_risk_flag(raw: &str) -> Result<Risk, ShellError> {
-    parse_risk(raw).map_err(|error| cli_field_error(error, "risk"))
-}
-
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-fn aliases_flag(args: &[String]) -> Option<Vec<String>> {
-    flag_value(args, "--aliases").map(split_csv)
-}
-
-fn event_filter_flag(args: &[String]) -> Result<Vec<String>, ShellError> {
-    Ok(flag_value(args, "--event-filter")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect())
 }
 
 fn criterion_proofs_flag(
@@ -2935,20 +2096,6 @@ fn reject_admin_flag(args: &[String]) -> Result<(), ShellError> {
         ));
     }
     Ok(())
-}
-
-fn reject_principal_flag(args: &[String]) -> Result<(), ShellError> {
-    if args
-        .iter()
-        .any(|arg| arg == "--principal" || arg.starts_with("--principal="))
-    {
-        Err(ShellError::Invalid(
-            "--principal is not accepted; authenticated principal comes from the remote credential"
-                .to_string(),
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 fn card_id_values(ids: &[CardId]) -> Vec<String> {
@@ -3102,26 +2249,14 @@ fn flag_takes_value(flag: &str) -> bool {
     !matches!(
         flag,
         "--clear"
-            | "--dry-run"
+            | "--clear-repo"
             | "--show-secret"
             | "--redacted"
-            | "--include-hidden"
             | "--unchecked"
             | "--repair"
             | "--json"
     )
 }
-
-fn body_from_positionals(args: &[String]) -> Result<String, ShellError> {
-    let words = positional_preserving_leading_hyphen(args, known_flags("papercut"));
-    if words.is_empty() {
-        return Err(ShellError::Invalid(
-            "papercut requires a body; pass it as the first argument".to_string(),
-        ));
-    }
-    Ok(words.join(" "))
-}
-
 fn store_err(err: StoreError) -> ShellError {
     match err {
         StoreError::Domain(domain_err) => ShellError::from(domain_err),
@@ -3153,18 +2288,9 @@ mod tests {
         assert!(COMMANDS.contains(&"key-revoke"));
         assert!(!COMMANDS.contains(&"import"));
         assert!(!COMMANDS.contains(&"import-repo"));
-        assert!(COMMANDS.contains(&"import-github-issues"));
         assert!(COMMANDS.contains(&"update-card"));
         assert!(COMMANDS.contains(&"list-ready"));
         assert!(COMMANDS.contains(&"list-cards"));
-        assert!(COMMANDS.contains(&"board-rollups"));
-        assert!(COMMANDS.contains(&"board-stats"));
-        assert!(COMMANDS.contains(&"repository-list"));
-        assert!(COMMANDS.contains(&"repository-get"));
-        assert!(COMMANDS.contains(&"repository-upsert"));
-        assert!(COMMANDS.contains(&"repository-merge-alias"));
-        assert!(COMMANDS.contains(&"repository-delete"));
-        assert!(COMMANDS.contains(&"repository-normalize"));
         assert!(COMMANDS.contains(&"update-relations"));
         assert!(COMMANDS.contains(&"relations-doctor"));
         assert!(COMMANDS.contains(&"claim"));
@@ -3174,28 +2300,42 @@ mod tests {
         assert!(COMMANDS.contains(&"heartbeat"));
         assert!(COMMANDS.contains(&"get-card"));
         assert!(COMMANDS.contains(&"get-run"));
-        assert!(COMMANDS.contains(&"list-approvals"));
         assert!(COMMANDS.contains(&"list-awaiting-input"));
         assert!(COMMANDS.contains(&"answer-input"));
         assert!(COMMANDS.contains(&"add-comment"));
         assert!(COMMANDS.contains(&"append-work-log"));
-        assert!(COMMANDS.contains(&"repair-criteria"));
         assert!(COMMANDS.contains(&"check-criterion"));
         assert!(COMMANDS.contains(&"request-input"));
         assert!(COMMANDS.contains(&"complete-card"));
 
-        for retired in ["import", "import-repo"] {
+        for retired in [
+            "import",
+            "import-repo",
+            "import-github-issues",
+            "repair-criteria",
+            "papercut",
+            "list-approvals",
+        ] {
             let err = run(&[retired.to_string()]).unwrap_err();
             assert!(
                 matches!(err, ShellError::Invalid(message) if message == format!("unknown command: {retired}"))
             );
         }
-        assert!(COMMANDS.contains(&"subscription-create"));
-        assert!(COMMANDS.contains(&"subscription-list"));
-        assert!(COMMANDS.contains(&"subscription-disable"));
-        assert!(COMMANDS.contains(&"dead-letter-list"));
-        assert!(COMMANDS.contains(&"dead-letter-replay"));
         assert!(COMMANDS.contains(&"event-tail"));
+        assert!(COMMANDS.contains(&"help"));
+    }
+
+    #[test]
+    fn help_command_alias_describes_commands() {
+        let output = run_with_env(&args(["help", "event-tail"]), &remote_env(None, None)).unwrap();
+        assert!(output.contains("usage: powder event-tail"), "{output}");
+        let list_cards =
+            run_with_env(&args(["help", "list-cards"]), &remote_env(None, None)).unwrap();
+        assert!(list_cards.contains("--updated-after"), "{list_cards}");
+        assert!(list_cards.contains("--updated-before"), "{list_cards}");
+        assert!(run_with_env(&args(["help"]), &remote_env(None, None))
+            .unwrap()
+            .contains("  help\n"));
     }
 
     #[test]
@@ -3300,36 +2440,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_unconsumed_subscription_disable_flags() {
-        let error = run_with_env(
-            &args([
-                "subscription-disable",
-                "subscription-1",
-                "--db",
-                "/tmp/not-opened.db",
-                "--idempotency-key",
-                "replay-1",
-            ]),
-            &remote_env(None, None),
-        )
-        .expect_err("unsupported flags must fail before opening the database");
-
-        assert!(matches!(
-            error,
-            ShellError::Invalid(message)
-                if message == "unknown flag --idempotency-key for subscription-disable"
-        ));
-    }
-
-    #[test]
     fn cli_preserves_hyphenated_positionals_and_supports_end_of_options() {
-        let hyphenated_body = args(["--retry the failed request"]);
-        assert_eq!(
-            positional_preserving_leading_hyphen(&hyphenated_body, known_flags("papercut")),
-            vec!["--retry the failed request"]
-        );
-        validate_flags("papercut", &hyphenated_body).unwrap();
-
         let hyphenated_query = args(["--retry the failed search"]);
         assert_eq!(
             positional_preserving_leading_hyphen(&hyphenated_query, known_flags("search")),
@@ -3343,10 +2454,21 @@ mod tests {
     }
 
     #[test]
+    fn update_card_clear_repo_accepts_flag_before_or_after_card_id() {
+        for arguments in [
+            args(["update-card", "--clear-repo", "card-id"]),
+            args(["update-card", "card-id", "--clear-repo"]),
+        ] {
+            let (command, arguments) = arguments.split_first().unwrap();
+            validate_flags(command, arguments).unwrap();
+            let card_id = positional_card_id(arguments, command).unwrap();
+            assert_eq!(card_id.as_str(), "card-id");
+        }
+    }
+
+    #[test]
     fn cli_help_examples_only_advertise_current_statuses() {
         let help = help();
-        assert!(help.contains("--updated-after"));
-        assert!(help.contains("--updated-before"));
         let status_values = help
             .lines()
             .filter_map(|line| {
@@ -3635,8 +2757,6 @@ mod tests {
                 "--json",
                 "--q",
                 "needle",
-                "--source",
-                "cards",
                 "--status",
                 "backlog",
                 "--created-after",
@@ -3653,12 +2773,17 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].path.contains("/api/v1/cards/search?"));
         assert!(requests[0].path.contains("q=needle"));
-        assert!(requests[0].path.contains("source_kind=cards"));
         assert!(requests[0].path.contains("created_after=10"));
         assert_eq!(
             requests[0].authorization.as_deref(),
             Some("Bearer sk_powder_search")
         );
+    }
+
+    #[test]
+    fn cli_rejects_retired_search_source_filter() {
+        let error = run(&args(["search", "--q", "needle", "--source", "cards"])).unwrap_err();
+        assert!(error.to_string().contains("unknown flag --source"));
     }
 
     #[test]
@@ -3777,75 +2902,6 @@ mod tests {
         .unwrap();
 
         assert!(completed.contains("completed\tcli-test\tdone"));
-    }
-
-    #[test]
-    fn cli_estimate_round_trips_through_create_update_and_list_filters() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-estimate-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        let created = run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "sized-cli",
-            "--title",
-            "Sized CLI card",
-            "--acceptance",
-            "proof exists",
-            "--status",
-            "ready",
-            "--estimate",
-            "S",
-        ]))
-        .unwrap();
-        assert!(created.contains("created\tsized-cli"));
-
-        let card = run(&args(["get-card", "sized-cli", "--db", &db])).unwrap();
-        assert!(card.contains("\"estimate\": \"s\""));
-
-        let filtered_out = run(&args(["list-cards", "--db", &db, "--estimate", "L"])).unwrap();
-        assert!(!filtered_out.contains("sized-cli"));
-
-        let filtered_in = run(&args(["list-cards", "--db", &db, "--estimate", "S"])).unwrap();
-        assert!(filtered_in.contains("sized-cli"));
-
-        let ready_filtered = run(&args(["list-ready", "--db", &db, "--estimate", "S"])).unwrap();
-        assert!(ready_filtered.contains("sized-cli"));
-
-        run(&args([
-            "update-card",
-            "sized-cli",
-            "--db",
-            &db,
-            "--estimate",
-            "XL",
-        ]))
-        .unwrap();
-        let card = run(&args(["get-card", "sized-cli", "--db", &db])).unwrap();
-        assert!(card.contains("\"estimate\": \"xl\""));
-
-        let err = run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "bad-estimate",
-            "--title",
-            "t",
-            "--estimate",
-            "huge",
-        ]))
-        .unwrap_err();
-        assert!(err.to_string().contains("invalid --estimate"));
     }
 
     #[test]
@@ -4064,9 +3120,10 @@ mod tests {
     }
 
     #[test]
-    fn cli_list_cards_filters_by_updated_at_on_the_fetched_page() {
+    fn cli_list_cards_filters_by_updated_at_with_ordered_unix_bounds() {
         let db = std::env::temp_dir().join(format!(
-            "powder-cli-list-cards-updated-{}.db",
+            "powder-cli-list-cards-updated-{}-{}.db",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -4075,27 +3132,13 @@ mod tests {
         let db = db.to_string_lossy().to_string();
 
         run(&args(["init-db", "--db", &db])).unwrap();
-        for (id, title) in [("stale-1", "Stale ticket"), ("fresh-1", "Fresh ticket")] {
-            run(&args([
-                "create-card",
-                "--db",
-                &db,
-                "--id",
-                id,
-                "--title",
-                title,
-                "--status",
-                "backlog",
-            ]))
-            .unwrap();
-        }
         let mut store = open_store(&db).unwrap();
         for (id, updated_at) in [("stale-1", 100), ("fresh-1", 200)] {
-            let card_id = CardId::new(id).unwrap();
-            let mut card = store.get_card(&card_id).unwrap().unwrap();
+            let mut card = Card::new(CardId::new(id).unwrap(), id, "").unwrap();
+            card.created_at = updated_at;
             card.updated_at = updated_at;
             store
-                .upsert_card_with_events(card, "test", updated_at)
+                .create_card_with_events(card, "test", updated_at)
                 .unwrap();
         }
 
@@ -4104,15 +3147,28 @@ mod tests {
             "--db",
             &db,
             "--updated-before",
-            "150",
+            "100",
         ]))
         .unwrap();
         assert!(stale.contains("stale-1"));
         assert!(!stale.contains("fresh-1"));
 
-        let fresh = run(&args(["list-cards", "--db", &db, "--updated-after", "150"])).unwrap();
-        assert!(fresh.contains("fresh-1"));
+        let fresh = run(&args(["list-cards", "--db", &db, "--updated-after", "200"])).unwrap();
         assert!(!fresh.contains("stale-1"));
+        assert!(fresh.contains("fresh-1"));
+
+        let bounded = run(&args([
+            "list-cards",
+            "--db",
+            &db,
+            "--updated-after",
+            "100",
+            "--updated-before",
+            "200",
+        ]))
+        .unwrap();
+        assert!(bounded.contains("stale-1"));
+        assert!(bounded.contains("fresh-1"));
 
         let invalid = run(&args([
             "list-cards",
@@ -4126,227 +3182,22 @@ mod tests {
             invalid,
             ShellError::Invalid(message) if message.starts_with("invalid --updated-before:")
         ));
-    }
 
-    #[test]
-    fn cli_papercut_files_a_backlog_card_and_label_filter_sweeps_it() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-papercut-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+        let reversed = run(&args([
+            "list-cards",
+            "--db",
+            &db,
+            "--updated-after",
+            "201",
+            "--updated-before",
+            "200",
+        ]))
+        .unwrap_err();
+        assert!(matches!(
+            reversed,
+            ShellError::Invalid(message)
+                if message == "--updated-after must be less than or equal to --updated-before"
         ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        let ack = run(&args([
-            "papercut",
-            "too many tokens just to report a typo",
-            "--db",
-            &db,
-            "--agent",
-            "codex",
-            "--service",
-            "canary",
-        ]))
-        .unwrap();
-        assert!(ack.starts_with("papercut\t"));
-        assert!(ack.contains("backlog"));
-
-        let all = run(&args(["list-cards", "--db", &db])).unwrap();
-        assert!(all.contains("papercut-"));
-
-        let filtered = run(&args(["list-cards", "--db", &db, "--label", "papercut"])).unwrap();
-        assert!(filtered.contains("too many tokens"));
-        assert!(filtered.contains("backlog"));
-
-        let none = run(&args(["list-cards", "--db", &db, "--label", "nonexistent"])).unwrap();
-        assert!(none.contains("no-cards"));
-    }
-
-    #[test]
-    fn cli_repository_settings_merge_alias_and_audit_rehomed_card() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-repositories-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        let repository = run(&args([
-            "repository-upsert",
-            "--db",
-            &db,
-            "--name",
-            "misty-step/canary",
-            "--aliases",
-            "canary-app,misty-step/canary",
-            "--visibility",
-            "visible",
-            "--import-provenance",
-            "manual",
-        ]))
-        .unwrap();
-        assert!(repository.contains("\"name\": \"canary\""));
-        assert!(repository.contains("canary-app"));
-
-        // Repository rows are explicit-only (powder-repo-registry-tightness):
-        // register "legacy-canary" itself before filing a card under it, so
-        // the merge-alias step below has a real (if soon-to-be-merged) row
-        // to rehome rather than an implicitly auto-created one.
-        run(&args([
-            "repository-upsert",
-            "--db",
-            &db,
-            "--name",
-            "legacy-canary",
-        ]))
-        .unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "legacy-canary",
-            "--title",
-            "Legacy canary",
-            "--acceptance",
-            "proof exists",
-            "--repo",
-            "legacy-canary",
-        ]))
-        .unwrap();
-
-        let merged = run(&args([
-            "repository-merge-alias",
-            "--db",
-            &db,
-            "--alias",
-            "legacy-canary",
-            "--into",
-            "canary",
-            "--actor",
-            "operator",
-        ]))
-        .unwrap();
-        assert!(merged.contains("\"rehomed_cards\": 1"));
-
-        let card = run(&args(["get-card", "legacy-canary", "--db", &db])).unwrap();
-        assert!(card.contains("\"repo\": \"canary\""));
-        assert!(card.contains("\"event_type\": \"repository\""));
-        assert!(card.contains("legacy-canary -> canary"));
-    }
-
-    /// powder-904: `repository-normalize` is admin-ish/local-db-only, wired
-    /// straight to `Store::normalize_repository_strings`. Every write path
-    /// already canonicalizes `cards.repo` at write time (see
-    /// `powder-store::tests::create_card_with_events_normalizes_alias_repo_string_at_write_time`),
-    /// so there is no way to produce a non-canonical row through this CLI's
-    /// own public commands to normalize away -- the sweep's actual
-    /// rewrite-and-audit behavior against a legacy (pre-normalization) row
-    /// is covered at the store level
-    /// (`normalize_repository_strings_sweeps_legacy_rows_and_audits_each_change`).
-    /// This test instead locks in the CLI plumbing: the subcommand is
-    /// registered, accepts `--db`/`--actor`, and returns the sweep's JSON
-    /// shape for an already-canonical board (a real no-op run, not a stub).
-    #[test]
-    fn cli_repository_normalize_sweeps_an_already_canonical_board_as_a_no_op() {
-        assert!(COMMANDS.contains(&"repository-normalize"));
-
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-repository-normalize-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "already-canonical",
-            "--title",
-            "Already canonical",
-            "--acceptance",
-            "proof exists",
-            "--repo",
-            "misty-step/canary",
-        ]))
-        .unwrap();
-
-        let output = run(&args([
-            "repository-normalize",
-            "--db",
-            &db,
-            "--actor",
-            "operator",
-        ]))
-        .unwrap();
-        assert!(output.contains("\"scanned\": 1"), "output was: {output}");
-        assert!(output.contains("\"changes\": []"), "output was: {output}");
-    }
-
-    /// powder-repo-registry-tightness: every card-write path this CLI
-    /// exposes is explicit-only now, so a board built purely through the
-    /// CLI's own public commands can never grow a "suspicious"
-    /// auto-created repository row for `repository-doctor` to flag -- that
-    /// is precisely the outcome this card delivers. This test locks in the
-    /// CLI plumbing (subcommand registered, accepts `--db`, returns the
-    /// report's JSON shape) and the zero-suspicious-rows guarantee for a
-    /// board with one explicitly registered repo; the actual detection of a
-    /// legacy flagged row is covered at the store level
-    /// (`repository_doctor_lists_legacy_auto_created_rows_without_mutating_them`),
-    /// since producing one requires reaching past every live write path.
-    #[test]
-    fn cli_repository_doctor_reports_no_suspicious_rows_for_an_explicitly_registered_board() {
-        assert!(COMMANDS.contains(&"repository-doctor"));
-
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-repository-doctor-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "repository-upsert",
-            "--db",
-            &db,
-            "--name",
-            "explicit-doctor-repo",
-        ]))
-        .unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "doctor-covered",
-            "--title",
-            "Doctor covered",
-            "--acceptance",
-            "proof exists",
-            "--repo",
-            "explicit-doctor-repo",
-        ]))
-        .unwrap();
-
-        let output = run(&args(["repository-doctor", "--db", &db])).unwrap();
-        assert!(
-            output.contains("\"suspicious\": []"),
-            "output was: {output}"
-        );
     }
 
     /// powder-dogfood-2026-07-14-nonreciprocal-relations: `update-relations`
@@ -4475,52 +3326,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_append_work_log_appears_in_get_card() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-work-log-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "worklogged",
-            "--title",
-            "Has a work log",
-        ]))
-        .unwrap();
-
-        let output = run(&args([
-            "append-work-log",
-            "worklogged",
-            "--db",
-            &db,
-            "--agent",
-            "codex",
-            "--body",
-            "tracing the claim expiry bug",
-            "--model",
-            "claude-sonnet-5",
-        ]))
-        .unwrap();
-        assert!(output.contains("worklogged"));
-        assert!(output.contains("codex"));
-        assert!(output.contains("tracing the claim expiry bug"));
-
-        let card = run(&args(["get-card", "worklogged", "--db", &db])).unwrap();
-        assert!(card.contains("\"agent\": \"codex\""));
-        assert!(card.contains("\"model\": \"claude-sonnet-5\""));
-        assert!(card.contains("\"body\": \"tracing the claim expiry bug\""));
-    }
-
-    #[test]
     fn cli_rejects_removed_admin_flag_before_mutation() {
         let err = run(&args([
             "update-status",
@@ -4583,12 +3388,12 @@ mod tests {
             ]),
         ] {
             let error = run_with_env(&command, &env).expect_err("principal flag rejected");
-            assert!(error.to_string().contains("--principal is not accepted"));
+            assert!(error.to_string().contains("unknown flag --principal"));
         }
     }
 
     #[test]
-    fn cli_manages_event_subscriptions_and_tails_events() {
+    fn cli_tails_events() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-events-{}.db",
             std::time::SystemTime::now()
@@ -4599,28 +3404,6 @@ mod tests {
         let db = db.to_string_lossy().to_string();
 
         run(&args(["init-db", "--db", &db])).unwrap();
-        let created = run(&args([
-            "subscription-create",
-            "--db",
-            &db,
-            "--url",
-            "http://127.0.0.1:9000/webhook",
-            "--event-filter",
-            "moved-to-ready,completed",
-            "--show-secret",
-        ]))
-        .unwrap();
-        let parts = created.trim().split('\t').collect::<Vec<_>>();
-        assert_eq!(parts[0], "subscription");
-        assert!(parts[3].starts_with("whsec_powder_"));
-
-        let listed = run(&args(["subscription-list", "--db", &db])).unwrap();
-        assert!(listed.contains("moved-to-ready"));
-        assert!(
-            !listed.contains(parts[3]),
-            "subscription-list must not disclose signing secrets"
-        );
-
         run(&args([
             "create-card",
             "--db",
@@ -4647,214 +3430,62 @@ mod tests {
         let events = run(&args(["event-tail", "--db", &db])).unwrap();
         assert!(events.contains("\"event_type\": \"card-created\""));
         assert!(events.contains("\"event_type\": \"moved-to-ready\""));
-
-        let disabled = run(&args(["subscription-disable", parts[1], "--db", &db])).unwrap();
-        assert!(disabled.contains(parts[1]));
     }
 
-    /// `dead-letter-replay` requeues everything (or one subscription's
-    /// backlog) so the next delivery-loop tick retries it -- exercised here
-    /// by driving deliveries straight to `dead_letter` via the store
-    /// directly (the CLI has no delivery loop of its own to wait out the
-    /// real backoff schedule) and then proving the CLI command clears them.
     #[test]
-    fn cli_dead_letter_replay_requeues_deliveries_and_reports_the_count() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-dead-letter-replay-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "subscription-create",
-            "--db",
-            &db,
-            "--url",
-            "http://127.0.0.1:9/unreachable",
-            "--event-filter",
-            "completed",
-        ]))
-        .unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "dlq-replay-cli",
-            "--title",
-            "DLQ replay via CLI",
-            "--acceptance",
-            "proof exists",
-            "--status",
-            "ready",
-        ]))
-        .unwrap();
-        run(&args([
-            "complete-card",
-            "dlq-replay-cli",
-            "--db",
-            &db,
-            "--proof",
-            "cli dead-letter-replay coverage",
-        ]))
-        .unwrap();
-
-        {
-            let mut store = Store::open(&db).unwrap();
-            let mut now = unix_now();
-            for _ in 0..6 {
-                for due in store.due_webhook_deliveries(now, 10).unwrap() {
-                    store
-                        .record_webhook_delivery_failure(&due.id, Some(500), "unreachable", now)
-                        .unwrap();
+    fn cli_remote_event_tail_returns_finite_sse_with_auth_and_cursor() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE test server");
+        let address = listener.local_addr().expect("SSE test server address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let body = "id: 4\nevent: card-created\ndata: {\"id\":\"remote-tail\"}\n\n";
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept SSE request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone SSE stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read SSE request line");
+            let mut authorization = None;
+            loop {
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read SSE request header");
+                if line == "\r\n" || line.is_empty() {
+                    break;
                 }
-                now += 300;
+                if let Some(value) = line.strip_prefix("Authorization:") {
+                    authorization = Some(value.trim().to_string());
+                }
             }
-            assert_eq!(store.list_dead_letter_deliveries(10).unwrap().len(), 1);
-        }
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .expect("SSE request path")
+                .to_string();
+            request_tx
+                .send((path, authorization))
+                .expect("record SSE request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write SSE response");
+        });
 
-        let listed = run(&args(["dead-letter-list", "--db", &db])).unwrap();
-        assert!(listed.contains("\"event_type\": \"completed\""));
-
-        let replayed = run(&args([
-            "dead-letter-replay",
-            "--db",
-            &db,
-            "--idempotency-key",
-            "replay-001",
-        ]))
-        .unwrap();
-        assert!(replayed.contains("\"replayed\": 1"));
-
-        let listed_after = run(&args(["dead-letter-list", "--db", &db])).unwrap();
-        assert!(listed_after.contains("\"dead_letters\": []"));
-
-        // A second replay with nothing left dead-lettered is a legitimate
-        // no-op, not an error.
-        let replayed_again = run(&args([
-            "dead-letter-replay",
-            "--db",
-            &db,
-            "--idempotency-key",
-            "replay-002",
-        ]))
-        .unwrap();
-        assert!(replayed_again.contains("\"replayed\": 0"));
-    }
-
-    #[test]
-    fn cli_import_github_issues_maps_open_and_closed_issues_and_survives_reimport() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let db = std::env::temp_dir().join(format!("powder-cli-gh-issues-{nanos}.db"));
-        let db = db.to_string_lossy().to_string();
-        let issues_file = std::env::temp_dir().join(format!("powder-cli-gh-issues-{nanos}.json"));
-        std::fs::write(
-            &issues_file,
-            r#"[
-              {"number": 1, "title": "Open issue", "body": "needs work", "labels": [{"name": "bug"}], "state": "OPEN", "url": "https://github.com/misty-step/example/issues/1"},
-              {"number": 2, "title": "Closed issue", "body": "done", "labels": [], "state": "CLOSED", "url": "https://github.com/misty-step/example/issues/2"}
-            ]"#,
+        let output = run_with_env(
+            &args(["event-tail", "--after", "3", "--limit", "7"]),
+            &remote_env(Some(&format!("http://{address}")), Some("sk_powder_tail")),
         )
         .unwrap();
-        let issues_file = issues_file.to_string_lossy().to_string();
+        server.join().expect("SSE server must finish");
 
-        run(&args(["init-db", "--db", &db])).unwrap();
-        // Repository rows are explicit-only (powder-repo-registry-tightness):
-        // register "example" before filing any card under it.
-        run(&args([
-            "repository-upsert",
-            "--db",
-            &db,
-            "--name",
-            "example",
-            "--tier",
-            "active",
-        ]))
-        .unwrap();
-        let imported = run(&args([
-            "import-github-issues",
-            &issues_file,
-            "--repo",
-            "misty-step/example",
-            "--db",
-            &db,
-        ]))
-        .unwrap();
-        assert!(imported.contains("imported\ttotal=2\tcreated=2"));
-
-        let open_card = run(&args(["get-card", "example-1", "--db", &db])).unwrap();
-        let open_card: Value = serde_json::from_str(&open_card).unwrap();
-        assert_eq!(open_card["card"]["status"], "backlog");
-        assert!(
-            open_card["card"].get("acceptance").is_none(),
-            "no fabricated acceptance"
-        );
-        let closed_card = run(&args(["get-card", "example-2", "--db", &db])).unwrap();
-        assert!(closed_card.contains("\"status\": \"done\""));
-
-        // status alone doesn't make it claimable: moving Backlog -> Ready is
-        // a legal transition, but with no real acceptance criteria the card
-        // still never shows up as ready ("ready is a query, not vibes").
-        run(&args([
-            "update-status",
-            "example-1",
-            "--db",
-            &db,
-            "--status",
-            "ready",
-        ]))
-        .unwrap();
-        let ready = run(&args(["list-ready", "--db", &db])).unwrap();
-        assert!(
-            !ready.contains("example-1"),
-            "no acceptance criteria means never claimable, regardless of status: {ready}"
-        );
-
-        // reimport-safety carries through the GitHub path too: the closed
-        // issue is a terminal (Done) card, so its *status* is protected from
-        // a stale reimport the same way a claim is -- even if the issue is
-        // reopened on GitHub afterward (content like title/body still
-        // refreshes on reimport, same as source file; only status/claim are
-        // frozen, per Card::merge_reimport -- reopening can't silently
-        // revert a card Powder already recorded as done).
-        std::fs::write(
-            &issues_file,
-            r#"[
-              {"number": 1, "title": "Open issue", "body": "needs work", "labels": [{"name": "bug"}], "state": "OPEN", "url": "https://github.com/misty-step/example/issues/1"},
-              {"number": 2, "title": "Reopened issue", "body": "done", "labels": [], "state": "OPEN", "url": "https://github.com/misty-step/example/issues/2"}
-            ]"#,
-        )
-        .unwrap();
-        let reimport = run(&args([
-            "import-github-issues",
-            &issues_file,
-            "--repo",
-            "misty-step/example",
-            "--db",
-            &db,
-        ]))
-        .unwrap();
-        assert!(
-            reimport.contains("preserved=1"),
-            "the terminal (closed) issue must be reported preserved: {reimport}"
-        );
-
-        let closed_card_after = run(&args(["get-card", "example-2", "--db", &db])).unwrap();
-        assert!(
-            closed_card_after.contains("\"status\": \"done\""),
-            "reopening on GitHub must not revert Powder's done status: {closed_card_after}"
-        );
-        assert!(
-            closed_card_after.contains("\"title\": \"Reopened issue\""),
-            "content still refreshes on reimport, same as source file: {closed_card_after}"
-        );
+        assert_eq!(output, body);
+        let (path, authorization) = request_rx.recv().expect("recorded request");
+        assert_eq!(path, "/api/v1/events/tail?after=3&limit=7");
+        assert_eq!(authorization.as_deref(), Some("Bearer sk_powder_tail"));
     }
 
     #[test]
@@ -4911,7 +3542,15 @@ mod tests {
             "key-list's key_prefix must be a real prefix of the raw key"
         );
 
-        let revoked = run(&args(["key-revoke", &key_id, "--db", &db])).unwrap();
+        let revoked = run(&args([
+            "key-revoke",
+            &key_id,
+            "--db",
+            &db,
+            "--idempotency-key",
+            "revoke-1",
+        ]))
+        .unwrap();
         assert_eq!(revoked, format!("revoked\t{key_id}\n"));
 
         let listed_after = run(&args(["key-list", "--db", &db])).unwrap();
@@ -4925,10 +3564,31 @@ mod tests {
             "revoked key must not report active: {revoked_line}"
         );
 
-        // idempotent: revoking again does not error.
-        run(&args(["key-revoke", &key_id, "--db", &db])).unwrap();
+        // Same-key retry replays the keyed receipt without error.
+        run(&args([
+            "key-revoke",
+            &key_id,
+            "--db",
+            &db,
+            "--idempotency-key",
+            "revoke-1",
+        ]))
+        .unwrap();
 
-        let missing = run(&args(["key-revoke", "key-does-not-exist", "--db", &db])).unwrap_err();
+        let missing_key = run(&args(["key-revoke", &key_id, "--db", &db])).unwrap_err();
+        assert!(missing_key
+            .to_string()
+            .contains("requires --idempotency-key"));
+
+        let missing = run(&args([
+            "key-revoke",
+            "key-does-not-exist",
+            "--db",
+            &db,
+            "--idempotency-key",
+            "revoke-missing",
+        ]))
+        .unwrap_err();
         assert!(matches!(missing, ShellError::NotFound(_)));
     }
 
@@ -5189,8 +3849,6 @@ mod tests {
             &db,
             "--agent",
             "codex",
-            "--actor",
-            "codex",
         ]))
         .unwrap();
 
@@ -5219,7 +3877,8 @@ mod tests {
         assert!(completed.contains("completed\tholder-test\tdone"));
         let card = run(&args(["get-card", "holder-test", "--db", &db])).unwrap();
         assert!(card.contains("\"actor\": \"local-cli\""));
-        assert!(card.contains("in_progress -> done"));
+        assert!(card.contains("\"previous\": \"in_progress\""));
+        assert!(card.contains("\"current\": \"done\""));
     }
 
     #[test]
@@ -5357,7 +4016,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_set_parent_links_and_get_card_shows_children_and_epic_state() {
+    fn cli_set_parent_links_and_get_card_shows_children() {
         let db = std::env::temp_dir().join(format!(
             "powder-cli-parent-{}.db",
             std::time::SystemTime::now()
@@ -5373,14 +4032,13 @@ mod tests {
             "--db",
             &db,
             "--id",
-            "epic-cli",
+            "parent-cli",
             "--title",
-            "Epic",
+            "Parent",
             "--acceptance",
             "children land",
         ]))
         .unwrap();
-        // Born decomposed via --parent.
         let born = run(&args([
             "create-card",
             "--db",
@@ -5392,7 +4050,7 @@ mod tests {
             "--acceptance",
             "proof",
             "--parent",
-            "epic-cli",
+            "parent-cli",
         ]))
         .unwrap();
         assert!(born.contains("created\tchild-cli-a"));
@@ -5415,16 +4073,15 @@ mod tests {
             "--db",
             &db,
             "--parent",
-            "epic-cli",
+            "parent-cli",
             "--actor",
             "operator",
         ]))
         .unwrap();
-        assert_eq!(linked, "parent\tchild-cli-b\tepic-cli\n");
+        assert_eq!(linked, "parent\tchild-cli-b\tparent-cli\n");
 
-        let card = run(&args(["get-card", "epic-cli", "--db", &db])).unwrap();
+        let card = run(&args(["get-card", "parent-cli", "--db", &db])).unwrap();
         assert!(card.contains("\"children_total\": 2"));
-        assert!(card.contains("\"epic_state\""));
         assert!(card.contains("\"child-cli-a\""));
 
         let cleared = run(&args(["set-parent", "child-cli-b", "--db", &db, "--clear"])).unwrap();
@@ -5436,7 +4093,7 @@ mod tests {
             "--db",
             &db,
             "--parent",
-            "epic-cli",
+            "parent-cli",
             "--clear",
         ]));
         assert!(both.is_err(), "exactly one of --parent/--clear");
@@ -5513,11 +4170,6 @@ mod tests {
         assert!(awaiting.contains("answer-test"));
         assert!(awaiting.contains("Approve?\\nwith\\ttab"));
 
-        let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
-        assert!(approvals.contains("\"approvals\""));
-        assert!(approvals.contains("\"card_id\": \"answer-test\""));
-        assert!(approvals.contains("https://example.test/packet"));
-
         let card = run(&args(["get-card", "answer-test", "--db", &db])).unwrap();
         assert!(card.contains("\"activities\""));
         assert!(card.contains("Approve?\\nwith\\ttab"));
@@ -5535,84 +4187,10 @@ mod tests {
         .unwrap();
         assert!(answered.contains("answered-input"));
 
-        let approvals = run(&args(["list-approvals", "--db", &db])).unwrap();
-        assert!(approvals.contains("\"approvals\": []"));
-
         let run_detail = run(&args(["get-run", &run_id, "--db", &db])).unwrap();
         assert!(run_detail.contains("\"state\": \"active\""));
         assert!(run_detail.contains("operator"));
         assert!(run_detail.contains("Approved"));
-    }
-
-    #[test]
-    fn cli_board_rollups_remote_forwards_cursor_and_returns_json() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({
-                "rollups": [{"kind":"unsorted","repo":null,"title":"Unsorted","status_counts":{"ready":1}}],
-                "total_count": 2,
-                "has_more": true,
-                "next_after": "u:repo-a",
-                "coverage": {"total_cards": 3,"accounted_cards": 3,"root_epics": 1,"unsorted_cards": 1,"parent_issue_count": 0,"complete": true}
-            }),
-        )]);
-        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
-        let output = run_with_env(
-            &args([
-                "board-rollups",
-                "--json",
-                "--limit",
-                "1",
-                "--after",
-                "e:epic",
-            ]),
-            &env,
-        )
-        .unwrap();
-        let payload: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(payload["total_count"], 2);
-        assert_eq!(payload["coverage"]["complete"], true);
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests[0].method, "GET");
-        assert_eq!(
-            requests[0].path,
-            "/api/v1/board/rollups?limit=1&include_hidden=false&after=e%3Aepic"
-        );
-        assert_eq!(
-            requests[0].authorization.as_deref(),
-            Some("Bearer sk_powder_test")
-        );
-    }
-
-    #[test]
-    fn cli_list_cards_remote_filters_updated_at_on_the_fetched_page() {
-        let (base_url, recorded) = spawn_test_server(vec![(
-            200,
-            json!({
-                "cards": [
-                    {"id": "stale-remote", "priority": "p1", "status": "backlog", "title": "Stale remote", "updated_at": 100},
-                    {"id": "fresh-remote", "priority": "p2", "status": "backlog", "title": "Fresh remote", "updated_at": 200}
-                ],
-                "total_count": 2,
-                "has_more": false
-            }),
-        )]);
-        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
-        let output = run_with_env(
-            &args(["list-cards", "--limit", "2", "--updated-before", "150"]),
-            &env,
-        )
-        .unwrap();
-        assert!(output.contains("stale-remote"));
-        assert!(!output.contains("fresh-remote"));
-
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests[0].method, "GET");
-        assert_eq!(requests[0].path, "/api/v1/cards?limit=2");
-        assert_eq!(
-            requests[0].authorization.as_deref(),
-            Some("Bearer sk_powder_test")
-        );
     }
 
     #[test]
@@ -5677,6 +4255,36 @@ mod tests {
         let second = idempotency_key(&generated).unwrap();
         assert_ne!(first, second);
         assert!(first.starts_with("powder-cli-"));
+    }
+
+    #[test]
+    fn cli_list_cards_remote_filters_by_updated_at_on_fetched_page() {
+        let (base_url, recorded) = spawn_test_server(vec![(
+            200,
+            json!({
+                "cards": [
+                    {"id": "stale-remote", "priority": "p1", "status": "backlog", "title": "Stale remote", "updated_at": 100},
+                    {"id": "fresh-remote", "priority": "p2", "status": "backlog", "title": "Fresh remote", "updated_at": 200}
+                ],
+                "total_count": 2,
+                "has_more": false
+            }),
+        )]);
+        let env = remote_env(Some(&base_url), Some("sk_powder_test"));
+        let output = run_with_env(
+            &args(["list-cards", "--limit", "2", "--updated-before", "100"]),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(output, "stale-remote\tP1\tbacklog\tStale remote\n");
+
+        let requests = recorded.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/v1/cards?limit=2");
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer sk_powder_test")
+        );
     }
 
     #[test]
@@ -6184,210 +4792,6 @@ mod tests {
             recorded.lock().unwrap().is_empty(),
             "--db must use SQLite and must not contact POWDER_API_BASE_URL"
         );
-    }
-
-    #[test]
-    fn cli_repair_criteria_dry_run_reports_diffs_and_apply_preserves_lifecycle() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-repair-criteria-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-        let fixtures = std::env::temp_dir().join(format!(
-            "powder-cli-repair-criteria-fixtures-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&fixtures).unwrap();
-        let fixture = fixtures.join("026.md");
-        std::fs::write(
-            &fixture,
-            "# sploot-026: wrapped thumbnail route criterion\n\n\
-Priority: P1 | Status: ready\n\n\
-## Goal\n\
-Serve grid thumbnails instead of full originals.\n\n\
-## Oracle\n\
-- [ ] The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar (`similar/route.ts`) read paths return\n    `thumbnailUrl`, so grid tiles source the 256px thumbnail (with the existing thumbnail→blob error fallback intact).\n",
-        )
-        .unwrap();
-        let fixtures = fixtures.to_string_lossy().to_string();
-
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "sploot-026",
-            "--title",
-            "Thumbnail routes",
-            "--acceptance",
-            "The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar",
-            "--status",
-            "ready",
-            "--repo",
-            "misty-step/sploot",
-        ]))
-        .unwrap();
-        run(&args([
-            "add-comment",
-            "sploot-026",
-            "--db",
-            &db,
-            "--author",
-            "operator",
-            "--body",
-            "manual Sploot repair note",
-        ]))
-        .unwrap();
-        let claimed = run(&args([
-            "claim",
-            "sploot-026",
-            "--db",
-            &db,
-            "--agent",
-            "codex",
-            "--ttl",
-            "3600",
-        ]))
-        .unwrap();
-        assert!(claimed.starts_with("claimed\tsploot-026"));
-
-        let dry_run = run(&args([
-            "repair-criteria",
-            &fixtures,
-            "--db",
-            &db,
-            "--repo",
-            "misty-step/sploot",
-        ]))
-        .unwrap();
-        let report: Value = serde_json::from_str(dry_run.lines().next().unwrap()).unwrap();
-        assert_eq!(report["card_id"], "sploot-026");
-        assert!(report["dry_run"].as_bool().unwrap());
-        assert!(
-            report["truncated"].as_array().unwrap().len() == 1,
-            "dry-run must report one truncated criterion: {dry_run}"
-        );
-
-        let repair = run(&args([
-            "repair-criteria",
-            &fixtures,
-            "--db",
-            &db,
-            "--repo",
-            "misty-step/sploot",
-            "--apply",
-            "--actor",
-            "operator",
-        ]))
-        .unwrap();
-        let repair: Value = serde_json::from_str(repair.lines().next().unwrap()).unwrap();
-        assert_eq!(repair["criteria_changed"], 1);
-        assert!(repair["changes"][0]["state_preserved"].as_bool().unwrap());
-
-        let card = run(&args(["get-card", "sploot-026", "--db", &db])).unwrap();
-        let detail: Value = serde_json::from_str(&card).unwrap();
-        assert_eq!(
-            detail["card"]["status"], "in_progress",
-            "status must survive repair"
-        );
-        assert!(
-            detail["card"]["claim"].is_object(),
-            "claim must survive repair: {card}"
-        );
-        assert_eq!(
-            detail["card"]["criteria"][0]["text"],
-            "The list/shuffle (`assets/route.ts`), search (`vectorSearch`), and similar (`similar/route.ts`) read paths return `thumbnailUrl`, so grid tiles source the 256px thumbnail (with the existing thumbnail→blob error fallback intact)."
-        );
-        let comments = detail["comments"].as_array().unwrap();
-        assert!(comments
-            .iter()
-            .any(|c| c["body"] == "manual Sploot repair note"));
-    }
-
-    #[test]
-    fn cli_board_rollups_json_reads_local_store() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-rollups-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-        run(&args(["init-db", "--db", &db])).unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "cli-epic",
-            "--title",
-            "Epic",
-            "--acceptance",
-            "proof",
-        ]))
-        .unwrap();
-        run(&args([
-            "create-card",
-            "--db",
-            &db,
-            "--id",
-            "cli-leaf",
-            "--title",
-            "Leaf",
-            "--acceptance",
-            "proof",
-        ]))
-        .unwrap();
-        let output = run(&args(["board-rollups", "--json", "--db", &db])).unwrap();
-        let payload: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(payload["total_count"], 1);
-        assert_eq!(payload["coverage"]["total_cards"], 2);
-        assert_eq!(payload["coverage"]["accounted_cards"], 2);
-        assert_eq!(payload["rollups"][0]["kind"], "unsorted");
-    }
-
-    #[test]
-    fn board_stats_json_reads_local_store() {
-        let db = std::env::temp_dir().join(format!(
-            "powder-cli-stats-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let db = db.to_string_lossy().to_string();
-        let env = remote_env(None, None);
-        run_with_env(&args(["init-db", "--db", &db]), &env).unwrap();
-        for id in ["stats-a", "stats-b"] {
-            run_with_env(
-                &args([
-                    "create-card",
-                    "--db",
-                    &db,
-                    "--id",
-                    id,
-                    "--title",
-                    "Stats card",
-                    "--acceptance",
-                    "proof exists",
-                ]),
-                &env,
-            )
-            .unwrap();
-        }
-        let output = run_with_env(&args(["board-stats", "--db", &db, "--json"]), &env).unwrap();
-        let payload: Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(payload["totals"]["cards"], 2);
-        assert_eq!(payload["totals"]["ready"], 2);
-        let _ = std::fs::remove_file(db);
     }
 
     #[test]

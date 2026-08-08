@@ -39,7 +39,7 @@ Powder itself.
 
 | Changed area | Surface | Verification path |
 |---|---|---|
-| `crates/powder-core`, `powder-shell`, `powder-store` | Domain rules, adapters, SQLite persistence | `cargo test --workspace` (or `-p <crate>` narrowed) |
+| `crates/powder-core`, `powder-store` | Domain rules and SQLite persistence | `cargo test --workspace` (or `-p <crate>` narrowed) |
 | `crates/powder-api`, `powder-cli` | `powder` CLI over the card/run lifecycle | Local CLI smoke below against a throwaway DB |
 | `crates/powder-server` | HTTP API, single deployable app | `POWDER_DB_PATH=<db> cargo run -p powder-server`, then `/healthz` + `/readyz` |
 

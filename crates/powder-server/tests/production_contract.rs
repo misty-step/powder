@@ -1,10 +1,6 @@
-//! powder-epic-truthful-ops: `deploy_contract.rs` asserts the standalone
-//! self-hoster reference deployment (Fly/Litestream/entrypoint.sh) stays
-//! internally consistent. This file asserts the separate, narrower thing
-//! the operator's *real* production path (a DigitalOcean droplet, `scp`'d
-//! binaries, no image build -- see `docs/production-deploy.md`) actually
-//! needs from this repo, independent of which reference deployment shape
-//! (or none at all) a given instance uses:
+//! Proves the production contract for a DigitalOcean droplet with
+//! systemd/supervisor, direct binaries, SQLite, and optional Litestream.
+//! The checks stay independent of any image build or retired deployment path:
 //!
 //! - the binary boots from real process environment only, never a `.env`
 //!   file (`docs/self-hosting.md`'s "No dotenv loader" section) -- load-
@@ -26,6 +22,33 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn repo_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("powder-server lives two levels below repo root")
+        .to_path_buf()
+}
+
+/// Runs the entrypoint's Litestream restore and replication harness as part of
+/// the retained production contract instead of leaving it as an orphaned shell test.
+#[test]
+fn litestream_entrypoint_harness_matches_production_contract() {
+    let root = repo_root();
+    let output = Command::new("bash")
+        .arg(root.join("test/bin/entrypoint_test.sh"))
+        .current_dir(&root)
+        .output()
+        .expect("run test/bin/entrypoint_test.sh");
+
+    assert!(
+        output.status.success(),
+        "entrypoint test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 struct ChildGuard(Child);
 

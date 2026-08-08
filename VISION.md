@@ -1,197 +1,142 @@
 # Powder Vision
 
-Powder is the self-hostable work substrate for agent-driven software teams: a
-dumb, reliable ledger for work, claims, timelines, relations, and audit
-history.
+Powder is one self-hosted SQLite work ledger for agent-driven software teams.
+It records work, temporary ownership, typed run history, and attributed events.
+A deployed instance owns its data; this repository ships the service and its
+faces.
 
-The repository ships the application. A deployed instance owns the data.
-Operators bring their own backlog, store it in their own SQLite database, and
-connect their own agents, runners, and humans through Powder's API, CLI,
-and skill surfaces.
+Powder is the narrow boundary between an agent that needs durable coordination
+and a project-management system that owns every workflow. It does not run
+models, dispatch workers, shape intake, or provide analytics. External agents,
+workers, and humans make judgments and write their results through the same
+contract.
 
-Powder should feel like the narrow missing tool between "a chat thread full of
-tasks" and "a hosted project-management system that assumes humans are the
-primary workers." It is not the operator's backlog, not an instance-data dump,
-and not a private Factory board. It is the public product someone deploys so
-their work can be claimed, paused, audited, related, and completed with or
-without proof.
-Powder never calls a model. Intelligence belongs in orchestrators such as
-Bitterblossom workloads that read and write through Powder's deterministic
-interfaces.
+## Product Boundary
 
-## Why It Exists
+Powder answers six operational questions:
 
-Agent work needs durable coordination primitives:
+1. What work exists?
+2. What work is ready?
+3. Who holds the current lease?
+4. What typed run history explains the work?
+5. What event history records who changed what and when?
+6. What proof or input is needed to continue or close the work?
 
-- a card with enough context and an acceptance oracle
-- a ready query that deterministic code can answer
-- an expiring claim so duplicate agents do not collide
-- a run timeline that survives handoff, crash, and compaction
-- proof links, completion records, and audit events a human can inspect
-- an explicit awaiting-input state instead of invented approvals
-- structured run telemetry — agents, models, token counts, estimated cost,
-  outcomes — so ticket work doubles as evaluation data
-- attached session history at each lifecycle step, hidden by default, for
-  forensics, debugging, and agent-composition optimization
-- a pile-first intake path: raw fodder lands repo-less by default and is
-  shaped later through explicit, audited resolutions
+The semantic model has four load-bearing concepts:
 
-Hosted task tools can store tickets, but they usually treat agents as API
-clients bolted onto a human workflow. Orchestrators can remember their own
-leases, but that partitions work by runner. Powder's differentiated bet is
-that the board is the lock manager: Bitterblossom, Codex, Herdr, cron, and a
-human with curl can share one pool without trusting chat memory or duplicate
-dispatch loops.
+- **Card** stores context, acceptance criteria, status, priority, labels,
+  relations, links, comments, work-log entries, proof, and an optional opaque
+  `repo` string. Repository filtering is exact string filtering; `repo` is not a
+  registry or identity system.
+- **Claim** stores the current principal, worker label, run identifier, lease,
+  expiry, and liveness. Claims coordinate concurrent workers and expire without
+  changing the truth of the card.
+- **Run** is typed claim-scoped history. It stores claim attempts, lifecycle
+  state, principal, worker, timestamps, proof, and typed elicitation/response
+  activity. A run is not a telemetry, session-forensics, or evaluation product.
+- **Event** is immutable, attributed audit history with an ordered outbound
+  sequence and an SSE tail. Event payloads remain typed; Powder does not replace
+  fields with arbitrary JSON blobs.
 
-Operator ruling, 2026-07-03: "powder is unopinionated — audit over
-enforcement."
-
-That ruling makes auditable history the product's load-bearing invariant.
-Powder records who changed what, when, and through which surface. Ready queries
-and claims remain useful coordination primitives, but they are not lifecycle
-law: an authorized actor may set any card status in one call, with or without a
-claim or proof artifact. A stale runner must not wedge the queue, and external
-systems must be able to reconcile by writing the truth they know while Powder
-preserves the trail.
-
-## Audience
-
-Powder is for operators and small teams who want a self-hosted alternative to
-hosted agent-work boards. It is also for agent orchestrators that need a narrow
-work API instead of assigning jobs through chat transcripts.
-
-The primary user is technical: someone comfortable running one service,
-mounting one volume, configuring auth by env, and importing their own data. A
-future hosted version may exist, but the product core must not assume one.
+Relations include generic parent and blocker edges. A parent edge is not an
+epic, rollup, velocity, or portfolio product. Links, comments, work logs,
+proof, full-text search, ready snapshots, idempotency, and claim expiry remain
+ledger behavior. Awaiting input is a typed run state, not a separate answer
+product.
 
 ## Product Shape
 
-**One deployable.** Powder should remain a Rust service with one Docker image,
-one SQLite database, one plain-Linux-host deployment target (production runs on
-a DigitalOcean droplet), optional Litestream replication, health/readiness
-routes, first-run onboarding, and configuration through environment variables.
+Powder has one Rust service and one SQLite database. WAL, migrations,
+Litestream-safe backup and restore, health/readiness, and authentication remain
+part of the deployment contract.
 
-**One semantic contract.** HTTP, CLI, and the shipped skill are adapters over
-the same domain language: cards, runs, activity, audit events, claims,
-relations, links, comments, ready work, input requests, and optional proof.
-Agents use the CLI plus `SKILL.md`; HTTP serves the UI and integrations.
+Agents use the `powder` CLI and shipped `SKILL.md`. HTTP serves the human UI and
+external integrations. SSE exposes the ordered event tail. These faces share
+one deterministic contract; none is a second domain model.
 
-**A board, not a runner.** Powder stores work, locks, session state, timelines,
-events, and evidence. Codex, Herdr, Sprites, cron jobs, Bitterblossom agents,
-or other dispatchers may claim work from Powder and execute elsewhere, but the
-dispatch loop and every model call are outside the core.
+The human face is small and responsive. It provides ledger list or Kanban
+views, search, card detail, create/edit input, claim state, timeline, proof,
+awaiting-input answer, auth state, keyboard access, routing, empty states,
+security, and accessibility. It is not a portfolio dashboard, settings
+product, media browser, or theme system.
 
-**A human face on the same state.** The API/CLI contract comes first, but
-the product should still feel excellent to operate. The human UI is a thin
-layer over the same cards, claims, timelines, relations, blockers,
-awaiting-input states, and proof links that agents consume -- never a
-separate human-only data model or a feature-parity project-management clone.
-At small scale that thin layer is a gorgeous raw Kanban board. At fleet
-scale -- thousands of cards, dozens of repos, agents generating work
-continuously and without it being an event -- a raw ticket-by-ticket board
-stops being legible to a human, so the default human view becomes live
-rollups (epics, themes, velocity) computed from the same card graph, with
-raw per-ticket browsing one click away, not the landing page. Agents keep
-raw, full-fidelity access through the API/CLI contract regardless of
-what the human default renders (operator ruling, 2026-07-17: see
-`powder-epic-first-human-board`).
-At every scale the human face gains a durable answer loop (operator ruling,
-2026-07-21): a question asked on any surface becomes an audited request
-record, and an external worker writes back a cited answer — with principal,
-worker label, model, cost, and duration — through the same deterministic
-interfaces agents use. Answers accrete as inspectable rows; Powder still
-never calls a model.
+Powder is a board, not a runner. Dispatch loops, model calls, prompt/session
+capture, evaluation, shaping, ingestion, and external analytics run outside
+Powder. External workers may use cards, links, relations, proof, and events as
+stable anchors.
 
-**Instance data stays in instances.** The public repo may contain Powder's own
-product-development epics, synthetic fixtures, and sample config. Imported or
-operator/customer backlog, card, run, claim, activity, and proof data belongs in
-a deployed database and must not be committed here.
+## Principles
 
-## Product Principles
+1. **A card carries an oracle.** Acceptance criteria make ready work
+   explainable.
+2. **A claim coordinates.** A lease prevents duplicate work and expires after
+   liveness stops; it does not govern truth.
+3. **A run stays typed.** Claim attempts, lifecycle, proof, identity, and input
+   survive handoff and crash without telemetry fields.
+4. **Events preserve attribution.** Every change records its actor, principal,
+   time, operation, and ordered position where applicable.
+5. **Typed data beats blobs.** Durable fields and typed activities remain
+   inspectable and migratable.
+6. **Adapters stay thin.** Domain rules live below HTTP, CLI, UI, and skill
+   faces.
+7. **One deployment is enough.** One service, one database, and one backup
+   story reduce operational failure modes.
+8. **Small beats parity.** Add no project-management surface without a direct
+   ledger need and observed operator evidence.
+9. **No model boundary inside Powder.** Judgment and execution remain in
+   external workers.
 
-1. **Ready is a query, not law.** Eligibility must be explainable from card
-   status, blockers, acceptance, priority, age, and claim expiry.
-2. **Claims coordinate; they do not govern truth.** Agents may acquire an
-   expiring lock before acting so duplicate workers do not silently collide,
-   but a claim is not required to correct status.
-3. **Audit beats enforcement.** Completion may include evidence: a PR,
-   artifact, CI run, transcript, or other reviewable link. Powder records the
-   actor, time, and change even when proof is absent.
-4. **Human input is a state.** Awaiting a decision is part of the run model,
-   not a buried comment convention.
-5. **Adapters stay thin.** Business rules live in `powder-core`; API, CLI,
-   and skill surfaces should not grow separate semantics.
-6. **Private by deployment, public by repo.** Powder is a public product for
-   private instances, tailnet-friendly auth, and bring-your-own-data operation.
-7. **Small beats feature parity.** Do not clone a full project-management UI
-   before the agent contract is boring and trustworthy.
-8. **Triggers beat polling.** Ready queries must exist, but Powder should also
-   emit deterministic events that other systems can subscribe to.
-9. **No model boundary inside Powder.** Rules, persistence, identity, policy,
-   locks, and event delivery are deterministic. Judgment happens in external
-   workers that write their results back.
+## Migration Safety
 
-## Current Build Shape And Proof Debt
+The first cutover wave removes active rejected surfaces while historical tables
+and columns remain readable when needed. A later schema migration will
+inventory retained data and remove dormant storage.
 
-The current scaffold establishes the intended shape, but the contract is not
-yet trustworthy enough for a fleet to depend on:
+Migrations preserve row counts, attribution, typed run history, elicitation and
+response activity, proof, parent edges, links, claim expiry, event order,
+idempotency, and the opaque card `repo` value. Historical data is exported or
+backed up before destructive migration. WAL-safe backup and restore proof is a
+release prerequisite.
 
-- `powder-core` defines cards, runs, activity, audit events, relations, links,
-  comments, ready eligibility, expiring claims, permissive status changes,
-  and optional completion proof. The card status vocabulary is seven states
-  (`backlog`, `ready`, `in_progress`, `awaiting_input`, `done`, `shipped`,
-  `abandoned`); see `docs/status-vocabulary.md` for the ratified decision,
-  the 9->7 migration mapping, and the rejected alternatives.
-- `powder-store` persists the instance database in SQLite, enables WAL, owns
-  migrations, stores hashed API keys, seeds the first bootstrap key once, and
-  runs transactional card lifecycle operations.
-- API keys authenticate neutral integration principals. Claims and runs keep
-  that principal distinct from the declared worker label and unique run id, so
-  one orchestrator credential can coordinate many workers without lying in the
-  audit trail or minting a key per persona.
-- `powder-cli` is the agent face: initialize an instance database, list ready
-  work, claim, update, and complete cards locally (`--db`) or against a deployed
-  server (`POWDER_API_BASE_URL` / `POWDER_API_KEY`). See `SKILL.md`.
-- `powder-server` is the single deployable HTTP app with `/healthz`, `/readyz`,
-  first-run onboarding state, API-key auth, and tailnet/none modes.
-- Docker, systemd, Litestream, and env examples follow the Canary-style
-  self-hosted deployment pattern; a hosted-platform example survives only as
-  the self-hoster reference in `docs/self-hosting.md`.
+No migration replaces typed fields with arbitrary JSON. No compatibility alias,
+fallback, replacement framework, or generic event envelope is added to preserve
+a rejected product.
 
-The important remaining gaps are not polish. The audit trail needs to stay
-consistent across SQLite, HTTP, CLI, and the Kanban board; relations and
-webhooks need live-operator proof; the answer loop, real identity and
-authority, private-ingress conformance, deterministic event emission, and a
-Kanban surface must keep making the same state legible to humans.
+## Current Build And Cutover Notes
+
+Production runs one `powder-server` service with SQLite on a host volume, WAL
+enabled, optional Litestream replication, health/readiness routes, and the
+configured authentication boundary. The CLI and `SKILL.md` remain the agent
+face; HTTP serves integrations and the UI.
+
+During the first wave, code lanes may remove active registry, webhook-delivery,
+telemetry, media, portfolio, and static periphery surfaces while their
+historical storage remains readable. The surviving contract is the boundary
+above. Existing status vocabulary, claim behavior, typed input activity, proof,
+links, comments, work logs, FTS, ready snapshots, idempotency, and ordered SSE
+events remain load-bearing.
 
 ## Non-Goals
 
-- No real operator backlog, run, claim, or activity data in this repository.
-- No dispatch daemon inside `powder-core`.
-- No model calls inside Powder.
-- No hidden dependency on Gradient, Hermes, or any one operator's `kanban.db`.
-- No MCP agent face; agents use the CLI and skill only.
-- No hosted multi-tenant SaaS assumption in the product core.
-- No feature-parity Linear clone before the agent-first contract is solid.
+Powder does not provide:
 
-## Excellent In 6-12 Months
+- repository registration, aliases, tiers, visibility, import provenance, or
+  repository administration; cards keep only an optional opaque exact-filtered
+  `repo` string;
+- signed webhook subscriptions, delivery retries, dead letters, replay, or a
+  background delivery worker; ordered outbound events and the SSE tail remain;
+- run telemetry attempts, model or token pricing, cost aggregates, science,
+  exports, comparison datasets, or evaluation analytics;
+- attachment BLOB upload, attachment storage, attachment UI, or field-note
+  generation;
+- epic recomposition, rollups, velocity, overview dashboards, or portfolio
+  analytics; parent remains a generic relation;
+- ingestion, shaping, lineage, session forensics, prompt capture, embedding,
+  announcement, theme, or answer-product subsystems;
+- a dispatch daemon, model call, hosted multi-tenant SaaS assumption, or
+  repository-local backlog;
+- an MCP face or another agent protocol beside `powder` plus `SKILL.md`;
+- a marketing site or a second UI design system.
 
-Powder is the obvious self-hosted work ledger for agentic software teams. A new
-operator can deploy it on any plain Linux host or DigitalOcean droplet, mount
-SQLite storage, choose tailnet or shared
-secret auth, complete first-run onboarding, create or integrate cards through
-explicit APIs, configure rules and webhooks, inspect a beautiful Kanban board, and let agents
-safely ask:
-
-> What exists, what is ready, can I claim it, what context matters, and what
-> history or proof explains its current state?
-
-Humans inspect the same state agents use. Each run and card change leaves a
-durable trail.
-Terminal history compresses into compact summaries by default while full
-events and proof stay retrievable. Run telemetry makes cost and
-effectiveness per agent and per model queryable, so the board doubles as
-the fleet's evaluation dataset.
-Private backlog data stays in the deployment that owns it. External workers can
-make intelligent judgments, but Powder remains the boring source of truth for
-what work exists, who holds it, what happened, and what proof settled it.
+Powder remains a boring source of truth for what work exists, who holds its
+lease, what typed run history records, what changed, and what proof settled it.

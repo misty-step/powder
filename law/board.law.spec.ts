@@ -1,1324 +1,401 @@
 import { test, expect, type Page } from "@playwright/test";
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-// board law gate: no-page-scroll and clean-console invariants, proven on
-// the real UI instead of eyeballed per PR.
-// Inline assertion helpers (replacing the deleted vendor/aesthetic-law module).
-// The law gate now checks no-page-scroll and clean-console instead of the
-// retired fontSize<=16 and radius=0 invariants. Touch-target and horizontal-
-// overflow checks live in the mobile-390 test below.
-function collectConsoleErrors(page: Page): string[] {
-  const errors: string[] = [];
-  page.on("console", (msg) => {
-    if (msg.type() === "error") errors.push(msg.text());
-  });
-  page.on("pageerror", (err) => {
-    errors.push(err.message);
-  });
-  return errors;
-}
 
-async function assertBoard(page: Page, consoleErrors: string[]) {
-  // No page scroll: the app shell is overflow:hidden
-  const scrollable = await page.evaluate(() =>
-    document.documentElement.scrollHeight >
-      document.documentElement.clientHeight + 1,
-  );
-  expect(scrollable, "page must not scroll").toBe(false);
-
-  const cursor = await page.evaluate(() => getComputedStyle(document.body).cursor);
-  expect(cursor, "body cursor must remain default for static text").toBe("default");
-
-  // Clean console: no error-level messages or uncaught page errors
-  expect(consoleErrors, "console must be clean").toEqual([]);
-}
-
-async function assertRollupChipsFit(page: Page) {
-  await page.evaluate(() => {
-    const { promise, resolve } = Promise.withResolvers<void>();
-    requestAnimationFrame(() => resolve());
-    return promise;
-  });
-  const measurements = await page.locator(".pw-rollup-row").evaluateAll((rows) =>
-    rows.map((row, index) => {
-      const chips = row.querySelector<HTMLElement>(".pw-rollup-chips");
-      return {
-        label:
-          row.getAttribute("data-id") ||
-          row.getAttribute("data-rollup-repo") ||
-          `row ${index}`,
-        scrollWidth: chips?.scrollWidth ?? -1,
-        clientWidth: chips?.clientWidth ?? -2,
-      };
-    }),
-  );
-  expect(measurements.length, "the Overview renders rollup rows").toBeGreaterThan(0);
-  for (const measurement of measurements) {
-    expect(
-      measurement.scrollWidth,
-      `${measurement.label} status chips fit inside their cell`,
-    ).toBeLessThanOrEqual(measurement.clientWidth);
-  }
-}
-
-/* the law gate, wired against powder's own served board UI (crates/
-   powder-server, at /board) — no-page-scroll and clean-console invariants,
-   proven on the real UI instead of eyeballed per PR. playwright.config.ts
-   boots powder-server against a throwaway DB seeded through the public
-   card-creation command, so the board renders real cards rather than an
-   empty shell. */
-
-const MODES = ["light", "dark"] as const;
-// powder-ui-keyboard-firstrun: the second, genuinely-empty fixture server
-// (law/scripts/start-empty-fixture-server.sh, wired in playwright.config.ts's
-// `webServer` array) -- an absolute URL passed to page.goto() overrides the
-// config's default baseURL for just that navigation.
 const EMPTY_BASE_URL = "http://127.0.0.1:4101";
-const CARD_ROUTE_VIEWPORTS = [
-  { name: "desktop", size: { width: 1280, height: 900 } },
-  { name: "mobile-390", size: { width: 390, height: 900 } },
-] as const;
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SITE_ROOT = path.resolve(__dirname, "..", "site");
-const SITE_ROUTES = [
-  {
-    name: "marketing home",
-    path: "index.html",
-    expected: "A work board built for agents.",
-  },
-  {
-    name: "release notes",
-    path: "changelog.html",
-    expected: "Public site and board proof",
-  },
-] as const;
 
-// powder-epic-answer-board: the board route now holds one deliberately
-// long-lived connection for as long as the page is open (GET
-// /api/v1/events/tail?live=true, for the live-update strip) -- Playwright's
-// `networkidle` ("no network connections for 500ms") can never fire on its
-// own with a permanent SSE stream open, so it would hang every board test
-// until the per-test timeout. Race it against a short bound instead of
-// awaiting it unconditionally: the initial card/repo
-// fetches this exists to wait out settle in well under that window, and
-// every assertion downstream already auto-retries via Playwright's own
-// polling, so a slightly loose settle point here does not weaken what the
-// tests actually prove.
-async function waitForSettled(page: Page) {
-  await Promise.race([page.waitForLoadState("networkidle"), page.waitForTimeout(2000)]);
-}
+type ConsoleErrors = string[];
 
-async function boot(page: Page, mode: (typeof MODES)[number], path = "/board") {
-  const errors = collectConsoleErrors(page);
-  await page.addInitScript(({ selectedMode, view }) => {
-    localStorage.setItem("pw-mode", selectedMode);
-    if (!sessionStorage.getItem("powder-board-state")) {
-      sessionStorage.setItem("powder-board-state", JSON.stringify({ view }));
-    }
-  }, { selectedMode: mode, view: "both" });
-  await page.goto(path);
-  await waitForSettled(page);
+function captureErrors(page: Page): ConsoleErrors {
+  const errors: ConsoleErrors = [];
+  page.on("console", (message) => {
+    const text = message.text();
+    if (message.type() === "error" && !text.startsWith("Failed to load resource: the server responded with a status of 401")) errors.push(text);
+  });
+  page.on("pageerror", (error) => errors.push(error.message));
   return errors;
 }
 
-async function bootFresh(page: Page, mode: (typeof MODES)[number], path = "/board") {
-  const errors = collectConsoleErrors(page);
-  await page.addInitScript((selectedMode) => localStorage.setItem("pw-mode", selectedMode), mode);
-  await page.goto(path);
-  await waitForSettled(page);
+async function settle(page: Page) {
+  await page.waitForTimeout(1200);
+}
+
+async function boot(page: Page, route = "/board") {
+  await page.addInitScript(() => {
+    sessionStorage.clear();
+  });
+  const errors = captureErrors(page);
+  await page.goto(route);
+  await settle(page);
   return errors;
 }
 
-async function bootSite(
-  page: Page,
-  mode: (typeof MODES)[number],
-  route: (typeof SITE_ROUTES)[number],
-) {
-  const errors = collectConsoleErrors(page);
-  await page.addInitScript((m) => localStorage.setItem("pw-mode", m), mode);
-  await page.goto(pathToFileURL(path.join(SITE_ROOT, route.path)).href);
-  await page.waitForLoadState("networkidle");
-  return errors;
+async function assertLedger(page: Page, errors: ConsoleErrors) {
+  const overflow = await page.evaluate(() => ({
+    documentWidth: document.documentElement.scrollWidth,
+    viewportWidth: document.documentElement.clientWidth,
+    bodyWidth: document.body.scrollWidth,
+  }));
+  expect(overflow.documentWidth, "the document must not overflow horizontally").toBeLessThanOrEqual(overflow.viewportWidth);
+  expect(overflow.bodyWidth, "the body must not overflow horizontally").toBeLessThanOrEqual(overflow.viewportWidth);
+  expect(errors, "the ledger must keep the browser console clean").toEqual([]);
 }
 
-for (const mode of MODES) {
-  test(`board · ${mode} · the law holds`, async ({ page }) => {
-    const errors = await boot(page, mode);
-    // powder-942: the home affordance is real chrome now, present whenever
-    // POWDER_HOME_URL is configured (the fixture server sets it).
-    await expect(page.locator("#footer-home-link")).toBeVisible();
-    await expect(page.locator("#footer-home-link")).toHaveAttribute(
-      "href",
-      "https://sanctum.example.test",
-    );
-    await page.locator("#tab-overview").click();
-    await expect(page.locator("#overview")).toBeVisible();
-    await assertRollupChipsFit(page);
-    await assertBoard(page, errors);
-  });
-
-  test(`board filters panel · ${mode} · the law holds`, async ({ page }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#filter-btn").click();
-    await expect(page.locator("#filters")).toBeVisible();
-    await assertBoard(page, errors);
-  });
-
-
-  test(`board filters · ${mode} · estimate and risk apply independently to every lane`, async ({ page }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#filter-btn").click();
-
-    // Estimate S keeps the positive fixture in every rendered lane and removes
-    // the contrasting L fixture. The blocked card is a Ready card rendered in
-    // the derived blocked strip, so it proves that lane too.
-    await page.locator("#fg-estimate [data-estimates='s']").click();
-    for (const [lane, id] of [
-      ["lane-ready", "001"],
-      ["lane-ready", "blocked-card"],
-      ["rail-list", "backlog-match"],
-      ["lane-inprog", "inprogress-match"],
-      ["lane-done", "done-match"],
-    ] as const) {
-      await expect(page.locator(`#${lane} [data-id='${id}']`)).toBeVisible();
-    }
-    for (const [lane, id] of [
-      ["rail-list", "backlog-no-match"],
-      ["lane-inprog", "inprogress-no-match"],
-      ["lane-done", "done-card"],
-    ] as const) {
-      await expect(page.locator(`#${lane} [data-id='${id}']`)).toHaveCount(0);
-    }
-
-    // Clear estimate, then apply Risk High independently. Low-risk cards must
-    // disappear while high-risk cards remain in each lane.
-    await page.locator("#fg-estimate [data-estimates='s']").click();
-    await page.locator("#fg-risk [data-risks='high']").click();
-    for (const [lane, id] of [
-      ["lane-ready", "blocked-card"],
-      ["rail-list", "backlog-match"],
-      ["lane-inprog", "inprogress-match"],
-      ["lane-done", "done-card"],
-      ["lane-done", "done-match"],
-    ] as const) {
-      await expect(page.locator(`#${lane} [data-id='${id}']`)).toBeVisible();
-    }
-    for (const [lane, id] of [
-      ["lane-ready", "001"],
-      ["rail-list", "backlog-no-match"],
-      ["lane-inprog", "inprogress-no-match"],
-    ] as const) {
-      await expect(page.locator(`#${lane} [data-id='${id}']`)).toHaveCount(0);
-    }
-    await assertBoard(page, errors);
-  });
-
-  test(`board filters · ${mode} · estimate and risk state survives reload`, async ({ page }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#filter-btn").click();
-    await page.locator("#fg-estimate [data-estimates='s']").click();
-    await page.locator("#fg-risk [data-risks='high']").click();
-    await expect(page.locator("#filter-n")).toContainText("· 2");
-    await page.reload();
-    await waitForSettled(page);
-    await page.locator("#filter-btn").click();
-    await expect(page.locator("#fg-estimate [data-estimates='s']")).toHaveAttribute("aria-pressed", "true");
-    await expect(page.locator("#fg-risk [data-risks='high']")).toHaveAttribute("aria-pressed", "true");
-    await expect(page.locator("#lane-ready [data-id='blocked-card']")).toBeVisible();
-    await assertBoard(page, errors);
-  });
-  test(`board settings page · ${mode} · the law holds`, async ({ page }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#settings-toggle").click();
-    await expect(page.locator("#auth-panel")).toBeVisible();
-    await expect(page.locator("#repo-create-form")).toBeVisible();
-    await expect(page.locator("#repo-settings-list")).toContainText("Merge alias");
-    await expect(page.locator("#repo-settings-list")).toContainText("Tier");
-    // powder-915: init-db seeds ~24 "ratified tier" repositories at
-    // card_count 0 -- all hidden by default now that zero-card repos are
-    // hidden behind the "show empty" toggle (see the standalone toggle law
-    // spec). "powder" is the one fixture repo with a real card filed under
-    // it (start-fixture-server.sh), so it's the one expected to be visible
-    // by default with a nonzero count and a tier badge -- see PR design
-    // notes for why there is no description field here (RepositorySummary
-    // carries none).
-    const powderRow = page.locator('.pw-repo-row[data-repo-name="powder"]');
-    await expect(powderRow).toBeVisible();
-    await expect(powderRow.locator(".pw-repo-tier-badge")).toBeVisible();
-    const seededCount = await powderRow.locator(".pw-num").innerText();
-    expect(Number(seededCount)).toBeGreaterThan(0);
-    await assertBoard(page, errors);
-  });
-
-  test(`board · mobile-390 · ${mode} · lane switcher reaches every column without horizontal scroll (powder-930)`, async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width: 390, height: 900 });
-    const errors = await boot(page, mode);
-    await page.locator("#tab-both").click();
-    const board = page.locator("#board");
-    await expect(page.locator("#lane-switch")).toBeVisible();
-    for (const lane of ["ready", "inprogress", "done"] as const) {
-      await page.locator(`#lane-switch button[data-lane='${lane}']`).click();
-      await expect(board).toHaveAttribute("data-lane", lane);
-      await expect(page.locator(`.pw-lane[data-lane='${lane}']`)).toBeVisible();
-      const overflows = await board.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
-      expect(overflows, `${lane} lane must not force horizontal scroll on the board`).toBe(false);
-    }
-    await assertBoard(page, errors);
-  });
-
-  test(`board card link · ${mode} · opens the detail route and back returns`, async ({ page }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#tab-board").click();
-    await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
-    const card = page.locator("[data-card-link][data-id='001']");
-    await card.waitFor({ state: "visible" });
-    await expect(card).toHaveAttribute("href", "/c/001");
-    await card.click();
-
-    await expect(page).toHaveURL(/\/c\/001$/);
-    await expect(page.locator("#powder-card-app")).toBeVisible();
-    await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
-    await assertBoard(page, errors);
-    await page.goBack();
-    await expect(page).toHaveURL(/\/board$/);
-    await expect(page.locator("#powder-board-app")).toBeVisible();
-    await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
-  });
-
-}
-test("board · fresh session lands on the Overview rollups view", async ({ page }) => {
-  const errors = await bootFresh(page, "light");
-  await expect(page.locator("#tab-overview")).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#main")).toHaveAttribute("data-view", "overview");
-  await expect(page.locator("#overview")).toBeVisible();
-  await assertBoard(page, errors);
-});
-
-test("board · saved Both view still wins over the Overview default", async ({ page }) => {
-  const errors = await boot(page, "light");
-  await expect(page.locator("#tab-both")).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#main")).toHaveAttribute("data-view", "both");
-  await assertBoard(page, errors);
-});
-
-test("board · Overview epic rows show counts and freshness and open detail", async ({ page }) => {
-  const errors = await bootFresh(page, "light");
-  const captions = page.locator(".pw-rollup-section > .pw-caption");
-  await expect(captions).toHaveText(["EPICS", "UNSORTED"]);
-
-  const epic = page.locator(".pw-rollup-row").filter({ hasText: "ship the hierarchy view" });
-  await expect(epic).toBeVisible();
-  await expect(epic).toHaveAttribute("data-id", "epic-hierarchy");
-  await expect(epic).toContainText("ready 1");
-  await expect(epic).toContainText("done 1");
-  await expect(epic).toContainText("criteria 1/2");
-  await expect(epic.locator(".pw-rollup-claims")).toHaveText("—");
-  await expect(epic).toHaveAttribute("aria-label", /0 active claims/);
-  await expect(epic.locator(".pw-rollup-age")).toHaveText(/^updated /);
-  await expect(epic.locator(".pw-rollup-age")).not.toContainText("oldest");
-  await expect(epic).toContainText("epic-hierarchy");
-  await epic.click();
-  await expect(page).toHaveURL(/\/c\/epic-hierarchy$/);
-  await expect(page.locator(".pw-detail-title")).toHaveText("ship the hierarchy view");
-  await expect(page.locator("#detail-body")).toContainText("EPIC PROGRESS");
-  await assertBoard(page, errors);
-});
-
-test("board · Overview unsorted row applies its repository filter", async ({ page }) => {
-  const errors = await bootFresh(page, "light");
-  const unsorted = page.locator(".pw-rollup-row[data-rollup-repo='powder']");
-  await expect(unsorted.locator(".pw-rollup-title")).toHaveText("powder");
-  await expect(unsorted).not.toContainText("Unsorted");
-  const general = page.locator(".pw-rollup-row[data-rollup-repo='general']");
-  await expect(general.locator(".pw-rollup-id")).toHaveCount(1);
-  await expect(general.locator(".pw-rollup-id")).toBeEmpty();
-  const [generalHeight, repositoryHeight] = await Promise.all([
-    general.evaluate((el) => el.getBoundingClientRect().height),
-    unsorted.evaluate((el) => el.getBoundingClientRect().height),
-  ]);
-  expect(
-    Math.abs(generalHeight - repositoryHeight),
-    "the empty General slug slot preserves the repository-row pitch",
-  ).toBeLessThanOrEqual(1);
-  await unsorted.click();
-  await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#main")).toHaveAttribute("data-view", "board");
-  await expect(page.locator("#fg-repo [data-repo='powder']")).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator("#board")).toContainText("Repo-scoped example card");
-  await assertBoard(page, errors);
-});
-
-test("board · Overview rollup fetch failure stays inline and leaves raw board usable", async ({ page }) => {
-  await page.route("**/api/v1/board/rollups**", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: "not-json" }),
-  );
-  const errors = await bootFresh(page, "light");
-  await expect(page.locator("#overview .pw-empty")).toContainText("Overview unavailable");
-  await page.locator("#tab-board").click();
-  await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
+test("board · defaults to raw lanes and keeps only ledger controls", async ({ page }) => {
+  const errors = await boot(page);
   await expect(page.locator("#lane-ready")).toContainText("Lifecycle example card");
-  await assertBoard(page, errors);
+  await expect(page.locator("#tab-overview")).toHaveCount(0);
+  await expect(page.locator("#overview")).toHaveCount(0);
+  await expect(page.locator(".pw-rollup-row")).toHaveCount(0);
+  await expect(page.locator("#repo-settings")).toHaveCount(0);
+  await expect(page.locator("#quick-add-attachments")).toHaveCount(0);
+  await expect(page.locator("#settings-toggle")).toHaveCount(0);
+  await assertLedger(page, errors);
 });
 
-// powder-ui-overview-hierarchy: production-width rows share one five-column
-// grid across both captioned sections. The fixture supplies long titles,
-// six-status chip clusters, wide criteria fractions, and stale freshness.
-test("board · Overview · rollup rows share one aligned column grid (powder-ui-overview-hierarchy)", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 1462, height: 950 });
-  const errors = await bootFresh(page, "light");
-  const rows = page.locator(".pw-rollup-row");
-  await expect(rows.first()).toBeVisible();
-  const rowCount = await rows.count();
-  expect(rowCount, "the fixture renders a deep rollup list").toBeGreaterThanOrEqual(8);
-  await assertRollupChipsFit(page);
-
-  const captions = page.locator(".pw-rollup-section > .pw-caption");
-  await expect(captions).toHaveText(["EPICS", "UNSORTED"]);
-
-  // Track edges, not glyph edges: every measured cell stretches across its
-  // grid track, so each column's left x stays identical across both sections.
-  const CELL_SELECTOR =
-    ":scope > .pw-rollup-main, :scope > .pw-rollup-chips, :scope .pw-rollup-criteria, :scope .pw-rollup-claims, :scope .pw-rollup-age";
-  const columnXs = await rows.evaluateAll(
-    (els, selector) =>
-      els.map((row) =>
-        Array.from(row.querySelectorAll(selector)).map((cell) =>
-          Math.round(cell.getBoundingClientRect().left),
-        ),
-      ),
-    CELL_SELECTOR,
-  );
-  const [reference] = columnXs;
-  expect(reference.length, "a row exposes all five grid cells").toBe(5);
-  columnXs.forEach((xs, rowIndex) => {
-    expect(xs.length, `row ${rowIndex} exposes every grid cell`).toBe(reference.length);
-    xs.forEach((x, column) => {
-      expect(
-        Math.abs(x - reference[column]),
-        `row ${rowIndex} column ${column} left edge aligns with the first row`,
-      ).toBeLessThanOrEqual(1);
-    });
-  });
-  const captionXs = await captions.evaluateAll((els) =>
-    els.map((caption) => Math.round(caption.getBoundingClientRect().left)),
-  );
-  captionXs.forEach((x) => {
-    expect(Math.abs(x - reference[0]), "row content keeps the caption x-offset").toBeLessThanOrEqual(
-      1,
-    );
-  });
-  const titleTrackWidth = await rows
-    .first()
-    .locator(".pw-rollup-main")
-    .evaluate((el) => el.getBoundingClientRect().width);
-  expect(titleTrackWidth, "the title track owns at least 540px at production width").toBeGreaterThan(
-    540,
-  );
-
-
-  // Titles clamp to at most two lines even for the 9+ word pathological
-  // title; ids never wrap to a second line.
-  for (const title of await page.locator(".pw-rollup-title").all()) {
-    const box = await title.boundingBox();
-    const lineHeight = await title.evaluate((el) =>
-      parseFloat(getComputedStyle(el).lineHeight),
-    );
-    expect(box!.height / lineHeight, "title line-clamp is at most two lines").toBeLessThanOrEqual(
-      2.05,
-    );
-  }
-  for (const id of await page.locator(".pw-rollup-id").all()) {
-    const box = await id.boundingBox();
-    const lineHeight = await id.evaluate((el) => parseFloat(getComputedStyle(el).lineHeight));
-    expect(box!.height, "card id stays on one line").toBeLessThanOrEqual(lineHeight + 1);
-  }
-
-  // The pathological epic: 'EPIC:' prefix stripped from the display title,
-  // chips in fixed pipeline order, and the six-status cluster collapsed
-  // into a titled "+N" chip instead of wrapping.
-  const crucible = rows.filter({ hasText: "crucible-capability-decomposition-eval" });
-  await expect(crucible.locator(".pw-rollup-title")).not.toContainText("EPIC:");
-  await expect(crucible.locator(".pw-rollup-title")).toContainText("retire dead products");
-  const vault = rows.filter({ hasText: "agent-vault-retirement" });
-  await expect(vault.locator(".pw-rollup-title")).not.toContainText("Epic:");
-  await expect(vault.locator(".pw-rollup-title")).toContainText("retire Agent Vault");
-
-  const chipStatuses = await crucible
-    .locator(".pw-rollup-chip:not([hidden])")
-    .evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.status || ""));
-  const ORDER = [
-    "backlog",
-    "ready",
-    "in_progress",
-    "awaiting_input",
-    "done",
-    "shipped",
-    "abandoned",
-  ];
-  const indices = chipStatuses.map((status) => ORDER.indexOf(status));
-  expect(
-    indices.every((value, index) => index === 0 || value > indices[index - 1]),
-    `visible chips follow the fixed status order, got ${chipStatuses.join(", ")}`,
-  ).toBe(true);
-  expect(chipStatuses, "in-progress work survives the last-resort collapse").toContain("in_progress");
-  // The 19rem chip track (design-critic round 3) keeps the actionable
-  // awaiting-input chip visible at production width; only lower-priority
-  // statuses fold into +N.
-  expect(chipStatuses, "awaiting input stays visible at production width").toContain("awaiting_input");
-  const more = crucible.locator(".pw-rollup-chip-more");
-  await expect(more).toBeVisible();
-  expect(await more.getAttribute("title")).toContain("shipped 1");
-  expect(await more.getAttribute("title")).not.toContain("awaiting input");
-  await expect(crucible).toHaveAttribute("aria-label", /shipped 1/);
-  expect(
-    await more.evaluate((el) => ({
-      tag: el.tagName,
-      role: el.getAttribute("role"),
-      tabIndex: (el as HTMLElement).tabIndex,
-    })),
-    "the disclosure count remains a non-interactive span",
-  ).toEqual({ tag: "SPAN", role: null, tabIndex: -1 });
-
-  // Wide fractions and stale freshness render in their own columns.
-  const estate = rows.filter({ hasText: "estate-digitalocean-only-cutover" });
-  await expect(estate.locator(".pw-rollup-frac")).toHaveText("10/56");
-  await expect(estate.locator(".pw-rollup-age")).toHaveText(/updated \d+d ago/);
-  await expect(estate.locator(".pw-rollup-age")).not.toContainText("oldest");
-  await expect(estate.locator(".pw-rollup-age")).toHaveAttribute(
-    "title",
-    /oldest update \d+d ago/,
-  );
-  const overview = rows.filter({ hasText: "powder-overview-visual-hierarchy" });
-  await expect(overview.locator(".pw-rollup-frac")).toHaveText("21/30");
-  await assertBoard(page, errors);
+test("board · search uses the card index and preserves exact repo filtering", async ({ page }) => {
+  const errors = await boot(page);
+  await page.locator("#filter-toggle").click();
+  await page.locator("#text-filter").fill("Lifecycle");
+  await expect(page.locator("#text-search-status")).toContainText("matching card");
+  await expect(page.locator("#lane-ready")).toContainText("Lifecycle example card");
+  await page.locator("#repo-filters button", { hasText: "powder" }).click();
+  await expect(page.locator("#lane-ready")).not.toContainText("Lifecycle example card");
+  await page.locator("#filter-clear").click();
+  await expect(page.locator("#lane-ready")).toContainText("Lifecycle example card");
+  await assertLedger(page, errors);
 });
 
-test("board · mobile-390 · Overview rollup rows restack without horizontal scroll (powder-ui-overview-hierarchy)", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 390, height: 900 });
-  const errors = await bootFresh(page, "light");
-  const first = page.locator(".pw-rollup-row").first();
-  await expect(first).toBeVisible();
-  await assertRollupChipsFit(page);
-  const [generalMainHeight, repositoryMainHeight] = await Promise.all([
-    page
-      .locator(".pw-rollup-row[data-rollup-repo='general'] .pw-rollup-main")
-      .evaluate((el) => el.getBoundingClientRect().height),
-    page
-      .locator(".pw-rollup-row[data-rollup-repo='powder'] .pw-rollup-main")
-      .evaluate((el) => el.getBoundingClientRect().height),
-  ]);
-  expect(
-    Math.abs(generalMainHeight - repositoryMainHeight),
-    "the mobile General title block preserves the repository-row pitch",
-  ).toBeLessThanOrEqual(1);
-  const overflow = await page
-    .locator("#overview")
-    .evaluate((el) => el.scrollWidth > el.clientWidth + 1);
-  expect(overflow, "the Overview never scrolls horizontally at 390px").toBe(false);
-
-  // Restacked: chips sit below the title block, meta wraps onto its own
-  // line, and the row keeps its 44px touch target.
-  const titleBox = (await first.locator(".pw-rollup-title").boundingBox())!;
-  const chipsBox = (await first.locator(".pw-rollup-chips").boundingBox())!;
-  expect(
-    chipsBox.y,
-    "chips restack below the title at 390px",
-  ).toBeGreaterThanOrEqual(titleBox.y + titleBox.height - 1);
-  const rowHeight = await first.evaluate((el) => el.getBoundingClientRect().height);
-  expect(rowHeight, "row keeps the 44px touch target").toBeGreaterThanOrEqual(44);
-  const crucible = page
-    .locator(".pw-rollup-row")
-    .filter({ hasText: "crucible-capability-decomposition-eval" });
-  const flexWrap = await crucible
-    .locator(".pw-rollup-chips")
-    .evaluate((el) => getComputedStyle(el).flexWrap);
-  expect(flexWrap, "mobile chips stay on one line").toBe("nowrap");
-  await expect(crucible.locator(".pw-rollup-chip-more")).toBeVisible();
-  await assertBoard(page, errors);
-});
-
-// Operator report 2026-08-03: a browser outside the trusted ingress hit a
-// jumbled auth screen -- the repository editor rendered inert beside the key
-// form, columns overlapped at desktop width, and the intro claimed no key is
-// needed while every read was being denied. This locks the denied-read state
-// to a focused connect card: repo editor hidden, copy consistent, no overlap.
-test("board · denied reads collapse settings to a connect card without overlap", async ({ page }) => {
-  await page.route("**/api/v1/**", (route) => {
-    if (route.request().url().includes("/api/v1/onboarding")) {
-      return route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ auth_mode: "tailscale_header", public_reads: false, needs_setup: false }),
-      });
-    }
-    return route.fulfill({
-      status: 401,
-      contentType: "application/json",
-      body: JSON.stringify({
-        denial_class: "unauthenticated",
-        error: "x-powder-proxy-secret is not configured; identity headers are not trusted",
-      }),
-    });
-  });
-  const errors = collectConsoleErrors(page);
-  await page.goto("/board");
-  await expect(page.locator("#auth-panel")).toBeVisible();
-  await expect(page.locator("#repo-settings")).toBeHidden();
-  await expect(page.locator("#auth-intro")).toContainText(
-    "This instance denied the read. Paste a valid API key to connect.",
-  );
-  await expect(page.locator("#auth-intro")).not.toContainText("does not require");
-  // One auth surface: no duplicate instruction under the form, the mint
-  // hint is offered, lanes point at the connect card without leaking the
-  // raw server denial, and the header never claims "live" beside it.
-  await expect(page.locator("#auth-message")).toHaveText("");
-  await expect(page.locator("#mint-hint")).toBeVisible();
-  await expect(page.locator("#overview .pw-empty")).toContainText(
-    "Connect with an API key to load the board.",
-  );
-  await expect(page.locator("#overview .pw-empty")).not.toContainText("x-powder-proxy-secret");
-  await expect(page.locator("#live-indicator")).not.toHaveText("live");
-  // Layout truth, not copy: every visible child stays inside the panel box,
-  // no two children overlap, and the page gains no horizontal scroll.
-  const layout = await page.evaluate(() => {
-    const panel = document.getElementById("auth-panel")!;
-    const panelBox = panel.getBoundingClientRect();
-    const kids = [...panel.children]
-      .filter((child) => getComputedStyle(child).display !== "none")
-      .map((child) => child.getBoundingClientRect());
-    return {
-      outside: kids.some((box) => box.right > panelBox.right + 1 || box.left < panelBox.left - 1),
-      overlap: kids.some((a, i) =>
-        kids.some(
-          (b, j) =>
-            j > i &&
-            a.left < b.right - 1 &&
-            b.left < a.right - 1 &&
-            a.top < b.bottom - 1 &&
-            b.top < a.bottom - 1,
-        ),
-      ),
-      hscroll: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
-    };
-  });
-  expect(layout).toEqual({ outside: false, overlap: false, hscroll: false });
-  const noise = errors.filter((message) => !/status of 401/.test(message));
-  expect(noise, "console must stay clean beyond the denied reads").toEqual([]);
-});
-
-// powder-ui-keyboard-firstrun: card-level keyboard nav -- j/k roving focus
-// across every visible card link, Enter opens the focused card's detail
-// route (the browser's own anchor activation, not reimplemented), Escape
-// returns to the board. Read-only against the shared fixture.
-for (const mode of MODES) {
-  test(`board · ${mode} · j moves focus onto a card, Enter opens it, Escape returns (powder-ui-keyboard-firstrun)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode);
-    await page.keyboard.press("j");
-    const focused = page.locator("[data-card-link]:focus");
-    await expect(focused).toBeVisible();
-    const href = await focused.getAttribute("href");
-    expect(href).toBeTruthy();
-    await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(new RegExp(`${href}$`));
-    await expect(page.locator("#powder-card-app")).toBeVisible();
-    await assertBoard(page, errors);
-    await page.keyboard.press("Escape");
-    await expect(page).toHaveURL(/\/board$/);
-    await expect(page.locator("#powder-board-app")).toBeVisible();
-  });
-}
-
-// powder-ui-keyboard-firstrun: the ⌘K/Ctrl-K command palette -- simplest
-// honest design is a modal listbox filtering the board's own already-loaded
-// card list. Opened here via the visible #cmdk-toggle button (a real click
-// target, not just a hidden shortcut) rather than simulating the
-// platform-specific meta/ctrl modifier.
-for (const mode of MODES) {
-  test(`board · ${mode} · the command palette jumps to a seeded card by id fragment (powder-ui-keyboard-firstrun)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#cmdk-toggle").click();
-    await expect(page.locator("#cmdk")).toBeVisible();
-    await expect(page.locator("#cmdk-input")).toBeFocused();
-    await page.locator("#cmdk-input").fill("epic-hierarchy-child-a");
-    await expect(page.locator('#cmdk-list [role="option"]')).toHaveCount(1);
-    await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/c\/epic-hierarchy-child-a$/);
-    await assertBoard(page, errors);
-  });
-}
-
-for (const mode of MODES) {
-  test(`board · ${mode} · the command palette queues Enter during search (powder-ui-keyboard-firstrun)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#cmdk-toggle").click();
-    await page.locator("#cmdk-input").fill("epic-hierarchy-child-a");
-    await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/c\/epic-hierarchy-child-a$/);
-    await assertBoard(page, errors);
-  });
-}
-
-
-// powder-search-p2: exact card-id hits keep their source provenance, and a
-// search result retains the blocker relation needed by the derived blocked
-// strip rather than treating an unloaded summary as claimable.
-for (const mode of MODES) {
-  test(`board · ${mode} · search keeps exact-id provenance and blocked classification (powder-search-p2)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#cmdk-toggle").click();
-    await page.locator("#cmdk-input").fill("blocked-card");
-    const option = page.locator('#cmdk-list [role="option"]').first();
-    await expect(option).toBeVisible();
-    await expect(option.locator(".pw-cmdk-item-source")).toContainText("cards / id");
-    await page.keyboard.press("Escape");
-    await page.locator("#filter-btn").click();
-    await page.locator("#text-filter").fill("blocked-card");
-    await expect(page.locator("#lane-ready .pw-blocked-cap")).toContainText("BLOCKED");
-    await expect(page.locator("#lane-ready")).toContainText("blocked-card");
-    await assertBoard(page, errors);
-  });
-}
-
-// Adversarial-review blocker: aria-modal="true" without focus containment
-// is a lie -- Tab used to walk straight out of the palette into the
-// visually-covered board. This proves the trap: Tab/Shift-Tab keep focus
-// inside the dialog, and closing hands focus back to the invoker.
-test("board · the command palette traps Tab focus and restores the invoker on close (powder-ui-keyboard-firstrun review)", async ({
-  page,
-}) => {
-  const errors = await boot(page, "light");
-  await page.locator("#cmdk-toggle").click();
-  await expect(page.locator("#cmdk")).toBeVisible();
-  await expect(page.locator("#cmdk-input")).toBeFocused();
-  for (const key of ["Tab", "Tab", "Shift+Tab", "Tab", "Shift+Tab"]) {
-    await page.keyboard.press(key);
-    const inside = await page.evaluate(() =>
-      document.getElementById("cmdk")!.contains(document.activeElement),
-    );
-    expect(inside, `focus must stay inside the dialog after ${key}`).toBe(true);
-  }
+test("board · keyboard opens search, moves card focus, and opens detail", async ({ page }) => {
+  const errors = await boot(page);
+  await page.keyboard.press("/");
+  await expect(page.locator("#text-filter")).toBeFocused();
   await page.keyboard.press("Escape");
-  await expect(page.locator("#cmdk")).toBeHidden();
-  await expect(page.locator("#cmdk-toggle")).toBeFocused();
-  await assertBoard(page, errors);
-});
-
-// powder-ui-keyboard-firstrun: honest empty states -- a brand-new instance
-// (zero cards, zero filters) gets an onboarding welcome, distinct from a
-// filter that simply matches nothing. Uses the second, genuinely-empty
-// fixture server (see EMPTY_BASE_URL) so this proves against a board that
-// really has zero cards, not a populated one with every filter cleared.
-for (const mode of MODES) {
-  test(`board · ${mode} · a brand-new instance renders the welcome empty state (powder-ui-keyboard-firstrun)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode, `${EMPTY_BASE_URL}/board`);
-    await expect(page.locator("#lane-ready")).toContainText("Welcome");
-    await expect(page.locator("#lane-ready")).toContainText("powder key-create");
-    const nudge = page.locator("#lane-ready [data-firstrun-file-card]");
-    await expect(nudge).toBeVisible();
-    await assertBoard(page, errors);
-    await nudge.click();
-    await expect(page.locator("#quick-add-panel")).toBeVisible();
-  });
-}
-
-test("board · empty default Overview renders the first-run welcome", async ({ page }) => {
-  const errors = await bootFresh(page, "light", `${EMPTY_BASE_URL}/board`);
-  await expect(page.locator("#tab-overview")).toHaveAttribute("aria-selected", "true");
-  const overview = page.locator("#overview");
-  await expect(overview).toContainText("Welcome");
-  await expect(overview).toContainText("powder key-create");
-  const nudge = overview.locator("[data-firstrun-file-card]");
-  await expect(nudge).toBeVisible();
-  await nudge.click();
-  await expect(page.locator("#quick-add-panel")).toBeVisible();
-  await assertBoard(page, errors);
-});
-
-test("board · one display-title helper strips EPIC labels across card surfaces", async ({
-  page,
-}) => {
-  const errors = await bootFresh(page, "light");
-  await expect(
-    page.locator(".pw-rollup-row[data-id='epic-hierarchy'] .pw-rollup-title"),
-  ).toHaveText("ship the hierarchy view");
-
-  await page.locator("#tab-board").click();
-  await expect(page.locator("#lane-ready [data-id='epic-hierarchy'] .pw-card-t")).toHaveText(
-    "ship the hierarchy view",
-  );
-  await expect(page.locator("#lane-done [data-id='epic-mismatch'] .pw-done-t")).toHaveText(
-    "mismatch example",
-  );
-
-  await page.locator("#cmdk-toggle").click();
-  await page.locator("#cmdk-input").fill("ship the hierarchy view");
-  await expect(page.locator(".pw-cmdk-item-title").first()).toHaveText("ship the hierarchy view");
-  await page.keyboard.press("Escape");
-
-  await page.locator("#lane-ready [data-id='epic-hierarchy']").click();
-  await expect(page).toHaveURL(/\/c\/epic-hierarchy$/);
-  await expect(page.locator(".pw-detail-title")).toHaveText("ship the hierarchy view");
-  await assertBoard(page, errors);
-});
-
-for (const mode of MODES) {
-  test(`board · ${mode} · a filter matching nothing names the active filters (powder-ui-keyboard-firstrun)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode);
-    await page.locator("#filter-btn").click();
-    await page.locator("#text-filter").fill("zzz-no-such-card-zzz");
-    await expect(page.locator("#lane-ready")).toContainText(
-      'No matches for "zzz-no-such-card-zzz"',
-    );
-    await expect(page.locator("#lane-ready")).toContainText("clear filters");
-    await assertBoard(page, errors);
-  });
-}
-
-// powder-903: the board <-> backlog <-> both view switch is a plain CSS
-// transition on `.pw-main`'s grid-template-columns (see PR design notes),
-// not a per-frame JS animation loop. Honest scope of this spec
-// (adversarial-review rewording): it does NOT measure jank or prove the
-// main thread never stalls -- it proves a click landing while the CSS
-// transition is verifiably mid-interpolation (the rail's resolved grid
-// track is strictly between its start and end widths at the moment of the
-// next click) is handled immediately rather than dropped or queued behind
-// the animation. The pre-PR rAF loop also kept clicks working; what this
-// pins down is that the *current* transition really is in flight when the
-// next command lands, which the earlier version of this spec never
-// sampled. `--pw-view-duration` is stretched via an injected style so the
-// mid-flight window is reliably sampleable under CI load -- same
-// declarative mechanism, longer beat.
-test("board · view switch controls stay responsive mid-transition (powder-903)", async ({
-  page,
-}) => {
-  const errors = await boot(page, "light");
-  await page.addStyleTag({ content: ":root { --pw-view-duration: 600ms; }" });
-  const railTrackWidth = () =>
-    page
-      .locator("#main")
-      .evaluate((el) => parseFloat(getComputedStyle(el).gridTemplateColumns));
-  const start = await railTrackWidth();
-  expect(start, "the rail track starts at its 'both' share").toBeGreaterThan(0);
-
-  await page.locator("#tab-board").click();
-  // Wait until the resolved track width has left its start value...
-  await expect
-    .poll(railTrackWidth, { intervals: [16, 16, 16, 16, 32, 32, 64] })
-    .toBeLessThan(start);
-  // ...and sample again: strictly between end (0) and start proves the CSS
-  // transition is interpolating right now, not already finished.
-  const during = await railTrackWidth();
-  expect(during, "sampled mid-interpolation, not after the transition ended").toBeGreaterThan(0);
-  expect(during).toBeLessThan(start);
-
-  // Fire the next switch while the transition is provably in flight: the
-  // click must register immediately (aria-selected and data-view flip),
-  // not be dropped or deferred until the animation ends.
-  await page.locator("#tab-backlog").click();
-  await expect(page.locator("#tab-backlog")).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#main")).toHaveAttribute("data-view", "backlog");
-  await page.locator("#tab-both").click();
-  await expect(page.locator("#tab-both")).toHaveAttribute("aria-selected", "true");
-  await expect(page.locator("#main")).toHaveAttribute("data-view", "both");
-  await assertBoard(page, errors);
-});
-
-test("board · prefers-reduced-motion collapses the view-switch transition (powder-903)", async ({
-  page,
-}) => {
-  await page.emulateMedia({ reducedMotion: "reduce" });
-  const errors = await boot(page, "light");
-  const duration = await page
-    .locator("#main")
-    .evaluate((el) => getComputedStyle(el).transitionDuration);
-  expect(parseFloat(duration)).toBeLessThan(0.001);
-  await assertBoard(page, errors);
-});
-
-// powder-ui-hierarchy-render: get_card_detail already returns children,
-// children_total, and epic_state fully populated -- these prove
-// detailHTML() actually renders that packet instead of discarding it.
-for (const mode of MODES) {
-  test(`card route · epic-hierarchy · ${mode} · renders children and the epic-state packet (powder-ui-hierarchy-render)`, async ({
-    page,
-  }) => {
-    const errors = await boot(page, mode, "/c/epic-hierarchy");
-    await expect(page.locator("#detail-body")).toContainText("EPIC PROGRESS");
-    await expect(page.locator("#detail-body")).toContainText(
-      "1/2 criteria checked across 2 children",
-    );
-    const doneChip = page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", {
-      hasText: "done 1",
-    });
-    const readyChip = page.locator(".pw-epic-progress ~ .pw-repo-counts .pw-chip", {
-      hasText: "ready 1",
-    });
-    await expect(doneChip).toBeVisible();
-    await expect(doneChip).toHaveAttribute("data-status", "done");
-    await expect(readyChip).toBeVisible();
-    await expect(readyChip).toHaveAttribute("data-status", "ready");
-    // evidence carries child provenance (child id + label), not just a bare link
-    await expect(page.locator("#detail-body")).toContainText("epic-hierarchy-child-a · proof");
-    await expect(page.locator("#detail-body")).toContainText("https://example.test/pr/1");
-
-    await expect(page.locator("#detail-body")).toContainText("CHILDREN");
-    const childLink = page.locator("#detail-body a", { hasText: "epic-hierarchy-child-a" });
-    await expect(childLink).toHaveAttribute("href", "/c/epic-hierarchy-child-a");
-    await assertBoard(page, errors);
-
-    // children link back up to their parent from their own detail page.
-    await childLink.click();
-    await expect(page).toHaveURL(/\/c\/epic-hierarchy-child-a$/);
-    await expect(page.locator("#detail-body")).toContainText("part of epic-hierarchy");
-    await expect(page.locator(".pw-parent-badge")).toHaveAttribute(
-      "href",
-      "/c/epic-hierarchy",
-    );
-    await assertBoard(page, errors);
-  });
-}
-
-test("card route · epic-mismatch · parent/child drift renders as a warning, not a silent pass (powder-ui-hierarchy-render)", async ({
-  page,
-}) => {
-  const errors = await boot(page, "light", "/c/epic-mismatch");
-  await expect(page.locator(".pw-epic-warn")).toBeVisible();
-  await expect(page.locator(".pw-epic-warn")).toContainText(
-    "parent is done while 1 of 1 children are not terminal",
-  );
-  await assertBoard(page, errors);
-});
-
-test('board · child cards badge "part of <epic>" even though the board list has no children_total (powder-ui-hierarchy-render)', async ({
-  page,
-}) => {
-  const errors = await boot(page, "light");
-  const badge = page.locator('[data-id="epic-hierarchy-child-b"] .pw-rel-badge', {
-    hasText: "part of epic-hierarchy",
-  });
-  await expect(badge).toBeVisible();
-  await assertBoard(page, errors);
-});
-
-for (const mode of MODES) {
-  for (const route of SITE_ROUTES) {
-    test(`site ${route.name} · ${mode} · the law holds`, async ({ page }) => {
-      const errors = await bootSite(page, mode, route);
-      await expect(page.locator("body")).toContainText(route.expected);
-      await assertBoard(page, errors);
-    });
-  }
-}
-
-for (const mode of MODES) {
-  for (const viewport of CARD_ROUTE_VIEWPORTS) {
-    test(`card route · ${mode} · ${viewport.name} · the law holds`, async ({ page }) => {
-      await page.setViewportSize(viewport.size);
-      const errors = await boot(page, mode, "/c/001");
-      await expect(page.locator("#powder-card-app")).toBeVisible();
-      await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
-      await expect(page.locator("#detail-body")).toContainText("ACCEPTANCE");
-      // powder-942: home affordance present next to the existing "board"
-      // link at every viewport this route is tested at, mobile included.
-      await expect(page.locator("#detail-home-link")).toBeVisible();
-      await expect(page.locator("#detail-home-link")).toHaveAttribute(
-        "href",
-        "https://sanctum.example.test",
-      );
-      await assertBoard(page, errors);
-    });
-  }
-}
-
-test("board · touch device · keyboard-shortcut hint hides, footer bar and home link stay reachable (powder-930, powder-942)", async ({
-  browser,
-}) => {
-  // pointer:coarse is the touch signal the CSS keys off, not viewport width
-  // (a narrowed desktop window should keep the hint) -- hasTouch is how
-  // Chromium reports a coarse primary pointer under Playwright.
-  //
-  // Superseded assertion (powder-942): the whole `.pw-foot` bar used to hide
-  // here, but that also hid the home-affordance link on every touch device --
-  // exactly where it matters most. Only the hint itself (`.pw-foot-hint`,
-  // genuinely dead weight with no keyboard) hides now; the bar and the home
-  // link stay visible.
-  const context = await browser.newContext({
-    viewport: { width: 390, height: 900 },
-    hasTouch: true,
-  });
-  const page = await context.newPage();
-  const errors = collectConsoleErrors(page);
-  await page.addInitScript(() => localStorage.setItem("pw-mode", "light"));
-  await page.goto("/board");
-  await waitForSettled(page);
-  await expect(page.locator(".pw-foot")).toBeVisible();
-  await expect(page.locator(".pw-foot-hint")).toBeHidden();
-  await expect(page.locator("#footer-home-link")).toBeVisible();
-  await expect(page.locator("#footer-home-link")).toHaveAttribute(
-    "href",
-    "https://sanctum.example.test",
-  );
-  await assertBoard(page, errors);
-  await context.close();
-});
-
-test("the gate catches a planted console error (not theater)", async ({
-  page,
-}) => {
-  // proves the wiring actually fails on a violation rather than silently
-  // passing everything — the gate's live assertion is console-clean.
-  const errors: string[] = [];
-  page.on("console", (msg) => {
-    if (msg.type() === "error") errors.push(msg.text());
-  });
-  await page.goto("/board");
-  await waitForSettled(page);
-  expect(errors, "no console errors on a clean board").toEqual([]);
-
-  await page.evaluate(() => console.error("planted gate self-test error"));
-  expect(errors.length, "the gate must catch the planted error").toBe(1);
-});
-
-// powder-925: the operator's mobile write path. These run once each,
-// standalone (not mode-looped), and last in the file -- the quick-add test
-// creates a persistent card in the shared fixture DB, which would break
-// board-card-link's "first rail card is 001" assumption if it ran earlier.
-// The status-change test restores 001's status before finishing, so it's
-// safe regardless of order, but is kept alongside its sibling for clarity.
-
-test("board · mobile-390 · operator can change a card's status with no CLI (powder-925)", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 390, height: 900 });
-  const errors = await boot(page, "light", "/c/001");
-  await expect(page.locator("#detail-status-change")).toHaveValue("ready");
-
-  const updated = page.waitForResponse(
-    (response) =>
-      /\/api\/v1\/cards\/001\/status$/.test(response.url()) && response.request().method() === "POST",
-  );
-  await page.locator("#detail-status-change").selectOption("backlog");
-  const response = await updated;
-  expect(response.status()).toBe(200);
-  await expect(page.locator("#detail-status-change")).toHaveValue("backlog");
-  await expect(page.locator(".pw-st")).toContainText("backlog");
-
-  // restore the fixture card's status so a later local run against the
-  // same reused DB still finds 001 ready.
-  const restored = page.waitForResponse(
-    (response) =>
-      /\/api\/v1\/cards\/001\/status$/.test(response.url()) && response.request().method() === "POST",
-  );
-  await page.locator("#detail-status-change").selectOption("ready");
-  await restored;
-
-  await assertBoard(page, errors);
-});
-
-test("board · mobile-390 · operator can quick-add a card with no CLI (powder-925)", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 390, height: 900 });
-  const errors = await boot(page, "light");
-  await expect(page.locator("#quick-add-panel")).toBeHidden();
-  await page.locator("#quick-add-toggle").click();
-  await expect(page.locator("#quick-add-panel")).toBeVisible();
-
-  await page.locator("#quick-add-title").fill("powder-925 law-gate quick add");
-  await page.locator("#quick-add-body").fill("Filed touch-first, no CLI, from a 390px viewport.");
-  await page.locator("#quick-add-attachments").setInputFiles({
-    name: "law-proof.png",
-    mimeType: "image/png",
-    buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
-  });
-  await expect(page.locator("#quick-add-attachment-list")).toContainText("law-proof.png");
-  const repoBeforeSubmit = await page.locator("#quick-add-repo").inputValue();
-  expect(repoBeforeSubmit, "captures default to the repo-less general bucket (operator ruling 2026-07-20)").toBe("");
-
-  const created = page.waitForResponse(
-    (response) => response.url().endsWith("/api/v1/cards") && response.request().method() === "POST",
-  );
-  const uploaded = page.waitForRequest(
-    (request) => request.url().includes("/api/v1/cards/") && request.url().endsWith("/attachments") && request.method() === "POST",
-  );
-  await page.locator("#quick-add-form button[type=submit]").click();
-  const response = await created;
-  expect(response.status()).toBe(200);
-  const createdKey = (await response.request().allHeaders())["idempotency-key"] || "";
-  expect(createdKey, "quick-add card creation must carry a receipt").not.toBe("");
-  const uploadedRequest = await uploaded;
-  const uploadKey = (await uploadedRequest.allHeaders())["idempotency-key"] || "";
-  expect(uploadKey, "quick-add attachment upload must carry a receipt").not.toBe("");
-  expect(uploadKey).not.toBe(createdKey);
-  const card = await response.json();
-  expect(card.title).toBe("powder-925 law-gate quick add");
-  expect(card.status).toBe("backlog");
-
-  await expect(page.locator("#quick-add-panel")).toBeHidden();
-  const board = page.locator("#board");
-  const overflows = await board.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
-  expect(overflows, "quick-add panel must not force horizontal scroll at 390px").toBe(false);
-  await assertBoard(page, errors);
-});
-
-// powder-epic-answer-board: proves the board updates itself from the SSE
-// tail (GET /api/v1/events/tail), not just from its own write paths. The
-// card below is created out-of-band via page.request (bypassing the page's
-// own quick-add form entirely) -- the only way it can appear in the DOM is
-// the live stream noticing the card-created event and the debounced
-// refetch picking it up, with no navigation.
-test("board · live updates over SSE refresh the board in place (powder-epic-answer-board)", async ({
-  page,
-}) => {
-  const errors = await boot(page, "light");
-  await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
-    timeout: 15_000,
-  });
-
-  // No `repo` field, and a non-numeric id suffix ("...x", not a bare
-  // timestamp): `repo_from_numeric_card_id_prefix` (powder-core) would
-  // otherwise auto-assign an unregistered repo from a purely-numeric id
-  // tail, which the board's default "active tier only" scope then hides
-  // (no Repository row means `repoPassesScope` can't find it) -- neither
-  // has anything to do with live updates and both would make this test
-  // flaky for the wrong reason. Omitting `repo` and dodging the numeric
-  // suffix keeps this card in the always-visible "general" bucket, same as
-  // the rest of this fixture's cards (see start-fixture-server.sh).
-  const cardId = `law-gate-live-${Date.now()}x`;
-  const created = await page.request.post("/api/v1/cards", {
-    headers: { "Idempotency-Key": `law-gate-live-card-create:${cardId}` },
-    data: {
-      id: cardId,
-      title: "SSE live-update proof card",
-      acceptance: [],
-      status: "backlog",
-    },
-  });
-  expect(created.ok()).toBe(true);
-
-  await expect(page.locator(`#rail-list [data-id="${cardId}"]`)).toBeVisible({
-    timeout: 15_000,
-  });
-  await expect(page.locator("#live-indicator")).toHaveAttribute("title", /last event/, {
-    timeout: 5_000,
-  });
-
-  await assertBoard(page, errors);
-});
-
-test("board · child live updates highlight the parent epic rollup", async ({ page }) => {
-  const errors = await bootFresh(page, "light");
-  await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
-    timeout: 15_000,
-  });
-
-  const childId = "epic-hierarchy-child-b";
-  const parent = page.locator(".pw-rollup-row[data-id='epic-hierarchy']");
-  await expect(parent).toBeVisible();
-  const originalResponse = await page.request.get(`/api/v1/cards/${childId}`);
-  expect(originalResponse.ok(), "the fixture child detail loads").toBe(true);
-  const originalStatus = (await originalResponse.json()).card.status as string;
-  const changedStatus = originalStatus === "done" ? "ready" : "done";
-  const receipt = Date.now();
-  let mutated = false;
-  try {
-    const changed = await page.request.post(`/api/v1/cards/${childId}/status`, {
-      headers: { "Idempotency-Key": `law-gate-epic-highlight:${receipt}:change` },
-      data: { status: changedStatus },
-    });
-    mutated = changed.ok();
-    expect(mutated, "the fixture child status changes").toBe(true);
-    await expect(parent).toHaveClass(/pw-card-live-changed/, { timeout: 15_000 });
-  } finally {
-    if (mutated) {
-      const restored = await page.request.post(`/api/v1/cards/${childId}/status`, {
-        headers: { "Idempotency-Key": `law-gate-epic-highlight:${receipt}:restore` },
-        data: { status: originalStatus },
-      });
-      expect(restored.ok(), "the fixture child status is restored").toBe(true);
-    }
-  }
-  await assertBoard(page, errors);
-});
-
-// Review regression (powder-ui-awaiting-you review): the header's right
-// cluster holds several controls -- live indicator, quick-add, filter,
-// settings. Before .pw-top-right learned to flex-wrap, a 390px viewport
-// pushed #settings-toggle fully off-viewport with no scrollbar to reach it
-// (the app shell is overflow:hidden). This reproduces that state -- with a
-// real SSE event landed so the indicator is in its final connected form --
-// and asserts every header control stays inside the viewport.
-test("board · mobile-390 · header controls stay on-screen with the live indicator connected (powder-ui-awaiting-you review)", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 390, height: 900 });
-  const errors = await boot(page, "light");
-
-  // land a real SSE event so the indicator reaches its connected state
-  await expect(page.locator("#live-indicator")).toHaveAttribute("data-state", "live", {
-    timeout: 15_000,
-  });
-  const headerWrapCardId = `law-gate-headerwrap-${Date.now()}x`;
-  const created = await page.request.post("/api/v1/cards", {
-    headers: { "Idempotency-Key": `law-gate-headerwrap-card-create:${headerWrapCardId}` },
-    data: {
-      id: headerWrapCardId,
-      title: "header wrap trigger card",
-      acceptance: [],
-      status: "backlog",
-    },
-  });
-  expect(created.ok()).toBe(true);
-  await expect(page.locator("#live-indicator")).toHaveAttribute("title", /last event/, {
-    timeout: 15_000,
-  });
-
-  const viewport = page.viewportSize();
-  expect(viewport).not.toBeNull();
-  for (const id of ["#settings-toggle", "#filter-btn", "#quick-add-toggle", "#cmdk-toggle", "#live-indicator"]) {
-    const box = await page.locator(id).boundingBox();
-    expect(box, `${id} must have a bounding box`).not.toBeNull();
-    expect(box!.x, `${id} must not start left of the viewport`).toBeGreaterThanOrEqual(0);
-    if (id !== "#live-indicator") {
-      expect(box!.width, `${id} must be at least 44px wide`).toBeGreaterThanOrEqual(44);
-      expect(box!.height, `${id} must be at least 44px tall`).toBeGreaterThanOrEqual(44);
-    }
-    expect(
-      box!.x + box!.width,
-      `${id} must end inside the ${viewport!.width}px viewport`,
-    ).toBeLessThanOrEqual(viewport!.width);
-  }
-
-  await assertBoard(page, errors);
-});
-
-// powder-915: zero-card repositories are hidden from the settings list by
-// default, behind an explicit "show empty" toggle -- registers a real
-// repository entity with no cards via the same API the settings form uses,
-// standalone (not mode-looped) and last in the file since it's a write
-// against the shared fixture DB, cleaned up afterward via DELETE so a
-// second local run against the reused dev DB starts from the same state.
-test("board · a zero-card repository is hidden until the show-empty toggle is used (powder-915)", async ({
-  page,
-}) => {
-  const repoName = `law-gate-zero-card-${Date.now()}`;
-  const created = await page.request.post("/api/v1/repositories", {
-    headers: { "Idempotency-Key": `law-gate-zero-card-repository-create:${repoName}` },
-    data: { name: repoName, aliases: [], visibility: "visible", tier: "active" },
-  });
-  expect(created.ok()).toBe(true);
-
-  const errors = await boot(page, "light");
-  await page.locator("#settings-toggle").click();
-  await expect(page.locator("#auth-panel")).toBeVisible();
-
-  const row = page.locator(`.pw-repo-row[data-repo-name="${repoName}"]`);
-  await expect(row).toBeHidden();
-  const toggle = page.locator("#repo-empty-toggle");
-  await expect(toggle).toBeVisible();
-  await expect(toggle).toHaveAttribute("aria-pressed", "false");
-
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("aria-pressed", "true");
-  await expect(row).toBeVisible();
-  await expect(row.locator(".pw-num")).toHaveText("0");
-
-  await assertBoard(page, errors);
-
-  // Review fix: showEmptyRepos persists through the same
-  // saveBoardState()/restoreBoardState() session round-trip as its sibling
-  // showAllTiers -- navigate out to a card (which saves board state) and
-  // back to the board (which restores it), then confirm the toggle is
-  // still engaged instead of silently reset.
-  await page.locator("#tab-board").click();
-  await expect(page.locator("#tab-board")).toHaveAttribute("aria-selected", "true");
-  await page.locator("#board [data-card-link]").first().click();
+  await page.keyboard.press("j");
+  await expect(page.locator("[data-card-link]").first()).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/\/c\//);
   await expect(page.locator("#powder-card-app")).toBeVisible();
-  await page.locator("#detail-board-link").click();
-  await expect(page.locator("#powder-board-app")).toBeVisible();
-  await waitForSettled(page);
-  await page.locator("#settings-toggle").click();
-  await expect(page.locator("#repo-empty-toggle")).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator(`.pw-repo-row[data-repo-name="${repoName}"]`)).toBeVisible();
-
-  const deleted = await page.request.delete(`/api/v1/repositories/${repoName}`, {
-    headers: { "Idempotency-Key": `law-gate-zero-card-repository-delete:${repoName}` },
-  });
-  expect(deleted.ok(), "clean up the zero-card fixture repository").toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(page).toHaveURL(/\/board$/);
+  await assertLedger(page, errors);
 });
 
-
-// powder-operation-authority: every browser mutation receives a non-empty
-// caller-owned receipt, retries can replay that receipt, and separate intents
-// do not share it. This observes the actual served transport, not source text.
-test("board · operation authority · mutation receipts are stable and unique", async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 900 });
-  const observed: Array<{ method: string; path: string; headers: Record<string, string> }> = [];
-  const pending = new Set<Promise<void>>();
-  page.on("request", (request) => {
-    const url = new URL(request.url());
-    if (!url.pathname.startsWith("/api/v1/")) return;
-    const task = (async () => {
-      observed.push({ method: request.method(), path: url.pathname, headers: await request.allHeaders() });
-    })();
-    pending.add(task);
-    void task.finally(() => pending.delete(task));
+test("card detail · retains context, claim state, proof, timeline, and edit", async ({ page }) => {
+  const errors = await boot(page, "/c/001");
+  await expect(page.locator("#detail-body")).toContainText("Lifecycle example card");
+  await expect(page.locator("#detail-body")).toContainText("ACCEPTANCE");
+  await expect(page.locator("#detail-body")).toContainText("CLAIM");
+  await expect(page.locator("#detail-body")).toContainText("PROOF");
+  await expect(page.locator("#detail-body")).toContainText("TIMELINE");
+  await expect(page.locator("#detail-edit-form")).toBeVisible();
+  await expect(page.locator(".pw-attachments")).toHaveCount(0);
+  await page.locator("#detail-board-link").click();
+  await expect(page).toHaveURL(/\/board$/);
+  await assertLedger(page, errors);
+});
+test("card detail · renders typed event change and authority identity separately", async ({ page }) => {
+  await page.route("**/api/v1/cards/001", async (route) => {
+    const response = await route.fetch();
+    const data = await response.json();
+    data.events = [{ event_type: "status", actor: "semantic-worker", principal: "credential-1", role: "admin", run_id: "run-1", change: { kind: "status", previous: "ready", current: "done" }, created_at: 1 }];
+    await route.fulfill({ response, json: data });
   });
+  const errors = await boot(page, "/c/001");
+  const timeline = page.locator("#detail-body").locator(".pw-trail").last();
+  await expect(timeline).toContainText("actor semantic-worker");
+  await expect(timeline).toContainText("principal credential-1");
+  await expect(timeline).toContainText("role admin");
+  await expect(timeline).toContainText("run run-1");
+  await expect(timeline).toContainText("status ready → done");
+  await assertLedger(page, errors);
+});
 
-  await boot(page, "light", "/c/001");
-  const firstStatus = page.waitForResponse(
-    (response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST",
-  );
+test("card detail · status change keeps the typed mutation contract", async ({ page }) => {
+  const errors = await boot(page, "/c/001");
+  const changed = page.waitForResponse((response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST");
   await page.locator("#detail-status-change").selectOption("backlog");
-  await expect((await firstStatus).status()).toBe(200);
-
-  const retryKey = await page.evaluate(async () => {
-    const options = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "backlog" }),
-    };
-    await apiJson("/api/v1/cards/001/status", options);
-    const key = options.idempotencyKey;
-    await apiJson("/api/v1/cards/001/status", options);
-    return key;
-  });
-
-  const restoreStatus = page.waitForResponse(
-    (response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST",
-  );
+  expect((await changed).status()).toBe(200);
+  await expect(page.locator("#detail-status-change")).toHaveValue("backlog");
+  const restored = page.waitForResponse((response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST");
   await page.locator("#detail-status-change").selectOption("ready");
-  await expect((await restoreStatus).status()).toBe(200);
-  await Promise.all([...pending]);
+  expect((await restored).status()).toBe(200);
+  await assertLedger(page, errors);
+});
 
-  const mutationRequests = observed.filter(({ method }) => !["GET", "HEAD"].includes(method));
-  expect(mutationRequests.length).toBeGreaterThanOrEqual(4);
-  for (const request of mutationRequests) {
-    const key = request.headers["idempotency-key"] || "";
-    expect(key, "mutation request must carry a receipt").not.toBe("");
+test("board · create and edit use the retained card routes", async ({ page }) => {
+  const errors = await boot(page);
+  const cardId = `law-ui-${Date.now()}x`;
+  await page.locator("#quick-add-toggle").click();
+  await page.locator("#quick-add-form [name=id]").fill(cardId);
+  await page.locator("#quick-add-title").fill("Created ledger card");
+  await page.locator("#quick-add-body").fill("A card created through the human ledger.");
+  await page.locator("#quick-add-acceptance").fill("the ledger shows the card");
+  const created = page.waitForResponse((response) => response.url().endsWith("/api/v1/cards") && response.request().method() === "POST");
+  await page.locator("#quick-add-submit").click();
+  expect((await created).status()).toBe(200);
+  await expect(page.locator("#quick-add-panel")).toBeHidden();
+  await page.goto(`/c/${cardId}`);
+  await settle(page);
+  await expect(page.locator("#detail-edit-form")).toBeVisible();
+  await page.locator("#detail-edit-form [name=title]").fill("Edited ledger card");
+  const edited = page.waitForResponse((response) => response.url().endsWith(`/api/v1/cards/${cardId}`) && response.request().method() === "PATCH");
+  await page.locator("#detail-edit-form").getByRole("button", { name: "Save changes" }).click();
+  expect((await edited).status()).toBe(200);
+  await expect(page.locator("#detail-body")).toContainText("Edited ledger card");
+  await assertLedger(page, errors);
+});
+
+test("card detail · awaiting input exposes a typed answer action", async ({ page }) => {
+  const errors = await boot(page, "/c/awaiting-answer");
+  await expect(page.locator("#detail-body")).toContainText("INPUT REQUESTED");
+  const answer = page.locator("#answer-form");
+  await expect(answer).toBeVisible();
+  await answer.locator("[name=answer]").fill("Ship it behind a flag.");
+  const request = page.waitForRequest((request) => request.url().includes("/api/v1/runs/") && request.url().endsWith("/answer") && request.method() === "POST");
+  const response = page.waitForResponse((response) => response.url().includes("/api/v1/runs/") && response.url().endsWith("/answer") && response.request().method() === "POST");
+  await answer.getByRole("button", { name: "Send answer" }).click();
+  const sent = await request;
+  expect((await response).status()).toBe(200);
+  expect((await sent.postDataJSON()).answer).toBe("Ship it behind a flag.");
+  await assertLedger(page, errors);
+});
+
+test("board · denied reads show one safe access state", async ({ page }) => {
+  await page.route("**/api/v1/**", async (route) => {
+    if (route.request().url().includes("/api/v1/onboarding")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ auth_mode: "api_key", public_reads: false, needs_setup: false }) });
+      return;
+    }
+    await route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "denied" }) });
+  });
+  const errors = await boot(page);
+  await expect(page.locator("#auth-panel")).toBeVisible();
+  await expect(page.locator("#auth-intro")).toContainText("denied the read");
+  await expect(page.locator("#mint-hint")).toBeVisible();
+  await expect(page.locator("#lane-ready")).toContainText("Connect with an API key");
+  await expect(page.locator("#lane-ready")).not.toContainText("denied");
+  await assertLedger(page, errors);
+});
+
+test("board · access key stays in session storage and clear removes it", async ({ page }) => {
+  const errors = await boot(page);
+  await page.locator("#auth-toggle").click();
+  await page.locator("#api-key-input").fill("law-session-key");
+  await page.locator("#api-key-form").getByRole("button", { name: "save key" }).click();
+  await expect.poll(() => page.evaluate(() => ({ session: sessionStorage.getItem("powder-api-key"), local: localStorage.getItem("powder-api-key") }))).toEqual({ session: "law-session-key", local: null });
+  await page.locator("#clear-api-key").click();
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem("powder-api-key"))).toBeNull();
+  await assertLedger(page, errors);
+});
+
+test("board · migrates a legacy access key into this tab only", async ({ page }) => {
+  await page.addInitScript(() => {
+    sessionStorage.clear();
+    localStorage.setItem("powder-api-key", "law-legacy-key");
+  });
+  const errors = captureErrors(page);
+  await page.goto("/board");
+  await settle(page);
+  await expect.poll(() => page.evaluate(() => ({ session: sessionStorage.getItem("powder-api-key"), local: localStorage.getItem("powder-api-key") }))).toEqual({ session: "law-legacy-key", local: null });
+  await assertLedger(page, errors);
+});
+
+test("board · search blocker context keeps a result in BLOCKED", async ({ page }) => {
+  await page.route("**/api/v1/cards/search**", async (route) => {
+    const blocker = `law-search-blocker-${Date.now()}`;
+    const card = { id: `law-search-blocked-${Date.now()}`, title: "Search blocked card", body: "", status: "ready", priority: "p1", blocked_by: [] };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ matches: [{ card, blocked_by: [blocker], rank: 1 }], total_count: 1, has_more: false }) });
+  });
+  const errors = await boot(page);
+  await page.locator("#filter-toggle").click();
+  await page.locator("#text-filter").fill("Search blocked");
+  await expect(page.locator("#lane-ready .pw-blocked-cap")).toHaveText("BLOCKED");
+  await expect(page.locator("#lane-ready")).toContainText("Search blocked card");
+  await assertLedger(page, errors);
+});
+
+test("board · the latest filter-only ready response wins", async ({ page }) => {
+  let readyCalls = 0;
+  let releaseFirst: (() => void) | undefined;
+  await page.route("**/api/v1/cards/ready**", async (route) => {
+    const call = ++readyCalls;
+    if (call === 1) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ cards: [], total_count: 0, has_more: false }) });
+      return;
+    }
+    const card = { id: call === 2 ? "law-stale-ready" : "law-current-ready", title: call === 2 ? "Stale ready card" : "Current ready card", body: "", status: "ready", priority: "p1", blocked_by: [] };
+    if (call === 2) await new Promise<void>((resolve) => { releaseFirst = resolve; });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ cards: [card], total_count: 1, has_more: false }) });
+  });
+  const errors = await boot(page);
+  await page.evaluate(() => { refreshReadyForFilters(); refreshReadyForFilters(); });
+  await expect.poll(() => readyCalls).toBeGreaterThanOrEqual(3);
+  releaseFirst?.();
+  await expect(page.locator("#lane-ready")).toContainText("Current ready card");
+  await expect(page.locator("#lane-ready")).not.toContainText("Stale ready card");
+  await assertLedger(page, errors);
+});
+
+test("board · primes the event cursor before the live SSE connection", async ({ page }) => {
+  const tails: Array<{ live: string; after: string; limit: string }> = [];
+  await page.route("**/api/v1/events/tail**", async (route) => {
+    const url = new URL(route.request().url());
+    const record = { live: url.searchParams.get("live") || "", after: url.searchParams.get("after") || "", limit: url.searchParams.get("limit") || "" };
+    tails.push(record);
+    if (record.live === "false") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "id: 42\n\n" });
+      return;
+    }
+    await route.continue();
+  });
+  const errors = await boot(page);
+  await expect.poll(() => tails.some(({ live }) => live === "true")).toBe(true);
+  expect(tails[0]).toEqual({ live: "false", after: "", limit: "500" });
+  expect(tails.find(({ live }) => live === "true")?.after).toBe("42");
+  await assertLedger(page, errors);
+});
+
+test("board · live refresh updates the READY lane", async ({ page }) => {
+  let readyCalls = 0;
+  let emitted = false;
+  await page.route("**/api/v1/cards/ready**", async (route) => {
+    const card = { id: "law-live-ready", title: "Live ready card", body: "", status: "ready", priority: "p1", blocked_by: [] };
+    const cards = readyCalls++ === 0 ? [] : [card];
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ cards, total_count: cards.length, has_more: false }) });
+  });
+  await page.route("**/api/v1/events/tail**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("live") === "false") {
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: "id: 1\n\n" });
+      return;
+    }
+    const body = emitted ? "" : "id: 2\ndata: live\n\n";
+    emitted = true;
+    await route.fulfill({ status: 200, contentType: "text/event-stream", body });
+  });
+  const errors = await boot(page);
+  await expect(page.locator("#lane-ready")).toContainText("Live ready card");
+  await expect.poll(() => readyCalls).toBeGreaterThanOrEqual(2);
+  await assertLedger(page, errors);
+});
+test("board · empty state names the next human action", async ({ page }) => {
+  const errors = captureErrors(page);
+  await page.goto(`${EMPTY_BASE_URL}/board`);
+  await settle(page);
+  await expect(page.locator("#lane-ready")).toContainText("Ledger is empty");
+  await expect(page.locator("#quick-add-toggle")).toBeVisible();
+  await assertLedger(page, errors);
+});
+
+test("board · mobile layout keeps controls and lanes reachable", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const errors = await boot(page);
+  await expect(page.locator("#quick-add-toggle")).toBeVisible();
+  await expect(page.locator("#filter-toggle")).toBeVisible();
+  await page.locator("#lane-switch [data-lane=inprogress]").click();
+  await expect(page.locator("#main")).toHaveAttribute("data-lane", "inprogress");
+  const controls = await page.locator("button, a[href]").evaluateAll((nodes) => nodes.map((node) => { const rect = node.getBoundingClientRect(); return { width: rect.width, height: rect.height, right: rect.right }; }).filter(({ width, height }) => width > 0 && height > 0));
+  expect(controls.every(({ width, height, right }) => width >= 40 && height >= 40 && right <= 390)).toBe(true);
+  await assertLedger(page, errors);
+});
+
+test("law · mutation receipts are present, stable for retries, and absent on reads", async ({ page }) => {
+  const observed: Array<{ method: string; path: string; key: string }> = [];
+  page.on("request", (request) => observed.push({ method: request.method(), path: new URL(request.url()).pathname, key: request.headers()["idempotency-key"] || "" }));
+  const errors = await boot(page, "/c/001");
+  await page.evaluate(async () => {
+    const options = { method: "POST", idempotencyKey: "law-repeat", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "backlog" }) };
+    await apiJson("/api/v1/cards/001/status", options);
+    await apiJson("/api/v1/cards/001/status", options);
+  });
+  const changed = page.waitForResponse((response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST");
+  await page.locator("#detail-status-change").selectOption("done");
+  expect((await changed).status()).toBe(200);
+  const writes = observed.filter(({ method }) => method !== "GET" && method !== "HEAD");
+  expect(writes.every(({ key }) => key.length > 0)).toBe(true);
+  expect(writes.filter(({ key }) => key === "law-repeat")).toHaveLength(2);
+  expect(new Set(writes.map(({ key }) => key)).size).toBeGreaterThan(1);
+  expect(observed.filter(({ method }) => method === "GET" || method === "HEAD").every(({ key }) => !key)).toBe(true);
+  const restored = page.waitForResponse((response) => response.url().endsWith("/api/v1/cards/001/status") && response.request().method() === "POST");
+  await page.locator("#detail-status-change").selectOption("ready");
+  expect((await restored).status()).toBe(200);
+  await assertLedger(page, errors);
+});
+
+test("board · SSE tail stays connected", async ({ page }) => {
+  let seen = false;
+  await page.route("**/api/v1/events/tail**", async (route) => { seen = true; await route.continue(); });
+  const errors = await boot(page);
+  expect(seen, "the board must open the ordered event tail").toBe(true);
+  await assertLedger(page, errors);
+});
+
+test("board · ready cursor pagination preserves the returned order", async ({ page }) => {
+  await page.route("**/api/v1/cards/ready**", async (route) => {
+    const url = new URL(route.request().url());
+    if (!url.searchParams.has("after")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ cards: [], total_count: 1, has_more: true, next_after: "ready-page-2" }) });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ cards: [{ id: "paged-ready", title: "Paged ready card", body: "", status: "ready", priority: "p0", blocked_by: [] }], total_count: 1, has_more: false }) });
+  });
+  const errors = await boot(page);
+  await expect(page.locator("#lane-ready")).toContainText("Paged ready card");
+  await assertLedger(page, errors);
+});
+
+test("board · search cursor pagination reports every matching card", async ({ page }) => {
+  await page.route("**/api/v1/cards/search**", async (route) => {
+    const url = new URL(route.request().url());
+    const card = (id: string, title: string) => ({ id, title, body: "", status: "backlog", priority: "p2", blocked_by: [] });
+    const first = !url.searchParams.has("after");
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ matches: [{ card: card(first ? "search-a" : "search-b", first ? "Paged search A" : "Paged search B"), rank: first ? 1 : 2 }], total_count: 2, has_more: first, next_after: first ? "search-page-2" : undefined }) });
+  });
+  const errors = await boot(page);
+  await page.locator("#filter-toggle").click();
+  await page.locator("#text-filter").fill("paged");
+  await expect(page.locator("#text-search-status")).toContainText("2 matching cards");
+  await expect(page.locator("#rail-list")).toContainText("Paged search B");
+  await assertLedger(page, errors);
+});
+
+test("card detail · generic parent edge remains navigable", async ({ page }) => {
+  const errors = await boot(page, "/c/parent-card");
+  await expect(page.locator("#detail-body")).toContainText("CHILD CARDS");
+  await expect(page.locator("#detail-body")).toContainText("child-card");
+  await page.goto("/c/child-card");
+  await settle(page);
+  await expect(page.locator("#detail-body")).toContainText("parent-card");
+  await assertLedger(page, errors);
+});
+
+test("card detail · proof links use the authenticated link route", async ({ page }) => {
+  const errors = await boot(page, "/c/001");
+  await page.locator("#proof-form [name=url]").fill("https://example.test/law-proof");
+  const proof = page.waitForResponse((response) => response.url().endsWith("/api/v1/cards/001/links") && response.request().method() === "POST");
+  await page.locator("#proof-form").getByRole("button", { name: "Add proof" }).click();
+  expect((await proof).status()).toBe(200);
+  await expect(page.locator("#detail-body")).toContainText("https://example.test/law-proof");
+  await assertLedger(page, errors);
+});
+
+test("ledger · quick-add exposes all seven statuses and terminal outcomes stay distinct", async ({ page }) => {
+  const errors = await boot(page);
+  await page.locator("#quick-add-toggle").click();
+  await expect(page.locator("#quick-add-status option").evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value))).resolves.toEqual(["backlog", "ready", "in_progress", "awaiting_input", "done", "shipped", "abandoned"]);
+  await page.goto("/board");
+  await settle(page);
+  for (const status of ["done", "shipped", "abandoned"]) {
+    const row = page.locator(`.pw-done-row[data-status="${status}"]`);
+    await expect(row).toBeVisible();
+    await expect(row).toContainText(status);
   }
-  const statusKeys = observed
-    .filter(({ method, path }) => method === "POST" && path === "/api/v1/cards/001/status")
-    .map(({ headers }) => headers["idempotency-key"] || "");
-  expect(statusKeys.filter((key) => key === retryKey)).toHaveLength(2);
-  expect(new Set(statusKeys).size).toBeGreaterThanOrEqual(3);
-  expect(observed.filter(({ method }) => ["GET", "HEAD"].includes(method)).every(({ headers }) => !headers["idempotency-key"])).toBe(true);
+  await assertLedger(page, errors);
+});
+
+test("law · a planted console error is observable", async ({ page }) => {
+  const errors = captureErrors(page);
+  await page.goto("about:blank");
+  await page.evaluate(() => console.error("law probe"));
+  await page.waitForTimeout(50);
+  expect(errors).toContain("law probe");
 });

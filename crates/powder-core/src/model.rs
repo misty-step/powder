@@ -18,6 +18,11 @@ pub enum DomainError {
         class: DenialClass,
         message: String,
     },
+    /// Stored event data is known to be malformed or unsupported.
+    EventData {
+        event_type: String,
+        message: String,
+    },
     /// A mutation targeted a claim that has expired but has not yet been
     /// reclaimed by a new agent. Distinct from `Conflict` (wrong run, wrong
     /// status) so a caller can tell "your claim went stale, renew failed --
@@ -53,6 +58,13 @@ impl DomainError {
         Self::ClaimExpired(message.into())
     }
 
+    pub fn event_data(event_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::EventData {
+            event_type: event_type.into(),
+            message: message.into(),
+        }
+    }
+
     pub fn authority_denied(class: DenialClass, message: impl Into<String>) -> Self {
         Self::AuthorityDenied {
             class,
@@ -66,7 +78,7 @@ impl DomainError {
             Self::ClaimExpired(_) => Some(DenialClass::ClaimExpired),
             Self::Forbidden(_) => Some(DenialClass::Capability),
             Self::Conflict(_) => None,
-            Self::Validation { .. } | Self::NotFound { .. } => None,
+            Self::Validation { .. } | Self::NotFound { .. } | Self::EventData { .. } => None,
         }
     }
 }
@@ -79,6 +91,10 @@ impl fmt::Display for DomainError {
             Self::Conflict(message) => f.write_str(message),
             Self::Forbidden(message) => f.write_str(message),
             Self::AuthorityDenied { message, .. } => f.write_str(message),
+            Self::EventData {
+                event_type,
+                message,
+            } => write!(f, "event data invalid ({event_type}): {message}"),
             Self::ClaimExpired(message) => f.write_str(message),
         }
     }
@@ -125,7 +141,6 @@ impl PrincipalRole {
 pub enum OperationCapability {
     CardCorrection,
     WorkerExecution,
-    RepositoryAdmin,
     SecurityAdmin,
     Destructive,
 }
@@ -180,22 +195,12 @@ pub enum Operation {
     HeartbeatClaim,
     TransferClaim,
     WorkLog,
-    RecordRunTelemetry,
     AddLink,
     AddComment,
     RequestInput,
     AnswerInput,
-    AttachImage,
-    DetachImage,
-    UpsertRepository,
-    MergeRepositoryAlias,
-    DeleteRepository,
-    NormalizeRepositories,
     CreateApiKey,
     RevokeApiKey,
-    CreateSubscription,
-    DisableSubscription,
-    ReplayDeadLetter,
     Destructive,
 }
 
@@ -224,7 +229,7 @@ pub struct OperationRule {
 }
 
 impl Operation {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 20] = [
         Self::CreateCard,
         Self::PatchCard,
         Self::CheckCriterion,
@@ -238,22 +243,12 @@ impl Operation {
         Self::HeartbeatClaim,
         Self::TransferClaim,
         Self::WorkLog,
-        Self::RecordRunTelemetry,
         Self::AddLink,
         Self::AddComment,
         Self::RequestInput,
         Self::AnswerInput,
-        Self::AttachImage,
-        Self::DetachImage,
-        Self::UpsertRepository,
-        Self::MergeRepositoryAlias,
-        Self::DeleteRepository,
-        Self::NormalizeRepositories,
         Self::CreateApiKey,
         Self::RevokeApiKey,
-        Self::CreateSubscription,
-        Self::DisableSubscription,
-        Self::ReplayDeadLetter,
         Self::Destructive,
     ];
 
@@ -262,8 +257,8 @@ impl Operation {
         use IdempotencyMode::{Keyed, None as NoKey, RetrySafe};
         use IdentityRequirement::{Principal, Run as RunIdentity, Worker};
         use OperationCapability::{
-            CardCorrection as Correct, Destructive as Destroy, RepositoryAdmin as Repo,
-            SecurityAdmin as Security, WorkerExecution as Execute,
+            CardCorrection as Correct, Destructive as Destroy, SecurityAdmin as Security,
+            WorkerExecution as Execute,
         };
         let (capability, claim, identity, idempotency) = match self {
             Self::CreateCard => (Correct, None, Principal, Keyed),
@@ -284,19 +279,10 @@ impl Operation {
                 (Execute, Run, Worker, Keyed)
             }
             Self::WorkLog | Self::AddLink => (Execute, Card, Worker, Keyed),
-            Self::RecordRunTelemetry => (Execute, Run, RunIdentity, Keyed),
             Self::AddComment => (Execute, None, Principal, Keyed),
-            Self::AttachImage | Self::DetachImage => (Execute, Card, Principal, Keyed),
             Self::RequestInput | Self::AnswerInput => (Execute, Run, RunIdentity, Keyed),
-            Self::UpsertRepository
-            | Self::MergeRepositoryAlias
-            | Self::DeleteRepository
-            | Self::NormalizeRepositories => (Repo, None, Principal, Keyed),
-            Self::CreateApiKey | Self::CreateSubscription => (Security, None, Principal, NoKey),
-            Self::RevokeApiKey | Self::DisableSubscription => {
-                (Security, None, Principal, RetrySafe)
-            }
-            Self::ReplayDeadLetter => (Security, None, Principal, Keyed),
+            Self::CreateApiKey => (Security, None, Principal, NoKey),
+            Self::RevokeApiKey => (Security, None, Principal, Keyed),
             Self::Destructive => (Destroy, None, Principal, NoKey),
         };
         OperationRule {
@@ -335,22 +321,12 @@ impl Operation {
             Self::HeartbeatClaim => "heartbeat_claim",
             Self::TransferClaim => "transfer_claim",
             Self::WorkLog => "work_log",
-            Self::RecordRunTelemetry => "record_run_telemetry",
             Self::AddLink => "add_link",
             Self::AddComment => "add_comment",
             Self::RequestInput => "request_input",
             Self::AnswerInput => "answer_input",
-            Self::AttachImage => "attach_image",
-            Self::DetachImage => "detach_image",
-            Self::UpsertRepository => "upsert_repository",
-            Self::MergeRepositoryAlias => "merge_repository_alias",
-            Self::DeleteRepository => "delete_repository",
-            Self::NormalizeRepositories => "normalize_repositories",
             Self::CreateApiKey => "create_api_key",
             Self::RevokeApiKey => "revoke_api_key",
-            Self::CreateSubscription => "create_subscription",
-            Self::DisableSubscription => "disable_subscription",
-            Self::ReplayDeadLetter => "replay_dead_letter",
             Self::Destructive => "destructive",
         }
     }
@@ -430,10 +406,10 @@ impl Authority {
         }
     }
 
-    /// Administrative mutations (repository, key, and subscription policy)
-    /// require an explicit admin capability. Unchecked is retained only for
-    /// trusted fixture/none-mode callers; authenticated principals never
-    /// inherit admin from a semantic actor label.
+    /// Administrative mutations (key policy) require an explicit admin
+    /// capability. Unchecked is retained only for trusted fixture/none-mode
+    /// callers; authenticated principals never inherit admin from a semantic
+    /// actor label.
     pub fn require_admin(&self) -> Result<(), DomainError> {
         match self {
             Self::Unchecked => Ok(()),
@@ -714,75 +690,6 @@ impl Priority {
     }
 }
 
-/// A coarse size signal: a cheap, structured way for an autonomous consumer
-/// to filter for low-complexity work before spending tokens reading a full
-/// card body. Optional everywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Estimate {
-    S,
-    M,
-    L,
-    Xl,
-}
-
-impl Estimate {
-    pub const ALL: [Self; 4] = [Self::S, Self::M, Self::L, Self::Xl];
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_uppercase().as_str() {
-            "S" => Some(Self::S),
-            "M" => Some(Self::M),
-            "L" => Some(Self::L),
-            "XL" => Some(Self::Xl),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::S => "S",
-            Self::M => "M",
-            Self::L => "L",
-            Self::Xl => "XL",
-        }
-    }
-}
-
-/// A coarse blast-radius x reversibility x uncertainty signal: the
-/// orthogonal axis to `Estimate` (which covers size/effort). Together the
-/// two let a manual-fire OMP loop read "how big" and "how dangerous" before
-/// claiming a card, without opening the full body. Optional everywhere,
-/// same as `Estimate` -- no card is required to carry a risk rating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Risk {
-    Low,
-    Medium,
-    High,
-}
-
-impl Risk {
-    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
-
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
-}
-
 /// The status vocabulary (powder-status-vocabulary): seven statuses, down
 /// from the prior nine. `Claimed`/`Running` collapsed into a single
 /// `InProgress` -- the claim struct already carries who/lease/liveness, so a
@@ -816,18 +723,15 @@ impl CardStatus {
         Self::Abandoned,
     ];
 
-    /// Only the current seven-status vocabulary parses. The retired names
-    /// (`claimed`, `running`, `blocked`) intentionally fall through to
-    /// `None` rather than silently aliasing onto a surviving status --
-    /// every caller of `parse` must reject them with an error naming the
-    /// current vocabulary (see `docs/status-vocabulary.md`), not translate
-    /// them quietly.
+    /// Only the current seven-status vocabulary and canonical snake_case
+    /// spellings parse. Retired names and compatibility aliases fall through
+    /// to `None` so callers reject them instead of silently translating input.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "backlog" | "pending" => Some(Self::Backlog),
+            "backlog" => Some(Self::Backlog),
             "ready" => Some(Self::Ready),
-            "in_progress" | "in-progress" => Some(Self::InProgress),
-            "awaiting_input" | "awaiting-input" => Some(Self::AwaitingInput),
+            "in_progress" => Some(Self::InProgress),
+            "awaiting_input" => Some(Self::AwaitingInput),
             "done" => Some(Self::Done),
             "shipped" => Some(Self::Shipped),
             "abandoned" => Some(Self::Abandoned),
@@ -891,7 +795,7 @@ impl RunState {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "active" => Some(Self::Active),
-            "awaiting-input" | "awaiting_input" => Some(Self::AwaitingInput),
+            "awaiting_input" => Some(Self::AwaitingInput),
             "released" => Some(Self::Released),
             "error" => Some(Self::Error),
             "complete" => Some(Self::Complete),
@@ -915,43 +819,28 @@ impl RunState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityType {
-    Thought,
     Action,
     Response,
     Elicitation,
-    Error,
-    Prompt,
 }
 
 impl ActivityType {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "thought" => Some(Self::Thought),
             "action" => Some(Self::Action),
             "response" => Some(Self::Response),
             "elicitation" => Some(Self::Elicitation),
-            "error" => Some(Self::Error),
-            "prompt" => Some(Self::Prompt),
             _ => None,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Thought => "thought",
             Self::Action => "action",
             Self::Response => "response",
             Self::Elicitation => "elicitation",
-            Self::Error => "error",
-            Self::Prompt => "prompt",
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CardSource {
-    pub path: String,
-    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1029,14 +918,8 @@ pub struct Card {
     pub proof_plan: Vec<String>,
     pub status: CardStatus,
     pub priority: Priority,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimate: Option<Estimate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk: Option<Risk>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<CardId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1052,8 +935,6 @@ pub struct Card {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<CardSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<Claim>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -1065,10 +946,6 @@ pub struct CardSummary {
     pub title: String,
     pub status: CardStatus,
     pub priority: Priority,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimate: Option<Estimate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk: Option<Risk>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1093,8 +970,6 @@ impl From<&Card> for CardSummary {
             title: card.title.clone(),
             status: card.status,
             priority: card.priority,
-            estimate: card.estimate,
-            risk: card.risk,
             repo: card.repo.clone(),
             labels: card.labels.clone(),
             claim: card.claim.as_ref().map(ClaimSummary::from),
@@ -1119,13 +994,7 @@ struct CardFields {
     status: CardStatus,
     priority: Priority,
     #[serde(default)]
-    estimate: Option<Estimate>,
-    #[serde(default)]
-    risk: Option<Risk>,
-    #[serde(default)]
     labels: Vec<String>,
-    #[serde(default)]
-    assignee: Option<String>,
     #[serde(default)]
     related: Vec<CardId>,
     #[serde(default)]
@@ -1136,8 +1005,6 @@ struct CardFields {
     parent: Option<CardId>,
     #[serde(default)]
     repo: Option<String>,
-    #[serde(default)]
-    source: Option<CardSource>,
     #[serde(default)]
     claim: Option<Claim>,
     created_at: i64,
@@ -1159,16 +1026,12 @@ impl<'de> Deserialize<'de> for Card {
             proof_plan: fields.proof_plan,
             status: fields.status,
             priority: fields.priority,
-            estimate: fields.estimate,
-            risk: fields.risk,
             labels: fields.labels,
-            assignee: fields.assignee,
             related: fields.related,
             blocks: fields.blocks,
             blocked_by: fields.blocked_by,
             parent: fields.parent,
             repo: fields.repo,
-            source: fields.source,
             claim: fields.claim,
             created_at: fields.created_at,
             updated_at: fields.updated_at,
@@ -1214,16 +1077,12 @@ impl Card {
             proof_plan: Vec::new(),
             status: CardStatus::Backlog,
             priority: Priority::default(),
-            estimate: None,
-            risk: None,
             labels: Vec::new(),
-            assignee: None,
             related: Vec::new(),
             blocks: Vec::new(),
             blocked_by: Vec::new(),
             parent: None,
             repo: None,
-            source: None,
             claim: None,
             created_at: 0,
             updated_at: 0,
@@ -1286,16 +1145,6 @@ impl Card {
 
     pub fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
-        self
-    }
-
-    pub fn with_estimate(mut self, estimate: Option<Estimate>) -> Self {
-        self.estimate = estimate;
-        self
-    }
-
-    pub fn with_risk(mut self, risk: Option<Risk>) -> Self {
-        self.risk = risk;
         self
     }
 
@@ -1477,78 +1326,6 @@ impl Card {
         self.claim.as_ref().map(|claim| claim.principal.as_str())
     }
 
-    /// Whether this card's lifecycle (status + claim) must survive a
-    /// source refresh: an active claim, an in-progress/awaiting-input
-    /// status, or a terminal outcome. A backlog/ready card with no claim has
-    /// no live lifecycle to protect, so a reimport may refresh its status
-    /// along with its content.
-    pub fn protects_lifecycle_on_reimport(&self) -> bool {
-        self.claim.is_some()
-            || matches!(
-                self.status,
-                CardStatus::InProgress | CardStatus::AwaitingInput
-            )
-            || self.status.is_terminal()
-    }
-
-    /// Merge refreshed external content (`incoming`) onto this card's
-    /// stored state: `created_at` always survives, and when
-    /// [`protects_lifecycle_on_reimport`](Self::protects_lifecycle_on_reimport)
-    /// is true, this card's live `status`/`claim` survive too instead of
-    /// being clobbered by the source file's (necessarily claim-less) values.
-    ///
-    /// A reimport refreshes content, but must never destroy it: if the
-    /// freshly parsed file produced nothing where real content already
-    /// existed -- a heading-convention mismatch, a parser regression, a
-    /// truncated read -- keep what's stored rather than silently wiping it
-    /// (crucible-905: two cards lost their full body/acceptance this way).
-    /// A genuine edit that legitimately shrinks content without emptying it
-    /// still goes through untouched; this only guards the empty case.
-    pub fn merge_reimport(&self, incoming: Card) -> Card {
-        let mut merged = incoming;
-        if self.protects_lifecycle_on_reimport() {
-            merged.status = self.status;
-            merged.claim = self.claim.clone();
-        }
-        if merged.body.trim().is_empty() && !self.body.trim().is_empty() {
-            merged.body = self.body.clone();
-        }
-        if merged.acceptance.is_empty() && !self.acceptance.is_empty() {
-            merged.acceptance = self.acceptance.clone();
-            merged.criteria = self.criteria.clone();
-            // The incoming file's own oracle was empty, so any status it
-            // landed on came from the source adapter's empty-oracle default
-            // (Backlog). Restoring real acceptance above makes that default
-            // stale -- but only correct it back to what this card already
-            // was (Ready) before this reimport, never to any other status.
-            // Gating on `self.status` (the stored value, not the merged/
-            // incoming one) is what keeps this scoped to exactly the
-            // regression it fixes: a Ready card must not silently read as
-            // Backlog just because one reimport had a heading mismatch. It
-            // must not touch a deliberately Backlog card caught by the same
-            // malformed file (Backlog isn't lifecycle-protected either) --
-            // "was Ready, stays Ready" is a narrower, safer claim than
-            // "any non-empty acceptance implies Ready" (that broader form
-            // was a false positive: a file that deliberately keeps
-            // `Status: backlog` alongside a real Oracle section never needs
-            // this branch at all, since nothing was empty to restore).
-            if self.status == CardStatus::Ready {
-                merged.status = CardStatus::Ready;
-            }
-        } else if !merged.criteria.is_empty() {
-            // powder-963 follow-up: the freshly parsed `incoming` criteria
-            // always start with no checked/proof state (the source adapter
-            // builds them fresh from raw oracle text every time), so a plain
-            // reimport used to wipe completion evidence off every criterion
-            // on the card -- including ones whose text never changed --
-            // every single time external content was refreshed. Preserve
-            // state by criterion identity instead of overwriting wholesale.
-            merged.criteria = merge_criteria_state(&self.criteria, merged.criteria);
-        }
-        merged.created_at = self.created_at;
-        merged
-    }
-
     pub fn apply_claim(
         &mut self,
         principal: impl Into<String>,
@@ -1700,100 +1477,8 @@ pub struct Run {
     pub claim_expires_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<String>,
-    /// Bounded scalar telemetry summary; detailed attempts remain normalized in the store.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub telemetry: Option<RunTelemetrySummary>,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RunTelemetrySummary {
-    pub attempt_count: i64,
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub reasoning_tokens: Option<i64>,
-    pub estimated_cost_usd_micros: Option<i64>,
-    pub duration_ms: Option<i64>,
-    pub pricing_version: Option<String>,
-    pub outcome: Option<String>,
-    pub unattributed_attempt_count: i64,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RunTelemetryAttemptInput {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub harness: Option<String>,
-    pub reasoning: Option<String>,
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub reasoning_tokens: Option<i64>,
-    pub estimated_cost_usd_micros: Option<i64>,
-    pub duration_ms: Option<i64>,
-    pub outcome: Option<String>,
-    pub pricing_version: Option<String>,
-    pub input_rate_usd_per_million_micros: Option<i64>,
-    pub output_rate_usd_per_million_micros: Option<i64>,
-    pub reasoning_rate_usd_per_million_micros: Option<i64>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RunTelemetryWrite {
-    #[serde(default)]
-    pub attempts: Vec<RunTelemetryAttemptInput>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryReceipt {
-    pub run_id: RunId,
-    pub principal: String,
-    pub attempt_count: i64,
-    pub telemetry: RunTelemetrySummary,
-    pub replayed: bool,
-}
-
-impl RunTelemetryReceipt {
-    /// Carry the outer keyed-operation replay bit into the domain receipt.
-    pub fn with_replayed(mut self, replayed: bool) -> Self {
-        self.replayed = replayed;
-        self
-    }
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryAggregateQuery {
-    pub agent: Option<String>,
-    pub model: Option<String>,
-    pub provider: Option<String>,
-    pub limit: usize,
-}
-impl Default for RunTelemetryAggregateQuery {
-    fn default() -> Self {
-        Self {
-            agent: None,
-            model: None,
-            provider: None,
-            limit: 100,
-        }
-    }
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryAggregateRow {
-    pub agent: String,
-    pub model: String,
-    pub provider: String,
-    pub unattributed: bool,
-    pub runs: i64,
-    pub attempts: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub reasoning_tokens: i64,
-    pub estimated_cost_usd_micros: i64,
-    pub duration_ms: i64,
-    pub outcome_mix: std::collections::BTreeMap<String, i64>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunTelemetryAggregate {
-    pub rows: Vec<RunTelemetryAggregateRow>,
-    pub total_rows: i64,
-    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1809,13 +1494,267 @@ pub struct Activity {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CardEventType {
+    Create,
+    Patch,
+    Status,
+    Criterion,
+    Relations,
+    Hierarchy,
+    Link,
+    Comment,
+    WorkLog,
+    Claim,
+    Release,
+    Renew,
+    Heartbeat,
+    Transfer,
+    RequestInput,
+    AnswerInput,
+    Complete,
+    CardCreated,
+    MovedToReady,
+    AwaitingInput,
+    ClaimExpired,
+    Completed,
+    CommentAdded,
+    WorkLogAppended,
+}
+
+impl CardEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Patch => "patch",
+            Self::Status => "status",
+            Self::Criterion => "criterion",
+            Self::Relations => "relations",
+            Self::Hierarchy => "hierarchy",
+            Self::Link => "link",
+            Self::Comment => "comment",
+            Self::WorkLog => "work-log",
+            Self::Claim => "claim",
+            Self::Release => "release",
+            Self::Renew => "renew",
+            Self::Heartbeat => "heartbeat",
+            Self::Transfer => "transfer",
+            Self::RequestInput => "request-input",
+            Self::AnswerInput => "answer-input",
+            Self::Complete => "complete",
+            Self::CardCreated => "card-created",
+            Self::MovedToReady => "moved-to-ready",
+            Self::AwaitingInput => "awaiting-input",
+            Self::ClaimExpired => "claim-expired",
+            Self::Completed => "completed",
+            Self::CommentAdded => "comment-added",
+            Self::WorkLogAppended => "work-log-appended",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.as_str() == raw)
+    }
+
+    pub const ALL: [Self; 24] = [
+        Self::Create,
+        Self::Patch,
+        Self::Status,
+        Self::Criterion,
+        Self::Relations,
+        Self::Hierarchy,
+        Self::Link,
+        Self::Comment,
+        Self::WorkLog,
+        Self::Claim,
+        Self::Release,
+        Self::Renew,
+        Self::Heartbeat,
+        Self::Transfer,
+        Self::RequestInput,
+        Self::AnswerInput,
+        Self::Complete,
+        Self::CardCreated,
+        Self::MovedToReady,
+        Self::AwaitingInput,
+        Self::ClaimExpired,
+        Self::Completed,
+        Self::CommentAdded,
+        Self::WorkLogAppended,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimEventAction {
+    Acquired,
+    Released,
+    Renewed,
+    Heartbeat,
+    Transferred,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputEventAction {
+    Requested,
+    Answered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentEventAction {
+    Attached,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryEventAction {
+    Upserted,
+    Deleted,
+    AliasMerged,
+    Normalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollupEventAction {
+    StatusChanged,
+    ChildCompleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecomposeEventAction {
+    Linked,
+    Unlinked,
+    ChildCreated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportEventOutcome {
+    Created,
+    Updated,
+    Preserved,
+    Unchanged,
+}
+
+/// The only event payload vocabulary accepted by audit and outbound writers.
+/// Retired variants are deserialization-only and are never emitted by a new
+/// mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CardEventChange {
+    Create {
+        source: String,
+    },
+    Patch {
+        fields: Vec<String>,
+    },
+    Status {
+        previous: CardStatus,
+        current: CardStatus,
+    },
+    Criterion {
+        index: usize,
+        checked: bool,
+    },
+    Relations {
+        related: Vec<CardId>,
+        blocks: Vec<CardId>,
+        blocked_by: Vec<CardId>,
+    },
+    Parent {
+        previous: Option<CardId>,
+        current: Option<CardId>,
+    },
+    Link {
+        id: Option<LinkId>,
+        label: Option<String>,
+        url: Option<String>,
+    },
+    Comment {
+        author: String,
+        body: String,
+    },
+    WorkLog {
+        agent: String,
+        run_id: Option<RunId>,
+        body: String,
+    },
+    Claim {
+        action: ClaimEventAction,
+        principal: Option<String>,
+        run_id: Option<RunId>,
+        agent: Option<String>,
+        expires_at: Option<i64>,
+    },
+    Input {
+        action: InputEventAction,
+        run_id: Option<RunId>,
+        text: Option<String>,
+    },
+    Completion {
+        previous: CardStatus,
+        current: CardStatus,
+        proof: Option<String>,
+        criteria: Vec<usize>,
+    },
+    RetiredAttachment {
+        action: AttachmentEventAction,
+        attachment_id: String,
+        filename: Option<String>,
+    },
+    RetiredRepository {
+        action: RepositoryEventAction,
+        name: String,
+    },
+    RetiredRollup {
+        action: RollupEventAction,
+        parent_id: Option<CardId>,
+        child_id: CardId,
+        status: Option<CardStatus>,
+        proof: Option<String>,
+    },
+    RetiredDecompose {
+        action: DecomposeEventAction,
+        parent_id: Option<CardId>,
+        child_id: CardId,
+    },
+    RetiredUpdate {
+        fields: Vec<String>,
+    },
+    RetiredImport {
+        source: String,
+        outcome: ImportEventOutcome,
+    },
+}
+
+impl CardEventChange {
+    pub fn is_retired(&self) -> bool {
+        matches!(
+            self,
+            Self::RetiredAttachment { .. }
+                | Self::RetiredRepository { .. }
+                | Self::RetiredRollup { .. }
+                | Self::RetiredDecompose { .. }
+                | Self::RetiredUpdate { .. }
+                | Self::RetiredImport { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardEvent {
     pub id: CardEventId,
     pub card_id: CardId,
     pub event_type: String,
     pub actor: String,
-    pub payload: String,
+    pub change: CardEventChange,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1852,15 +1791,6 @@ pub struct Link {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachmentMeta {
-    pub id: String,
-    pub filename: String,
-    pub mime: String,
-    pub size: i64,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
@@ -1870,24 +1800,12 @@ pub struct Comment {
     pub created_at: i64,
 }
 
-/// A high-frequency, fully-attributed entry an agent appends while actively
-/// working a card -- context, current activity, encountered issues, chain of
-/// thought -- as a first-class field distinct from `Comment` (powder-943).
-/// Only `agent` is required; `model`/`reasoning`/`harness`/`run_id` are
-/// whatever attribution the calling surface can supply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkLogEntry {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
     pub card_id: CardId,
     pub agent: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harness: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
     pub body: String,
     pub created_at: i64,
@@ -2031,13 +1949,10 @@ pub struct CardDetail {
     pub work_log: Vec<WorkLogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_log_total: Option<usize>,
-    pub attachments: Vec<AttachmentMeta>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<CardSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub children_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub epic_state: Option<EpicState>,
     /// Non-terminal blockers found strictly beyond `card.blocked_by`'s own
     /// depth-1 entries (powder-epic-ready-plan): `list_ready` deliberately
     /// stays direct-blocker-only for both eligibility and its per-row
@@ -2062,160 +1977,6 @@ pub struct CardDetail {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-/// One row of child evidence carried into a parent's [`EpicState`]: a proof
-/// string recorded on a child run, or a link attached to a child card. Always
-/// carries the child id as provenance -- the packet points at evidence, it
-/// never rewrites it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EpicEvidence {
-    pub child_id: CardId,
-    pub kind: EvidenceKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    pub reference: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceKind {
-    Proof,
-    Link,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EpicFreshness {
-    pub oldest_update: i64,
-    pub newest_update: i64,
-}
-
-/// Deterministic recomposition packet for a parent ("epic") card: pure
-/// arithmetic and selection over child summaries and child evidence. It never
-/// concatenates transcripts and never invents a semantic conclusion. Parent
-/// acceptance stays authoritative -- `mismatches` makes parent/child drift
-/// visible instead of lifecycle-forbidding it, and nothing here completes the
-/// parent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EpicState {
-    pub children_total: usize,
-    pub status_counts: std::collections::BTreeMap<String, usize>,
-    pub criteria_checked: usize,
-    pub criteria_total: usize,
-    /// Children whose claim lease is unexpired at recompose time.
-    pub active_claims: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<EpicEvidence>,
-    /// Set to the full evidence count when the list above was truncated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_total: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub freshness: Option<EpicFreshness>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mismatches: Vec<String>,
-}
-
-impl EpicState {
-    pub const EVIDENCE_CAP: usize = 20;
-    pub const PROOF_SNIPPET_CHARS: usize = 240;
-
-    /// Truncate a child run's proof for the packet; the full text stays on
-    /// the child run and the packet points there via `child_id`.
-    pub fn proof_snippet(proof: &str) -> String {
-        let trimmed = proof.trim();
-        if trimmed.chars().count() <= Self::PROOF_SNIPPET_CHARS {
-            trimmed.to_string()
-        } else {
-            let mut snippet: String = trimmed.chars().take(Self::PROOF_SNIPPET_CHARS).collect();
-            snippet.push('…');
-            snippet
-        }
-    }
-
-    /// Roll child outcomes into a packet. `evidence` arrives in the caller's
-    /// deterministic order (child creation order, then row creation order)
-    /// and is capped at [`Self::EVIDENCE_CAP`] with the full count preserved.
-    pub fn recompose(
-        parent_status: CardStatus,
-        children: &[CardSummary],
-        evidence: Vec<EpicEvidence>,
-        now: i64,
-    ) -> Self {
-        let mut status_counts = std::collections::BTreeMap::new();
-        let mut criteria_checked = 0;
-        let mut criteria_total = 0;
-        let mut active_claims = 0;
-        for child in children {
-            *status_counts
-                .entry(child.status.as_str().to_string())
-                .or_insert(0) += 1;
-            criteria_checked += child.criteria_checked;
-            criteria_total += child.criteria_total;
-            if child
-                .claim
-                .as_ref()
-                .is_some_and(|claim| claim.expires_at > now)
-            {
-                active_claims += 1;
-            }
-        }
-        let freshness = children.iter().map(|child| child.updated_at).fold(
-            None::<EpicFreshness>,
-            |acc, updated_at| {
-                Some(match acc {
-                    None => EpicFreshness {
-                        oldest_update: updated_at,
-                        newest_update: updated_at,
-                    },
-                    Some(freshness) => EpicFreshness {
-                        oldest_update: freshness.oldest_update.min(updated_at),
-                        newest_update: freshness.newest_update.max(updated_at),
-                    },
-                })
-            },
-        );
-
-        let open_children = children
-            .iter()
-            .filter(|child| !child.status.is_terminal())
-            .count();
-        let mut mismatches = Vec::new();
-        if parent_status.is_terminal() && open_children > 0 {
-            mismatches.push(format!(
-                "parent is {} while {open_children} of {} children are not terminal",
-                parent_status.as_str(),
-                children.len()
-            ));
-        }
-        if !children.is_empty() && open_children == 0 && !parent_status.is_terminal() {
-            mismatches.push(format!(
-                "all {} children are terminal while parent is {}",
-                children.len(),
-                parent_status.as_str()
-            ));
-        }
-
-        let evidence_full = evidence.len();
-        let mut evidence = evidence;
-        let evidence_total = if evidence_full > Self::EVIDENCE_CAP {
-            evidence.truncate(Self::EVIDENCE_CAP);
-            Some(evidence_full)
-        } else {
-            None
-        };
-
-        Self {
-            children_total: children.len(),
-            status_counts,
-            criteria_checked,
-            criteria_total,
-            active_claims,
-            evidence,
-            evidence_total,
-            freshness,
-            mismatches,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2244,17 +2005,6 @@ pub struct AwaitingInput {
     pub run: Run,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<Activity>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalQueueRow {
-    pub card_id: CardId,
-    pub title: String,
-    pub run_id: RunId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub question: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub packet_links: Vec<Link>,
 }
 
 pub fn non_empty(field: &'static str, value: String) -> Result<String, DomainError> {
@@ -2368,365 +2118,6 @@ mod tests {
             .with_created_at(10)
     }
 
-    fn child_summary(id: &str, status: CardStatus, checked: usize, total: usize) -> CardSummary {
-        let mut card = card(id, status).with_acceptance(
-            (0..total)
-                .map(|index| format!("criterion {index}"))
-                .collect::<Vec<_>>(),
-        );
-        for criterion in card.criteria.iter_mut().take(checked) {
-            criterion.checked_at = Some(50);
-        }
-        card.summary()
-    }
-
-    #[test]
-    fn epic_state_rolls_counts_acceptance_claims_and_freshness() {
-        let mut claimed = child_summary("child-b", CardStatus::InProgress, 1, 3);
-        claimed.claim = Some(ClaimSummary {
-            agent: "agent-a".to_string(),
-            expires_at: 200,
-        });
-        claimed.updated_at = 40;
-        let mut expired = child_summary("child-c", CardStatus::InProgress, 0, 2);
-        expired.claim = Some(ClaimSummary {
-            agent: "agent-b".to_string(),
-            expires_at: 90,
-        });
-        expired.updated_at = 15;
-        let done = child_summary("child-a", CardStatus::Done, 2, 2);
-
-        let state = EpicState::recompose(
-            CardStatus::Ready,
-            &[done, claimed, expired],
-            vec![EpicEvidence {
-                child_id: CardId::new("child-a").unwrap(),
-                kind: EvidenceKind::Link,
-                label: Some("PR".to_string()),
-                reference: "https://example.test/pr/1".to_string(),
-            }],
-            100,
-        );
-
-        assert_eq!(state.children_total, 3);
-        assert_eq!(state.status_counts.get("done"), Some(&1));
-        assert_eq!(state.status_counts.get("in_progress"), Some(&2));
-        assert_eq!(state.criteria_checked, 3);
-        assert_eq!(state.criteria_total, 7);
-        assert_eq!(state.active_claims, 1, "expired lease is not active");
-        assert_eq!(state.evidence.len(), 1);
-        assert_eq!(state.evidence_total, None);
-        let freshness = state.freshness.unwrap();
-        assert_eq!(freshness.oldest_update, 10);
-        assert_eq!(freshness.newest_update, 40);
-        assert!(state.mismatches.is_empty());
-    }
-
-    #[test]
-    fn epic_state_surfaces_mismatches_without_forbidding_them() {
-        let open_child = child_summary("child-open", CardStatus::InProgress, 0, 1);
-        let terminal_parent = EpicState::recompose(
-            CardStatus::Done,
-            std::slice::from_ref(&open_child),
-            Vec::new(),
-            100,
-        );
-        assert_eq!(terminal_parent.mismatches.len(), 1);
-        assert!(terminal_parent.mismatches[0].contains("parent is done"));
-
-        let done_child = child_summary("child-done", CardStatus::Done, 1, 1);
-        let lagging_parent =
-            EpicState::recompose(CardStatus::Ready, &[done_child], Vec::new(), 100);
-        assert_eq!(lagging_parent.mismatches.len(), 1);
-        assert!(lagging_parent.mismatches[0].contains("all 1 children are terminal"));
-
-        let aligned = EpicState::recompose(CardStatus::Ready, &[open_child], Vec::new(), 100);
-        assert!(aligned.mismatches.is_empty());
-    }
-
-    #[test]
-    fn epic_state_caps_evidence_and_preserves_the_full_count() {
-        let evidence = (0..25)
-            .map(|index| EpicEvidence {
-                child_id: CardId::new(format!("child-{index}")).unwrap(),
-                kind: EvidenceKind::Proof,
-                label: None,
-                reference: format!("proof {index}"),
-            })
-            .collect::<Vec<_>>();
-        let state = EpicState::recompose(CardStatus::Ready, &[], evidence, 100);
-        assert_eq!(state.evidence.len(), EpicState::EVIDENCE_CAP);
-        assert_eq!(state.evidence_total, Some(25));
-        assert_eq!(state.evidence[0].reference, "proof 0", "order preserved");
-    }
-
-    #[test]
-    fn proof_snippet_truncates_on_char_boundaries() {
-        let short = "done: all gates green";
-        assert_eq!(EpicState::proof_snippet(short), short);
-        let long = "é".repeat(EpicState::PROOF_SNIPPET_CHARS + 10);
-        let snippet = EpicState::proof_snippet(&long);
-        assert_eq!(
-            snippet.chars().count(),
-            EpicState::PROOF_SNIPPET_CHARS + 1,
-            "cap plus ellipsis"
-        );
-        assert!(snippet.ends_with('…'));
-    }
-
-    fn fresh_reimport(id: &str) -> Card {
-        Card::new(
-            CardId::new(id).unwrap(),
-            "Refreshed title",
-            "refreshed body",
-        )
-        .unwrap()
-        .with_status(CardStatus::Ready)
-        .with_created_at(999)
-    }
-
-    #[test]
-    fn quiescent_card_takes_the_reimported_content_and_status() {
-        let current = card("001", CardStatus::Backlog);
-        let merged = current.merge_reimport(fresh_reimport("001"));
-
-        assert_eq!(merged.status, CardStatus::Ready);
-        assert_eq!(merged.title, "Refreshed title");
-        assert_eq!(merged.created_at, 10, "created_at survives reimport");
-    }
-
-    #[test]
-    fn claimed_card_keeps_status_and_claim_across_reimport() {
-        let mut current = card("001", CardStatus::InProgress);
-        current.claim = Some(Claim {
-            principal: "principal-a".to_string(),
-            agent: "agent-a".to_string(),
-            run_id: RunId::new("run-1").unwrap(),
-            acquired_at: 5,
-            expires_at: 100,
-        });
-
-        let merged = current.merge_reimport(fresh_reimport("001"));
-
-        assert_eq!(merged.status, CardStatus::InProgress);
-        assert_eq!(merged.claim, current.claim);
-        assert_eq!(merged.title, "Refreshed title", "content still refreshes");
-        assert_eq!(merged.created_at, 10);
-    }
-
-    #[test]
-    fn terminal_card_keeps_its_outcome_across_reimport() {
-        let current = card("001", CardStatus::Done);
-        let merged = current.merge_reimport(fresh_reimport("001"));
-
-        assert_eq!(merged.status, CardStatus::Done);
-        assert_eq!(merged.title, "Refreshed title");
-    }
-
-    #[test]
-    fn reimport_never_shrinks_body_or_acceptance_to_empty() {
-        // crucible-905: a heading-convention mismatch made a source adapter
-        // produce an empty body and empty acceptance for two real cards on
-        // reimport, silently destroying 60+ lines of existing content. A
-        // reimport that finds nothing where something already existed must
-        // keep what's stored instead of wiping it.
-        let current = Card::new(CardId::new("001").unwrap(), "Title", "the real body")
-            .unwrap()
-            .with_status(CardStatus::Ready)
-            .with_acceptance(["real oracle item".to_string()])
-            .with_created_at(10);
-
-        let empty_reimport = Card::new(CardId::new("001").unwrap(), "Title", "")
-            .unwrap()
-            .with_status(CardStatus::Backlog)
-            .with_created_at(999);
-
-        let merged = current.merge_reimport(empty_reimport);
-
-        assert_eq!(merged.body, "the real body");
-        assert_eq!(merged.acceptance, vec!["real oracle item".to_string()]);
-        assert_eq!(merged.criteria.len(), 1);
-        assert_eq!(merged.criteria[0].text, "real oracle item");
-        assert_eq!(
-            merged.status,
-            CardStatus::Ready,
-            "restoring real acceptance must re-derive Ready, not leave the card stuck at \
-             the malformed file's own empty-oracle default of Backlog"
-        );
-    }
-
-    #[test]
-    fn reimport_restoring_acceptance_never_promotes_a_deliberately_backlog_card_to_ready() {
-        // A deliberately Backlog card is not lifecycle-protected (see
-        // protects_lifecycle_on_reimport_covers_active_and_terminal_states
-        // below), so a malformed reimport can legitimately change it --
-        // but the Backlog->Ready re-derivation above must not turn it into
-        // Ready just because it also had to restore real acceptance
-        // underneath it. Gating the re-derivation on `self.status == Ready`
-        // specifically (not "any status the unprotected merge happened to
-        // produce") is what keeps this scoped.
-        let current = Card::new(CardId::new("001").unwrap(), "Title", "the real body")
-            .unwrap()
-            .with_status(CardStatus::Backlog)
-            .with_acceptance(["real oracle item".to_string()])
-            .with_created_at(10);
-
-        let empty_reimport = Card::new(CardId::new("001").unwrap(), "Title", "")
-            .unwrap()
-            .with_status(CardStatus::Backlog)
-            .with_created_at(999);
-
-        let merged = current.merge_reimport(empty_reimport);
-
-        assert_eq!(merged.body, "the real body");
-        assert_eq!(merged.acceptance, vec!["real oracle item".to_string()]);
-        assert_ne!(
-            merged.status,
-            CardStatus::Ready,
-            "a deliberately Backlog card must never be silently promoted to Ready by the \
-             reimport-restore path"
-        );
-    }
-
-    #[test]
-    fn reimport_still_refreshes_body_and_acceptance_when_the_new_content_is_non_empty() {
-        // the no-shrink guard must not turn every reimport into a no-op --
-        // a genuine edit to non-empty content still goes through.
-        let current = Card::new(CardId::new("001").unwrap(), "Title", "old body")
-            .unwrap()
-            .with_status(CardStatus::Backlog)
-            .with_acceptance(["old oracle item".to_string()])
-            .with_created_at(10);
-
-        let real_reimport = Card::new(CardId::new("001").unwrap(), "Title", "new body")
-            .unwrap()
-            .with_status(CardStatus::Backlog)
-            .with_acceptance(["new oracle item".to_string()])
-            .with_created_at(999);
-
-        let merged = current.merge_reimport(real_reimport);
-
-        assert_eq!(merged.body, "new body");
-        assert_eq!(merged.acceptance, vec!["new oracle item".to_string()]);
-        assert_eq!(
-            merged.status,
-            CardStatus::Backlog,
-            "an incoming file that deliberately keeps Status: backlog alongside real \
-             acceptance must not get silently promoted to Ready -- the Backlog->Ready \
-             re-derivation only fires when this reimport had to restore acceptance from \
-             the stored card, not whenever the final acceptance happens to be non-empty"
-        );
-    }
-
-    #[test]
-    fn reimport_preserves_checked_and_proof_state_by_criterion_identity() {
-        // A reimport used to wipe checked_by/checked_at/proof_links off
-        // every criterion, because a source adapter always builds a fresh
-        // AcceptanceCriterion with no state, and merge_reimport used to take
-        // that fresh vector wholesale -- so a byte-identical reimport (e.g.
-        // running `import` again for an unrelated reason) silently erased
-        // completion evidence. This is doubly important after powder-963:
-        // the continuation-aware parser now legitimately changes a
-        // previously-truncated criterion's text on reimport (the "wrapped"
-        // criterion below), and that repair must not cost it its checked
-        // state either -- the prefix rule treats a text that only grew is
-        // the same oracle item, not a new one.
-        let mut current = Card::new(CardId::new("001").unwrap(), "Title", "body")
-            .unwrap()
-            .with_status(CardStatus::Ready)
-            .with_acceptance([
-                "first criterion".to_string(),
-                "The list/shuffle (`assets/route.ts`), and similar".to_string(),
-            ])
-            .with_created_at(10);
-        current.criteria[0].checked_by = Some("agent-a".to_string());
-        current.criteria[0].checked_at = Some(20);
-        current.criteria[0].proof_links.push(CriterionProof {
-            url: "https://example.test/pr-1".to_string(),
-            actor: "agent-a".to_string(),
-            created_at: 20,
-        });
-        current.criteria[1].checked_by = Some("agent-b".to_string());
-        current.criteria[1].checked_at = Some(21);
-        current.criteria[1].proof_links.push(CriterionProof {
-            url: "https://example.test/pr-2".to_string(),
-            actor: "agent-b".to_string(),
-            created_at: 21,
-        });
-
-        // The repaired reimport: criterion 0's text is unchanged; criterion
-        // 1's text grew from the previously-truncated prefix to its full
-        // wrapped sentence (the powder-963 fix repairing prior damage).
-        let repaired = Card::new(CardId::new("001").unwrap(), "Title", "body")
-            .unwrap()
-            .with_status(CardStatus::Ready)
-            .with_acceptance([
-                "first criterion".to_string(),
-                "The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) \
-                 read paths return `thumbnailUrl`."
-                    .to_string(),
-            ])
-            .with_created_at(999);
-
-        let merged = current.merge_reimport(repaired);
-
-        assert_eq!(merged.criteria[0].text, "first criterion");
-        assert_eq!(merged.criteria[0].checked_by.as_deref(), Some("agent-a"));
-        assert_eq!(merged.criteria[0].checked_at, Some(20));
-        assert_eq!(merged.criteria[0].proof_links.len(), 1);
-
-        assert_eq!(
-            merged.criteria[1].text,
-            "The list/shuffle (`assets/route.ts`), and similar (`similar/route.ts`) \
-             read paths return `thumbnailUrl`."
-        );
-        assert_eq!(
-            merged.criteria[1].checked_by.as_deref(),
-            Some("agent-b"),
-            "a criterion repaired by the truncation fix keeps its checked state -- the \
-             stored text is a prefix of the repaired text, so it's the same oracle item"
-        );
-        assert_eq!(merged.criteria[1].checked_at, Some(21));
-        assert_eq!(merged.criteria[1].proof_links.len(), 1);
-    }
-
-    #[test]
-    fn reimport_resets_state_for_a_criterion_whose_text_changed_for_an_unrelated_reason() {
-        let mut current = Card::new(CardId::new("001").unwrap(), "Title", "body")
-            .unwrap()
-            .with_status(CardStatus::Ready)
-            .with_acceptance(["old wording entirely".to_string()])
-            .with_created_at(10);
-        current.criteria[0].checked_by = Some("agent-a".to_string());
-        current.criteria[0].checked_at = Some(20);
-
-        let edited = Card::new(CardId::new("001").unwrap(), "Title", "body")
-            .unwrap()
-            .with_status(CardStatus::Ready)
-            .with_acceptance(["a completely different criterion".to_string()])
-            .with_created_at(999);
-
-        let merged = current.merge_reimport(edited);
-
-        assert_eq!(merged.criteria[0].text, "a completely different criterion");
-        assert_eq!(
-            merged.criteria[0].checked_by, None,
-            "a genuine content edit (not a text-preserving-or-growing repair) is a new \
-             oracle item and must not inherit stale checked state"
-        );
-    }
-
-    #[test]
-    fn protects_lifecycle_on_reimport_covers_active_and_terminal_states() {
-        assert!(!card("001", CardStatus::Backlog).protects_lifecycle_on_reimport());
-        assert!(!card("001", CardStatus::Ready).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::InProgress).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::AwaitingInput).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::Done).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::Shipped).protects_lifecycle_on_reimport());
-        assert!(card("001", CardStatus::Abandoned).protects_lifecycle_on_reimport());
-    }
-
     #[test]
     fn claim_readiness_names_missing_acceptance_criteria() {
         let card = card("001", CardStatus::Ready);
@@ -2817,6 +2208,20 @@ mod tests {
             CardStatus::Ready
         );
     }
+    #[test]
+    fn lifecycle_parsers_reject_compatibility_aliases() {
+        assert_eq!(
+            CardStatus::parse("in_progress"),
+            Some(CardStatus::InProgress)
+        );
+        assert!(CardStatus::parse("in-progress").is_none());
+        assert!(CardStatus::parse("pending").is_none());
+        assert_eq!(
+            RunState::parse("awaiting_input"),
+            Some(RunState::AwaitingInput)
+        );
+        assert!(RunState::parse("awaiting-input").is_none());
+    }
 
     #[test]
     fn apply_status_accepts_any_transition_unconditionally() {
@@ -2851,7 +2256,7 @@ mod tests {
 
     #[test]
     fn operation_matrix_is_exhaustive_and_declarative() {
-        assert_eq!(Operation::ALL.len(), 30);
+        assert_eq!(Operation::ALL.len(), 20);
         for operation in Operation::ALL {
             let rule = operation.rule();
             assert_eq!(rule.operation, operation);
@@ -2882,30 +2287,9 @@ mod tests {
             ClaimRequirement::CurrentRun
         );
         assert_eq!(
-            Operation::DeleteRepository.rule().capability,
-            OperationCapability::RepositoryAdmin
-        );
-        assert_eq!(
             Operation::CreateApiKey.rule().idempotency,
             IdempotencyMode::None,
             "one-shot API-key secrets must never be replayed or persisted"
-        );
-        assert_eq!(
-            Operation::CreateSubscription.rule().idempotency,
-            IdempotencyMode::None,
-            "one-shot webhook secrets must never be replayed or persisted"
-        );
-        assert_eq!(
-            Operation::RevokeApiKey.rule().idempotency,
-            IdempotencyMode::RetrySafe
-        );
-        assert_eq!(
-            Operation::DisableSubscription.rule().idempotency,
-            IdempotencyMode::RetrySafe
-        );
-        assert_eq!(
-            Operation::ReplayDeadLetter.rule().idempotency,
-            IdempotencyMode::Keyed
         );
         assert_eq!(
             Operation::Destructive.rule().capability,
@@ -2934,6 +2318,7 @@ mod tests {
             Operation::RenewClaim,
             Operation::HeartbeatClaim,
             Operation::TransferClaim,
+            Operation::RevokeApiKey,
         ] {
             assert_eq!(operation.rule().idempotency, IdempotencyMode::Keyed);
         }
@@ -2942,8 +2327,6 @@ mod tests {
     #[test]
     fn capability_policy_never_promotes_agent_or_payload_labels() {
         assert!(OperationCapability::CardCorrection.allows(PrincipalRole::Agent));
-        assert!(!OperationCapability::RepositoryAdmin.allows(PrincipalRole::Agent));
-        assert!(OperationCapability::RepositoryAdmin.allows(PrincipalRole::Admin));
         assert!(OperationCapability::WorkerExecution.allows(PrincipalRole::Agent));
         assert_eq!(DenialClass::IdentityMismatch.as_str(), "identity_mismatch");
     }
@@ -3105,5 +2488,19 @@ mod tests {
                 5,
             )
             .is_ok());
+    }
+    #[test]
+    fn card_event_type_rejects_retired_product_names() {
+        for raw in [
+            "attachment",
+            "repository",
+            "rollup",
+            "decompose",
+            "update",
+            "import",
+        ] {
+            assert!(CardEventType::parse(raw).is_none(), "{raw}");
+            assert!(serde_json::from_str::<CardEventType>(&format!("\"{raw}\"")).is_err());
+        }
     }
 }

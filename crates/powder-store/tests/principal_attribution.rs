@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use powder_core::{Authority, Card, CardId, CardStatus, DetailLevel};
-use powder_store::{ApiKeyScope, Store, WorkLogAttribution, SCHEMA_VERSION};
+use powder_store::{ApiKeyScope, Store, SCHEMA_VERSION};
 use rusqlite::{types::Value, Connection};
 
 fn temp_db(name: &str) -> PathBuf {
@@ -66,10 +66,10 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
     let (link_id, first_comment_id, second_comment_id, work_log_id) = {
         let mut store = Store::open(&path).expect("open store");
         store.migrate().expect("migrate fresh store");
-        assert_eq!(SCHEMA_VERSION, 28);
+        assert_eq!(SCHEMA_VERSION, 29);
         store
-            .import_cards(vec![ready_card(card_id.as_str())])
-            .expect("import card");
+            .upsert_card(ready_card(card_id.as_str()))
+            .expect("upsert card");
 
         let operator = Authority::principal("roster", true);
         store
@@ -97,10 +97,7 @@ fn authenticated_writes_share_one_publicly_correlated_audit_envelope() {
             .append_work_log_as(
                 &card_id,
                 "worker-a",
-                WorkLogAttribution {
-                    run_id: Some(claim.run_id.as_str()),
-                    ..WorkLogAttribution::default()
-                },
+                Some(claim.run_id.as_str()),
                 "investigating",
                 50,
                 &authority,
@@ -192,8 +189,8 @@ fn unchecked_writes_record_null_principal_instead_of_fabricating_identity() {
     let mut store = Store::open(&path).expect("open store");
     store.migrate().expect("migrate");
     store
-        .import_cards(vec![ready_card(card_id.as_str())])
-        .expect("import card");
+        .upsert_card(ready_card(card_id.as_str()))
+        .expect("upsert card");
     let comment = store
         .add_comment(&card_id, "operator", "unchecked", 60)
         .expect("unchecked comment");
@@ -226,8 +223,8 @@ fn outbound_failure_rolls_back_domain_row_and_audit_event() {
         let mut store = Store::open(&path).expect("open store");
         store.migrate().expect("migrate");
         store
-            .import_cards(vec![ready_card(card_id.as_str())])
-            .expect("import card");
+            .upsert_card(ready_card(card_id.as_str()))
+            .expect("upsert card");
     }
     let connection = Connection::open(&path).expect("install failure trigger");
     connection
@@ -252,10 +249,7 @@ fn outbound_failure_rolls_back_domain_row_and_audit_event() {
         .append_work_log_as(
             &card_id,
             "worker-a",
-            WorkLogAttribution {
-                run_id: Some(claim.run_id.as_str()),
-                ..WorkLogAttribution::default()
-            },
+            Some(claim.run_id.as_str()),
             "must roll back",
             70,
             &authority,
@@ -314,8 +308,8 @@ fn sanitized_schema_19_snapshot_migrates_losslessly_and_old_envelope_deserialize
         let mut store = Store::open(&path).expect("open store");
         store.migrate().expect("migrate fresh");
         store
-            .import_cards(vec![ready_card(card_id.as_str())])
-            .expect("import card");
+            .upsert_card(ready_card(card_id.as_str()))
+            .expect("upsert card");
         store
             .check_criterion(&card_id, 0, "legacy-operator", true, 80)
             .expect("legacy criterion");
@@ -326,13 +320,7 @@ fn sanitized_schema_19_snapshot_migrates_losslessly_and_old_envelope_deserialize
             .add_comment(&card_id, "legacy-author", "legacy body", 80)
             .expect("legacy comment");
         store
-            .append_work_log(
-                &card_id,
-                "legacy-worker",
-                WorkLogAttribution::default(),
-                "legacy log",
-                80,
-            )
+            .append_work_log(&card_id, "legacy-worker", None, "legacy log", 80)
             .expect("legacy work log");
     }
 
@@ -383,7 +371,7 @@ fn sanitized_schema_19_snapshot_migrates_losslessly_and_old_envelope_deserialize
     let mut store = Store::open(&path).expect("open schema 19 snapshot");
     store.migrate().expect("migrate snapshot");
     store.migrate().expect("retry is idempotent");
-    assert_eq!(store.schema_version().expect("schema version"), 28);
+    assert_eq!(store.schema_version().expect("schema version"), 29);
     for item in store.list_event_tail(0, 20).expect("read old envelopes") {
         assert_eq!(item.event.principal, None);
         assert_eq!(item.event.audit_event_id, None);
@@ -417,7 +405,7 @@ fn schema_v20_adds_only_audit_provenance_columns() {
     let path = temp_db("principal-schema");
     let mut store = Store::open(&path).expect("open store");
     store.migrate().expect("migrate fresh store");
-    assert_eq!(SCHEMA_VERSION, 28);
+    assert_eq!(SCHEMA_VERSION, 29);
     drop(store);
 
     let connection = Connection::open(&path).expect("open inspection database");
@@ -447,8 +435,8 @@ fn authority_principal_is_independent_of_api_key_scope_or_semantic_worker() {
         .expect("authenticated");
     let card_id = CardId::new("principal-key-scope").expect("card id");
     store
-        .import_cards(vec![ready_card(card_id.as_str())])
-        .expect("import card");
+        .upsert_card(ready_card(card_id.as_str()))
+        .expect("upsert card");
     let authority = Authority::principal(verified.principal, false);
     let claim = store
         .claim_card(&card_id, "worker-not-roster", 3, 600, &authority)
@@ -457,10 +445,7 @@ fn authority_principal_is_independent_of_api_key_scope_or_semantic_worker() {
         .append_work_log_as(
             &card_id,
             "worker-not-roster",
-            WorkLogAttribution {
-                run_id: Some(claim.run_id.as_str()),
-                ..WorkLogAttribution::default()
-            },
+            Some(claim.run_id.as_str()),
             "one principal, another worker",
             3,
             &authority,

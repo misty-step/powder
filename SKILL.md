@@ -2,160 +2,138 @@
 name: powder
 description: |
   Use when an agent must inspect, claim, update, request input for, or complete
-  Powder cards. Powder is the self-hostable agent work board. The agent face is
-  the `powder` CLI plus this skill — not MCP, not ad-hoc HTTP.
-argument-hint: "[list-ready|claim|get-card|complete-card|papercut]"
+  Powder cards. Powder is a self-hosted Card, Claim, typed Run, and Event
+  ledger. The supported agent face is the `powder` CLI plus this skill.
+argument-hint: "[create-card|list-awaiting-input]"
 ---
 
 # Powder
 
-Powder stores cards, claims, runs, relations, audit, and proof. It never calls a
-model. Real card data lives in a deployed instance database, not in this repo.
+Powder stores cards, current claims, typed run history, relations, audit events,
+comments, work logs, input activity, and proof. It never calls a model. Real
+card data lives in a deployed SQLite database, not in this repository.
 
-Read `VISION.md` before you change product scope, the card/run model, the runner
-boundary, or self-hosting.
+Read `VISION.md` before changing product scope, the Card/Claim/Run/Event model,
+the runner boundary, or self-hosting.
 
 ## Transport
 
-Set both:
+For a deployed board, set:
 
 ```sh
-export POWDER_API_BASE_URL=…   # deployed powder-server
-export POWDER_API_KEY=…         # integration key
+export POWDER_API_BASE_URL=<deployed-powder-server>
+export POWDER_API_KEY=<integration-key>
 ```
 
 Omit `--db` for the deployed board. Pass `--db <path>` only for a local file;
-`--db` always wins over the remote env.
+`--db` always wins over remote environment variables.
 
-Run `powder version` before a lane starts. It prints the installed binary’s git
-sha so a stale `~/.cargo/bin/powder` is obvious.
+Run `powder version` before a lane starts. It prints the installed binary git
+SHA so a stale CLI is visible.
 
-Flag truth is `powder <command> --help` (also `-h`). Help never mutates.
+Flag truth is `powder <command> --help` (also `-h`). Help never mutates data.
 
-## Operating contract
+## Operating Contract
 
-1. `powder list-ready` before you claim. Claim one card at a time.
-2. Cards without acceptance criteria cannot be claimed.
-3. `powder get-card <id>` before you implement. Lists are summaries; the card is
-   the spec (goal, criteria, proof plan, relations, claim, recent activity).
-4. Every `get-card` includes `claim_eligibility` (`eligible`/`code`; `message`
-   when ineligible; `blockers` only for `unresolved_blockers`). Codes:
-   `eligible`, `no_acceptance`, `unresolved_blockers`, `active_claim`,
-   `status_not_claimable`, `in_progress_claim_not_expired`. Use it when a ready
-   lane card is missing from `list-ready`.
-5. `powder append-work-log` often while you work (context, progress, blockers,
-   evidence, attribution). Use `powder add-comment` only for rare human-facing
-   notes.
-6. File friction the moment you feel it: `powder papercut '…' --agent <label>
-   [--service <repo>]`. One call. Do not stop. Do not fix it in that moment.
-7. Leave `repo` unset for cross-repo, process, or ops work. Those cards land in
-   the General catch-all.
-8. Complete with proof when you have it: `powder complete-card <id> --proof <url>`.
+1. Run `powder list-ready` before claiming. Claim one card at a time.
+2. A card without acceptance criteria cannot be claimed.
+3. Run `powder get-card <id>` before implementation. The card is the spec:
+   goal, criteria, proof plan, relations, claim, and recent activity.
+4. Use `claim_eligibility` when a card is missing from `list-ready`. It reports
+   `eligible` or a reason code such as `no_acceptance`,
+   `unresolved_blockers`, `active_claim`, or `status_not_claimable`.
+5. Append a work log during work. Include context, progress, blockers,
+   evidence, and attribution. Use `add-comment` only for a human-facing note.
+6. Leave `repo` unset for cross-repository, process, or operations work. When
+   set, it is an opaque card string and filters match it exactly.
+7. Complete only after the card status, audit event, and proof are present.
 
-## Lane (remote)
+## Lifecycle
 
 ```sh
-powder list-ready --limit 10 [--repo powder] [--estimate S]
-powder claim <id> --agent <worker-label>
-powder get-card <id>
-powder append-work-log <id> --agent <worker-label> --body "…" [--model …] [--run-id …]
-powder add-link <id> --label pr --url https://…
-powder check-criterion <id> --criterion 0 --actor <label>
-powder complete-card <id> --proof https://…
+powder list-ready --limit 10
+powder claim <card-id> --agent <worker-label>
+powder get-card <card-id>
+powder heartbeat <card-id> --run <run-id>
+powder append-work-log <card-id> --agent <worker-label> --body '...'
+powder request-input <run-id> --question '...'
+powder answer-input <run-id> --actor <label> --answer '...'
+powder check-criterion <card-id> --criterion <index> --actor <label>
+powder complete-card <card-id> --proof <url>
 ```
 
-Claim lease: `powder heartbeat|renew-claim|release-claim|transfer-claim` with
-`--run <run_id>` from the claim response.
+The claim response supplies the `run_id` and lease expiry. Use that run for
+heartbeat, renewal, release, input, and completion operations. A claim expires
+when its worker stops renewing it.
 
 ## Discovery
 
 | Need | Command |
 |---|---|
-| Claimable queue | `powder list-ready` |
-| Board shape counts | `powder board-stats` |
-| Epic / Unsorted rollups | `powder board-rollups --json` |
-| Epic velocity | `powder epic-velocity <epic-id> --json` |
-| Filter any status | `powder list-cards --status backlog\|ready\|…` |
-| Search text | `powder search '<q>'` |
+| Claimable cards | `powder list-ready` |
+| Any status | `powder list-cards --status backlog\|ready\|…` |
+| Text search | `powder search '<q>'` |
 | One card | `powder get-card <id>` |
 | One run | `powder get-run <run-id>` |
-| Awaiting input | `powder list-awaiting-input` / `powder list-approvals` |
+| Awaiting input | `powder list-awaiting-input` |
+| Ordered events | `powder event-tail --after 0 --limit 20` |
 
-`list-ready` is dependency-ordered among the returned set. `repo` filters use
-exact canonical short slugs or registered aliases — never substring match.
+`list-ready` is dependency-ordered among returned cards. Ready snapshots use
+opaque continuation values; pass the returned value unchanged when paging.
+Search uses the store full-text index and returns untrusted snippets. Escape
+snippets before rendering HTML.
 
-`list-cards` includes every matching status by default, including
-`done`/`shipped`/`abandoned`. Pass `--status` to narrow the page.
-
-## Mutations agents use
+## Mutations
 
 | Intent | Command |
 |---|---|
-| Create | `powder create-card --id … --title … --acceptance …` (repeat `--acceptance`) |
+| Create | `powder create-card --id … --title … --acceptance …` |
 | Patch fields | `powder update-card <id> --title … --body … --acceptance …` |
 | Status only | `powder update-status <id> --status …` |
 | Relations | `powder update-relations <id> --related a,b --blocks c --blocked-by d` |
-| Parent epic | `powder set-parent <id> --parent <epic>` / `--clear` |
+| Parent edge | `powder set-parent <id> --parent <id>` or `--clear` |
 | Criterion | `powder check-criterion <id> --criterion N --actor …` |
-| Link / comment / log | `add-link` / `add-comment` / `append-work-log` |
+| Link | `powder add-link <id> --label proof --url <url>` |
+| Comment | `powder add-comment <id> --author <label> --body '…'` |
+| Work log | `powder append-work-log <id> --agent <label> --body '…'` |
 | Ask operator | `powder request-input <run-id> --question '…'` |
 | Answer input | `powder answer-input <run-id> --actor … --answer …` |
-| Papercut | `powder papercut '…' --agent …` |
-| Done | `powder complete-card <id> [--proof …]` |
+| Done | `powder complete-card <id> [--proof <url>]` |
 
-Relation writes mirror onto existing peers in one transaction. Parent edges do
-not block children; child completion does not complete the parent.
+Relation writes mirror existing peers in one transaction. Parent edges are
+reference edges; they do not create an epic or rollup product. Child completion
+does not complete a parent.
 
-## Papercuts
+## Input And Proof
 
-Papercuts are backlog cards labeled `papercut`. Sweep with:
+Use `list-awaiting-input` to find runs that need an operator response. Use
+`request-input` to append a typed question activity and move the run to
+`awaiting_input`. Use `answer-input` to append the typed response and resume the
+run. Do not create a separate answer record or put typed activity into an
+arbitrary JSON blob.
 
-```sh
-powder list-cards --label papercut
-```
-
-## Groom cadence
-
-Curators run this outside Powder. Powder does not enforce lifecycle.
-
-1. Page backlog: `powder list-cards --status backlog --updated-before <unix>`.
-2. Abandon stale cards with a comment that names the sweep. Never hard-delete.
-3. Flag claim violations: list `ready` / `in_progress`, then `get-card` for each
-   with no active claim.
-4. Emit one operator digest (stale, abandoned, claim-violation counts).
-
-## Telemetry
-
-```sh
-powder record-run-telemetry <run-id> --attempts '[…]' --idempotency-key <key>
-powder run-telemetry-aggregate [--agent …] [--model …] [--limit 100]
-```
-
-Same contract as HTTP. Cost fields use `estimated_cost_usd_micros`.
-
-## Admin / local-only
-
-Repository upsert/merge/delete, key mint/revoke, webhook subscriptions, event
-tail, relations-doctor, and markdown/GitHub import stay operator tools. Prefer
-`--db` or the HTTP admin API. Agents on a deployed board do not need them for
-the claim→complete loop.
+Use links and proof fields for reviewable evidence. Do not upload attachments
+or copy prompts, tool traces, or sessions into Powder.
 
 ## Authority
 
-Remote mode: the API key’s principal is the transport identity. `--agent`,
-`--actor`, and `--author` are semantic labels only.
+In remote mode, the API key principal is the transport identity. `--agent`,
+`--actor`, and `--author` are semantic labels in the audit trail.
 
-Local `--db` mutations use `POWDER_PRINCIPAL` (else the fixed trusted local-cli
-admin principal). `--admin` is rejected.
+Local `--db` mutations use `POWDER_PRINCIPAL`, or the fixed trusted local CLI
+principal when it is unset. `--admin` is not a supported escape hatch.
 
-## Response skew
+## Response Skew
 
-Unknown future status values must not crash listings. `get-card` / `get-run`
-return server JSON as-is. Deploy server first; clients follow.
+Unknown future status values must not crash listings. `get-card` and `get-run`
+return server JSON as-is. Deploy the server first; clients follow.
 
-## Red lines
+## Red Lines
 
 - Do not call a model from inside Powder.
 - Do not commit instance backlog data to this repository.
-- Do not treat process exit zero as completion without card status + audit.
-- Do not invent a second agent face beside `powder` + this skill.
+- Do not treat process exit zero as completion without card status and audit.
+- Do not add a second agent face beside `powder` plus this skill.
+- Do not add repository registries, telemetry analytics, media storage,
+  portfolio rollups, signed webhook delivery, ingestion, shaping, or session
+  forensics.

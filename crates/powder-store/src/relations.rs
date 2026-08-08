@@ -88,7 +88,7 @@
 //! (which unmirrors atomically) instead of letting repair re-add them.
 use std::collections::{HashMap, HashSet};
 
-use powder_core::{Authority, Card, CardId, Operation};
+use powder_core::{Authority, Card, CardEventChange, CardEventType, CardId, Operation};
 use rusqlite::{types::Value, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::from_str;
@@ -237,18 +237,30 @@ fn mirror_relation_change_inner(
     if updated == 0 {
         return Ok(false);
     }
-    let detail = format!(
-        "mirrored {} {} {self_id}",
-        if add { "add" } else { "remove" },
-        field.as_str()
-    );
+    let change = match field {
+        RelationField::Related => CardEventChange::Relations {
+            related: vec![self_id.clone()],
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        },
+        RelationField::Blocks => CardEventChange::Relations {
+            related: Vec::new(),
+            blocks: vec![self_id.clone()],
+            blocked_by: Vec::new(),
+        },
+        RelationField::BlockedBy => CardEventChange::Relations {
+            related: Vec::new(),
+            blocks: Vec::new(),
+            blocked_by: vec![self_id.clone()],
+        },
+    };
     if let Some(authority) = options.authority {
         append_card_event_with_authority(
             connection,
             other_id,
-            "relations",
+            CardEventType::Relations,
             options.actor,
-            &detail,
+            change.clone(),
             options.now,
             authority,
         )?;
@@ -256,9 +268,9 @@ fn mirror_relation_change_inner(
         append_card_event(
             connection,
             other_id,
-            "relations",
+            CardEventType::Relations,
             options.actor,
-            &detail,
+            change,
             options.now,
         )?;
     }
@@ -411,54 +423,11 @@ pub struct ParentDoctorIssue {
     pub evidence: String,
     pub repaired: bool,
 }
-
-/// The bucket to which a valid card belongs for hierarchy coverage. Parentless
-/// leaves belong to their repository's unsorted bucket; parentless cards with
-/// direct children are root epics and own their descendants, including
-/// themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParentCoverageBucket {
-    EpicAncestor,
-    Unsorted,
-}
-
-/// One deterministic card-to-bucket assignment from the full parent graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParentCoverageAssignment {
-    pub card_id: String,
-    pub bucket: ParentCoverageBucket,
-    pub ancestor_id: Option<String>,
-    pub repo: Option<String>,
-}
-
-/// Full-board parent coverage counts and assignments. classified plus
-/// unclassified must equal scanned; duplicate is retained explicitly so
-/// rollup callers can fail closed if a future classifier ever emits more than
-/// one assignment for a card.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParentCoverageReport {
-    pub scanned: usize,
-    pub classified: usize,
-    pub unclassified: usize,
-    pub duplicate: usize,
-    pub assignments: Vec<ParentCoverageAssignment>,
-}
-
-impl ParentCoverageReport {
-    pub fn is_complete(&self) -> bool {
-        self.unclassified == 0 && self.duplicate == 0 && self.classified == self.scanned
-    }
-}
-
-/// Shared read-only parent graph evidence. The relations doctor exposes its
-/// issues; rollup queries consume coverage without rebuilding hierarchy
-/// semantics or summing paginated rows.
+/// Read-only parent diagnostics used by the relations doctor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParentGraphReport {
     pub scanned: usize,
     pub issues: Vec<ParentDoctorIssue>,
-    pub coverage: ParentCoverageReport,
 }
 
 /// Why the relations doctor reported a stored relation row.
@@ -498,10 +467,6 @@ pub struct RelationsDoctorReport {
 impl RelationsDoctorReport {
     pub fn issue_count(&self) -> usize {
         self.issues.len()
-    }
-
-    pub fn parent_issue_count(&self) -> usize {
-        self.parent_issues.len()
     }
 }
 
@@ -761,30 +726,26 @@ struct RawParentRow {
     parent_text: Option<String>,
     parent_description: String,
     parent_id: Option<CardId>,
-    repo: Option<String>,
 }
 
-fn raw_parent_rows(connection: &Connection, include_hidden: bool) -> Result<Vec<RawParentRow>> {
+fn raw_parent_rows(connection: &Connection, _include_hidden: bool) -> Result<Vec<RawParentRow>> {
     let mut statement = connection.prepare(
-        "SELECT c.rowid, c.id, c.parent, c.repo
+        "SELECT c.rowid, c.id, c.parent
          FROM cards c
-         LEFT JOIN repositories r ON r.name = c.repo
-         WHERE ?1 OR COALESCE(r.visibility, 'visible') = 'visible'
          ORDER BY c.rowid",
     )?;
     let rows = statement
-        .query_map([include_hidden as i64], |row| {
+        .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, Value>(1)?,
                 row.get::<_, Value>(2)?,
-                row.get::<_, Value>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows
         .into_iter()
-        .map(|(rowid, card, parent, repo)| RawParentRow {
+        .map(|(rowid, card, parent)| RawParentRow {
             rowid,
             card_text: value_text(&card),
             card_description: value_description(&card),
@@ -792,7 +753,6 @@ fn raw_parent_rows(connection: &Connection, include_hidden: bool) -> Result<Vec<
             parent_text: value_text(&parent),
             parent_description: value_description(&parent),
             parent_id: value_text(&parent).and_then(|value| CardId::new(value).ok()),
-            repo: value_text(&repo),
         })
         .collect())
 }
@@ -840,97 +800,6 @@ fn parent_cycle_members(
             return None;
         }
         current = parent.clone();
-    }
-}
-
-fn classify_parent_coverage(
-    rows: &[RawParentRow],
-    parents: &HashMap<String, Option<String>>,
-    ids: &HashSet<String>,
-    cycle_cards: &HashSet<String>,
-    invalid_parent_cards: &HashSet<String>,
-    unique_card_rows: &HashSet<i64>,
-    scoped: bool,
-) -> ParentCoverageReport {
-    let roots_with_visible_children = parents
-        .values()
-        .filter_map(Option::as_ref)
-        .filter(|parent| ids.contains(*parent))
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut assignments = Vec::new();
-    let mut unclassified = 0;
-    for row in rows
-        .iter()
-        .filter(|row| unique_card_rows.contains(&row.rowid))
-    {
-        let card_id = row.card_id.as_ref().expect("filtered card id");
-        if invalid_parent_cards.contains(card_id.as_str()) {
-            unclassified += 1;
-            continue;
-        }
-        let Some(parent) = parents.get(card_id.as_str()) else {
-            unclassified += 1;
-            continue;
-        };
-        let is_scoped_root = parent.is_none()
-            || (scoped && parent.as_ref().is_some_and(|parent| !ids.contains(parent)));
-        if is_scoped_root {
-            let is_root_epic = roots_with_visible_children.contains(card_id.as_str());
-            assignments.push(ParentCoverageAssignment {
-                card_id: card_id.to_string(),
-                bucket: if is_root_epic {
-                    ParentCoverageBucket::EpicAncestor
-                } else {
-                    ParentCoverageBucket::Unsorted
-                },
-                ancestor_id: is_root_epic.then(|| card_id.to_string()),
-                repo: row.repo.clone(),
-            });
-            continue;
-        }
-        if cycle_cards.contains(card_id.as_str()) {
-            unclassified += 1;
-            continue;
-        }
-        let mut current = card_id.as_str().to_string();
-        let mut seen = HashSet::new();
-        let root = loop {
-            if !seen.insert(current.clone()) || cycle_cards.contains(current.as_str()) {
-                break None;
-            }
-            if invalid_parent_cards.contains(&current) {
-                break None;
-            }
-            let Some(Some(parent)) = parents.get(&current) else {
-                break Some(current);
-            };
-            if !ids.contains(parent) {
-                break scoped.then_some(current);
-            }
-            current = parent.clone();
-        };
-        let Some(ancestor_id) = root else {
-            unclassified += 1;
-            continue;
-        };
-        assignments.push(ParentCoverageAssignment {
-            card_id: card_id.to_string(),
-            bucket: ParentCoverageBucket::EpicAncestor,
-            ancestor_id: Some(ancestor_id),
-            repo: row.repo.clone(),
-        });
-    }
-    assignments.sort_by(|left, right| left.card_id.cmp(&right.card_id));
-    let classified = assignments.len();
-    let scanned = rows.len();
-    let invalid_rows = rows.len() - unique_card_rows.len();
-    ParentCoverageReport {
-        scanned,
-        classified,
-        unclassified: unclassified + invalid_rows,
-        duplicate: 0,
-        assignments,
     }
 }
 
@@ -1039,7 +908,6 @@ fn scan_parent_graph(connection: &Connection, include_hidden: bool) -> Result<Pa
             });
         }
     }
-    let mut cycle_cards = HashSet::new();
     let mut cycle_by_card = HashMap::<String, Vec<String>>::new();
     let mut starts = ids.iter().cloned().collect::<Vec<_>>();
     starts.sort();
@@ -1047,7 +915,6 @@ fn scan_parent_graph(connection: &Connection, include_hidden: bool) -> Result<Pa
         if let Some(cycle) = parent_cycle_members(&start, &parents, &ids) {
             if cycle.len() > 1 {
                 for card_id in &cycle {
-                    cycle_cards.insert(card_id.clone());
                     cycle_by_card.insert(card_id.clone(), cycle.clone());
                 }
             }
@@ -1066,35 +933,16 @@ fn scan_parent_graph(connection: &Connection, include_hidden: bool) -> Result<Pa
         });
     }
     issues.sort_by(|left, right| parent_issue_sort_key(left).cmp(&parent_issue_sort_key(right)));
-    let coverage = classify_parent_coverage(
-        &rows,
-        &parents,
-        &ids,
-        &cycle_cards,
-        &invalid_parent_cards,
-        &unique_card_rows,
-        !include_hidden,
-    );
     Ok(ParentGraphReport {
         scanned: rows.len(),
         issues,
-        coverage,
     })
 }
 
 impl Store {
-    /// Return raw parent-edge diagnostics and the full-board coverage
-    /// classification shared by the relations doctor and rollup queries.
+    /// Return raw parent-edge diagnostics.
     pub fn parent_graph_report(&self) -> Result<ParentGraphReport> {
         scan_parent_graph(&self.connection, true)
-    }
-
-    /// Return parent graph coverage for the same visible repository scope as a
-    /// board read. A parent outside that scope is treated as a scoped root so a
-    /// read cannot disclose whether it is hidden or missing; the relations
-    /// doctor keeps using the global report above for true dangling edges.
-    pub fn parent_graph_report_scoped(&self, include_hidden: bool) -> Result<ParentGraphReport> {
-        scan_parent_graph(&self.connection, include_hidden)
     }
 
     /// Report relation symmetry plus parent-edge drift. Parent findings are

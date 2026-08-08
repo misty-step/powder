@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use powder_core::{
-    Activity, ActivityId, ActivityType, ApprovalQueueRow, Authority, AwaitingInput, CardDetail,
-    CardEvent, CardEventId, CardId, CardStatus, CardSummary, Comment, DetailLevel, DomainError,
-    EpicEvidence, EpicState, EvidenceKind, Link, LinkId, Operation, Run, RunDetail, RunId,
-    RunState, TerminalSummary, WorkLogEntry,
+    Activity, ActivityId, ActivityType, Authority, AwaitingInput, CardDetail, CardEvent,
+    CardEventChange, CardEventId, CardEventType, CardId, CardStatus, CardSummary, Comment,
+    DetailLevel, DomainError, Link, LinkId, Operation, Run, RunDetail, RunId, RunState,
+    TerminalSummary, WorkLogEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -35,25 +35,18 @@ impl Store {
         };
         let runs = load_runs_for_card(&self.connection, card_id, detail)?;
         let activities = load_activities_for_card(&self.connection, card_id, detail)?;
-        let events = load_events_for_card(&self.connection, card_id, detail)?;
+        let historical_blocked_status = if card.acceptance.is_empty() || card.blocked_by.is_empty()
+        {
+            CardStatus::Backlog
+        } else {
+            CardStatus::Ready
+        };
+        let events =
+            load_events_for_card(&self.connection, card_id, detail, historical_blocked_status)?;
         let links = load_link_section_for_card(&self.connection, card_id, detail)?;
         let comments = load_comments_for_card(&self.connection, card_id, detail)?;
         let work_log = load_work_log_for_card(&self.connection, card_id, detail)?;
-        let attachments = self.attachments_for_card(card_id)?;
-        // The packet always rolls up every child; only the displayed child
-        // list is bounded in concise mode.
         let all_children = load_children_for_card(&self.connection, card_id)?;
-        let epic_state = if all_children.is_empty() {
-            None
-        } else {
-            let evidence = load_child_evidence(&self.connection, card_id)?;
-            Some(EpicState::recompose(
-                card.status,
-                &all_children,
-                evidence,
-                now,
-            ))
-        };
         let children_total = (!all_children.is_empty()).then_some(all_children.len());
         let children = bound_children(all_children, detail);
         let truncated = runs.truncated()
@@ -230,10 +223,8 @@ impl Store {
             comments_total,
             work_log: work_log_items,
             work_log_total,
-            attachments,
             children,
             children_total,
-            epic_state,
             transitive_blocked_by,
             blocked_by_cycle,
             claim_eligibility,
@@ -271,7 +262,7 @@ impl Store {
     pub fn list_awaiting_input(&self, limit: usize) -> Result<Vec<AwaitingInput>> {
         let mut statement = self.connection.prepare(
             "SELECT runs.id, runs.card_id, runs.state, runs.principal, runs.role, runs.agent,
-             runs.claim_expires_at, runs.proof, runs.telemetry_attempt_count, runs.telemetry_input_tokens, runs.telemetry_output_tokens, runs.telemetry_reasoning_tokens, runs.telemetry_estimated_cost_usd_micros, runs.telemetry_duration_ms, runs.telemetry_pricing_version, runs.telemetry_outcome, runs.telemetry_unattributed_attempt_count, runs.created_at, runs.updated_at
+             runs.claim_expires_at, runs.proof, runs.created_at, runs.updated_at
              FROM runs
              JOIN cards ON cards.id = runs.card_id
                        AND cards.claim_run_id = runs.id
@@ -293,51 +284,6 @@ impl Store {
                     card: load_card(&self.connection, &run.card_id)?,
                     question: latest_elicitation(&self.connection, &run.id)?,
                     run,
-                })
-            })
-            .collect()
-    }
-
-    pub fn list_approvals(&self, limit: usize) -> Result<Vec<ApprovalQueueRow>> {
-        let mut statement = self.connection.prepare(
-            "SELECT DISTINCT runs.id, runs.card_id, runs.state, runs.principal, runs.role, runs.agent,
-             runs.claim_expires_at, runs.proof, runs.telemetry_attempt_count, runs.telemetry_input_tokens, runs.telemetry_output_tokens, runs.telemetry_reasoning_tokens, runs.telemetry_estimated_cost_usd_micros, runs.telemetry_duration_ms, runs.telemetry_pricing_version, runs.telemetry_outcome, runs.telemetry_unattributed_attempt_count, runs.created_at, runs.updated_at
-             FROM runs
-             JOIN cards ON cards.id = runs.card_id
-                       AND cards.claim_run_id = runs.id
-                       AND cards.status = 'awaiting_input'
-             JOIN links ON links.card_id = runs.card_id
-             WHERE runs.state = 'awaiting_input'
-               AND lower(ltrim(links.label)) LIKE 'approval%'
-             ORDER BY runs.updated_at ASC, runs.id ASC
-             LIMIT ?1",
-        )?;
-        let runs = statement
-            .query_map([limit.max(1) as i64], RunRecord::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(RunRecord::into_run)
-            .collect::<Result<Vec<_>>>()?;
-
-        runs.into_iter()
-            .map(|run| {
-                let card = load_card(&self.connection, &run.card_id)?;
-                let question = latest_elicitation(&self.connection, &run.id)?;
-                let packet_links = load_links_for_card(&self.connection, &card.id)?
-                    .into_iter()
-                    .filter(|link| {
-                        link.label
-                            .trim_start()
-                            .to_ascii_lowercase()
-                            .starts_with("approval")
-                    })
-                    .collect::<Vec<_>>();
-                Ok(ApprovalQueueRow {
-                    card_id: card.id,
-                    title: card.title,
-                    run_id: run.id,
-                    question: question.map(|question| question.payload),
-                    packet_links,
                 })
             })
             .collect()
@@ -441,9 +387,13 @@ fn answer_input_in_transaction(
             semantic_identity: card.claim.as_ref().map(|claim| claim.agent.as_str()),
             run_id: Some(run_id),
             reason: None,
-            event_type: "answer-input",
+            event_type: CardEventType::AnswerInput,
             actor: &actor,
-            payload: "answered input",
+            change: CardEventChange::Input {
+                action: powder_core::InputEventAction::Answered,
+                run_id: Some(run_id.clone()),
+                text: Some(answer.clone()),
+            },
             subject_kind: "run",
             subject_id: run_id.as_str(),
             authority,
@@ -502,7 +452,7 @@ fn truncated_total(total: usize, returned: usize) -> Option<usize> {
     (total > returned).then_some(total)
 }
 
-/// One query, oldest child first -- creation order is decomposition order.
+/// One query, oldest child first -- creation order is stable relation order.
 fn load_children_for_card(connection: &Connection, card_id: &CardId) -> Result<Vec<CardSummary>> {
     let mut statement = connection.prepare(&format!(
         "SELECT {} FROM cards WHERE parent = ?1 ORDER BY created_at ASC, id ASC",
@@ -513,7 +463,7 @@ fn load_children_for_card(connection: &Connection, card_id: &CardId) -> Result<V
         .collect::<rusqlite::Result<Vec<_>>>()?;
     records
         .into_iter()
-        .map(|record| crate::card_from_record(connection, record).map(|card| card.summary()))
+        .map(|record| crate::card_from_record(record).map(|card| card.summary()))
         .collect()
 }
 
@@ -528,80 +478,6 @@ fn bound_children(children: Vec<CardSummary>, detail: DetailLevel) -> Vec<CardSu
             bounded
         }
     }
-}
-
-/// All child evidence in two queries (runs with proof, then links), merged
-/// into one deterministic order: child creation order, then row creation
-/// order, proofs before links per child.
-fn load_child_evidence(connection: &Connection, card_id: &CardId) -> Result<Vec<EpicEvidence>> {
-    let mut evidence: Vec<(i64, String, u8, i64, EpicEvidence)> = Vec::new();
-    let mut proofs = connection.prepare(
-        "SELECT children.created_at, children.id, runs.created_at, runs.proof
-         FROM runs JOIN cards children ON children.id = runs.card_id
-         WHERE children.parent = ?1 AND runs.proof IS NOT NULL",
-    )?;
-    let proof_rows = proofs
-        .query_map([card_id.as_str()], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (child_created, child_id, row_created, proof) in proof_rows {
-        evidence.push((
-            child_created,
-            child_id.clone(),
-            0,
-            row_created,
-            EpicEvidence {
-                child_id: CardId::new(child_id)?,
-                kind: EvidenceKind::Proof,
-                label: None,
-                reference: EpicState::proof_snippet(&proof),
-            },
-        ));
-    }
-    let mut links = connection.prepare(
-        "SELECT children.created_at, children.id, links.created_at, links.label, links.url
-         FROM links JOIN cards children ON children.id = links.card_id
-         WHERE children.parent = ?1",
-    )?;
-    let link_rows = links
-        .query_map([card_id.as_str()], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (child_created, child_id, row_created, label, url) in link_rows {
-        evidence.push((
-            child_created,
-            child_id.clone(),
-            1,
-            row_created,
-            EpicEvidence {
-                child_id: CardId::new(child_id)?,
-                kind: EvidenceKind::Link,
-                label: Some(label),
-                reference: url,
-            },
-        ));
-    }
-    evidence.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.3.cmp(&right.3))
-    });
-    Ok(evidence.into_iter().map(|entry| entry.4).collect())
 }
 
 pub(super) fn load_run(connection: &Connection, run_id: &RunId) -> Result<Run> {
@@ -621,7 +497,6 @@ fn load_runs_for_card(
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
-                 telemetry_attempt_count, telemetry_input_tokens, telemetry_output_tokens, telemetry_reasoning_tokens, telemetry_estimated_cost_usd_micros, telemetry_duration_ms, telemetry_pricing_version, telemetry_outcome, telemetry_unattributed_attempt_count,
                  created_at, updated_at
                  FROM runs
                  WHERE card_id = ?1
@@ -635,7 +510,6 @@ fn load_runs_for_card(
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
                 "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
-                 telemetry_attempt_count, telemetry_input_tokens, telemetry_output_tokens, telemetry_reasoning_tokens, telemetry_estimated_cost_usd_micros, telemetry_duration_ms, telemetry_pricing_version, telemetry_outcome, telemetry_unattributed_attempt_count,
                  created_at, updated_at
                  FROM runs
                  WHERE card_id = ?1
@@ -695,6 +569,7 @@ fn load_activities_for_card(
                  FROM activities
                  JOIN runs ON runs.id = activities.run_id
                  WHERE runs.card_id = ?1
+                   AND activities.activity_type IN ('action', 'response', 'elicitation')
                  ORDER BY activities.created_at ASC, activities.rowid ASC",
             )?;
             let records = statement
@@ -709,6 +584,7 @@ fn load_activities_for_card(
                  FROM activities
                  JOIN runs ON runs.id = activities.run_id
                  WHERE runs.card_id = ?1
+                   AND activities.activity_type IN ('action', 'response', 'elicitation')
                  ORDER BY activities.created_at DESC, activities.rowid DESC
                  LIMIT ?2",
             )?;
@@ -743,7 +619,8 @@ fn count_activities_for_card(connection: &Connection, card_id: &CardId) -> Resul
         "SELECT COUNT(*)
          FROM activities
          JOIN runs ON runs.id = activities.run_id
-         WHERE runs.card_id = ?1",
+         WHERE runs.card_id = ?1
+           AND activities.activity_type IN ('action', 'response', 'elicitation')",
         [card_id.as_str()],
         |row| row.get(0),
     )?;
@@ -761,6 +638,7 @@ fn load_activities_for_run(
                 "SELECT id, run_id, activity_type, payload, principal, role, created_at
                  FROM activities
                  WHERE run_id = ?1
+                   AND activity_type IN ('action', 'response', 'elicitation')
                  ORDER BY created_at ASC, rowid ASC",
             )?;
             let records = statement
@@ -773,6 +651,7 @@ fn load_activities_for_run(
                 "SELECT id, run_id, activity_type, payload, principal, role, created_at
                  FROM activities
                  WHERE run_id = ?1
+                   AND activity_type IN ('action', 'response', 'elicitation')
                  ORDER BY created_at DESC, rowid DESC
                  LIMIT ?2",
             )?;
@@ -804,7 +683,9 @@ fn load_activities_for_run(
 
 fn count_activities_for_run(connection: &Connection, run_id: &RunId) -> Result<usize> {
     let total: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM activities WHERE run_id = ?1",
+        "SELECT COUNT(*) FROM activities
+         WHERE run_id = ?1
+           AND activity_type IN ('action', 'response', 'elicitation')",
         [run_id.as_str()],
         |row| row.get(0),
     )?;
@@ -815,6 +696,7 @@ fn load_events_for_card(
     connection: &Connection,
     card_id: &CardId,
     detail: DetailLevel,
+    blocked_status: CardStatus,
 ) -> Result<DetailSection<CardEvent>> {
     let records = match detail {
         DetailLevel::Detailed => {
@@ -852,7 +734,7 @@ fn load_events_for_card(
     };
     let events = records
         .into_iter()
-        .map(CardEventRecord::into_event)
+        .map(|record| record.into_event(blocked_status))
         .collect::<Result<Vec<_>>>()?;
     let total = match detail {
         DetailLevel::Detailed => None,
@@ -889,10 +771,6 @@ fn latest_elicitation(connection: &Connection, run_id: &RunId) -> Result<Option<
         .optional()?
         .map(ActivityRecord::into_activity)
         .transpose()
-}
-
-pub(super) fn load_links_for_card(connection: &Connection, card_id: &CardId) -> Result<Vec<Link>> {
-    Ok(load_link_section_for_card(connection, card_id, DetailLevel::Detailed)?.items)
 }
 
 fn load_link_section_for_card(
@@ -1065,13 +943,20 @@ impl CardEventRecord {
         })
     }
 
-    fn into_event(self) -> Result<CardEvent> {
+    fn into_event(self, blocked_status: CardStatus) -> Result<CardEvent> {
+        let change = super::events::parse_card_event_change(
+            &self.event_type,
+            &self.payload,
+            self.subject_id.as_deref(),
+            self.run_id.as_deref(),
+            blocked_status,
+        )?;
         Ok(CardEvent {
             id: CardEventId::new(self.id)?,
             card_id: CardId::new(self.card_id)?,
             event_type: self.event_type,
             actor: self.actor,
-            payload: self.payload,
+            change,
             principal: self.principal,
             role: self.role,
             subject_kind: self.subject_kind,
@@ -1185,7 +1070,7 @@ fn load_work_log_for_card(
     let records = match detail {
         DetailLevel::Detailed => {
             let mut statement = connection.prepare(
-                "SELECT id, card_id, agent, model, reasoning, harness, run_id, body, created_at
+                "SELECT id, card_id, agent, run_id, body, created_at
                  FROM work_log_entries
                  WHERE card_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -1197,7 +1082,7 @@ fn load_work_log_for_card(
         }
         DetailLevel::Concise => {
             let mut statement = connection.prepare(
-                "SELECT id, card_id, agent, model, reasoning, harness, run_id, body, created_at
+                "SELECT id, card_id, agent, run_id, body, created_at
                  FROM work_log_entries
                  WHERE card_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -1242,9 +1127,6 @@ struct WorkLogRecord {
     id: String,
     card_id: String,
     agent: String,
-    model: Option<String>,
-    reasoning: Option<String>,
-    harness: Option<String>,
     run_id: Option<String>,
     body: String,
     created_at: i64,
@@ -1256,12 +1138,9 @@ impl WorkLogRecord {
             id: row.get(0)?,
             card_id: row.get(1)?,
             agent: row.get(2)?,
-            model: row.get(3)?,
-            reasoning: row.get(4)?,
-            harness: row.get(5)?,
-            run_id: row.get(6)?,
-            body: row.get(7)?,
-            created_at: row.get(8)?,
+            run_id: row.get(3)?,
+            body: row.get(4)?,
+            created_at: row.get(5)?,
         })
     }
 
@@ -1270,9 +1149,6 @@ impl WorkLogRecord {
             id: self.id,
             card_id: CardId::new(self.card_id)?,
             agent: self.agent,
-            model: self.model,
-            reasoning: self.reasoning,
-            harness: self.harness,
             run_id: self.run_id.map(RunId::new).transpose()?,
             body: self.body,
             created_at: self.created_at,

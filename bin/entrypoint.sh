@@ -14,9 +14,11 @@ else
   MISSING=""
   [ -z "${AWS_ACCESS_KEY_ID:-}" ] && MISSING="$MISSING AWS_ACCESS_KEY_ID"
   [ -z "${AWS_SECRET_ACCESS_KEY:-}" ] && MISSING="$MISSING AWS_SECRET_ACCESS_KEY"
+  [ -z "${AWS_ENDPOINT_URL:-}" ] && MISSING="$MISSING AWS_ENDPOINT_URL"
+  [ -z "${AWS_REGION:-}" ] && MISSING="$MISSING AWS_REGION"
 
   if [ -n "$MISSING" ]; then
-    echo "WARNING: Fly Tigris bucket set but missing required variables:$MISSING" >&2
+    echo "WARNING: S3 bucket set but missing required variables:$MISSING" >&2
   else
     LITESTREAM_READY=1
   fi

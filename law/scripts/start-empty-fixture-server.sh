@@ -15,7 +15,6 @@ DB="$(mktemp -d)/law-gate-empty.db"
 export POWDER_DB_PATH="$DB"
 export POWDER_AUTH_MODE=none
 export PORT="${PORT:-4101}"
-export POWDER_HOME_URL="https://sanctum.example.test"
 
 cargo run -q -p powder-cli -- init-db --db "$DB" >/dev/null
 

@@ -1,7 +1,7 @@
 # Status Vocabulary Decision (powder-status-vocabulary)
 
-Ratified 2026-07-14 under the operator constraints recorded on
-powder-epic-state-model: collapse toward a smaller lane model only where it
+Ratified 2026-07-14 under the operator constraints:
+collapse toward a smaller lane model only where it
 genuinely simplifies; status stays freely settable by any authorized actor
 with or without a claim; `awaiting_input` stays first-class and queryable;
 the TTL claim/lease model is untouched; the three terminal outcomes stay
@@ -16,7 +16,7 @@ Seven statuses, down from the prior nine:
 | `backlog` | Filed but carries no acceptance oracle yet (or deliberately parked). The create-time default for a card with empty acceptance. |
 | `ready` | Carries a real oracle and is claimable once its blockers (if any) resolve. The create-time default for a card with acceptance. |
 | `in_progress` | An agent is actively working the card. Who holds it, the lease, and liveness live on the claim struct, not in the status. |
-| `awaiting_input` | The run is parked on an operator question (first-class, queryable via `list_awaiting_input`/`list_approvals`). |
+| `awaiting_input` | The run is parked on an operator question (first-class, queryable via `list_awaiting_input`). |
 | `done` | Terminal: completed. |
 | `shipped` | Terminal: completed and deployed/released. |
 | `abandoned` | Terminal: deliberately not completed. |
@@ -81,18 +81,17 @@ complete principalized metadata shape, and the legacy `actors` table is gone.
 | `shipped` | `shipped` | Unchanged; terminal outcomes stay distinguishable per operator ruling. |
 | `abandoned` | `abandoned` | Unchanged. |
 
-The retired names (`claimed`, `running`, `blocked`) are **rejected** by
-`update_status`/`create_card`/list filters on HTTP and CLI with an error naming
-the current vocabulary -- never silently aliased onto a surviving status.
-`in-progress`/`in_progress` and `pending` (a long-standing alias for `backlog`)
-still parse; they were never statuses of their own.
+The retired names (`claimed`, `running`, `blocked`) and non-canonical status
+spellings are rejected by `update_status`, `create_card`, and list filters on
+HTTP and CLI. Status values use the exact snake_case wire vocabulary; callers
+must not rely on compatibility aliases.
 
 ## Terminal Outcomes Stay Distinguishable
 
 `done`, `shipped`, and `abandoned` remain three distinct statuses in the
 enum, the store, the wire vocabulary, and the board's DONE lane (distinct
 badges). `CardStatus::is_terminal` remains the single definition of
-"terminal" that blocker resolution, reimport lifecycle protection, and the
+"terminal" that blocker resolution, terminal lifecycle protection, and the
 board's DONE lane all share.
 
 ## Why Blocked Is Not A Status

@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 29;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS seed_runs (
@@ -69,7 +69,6 @@ CREATE TABLE IF NOT EXISTS ready_snapshot_items (
   UNIQUE(snapshot_id, card_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ready_snapshot_items_card ON ready_snapshot_items(snapshot_id, card_id);
-
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
   mime TEXT NOT NULL,
@@ -88,7 +87,6 @@ CREATE TABLE IF NOT EXISTS card_attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_card_attachments_card_created
   ON card_attachments(card_id, created_at, attachment_id);
-CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent);
 
 CREATE TABLE IF NOT EXISTS repositories (
   name TEXT PRIMARY KEY,
@@ -140,6 +138,11 @@ CREATE TABLE IF NOT EXISTS run_telemetry_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_run ON run_telemetry_attempts(run_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_run_telemetry_attempts_model ON run_telemetry_attempts(model, provider, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent);
+
+
+
 
 CREATE TABLE IF NOT EXISTS activities (
   id TEXT PRIMARY KEY,
@@ -200,7 +203,6 @@ CREATE TABLE IF NOT EXISTS work_log_entries (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_work_log_entries_card_created ON work_log_entries(card_id, created_at);
-
 CREATE TABLE IF NOT EXISTS event_subscriptions (
   id TEXT PRIMARY KEY,
   url TEXT NOT NULL,
@@ -211,6 +213,7 @@ CREATE TABLE IF NOT EXISTS event_subscriptions (
   disabled_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_event_subscriptions_active ON event_subscriptions(disabled_at, created_at, id);
+
 
 CREATE TABLE IF NOT EXISTS outbound_events (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,7 +227,6 @@ CREATE TABLE IF NOT EXISTS outbound_events (
 CREATE INDEX IF NOT EXISTS idx_outbound_events_card_created ON outbound_events(card_id, sequence);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_events_audit
   ON outbound_events(audit_event_id) WHERE audit_event_id IS NOT NULL;
-
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
   id TEXT PRIMARY KEY,
   subscription_id TEXT NOT NULL REFERENCES event_subscriptions(id) ON DELETE CASCADE,
@@ -250,6 +252,8 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
   attempted_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery ON webhook_delivery_attempts(delivery_id, attempt_number);
+
+
 
 CREATE TABLE IF NOT EXISTS operation_idempotency (
   operation TEXT NOT NULL,
@@ -514,18 +518,12 @@ pub const MIGRATE_11_TO_12: &str = r#"
 ALTER TABLE cards ADD COLUMN autonomy TEXT NOT NULL DEFAULT 'review';
 "#;
 
-/// powder-964: source file's `Estimate: S/M/L/XL` header has no Powder
-/// equivalent, so an autonomous chewer has to read a full card body to
-/// gauge complexity. Nullable/optional: existing cards are not required to
-/// backfill it.
 pub const MIGRATE_12_TO_13: &str = r#"
 ALTER TABLE cards ADD COLUMN estimate TEXT;
 "#;
 
-/// powder-epic-hierarchy-rollup: explicit parent/child hierarchy edge. A
-/// child card names its parent; children are derived by query. Nullable --
-/// hierarchy is opt-in and `related`/`blocks`/`blocked_by` keep their
-/// existing semantics untouched.
+/// Explicit parent/child relation. A child card names its parent; children are
+/// derived by query. Nullable, and independent from `related`/`blocks` edges.
 pub const MIGRATE_13_TO_14: &str = r#"
 ALTER TABLE cards ADD COLUMN parent TEXT;
 CREATE INDEX IF NOT EXISTS idx_cards_parent ON cards(parent);
@@ -551,23 +549,17 @@ pub const MIGRATE_15_TO_16: &str = r#"
 ALTER TABLE cards DROP COLUMN autonomy;
 "#;
 
-pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate, labels_json,
-assignee, related_json, blocks_json, blocked_by_json, repo, source_path,
-source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at, claim_expires_at,
-created_at, updated_at, parent, risk";
+pub const CARD_COLUMNS: &str = "id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority,
+labels_json, related_json, blocks_json, blocked_by_json, repo, claim_principal, claim_agent, claim_run_id,
+claim_acquired_at, claim_expires_at, created_at, updated_at, parent";
 
-pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
-labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
-source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at,
-claim_expires_at, created_at, updated_at, parent, risk FROM cards WHERE id = ?1";
+pub const CARD_SELECT_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority,
+labels_json, related_json, blocks_json, blocked_by_json, repo, claim_principal, claim_agent, claim_run_id,
+claim_acquired_at, claim_expires_at, created_at, updated_at, parent FROM cards WHERE id = ?1";
 
-pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority, estimate,
-labels_json, assignee, related_json, blocks_json, blocked_by_json, repo,
-source_path, source_digest, claim_principal, claim_agent, claim_run_id, claim_acquired_at,
-claim_expires_at, created_at, updated_at, parent, risk FROM cards";
+pub const CARD_SELECT_ALL_SQL: &str = "SELECT id, title, body, acceptance_json, criteria_json, proof_plan_json, status, priority,
+labels_json, related_json, blocks_json, blocked_by_json, repo, claim_principal, claim_agent, claim_run_id,
+claim_acquired_at, claim_expires_at, created_at, updated_at, parent FROM cards";
 
 pub const RUN_SELECT_SQL: &str =
-    "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof,
-telemetry_attempt_count, telemetry_input_tokens, telemetry_output_tokens, telemetry_reasoning_tokens,
-telemetry_estimated_cost_usd_micros, telemetry_duration_ms, telemetry_pricing_version, telemetry_outcome,
-telemetry_unattributed_attempt_count, created_at, updated_at FROM runs WHERE id = ?1";
+    "SELECT id, card_id, state, principal, role, agent, claim_expires_at, proof, created_at, updated_at FROM runs WHERE id = ?1";

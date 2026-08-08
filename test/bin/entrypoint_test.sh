@@ -14,11 +14,17 @@ reset_env() {
   unset AWS_ACCESS_KEY_ID
   unset AWS_SECRET_ACCESS_KEY
   unset AWS_REGION
-  unset AWS_ENDPOINT_URL_S3
+  unset AWS_ENDPOINT_URL
   unset LITESTREAM_STUB_CREATE_DB
   unset LITESTREAM_STUB_EXIT
   unset POWDER_REQUIRE_LITESTREAM
-  unset POWDER_BIN
+}
+configure_litestream() {
+  export BUCKET_NAME="my-bucket"
+  export AWS_ACCESS_KEY_ID="key"
+  export AWS_SECRET_ACCESS_KEY="secret"
+  export AWS_ENDPOINT_URL="https://storage.example.test"
+  export AWS_REGION="auto"
 }
 
 setup_stubs() {
@@ -144,18 +150,16 @@ assert_contains "$OUTPUT" "EXEC:/app/bin/powder-server" "starts app directly wit
 echo "Test 2: BUCKET_NAME set, AWS_ACCESS_KEY_ID missing"
 reset_env
 setup_stubs
-export BUCKET_NAME="my-bucket"
-export AWS_SECRET_ACCESS_KEY="secret"
+configure_litestream
+unset AWS_ACCESS_KEY_ID
 OUTPUT=$(run_entrypoint)
 assert_contains "$OUTPUT" "AWS_ACCESS_KEY_ID" "identifies missing ACCESS_KEY_ID"
 assert_not_contains "$OUTPUT" "NOT configured" "does not warn about unconfigured replication"
 
-echo "Test 3: All Fly Tigris vars set"
+echo "Test 3: All Litestream vars set"
 reset_env
 setup_stubs
-export BUCKET_NAME="my-bucket"
-export AWS_ACCESS_KEY_ID="key"
-export AWS_SECRET_ACCESS_KEY="secret"
+configure_litestream
 OUTPUT=$(run_entrypoint)
 assert_not_contains "$OUTPUT" "WARNING" "no warnings when fully configured"
 assert_contains "$OUTPUT" "EXEC:litestream replicate" "starts via litestream"
@@ -176,9 +180,7 @@ assert_not_contains "$BODY" "EXEC:/app/bin/powder-server" "does not start app di
 echo "Test 5: Missing DB restores from Litestream before startup"
 reset_env
 setup_stubs without_db
-export BUCKET_NAME="my-bucket"
-export AWS_ACCESS_KEY_ID="key"
-export AWS_SECRET_ACCESS_KEY="secret"
+configure_litestream
 export LITESTREAM_STUB_CREATE_DB=1
 OUTPUT=$(run_entrypoint)
 assert_file_contains "$LITESTREAM_LOG" \
@@ -190,9 +192,7 @@ assert_not_contains "$OUTPUT" "did not materialize" "does not warn when restore 
 echo "Test 6: Missing DB with no replica starts fresh"
 reset_env
 setup_stubs without_db
-export BUCKET_NAME="my-bucket"
-export AWS_ACCESS_KEY_ID="key"
-export AWS_SECRET_ACCESS_KEY="secret"
+configure_litestream
 OUTPUT=$(run_entrypoint)
 assert_contains "$OUTPUT" "No Litestream replica found for $POWDER_DB_PATH" \
   "reports first-run empty replica"
@@ -201,9 +201,7 @@ assert_contains "$OUTPUT" "EXEC:litestream replicate" "starts via litestream for
 echo "Test 7: Restore command failure fails closed"
 reset_env
 setup_stubs without_db
-export BUCKET_NAME="my-bucket"
-export AWS_ACCESS_KEY_ID="key"
-export AWS_SECRET_ACCESS_KEY="secret"
+configure_litestream
 export LITESTREAM_STUB_EXIT=1
 OUTPUT=$(run_entrypoint_failure)
 STATUS=$(printf '%s' "$OUTPUT" | head -n 1)
@@ -214,9 +212,7 @@ assert_not_contains "$BODY" "EXEC:litestream replicate" "does not start after re
 echo "Test 8: Existing DB skips restore"
 reset_env
 setup_stubs
-export BUCKET_NAME="my-bucket"
-export AWS_ACCESS_KEY_ID="key"
-export AWS_SECRET_ACCESS_KEY="secret"
+configure_litestream
 run_entrypoint >/dev/null
 assert_file_not_contains "$LITESTREAM_LOG" "restore -if-replica-exists" \
   "does not restore when database already exists"

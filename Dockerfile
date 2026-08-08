@@ -10,7 +10,7 @@ RUN cargo build --release --locked -p powder-server -p powder-cli
 FROM debian:bookworm-slim
 
 RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends ca-certificates curl && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=litestream/litestream@sha256:5572700ba18710cb010a0e415e36abf5cc0b4d74a2ad7b6d6a387142c0c99604 /usr/local/bin/litestream /usr/local/bin/litestream
