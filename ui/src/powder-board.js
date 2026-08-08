@@ -97,10 +97,10 @@ const els = {
   settingsToggle: document.getElementById("settings-toggle"),
   repoSettings: document.getElementById("repo-settings"),
   apiKeyForm: document.getElementById("api-key-form"),
-  apiKeyInput: document.getElementById("api-key-input"),
-  clearApiKey: document.getElementById("clear-api-key"),
-  pasteApiKey: document.getElementById("paste-api-key"),
-  saveApiKey: document.getElementById("save-api-key"),
+  authInput: document.getElementById("board-auth-input"),
+  clearAuth: document.getElementById("board-auth-clear"),
+  pasteAuth: document.getElementById("board-auth-paste"),
+  saveAuth: document.getElementById("board-auth-save"),
   mintHint: document.getElementById("mint-hint"),
   authIntro: document.getElementById("auth-intro"),
   authMessage: document.getElementById("auth-message"),
@@ -1164,7 +1164,7 @@ function classifyFailure(err) {
 function showAuth(message) {
   els.authPanel.hidden = false;
   els.settingsToggle.setAttribute("aria-expanded", "true");
-  els.apiKeyInput.value = state.apiKey;
+  els.authInput.value = state.apiKey;
   // A browser whose reads are denied cannot list, create, or edit
   // repositories -- collapse the drawer to a focused connect card instead
   // of an inert editor.
@@ -1183,9 +1183,9 @@ function renderAuthState(message = "") {
   // The one-click recovery path carries the visual weight while the field
   // is empty on a denied read; a bare "save" submit there just refetches
   // into the same denial.
-  const connectPrimary = state.readDenied && !state.apiKey && !els.pasteApiKey.hidden;
-  els.pasteApiKey.classList.toggle("pw-button-quiet", !connectPrimary);
-  els.saveApiKey.classList.toggle("pw-button-quiet", connectPrimary);
+  const connectPrimary = state.readDenied && !state.apiKey && !els.pasteAuth.hidden;
+  els.pasteAuth.classList.toggle("pw-button-quiet", !connectPrimary);
+  els.saveAuth.classList.toggle("pw-button-quiet", connectPrimary);
   // The mint hint only earns its place when a key is actually part of this
   // deployment's flow; beside perimeter-trust copy it reads as a
   // contradiction.
@@ -3654,7 +3654,7 @@ els.repoSettingsList.addEventListener("click", (event) => {
 });
 els.apiKeyForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  state.apiKey = els.apiKeyInput.value.trim();
+  state.apiKey = els.authInput.value.trim();
   if (state.apiKey) localStorage.setItem(STORAGE_KEY, state.apiKey);
   else localStorage.removeItem(STORAGE_KEY);
   // A key change changes what this browser is allowed to see -- never let
@@ -3663,9 +3663,9 @@ els.apiKeyForm.addEventListener("submit", (event) => {
   renderAuthState();
   loadBoard();
 });
-els.clearApiKey.addEventListener("click", () => {
+els.clearAuth.addEventListener("click", () => {
   state.apiKey = "";
-  els.apiKeyInput.value = "";
+  els.authInput.value = "";
   localStorage.removeItem(STORAGE_KEY);
   localStorage.removeItem(BOARD_CACHE_KEY);
   renderAuthState();
@@ -3686,13 +3686,13 @@ els.copyMintCommand?.addEventListener("click", async () => {
 // Feature-detected: `clipboard.readText` needs a secure context and a
 // permission grant, so browsers/origins without it never see a dead
 // button -- the manual paste-into-field-then-save flow still works there.
-if (els.pasteApiKey && navigator.clipboard?.readText) {
-  els.pasteApiKey.hidden = false;
-  els.pasteApiKey.addEventListener("click", async () => {
+if (els.pasteAuth && navigator.clipboard?.readText) {
+  els.pasteAuth.hidden = false;
+  els.pasteAuth.addEventListener("click", async () => {
     try {
       const text = (await navigator.clipboard.readText()).trim();
       if (!text) return;
-      els.apiKeyInput.value = text;
+      els.authInput.value = text;
       els.apiKeyForm.requestSubmit();
     } catch (_err) {
       renderAuthState(
