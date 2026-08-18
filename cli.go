@@ -498,6 +498,9 @@ func runSetRepo(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
+	if !f.bit("clear") && f.str("repo") == "" {
+		return fail(errf("usage", "set-repo requires --repo or --clear"))
+	}
 	body := map[string]any{"agent": agentOf(f)}
 	if f.bit("clear") {
 		body["clear_repo"] = true
@@ -516,6 +519,9 @@ func runSetBlockers(f *flagset) int {
 	id, err := f.id()
 	if err != nil {
 		return fail(err)
+	}
+	if !f.bit("clear") && f.str("blocked-by") == "" {
+		return fail(errf("usage", "set-blockers requires --blocked-by or --clear"))
 	}
 	var blocked []string
 	if !f.bit("clear") {

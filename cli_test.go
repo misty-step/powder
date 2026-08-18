@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -99,4 +101,82 @@ func TestEmbeddedSkillMatchesFile(t *testing.T) {
 	if skillMD != string(b) {
 		t.Fatal("embedded skillMD != SKILL.md")
 	}
+}
+
+func TestSetRepoNoFlagsUsage(t *testing.T) {
+	t.Setenv("POWDER_URL", "")
+	t.Setenv("POWDER_API_BASE_URL", "")
+	code, stderr := runCLI(t, []string{"set-repo", "foo"})
+	if code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if got := stderrCode(t, stderr); got != "usage" {
+		t.Fatalf("code %q stderr %s", got, stderr)
+	}
+}
+
+func TestSetBlockersNoFlagsUsage(t *testing.T) {
+	t.Setenv("POWDER_URL", "")
+	t.Setenv("POWDER_API_BASE_URL", "")
+	code, stderr := runCLI(t, []string{"set-blockers", "foo"})
+	if code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if got := stderrCode(t, stderr); got != "usage" {
+		t.Fatalf("code %q stderr %s", got, stderr)
+	}
+}
+
+func TestSetRepoClearReachesOrigin(t *testing.T) {
+	t.Setenv("POWDER_URL", "")
+	t.Setenv("POWDER_API_BASE_URL", "")
+	code, stderr := runCLI(t, []string{"set-repo", "foo", "--clear"})
+	if code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if got := stderrCode(t, stderr); got != "no_origin" {
+		t.Fatalf("code %q stderr %s", got, stderr)
+	}
+}
+
+func TestSetBlockersValueReachesOrigin(t *testing.T) {
+	t.Setenv("POWDER_URL", "")
+	t.Setenv("POWDER_API_BASE_URL", "")
+	code, stderr := runCLI(t, []string{"set-blockers", "foo", "--blocked-by", "a"})
+	if code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if got := stderrCode(t, stderr); got != "no_origin" {
+		t.Fatalf("code %q stderr %s", got, stderr)
+	}
+}
+
+func runCLI(t *testing.T, args []string) (int, string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	code := cliMain(args)
+	w.Close()
+	os.Stderr = old
+	b, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, string(b)
+}
+
+func stderrCode(t *testing.T, stderr string) string {
+	t.Helper()
+	var e struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(stderr), &e); err != nil {
+		t.Fatalf("decode stderr: %v %s", err, stderr)
+	}
+	return e.Code
 }
