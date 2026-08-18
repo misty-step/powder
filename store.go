@@ -722,7 +722,7 @@ func (s *Store) Note(id, agent, text string) (Job, error) {
 	return out, err
 }
 
-func (s *Store) Patch(id, agent string, title, spec *string, repo **string, blockedBy *[]string) (Job, error) {
+func (s *Store) Patch(id, agent string, title, spec, repo *string, clearRepo bool, blockedBy *[]string) (Job, error) {
 	var out Job
 	err := s.write(func(t *tx) error {
 		if _, err := t.requireHolderOrFree(id, agent); err != nil {
@@ -741,15 +741,13 @@ func (s *Store) Patch(id, agent string, title, spec *string, repo **string, bloc
 				return err
 			}
 		}
-		if repo != nil {
-			if *repo == nil {
-				if _, err := t.tx.Exec(`UPDATE jobs SET repo = NULL WHERE id = ?`, id); err != nil {
-					return err
-				}
-			} else {
-				if _, err := t.tx.Exec(`UPDATE jobs SET repo = ? WHERE id = ?`, **repo, id); err != nil {
-					return err
-				}
+		if clearRepo {
+			if _, err := t.tx.Exec(`UPDATE jobs SET repo = NULL WHERE id = ?`, id); err != nil {
+				return err
+			}
+		} else if repo != nil {
+			if _, err := t.tx.Exec(`UPDATE jobs SET repo = ? WHERE id = ?`, *repo, id); err != nil {
+				return err
 			}
 		}
 		if blockedBy != nil {

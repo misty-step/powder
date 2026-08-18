@@ -392,3 +392,91 @@ func TestPeekExpiredLeaseHidesHolder(t *testing.T) {
 		t.Fatalf("live mark after expiry")
 	}
 }
+
+func TestPatchOmitClearSet(t *testing.T) {
+	h := newHarness(t)
+	h.create("blk", "x")
+	st, raw := h.do("POST", "/api/jobs", map[string]any{
+		"id": "p", "title": "p", "spec": "s", "repo": "old/repo", "blocked_by": []string{"blk"},
+	})
+	if st != http.StatusCreated {
+		t.Fatalf("create %d %s", st, raw)
+	}
+
+	repo := "new/repo"
+	j, err := h.store.Patch("p", "ag", nil, nil, &repo, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Repo == nil || *j.Repo != "new/repo" {
+		t.Fatalf("set repo: %#v", j.Repo)
+	}
+	if len(j.BlockedBy) != 1 || j.BlockedBy[0] != "blk" {
+		t.Fatalf("omit blockers: %v", j.BlockedBy)
+	}
+
+	j, err = h.store.Patch("p", "ag", nil, nil, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Repo != nil {
+		t.Fatalf("clear repo: %#v", j.Repo)
+	}
+
+	title := "q"
+	j, err = h.store.Patch("p", "ag", &title, nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Title != "q" || j.Repo != nil {
+		t.Fatalf("omit after clear: title=%s repo=%#v", j.Title, j.Repo)
+	}
+
+	blocks := []string{"blk"}
+	j, err = h.store.Patch("p", "ag", nil, nil, nil, false, &blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(j.BlockedBy) != 1 || j.BlockedBy[0] != "blk" {
+		t.Fatalf("replace blockers: %v", j.BlockedBy)
+	}
+
+	empty := []string{}
+	j, err = h.store.Patch("p", "ag", nil, nil, nil, false, &empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(j.BlockedBy) != 0 {
+		t.Fatalf("clear blockers: %v", j.BlockedBy)
+	}
+
+	st, raw = h.do("PATCH", "/api/jobs/p", map[string]any{"repo": "via/json", "clear_repo": false})
+	if st != 200 {
+		t.Fatalf("json set repo %d %s", st, raw)
+	}
+	j = h.job(raw)
+	if j.Repo == nil || *j.Repo != "via/json" {
+		t.Fatalf("json repo %#v", j.Repo)
+	}
+	st, raw = h.do("PATCH", "/api/jobs/p", map[string]any{"clear_repo": true})
+	if st != 200 {
+		t.Fatalf("json clear repo %d %s", st, raw)
+	}
+	if h.job(raw).Repo != nil {
+		t.Fatalf("json clear %#v", h.job(raw).Repo)
+	}
+	st, raw = h.do("PATCH", "/api/jobs/p", map[string]any{"set_blockers": true, "blocked_by": []string{"blk"}})
+	if st != 200 {
+		t.Fatalf("json replace %d %s", st, raw)
+	}
+	if got := h.job(raw).BlockedBy; len(got) != 1 || got[0] != "blk" {
+		t.Fatalf("json replace %v", got)
+	}
+	st, raw = h.do("PATCH", "/api/jobs/p", map[string]any{"set_blockers": true})
+	if st != 200 {
+		t.Fatalf("json clear blocks %d %s", st, raw)
+	}
+	if len(h.job(raw).BlockedBy) != 0 {
+		t.Fatalf("json clear blocks %v", h.job(raw).BlockedBy)
+	}
+}
