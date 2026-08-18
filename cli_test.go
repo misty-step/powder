@@ -90,3 +90,13 @@ func TestSkillDocumentsEveryCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbeddedSkillMatchesFile(t *testing.T) {
+	b, err := os.ReadFile("SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skillMD != string(b) {
+		t.Fatal("embedded skillMD != SKILL.md")
+	}
+}
