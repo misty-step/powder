@@ -500,12 +500,12 @@ func actor(r *http.Request, agent string) string {
 	return principalOf(r)
 }
 
-func mustParseTTL(s string) time.Duration {
+func parseTTL(s string) (time.Duration, error) {
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return 4 * time.Hour
+		return 0, errf("invalid_ttl", "ttl %q is not a duration", s)
 	}
-	return d
+	return d, nil
 }
 
 const htmlTemplates = `

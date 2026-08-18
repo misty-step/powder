@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVersionLineOverride(t *testing.T) {
@@ -179,4 +180,19 @@ func stderrCode(t *testing.T, stderr string) string {
 		t.Fatalf("decode stderr: %v %s", err, stderr)
 	}
 	return e.Code
+}
+
+func TestParseTTLValid(t *testing.T) {
+	d, err := parseTTL("4h")
+	if err != nil || d != 4*time.Hour {
+		t.Fatalf("got %v %v", d, err)
+	}
+}
+
+func TestParseTTLGarbage(t *testing.T) {
+	_, err := parseTTL("garbage")
+	ce, ok := err.(*CodeError)
+	if !ok || ce.Code != "invalid_ttl" {
+		t.Fatalf("got %v", err)
+	}
 }

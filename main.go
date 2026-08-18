@@ -72,7 +72,11 @@ Environment:
 	bind := first(fs.str("bind"), os.Getenv("POWDER_BIND_ADDR"), "127.0.0.1:4000")
 	dbPath := first(fs.str("db"), os.Getenv("POWDER_DB_PATH"), "powder.db")
 	keyFile := first(fs.str("bootstrap-key-file"), os.Getenv("POWDER_BOOTSTRAP_KEY_FILE"), "powder-bootstrap.key")
-	ttl := mustParseTTL(first(fs.str("ttl"), os.Getenv("POWDER_LEASE_TTL"), "4h"))
+	ttl, err := parseTTL(first(fs.str("ttl"), os.Getenv("POWDER_LEASE_TTL"), "4h"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	auth := first(fs.str("auth"), os.Getenv("POWDER_AUTH_MODE"), "api-key")
 
 	if err := os.MkdirAll(filepath.Dir(absOrDot(dbPath)), 0o755); err != nil {
