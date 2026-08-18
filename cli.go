@@ -65,6 +65,9 @@ func cliMain(args []string) int {
 	case "version":
 		fmt.Println(versionLine())
 		return 0
+	case "skill":
+		fmt.Print(skillMD)
+		return 0
 	default:
 		return fail(errf("usage", "unknown command %s", cmd))
 	}
@@ -73,7 +76,7 @@ func cliMain(args []string) int {
 var cmdOrder = []string{
 	"serve", "create", "show", "list", "take", "release", "renew",
 	"note", "ask", "answer", "done", "abandon", "reopen",
-	"set-title", "set-spec", "set-repo", "set-blockers", "version",
+	"set-title", "set-spec", "set-repo", "set-blockers", "version", "skill",
 }
 
 var cmdHelp = map[string]string{
@@ -95,6 +98,7 @@ var cmdHelp = map[string]string{
 	"set-repo":     "powder set-repo ID [--repo REPO|--clear] [--agent AGENT]",
 	"set-blockers": "powder set-blockers ID [--blocked-by a,b|--clear] [--agent AGENT]",
 	"version":      "powder version",
+	"skill":        "powder skill",
 }
 
 func usageBanner() string {
