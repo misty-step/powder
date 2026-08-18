@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -345,5 +346,49 @@ func TestNoneAuthAllowsAPI(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		t.Fatalf("none auth GET /api/jobs %d", res.StatusCode)
+	}
+}
+
+func TestPeekExpiredLeaseHidesHolder(t *testing.T) {
+	h := newHarness(t)
+	h.create("hold", "x")
+	h.take("hold", "ticker")
+	h.now = h.now.Add(2 * time.Hour)
+
+	st, raw := h.do("GET", "/api/jobs/hold", nil)
+	if st != 200 {
+		t.Fatalf("api %d %s", st, raw)
+	}
+	j := h.job(raw)
+	if j.Lease == nil {
+		t.Fatal("load dropped expired lease")
+	}
+	if j.Derived.Live {
+		t.Fatal("expired lease still live")
+	}
+
+	req, err := http.NewRequest("GET", h.srv.URL+"/jobs/hold", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(body)
+	if strings.Contains(html, "Held by") {
+		t.Fatalf("held by after expiry")
+	}
+	if strings.Contains(html, "id=\"release\"") {
+		t.Fatalf("release after expiry")
+	}
+	if strings.Contains(html, `class="mark live"`) {
+		t.Fatalf("live mark after expiry")
 	}
 }

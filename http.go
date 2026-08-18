@@ -688,7 +688,7 @@ button.textish {
 <h2>{{.Title}}</h2>
 {{if .Repo}}<p class="muted id">{{.Repo}}</p>{{end}}
 {{if .BlockedBy}}<p class="id">blocked_by {{join .BlockedBy ", "}}</p>{{end}}
-{{if .Lease}}<p>Held by <span class="id">{{.Lease.Agent}}</span></p>{{end}}
+{{if .Derived.Live}}<p>Held by <span class="id">{{.Lease.Agent}}</span></p>{{end}}
 {{if .Ask}}<p class="wait">Ask from <span class="id">{{.Ask.By}}</span>: {{.Ask.Question}}</p>{{end}}
 {{if .Proof}}<p>Proof: {{.Proof}}</p>{{end}}
 <div class="spec">{{.Spec}}</div>
