@@ -1,139 +1,67 @@
 ---
 name: powder
-description: |
-  Use when an agent must inspect, claim, update, request input for, or complete
-  Powder cards. Powder is a self-hosted Card, Claim, typed Run, and Event
-  ledger. The supported agent face is the `powder` CLI plus this skill.
-argument-hint: "[create-card|list-awaiting-input]"
+description: Exclusive work ledger. Take a known job. Do not ask the system what is next.
 ---
 
 # Powder
 
-Powder stores cards, current claims, typed run history, relations, audit events,
-comments, work logs, input activity, and proof. It never calls a model. Real
-card data lives in a deployed SQLite database, not in this repository.
+One noun: a Job. One take policy. CLI talks HTTP only.
 
-Read `VISION.md` before changing product scope, the Card/Claim/Run/Event model,
-the runner boundary, or self-hosting.
-
-## Transport
-
-For a deployed board, set:
-
-```sh
-export POWDER_API_BASE_URL=<deployed-powder-server>
-export POWDER_API_KEY=<integration-key>
+```
+export POWDER_URL=http://127.0.0.1:4000
+export POWDER_API_KEY=<key>
+export POWDER_AGENT=<label>
 ```
 
-Omit `--db` for the deployed board. Pass `--db <path>` only for a local file;
-`--db` always wins over remote environment variables.
+`powder <command> --help` is flag truth. JSON on stdout. `list --plain` and
+`show --plain` print text. Errors are JSON on stderr with `code`.
+`--agent` wins over `$POWDER_AGENT`.
 
-Run `powder version` before a lane starts. It prints the installed binary git
-SHA so a stale CLI is visible.
+## Take predicate
 
-Flag truth is `powder <command> --help` (also `-h`). Help never mutates data.
+`take <id>` succeeds iff all of:
 
-## Operating Contract
+- not terminal (`proof` set or `abandoned`)
+- not waiting (`ask` set)
+- `spec` nonempty
+- no live lease (`lease.until` > now)
+- every **direct** `blocked_by` id exists and is terminal
+- this agent holds no other live lease
 
-1. Run `powder list-ready` before claiming. Claim one card at a time.
-2. A card without acceptance criteria cannot be claimed.
-3. Run `powder get-card <id>` before implementation. The card is the spec:
-   goal, criteria, proof plan, relations, claim, and recent activity.
-4. Use `claim_eligibility` when a card is missing from `list-ready`. It reports
-   `eligible` or a reason code such as `no_acceptance`,
-   `unresolved_blockers`, `active_claim`, or `status_not_claimable`.
-5. Append a work log during work. Include context, progress, blockers,
-   evidence, and attribution. Use `add-comment` only for a human-facing note.
-6. Leave `repo` unset for cross-repository, process, or operations work. When
-   set, it is an opaque card string and filters match it exactly.
-7. Complete only after the card status, audit event, and proof are present.
+If you already hold `id`, `take` returns it. Failure names the clause: `empty_spec`, `blocked`, `waiting`, `held`, `already_holding`, `terminal`, `not_found`.
 
-## Lifecycle
+`done` and `abandon` clear the lease and the ask. Do not `release` after them.
 
-```sh
-powder list-ready --limit 10
-powder claim <card-id> --agent <worker-label>
-powder get-card <card-id>
-powder heartbeat <card-id> --run <run-id>
-powder append-work-log <card-id> --agent <worker-label> --body '...'
-powder request-input <run-id> --question '...'
-powder answer-input <run-id> --actor <label> --answer '...'
-powder check-criterion <card-id> --criterion <index> --actor <label>
-powder complete-card <card-id> --proof <url>
+## Verbs
+
+```
+powder serve
+powder version
+powder list --takeable
+powder list --takeable --plain
+powder show <id>
+powder take <id> [--agent <label>]
+powder ask <id> --question '...' [--agent <label>]
+powder answer <id> --text '...'
+powder done <id> --proof <url-or-text> [--agent <label>]
+powder abandon <id> [--agent <label>]
+powder release <id>
+powder renew <id> [--agent <label>]
+powder note <id> --text '...' [--agent <label>]
+powder create --id <slug> --title '...' [--spec '...'] [--repo <exact>] [--blocked-by a,b]
+powder set-spec <id> --spec '...' [--agent <label>]
+powder set-title <id> --title '...' [--agent <label>]
+powder set-repo <id> [--repo <exact>|--clear] [--agent <label>]
+powder set-blockers <id> [--blocked-by a,b|--clear] [--agent <label>]
+powder reopen <id>
 ```
 
-The claim response supplies the `run_id` and lease expiry. Use that run for
-heartbeat, renewal, release, input, and completion operations. A claim expires
-when its worker stops renewing it.
+`list` filters: `--takeable --waiting --repo --mine`. Order is `created_at` ascending. That is scan order, not rank. `powder version` prints `powder-next <sha>`.
 
-## Discovery
+## Rules
 
-| Need | Command |
-|---|---|
-| Claimable cards | `powder list-ready` |
-| Any status | `powder list-cards --status backlog\|ready\|…` |
-| Text search | `powder search '<q>'` |
-| One card | `powder get-card <id>` |
-| One run | `powder get-run <run-id>` |
-| Awaiting input | `powder list-awaiting-input` |
-| Ordered events | `powder event-tail --after 0 --limit 20` |
-
-`list-ready` is dependency-ordered among returned cards. Ready snapshots use
-opaque continuation values; pass the returned value unchanged when paging.
-Search uses the store full-text index and returns untrusted snippets. Escape
-snippets before rendering HTML.
-
-## Mutations
-
-| Intent | Command |
-|---|---|
-| Create | `powder create-card --id … --title … --acceptance …` |
-| Patch fields | `powder update-card <id> --title … --body … --acceptance …` |
-| Status only | `powder update-status <id> --status …` |
-| Relations | `powder update-relations <id> --related a,b --blocks c --blocked-by d` |
-| Parent edge | `powder set-parent <id> --parent <id>` or `--clear` |
-| Criterion | `powder check-criterion <id> --criterion N --actor …` |
-| Link | `powder add-link <id> --label proof --url <url>` |
-| Comment | `powder add-comment <id> --author <label> --body '…'` |
-| Work log | `powder append-work-log <id> --agent <label> --body '…'` |
-| Ask operator | `powder request-input <run-id> --question '…'` |
-| Answer input | `powder answer-input <run-id> --actor … --answer …` |
-| Done | `powder complete-card <id> [--proof <url>]` |
-
-Relation writes mirror existing peers in one transaction. Parent edges are
-reference edges; they do not create an epic or rollup product. Child completion
-does not complete a parent.
-
-## Input And Proof
-
-Use `list-awaiting-input` to find runs that need an operator response. Use
-`request-input` to append a typed question activity and move the run to
-`awaiting_input`. Use `answer-input` to append the typed response and resume the
-run. Do not create a separate answer record or put typed activity into an
-arbitrary JSON blob.
-
-Use links and proof fields for reviewable evidence. Do not upload attachments
-or copy prompts, tool traces, or sessions into Powder.
-
-## Authority
-
-In remote mode, the API key principal is the transport identity. `--agent`,
-`--actor`, and `--author` are semantic labels in the audit trail.
-
-Local `--db` mutations use `POWDER_PRINCIPAL`, or the fixed trusted local CLI
-principal when it is unset. `--admin` is not a supported escape hatch.
-
-## Response Skew
-
-Unknown future status values must not crash listings. `get-card` and `get-run`
-return server JSON as-is. Deploy the server first; clients follow.
-
-## Red Lines
-
+- Claim one job. `already_holding` means finish, abandon, ask, or release first.
+- Holder-only: `ask`, `done`, `renew`. Field edits: holder, or anyone if not live.
+- Anyone may `release` or `answer`.
+- After TTL the lease dies. `done` then fails `not_holder`; `take` again.
 - Do not call a model from inside Powder.
-- Do not commit instance backlog data to this repository.
-- Do not treat process exit zero as completion without card status and audit.
-- Do not add a second agent face beside `powder` plus this skill.
-- Do not add repository registries, telemetry analytics, media storage,
-  portfolio rollups, signed webhook delivery, ingestion, shaping, or session
-  forensics.

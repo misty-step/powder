@@ -1,4 +1,4 @@
-name: Rust CI
+name: Go CI
 
 on:
   pull_request:
@@ -8,81 +8,18 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  fmt-clippy-test:
-    name: fmt-clippy-test
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Leak gate self-test
-        run: bash scripts/leak-gate.sh --self-test
-
-      - name: Leak gate scan
-        run: bash scripts/leak-gate.sh
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-
-      - name: Reject repository-local ticket ledgers
-        run: test -z "$(find . -type d -name backlog.d -not -path './.git/*' -print -quit)"
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-
-      - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: Test
-        run: cargo test --workspace
-
-  law-gate:
-    name: board law gate (UI invariants)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build powder-server and powder-cli
-        run: cargo build -p powder-server -p powder-cli
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: law/package-lock.json
-
-      - name: Install law-gate dependencies
-        run: npm ci
-        working-directory: law
-
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
-        working-directory: law
-
-      - name: Run the law gate against the board UI
-        run: npm run law
-        working-directory: law
-
-      - name: Upload Playwright report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: law-gate-report
-          path: law/playwright-report/
-          if-no-files-found: ignore
-
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Skill freshness
+        run: go test -run TestSkillDocumentsEveryCommand ./...
