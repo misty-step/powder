@@ -272,13 +272,6 @@ func (s *server) apiPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	var repo **string
-	if body.ClearRepo {
-		var n *string
-		repo = &n
-	} else if body.Repo != nil {
-		repo = &body.Repo
-	}
 	var blocks *[]string
 	if body.SetBlocks != nil && *body.SetBlocks {
 		if body.BlockedBy == nil {
@@ -290,7 +283,7 @@ func (s *server) apiPatch(w http.ResponseWriter, r *http.Request) {
 	} else if body.BlockedBy != nil {
 		blocks = &body.BlockedBy
 	}
-	j, err := s.store.Patch(r.PathValue("id"), actor(r, body.Agent), body.Title, body.Spec, repo, blocks)
+	j, err := s.store.Patch(r.PathValue("id"), actor(r, body.Agent), body.Title, body.Spec, body.Repo, body.ClearRepo, blocks)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
