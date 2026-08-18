@@ -104,13 +104,3 @@ func derive(j *Job, now time.Time, blockers map[string]Job) {
 	}
 }
 
-func takeFailCode(j Job, now time.Time, blockers map[string]Job, alreadyHolding bool) string {
-	if j.live(now) && alreadyHolding {
-		return ""
-	}
-	if alreadyHolding {
-		return "already_holding"
-	}
-	_, code := j.takeable(now, blockers)
-	return code
-}
