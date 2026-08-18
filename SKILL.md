@@ -1,36 +1,60 @@
 ---
 name: powder
-description: Exclusive work ledger. Take a known job. Do not ask the system what is next.
+description: >
+  Powder is the exclusive-work ledger. Use when listing takeable jobs,
+  taking a job, asking the operator, or completing work with proof.
 ---
 
 # Powder
 
-One noun: a Job. One take policy. CLI talks HTTP only.
+Powder stores jobs. Take one. Finish it. Write proof.
 
-```
-export POWDER_URL=http://127.0.0.1:4000
-export POWDER_API_KEY=<key>
-export POWDER_AGENT=<label>
-```
+## When
 
-`powder <command> --help` is flag truth. JSON on stdout. `list --plain` and
-`show --plain` print text. Errors are JSON on stderr with `code`.
-`--agent` wins over `$POWDER_AGENT`.
+Use Powder when work must be exclusive across agents: the next takeable
+job, a known job id, an operator question, or a completion.
 
-## Take predicate
+## Origin
 
-`take <id>` succeeds iff all of:
+The CLI is an HTTP client of the deployed instance.
 
-- not terminal (`proof` set or `abandoned`)
-- not waiting (`ask` set)
-- `spec` nonempty
-- no live lease (`lease.until` > now)
-- every **direct** `blocked_by` id exists and is terminal
-- this agent holds no other live lease
+Origin is `POWDER_URL`, else `POWDER_API_BASE_URL`. Identity is
+`POWDER_AGENT`. `--agent` wins.
 
-If you already hold `id`, `take` returns it. Failure names the clause: `empty_spec`, `blocked`, `waiting`, `held`, `already_holding`, `terminal`, `not_found`.
+`powder <command> --help` is flag truth. JSON on stdout. `list --plain`
+and `show --plain` print text. Errors are JSON on stderr with `code`.
 
-`done` and `abandon` clear the lease and the ask. Do not `release` after them.
+## Loop
+
+1. `powder list --takeable --plain`
+   Done when the list is on screen or empty.
+2. `powder show <id>`
+   Done when you can state the goal and the proof the spec asks for.
+3. `powder take <id>`
+   Done when the job is yours, or the `code` names why not.
+4. Do the work the spec names.
+5. `powder done <id> --proof <url-or-text>`
+   Done when the job is terminal and you hold no lease.
+
+One live lease per agent. `already_holding` means finish, ask, or
+release first.
+
+## Ask
+
+Holder only. `powder ask <id> --question '...'` parks the job and
+releases you. Any principal may `powder answer <id> --text '...'`.
+Then someone takes it again.
+
+## Take
+
+`take` succeeds when the job is takeable and you hold no other live
+lease. Takeable means: not terminal, not waiting, spec nonempty, no
+live lease, every **direct** `blocked_by` exists and is terminal.
+
+The `code` is the reason: `empty_spec` `blocked` `waiting` `held`
+`already_holding` `terminal` `not_found` `no_origin`.
+
+If you already hold `id`, `take` returns it.
 
 ## Verbs
 
@@ -38,30 +62,22 @@ If you already hold `id`, `take` returns it. Failure names the clause: `empty_sp
 powder serve
 powder version
 powder list --takeable
-powder list --takeable --plain
 powder show <id>
-powder take <id> [--agent <label>]
-powder ask <id> --question '...' [--agent <label>]
-powder answer <id> --text '...'
-powder done <id> --proof <url-or-text> [--agent <label>]
-powder abandon <id> [--agent <label>]
+powder take <id>
 powder release <id>
-powder renew <id> [--agent <label>]
-powder note <id> --text '...' [--agent <label>]
-powder create --id <slug> --title '...' [--spec '...'] [--repo <exact>] [--blocked-by a,b]
-powder set-spec <id> --spec '...' [--agent <label>]
-powder set-title <id> --title '...' [--agent <label>]
-powder set-repo <id> [--repo <exact>|--clear] [--agent <label>]
-powder set-blockers <id> [--blocked-by a,b|--clear] [--agent <label>]
+powder renew <id>
+powder note <id> --text '...'
+powder ask <id> --question '...'
+powder answer <id> --text '...'
+powder done <id> --proof <url-or-text>
+powder abandon <id>
 powder reopen <id>
+powder create --id <slug> --title '...'
+powder set-title <id> --title '...'
+powder set-spec <id> --spec '...'
+powder set-repo <id>
+powder set-blockers <id>
 ```
 
-`list` filters: `--takeable --waiting --repo --mine`. Order is `created_at` ascending. That is scan order, not rank. `powder version` prints `powder-next <sha>`.
-
-## Rules
-
-- Claim one job. `already_holding` means finish, abandon, ask, or release first.
-- Holder-only: `ask`, `done`, `renew`. Field edits: holder, or anyone if not live.
-- Anyone may `release` or `answer`.
-- After TTL the lease dies. `done` then fails `not_holder`; `take` again.
-- Do not call a model from inside Powder.
+`list` filters: `--takeable --waiting --repo --mine`. Order is
+`created_at` ascending (scan order, not rank).
