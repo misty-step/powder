@@ -480,3 +480,26 @@ func TestPatchOmitClearSet(t *testing.T) {
 		t.Fatalf("json clear blocks %v", h.job(raw).BlockedBy)
 	}
 }
+
+func TestEmptyRepoIsNull(t *testing.T) {
+	h := newHarness(t)
+	empty := ""
+	j, err := h.store.Create("e", "e", "s", &empty, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Repo != nil {
+		t.Fatalf("create empty repo: %#v", j.Repo)
+	}
+	repo := "x/y"
+	if _, err := h.store.Patch("e", "ag", nil, nil, &repo, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	j, err = h.store.Patch("e", "ag", nil, nil, &empty, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Repo != nil {
+		t.Fatalf("patch empty repo: %#v", j.Repo)
+	}
+}
