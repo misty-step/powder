@@ -10,7 +10,7 @@ func TestVersionLineOverride(t *testing.T) {
 	old := buildSHA
 	buildSHA = "deadbeefcafebabe"
 	t.Cleanup(func() { buildSHA = old })
-	if got := versionLine(); got != "powder-next deadbeefcafebabe" {
+	if got := versionLine(); got != "powder deadbeefcafebabe" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -46,6 +46,34 @@ func TestAgentOf(t *testing.T) {
 	f = newFlagset([]string{"--agent", "flag"})
 	if got := agentOf(f); got != "flag" {
 		t.Fatalf("flag: %q", got)
+	}
+}
+
+func TestBaseURLPrefersPowderURL(t *testing.T) {
+	t.Setenv("POWDER_URL", "http://explicit.example")
+	t.Setenv("POWDER_API_BASE_URL", "http://legacy.example")
+	got, err := baseURL()
+	if err != nil || got != "http://explicit.example" {
+		t.Fatalf("got %q %v", got, err)
+	}
+}
+
+func TestBaseURLFallsBackToAPIBase(t *testing.T) {
+	t.Setenv("POWDER_URL", "")
+	t.Setenv("POWDER_API_BASE_URL", "http://legacy.example")
+	got, err := baseURL()
+	if err != nil || got != "http://legacy.example" {
+		t.Fatalf("got %q %v", got, err)
+	}
+}
+
+func TestBaseURLRequiresOrigin(t *testing.T) {
+	t.Setenv("POWDER_URL", "")
+	t.Setenv("POWDER_API_BASE_URL", "")
+	_, err := baseURL()
+	ce, ok := err.(*CodeError)
+	if !ok || ce.Code != "no_origin" {
+		t.Fatalf("got %v", err)
 	}
 }
 

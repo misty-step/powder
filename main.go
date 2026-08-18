@@ -19,7 +19,7 @@ var buildSHA = "unknown"
 
 func versionLine() string {
 	if sha := strings.TrimSpace(buildSHA); sha != "" && sha != "unknown" {
-		return "powder-next " + sha
+		return "powder " + sha
 	}
 	if info, ok := debug.ReadBuildInfo(); ok {
 		rev, dirty := "", false
@@ -36,12 +36,12 @@ func versionLine() string {
 				rev = rev[:12]
 			}
 			if dirty {
-				return "powder-next " + rev + "-dirty"
+				return "powder " + rev + "-dirty"
 			}
-			return "powder-next " + rev
+			return "powder " + rev
 		}
 	}
-	return "powder-next unknown"
+	return "powder unknown"
 }
 
 func main() {

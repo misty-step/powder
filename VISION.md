@@ -59,9 +59,10 @@ Atomic. If you already hold `id`, return it.
 
 ## Faces
 
-One Go binary. `powder serve` plus HTTP CLI. `POWDER_URL` +
-`POWDER_API_KEY`. No `--db` on the client. Peek UI is SSR HTML: list,
-show, create, answer, release. API keys only.
+One Go binary. `powder serve` plus HTTP CLI. Origin is `POWDER_URL` or
+`POWDER_API_BASE_URL`. No `--db` on the client. Peek UI is SSR HTML:
+list, show, create, answer, release. Auth is `api-key`, or `none` on
+loopback.
 
 ## Non-goals
 
