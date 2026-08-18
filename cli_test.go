@@ -2,12 +2,67 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSkillDocumentsEveryCommand(t *testing.T) {
+	b, err := os.ReadFile("SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := skillVerbs(string(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]string(nil), cmdOrder...)
+	slices.Sort(want)
+	slices.Sort(got)
+	if !slices.Equal(want, got) {
+		t.Fatalf("SKILL.md ## Verbs %v\ncmdOrder %v", got, want)
+	}
+	if len(cmdHelp) != len(cmdOrder) {
+		t.Fatalf("cmdHelp %d cmdOrder %d", len(cmdHelp), len(cmdOrder))
+	}
+	for _, cmd := range cmdOrder {
+		if _, ok := cmdHelp[cmd]; !ok {
+			t.Errorf("cmdHelp missing %q", cmd)
+		}
+	}
+}
+
+func TestSkillVerbsIgnoresLoopProse(t *testing.T) {
+	text := "## Loop\n\n`powder list --takeable --plain`\n\n## Verbs\n\n```\npowder show <id>\n```\n"
+	got, err := skillVerbs(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(got, "list") {
+		t.Fatalf("loop prose counted as a verb: %v", got)
+	}
+	if !slices.Equal(got, []string{"show"}) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestSkillVerbsRejectsExtra(t *testing.T) {
+	text := "## Verbs\n\n```\npowder show <id>\npowder phantom\n```\n"
+	got, err := skillVerbs(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(got, "phantom") {
+		t.Fatal("expected phantom in parse")
+	}
+	if slices.Contains(cmdOrder, "phantom") {
+		t.Fatal("cmdOrder grew a phantom")
+	}
+}
 
 func TestVersionLineOverride(t *testing.T) {
 	old := buildSHA
@@ -80,19 +135,6 @@ func TestBaseURLRequiresOrigin(t *testing.T) {
 	}
 }
 
-func TestSkillDocumentsEveryCommand(t *testing.T) {
-	b, err := os.ReadFile("SKILL.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(b)
-	for _, cmd := range cmdOrder {
-		needle := "powder " + cmd
-		if !strings.Contains(text, needle) {
-			t.Errorf("SKILL.md missing %q", needle)
-		}
-	}
-}
 
 func TestEmbeddedSkillMatchesFile(t *testing.T) {
 	b, err := os.ReadFile("SKILL.md")
@@ -196,3 +238,38 @@ func TestParseTTLGarbage(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+func skillVerbs(text string) ([]string, error) {
+	const head = "## Verbs"
+	i := strings.Index(text, head)
+	if i < 0 {
+		return nil, fmt.Errorf("missing %s", head)
+	}
+	rest := text[i+len(head):]
+	start := strings.Index(rest, "```")
+	if start < 0 {
+		return nil, fmt.Errorf("missing verbs fence")
+	}
+	rest = rest[start+3:]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[nl+1:]
+	}
+	end := strings.Index(rest, "```")
+	if end < 0 {
+		return nil, fmt.Errorf("unclosed verbs fence")
+	}
+	var out []string
+	for _, line := range strings.Split(rest[:end], "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "powder ") {
+			continue
+		}
+		tok := strings.Fields(line)
+		if len(tok) < 2 {
+			continue
+		}
+		out = append(out, tok[1])
+	}
+	return out, nil
+}
+
