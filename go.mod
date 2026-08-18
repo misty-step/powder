@@ -1,4 +1,4 @@
-module github.com/misty-step/powder-next
+module github.com/misty-step/powder
 
 go 1.25.0
 
