@@ -295,7 +295,7 @@ func (s *Store) Create(id, title, spec string, repo *string, blockedBy []string)
 		now := t.now.UnixMilli()
 		_, err := t.tx.Exec(`
 INSERT INTO jobs (id, title, spec, repo, created_at, updated_at)
-VALUES (?,?,?,?,?,?)`, id, title, spec, repo, now, now)
+VALUES (?,?,?,?,?,?)`, id, title, spec, repoOrNil(repo), now, now)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				return errf("exists", "job %s already exists", id)
@@ -746,7 +746,11 @@ func (s *Store) Patch(id, agent string, title, spec, repo *string, clearRepo boo
 				return err
 			}
 		} else if repo != nil {
-			if _, err := t.tx.Exec(`UPDATE jobs SET repo = ? WHERE id = ?`, *repo, id); err != nil {
+			if strings.TrimSpace(*repo) == "" {
+				if _, err := t.tx.Exec(`UPDATE jobs SET repo = NULL WHERE id = ?`, id); err != nil {
+					return err
+				}
+			} else if _, err := t.tx.Exec(`UPDATE jobs SET repo = ? WHERE id = ?`, *repo, id); err != nil {
 				return err
 			}
 		}
@@ -815,6 +819,13 @@ func writeBootstrap(path, secret string) error {
 		return err
 	}
 	return os.Chmod(path, 0o600)
+}
+
+func repoOrNil(repo *string) *string {
+	if repo == nil || strings.TrimSpace(*repo) == "" {
+		return nil
+	}
+	return repo
 }
 
 func encodeJSON(v any) []byte {
