@@ -95,6 +95,33 @@ func TestUsageBannerUsesCmdHelp(t *testing.T) {
 	}
 }
 
+func TestCommandsRegistryIntegrity(t *testing.T) {
+	if len(commands) != len(cmdOrder) {
+		t.Fatalf("commands %d != cmdOrder %d", len(commands), len(cmdOrder))
+	}
+	for i, c := range commands {
+		if c.name == "" {
+			t.Errorf("command at index %d has empty name", i)
+		}
+		if c.help == "" {
+			t.Errorf("command %q has empty help", c.name)
+		}
+		if c.name != "serve" && c.run == nil {
+			t.Errorf("command %q has nil run func", c.name)
+		}
+		if cmdOrder[i] != c.name {
+			t.Errorf("cmdOrder[%d]=%q != commands[%d].name=%q", i, cmdOrder[i], i, c.name)
+		}
+	}
+	code, stderr := runCLI(t, []string{"nonexistent-command-slug"})
+	if code != 1 {
+		t.Fatalf("expected exit code 1 for unknown command, got %d", code)
+	}
+	if errCode := stderrCode(t, stderr); errCode != "usage" {
+		t.Fatalf("expected usage error code, got %q", errCode)
+	}
+}
+
 func TestAgentOf(t *testing.T) {
 	t.Setenv("POWDER_AGENT", "from-env")
 	f := newFlagset(nil)
