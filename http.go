@@ -33,30 +33,35 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /login", s.loginGET)
 	mux.HandleFunc("POST /login", s.loginPOST)
 	mux.HandleFunc("POST /logout", s.logout)
-	mux.HandleFunc("GET /{$}", s.authn(s.uiList))
-	mux.HandleFunc("GET /new", s.authn(s.uiNew))
-	mux.HandleFunc("POST /jobs", s.authn(s.uiCreate))
-	mux.HandleFunc("GET /jobs/{id}", s.authn(s.uiShow))
-	mux.HandleFunc("POST /jobs/{id}/answer", s.authn(s.uiAnswer))
-	mux.HandleFunc("POST /jobs/{id}/release", s.authn(s.uiRelease))
-	mux.HandleFunc("GET /api/jobs", s.authn(s.apiList))
-	mux.HandleFunc("POST /api/jobs", s.authn(s.apiCreate))
-	mux.HandleFunc("GET /api/jobs/{id}", s.authn(s.apiGet))
-	mux.HandleFunc("PATCH /api/jobs/{id}", s.authn(s.apiPatch))
-	mux.HandleFunc("POST /api/jobs/{id}/take", s.authn(s.apiTake))
-	mux.HandleFunc("POST /api/jobs/{id}/release", s.authn(s.apiRelease))
-	mux.HandleFunc("POST /api/jobs/{id}/renew", s.authn(s.apiRenew))
-	mux.HandleFunc("POST /api/jobs/{id}/note", s.authn(s.apiNote))
-	mux.HandleFunc("POST /api/jobs/{id}/ask", s.authn(s.apiAsk))
-	mux.HandleFunc("POST /api/jobs/{id}/answer", s.authn(s.apiAnswer))
-	mux.HandleFunc("POST /api/jobs/{id}/done", s.authn(s.apiDone))
-	mux.HandleFunc("POST /api/jobs/{id}/abandon", s.authn(s.apiAbandon))
-	mux.HandleFunc("POST /api/jobs/{id}/reopen", s.authn(s.apiReopen))
+	api := http.NewServeMux()
+	api.HandleFunc("GET /jobs", s.apiAuthn(s.apiList))
+	api.HandleFunc("POST /jobs", s.apiAuthn(s.apiCreate))
+	api.HandleFunc("GET /jobs/{id}", s.apiAuthn(s.apiGet))
+	api.HandleFunc("PATCH /jobs/{id}", s.apiAuthn(s.apiPatch))
+	api.HandleFunc("POST /jobs/{id}/take", s.apiAuthn(s.apiTake))
+	api.HandleFunc("POST /jobs/{id}/release", s.apiAuthn(s.apiRelease))
+	api.HandleFunc("POST /jobs/{id}/renew", s.apiAuthn(s.apiRenew))
+	api.HandleFunc("POST /jobs/{id}/note", s.apiAuthn(s.apiNote))
+	api.HandleFunc("POST /jobs/{id}/ask", s.apiAuthn(s.apiAsk))
+	api.HandleFunc("POST /jobs/{id}/answer", s.apiAuthn(s.apiAnswer))
+	api.HandleFunc("POST /jobs/{id}/done", s.apiAuthn(s.apiDone))
+	api.HandleFunc("POST /jobs/{id}/abandon", s.apiAuthn(s.apiAbandon))
+	api.HandleFunc("POST /jobs/{id}/reopen", s.apiAuthn(s.apiReopen))
+	mux.Handle("/api/", http.StripPrefix("/api", api))
+
+	ui := http.NewServeMux()
+	ui.HandleFunc("GET /{$}", s.uiAuthn(s.uiList))
+	ui.HandleFunc("GET /new", s.uiAuthn(s.uiNew))
+	ui.HandleFunc("POST /jobs", s.uiAuthn(s.uiCreate))
+	ui.HandleFunc("GET /jobs/{id}", s.uiAuthn(s.uiShow))
+	ui.HandleFunc("POST /jobs/{id}/answer", s.uiAuthn(s.uiAnswer))
+	ui.HandleFunc("POST /jobs/{id}/release", s.uiAuthn(s.uiRelease))
+	mux.Handle("/", ui)
+
 	return mux
 }
 
-
-func (s *server) authn(next http.HandlerFunc) http.HandlerFunc {
+func (s *server) apiAuthn(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.auth == "none" {
 			next(w, r.WithContext(withPrincipal(r.Context(), "none")))
@@ -64,10 +69,30 @@ func (s *server) authn(next http.HandlerFunc) http.HandlerFunc {
 		}
 		secret := bearer(r)
 		if secret == "" {
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				writeErr(w, http.StatusUnauthorized, errf("unauthenticated", "missing API key"))
-				return
-			}
+			writeErr(w, http.StatusUnauthorized, errf("unauthenticated", "missing API key"))
+			return
+		}
+		id, ok, err := s.store.principalFor(secret)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, errf("internal", "key lookup failed"))
+			return
+		}
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, errf("unauthenticated", "invalid API key"))
+			return
+		}
+		next(w, r.WithContext(withPrincipal(r.Context(), id)))
+	}
+}
+
+func (s *server) uiAuthn(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.auth == "none" {
+			next(w, r.WithContext(withPrincipal(r.Context(), "none")))
+			return
+		}
+		secret := bearer(r)
+		if secret == "" {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
@@ -77,10 +102,6 @@ func (s *server) authn(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if !ok {
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				writeErr(w, http.StatusUnauthorized, errf("unauthenticated", "invalid API key"))
-				return
-			}
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
