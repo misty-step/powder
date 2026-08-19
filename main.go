@@ -122,36 +122,20 @@ Environment:
 		}
 	}
 
+	ln, err := net.Listen("tcp", bind)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer ln.Close()
+
 	srv := &http.Server{
-		Addr:              bind,
 		Handler:           newServer(store, auth).handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
+	go func() { errCh <- srv.Serve(ln) }()
 
-	// wait until the port accepts connections or listen fails
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		select {
-		case err := <-errCh:
-			if err != nil && err != http.ErrServerClosed {
-				fmt.Fprintln(os.Stderr, err)
-				return 1
-			}
-		default:
-		}
-		c, err := net.DialTimeout("tcp", bind, 50*time.Millisecond)
-		if err == nil {
-			c.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			fmt.Fprintln(os.Stderr, "listen timeout:", bind)
-			return 1
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 	fmt.Fprintf(os.Stderr, "powder listening on %s db=%s ttl=%s\n", bind, dbPath, ttl)
 
 	sig := make(chan os.Signal, 1)

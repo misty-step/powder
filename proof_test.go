@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -501,5 +503,37 @@ func TestEmptyRepoIsNull(t *testing.T) {
 	}
 	if j.Repo != nil {
 		t.Fatalf("patch empty repo: %#v", j.Repo)
+	}
+}
+
+func TestServeSyncListen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := ln.Addr().String()
+
+	db := filepath.Join(t.TempDir(), "test.db")
+	// Capture stderr
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	code := runServe([]string{"--bind", addr, "--db", db, "--auth", "none"})
+
+	w.Close()
+	os.Stderr = oldStderr
+	out, _ := io.ReadAll(r)
+	r.Close()
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1 on port in use, got %d", code)
+	}
+	if strings.Contains(string(out), "powder listening on") {
+		t.Fatalf("falsely logged readiness on occupied port: %s", string(out))
 	}
 }
