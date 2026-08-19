@@ -55,9 +55,6 @@ func (s *server) handler() http.Handler {
 	return mux
 }
 
-type ctxKey int
-
-const principalKey ctxKey = 1
 
 func (s *server) authn(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
