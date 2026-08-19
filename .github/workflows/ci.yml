@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   test:
@@ -21,3 +22,33 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
+      - name: Check deploy script
+        run: bash -n scripts/powder-deploy.sh
+      - name: Build linux amd64
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-X main.buildSHA=${GITHUB_SHA}" \
+            -o powder .
+          ./powder version
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        with:
+          name: powder-linux-amd64
+          path: powder
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: test
+    runs-on: [self-hosted, Linux, X64, sanctum]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: powder-linux-amd64
+      - name: Install and restart
+        run: |
+          chmod +x powder
+          sudo /usr/local/sbin/powder-deploy "$(pwd)/powder" "${GITHUB_SHA}"
