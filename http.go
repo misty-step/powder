@@ -175,7 +175,7 @@ func (s *server) uiList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) uiNew(w http.ResponseWriter, _ *http.Request) {
-	s.render(w, "new", nil)
+	s.render(w, "new", map[string]any{"PageTitle": "New job — Powder"})
 }
 
 func (s *server) uiCreate(w http.ResponseWriter, r *http.Request) {
@@ -618,6 +618,18 @@ button.textish {
 .muted { color: var(--dead); }
 {{end}}
 
+{{define "head"}}
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{if .}}{{if .ID}}{{.ID}} — Powder{{else if .PageTitle}}{{.PageTitle}}{{else}}Powder{{end}}{{else}}Powder{{end}}</title><style>{{template "css"}}</style>
+{{end}}
+
+{{define "marks"}}
+{{if .Derived.Takeable}}<span class="mark take">takeable</span>{{end}}
+{{if .Derived.Waiting}}<span class="mark wait">waiting</span>{{end}}
+{{if .Derived.Live}}<span class="mark live">{{if .Lease}}live until {{.Lease.Until.UTC.Format "15:04Z"}}{{else}}live{{end}}</span>{{end}}
+{{if .Derived.Terminal}}<span class="mark dead">{{if .Abandoned}}abandoned{{else}}done{{end}}</span>{{end}}
+{{end}}
+
 {{define "chrome"}}
 <header class="ticket">
   <h1>Powder</h1>
@@ -632,8 +644,7 @@ button.textish {
 {{end}}
 
 {{define "login"}}
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Powder</title><style>{{template "css"}}</style>
+{{template "head" .}}
 <header class="ticket"><h1>Powder</h1></header>
 <p>Paste an API key. This machine holds the board.</p>
 {{if .Error}}<p class="wait">Key refused.</p>{{end}}
@@ -645,8 +656,7 @@ button.textish {
 {{end}}
 
 {{define "list"}}
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Powder</title><style>{{template "css"}}</style>
+{{template "head" .}}
 {{template "chrome"}}
 <form class="filters" method="get" action="/">
   <label>repo <input name="repo" value="{{.Repo}}"></label>
@@ -660,10 +670,7 @@ button.textish {
 {{range .Jobs}}
   <li class="{{if .Derived.Takeable}}takeable{{end}} {{if .Derived.Waiting}}waiting{{end}} {{if .Derived.Live}}live{{end}} {{if .Derived.Terminal}}terminal{{end}}">
     <a class="id" href="/jobs/{{.ID}}">{{.ID}}</a>
-    {{if .Derived.Takeable}}<span class="mark take">takeable</span>{{end}}
-    {{if .Derived.Waiting}}<span class="mark wait">waiting</span>{{end}}
-    {{if .Derived.Live}}<span class="mark live">live</span>{{end}}
-    {{if .Derived.Terminal}}<span class="mark dead">{{if .Abandoned}}abandoned{{else}}done{{end}}</span>{{end}}
+    {{template "marks" .}}
     <div class="title"><a href="/jobs/{{.ID}}">{{.Title}}</a></div>
     {{if .Repo}}<div class="muted id">{{.Repo}}</div>{{end}}
   </li>
@@ -672,8 +679,7 @@ button.textish {
 {{end}}
 
 {{define "new"}}
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>New job — Powder</title><style>{{template "css"}}</style>
+{{template "head" .}}
 {{template "chrome"}}
 <h2>New ticket</h2>
 <form class="stack" method="post" action="/jobs">
@@ -687,14 +693,10 @@ button.textish {
 {{end}}
 
 {{define "show"}}
-<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{.ID}} — Powder</title><style>{{template "css"}}</style>
+{{template "head" .}}
 {{template "chrome"}}
 <p class="id">{{.ID}}
-  {{if .Derived.Takeable}}<span class="mark take">takeable</span>{{end}}
-  {{if .Derived.Waiting}}<span class="mark wait">waiting</span>{{end}}
-  {{if .Derived.Live}}<span class="mark live">live until {{.Lease.Until.UTC.Format "15:04Z"}}</span>{{end}}
-  {{if .Derived.Terminal}}<span class="mark dead">{{if .Abandoned}}abandoned{{else}}done{{end}}</span>{{end}}
+  {{template "marks" .}}
 </p>
 <h2>{{.Title}}</h2>
 {{if .Repo}}<p class="muted id">{{.Repo}}</p>{{end}}
