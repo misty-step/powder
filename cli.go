@@ -29,76 +29,56 @@ func cliMain(args []string) int {
 			return 0
 		}
 	}
-	switch cmd {
-	case "create":
-		return runCreate(fs)
-	case "show":
-		return runShow(fs)
-	case "list":
-		return runList(fs)
-	case "take":
-		return runTake(fs)
-	case "release":
-		return runRelease(fs)
-	case "renew":
-		return runRenew(fs)
-	case "note":
-		return runNote(fs)
-	case "ask":
-		return runAsk(fs)
-	case "answer":
-		return runAnswer(fs)
-	case "done":
-		return runDone(fs)
-	case "abandon":
-		return runAbandon(fs)
-	case "reopen":
-		return runReopen(fs)
-	case "set-title":
-		return runSetTitle(fs)
-	case "set-spec":
-		return runSetSpec(fs)
-	case "set-repo":
-		return runSetRepo(fs)
-	case "set-blockers":
-		return runSetBlockers(fs)
-	case "version":
-		fmt.Println(versionLine())
-		return 0
-	case "skill":
-		fmt.Print(skillMD)
-		return 0
-	default:
+	run, ok := cmdRun[cmd]
+	if !ok || run == nil {
 		return fail(errf("usage", "unknown command %s", cmd))
 	}
+	return run(fs)
 }
 
-var cmdOrder = []string{
-	"serve", "create", "show", "list", "take", "release", "renew",
-	"note", "ask", "answer", "done", "abandon", "reopen",
-	"set-title", "set-spec", "set-repo", "set-blockers", "version", "skill",
+type command struct {
+	name string
+	help string
+	run  func(f *flagset) int
 }
 
-var cmdHelp = map[string]string{
-	"serve":        "powder serve [--bind ADDR] [--db PATH] [--bootstrap-key-file PATH] [--ttl DURATION]",
-	"create":       "powder create --id ID --title TITLE [--spec SPEC] [--repo REPO] [--blocked-by a,b]",
-	"show":         "powder show ID [--plain]",
-	"list":         "powder list [--takeable] [--waiting] [--repo REPO] [--mine AGENT] [--plain]",
-	"take":         "powder take ID [--agent AGENT]",
-	"release":      "powder release ID",
-	"renew":        "powder renew ID [--agent AGENT]",
-	"note":         "powder note ID --text TEXT [--agent AGENT]",
-	"ask":          "powder ask ID --question Q [--agent AGENT]",
-	"answer":       "powder answer ID --text TEXT",
-	"done":         "powder done ID --proof PROOF [--agent AGENT]",
-	"abandon":      "powder abandon ID [--agent AGENT]",
-	"reopen":       "powder reopen ID",
-	"set-title":    "powder set-title ID --title TITLE [--agent AGENT]",
-	"set-spec":     "powder set-spec ID --spec SPEC [--agent AGENT]",
-	"set-repo":     "powder set-repo ID [--repo REPO|--clear] [--agent AGENT]",
-	"set-blockers": "powder set-blockers ID [--blocked-by a,b|--clear] [--agent AGENT]",
-	"version":      "powder version",
-	"skill":        "powder skill",
+var commands = []command{
+	{name: "serve", help: "powder serve [--bind ADDR] [--db PATH] [--bootstrap-key-file PATH] [--ttl DURATION]"},
+	{name: "create", help: "powder create --id ID --title TITLE [--spec SPEC] [--repo REPO] [--blocked-by a,b]", run: runCreate},
+	{name: "show", help: "powder show ID [--plain]", run: runShow},
+	{name: "list", help: "powder list [--takeable] [--waiting] [--repo REPO] [--mine AGENT] [--plain]", run: runList},
+	{name: "take", help: "powder take ID [--agent AGENT]", run: runTake},
+	{name: "release", help: "powder release ID", run: runRelease},
+	{name: "renew", help: "powder renew ID [--agent AGENT]", run: runRenew},
+	{name: "note", help: "powder note ID --text TEXT [--agent AGENT]", run: runNote},
+	{name: "ask", help: "powder ask ID --question Q [--agent AGENT]", run: runAsk},
+	{name: "answer", help: "powder answer ID --text TEXT", run: runAnswer},
+	{name: "done", help: "powder done ID --proof PROOF [--agent AGENT]", run: runDone},
+	{name: "abandon", help: "powder abandon ID [--agent AGENT]", run: runAbandon},
+	{name: "reopen", help: "powder reopen ID", run: runReopen},
+	{name: "set-title", help: "powder set-title ID --title TITLE [--agent AGENT]", run: runSetTitle},
+	{name: "set-spec", help: "powder set-spec ID --spec SPEC [--agent AGENT]", run: runSetSpec},
+	{name: "set-repo", help: "powder set-repo ID [--repo REPO|--clear] [--agent AGENT]", run: runSetRepo},
+	{name: "set-blockers", help: "powder set-blockers ID [--blocked-by a,b|--clear] [--agent AGENT]", run: runSetBlockers},
+	{name: "version", help: "powder version", run: func(_ *flagset) int { fmt.Println(versionLine()); return 0 }},
+	{name: "skill", help: "powder skill", run: func(_ *flagset) int { fmt.Print(skillMD); return 0 }},
+}
+
+var (
+	cmdOrder []string
+	cmdHelp  map[string]string
+	cmdRun   map[string]func(*flagset) int
+)
+
+func init() {
+	cmdOrder = make([]string, len(commands))
+	cmdHelp = make(map[string]string, len(commands))
+	cmdRun = make(map[string]func(*flagset) int, len(commands))
+	for i, c := range commands {
+		cmdOrder[i] = c.name
+		cmdHelp[c.name] = c.help
+		cmdRun[c.name] = c.run
+	}
 }
 
 func usageBanner() string {
