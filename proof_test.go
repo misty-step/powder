@@ -537,3 +537,21 @@ func TestServeSyncListen(t *testing.T) {
 		t.Fatalf("falsely logged readiness on occupied port: %s", string(out))
 	}
 }
+
+func TestPrincipalContextHelpers(t *testing.T) {
+	req, err := http.NewRequest("GET", "http://127.0.0.1/api/jobs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := principalOf(req); got != "unknown" {
+		t.Fatalf("expected unknown for unauthenticated request, got %q", got)
+	}
+	req = req.WithContext(withPrincipal(req.Context(), "k_test123"))
+	if got := principalOf(req); got != "k_test123" {
+		t.Fatalf("expected k_test123, got %q", got)
+	}
+	req = req.WithContext(withPrincipal(req.Context(), ""))
+	if got := principalOf(req); got != "unknown" {
+		t.Fatalf("expected unknown for empty principal, got %q", got)
+	}
+}

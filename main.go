@@ -178,15 +178,3 @@ func absOrDot(p string) string {
 	}
 	return p
 }
-
-func withPrincipal(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, principalKey, id)
-}
-
-func principalOf(r *http.Request) string {
-	v, _ := r.Context().Value(principalKey).(string)
-	if v == "" {
-		return "unknown"
-	}
-	return v
-}

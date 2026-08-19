@@ -1,11 +1,28 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 	"strings"
 )
+
+type ctxKey int
+
+const principalKey ctxKey = 1
+
+func withPrincipal(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, principalKey, id)
+}
+
+func principalOf(r *http.Request) string {
+	v, _ := r.Context().Value(principalKey).(string)
+	if v == "" {
+		return "unknown"
+	}
+	return v
+}
 
 func hashKey(secret string) []byte {
 	sum := sha256.Sum256([]byte(secret))
