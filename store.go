@@ -231,13 +231,21 @@ func (t *tx) loadMany(ids []string) (map[string]Job, error) {
 	return out, nil
 }
 
-func (t *tx) decorate(j *Job) error {
+func (t *tx) hydrate(id string) (Job, error) {
+	j, err := t.load(id)
+	if err != nil {
+		return j, err
+	}
 	bs, err := t.loadMany(j.BlockedBy)
 	if err != nil {
-		return err
+		return j, err
 	}
-	derive(j, t.now, bs)
-	return nil
+	derive(&j, t.now, bs)
+	return j, nil
+}
+
+func (t *tx) finish(id string) (Job, error) {
+	return t.hydrate(id)
 }
 
 func (t *tx) heldBy(agent string) (string, error) {
@@ -285,7 +293,8 @@ WHERE id = ?`, agent, principal, until, t.now.UnixMilli(), id)
 
 func (s *Store) Create(id, title, spec string, repo *string, blockedBy []string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		if !validSlug(id) {
 			return errf("invalid_id", "id %q is not a slug", id)
 		}
@@ -310,31 +319,18 @@ VALUES (?,?,?,?,?,?)`, id, title, spec, repoOrNil(repo), now, now)
 				return err
 			}
 		}
-		j, err := t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Get(id string) (Job, error) {
 	var out Job
-	err := s.read(func(t *tx) error {
-		j, err := t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+	var err error
+	err = s.read(func(t *tx) error {
+		out, err = t.hydrate(id)
+		return err
 	})
 	return out, err
 }
@@ -366,11 +362,8 @@ func (s *Store) List(f ListFilter) ([]Job, error) {
 			return err
 		}
 		for _, id := range ids {
-			j, err := t.load(id)
+			j, err := t.hydrate(id)
 			if err != nil {
-				return err
-			}
-			if err := t.decorate(&j); err != nil {
 				return err
 			}
 			if f.Takeable && !j.Derived.Takeable {
@@ -401,7 +394,8 @@ func (s *Store) List(f ListFilter) ([]Job, error) {
 
 func (s *Store) Take(id, agent, principal string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		if strings.TrimSpace(agent) == "" {
 			return errf("invalid_agent", "agent is required")
 		}
@@ -413,11 +407,8 @@ func (s *Store) Take(id, agent, principal string) (Job, error) {
 			return errf("terminal", "job %s is terminal", id)
 		}
 		if j.live(t.now) && j.Lease.Agent == agent {
-			if err := t.decorate(&j); err != nil {
-				return err
-			}
-			out = j
-			return nil
+			out, err = t.finish(id)
+			return err
 		}
 		held, err := t.heldBy(agent)
 		if err != nil {
@@ -440,24 +431,17 @@ func (s *Store) Take(id, agent, principal string) (Job, error) {
 		if err := t.addNote(id, agent, "took"); err != nil {
 			return err
 		}
-		j, err = t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Release(id, by string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
-		j, err := t.load(id)
-		if err != nil {
+	var err error
+	err = s.write(func(t *tx) error {
+		if _, err := t.load(id); err != nil {
 			return err
 		}
 		if _, err := t.tx.Exec(`
@@ -468,22 +452,16 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, by, "released"); err != nil {
 			return err
 		}
-		j, err = t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Renew(id, agent string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		j, err := t.requireHolder(id, agent)
 		if err != nil {
 			return err
@@ -491,15 +469,8 @@ func (s *Store) Renew(id, agent string) (Job, error) {
 		if err := t.setLease(id, j.Lease.Agent, j.Lease.Principal); err != nil {
 			return err
 		}
-		j, err = t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
@@ -534,7 +505,8 @@ func (t *tx) requireHolderOrFree(id, agent string) (Job, error) {
 
 func (s *Store) Ask(id, agent, question string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		if strings.TrimSpace(question) == "" {
 			return errf("invalid_ask", "question is required")
 		}
@@ -551,22 +523,16 @@ WHERE id = ?`, question, agent, t.now.UnixMilli(), t.now.UnixMilli(), id); err !
 		if err := t.addNote(id, agent, "ask: "+question); err != nil {
 			return err
 		}
-		j, err := t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Answer(id, by, text string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		j, err := t.load(id)
 		if err != nil {
 			return err
@@ -585,22 +551,16 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, by, "answer: "+text); err != nil {
 			return err
 		}
-		j, err = t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Done(id, agent, proof string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		if strings.TrimSpace(proof) == "" {
 			return errf("empty_proof", "proof is required")
 		}
@@ -618,22 +578,16 @@ WHERE id = ?`, proof, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, agent, "done: "+proof); err != nil {
 			return err
 		}
-		j, err := t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Abandon(id, agent string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		if _, err := t.requireHolderOrFree(id, agent); err != nil {
 			return err
 		}
@@ -648,22 +602,16 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, agent, "abandoned"); err != nil {
 			return err
 		}
-		j, err := t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Reopen(id, by string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		j, err := t.load(id)
 		if err != nil {
 			return err
@@ -681,22 +629,16 @@ func (s *Store) Reopen(id, by string) (Job, error) {
 		if err := t.addNote(id, by, "reopened"); err != nil {
 			return err
 		}
-		j, err = t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Note(id, agent, text string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		if _, err := t.load(id); err != nil {
 			return err
 		}
@@ -709,22 +651,16 @@ func (s *Store) Note(id, agent, text string) (Job, error) {
 		if err := t.touch(id); err != nil {
 			return err
 		}
-		j, err := t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
 
 func (s *Store) Patch(id, agent string, title, spec, repo *string, clearRepo bool, blockedBy *[]string) (Job, error) {
 	var out Job
-	err := s.write(func(t *tx) error {
+	var err error
+	err = s.write(func(t *tx) error {
 		if _, err := t.requireHolderOrFree(id, agent); err != nil {
 			return err
 		}
@@ -770,15 +706,8 @@ func (s *Store) Patch(id, agent string, title, spec, repo *string, clearRepo boo
 		if err := t.touch(id); err != nil {
 			return err
 		}
-		j, err := t.load(id)
-		if err != nil {
-			return err
-		}
-		if err := t.decorate(&j); err != nil {
-			return err
-		}
-		out = j
-		return nil
+		out, err = t.finish(id)
+		return err
 	})
 	return out, err
 }
