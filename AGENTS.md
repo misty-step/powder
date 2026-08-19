@@ -22,6 +22,9 @@ One `powder serve` process on the Sanctum host, loopback bind, tailnet
 origin. SQLite is `/data/apps/powder/ledger.db`. The retired rust
 database remains on disk as an archive and is not served.
 
+A push to `master` that passes `go test` and `go vet` builds a linux/amd64
+binary and the Sanctum runner installs it with `scripts/powder-deploy.sh`.
+
 ## Gates
 
 ```sh
