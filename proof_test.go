@@ -395,6 +395,89 @@ func TestPeekExpiredLeaseHidesHolder(t *testing.T) {
 	}
 }
 
+func (h *harness) html(path string) string {
+	h.t.Helper()
+	req, err := http.NewRequest("GET", h.srv.URL+path, nil)
+	if err != nil {
+		h.fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		h.fatal(err)
+	}
+	if res.StatusCode != 200 {
+		h.t.Fatalf("%s: %d %s", path, res.StatusCode, body)
+	}
+	return string(body)
+}
+
+func TestPeekRendersJobs(t *testing.T) {
+	h := newHarness(t)
+	h.create("alpha", "the spec")
+	h.create("done-one", "x")
+	if st, _, code := h.take("done-one", "closer"); st != 200 {
+		t.Fatalf("take closer: %d %s", st, code)
+	}
+	st, raw := h.do("POST", "/api/jobs/done-one/done", map[string]any{"agent": "closer", "proof": "https://example.test/p"})
+	if st != 200 {
+		t.Fatalf("done: %d %s", st, raw)
+	}
+	h.take("alpha", "ticker")
+
+	list := h.html("/")
+	if !strings.Contains(list, `class="mark live"`) {
+		t.Fatal("list missing live mark")
+	}
+	if !strings.Contains(list, "live until") {
+		t.Fatal("list missing live until")
+	}
+	if !strings.Contains(list, `class="mark dead"`) || !strings.Contains(list, ">done<") {
+		t.Fatal("list missing done mark")
+	}
+	if !strings.Contains(list, "--paper") {
+		t.Fatal("list missing shared head CSS")
+	}
+	if !strings.Contains(list, "<title>Powder</title>") {
+		t.Fatal("list title")
+	}
+
+	show := h.html("/jobs/alpha")
+	if !strings.Contains(show, "<title>alpha — Powder</title>") {
+		t.Fatal("show title")
+	}
+	if !strings.Contains(show, `class="mark live"`) || !strings.Contains(show, "live until") {
+		t.Fatal("show missing live mark")
+	}
+	if !strings.Contains(show, "Held by") || !strings.Contains(show, "ticker") {
+		t.Fatal("show missing holder")
+	}
+	if !strings.Contains(show, "--paper") {
+		t.Fatal("show missing shared head CSS")
+	}
+
+	login := h.html("/login")
+	if !strings.Contains(login, "--paper") {
+		t.Fatal("login missing shared head CSS")
+	}
+	if !strings.Contains(login, `name="key"`) {
+		t.Fatal("login missing key field")
+	}
+
+	newPage := h.html("/new")
+	if !strings.Contains(newPage, "<title>New job — Powder</title>") {
+		t.Fatal("new title")
+	}
+	if !strings.Contains(newPage, "--paper") {
+		t.Fatal("new missing shared head CSS")
+	}
+}
+
 func TestPatchOmitClearSet(t *testing.T) {
 	h := newHarness(t)
 	h.create("blk", "x")
