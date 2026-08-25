@@ -11,7 +11,7 @@ artifacts:
 release:
   profile: full
 model:
-  policy: balanced
+  policy: off
 budget:
   max_input_tokens: 12000
   max_output_tokens: 1200
