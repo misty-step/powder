@@ -1,0 +1,50 @@
+{
+  "branches": [
+    "master"
+  ],
+  "plugins": [
+    [
+      "@semantic-release/commit-analyzer",
+      {
+        "parserOpts": {
+          "headerPattern": "^(\\w*)(?:\\((.*)\\))?(!)?: (.*)$",
+          "headerCorrespondence": [
+            "type",
+            "scope",
+            "breaking",
+            "subject"
+          ]
+        },
+        "releaseRules": [
+          {
+            "header": "*!:*",
+            "release": "minor"
+          },
+          {
+            "breaking": true,
+            "release": "minor"
+          },
+          {
+            "type": "feat",
+            "release": "patch"
+          }
+        ]
+      }
+    ],
+    [
+      "@semantic-release/release-notes-generator",
+      {
+        "parserOpts": {
+          "headerPattern": "^(\\w*)(?:\\((.*)\\))?(!)?: (.*)$",
+          "headerCorrespondence": [
+            "type",
+            "scope",
+            "breaking",
+            "subject"
+          ]
+        }
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}
