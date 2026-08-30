@@ -244,10 +244,6 @@ func (t *tx) hydrate(id string) (Job, error) {
 	return j, nil
 }
 
-func (t *tx) finish(id string) (Job, error) {
-	return t.hydrate(id)
-}
-
 func (t *tx) heldBy(agent string) (string, error) {
 	ms := t.now.UnixMilli()
 	var id string
@@ -319,7 +315,7 @@ VALUES (?,?,?,?,?,?)`, id, title, spec, repoOrNil(repo), now, now)
 				return err
 			}
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -407,7 +403,7 @@ func (s *Store) Take(id, agent, principal string) (Job, error) {
 			return errf("terminal", "job %s is terminal", id)
 		}
 		if j.live(t.now) && j.Lease.Agent == agent {
-			out, err = t.finish(id)
+			out, err = t.hydrate(id)
 			return err
 		}
 		held, err := t.heldBy(agent)
@@ -431,7 +427,7 @@ func (s *Store) Take(id, agent, principal string) (Job, error) {
 		if err := t.addNote(id, agent, "took"); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -452,7 +448,7 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, by, "released"); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -469,7 +465,7 @@ func (s *Store) Renew(id, agent string) (Job, error) {
 		if err := t.setLease(id, j.Lease.Agent, j.Lease.Principal); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -523,7 +519,7 @@ WHERE id = ?`, question, agent, t.now.UnixMilli(), t.now.UnixMilli(), id); err !
 		if err := t.addNote(id, agent, "ask: "+question); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -551,7 +547,7 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, by, "answer: "+text); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -578,7 +574,7 @@ WHERE id = ?`, proof, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, agent, "done: "+proof); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -602,7 +598,7 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 		if err := t.addNote(id, agent, "abandoned"); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -629,7 +625,7 @@ func (s *Store) Reopen(id, by string) (Job, error) {
 		if err := t.addNote(id, by, "reopened"); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -651,7 +647,7 @@ func (s *Store) Note(id, agent, text string) (Job, error) {
 		if err := t.touch(id); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
@@ -706,7 +702,7 @@ func (s *Store) Patch(id, agent string, title, spec, repo *string, clearRepo boo
 		if err := t.touch(id); err != nil {
 			return err
 		}
-		out, err = t.finish(id)
+		out, err = t.hydrate(id)
 		return err
 	})
 	return out, err
