@@ -45,6 +45,14 @@
         }
       }
     ],
-    "@semantic-release/github"
+    [
+      "@semantic-release/github",
+      {
+        "successCommentCondition": false,
+        "failCommentCondition": false,
+        "labels": false,
+        "releasedLabels": false
+      }
+    ]
   ]
 }
