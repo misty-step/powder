@@ -156,6 +156,7 @@ func (s *server) uiList(w http.ResponseWriter, r *http.Request) {
 		Takeable: q.Get("takeable") == "1",
 		Waiting:  q.Get("waiting") == "1",
 		Mine:     q.Get("mine"),
+		Query:    q.Get("query"),
 	}
 	if repo := q.Get("repo"); repo != "" {
 		f.Repo = &repo
@@ -171,6 +172,7 @@ func (s *server) uiList(w http.ResponseWriter, r *http.Request) {
 		"Waiting":  f.Waiting,
 		"Repo":     q.Get("repo"),
 		"Mine":     f.Mine,
+		"Query":    f.Query,
 	})
 }
 
@@ -235,6 +237,7 @@ func (s *server) apiList(w http.ResponseWriter, r *http.Request) {
 		Takeable: q.Get("takeable") == "1" || q.Get("takeable") == "true",
 		Waiting:  q.Get("waiting") == "1" || q.Get("waiting") == "true",
 		Mine:     q.Get("mine"),
+		Query:    q.Get("query"),
 	}
 	if repo := q.Get("repo"); repo != "" {
 		f.Repo = &repo
