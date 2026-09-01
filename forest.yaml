@@ -1,0 +1,12 @@
+repo: misty-step/powder
+agents:
+  builder:  { poll: "./forest poll builder",  interval: 300 }
+  verifier: { poll: "./forest poll verifier", interval: 120 }
+  fixer:    { poll: "./forest poll fixer",    interval: 300 }
+checks:
+  - name: test
+    run: go test ./...
+  - name: vet
+    run: go vet ./...
+  - name: deploy-script
+    run: bash -n scripts/powder-deploy.sh
