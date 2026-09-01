@@ -162,6 +162,12 @@ func TestBaseURLRequiresOrigin(t *testing.T) {
 	}
 }
 
+func TestQueryShortFlag(t *testing.T) {
+	f := newFlagset([]string{"-q", "Needle"})
+	if got := f.str("query"); got != "Needle" {
+		t.Fatalf("query: %q", got)
+	}
+}
 
 func TestEmbeddedSkillMatchesFile(t *testing.T) {
 	b, err := os.ReadFile("SKILL.md")
@@ -299,4 +305,3 @@ func skillVerbs(text string) ([]string, error) {
 	}
 	return out, nil
 }
-

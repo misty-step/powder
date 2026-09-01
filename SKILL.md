@@ -80,5 +80,6 @@ powder set-repo <id>
 powder set-blockers <id>
 ```
 
-`list` filters: `--takeable --waiting --repo --mine`. Order is
-`created_at` ascending (scan order, not rank).
+`list` filters: `--takeable --waiting --repo --mine --query/-q`. `--query`
+matches a case-insensitive title substring. Order is `created_at` ascending
+(scan order, not rank).

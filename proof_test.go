@@ -223,6 +223,28 @@ func TestAnswerTakeDoneThenTakeOther(t *testing.T) {
 	}
 }
 
+func TestListQueryMatchesTitleCaseInsensitive(t *testing.T) {
+	h := newHarness(t)
+	h.do("POST", "/api/jobs", map[string]any{
+		"id": "matching", "title": "Resolve Powder Discovery", "spec": "work",
+	})
+	h.do("POST", "/api/jobs", map[string]any{
+		"id": "other", "title": "Add health endpoint", "spec": "work",
+	})
+
+	st, raw := h.do("GET", "/api/jobs?query=powder+discovery", nil)
+	if st != 200 {
+		t.Fatalf("list %d %s", st, raw)
+	}
+	var listed []Job
+	if err := json.Unmarshal(raw, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != "matching" {
+		t.Fatalf("listed: %+v", listed)
+	}
+}
+
 func TestAbandonClearsLease(t *testing.T) {
 	h := newHarness(t)
 	h.create("a", "do a")

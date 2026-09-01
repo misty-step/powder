@@ -336,6 +336,7 @@ type ListFilter struct {
 	Waiting  bool
 	Repo     *string
 	Mine     string
+	Query    string
 }
 
 func (s *Store) List(f ListFilter) ([]Job, error) {
@@ -357,10 +358,14 @@ func (s *Store) List(f ListFilter) ([]Job, error) {
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		query := strings.ToLower(f.Query)
 		for _, id := range ids {
 			j, err := t.hydrate(id)
 			if err != nil {
 				return err
+			}
+			if query != "" && !strings.Contains(strings.ToLower(j.Title), query) {
+				continue
 			}
 			if f.Takeable && !j.Derived.Takeable {
 				continue

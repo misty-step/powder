@@ -46,7 +46,7 @@ var commands = []command{
 	{name: "serve", help: "powder serve [--bind ADDR] [--db PATH] [--bootstrap-key-file PATH] [--ttl DURATION]"},
 	{name: "create", help: "powder create --id ID --title TITLE [--spec SPEC] [--repo REPO] [--blocked-by a,b]", run: runCreate},
 	{name: "show", help: "powder show ID [--plain]", run: runShow},
-	{name: "list", help: "powder list [--takeable] [--waiting] [--repo REPO] [--mine AGENT] [--plain]", run: runList},
+	{name: "list", help: "powder list [--takeable] [--waiting] [--repo REPO] [--mine AGENT] [--query TEXT|-q TEXT] [--plain]", run: runList},
 	{name: "take", help: "powder take ID [--agent AGENT]", run: runTake},
 	{name: "release", help: "powder release ID", run: runRelease},
 	{name: "renew", help: "powder renew ID [--agent AGENT]", run: runRenew},
@@ -118,6 +118,15 @@ func newFlagset(args []string) *flagset {
 		}
 		if a == "-h" {
 			f.bits["h"] = true
+			continue
+		}
+		if a == "-q" {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				f.kv["query"] = args[i+1]
+				i++
+			} else {
+				f.bits["query"] = true
+			}
 			continue
 		}
 		if strings.HasPrefix(a, "--") {
@@ -313,6 +322,9 @@ func runList(f *flagset) int {
 	}
 	if v := f.str("mine"); v != "" {
 		q.Set("mine", v)
+	}
+	if v := f.str("query"); v != "" {
+		q.Set("query", v)
 	}
 	path := "/api/jobs"
 	if enc := q.Encode(); enc != "" {
