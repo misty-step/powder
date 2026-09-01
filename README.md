@@ -16,3 +16,12 @@ list/show. Errors are JSON on stderr with a `code`.
 
 The Rust service that previously lived in this repository is retired.
 Git history is intact. The live process is `powder serve`.
+
+## Agent skill
+
+`SKILL.md` is the source of truth for `skill://powder`. Register it for
+OMP workspace discovery with:
+
+```sh
+./scripts/install-skill.sh
+```

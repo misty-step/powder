@@ -8,3 +8,4 @@ if [ -d "$HOME/.cargo/bin" ]; then
   cp "$out" "$HOME/.cargo/bin/powder"
 fi
 "$out" version
+"$root/scripts/install-skill.sh"
