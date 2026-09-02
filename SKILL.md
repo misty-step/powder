@@ -80,6 +80,11 @@ powder set-repo <id>
 powder set-blockers <id>
 ```
 
-`list` filters: `--takeable --waiting --repo --mine --query/-q`. `--query`
-matches a case-insensitive title substring. Order is `created_at` ascending
-(scan order, not rank).
+`list` filters: `--takeable --waiting --repo --mine --query/-q`,
+`--state`, `--summary`, `--limit`, `--cursor`. `--state` takes one of
+`draft blocked waiting live takeable open terminal abandoned done`;
+it cannot be combined with `--takeable`/`--waiting`. `--summary` returns
+bounded rows without spec, notes, ask text, or proof body. `--limit` and
+`--cursor` page the stable `created_at,id` order and return `next_cursor`
+in the machine envelope. `--query` matches a case-insensitive title
+substring. Order is `created_at` ascending (scan order, not rank).

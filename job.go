@@ -61,6 +61,40 @@ type Job struct {
 	Derived   Derived   `json:"derived"`
 }
 
+type JobSummary struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Repo      *string   `json:"repo"`
+	BlockedBy []string  `json:"blocked_by"`
+	Lease     *Lease    `json:"lease"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Derived   Derived   `json:"derived"`
+}
+
+type JobListEnvelope struct {
+	Jobs       []Job  `json:"jobs"`
+	NextCursor string `json:"next_cursor"`
+}
+
+type SummaryListEnvelope struct {
+	Jobs       []JobSummary `json:"jobs"`
+	NextCursor string       `json:"next_cursor"`
+}
+
+func summarize(j Job) JobSummary {
+	return JobSummary{
+		ID:        j.ID,
+		Title:     j.Title,
+		Repo:      j.Repo,
+		BlockedBy: append([]string(nil), j.BlockedBy...),
+		Lease:     j.Lease,
+		CreatedAt: j.CreatedAt,
+		UpdatedAt: j.UpdatedAt,
+		Derived:   j.Derived,
+	}
+}
+
 func validSlug(id string) bool { return slugRE.MatchString(id) }
 
 func (j Job) terminal() bool { return j.Proof != nil || j.Abandoned }
@@ -103,4 +137,3 @@ func derive(j *Job, now time.Time, blockers map[string]Job) {
 		Takeable: ok,
 	}
 }
-

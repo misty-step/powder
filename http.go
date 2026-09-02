@@ -152,24 +152,31 @@ func (s *server) logout(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) uiList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	f := ListFilter{
-		Takeable: q.Get("takeable") == "1",
-		Waiting:  q.Get("waiting") == "1",
-		Mine:     q.Get("mine"),
-		Query:    q.Get("query"),
-	}
-	if repo := q.Get("repo"); repo != "" {
-		f.Repo = &repo
-	}
-	jobs, err := s.store.List(f)
+	f, err := listFilterFromQuery(q)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), statusOf(err))
 		return
 	}
+	res, err := s.store.List(f)
+	if err != nil {
+		http.Error(w, err.Error(), statusOf(err))
+		return
+	}
+	next := ""
+	if res.NextCursor != "" {
+		nq := q
+		nq.Set("cursor", res.NextCursor)
+		next = "/?" + nq.Encode()
+	}
 	s.render(w, "list", map[string]any{
-		"Jobs":     jobs,
+		"Jobs":     res.Jobs,
+		"Next":     next,
 		"Takeable": f.Takeable,
 		"Waiting":  f.Waiting,
+		"Summary":  f.Summary,
+		"State":    f.State,
+		"Limit":    q.Get("limit"),
+		"Cursor":   f.Cursor,
 		"Repo":     q.Get("repo"),
 		"Mine":     f.Mine,
 		"Query":    f.Query,
@@ -232,22 +239,29 @@ func (s *server) uiRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) apiList(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	f := ListFilter{
-		Takeable: q.Get("takeable") == "1" || q.Get("takeable") == "true",
-		Waiting:  q.Get("waiting") == "1" || q.Get("waiting") == "true",
-		Mine:     q.Get("mine"),
-		Query:    q.Get("query"),
-	}
-	if repo := q.Get("repo"); repo != "" {
-		f.Repo = &repo
-	}
-	jobs, err := s.store.List(f)
+	f, err := listFilterFromQuery(r.URL.Query())
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
 	}
-	writeJSON(w, http.StatusOK, jobs)
+	res, err := s.store.List(f)
+	if err != nil {
+		writeErr(w, statusOf(err), err)
+		return
+	}
+	if f.Summary {
+		sums := make([]JobSummary, 0, len(res.Jobs))
+		for _, j := range res.Jobs {
+			sums = append(sums, summarize(j))
+		}
+		writeJSON(w, http.StatusOK, SummaryListEnvelope{Jobs: sums, NextCursor: res.NextCursor})
+		return
+	}
+	if f.Limit > 0 || f.Cursor != "" {
+		writeJSON(w, http.StatusOK, JobListEnvelope{Jobs: res.Jobs, NextCursor: res.NextCursor})
+		return
+	}
+	writeJSON(w, http.StatusOK, res.Jobs)
 }
 
 func (s *server) apiCreate(w http.ResponseWriter, r *http.Request) {
@@ -666,8 +680,23 @@ button.textish {
   <label>mine <input name="mine" value="{{.Mine}}"></label>
   <label><input type="checkbox" name="takeable" value="1" {{if .Takeable}}checked{{end}}> takeable</label>
   <label><input type="checkbox" name="waiting" value="1" {{if .Waiting}}checked{{end}}> waiting</label>
+  <label>state <select name="state">
+    <option value="" {{if not .State}}selected{{end}}>any</option>
+    <option value="draft" {{if eq .State "draft"}}selected{{end}}>draft</option>
+    <option value="blocked" {{if eq .State "blocked"}}selected{{end}}>blocked</option>
+    <option value="waiting" {{if eq .State "waiting"}}selected{{end}}>waiting</option>
+    <option value="live" {{if eq .State "live"}}selected{{end}}>live</option>
+    <option value="takeable" {{if eq .State "takeable"}}selected{{end}}>takeable</option>
+    <option value="open" {{if eq .State "open"}}selected{{end}}>open</option>
+    <option value="terminal" {{if eq .State "terminal"}}selected{{end}}>terminal</option>
+    <option value="abandoned" {{if eq .State "abandoned"}}selected{{end}}>abandoned</option>
+    <option value="done" {{if eq .State "done"}}selected{{end}}>done</option>
+  </select></label>
+  <label><input type="checkbox" name="summary" value="1" {{if .Summary}}checked{{end}}> summary</label>
+  <label>limit <input name="limit" type="number" min="1" max="1000" value="{{.Limit}}"></label>
   <button>Filter</button>
 </form>
+{{if .Cursor}}<p class="muted">Page cursor set.</p>{{end}}
 {{if not .Jobs}}<p class="muted">No jobs match.</p>{{end}}
 <ul class="jobs">
 {{range .Jobs}}
@@ -679,6 +708,7 @@ button.textish {
   </li>
 {{end}}
 </ul>
+{{if .Next}}<p><a href="{{.Next}}">next page</a></p>{{end}}
 {{end}}
 
 {{define "new"}}

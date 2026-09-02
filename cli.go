@@ -46,7 +46,7 @@ var commands = []command{
 	{name: "serve", help: "powder serve [--bind ADDR] [--db PATH] [--bootstrap-key-file PATH] [--ttl DURATION]"},
 	{name: "create", help: "powder create --id ID --title TITLE [--spec SPEC] [--repo REPO] [--blocked-by a,b]", run: runCreate},
 	{name: "show", help: "powder show ID [--plain]", run: runShow},
-	{name: "list", help: "powder list [--takeable] [--waiting] [--repo REPO] [--mine AGENT] [--query TEXT|-q TEXT] [--plain]", run: runList},
+	{name: "list", help: "powder list [--takeable] [--waiting] [--repo REPO] [--mine AGENT] [--query TEXT|-q TEXT] [--state STATE] [--summary] [--limit N] [--cursor TOKEN] [--plain]", run: runList},
 	{name: "take", help: "powder take ID [--agent AGENT]", run: runTake},
 	{name: "release", help: "powder release ID", run: runRelease},
 	{name: "renew", help: "powder renew ID [--agent AGENT]", run: runRenew},
@@ -230,7 +230,37 @@ func jobState(j Job) string {
 	return "open"
 }
 
-func emitList(raw []byte) int {
+func emitList(raw []byte, summary bool) int {
+	tr := bytes.TrimSpace(raw)
+	if len(tr) == 0 {
+		return 0
+	}
+	if tr[0] == '{' {
+		if summary {
+			var env SummaryListEnvelope
+			if err := json.Unmarshal(raw, &env); err != nil {
+				return fail(errf("decode", "%s", err.Error()))
+			}
+			for _, j := range env.Jobs {
+				fmt.Printf("%s\t%s\t%s\n", j.ID, summaryState(j), j.Title)
+			}
+			if env.NextCursor != "" {
+				fmt.Printf("next_cursor\t%s\n", env.NextCursor)
+			}
+			return 0
+		}
+		var env JobListEnvelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return fail(errf("decode", "%s", err.Error()))
+		}
+		for _, j := range env.Jobs {
+			fmt.Printf("%s\t%s\t%s\n", j.ID, jobState(j), j.Title)
+		}
+		if env.NextCursor != "" {
+			fmt.Printf("next_cursor\t%s\n", env.NextCursor)
+		}
+		return 0
+	}
 	var jobs []Job
 	if err := json.Unmarshal(raw, &jobs); err != nil {
 		return fail(errf("decode", "%s", err.Error()))
@@ -239,6 +269,21 @@ func emitList(raw []byte) int {
 		fmt.Printf("%s\t%s\t%s\n", j.ID, jobState(j), j.Title)
 	}
 	return 0
+}
+
+func summaryState(s JobSummary) string {
+	switch {
+	case s.Derived.Terminal:
+		return "terminal"
+	case s.Derived.Waiting:
+		return "waiting"
+	case s.Derived.Live:
+		return "live"
+	case s.Derived.Takeable:
+		return "takeable"
+	default:
+		return "open"
+	}
 }
 
 func emitShow(raw []byte) int {
@@ -326,6 +371,18 @@ func runList(f *flagset) int {
 	if v := f.str("query"); v != "" {
 		q.Set("query", v)
 	}
+	if f.bit("summary") {
+		q.Set("summary", "1")
+	}
+	if v := f.str("state"); v != "" {
+		q.Set("state", v)
+	}
+	if v := f.str("limit"); v != "" {
+		q.Set("limit", v)
+	}
+	if v := f.str("cursor"); v != "" {
+		q.Set("cursor", v)
+	}
 	path := "/api/jobs"
 	if enc := q.Encode(); enc != "" {
 		path += "?" + enc
@@ -335,7 +392,7 @@ func runList(f *flagset) int {
 		return fail(err)
 	}
 	if wantPlain(f) && st < 300 {
-		return emitList(b)
+		return emitList(b, f.bit("summary"))
 	}
 	return emit(st, b)
 }

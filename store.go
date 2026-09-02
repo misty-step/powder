@@ -3,10 +3,13 @@ package main
 import (
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -331,18 +334,117 @@ func (s *Store) Get(id string) (Job, error) {
 	return out, err
 }
 
+const maxListLimit = 1000
+
+var listStates = map[string]bool{
+	"draft": true, "blocked": true, "waiting": true, "live": true,
+	"takeable": true, "open": true, "terminal": true, "abandoned": true, "done": true,
+}
+
 type ListFilter struct {
 	Takeable bool
 	Waiting  bool
 	Repo     *string
 	Mine     string
 	Query    string
+	Summary  bool
+	State    string
+	Limit    int
+	Cursor   string
+
+	cursor    listCursor
+	cursorSet bool
 }
 
-func (s *Store) List(f ListFilter) ([]Job, error) {
-	var out []Job
+type ListResult struct {
+	Jobs       []Job
+	NextCursor string
+}
+
+type listCursor struct {
+	CreatedAt int64  `json:"created_at"`
+	ID        string `json:"id"`
+}
+
+func encodeCursor(at time.Time, id string) string {
+	b, _ := json.Marshal(listCursor{CreatedAt: at.UnixMilli(), ID: id})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeCursor(s string) (listCursor, error) {
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return listCursor{}, errf("invalid_cursor", "malformed cursor")
+	}
+	var c listCursor
+	if err := json.Unmarshal(b, &c); err != nil {
+		return listCursor{}, errf("invalid_cursor", "malformed cursor")
+	}
+	if c.CreatedAt < 0 || c.ID == "" || !validSlug(c.ID) {
+		return listCursor{}, errf("invalid_cursor", "malformed cursor")
+	}
+	return c, nil
+}
+
+func listFilterFromQuery(q url.Values) (ListFilter, error) {
+	var f ListFilter
+	f.Takeable = q.Get("takeable") == "1" || q.Get("takeable") == "true"
+	f.Waiting = q.Get("waiting") == "1" || q.Get("waiting") == "true"
+	f.Summary = q.Get("summary") == "1" || q.Get("summary") == "true"
+	f.Mine = q.Get("mine")
+	f.Query = q.Get("query")
+	if repo := q.Get("repo"); repo != "" {
+		f.Repo = &repo
+	}
+	if st := q.Get("state"); st != "" {
+		if !listStates[st] {
+			return f, errf("invalid_state", "unknown state %q", st)
+		}
+		f.State = st
+	}
+	if lim := q.Get("limit"); lim != "" {
+		n, err := strconv.Atoi(lim)
+		if err != nil || n <= 0 || n > maxListLimit {
+			return f, errf("invalid_limit", "limit must be between 1 and %d", maxListLimit)
+		}
+		f.Limit = n
+	}
+	if cur := q.Get("cursor"); cur != "" {
+		c, err := decodeCursor(cur)
+		if err != nil {
+			return f, err
+		}
+		f.Cursor = cur
+		f.cursor = c
+		f.cursorSet = true
+	}
+	if err := validateListFilter(f); err != nil {
+		return f, err
+	}
+	return f, nil
+}
+
+func validateListFilter(f ListFilter) error {
+	if f.Takeable && f.Waiting {
+		return errf("invalid_filter", "takeable and waiting cannot be combined")
+	}
+	if f.State != "" && (f.Takeable || f.Waiting) {
+		return errf("invalid_filter", "state cannot be combined with takeable or waiting")
+	}
+	return nil
+}
+
+func (s *Store) List(f ListFilter) (ListResult, error) {
+	var out ListResult
 	err := s.read(func(t *tx) error {
-		rows, err := t.tx.Query(`SELECT id FROM jobs ORDER BY created_at ASC, id ASC`)
+		querySQL := `SELECT id, created_at FROM jobs`
+		var args []any
+		if f.cursorSet {
+			querySQL += ` WHERE created_at > ? OR (created_at = ? AND id > ?)`
+			args = append(args, f.cursor.CreatedAt, f.cursor.CreatedAt, f.cursor.ID)
+		}
+		querySQL += ` ORDER BY created_at ASC, id ASC`
+		rows, err := t.tx.Query(querySQL, args...)
 		if err != nil {
 			return err
 		}
@@ -350,7 +452,8 @@ func (s *Store) List(f ListFilter) ([]Job, error) {
 		var ids []string
 		for rows.Next() {
 			var id string
-			if err := rows.Scan(&id); err != nil {
+			var created int64
+			if err := rows.Scan(&id, &created); err != nil {
 				return err
 			}
 			ids = append(ids, id)
@@ -383,14 +486,70 @@ func (s *Store) List(f ListFilter) ([]Job, error) {
 					continue
 				}
 			}
-			out = append(out, j)
+			if f.State != "" {
+				match, err := stateMatches(t, j, f.State)
+				if err != nil {
+					return err
+				}
+				if !match {
+					continue
+				}
+			}
+			out.Jobs = append(out.Jobs, j)
 		}
-		if out == nil {
-			out = []Job{}
+		if out.Jobs == nil {
+			out.Jobs = []Job{}
+		}
+		if f.Limit > 0 && len(out.Jobs) > f.Limit {
+			last := out.Jobs[f.Limit-1]
+			out.NextCursor = encodeCursor(last.CreatedAt, last.ID)
+			out.Jobs = out.Jobs[:f.Limit]
 		}
 		return nil
 	})
 	return out, err
+}
+
+func stateMatches(t *tx, j Job, state string) (bool, error) {
+	switch state {
+	case "draft":
+		return !j.Derived.Terminal && j.Spec == "", nil
+	case "blocked":
+		bs, err := t.loadMany(j.BlockedBy)
+		if err != nil {
+			return false, err
+		}
+		return blockedState(j, bs), nil
+	case "waiting":
+		return j.Derived.Waiting, nil
+	case "live":
+		return j.Derived.Live, nil
+	case "takeable":
+		return j.Derived.Takeable, nil
+	case "open":
+		return j.Derived.Open, nil
+	case "terminal":
+		return j.Derived.Terminal, nil
+	case "abandoned":
+		return j.Abandoned, nil
+	case "done":
+		return j.Derived.Terminal && !j.Abandoned, nil
+	default:
+		return false, errf("invalid_state", "unknown state %q", state)
+	}
+}
+
+func blockedState(j Job, blockers map[string]Job) bool {
+	if j.Derived.Terminal || j.Derived.Waiting || j.Derived.Live {
+		return false
+	}
+	for _, id := range j.BlockedBy {
+		b, ok := blockers[id]
+		if !ok || !b.terminal() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) Take(id, agent, principal string) (Job, error) {
