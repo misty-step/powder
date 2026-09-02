@@ -19,8 +19,9 @@ Git history is intact. The live process is `powder serve`.
 
 ## Agent skill
 
-`SKILL.md` is the source of truth for `skill://powder`. Register it for
-OMP workspace discovery with:
+`SKILL.md` is the source of truth for `skill://powder`. The installer copies
+only that file into the user-wide skill directory; the repository checkout
+never becomes skill-readable. Register or refresh it with:
 
 ```sh
 ./scripts/install-skill.sh

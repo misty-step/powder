@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -304,4 +306,95 @@ func skillVerbs(text string) ([]string, error) {
 		out = append(out, tok[1])
 	}
 	return out, nil
+}
+
+func TestInstallSkillConfinesDestination(t *testing.T) {
+	repo, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	dest := filepath.Join(root, "powder")
+	if err := os.Symlink(repo, dest); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(path string) {
+		t.Helper()
+		cmd := exec.Command("./scripts/install-skill.sh", path)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("install skill: %v\n%s", err, out)
+		}
+	}
+	refuse := func(path string) {
+		t.Helper()
+		cmd := exec.Command("./scripts/install-skill.sh", path)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("installer replaced unmanaged destination:\n%s", out)
+		}
+	}
+
+	run(dest)
+	run(dest + "/")
+
+	entries, err := os.ReadDir(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "SKILL.md" {
+		t.Fatalf("skill destination entries: %v", entries)
+	}
+	marker, err := os.ReadFile(dest + ".registration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(marker)) != repo {
+		t.Fatalf("registration marker = %q, want %q", marker, repo)
+	}
+	if info, err := os.Lstat(dest); err != nil {
+		t.Fatal(err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("skill destination remains a checkout symlink")
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile("SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("installed SKILL.md differs from source")
+	}
+
+	unrelatedLink := filepath.Join(root, "unrelated-link")
+	if err := os.Symlink(root, unrelatedLink); err != nil {
+		t.Fatal(err)
+	}
+	refuse(unrelatedLink)
+	if info, err := os.Lstat(unrelatedLink); err != nil {
+		t.Fatal(err)
+	} else if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("unrelated symlink was replaced")
+	}
+
+	unmarked := filepath.Join(root, "unmarked")
+	if err := os.Mkdir(unmarked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unmarked, "SKILL.md"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	refuse(unmarked)
+	if got, err := os.ReadFile(filepath.Join(unmarked, "SKILL.md")); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "keep" {
+		t.Fatal("unmarked skill was modified")
+	}
+
+	if err := os.WriteFile(filepath.Join(dest, "unmanaged"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	refuse(dest)
 }
