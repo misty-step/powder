@@ -297,6 +297,15 @@ func emitShow(raw []byte) int {
 	if j.Repo != nil {
 		fmt.Printf("repo\t%s\n", *j.Repo)
 	}
+	if j.CreatedBy != nil {
+		fmt.Printf("created_by\t%s\n", *j.CreatedBy)
+	}
+	if j.PromotedBy != nil {
+		fmt.Printf("promoted_by\t%s\n", *j.PromotedBy)
+	}
+	if j.PromotedAt != nil {
+		fmt.Printf("promoted_at\t%s\n", j.PromotedAt.UTC().Format(time.RFC3339))
+	}
 	fmt.Printf("spec\n%s\n", j.Spec)
 	for _, n := range j.Notes {
 		fmt.Printf("note\t%s\t%s\t%s\n", n.At.UTC().Format(time.RFC3339), n.By, n.Text)

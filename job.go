@@ -37,6 +37,12 @@ type Note struct {
 	Text string    `json:"text"`
 }
 
+type SpecEdit struct {
+	At   time.Time `json:"at"`
+	By   string    `json:"by"`
+	Spec string    `json:"spec"`
+}
+
 type Derived struct {
 	Terminal bool `json:"terminal"`
 	Waiting  bool `json:"waiting"`
@@ -46,30 +52,37 @@ type Derived struct {
 }
 
 type Job struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Spec      string    `json:"spec"`
-	Repo      *string   `json:"repo"`
-	BlockedBy []string  `json:"blocked_by"`
-	Lease     *Lease    `json:"lease"`
-	Ask       *Ask      `json:"ask"`
-	Proof     *string   `json:"proof"`
-	Abandoned bool      `json:"abandoned"`
-	Notes     []Note    `json:"notes"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Derived   Derived   `json:"derived"`
+	ID         string     `json:"id"`
+	Title      string     `json:"title"`
+	Spec       string     `json:"spec"`
+	Repo       *string    `json:"repo"`
+	BlockedBy  []string   `json:"blocked_by"`
+	Lease      *Lease     `json:"lease"`
+	Ask        *Ask       `json:"ask"`
+	Proof      *string    `json:"proof"`
+	Abandoned  bool       `json:"abandoned"`
+	Notes      []Note     `json:"notes"`
+	CreatedBy  *string    `json:"created_by"`
+	PromotedBy *string    `json:"promoted_by"`
+	PromotedAt *time.Time `json:"promoted_at"`
+	Promotions []SpecEdit `json:"promotions"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	Derived    Derived    `json:"derived"`
 }
 
 type JobSummary struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Repo      *string   `json:"repo"`
-	BlockedBy []string  `json:"blocked_by"`
-	Lease     *Lease    `json:"lease"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Derived   Derived   `json:"derived"`
+	ID         string     `json:"id"`
+	Title      string     `json:"title"`
+	Repo       *string    `json:"repo"`
+	BlockedBy  []string   `json:"blocked_by"`
+	Lease      *Lease     `json:"lease"`
+	CreatedBy  *string    `json:"created_by"`
+	PromotedBy *string    `json:"promoted_by"`
+	PromotedAt *time.Time `json:"promoted_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	Derived    Derived    `json:"derived"`
 }
 
 type JobListEnvelope struct {
@@ -84,14 +97,17 @@ type SummaryListEnvelope struct {
 
 func summarize(j Job) JobSummary {
 	return JobSummary{
-		ID:        j.ID,
-		Title:     j.Title,
-		Repo:      j.Repo,
-		BlockedBy: append([]string(nil), j.BlockedBy...),
-		Lease:     j.Lease,
-		CreatedAt: j.CreatedAt,
-		UpdatedAt: j.UpdatedAt,
-		Derived:   j.Derived,
+		ID:         j.ID,
+		Title:      j.Title,
+		Repo:       j.Repo,
+		BlockedBy:  append([]string(nil), j.BlockedBy...),
+		Lease:      j.Lease,
+		CreatedBy:  j.CreatedBy,
+		PromotedBy: j.PromotedBy,
+		PromotedAt: j.PromotedAt,
+		CreatedAt:  j.CreatedAt,
+		UpdatedAt:  j.UpdatedAt,
+		Derived:    j.Derived,
 	}
 }
 

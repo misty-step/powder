@@ -52,8 +52,14 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Ping() error { return s.db.Ping() }
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS jobs (
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   spec TEXT NOT NULL DEFAULT '',
@@ -66,28 +72,103 @@ CREATE TABLE IF NOT EXISTS jobs (
   ask_question TEXT,
   ask_by TEXT,
   ask_at INTEGER,
+  created_by TEXT,
+  promoted_by TEXT,
+  promoted_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS blockers (
+)`, `CREATE TABLE IF NOT EXISTS blockers (
   job_id TEXT NOT NULL,
   blocker_id TEXT NOT NULL,
   PRIMARY KEY (job_id, blocker_id)
-);
-CREATE TABLE IF NOT EXISTS notes (
+)`, `CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id TEXT NOT NULL,
   at INTEGER NOT NULL,
   by_label TEXT NOT NULL,
   body TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS api_keys (
+)`, `CREATE TABLE IF NOT EXISTS api_keys (
   id TEXT PRIMARY KEY,
   hash BLOB NOT NULL,
-  created_at INTEGER NOT NULL
-);
-`)
-	return err
+  created_at INTEGER NOT NULL,
+  report INTEGER NOT NULL DEFAULT 0,
+  promote INTEGER NOT NULL DEFAULT 0,
+  repo TEXT
+)`, `CREATE TABLE IF NOT EXISTS spec_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  by_label TEXT NOT NULL,
+  body TEXT NOT NULL
+)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+
+	legacyKeys := false
+	for _, add := range []struct{ table, name, decl string }{
+		{"jobs", "created_by", "TEXT"},
+		{"jobs", "promoted_by", "TEXT"},
+		{"jobs", "promoted_at", "INTEGER"},
+		{"api_keys", "report", "INTEGER NOT NULL DEFAULT 0"},
+		{"api_keys", "promote", "INTEGER NOT NULL DEFAULT 0"},
+		{"api_keys", "repo", "TEXT"},
+	} {
+		added, err := addColumnIfMissing(tx, add.table, add.name, add.decl)
+		if err != nil {
+			return err
+		}
+		if add.table == "api_keys" && (add.name == "report" || add.name == "promote") && added {
+			legacyKeys = true
+		}
+	}
+
+	// Existing keys predate capability enforcement and were full authority.
+	// Preserving their authority means marking them report+promote when the
+	// capability columns are first introduced. New keys are inserted with
+	// explicit capabilities and are never backfilled by a later migration.
+	if legacyKeys {
+		if _, err := tx.Exec(`UPDATE api_keys SET report = 1, promote = 1`); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func addColumnIfMissing(tx *sql.Tx, table, name, decl string) (bool, error) {
+	cols, err := tableColumns(tx, table)
+	if err != nil {
+		return false, err
+	}
+	if cols[name] {
+		return false, nil
+	}
+	if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, name, decl)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func tableColumns(tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }
 
 type tx struct {
@@ -125,17 +206,19 @@ func (s *Store) read(fn func(*tx) error) error {
 func (t *tx) load(id string) (Job, error) {
 	var j Job
 	var repo, proof, lAgent, lPrin sql.NullString
-	var lUntil, askAt sql.NullInt64
-	var askQ, askBy sql.NullString
+	var lUntil, askAt, promotedAt sql.NullInt64
+	var askQ, askBy, createdBy, promotedBy sql.NullString
 	var created, updated int64
 	var abandoned int
 	err := t.tx.QueryRow(`
 SELECT id, title, spec, repo, proof, abandoned,
        lease_agent, lease_principal, lease_until,
-       ask_question, ask_by, ask_at, created_at, updated_at
+       ask_question, ask_by, ask_at,
+       created_by, promoted_by, promoted_at, created_at, updated_at
 FROM jobs WHERE id = ?`, id).Scan(
 		&j.ID, &j.Title, &j.Spec, &repo, &proof, &abandoned,
-		&lAgent, &lPrin, &lUntil, &askQ, &askBy, &askAt, &created, &updated,
+		&lAgent, &lPrin, &lUntil, &askQ, &askBy, &askAt,
+		&createdBy, &promotedBy, &promotedAt, &created, &updated,
 	)
 	if err == sql.ErrNoRows {
 		return j, errf("not_found", "job %s not found", id)
@@ -164,6 +247,16 @@ FROM jobs WHERE id = ?`, id).Scan(
 		}
 		j.Ask = &Ask{Question: askQ.String, By: askBy.String, At: at}
 	}
+	if createdBy.Valid {
+		j.CreatedBy = &createdBy.String
+	}
+	if promotedBy.Valid {
+		j.PromotedBy = &promotedBy.String
+	}
+	if promotedAt.Valid {
+		at := time.UnixMilli(promotedAt.Int64).UTC()
+		j.PromotedAt = &at
+	}
 	j.CreatedAt = time.UnixMilli(created).UTC()
 	j.UpdatedAt = time.UnixMilli(updated).UTC()
 	j.BlockedBy, err = t.blockers(id)
@@ -179,6 +272,13 @@ FROM jobs WHERE id = ?`, id).Scan(
 	}
 	if j.BlockedBy == nil {
 		j.BlockedBy = []string{}
+	}
+	j.Promotions, err = t.promotions(id)
+	if err != nil {
+		return j, err
+	}
+	if j.Promotions == nil {
+		j.Promotions = []SpecEdit{}
 	}
 	return j, nil
 }
@@ -215,6 +315,25 @@ func (t *tx) notes(id string) ([]Note, error) {
 		}
 		n.At = time.UnixMilli(at).UTC()
 		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (t *tx) promotions(id string) ([]SpecEdit, error) {
+	rows, err := t.tx.Query(`SELECT at, by_label, body FROM spec_history WHERE job_id = ? ORDER BY at, id`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SpecEdit
+	for rows.Next() {
+		var at int64
+		var e SpecEdit
+		if err := rows.Scan(&at, &e.By, &e.Spec); err != nil {
+			return nil, err
+		}
+		e.At = time.UnixMilli(at).UTC()
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }
@@ -290,7 +409,7 @@ WHERE id = ?`, agent, principal, until, t.now.UnixMilli(), id)
 	return err
 }
 
-func (s *Store) Create(id, title, spec string, repo *string, blockedBy []string) (Job, error) {
+func (s *Store) Create(a authz, id, title, spec string, repo *string, blockedBy []string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
@@ -300,10 +419,22 @@ func (s *Store) Create(id, title, spec string, repo *string, blockedBy []string)
 		if strings.TrimSpace(title) == "" {
 			return errf("invalid_title", "title is required")
 		}
+		norm := repoOrNil(repo)
+		if spec != "" {
+			if err := a.requirePromote(norm); err != nil {
+				return err
+			}
+		} else if err := a.requireReport(norm); err != nil {
+			return err
+		}
 		now := t.now.UnixMilli()
+		var promoBy, promoAt any
+		if spec != "" {
+			promoBy, promoAt = a.ID, now
+		}
 		_, err := t.tx.Exec(`
-INSERT INTO jobs (id, title, spec, repo, created_at, updated_at)
-VALUES (?,?,?,?,?,?)`, id, title, spec, repoOrNil(repo), now, now)
+INSERT INTO jobs (id, title, spec, repo, created_by, promoted_by, promoted_at, created_at, updated_at)
+VALUES (?,?,?,?,?,?,?,?,?)`, id, title, spec, norm, a.ID, promoBy, promoAt, now, now)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				return errf("exists", "job %s already exists", id)
@@ -315,6 +446,12 @@ VALUES (?,?,?,?,?,?)`, id, title, spec, repoOrNil(repo), now, now)
 				return errf("invalid_id", "blocker %q is not a slug", b)
 			}
 			if _, err := t.tx.Exec(`INSERT INTO blockers (job_id, blocker_id) VALUES (?,?)`, id, b); err != nil {
+				return err
+			}
+		}
+		if spec != "" {
+			if _, err := t.tx.Exec(`INSERT INTO spec_history (job_id, at, by_label, body) VALUES (?,?,?,?)`,
+				id, now, a.ID, spec); err != nil {
 				return err
 			}
 		}
@@ -552,7 +689,7 @@ func blockedState(j Job, blockers map[string]Job) bool {
 	return false
 }
 
-func (s *Store) Take(id, agent, principal string) (Job, error) {
+func (s *Store) Take(a authz, id, agent string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
@@ -561,6 +698,9 @@ func (s *Store) Take(id, agent, principal string) (Job, error) {
 		}
 		j, err := t.load(id)
 		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if j.terminal() {
@@ -585,7 +725,7 @@ func (s *Store) Take(id, agent, principal string) (Job, error) {
 		if !ok {
 			return errf(code, "take %s failed: %s", id, code)
 		}
-		if err := t.setLease(id, agent, principal); err != nil {
+		if err := t.setLease(id, agent, a.ID); err != nil {
 			return err
 		}
 		if err := t.addNote(id, agent, "took"); err != nil {
@@ -597,11 +737,15 @@ func (s *Store) Take(id, agent, principal string) (Job, error) {
 	return out, err
 }
 
-func (s *Store) Release(id, by string) (Job, error) {
+func (s *Store) Release(a authz, id string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
-		if _, err := t.load(id); err != nil {
+		j, err := t.load(id)
+		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if _, err := t.tx.Exec(`
@@ -609,7 +753,7 @@ UPDATE jobs SET lease_agent = NULL, lease_principal = NULL, lease_until = NULL, 
 WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 			return err
 		}
-		if err := t.addNote(id, by, "released"); err != nil {
+		if err := t.addNote(id, a.ID, "released"); err != nil {
 			return err
 		}
 		out, err = t.hydrate(id)
@@ -618,12 +762,15 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 	return out, err
 }
 
-func (s *Store) Renew(id, agent string) (Job, error) {
+func (s *Store) Renew(a authz, id, agent string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
 		j, err := t.requireHolder(id, agent)
 		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if err := t.setLease(id, j.Lease.Agent, j.Lease.Principal); err != nil {
@@ -663,14 +810,18 @@ func (t *tx) requireHolderOrFree(id, agent string) (Job, error) {
 	return j, nil
 }
 
-func (s *Store) Ask(id, agent, question string) (Job, error) {
+func (s *Store) Ask(a authz, id, agent, question string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
 		if strings.TrimSpace(question) == "" {
 			return errf("invalid_ask", "question is required")
 		}
-		if _, err := t.requireHolder(id, agent); err != nil {
+		j, err := t.requireHolder(id, agent)
+		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if _, err := t.tx.Exec(`
@@ -689,12 +840,15 @@ WHERE id = ?`, question, agent, t.now.UnixMilli(), t.now.UnixMilli(), id); err !
 	return out, err
 }
 
-func (s *Store) Answer(id, by, text string) (Job, error) {
+func (s *Store) Answer(a authz, id, text string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
 		j, err := t.load(id)
 		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if j.terminal() {
@@ -708,7 +862,7 @@ UPDATE jobs SET ask_question = NULL, ask_by = NULL, ask_at = NULL, updated_at = 
 WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 			return err
 		}
-		if err := t.addNote(id, by, "answer: "+text); err != nil {
+		if err := t.addNote(id, a.ID, "answer: "+text); err != nil {
 			return err
 		}
 		out, err = t.hydrate(id)
@@ -717,14 +871,18 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 	return out, err
 }
 
-func (s *Store) Done(id, agent, proof string) (Job, error) {
+func (s *Store) Done(a authz, id, agent, proof string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
 		if strings.TrimSpace(proof) == "" {
 			return errf("empty_proof", "proof is required")
 		}
-		if _, err := t.requireHolder(id, agent); err != nil {
+		j, err := t.requireHolder(id, agent)
+		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if _, err := t.tx.Exec(`
@@ -744,11 +902,15 @@ WHERE id = ?`, proof, t.now.UnixMilli(), id); err != nil {
 	return out, err
 }
 
-func (s *Store) Abandon(id, agent string) (Job, error) {
+func (s *Store) Abandon(a authz, id, agent string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
-		if _, err := t.requireHolderOrFree(id, agent); err != nil {
+		j, err := t.requireHolderOrFree(id, agent)
+		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if _, err := t.tx.Exec(`
@@ -768,12 +930,15 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 	return out, err
 }
 
-func (s *Store) Reopen(id, by string) (Job, error) {
+func (s *Store) Reopen(a authz, id string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
 		j, err := t.load(id)
 		if err != nil {
+			return err
+		}
+		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
 		if j.live(t.now) {
@@ -786,7 +951,7 @@ func (s *Store) Reopen(id, by string) (Job, error) {
 			t.now.UnixMilli(), id); err != nil {
 			return err
 		}
-		if err := t.addNote(id, by, "reopened"); err != nil {
+		if err := t.addNote(id, a.ID, "reopened"); err != nil {
 			return err
 		}
 		out, err = t.hydrate(id)
@@ -795,12 +960,19 @@ func (s *Store) Reopen(id, by string) (Job, error) {
 	return out, err
 }
 
-func (s *Store) Note(id, agent, text string) (Job, error) {
+func (s *Store) Note(a authz, id, agent, text string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
-		if _, err := t.load(id); err != nil {
+		j, err := t.load(id)
+		if err != nil {
 			return err
+		}
+		if !a.Report {
+			return errf("missing_capability", "principal %s lacks report capability", a.ID)
+		}
+		if !a.scoped(j.Repo) {
+			return errf("repo_scope", "principal %s is not scoped to repository %s", a.ID, repoLabel(j.Repo))
 		}
 		if strings.TrimSpace(text) == "" {
 			return errf("invalid_note", "text is required")
@@ -817,14 +989,18 @@ func (s *Store) Note(id, agent, text string) (Job, error) {
 	return out, err
 }
 
-func (s *Store) Patch(id, agent string, title, spec, repo *string, clearRepo bool, blockedBy *[]string) (Job, error) {
+func (s *Store) Patch(a authz, id, agent string, title, spec, repo *string, clearRepo bool, blockedBy *[]string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
-		if _, err := t.requireHolderOrFree(id, agent); err != nil {
+		j, err := t.requireHolderOrFree(id, agent)
+		if err != nil {
 			return err
 		}
 		if title != nil {
+			if err := a.requirePromote(j.Repo); err != nil {
+				return err
+			}
 			if strings.TrimSpace(*title) == "" {
 				return errf("invalid_title", "title is required")
 			}
@@ -833,24 +1009,48 @@ func (s *Store) Patch(id, agent string, title, spec, repo *string, clearRepo boo
 			}
 		}
 		if spec != nil {
-			if _, err := t.tx.Exec(`UPDATE jobs SET spec = ? WHERE id = ?`, *spec, id); err != nil {
+			if err := a.requirePromote(j.Repo); err != nil {
 				return err
+			}
+			newSpec := *spec
+			if newSpec != j.Spec {
+				if newSpec != "" && j.PromotedBy == nil {
+					if _, err := t.tx.Exec(`UPDATE jobs SET spec = ?, promoted_by = ?, promoted_at = ? WHERE id = ?`,
+						newSpec, a.ID, t.now.UnixMilli(), id); err != nil {
+						return err
+					}
+				} else if _, err := t.tx.Exec(`UPDATE jobs SET spec = ? WHERE id = ?`, newSpec, id); err != nil {
+					return err
+				}
+				if _, err := t.tx.Exec(`INSERT INTO spec_history (job_id, at, by_label, body) VALUES (?,?,?,?)`,
+					id, t.now.UnixMilli(), a.ID, newSpec); err != nil {
+					return err
+				}
 			}
 		}
-		if clearRepo {
-			if _, err := t.tx.Exec(`UPDATE jobs SET repo = NULL WHERE id = ?`, id); err != nil {
+		if clearRepo || repo != nil {
+			if err := a.requirePromote(j.Repo); err != nil {
 				return err
 			}
-		} else if repo != nil {
-			if strings.TrimSpace(*repo) == "" {
+			newRepo := repoOrNil(repo)
+			if clearRepo {
+				newRepo = nil
+			}
+			if err := a.requirePromote(newRepo); err != nil {
+				return err
+			}
+			if newRepo == nil {
 				if _, err := t.tx.Exec(`UPDATE jobs SET repo = NULL WHERE id = ?`, id); err != nil {
 					return err
 				}
-			} else if _, err := t.tx.Exec(`UPDATE jobs SET repo = ? WHERE id = ?`, *repo, id); err != nil {
+			} else if _, err := t.tx.Exec(`UPDATE jobs SET repo = ? WHERE id = ?`, *newRepo, id); err != nil {
 				return err
 			}
 		}
 		if blockedBy != nil {
+			if err := a.requirePromote(j.Repo); err != nil {
+				return err
+			}
 			if _, err := t.tx.Exec(`DELETE FROM blockers WHERE job_id = ?`, id); err != nil {
 				return err
 			}
@@ -878,19 +1078,43 @@ func (s *Store) HasKeys() (bool, error) {
 	return n > 0, err
 }
 
+// InsertKey adds the bootstrap key. Bootstrap keys predate capability
+// enforcement and keep full authority over every repository.
 func (s *Store) InsertKey(id string, hash []byte) error {
-	_, err := s.db.Exec(`INSERT INTO api_keys (id, hash, created_at) VALUES (?,?,?)`,
-		id, hash, time.Now().UnixMilli())
+	return s.InsertScopedKey(id, hash, true, true, nil)
+}
+
+func (s *Store) InsertScopedKey(id string, hash []byte, report, promote bool, repo *string) error {
+	_, err := s.db.Exec(`INSERT INTO api_keys (id, hash, created_at, report, promote, repo) VALUES (?,?,?,?,?,?)`,
+		id, hash, time.Now().UnixMilli(), boolInt(report), boolInt(promote), repo)
 	return err
 }
 
-func (s *Store) LookupKey(hash []byte) (string, bool, error) {
-	var id string
-	err := s.db.QueryRow(`SELECT id FROM api_keys WHERE hash = ?`, hash).Scan(&id)
+func (s *Store) LookupAuthz(hash []byte) (authz, bool, error) {
+	var a authz
+	var report, promote int
+	var repo sql.NullString
+	err := s.db.QueryRow(`SELECT id, report, promote, repo FROM api_keys WHERE hash = ?`, hash).Scan(
+		&a.ID, &report, &promote, &repo)
 	if err == sql.ErrNoRows {
-		return "", false, nil
+		return authz{}, false, nil
 	}
-	return id, err == nil, err
+	if err != nil {
+		return authz{}, false, err
+	}
+	a.Report = report != 0
+	a.Promote = promote != 0
+	if repo.Valid {
+		a.Repo = &repo.String
+	}
+	return a, true, nil
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 func randomKey() (id, secret string, err error) {

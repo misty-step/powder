@@ -15,6 +15,11 @@ type server struct {
 	auth  string
 }
 
+type showData struct {
+	Job
+	Authz authz
+}
+
 func newServer(store *Store, auth string) *server {
 	if auth == "" {
 		auth = "api-key"
@@ -37,6 +42,7 @@ func (s *server) handler() http.Handler {
 	api.HandleFunc("GET /jobs", s.apiAuthn(s.apiList))
 	api.HandleFunc("POST /jobs", s.apiAuthn(s.apiCreate))
 	api.HandleFunc("GET /jobs/{id}", s.apiAuthn(s.apiGet))
+	api.HandleFunc("GET /principal", s.apiAuthn(s.apiPrincipal))
 	api.HandleFunc("PATCH /jobs/{id}", s.apiAuthn(s.apiPatch))
 	api.HandleFunc("POST /jobs/{id}/take", s.apiAuthn(s.apiTake))
 	api.HandleFunc("POST /jobs/{id}/release", s.apiAuthn(s.apiRelease))
@@ -64,7 +70,7 @@ func (s *server) handler() http.Handler {
 func (s *server) apiAuthn(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.auth == "none" {
-			next(w, r.WithContext(withPrincipal(r.Context(), "none")))
+			next(w, r.WithContext(withAuthz(r.Context(), fullAuthz("none"))))
 			return
 		}
 		secret := bearer(r)
@@ -72,7 +78,7 @@ func (s *server) apiAuthn(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, errf("unauthenticated", "missing API key"))
 			return
 		}
-		id, ok, err := s.store.principalFor(secret)
+		a, ok, err := s.store.principalFor(secret)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, errf("internal", "key lookup failed"))
 			return
@@ -81,14 +87,14 @@ func (s *server) apiAuthn(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, errf("unauthenticated", "invalid API key"))
 			return
 		}
-		next(w, r.WithContext(withPrincipal(r.Context(), id)))
+		next(w, r.WithContext(withAuthz(r.Context(), a)))
 	}
 }
 
 func (s *server) uiAuthn(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.auth == "none" {
-			next(w, r.WithContext(withPrincipal(r.Context(), "none")))
+			next(w, r.WithContext(withAuthz(r.Context(), fullAuthz("none"))))
 			return
 		}
 		secret := bearer(r)
@@ -96,7 +102,7 @@ func (s *server) uiAuthn(next http.HandlerFunc) http.HandlerFunc {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-		id, ok, err := s.store.principalFor(secret)
+		a, ok, err := s.store.principalFor(secret)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, errf("internal", "key lookup failed"))
 			return
@@ -105,7 +111,7 @@ func (s *server) uiAuthn(next http.HandlerFunc) http.HandlerFunc {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-		next(w, r.WithContext(withPrincipal(r.Context(), id)))
+		next(w, r.WithContext(withAuthz(r.Context(), a)))
 	}
 }
 
@@ -180,11 +186,12 @@ func (s *server) uiList(w http.ResponseWriter, r *http.Request) {
 		"Repo":     q.Get("repo"),
 		"Mine":     f.Mine,
 		"Query":    f.Query,
+		"Authz":    authzOf(r),
 	})
 }
 
-func (s *server) uiNew(w http.ResponseWriter, _ *http.Request) {
-	s.render(w, "new", map[string]any{"PageTitle": "New job — Powder"})
+func (s *server) uiNew(w http.ResponseWriter, r *http.Request) {
+	s.render(w, "new", map[string]any{"PageTitle": "New job — Powder", "Authz": authzOf(r)})
 }
 
 func (s *server) uiCreate(w http.ResponseWriter, r *http.Request) {
@@ -200,7 +207,7 @@ func (s *server) uiCreate(w http.ResponseWriter, r *http.Request) {
 	if v := strings.TrimSpace(r.FormValue("blocked_by")); v != "" {
 		blocked = splitCSV(v)
 	}
-	j, err := s.store.Create(id, title, spec, repo, blocked)
+	j, err := s.store.Create(authzOf(r), id, title, spec, repo, blocked)
 	if err != nil {
 		http.Error(w, err.Error(), statusOf(err))
 		return
@@ -214,13 +221,13 @@ func (s *server) uiShow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), statusOf(err))
 		return
 	}
-	s.render(w, "show", j)
+	s.render(w, "show", showData{Job: j, Authz: authzOf(r)})
 }
 
 func (s *server) uiAnswer(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	id := r.PathValue("id")
-	_, err := s.store.Answer(id, principalOf(r), r.FormValue("text"))
+	_, err := s.store.Answer(authzOf(r), id, r.FormValue("text"))
 	if err != nil {
 		http.Error(w, err.Error(), statusOf(err))
 		return
@@ -230,7 +237,7 @@ func (s *server) uiAnswer(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) uiRelease(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_, err := s.store.Release(id, principalOf(r))
+	_, err := s.store.Release(authzOf(r), id)
 	if err != nil {
 		http.Error(w, err.Error(), statusOf(err))
 		return
@@ -276,7 +283,7 @@ func (s *server) apiCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Create(body.ID, body.Title, body.Spec, body.Repo, body.BlockedBy)
+	j, err := s.store.Create(authzOf(r), body.ID, body.Title, body.Spec, body.Repo, body.BlockedBy)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -291,6 +298,10 @@ func (s *server) apiGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, j)
+}
+
+func (s *server) apiPrincipal(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, authzOf(r))
 }
 
 func (s *server) apiPatch(w http.ResponseWriter, r *http.Request) {
@@ -318,7 +329,7 @@ func (s *server) apiPatch(w http.ResponseWriter, r *http.Request) {
 	} else if body.BlockedBy != nil {
 		blocks = &body.BlockedBy
 	}
-	j, err := s.store.Patch(r.PathValue("id"), actor(r, body.Agent), body.Title, body.Spec, body.Repo, body.ClearRepo, blocks)
+	j, err := s.store.Patch(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.Title, body.Spec, body.Repo, body.ClearRepo, blocks)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -334,7 +345,7 @@ func (s *server) apiTake(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Take(r.PathValue("id"), body.Agent, principalOf(r))
+	j, err := s.store.Take(authzOf(r), r.PathValue("id"), body.Agent)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -343,7 +354,7 @@ func (s *server) apiTake(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) apiRelease(w http.ResponseWriter, r *http.Request) {
-	j, err := s.store.Release(r.PathValue("id"), principalOf(r))
+	j, err := s.store.Release(authzOf(r), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -356,7 +367,7 @@ func (s *server) apiRenew(w http.ResponseWriter, r *http.Request) {
 		Agent string `json:"agent"`
 	}
 	_ = decodeJSON(r, &body)
-	j, err := s.store.Renew(r.PathValue("id"), actor(r, body.Agent))
+	j, err := s.store.Renew(authzOf(r), r.PathValue("id"), actor(r, body.Agent))
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -373,7 +384,7 @@ func (s *server) apiNote(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Note(r.PathValue("id"), actor(r, body.Agent), body.Text)
+	j, err := s.store.Note(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.Text)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -390,7 +401,7 @@ func (s *server) apiAsk(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Ask(r.PathValue("id"), actor(r, body.Agent), body.Question)
+	j, err := s.store.Ask(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.Question)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -406,7 +417,7 @@ func (s *server) apiAnswer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Answer(r.PathValue("id"), principalOf(r), body.Text)
+	j, err := s.store.Answer(authzOf(r), r.PathValue("id"), body.Text)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -423,7 +434,7 @@ func (s *server) apiDone(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Done(r.PathValue("id"), actor(r, body.Agent), body.Proof)
+	j, err := s.store.Done(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.Proof)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -436,7 +447,7 @@ func (s *server) apiAbandon(w http.ResponseWriter, r *http.Request) {
 		Agent string `json:"agent"`
 	}
 	_ = decodeJSON(r, &body)
-	j, err := s.store.Abandon(r.PathValue("id"), actor(r, body.Agent))
+	j, err := s.store.Abandon(authzOf(r), r.PathValue("id"), actor(r, body.Agent))
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -445,7 +456,7 @@ func (s *server) apiAbandon(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) apiReopen(w http.ResponseWriter, r *http.Request) {
-	j, err := s.store.Reopen(r.PathValue("id"), principalOf(r))
+	j, err := s.store.Reopen(authzOf(r), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -486,6 +497,8 @@ func statusOf(err error) int {
 		return 404
 	case "unauthenticated":
 		return 401
+	case "missing_capability", "repo_scope":
+		return 403
 	case "exists":
 		return 409
 	case "empty_spec", "blocked", "waiting", "held", "already_holding", "terminal", "not_holder", "not_waiting", "empty_proof":
@@ -657,6 +670,7 @@ button.textish {
     <a href="/new">New</a>
     <form method="post" action="/logout" style="display:inline"><button type="submit" class="textish">sign out</button></form>
   </nav>
+  {{if .Authz}}<p class="muted id">{{.Authz.ID}}: {{if .Authz.Report}}report{{end}}{{if .Authz.Promote}} promote{{end}}{{if .Authz.Repo}} @{{.Authz.Repo}}{{end}}</p>{{end}}
 </header>
 {{end}}
 
@@ -733,6 +747,8 @@ button.textish {
 </p>
 <h2>{{.Title}}</h2>
 {{if .Repo}}<p class="muted id">{{.Repo}}</p>{{end}}
+{{if .CreatedBy}}<p class="muted">Filed by <span class="id">{{.CreatedBy}}</span></p>{{end}}
+{{if .PromotedBy}}<p class="muted">Promoted by <span class="id">{{.PromotedBy}}</span>{{if .PromotedAt}} {{.PromotedAt.UTC.Format "2006-01-02 15:04Z"}}{{end}}</p>{{end}}
 {{if .BlockedBy}}<p class="id">blocked_by {{join .BlockedBy ", "}}</p>{{end}}
 {{if .Derived.Live}}<p>Held by <span class="id">{{.Lease.Agent}}</span></p>{{end}}
 {{if .Ask}}<p class="wait">Ask from <span class="id">{{.Ask.By}}</span>: {{.Ask.Question}}</p>{{end}}

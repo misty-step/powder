@@ -15,11 +15,13 @@ import (
 )
 
 type harness struct {
-	t     *testing.T
-	store *Store
-	srv   *httptest.Server
-	key   string
-	now   time.Time
+	t       *testing.T
+	store   *Store
+	srv     *httptest.Server
+	key     string
+	authz   authz
+	secrets map[string]string
+	now     time.Time
 }
 
 func newHarness(t *testing.T) *harness {
@@ -40,6 +42,8 @@ func newHarness(t *testing.T) *harness {
 	}
 	h.store = st
 	h.key = secret
+	h.authz = fullAuthz(id)
+	h.secrets = map[string]string{id: secret}
 	h.srv = httptest.NewServer(newServer(st, "api-key").handler())
 	t.Cleanup(h.srv.Close)
 	return h
@@ -52,6 +56,15 @@ func (h *harness) fatal(err error) {
 
 func (h *harness) do(method, path string, body any) (int, json.RawMessage) {
 	h.t.Helper()
+	return h.doAuth(h.authz, method, path, body)
+}
+
+func (h *harness) doAuth(a authz, method, path string, body any) (int, json.RawMessage) {
+	h.t.Helper()
+	secret, ok := h.secrets[a.ID]
+	if !ok {
+		h.t.Fatalf("no secret for principal %s", a.ID)
+	}
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -67,7 +80,7 @@ func (h *harness) do(method, path string, body any) (int, json.RawMessage) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+h.key)
+	req.Header.Set("Authorization", "Bearer "+secret)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.fatal(err)
@@ -511,7 +524,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	repo := "new/repo"
-	j, err := h.store.Patch("p", "ag", nil, nil, &repo, false, nil)
+	j, err := h.store.Patch(h.authz, "p", "ag", nil, nil, &repo, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +535,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 		t.Fatalf("omit blockers: %v", j.BlockedBy)
 	}
 
-	j, err = h.store.Patch("p", "ag", nil, nil, nil, true, nil)
+	j, err = h.store.Patch(h.authz, "p", "ag", nil, nil, nil, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +544,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	title := "q"
-	j, err = h.store.Patch("p", "ag", &title, nil, nil, false, nil)
+	j, err = h.store.Patch(h.authz, "p", "ag", &title, nil, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,7 +553,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	blocks := []string{"blk"}
-	j, err = h.store.Patch("p", "ag", nil, nil, nil, false, &blocks)
+	j, err = h.store.Patch(h.authz, "p", "ag", nil, nil, nil, false, &blocks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +562,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	empty := []string{}
-	j, err = h.store.Patch("p", "ag", nil, nil, nil, false, &empty)
+	j, err = h.store.Patch(h.authz, "p", "ag", nil, nil, nil, false, &empty)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,7 +604,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 func TestEmptyRepoIsNull(t *testing.T) {
 	h := newHarness(t)
 	empty := ""
-	j, err := h.store.Create("e", "e", "s", &empty, nil)
+	j, err := h.store.Create(h.authz, "e", "e", "s", &empty, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,10 +612,10 @@ func TestEmptyRepoIsNull(t *testing.T) {
 		t.Fatalf("create empty repo: %#v", j.Repo)
 	}
 	repo := "x/y"
-	if _, err := h.store.Patch("e", "ag", nil, nil, &repo, false, nil); err != nil {
+	if _, err := h.store.Patch(h.authz, "e", "ag", nil, nil, &repo, false, nil); err != nil {
 		t.Fatal(err)
 	}
-	j, err = h.store.Patch("e", "ag", nil, nil, &empty, false, nil)
+	j, err = h.store.Patch(h.authz, "e", "ag", nil, nil, &empty, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
