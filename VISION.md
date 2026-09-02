@@ -19,6 +19,10 @@ Job
   proof         null | string
   abandoned     bool
   notes         []{ at, by, text }
+  created_by    null | principal id   # immutable creator
+  promoted_by   null | principal id   # immutable first promoter
+  promoted_at   null | timestamp      # first promotion time
+  promotions    []{ at, by, spec }    # auditable spec-write history
 ```
 
 Derived, never stored:
@@ -34,6 +38,20 @@ Missing blocker → not takeable. A cycle of non-terminal jobs is not
 takeable because no member is terminal.
 
 Invariant: **`terminal ⇒ ¬live`**.
+
+## Authority
+
+API keys carry repository-scoped capabilities:
+
+- `report`: create a job with an empty spec and add notes in the key's
+  repository.
+- `promote`: create or set a nonempty spec in the key's repository and
+  perform lifecycle work.
+
+A key is scoped to one exact repository, or to every repository when its
+scope is null. Existing keys predate capability enforcement and migrate to
+report+promote over every repository. New keys are fail-closed and require
+explicit capabilities. Existing jobs migrate with null provenance.
 
 ## Take
 
@@ -53,8 +71,14 @@ Atomic. If you already hold `id`, return it.
 - `ask` releases the lease.
 - `done` and `abandon` clear lease and ask.
 - `done` / `abandon` / `ask` / `take` on a terminal job fail `terminal`.
-- Field edits: holder, or anyone if not live.
-- Anyone may `release` or `answer`.
+- Field edits (`set-title`, `set-spec`, `set-repo`, `set-blockers`)
+  require `promote` capability in the job's repository.
+- `note` requires `report` capability in the job's repository.
+- Lifecycle verbs (`take`, `renew`, `release`, `ask`, `answer`, `done`,
+  `abandon`, `reopen`) require `promote` capability in the job's
+  repository.
+- Creating a job with a nonempty spec is promotion and requires `promote`;
+  creating an empty-spec draft requires `report` or `promote`.
 - One live lease per agent. Default TTL 4h. No heartbeat.
 
 ## Faces

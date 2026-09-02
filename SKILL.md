@@ -56,6 +56,16 @@ The `code` is the reason: `empty_spec` `blocked` `waiting` `held`
 
 If you already hold `id`, `take` returns it.
 
+## Authority
+
+API keys carry repository-scoped capabilities. `report` may create an
+empty-spec draft and add notes in its repository. `promote` may create or
+set a nonempty spec and perform lifecycle work in its repository. A key with
+no repository scope may act on every repository. `show` prints `created_by`,
+`promoted_by`, and `promoted_at` when they are set; it never prints key
+material. Authorization failures return `missing_capability` (the key lacks
+the capability) or `repo_scope` (the key is scoped to another repository).
+
 ## Verbs
 
 ```
