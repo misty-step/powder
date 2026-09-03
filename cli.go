@@ -60,6 +60,8 @@ var commands = []command{
 	{name: "set-spec", help: "powder set-spec ID --spec SPEC [--agent AGENT]", run: runSetSpec},
 	{name: "set-repo", help: "powder set-repo ID [--repo REPO|--clear] [--agent AGENT]", run: runSetRepo},
 	{name: "set-blockers", help: "powder set-blockers ID [--blocked-by a,b|--clear] [--agent AGENT]", run: runSetBlockers},
+	{name: "use", help: "powder use URL [--agent AGENT]", run: runUse},
+	{name: "doctor", help: "powder doctor [--agent AGENT]", run: runDoctor},
 	{name: "version", help: "powder version", run: func(_ *flagset) int { fmt.Println(versionLine()); return 0 }},
 	{name: "skill", help: "powder skill", run: func(_ *flagset) int { fmt.Print(skillMD); return 0 }},
 }
@@ -87,19 +89,17 @@ func usageBanner() string {
 	for _, c := range cmdOrder {
 		fmt.Fprintf(&b, "  %s\n", cmdHelp[c])
 	}
-	b.WriteString("\nEnvironment: POWDER_URL or POWDER_API_BASE_URL; POWDER_API_KEY; POWDER_AGENT\n")
-	b.WriteString("JSON on stdout. list/show --plain for text. Errors are JSON on stderr with a code.\n")
+	b.WriteString("\nEnvironment: POWDER_URL; POWDER_API_KEY\n")
+	b.WriteString("Client config: ~/.config/powder/config. JSON on stdout. list/show --plain for text. Errors are JSON on stderr with a code.\n")
 	return b.String()
 }
 
 func wantHelp(f *flagset) bool  { return f.bit("help") || f.bit("h") }
 func wantPlain(f *flagset) bool { return f.bit("plain") }
 
-func agentOf(f *flagset) string {
-	if v := f.str("agent"); v != "" {
-		return v
-	}
-	return os.Getenv("POWDER_AGENT")
+func agentOf(f *flagset) (string, error) {
+	agent, _, err := resolveAgent(f.str("agent"))
+	return agent, err
 }
 
 type flagset struct {
@@ -154,18 +154,15 @@ func (f *flagset) id() (string, error) {
 }
 
 func baseURL() (string, error) {
-	for _, k := range []string{"POWDER_URL", "POWDER_API_BASE_URL"} {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return strings.TrimRight(v, "/"), nil
-		}
+	cfg, err := resolveConnection(true)
+	if err != nil {
+		return "", err
 	}
-	return "", errf("no_origin", "set POWDER_URL or POWDER_API_BASE_URL")
+	return cfg.URL, nil
 }
 
-func apiKey() string { return os.Getenv("POWDER_API_KEY") }
-
 func doJSON(method, path string, body any) (int, []byte, error) {
-	origin, err := baseURL()
+	cfg, err := resolveConnection(true)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -177,17 +174,17 @@ func doJSON(method, path string, body any) (int, []byte, error) {
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, origin+path, rdr)
+	req, err := http.NewRequest(method, cfg.URL+path, rdr)
 	if err != nil {
 		return 0, nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if k := apiKey(); k != "" {
-		req.Header.Set("Authorization", "Bearer "+k)
+	if cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -411,7 +408,10 @@ func runTake(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	agent := agentOf(f)
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
 	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/take", map[string]any{"agent": agent})
 	if err != nil {
 		return fail(err)
@@ -436,7 +436,11 @@ func runRenew(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/renew", map[string]any{"agent": agentOf(f)})
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/renew", map[string]any{"agent": agent})
 	if err != nil {
 		return fail(err)
 	}
@@ -448,8 +452,12 @@ func runNote(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
 	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/note", map[string]any{
-		"agent": agentOf(f), "text": f.str("text"),
+		"agent": agent, "text": f.str("text"),
 	})
 	if err != nil {
 		return fail(err)
@@ -462,8 +470,12 @@ func runAsk(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
 	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/ask", map[string]any{
-		"agent": agentOf(f), "question": f.str("question"),
+		"agent": agent, "question": f.str("question"),
 	})
 	if err != nil {
 		return fail(err)
@@ -488,8 +500,12 @@ func runDone(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
 	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/done", map[string]any{
-		"agent": agentOf(f), "proof": f.str("proof"),
+		"agent": agent, "proof": f.str("proof"),
 	})
 	if err != nil {
 		return fail(err)
@@ -502,7 +518,11 @@ func runAbandon(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/abandon", map[string]any{"agent": agentOf(f)})
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/abandon", map[string]any{"agent": agent})
 	if err != nil {
 		return fail(err)
 	}
@@ -526,9 +546,13 @@ func runSetTitle(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
 	title := f.str("title")
 	st, b, err := doJSON("PATCH", "/api/jobs/"+url.PathEscape(id), map[string]any{
-		"agent": agentOf(f), "title": title,
+		"agent": agent, "title": title,
 	})
 	if err != nil {
 		return fail(err)
@@ -541,9 +565,13 @@ func runSetSpec(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
 	spec := f.str("spec")
 	st, b, err := doJSON("PATCH", "/api/jobs/"+url.PathEscape(id), map[string]any{
-		"agent": agentOf(f), "spec": spec,
+		"agent": agent, "spec": spec,
 	})
 	if err != nil {
 		return fail(err)
@@ -559,7 +587,11 @@ func runSetRepo(f *flagset) int {
 	if !f.bit("clear") && f.str("repo") == "" {
 		return fail(errf("usage", "set-repo requires --repo or --clear"))
 	}
-	body := map[string]any{"agent": agentOf(f)}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
+	body := map[string]any{"agent": agent}
 	if f.bit("clear") {
 		body["clear_repo"] = true
 	} else {
@@ -581,12 +613,16 @@ func runSetBlockers(f *flagset) int {
 	if !f.bit("clear") && f.str("blocked-by") == "" {
 		return fail(errf("usage", "set-blockers requires --blocked-by or --clear"))
 	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
 	var blocked []string
 	if !f.bit("clear") {
 		blocked = splitCSV(f.str("blocked-by"))
 	}
 	st, b, err := doJSON("PATCH", "/api/jobs/"+url.PathEscape(id), map[string]any{
-		"agent": agentOf(f), "blocked_by": blocked, "set_blockers": true,
+		"agent": agent, "blocked_by": blocked, "set_blockers": true,
 	})
 	if err != nil {
 		return fail(err)

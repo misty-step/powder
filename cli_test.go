@@ -125,42 +125,48 @@ func TestCommandsRegistryIntegrity(t *testing.T) {
 }
 
 func TestAgentOf(t *testing.T) {
-	t.Setenv("POWDER_AGENT", "from-env")
-	f := newFlagset(nil)
-	if got := agentOf(f); got != "from-env" {
-		t.Fatalf("env: %q", got)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("POWDER_AGENT", "worker-environment")
+	got, err := agentOf(newFlagset(nil))
+	if err != nil || got != "worker-environment" {
+		t.Fatalf("environment: %q %v", got, err)
 	}
-	f = newFlagset([]string{"--agent", "flag"})
-	if got := agentOf(f); got != "flag" {
-		t.Fatalf("flag: %q", got)
+	got, err = agentOf(newFlagset([]string{"--agent", "worker-2"}))
+	if err != nil || got != "worker-2" {
+		t.Fatalf("flag: %q %v", got, err)
 	}
 }
 
-func TestBaseURLPrefersPowderURL(t *testing.T) {
+func TestBaseURLUsesPowderURL(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("POWDER_URL", "http://explicit.example")
-	t.Setenv("POWDER_API_BASE_URL", "http://legacy.example")
 	got, err := baseURL()
 	if err != nil || got != "http://explicit.example" {
 		t.Fatalf("got %q %v", got, err)
 	}
 }
 
-func TestBaseURLFallsBackToAPIBase(t *testing.T) {
+func TestBaseURLIgnoresRetiredAPIBase(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("POWDER_URL", "")
-	t.Setenv("POWDER_API_BASE_URL", "http://legacy.example")
-	got, err := baseURL()
-	if err != nil || got != "http://legacy.example" {
-		t.Fatalf("got %q %v", got, err)
-	}
-}
-
-func TestBaseURLRequiresOrigin(t *testing.T) {
-	t.Setenv("POWDER_URL", "")
-	t.Setenv("POWDER_API_BASE_URL", "")
+	t.Setenv("POWDER_API_BASE_URL", "http://retired.example")
 	_, err := baseURL()
 	ce, ok := err.(*CodeError)
 	if !ok || ce.Code != "no_origin" {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestBaseURLRequiresOrigin(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("POWDER_URL", "")
+	_, err := baseURL()
+	ce, ok := err.(*CodeError)
+	if !ok || ce.Code != "no_origin" {
+		t.Fatalf("got %v", err)
+	}
+	if !strings.Contains(ce.Message, "powder use") {
+		t.Fatalf("missing setup action: %q", ce.Message)
 	}
 }
 
@@ -182,8 +188,7 @@ func TestEmbeddedSkillMatchesFile(t *testing.T) {
 }
 
 func TestSetRepoNoFlagsUsage(t *testing.T) {
-	t.Setenv("POWDER_URL", "")
-	t.Setenv("POWDER_API_BASE_URL", "")
+	isolatedClientEnv(t)
 	code, stderr := runCLI(t, []string{"set-repo", "foo"})
 	if code != 1 {
 		t.Fatalf("exit %d", code)
@@ -194,8 +199,7 @@ func TestSetRepoNoFlagsUsage(t *testing.T) {
 }
 
 func TestSetBlockersNoFlagsUsage(t *testing.T) {
-	t.Setenv("POWDER_URL", "")
-	t.Setenv("POWDER_API_BASE_URL", "")
+	isolatedClientEnv(t)
 	code, stderr := runCLI(t, []string{"set-blockers", "foo"})
 	if code != 1 {
 		t.Fatalf("exit %d", code)
@@ -206,8 +210,7 @@ func TestSetBlockersNoFlagsUsage(t *testing.T) {
 }
 
 func TestSetRepoClearReachesOrigin(t *testing.T) {
-	t.Setenv("POWDER_URL", "")
-	t.Setenv("POWDER_API_BASE_URL", "")
+	isolatedClientEnv(t)
 	code, stderr := runCLI(t, []string{"set-repo", "foo", "--clear"})
 	if code != 1 {
 		t.Fatalf("exit %d", code)
@@ -218,8 +221,7 @@ func TestSetRepoClearReachesOrigin(t *testing.T) {
 }
 
 func TestSetBlockersValueReachesOrigin(t *testing.T) {
-	t.Setenv("POWDER_URL", "")
-	t.Setenv("POWDER_API_BASE_URL", "")
+	isolatedClientEnv(t)
 	code, stderr := runCLI(t, []string{"set-blockers", "foo", "--blocked-by", "a"})
 	if code != 1 {
 		t.Fatalf("exit %d", code)
