@@ -67,6 +67,7 @@ Atomic. If you already hold `id`, return it.
 
 `create` `show` `list` `take` `release` `renew` `note` `ask` `answer`
 `done` `abandon` `reopen` `set-title` `set-spec` `set-repo` `set-blockers`
+`use` `doctor`
 
 - `ask` releases the lease.
 - `done` and `abandon` clear lease and ask.
@@ -79,14 +80,21 @@ Atomic. If you already hold `id`, return it.
   repository.
 - Creating a job with a nonempty spec is promotion and requires `promote`;
   creating an empty-spec draft requires `report` or `promote`.
-- One live lease per agent. Default TTL 4h. No heartbeat.
+- One live lease per holder identity. Default TTL 4h. No heartbeat.
+- The CLI resolves the holder from `--agent`, `POWDER_AGENT`, config `agent`,
+  then `user@host`. `POWDER_AGENT` is workload identity; `POWDER_API_KEY` is
+  transport authentication. The default is machine-global across repositories;
+  parallel workers use distinct holders and subagents inherit their parent's
+  holder.
 
 ## Faces
 
-One Go binary. `powder serve` plus HTTP CLI. Origin is `POWDER_URL` or
-`POWDER_API_BASE_URL`. No `--db` on the client. Peek UI is SSR HTML:
-list, show, create, answer, release. Auth is `api-key`, or `none` on
-loopback.
+One Go binary. `powder serve` plus HTTP CLI. The client origin is explicit:
+`POWDER_URL` overrides `~/.config/powder/config`; there is no default origin or
+local-ledger fallback. `powder use <url>` writes the config and `powder doctor`
+shows the resolved connection without exposing key material. No `--db` on the
+client. Peek UI is SSR HTML: list, show, create, answer, release. Auth is
+`api-key`, or `none` on loopback.
 
 ## Non-goals
 

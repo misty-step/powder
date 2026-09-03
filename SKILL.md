@@ -14,12 +14,21 @@ Powder stores jobs. Take one. Finish it. Write proof.
 Use Powder when work must be exclusive across agents: the next takeable
 job, a known job id, an operator question, or a completion.
 
-## Origin
+## Client
 
-The CLI is an HTTP client of the deployed instance.
+The CLI is an HTTP client of one explicitly configured instance. Run
+`powder use <url>` once to write `~/.config/powder/config`, or set
+`POWDER_URL`. Environment wins over the config file. There is no default
+origin or local-ledger fallback.
 
-Origin is `POWDER_URL`, else `POWDER_API_BASE_URL`. Identity is
-`POWDER_AGENT`. `--agent` wins.
+The holder identity is `--agent`, then the `POWDER_AGENT` workload identity,
+then config `agent`, then `user@host`. `POWDER_AGENT` is distinct from the
+shared `POWDER_API_KEY` transport credential. The default permits one live
+lease across all repositories for that user and host. Parallel workers use
+distinct holders. Subagents inherit the parent's holder.
+
+`powder doctor` prints the resolved origin and holder sources, key presence,
+and live health/readiness without printing key material.
 
 `powder <command> --help` is flag truth. JSON on stdout. `list --plain`
 and `show --plain` print text. Errors are JSON on stderr with `code`.
@@ -71,6 +80,8 @@ the capability) or `repo_scope` (the key is scoped to another repository).
 ```
 powder serve
 powder version
+powder use <url>
+powder doctor
 powder skill
 powder list --takeable
 powder show <id>

@@ -10,14 +10,16 @@ description: >
 
 Powder stores jobs. Take one. Finish it. Write proof.
 
-## Origin
+## Client contract
 
-Origin is `POWDER_URL`, else `POWDER_API_BASE_URL`. Identity is
-`POWDER_AGENT`. `--agent` wins. JSON on stdout. Errors are JSON on
-stderr with `code`.
+Origin resolves from `POWDER_URL`, then `~/.config/powder/config`; there is no
+default. The approved runtime environment must set `POWDER_AGENT` to the exact
+canonical holder `forest-misty-step/powder`. This workload identity is distinct
+from the shared `POWDER_API_KEY` transport credential.
 
-If `POWDER_AGENT` is unset, do not call Powder. GitHub Issues remain
-the Tracker.
+Require `POWDER_AGENT=forest-misty-step/powder`, then run
+`powder doctor --agent "$POWDER_AGENT"` before selection. If either check fails,
+do not call Powder. GitHub Issues remain the Tracker.
 
 ## Factory loop
 
@@ -27,7 +29,7 @@ the Tracker.
 2. `powder list --takeable --repo <forest.yaml repo>`
 3. `powder show <id>`
    The spec is the work. Empty spec is not takeable.
-4. `powder take <id>`
+4. `powder take <id> --agent "$POWDER_AGENT"`
    Do this before creating a branch. `already_holding` means finish or ask;
    release only a failed or unpublished Builder attempt. Keep a published
    Subject held for the Kernel completion loop.
@@ -39,7 +41,8 @@ the Tracker.
    Git-landed Subject only when request evidence has `tracker: powder`, using
    the approved Revision as proof.
 
-One live lease per agent. Use one `POWDER_AGENT` per Kernel.
+One live lease per holder. Every managed worker and the Kernel inherit the
+approved `POWDER_AGENT`; they do not mint task identities.
 
 ## Verbs
 

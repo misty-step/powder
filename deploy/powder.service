@@ -1,0 +1,41 @@
+[Unit]
+Description=Powder exclusive-work ledger
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=powder
+Group=powder
+WorkingDirectory=/var/lib/powder
+EnvironmentFile=/etc/powder/powder.env
+ExecStart=/usr/local/bin/powder serve
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+UMask=0077
+
+# The service has no write access outside its declared state directory.
+StateDirectory=powder
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/powder
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
