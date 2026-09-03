@@ -137,28 +137,35 @@ func validateOrigin(raw string) (string, error) {
 }
 
 func resolveConnection(requireOrigin bool) (resolvedClientConfig, error) {
-	file, err := readClientFileConfig()
-	if err != nil {
-		return resolvedClientConfig{}, err
-	}
 	var cfg resolvedClientConfig
 	if value := strings.TrimSpace(os.Getenv("POWDER_URL")); value != "" {
 		cfg.URL, cfg.URLSource = value, "environment"
-	} else if value := strings.TrimSpace(file.URL); value != "" {
-		cfg.URL, cfg.URLSource = value, "config"
-	}
-	if cfg.URL != "" {
-		cfg.URL, err = validateOrigin(cfg.URL)
-		if err != nil {
-			return resolvedClientConfig{}, err
-		}
-	} else if requireOrigin {
-		return resolvedClientConfig{}, errf("no_origin", "run powder use <url> or set POWDER_URL")
 	}
 	if value := strings.TrimSpace(os.Getenv("POWDER_API_KEY")); value != "" {
 		cfg.APIKey, cfg.APIKeySource = value, "environment"
-	} else if file.APIKey != "" {
-		cfg.APIKey, cfg.APIKeySource = file.APIKey, "config"
+	}
+	if cfg.URL == "" || cfg.APIKey == "" {
+		file, err := readClientFileConfig()
+		if err != nil {
+			return resolvedClientConfig{}, err
+		}
+		if cfg.URL == "" {
+			if value := strings.TrimSpace(file.URL); value != "" {
+				cfg.URL, cfg.URLSource = value, "config"
+			}
+		}
+		if cfg.APIKey == "" && file.APIKey != "" {
+			cfg.APIKey, cfg.APIKeySource = file.APIKey, "config"
+		}
+	}
+	if cfg.URL != "" {
+		origin, err := validateOrigin(cfg.URL)
+		if err != nil {
+			return resolvedClientConfig{}, err
+		}
+		cfg.URL = origin
+	} else if requireOrigin {
+		return resolvedClientConfig{}, errf("no_origin", "run powder use <url> or set POWDER_URL")
 	}
 	return cfg, nil
 }

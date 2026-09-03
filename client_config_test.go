@@ -81,6 +81,21 @@ func TestAgentEnvironmentDoesNotReadLowerPrecedenceConfig(t *testing.T) {
 		t.Fatalf("environment agent = %q from %q: %v", agent, source, err)
 	}
 }
+func TestConnectionEnvironmentDoesNotReadLowerPrecedenceConfig(t *testing.T) {
+	path := isolatedClientEnv(t)
+	writeTestClientConfig(t, path, "url=https://stale.example\n", 0o644)
+	t.Setenv("POWDER_URL", "https://environment.example")
+	t.Setenv("POWDER_API_KEY", "environment-key")
+
+	cfg, err := resolveConnection(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.URL != "https://environment.example" || cfg.URLSource != "environment" ||
+		cfg.APIKey != "environment-key" || cfg.APIKeySource != "environment" {
+		t.Fatalf("connection = %+v", cfg)
+	}
+}
 
 func TestClientConfigRejectsUnsafeOrMalformedFile(t *testing.T) {
 	for _, test := range []struct {
