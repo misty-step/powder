@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -54,31 +56,33 @@ func saveClaimToken(origin, jobID, token string) error {
 	if err := ensurePrivateClaimDir(parent); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(parent, ".claim-*")
-	if err != nil {
-		return errf("claim_state", "create claim state: %s", err)
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(claimStateFileMode); err != nil {
-		tmp.Close()
-		return errf("claim_state", "protect claim state: %s", err)
-	}
-	if _, err := io.WriteString(tmp, token); err != nil {
-		tmp.Close()
-		return errf("claim_state", "write claim state: %s", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return errf("claim_state", "sync claim state: %s", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return errf("claim_state", "close claim state: %s", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return errf("claim_state", "replace claim state: %s", err)
-	}
-	return nil
+	return withClaimLock(parent, func() error {
+		tmp, err := os.CreateTemp(parent, ".claim-*")
+		if err != nil {
+			return errf("claim_state", "create claim state: %s", err)
+		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+		if err := tmp.Chmod(claimStateFileMode); err != nil {
+			tmp.Close()
+			return errf("claim_state", "protect claim state: %s", err)
+		}
+		if _, err := io.WriteString(tmp, token); err != nil {
+			tmp.Close()
+			return errf("claim_state", "write claim state: %s", err)
+		}
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			return errf("claim_state", "sync claim state: %s", err)
+		}
+		if err := tmp.Close(); err != nil {
+			return errf("claim_state", "close claim state: %s", err)
+		}
+		if err := os.Rename(tmpPath, path); err != nil {
+			return errf("claim_state", "replace claim state: %s", err)
+		}
+		return syncClaimDir(parent)
+	})
 }
 
 func loadClaimToken(origin, jobID string) (string, error) {
@@ -128,13 +132,59 @@ func readClaimToken(path, jobID string, required bool) (string, error) {
 	return token, nil
 }
 
-func deleteClaimToken(origin, jobID string) error {
+func deleteClaimTokenIfMatches(origin, jobID, token string) error {
 	path, err := claimStatePath(origin, jobID)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return errf("claim_state", "delete claim state: %s", err)
+	parent := filepath.Dir(path)
+	if _, err := os.Stat(parent); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return errf("claim_state", "stat claim state directory: %s", err)
+	}
+	if err := ensurePrivateClaimDir(parent); err != nil {
+		return err
+	}
+	return withClaimLock(parent, func() error {
+		current, err := readClaimToken(path, jobID, false)
+		if err != nil {
+			return err
+		}
+		if !keyEqual([]byte(current), []byte(token)) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return errf("claim_state", "delete claim state: %s", err)
+		}
+		return syncClaimDir(parent)
+	})
+}
+
+func withClaimLock(parent string, fn func() error) error {
+	lock, err := os.OpenFile(filepath.Join(parent, ".lock"), os.O_CREATE|os.O_RDWR, claimStateFileMode)
+	if err != nil {
+		return errf("claim_state", "open claim state lock: %s", err)
+	}
+	defer lock.Close()
+	if err := lock.Chmod(claimStateFileMode); err != nil {
+		return errf("claim_state", "protect claim state lock: %s", err)
+	}
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return errf("claim_state", "lock claim state: %s", err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	return fn()
+}
+
+func syncClaimDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return errf("claim_state", "open claim state directory: %s", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return errf("claim_state", "sync claim state directory: %s", err)
 	}
 	return nil
 }

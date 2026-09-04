@@ -203,11 +203,6 @@ func doJSONWithConfig(cfg resolvedClientConfig, method, path string, body any) (
 	return res.StatusCode, b, err
 }
 
-type takeResponse struct {
-	Job
-	ClaimToken string `json:"claim_token"`
-}
-
 func claimForJob(jobID string, required bool) (resolvedClientConfig, string, error) {
 	cfg, err := resolveConnection(true)
 	if err != nil {
@@ -238,9 +233,9 @@ func successfulHTTP(status int) bool {
 	return status >= 200 && status < 300
 }
 
-func emitClaimResult(status int, raw []byte, origin, jobID string, cleanup bool) int {
+func emitClaimResult(status int, raw []byte, origin, jobID, claimToken string, cleanup bool) int {
 	if cleanup && successfulHTTP(status) {
-		if err := deleteClaimToken(origin, jobID); err != nil {
+		if err := deleteClaimTokenIfMatches(origin, jobID, claimToken); err != nil {
 			return fail(err)
 		}
 	}
@@ -251,7 +246,7 @@ func emitTakeResult(status int, raw []byte, cfg resolvedClientConfig, jobID stri
 	if !successfulHTTP(status) {
 		return emit(status, raw)
 	}
-	var response takeResponse
+	var response TakeResult
 	if err := json.Unmarshal(raw, &response); err != nil {
 		return fail(errf("decode", "take response: %s", err))
 	}
@@ -315,7 +310,7 @@ func runRelease(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	return emitClaimResult(st, b, cfg.URL, id, true)
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
 }
 
 func runRenew(f *flagset) int {
@@ -335,7 +330,7 @@ func runRenew(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	return emitClaimResult(st, b, cfg.URL, id, false)
+	return emitClaimResult(st, b, cfg.URL, id, token, false)
 }
 
 func redactClaimTokens(raw []byte) []byte {
@@ -628,7 +623,7 @@ func runAsk(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	return emitClaimResult(st, b, cfg.URL, id, true)
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
 }
 
 func runDone(f *flagset) int {
@@ -650,7 +645,7 @@ func runDone(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	return emitClaimResult(st, b, cfg.URL, id, true)
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
 }
 
 func runAbandon(f *flagset) int {
@@ -670,7 +665,7 @@ func runAbandon(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	return emitClaimResult(st, b, cfg.URL, id, true)
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
 }
 
 func runSetTitle(f *flagset) int {

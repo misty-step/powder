@@ -131,7 +131,7 @@ func parseConfigValue(value string) (string, error) {
 func validateOrigin(raw string) (string, error) {
 	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
 	u, err := url.Parse(raw)
-	if err != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") || u.Host == "" || u.Path != "" || u.RawPath != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") || u.Host == "" || u.Hostname() == "" || u.Path != "" || u.RawPath != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "", errf("invalid_origin", "origin must be an http(s) URL without a path, credentials, query, or fragment")
 	}
 	u.Scheme = strings.ToLower(u.Scheme)

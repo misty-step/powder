@@ -46,11 +46,13 @@ ask, done, or abandon.
    Issues remain the Tracker.
 2. When Powder is available and the label is set, run
    `powder list --mine "$POWDER_AGENT" --repo <forest.yaml repo>`. Treat
-   `--mine` as an audit-label filter, not authorization. For any live job in
-   this repository whose `git ls-remote origin 'refs/heads/forest/<id>/*'` is
-   empty, resume by job id using the CLI's private claim. Multiple such jobs
-   may exist under one label. If a held job is outside the `scope.subjects`
-   allowlist, stop cleanly and name it; do not work it or release it.
+   `--mine` as an audit-label filter, not resumable authority. A live candidate
+   is resumable only when `powder take <id> [--agent "$POWDER_AGENT"]` succeeds
+   with the private claim stored for this origin and job id, and
+   `git ls-remote origin 'refs/heads/forest/<id>/*'` is empty. When the label is
+   unset, attempt resumption only for a job id supplied by the managed run or
+   current branch. If a candidate is outside `scope.subjects`, stop cleanly and
+   name it; do not work it or release it.
 3. If you are not continuing a held job, list takeable Powder jobs with
    `powder list --takeable --repo <repo>` when Powder is available, and list
    open GitHub Issues with the `forest:ready` label.

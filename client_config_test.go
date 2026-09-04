@@ -122,7 +122,7 @@ func TestClientConfigRejectsUnsafeOrMalformedFile(t *testing.T) {
 
 func TestClientConfigRejectsInvalidOrigin(t *testing.T) {
 	isolatedClientEnv(t)
-	for _, raw := range []string{"powder.example", "file:///tmp/powder.db", "http://powder.example", "https://user:pass@powder.example", "https://powder.example/api", "https://powder.example?other=1"} {
+	for _, raw := range []string{"powder.example", "file:///tmp/powder.db", "http://powder.example", "https://:80", "https://user:pass@powder.example", "https://powder.example/api", "https://powder.example?", "https://powder.example?other=1"} {
 		if _, err := validateOrigin(raw); err == nil {
 			t.Fatalf("accepted %q", raw)
 		}

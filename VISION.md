@@ -57,9 +57,9 @@ explicit capabilities. Existing jobs migrate with null provenance.
 ## Take
 
 ```
-take(id, audit_label, claim_token) succeeds iff
-  (job is live and claim_token matches) or
-  job is takeable
+take(authz, id, audit_label, claim_token) succeeds iff
+  authz has promote capability for the job repository and
+  ((job is live and claim_token matches) or job is takeable)
 ```
 
 Atomic. `POST /api/v2/jobs/{id}/take` returns a flat JSON Job plus

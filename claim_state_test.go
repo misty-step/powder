@@ -70,10 +70,10 @@ func TestCliTakeStoresClaimAndRedactsResponse(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v2/jobs/job-1/take" {
-			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-			t.Fatalf("request body: %v", err)
+			t.Errorf("request body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"id":"job-1","title":"job title","spec":"work","claim_token":"`+token+`"}`)
@@ -203,19 +203,19 @@ func TestCliTakeReleasesClaimWhenLocalPersistenceFails(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v2/jobs/job-1/take":
 			if err := os.RemoveAll(stateDir); err != nil {
-				t.Fatalf("remove claim state directory: %v", err)
+				t.Errorf("remove claim state directory: %v", err)
 			}
 			if err := os.WriteFile(stateDir, []byte("occupied"), 0o600); err != nil {
-				t.Fatalf("replace claim state directory: %v", err)
+				t.Errorf("replace claim state directory: %v", err)
 			}
 			io.WriteString(w, `{"id":"job-1","title":"job title","spec":"work","claim_token":"`+token+`"}`)
 		case "/api/jobs/job-1/release":
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatalf("release request body: %v", err)
+				t.Errorf("release request body: %v", err)
 			}
 			if body["claim_token"] != token {
-				t.Fatalf("rollback claim_token = %#v", body["claim_token"])
+				t.Errorf("rollback claim_token = %#v", body["claim_token"])
 			}
 			io.WriteString(w, `{"id":"job-1"}`)
 		default:
@@ -296,12 +296,50 @@ func TestCliLifecycleInjectsAndCleansClaims(t *testing.T) {
 		})
 	}
 }
+
+func TestCliCleanupPreservesReplacementClaim(t *testing.T) {
+	isolatedClaimEnv(t)
+	const (
+		oldToken = "old-opaque-claim"
+		newToken = "new-opaque-claim"
+	)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("request body: %v", err)
+		}
+		if body["claim_token"] != oldToken {
+			t.Errorf("submitted claim = %#v", body["claim_token"])
+		}
+		if err := saveClaimToken(srv.URL, "job-1", newToken); err != nil {
+			t.Errorf("replace claim: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"job-1"}`)
+	}))
+	defer srv.Close()
+	t.Setenv("POWDER_URL", srv.URL)
+	if err := saveClaimToken(srv.URL, "job-1", oldToken); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _ := captureStdout(t, func() int {
+		return cliMain([]string{"release", "job-1"})
+	})
+	if code != 0 {
+		t.Fatalf("release exit %d", code)
+	}
+	if got, err := loadClaimToken(srv.URL, "job-1"); err != nil || got != newToken {
+		t.Fatalf("replacement claim = %q, err=%v", got, err)
+	}
+}
 func TestCliFreeAbandonAllowsMissingClaim(t *testing.T) {
 	isolatedClaimEnv(t)
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("request body: %v", err)
+			t.Errorf("request body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"id":"job-1"}`)
@@ -326,7 +364,7 @@ func TestCliPatchSendsAvailableOrEmptyClaim(t *testing.T) {
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("request body: %v", err)
+			t.Errorf("request body: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"id":"job-1"}`)

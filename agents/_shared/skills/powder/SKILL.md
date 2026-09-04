@@ -42,9 +42,12 @@ done, or abandon.
 
 1. When `POWDER_AGENT` is set, run
    `powder list --mine "$POWDER_AGENT" --repo <forest.yaml repo>`. Treat
-   `--mine` as an audit-label filter, never as ownership. Continue any live
-   job for this repository that has no `forest/<id>/*` branch by its job id;
-   the CLI resumes it with the private claim stored for this origin.
+   `--mine` as an audit-label filter, never as resumable authority. A live
+   candidate is resumable only when `powder take <id> [--agent "$POWDER_AGENT"]`
+   succeeds with the private claim stored for this origin and job id, and no
+   `forest/<id>/*` branch exists. When `POWDER_AGENT` is unset, attempt
+   resumption only for a job id supplied by the managed run or current branch;
+   otherwise continue to takeable selection.
 2. `powder list --takeable --repo <forest.yaml repo>`
 3. `powder show <id>`
    The spec is the work. Empty spec is not takeable. Show never contains a
