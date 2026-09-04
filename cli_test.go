@@ -139,9 +139,9 @@ func TestAgentOf(t *testing.T) {
 
 func TestBaseURLUsesPowderURL(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("POWDER_URL", "http://explicit.example")
+	t.Setenv("POWDER_URL", "https://explicit.example")
 	got, err := baseURL()
-	if err != nil || got != "http://explicit.example" {
+	if err != nil || got != "https://explicit.example" {
 		t.Fatalf("got %q %v", got, err)
 	}
 }

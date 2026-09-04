@@ -122,9 +122,26 @@ func TestClientConfigRejectsUnsafeOrMalformedFile(t *testing.T) {
 
 func TestClientConfigRejectsInvalidOrigin(t *testing.T) {
 	isolatedClientEnv(t)
-	for _, raw := range []string{"powder.example", "file:///tmp/powder.db", "https://user:pass@powder.example", "https://powder.example/api", "https://powder.example?other=1"} {
+	for _, raw := range []string{"powder.example", "file:///tmp/powder.db", "http://powder.example", "https://:80", "https://user:pass@powder.example", "https://powder.example/api", "https://powder.example?", "https://powder.example?other=1"} {
 		if _, err := validateOrigin(raw); err == nil {
 			t.Fatalf("accepted %q", raw)
+		}
+	}
+}
+
+func TestClientConfigCanonicalizesEquivalentOrigins(t *testing.T) {
+	for raw, want := range map[string]string{
+		"HTTPS://POWDER.EXAMPLE:443/": "https://powder.example",
+		"http://LOCALHOST:80":         "http://localhost",
+		"http://127.0.0.1:4000":       "http://127.0.0.1:4000",
+		"http://[::1]:80":             "http://[::1]",
+	} {
+		got, err := validateOrigin(raw)
+		if err != nil {
+			t.Fatalf("validate %q: %v", raw, err)
+		}
+		if got != want {
+			t.Fatalf("validate %q = %q, want %q", raw, got, want)
 		}
 	}
 }

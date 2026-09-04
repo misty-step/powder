@@ -14,7 +14,8 @@ Job
   spec          markdown; empty allowed
   repo          optional exact string
   blocked_by    []id          # direct edges only
-  lease         null | { agent, principal, until }
+  lease         null | { audit_label, until }  # claim token is never stored raw
+  lease_token_hash null | SHA-256(claim_token) # internal persistence
   ask           null | { question, by, at }
   proof         null | string
   abandoned     bool
@@ -56,12 +57,25 @@ explicit capabilities. Existing jobs migrate with null provenance.
 ## Take
 
 ```
-take(id, agent) succeeds iff
-  job is takeable
-  and this agent holds no other live lease
+take(authz, id, audit_label, claim_token) succeeds iff
+  authz has promote capability for the job repository and
+  ((job is live and claim_token matches) or job is takeable)
 ```
 
-Atomic. If you already hold `id`, return it.
+Atomic. `POST /api/v2/jobs/{id}/take` returns a flat JSON Job plus
+`claim_token`, a per-job capability made from 32 random bytes encoded as
+base64url. The old take endpoint is absent so version-skewed clients fail before
+mutation. A take of a live job returns `held` unless it presents that job's
+matching claim token, which resumes the existing claim. Audit labels never
+grant resume; distinct jobs may be live under one label. The raw token is never
+included in list, show, logs, or notes.
+
+The CLI stores tokens in private XDG state, namespaced by normalized origin and
+job id. It resumes by job id and sends the token automatically without printing
+it. `release`, `renew`, `ask`, `done`, live-job field edits, and live `abandon`
+require the claim token. Missing is `claim_required`; a mismatched or expired
+token is `invalid_claim`. The CLI deletes a token after release, ask, done, or
+abandon.
 
 ## Verbs
 
@@ -69,35 +83,36 @@ Atomic. If you already hold `id`, return it.
 `done` `abandon` `reopen` `set-title` `set-spec` `set-repo` `set-blockers`
 `use` `doctor`
 
-- `ask` releases the lease.
-- `done` and `abandon` clear lease and ask.
+- `ask` releases the lease and clears its claim.
+- `done` and `abandon` clear the lease, claim, and ask.
 - `done` / `abandon` / `ask` / `take` on a terminal job fail `terminal`.
-- Field edits (`set-title`, `set-spec`, `set-repo`, `set-blockers`)
-  require `promote` capability in the job's repository.
-- `note` requires `report` capability in the job's repository.
-- Lifecycle verbs (`take`, `renew`, `release`, `ask`, `answer`, `done`,
-  `abandon`, `reopen`) require `promote` capability in the job's
-  repository.
+- Field edits (`set-title`, `set-spec`, `set-repo`, `set-blockers`) on a live
+  job require both `promote` capability in the job's repository and its claim.
+- `note` requires `report` capability and stays claim-independent so reporters
+  can append evidence to any scoped job.
+- Lifecycle verbs (`renew`, `release`, `ask`, `done`, `abandon`) require
+  `promote` capability and the claim for a live job.
+- A free-job patch or abandon uses `promote` capability without a claim.
 - Creating a job with a nonempty spec is promotion and requires `promote`;
   creating an empty-spec draft requires `report` or `promote`.
-- One live lease per holder identity. Default TTL 4h. No heartbeat.
-- The CLI resolves the holder from `--agent`, `POWDER_AGENT`, config `agent`,
-  then `user@host`. `POWDER_AGENT` is workload identity; `POWDER_API_KEY` is
-  transport authentication. The default is machine-global across repositories;
-  parallel workers use distinct holders and subagents inherit their parent's
-  holder.
+- Default TTL is 4h. There is no heartbeat.
+- `POWDER_AGENT` is optional audit metadata, including the canonical
+  `forest-misty-step/powder` label passed by managed workers; it is never
+  authorization. `POWDER_API_KEY` authenticates transport.
 
 ## Faces
 
 One Go binary. `powder serve` plus HTTP CLI. The client origin is explicit:
 `POWDER_URL` overrides `~/.config/powder/config`; there is no default origin or
-local-ledger fallback. `powder use <url>` writes the config and `powder doctor`
-shows the resolved connection without exposing key material. No `--db` on the
-client. Peek UI is SSR HTML: list, show, create, answer, release. Auth is
-`api-key`, or `none` on loopback.
+local-ledger fallback. Remote origins require HTTPS; HTTP is loopback-only.
+`powder use <url>` writes the normalized config and `powder doctor` shows the
+resolved connection without exposing key material. No `--db` on the client.
+Peek UI is SSR HTML: list, show, create, and answer. Claim-bound
+lifecycle actions stay on the CLI/API, where the claimant can present its token.
+Auth is `api-key`, or `none` on loopback.
 
 ## Non-goals
 
-Ranked `next`, Card/Claim/Run/Event, heartbeats, stored status, criteria
-checklists, parent/epic, labels, kanban, MCP, SSE, direct-SQLite CLI,
-Tailscale auth, Postgres, dispatch, models, telemetry, attachments.
+Ranked `next`, Card/Run/Event, heartbeats, stored status, criteria checklists,
+parent/epic, labels, kanban, MCP, SSE, direct-SQLite CLI, Tailscale auth,
+Postgres, dispatch, models, telemetry, attachments.

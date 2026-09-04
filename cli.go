@@ -166,6 +166,10 @@ func doJSON(method, path string, body any) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	return doJSONWithConfig(cfg, method, path, body)
+}
+
+func doJSONWithConfig(cfg resolvedClientConfig, method, path string, body any) (int, []byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -184,7 +188,13 @@ func doJSON(method, path string, body any) (int, []byte, error) {
 	if cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	}
-	res, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -193,7 +203,180 @@ func doJSON(method, path string, body any) (int, []byte, error) {
 	return res.StatusCode, b, err
 }
 
+func claimForJob(jobID string, required bool) (resolvedClientConfig, string, error) {
+	cfg, err := resolveConnection(true)
+	if err != nil {
+		return resolvedClientConfig{}, "", err
+	}
+	var token string
+	if required {
+		token, err = loadClaimToken(cfg.URL, jobID)
+	} else {
+		token, err = loadOptionalClaimToken(cfg.URL, jobID)
+	}
+	if err != nil {
+		return resolvedClientConfig{}, "", err
+	}
+	return cfg, token, nil
+}
+
+func withOptionalClaim(jobID string, body map[string]any) (resolvedClientConfig, map[string]any, error) {
+	cfg, token, err := claimForJob(jobID, false)
+	if err != nil {
+		return resolvedClientConfig{}, nil, err
+	}
+	body["claim_token"] = token
+	return cfg, body, nil
+}
+
+func successfulHTTP(status int) bool {
+	return status >= 200 && status < 300
+}
+
+func emitClaimResult(status int, raw []byte, origin, jobID, claimToken string, cleanup bool) int {
+	if cleanup && successfulHTTP(status) {
+		if err := deleteClaimTokenIfMatches(origin, jobID, claimToken); err != nil {
+			return fail(err)
+		}
+	}
+	return emit(status, raw)
+}
+
+func emitTakeResult(status int, raw []byte, cfg resolvedClientConfig, jobID string) int {
+	if !successfulHTTP(status) {
+		return emit(status, raw)
+	}
+	var response TakeResult
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return fail(errf("decode", "take response: %s", err))
+	}
+	if strings.TrimSpace(response.ClaimToken) == "" {
+		return fail(errf("claim_state", "take response did not include a claim token"))
+	}
+	if err := saveClaimToken(cfg.URL, jobID, response.ClaimToken); err != nil {
+		rollbackStatus, _, rollbackErr := doJSONWithConfig(
+			cfg,
+			"POST",
+			"/api/jobs/"+url.PathEscape(jobID)+"/release",
+			map[string]any{"claim_token": response.ClaimToken},
+		)
+		if rollbackErr != nil {
+			return fail(errf("claim_state", "%s; release rollback failed: %s", err, rollbackErr))
+		}
+		if !successfulHTTP(rollbackStatus) {
+			return fail(errf("claim_state", "%s; release rollback returned HTTP %d", err, rollbackStatus))
+		}
+		return fail(err)
+	}
+	job, err := json.Marshal(response.Job)
+	if err != nil {
+		return fail(errf("decode", "take response job: %s", err))
+	}
+	return emit(status, job)
+}
+
+func runTake(f *flagset) int {
+	id, err := f.id()
+	if err != nil {
+		return fail(err)
+	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
+	cfg, token, err := claimForJob(id, false)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "POST", "/api/v2/jobs/"+url.PathEscape(id)+"/take", map[string]any{
+		"agent": agent, "claim_token": token,
+	})
+	if err != nil {
+		return fail(err)
+	}
+	return emitTakeResult(st, b, cfg, id)
+}
+
+func runRelease(f *flagset) int {
+	id, err := f.id()
+	if err != nil {
+		return fail(err)
+	}
+	cfg, token, err := claimForJob(id, true)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "POST", "/api/jobs/"+url.PathEscape(id)+"/release", map[string]any{"claim_token": token})
+	if err != nil {
+		return fail(err)
+	}
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
+}
+
+func runRenew(f *flagset) int {
+	id, err := f.id()
+	if err != nil {
+		return fail(err)
+	}
+	agent, err := agentOf(f)
+	if err != nil {
+		return fail(err)
+	}
+	cfg, token, err := claimForJob(id, true)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "POST", "/api/jobs/"+url.PathEscape(id)+"/renew", map[string]any{"agent": agent, "claim_token": token})
+	if err != nil {
+		return fail(err)
+	}
+	return emitClaimResult(st, b, cfg.URL, id, token, false)
+}
+
+func redactClaimTokens(raw []byte) []byte {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return raw
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return []byte(`{"code":"response_redacted","error":"response contained invalid JSON"}`)
+	}
+	if !redactClaimTokenValue(value) {
+		return raw
+	}
+	out, err := json.Marshal(value)
+	if err != nil {
+		return []byte(`{"code":"response_redacted","message":"response could not be emitted safely"}`)
+	}
+	return out
+}
+
+func redactClaimTokenValue(value any) bool {
+	changed := false
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "claim_token" {
+				delete(value, key)
+				changed = true
+				continue
+			}
+			if redactClaimTokenValue(child) {
+				changed = true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if redactClaimTokenValue(child) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
 func emit(status int, raw []byte) int {
+	raw = redactClaimTokens(raw)
 	if status >= 200 && status < 300 {
 		os.Stdout.Write(raw)
 		if len(raw) == 0 || raw[len(raw)-1] != '\n' {
@@ -403,50 +586,6 @@ func runList(f *flagset) int {
 	return emit(st, b)
 }
 
-func runTake(f *flagset) int {
-	id, err := f.id()
-	if err != nil {
-		return fail(err)
-	}
-	agent, err := agentOf(f)
-	if err != nil {
-		return fail(err)
-	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/take", map[string]any{"agent": agent})
-	if err != nil {
-		return fail(err)
-	}
-	return emit(st, b)
-}
-
-func runRelease(f *flagset) int {
-	id, err := f.id()
-	if err != nil {
-		return fail(err)
-	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/release", map[string]any{})
-	if err != nil {
-		return fail(err)
-	}
-	return emit(st, b)
-}
-
-func runRenew(f *flagset) int {
-	id, err := f.id()
-	if err != nil {
-		return fail(err)
-	}
-	agent, err := agentOf(f)
-	if err != nil {
-		return fail(err)
-	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/renew", map[string]any{"agent": agent})
-	if err != nil {
-		return fail(err)
-	}
-	return emit(st, b)
-}
-
 func runNote(f *flagset) int {
 	id, err := f.id()
 	if err != nil {
@@ -474,25 +613,17 @@ func runAsk(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/ask", map[string]any{
-		"agent": agent, "question": f.str("question"),
+	cfg, token, err := claimForJob(id, true)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "POST", "/api/jobs/"+url.PathEscape(id)+"/ask", map[string]any{
+		"agent": agent, "question": f.str("question"), "claim_token": token,
 	})
 	if err != nil {
 		return fail(err)
 	}
-	return emit(st, b)
-}
-
-func runAnswer(f *flagset) int {
-	id, err := f.id()
-	if err != nil {
-		return fail(err)
-	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/answer", map[string]any{"text": f.str("text")})
-	if err != nil {
-		return fail(err)
-	}
-	return emit(st, b)
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
 }
 
 func runDone(f *flagset) int {
@@ -504,13 +635,17 @@ func runDone(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/done", map[string]any{
-		"agent": agent, "proof": f.str("proof"),
+	cfg, token, err := claimForJob(id, true)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "POST", "/api/jobs/"+url.PathEscape(id)+"/done", map[string]any{
+		"agent": agent, "proof": f.str("proof"), "claim_token": token,
 	})
 	if err != nil {
 		return fail(err)
 	}
-	return emit(st, b)
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
 }
 
 func runAbandon(f *flagset) int {
@@ -522,23 +657,15 @@ func runAbandon(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/abandon", map[string]any{"agent": agent})
+	cfg, token, err := claimForJob(id, false)
 	if err != nil {
 		return fail(err)
 	}
-	return emit(st, b)
-}
-
-func runReopen(f *flagset) int {
-	id, err := f.id()
+	st, b, err := doJSONWithConfig(cfg, "POST", "/api/jobs/"+url.PathEscape(id)+"/abandon", map[string]any{"agent": agent, "claim_token": token})
 	if err != nil {
 		return fail(err)
 	}
-	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/reopen", map[string]any{})
-	if err != nil {
-		return fail(err)
-	}
-	return emit(st, b)
+	return emitClaimResult(st, b, cfg.URL, id, token, true)
 }
 
 func runSetTitle(f *flagset) int {
@@ -550,10 +677,11 @@ func runSetTitle(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	title := f.str("title")
-	st, b, err := doJSON("PATCH", "/api/jobs/"+url.PathEscape(id), map[string]any{
-		"agent": agent, "title": title,
-	})
+	cfg, body, err := withOptionalClaim(id, map[string]any{"agent": agent, "title": f.str("title")})
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "PATCH", "/api/jobs/"+url.PathEscape(id), body)
 	if err != nil {
 		return fail(err)
 	}
@@ -569,10 +697,11 @@ func runSetSpec(f *flagset) int {
 	if err != nil {
 		return fail(err)
 	}
-	spec := f.str("spec")
-	st, b, err := doJSON("PATCH", "/api/jobs/"+url.PathEscape(id), map[string]any{
-		"agent": agent, "spec": spec,
-	})
+	cfg, body, err := withOptionalClaim(id, map[string]any{"agent": agent, "spec": f.str("spec")})
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "PATCH", "/api/jobs/"+url.PathEscape(id), body)
 	if err != nil {
 		return fail(err)
 	}
@@ -598,7 +727,11 @@ func runSetRepo(f *flagset) int {
 		repo := f.str("repo")
 		body["repo"] = repo
 	}
-	st, b, err := doJSON("PATCH", "/api/jobs/"+url.PathEscape(id), body)
+	cfg, body, err := withOptionalClaim(id, body)
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "PATCH", "/api/jobs/"+url.PathEscape(id), body)
 	if err != nil {
 		return fail(err)
 	}
@@ -621,9 +754,37 @@ func runSetBlockers(f *flagset) int {
 	if !f.bit("clear") {
 		blocked = splitCSV(f.str("blocked-by"))
 	}
-	st, b, err := doJSON("PATCH", "/api/jobs/"+url.PathEscape(id), map[string]any{
+	cfg, body, err := withOptionalClaim(id, map[string]any{
 		"agent": agent, "blocked_by": blocked, "set_blockers": true,
 	})
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSONWithConfig(cfg, "PATCH", "/api/jobs/"+url.PathEscape(id), body)
+	if err != nil {
+		return fail(err)
+	}
+	return emit(st, b)
+}
+
+func runAnswer(f *flagset) int {
+	id, err := f.id()
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/answer", map[string]any{"text": f.str("text")})
+	if err != nil {
+		return fail(err)
+	}
+	return emit(st, b)
+}
+
+func runReopen(f *flagset) int {
+	id, err := f.id()
+	if err != nil {
+		return fail(err)
+	}
+	st, b, err := doJSON("POST", "/api/jobs/"+url.PathEscape(id)+"/reopen", map[string]any{})
 	if err != nil {
 		return fail(err)
 	}

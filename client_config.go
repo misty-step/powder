@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -130,10 +131,34 @@ func parseConfigValue(value string) (string, error) {
 func validateOrigin(raw string) (string, error) {
 	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Path != "" || u.RawPath != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") || u.Host == "" || u.Hostname() == "" || u.Path != "" || u.RawPath != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "", errf("invalid_origin", "origin must be an http(s) URL without a path, credentials, query, or fragment")
 	}
-	return raw, nil
+	u.Scheme = strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if u.Scheme == "http" && !isLoopbackOriginHost(host) {
+		return "", errf("invalid_origin", "remote Powder origins require https")
+	}
+	port := u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		u.Host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		u.Host = "[" + host + "]"
+	} else {
+		u.Host = host
+	}
+	return u.String(), nil
+}
+
+func isLoopbackOriginHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func resolveConnection(requireOrigin bool) (resolvedClientConfig, error) {
