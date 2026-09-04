@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -69,6 +70,7 @@ func (s *Store) migrate() error {
   lease_agent TEXT,
   lease_principal TEXT,
   lease_until INTEGER,
+  lease_token_hash BLOB,
   ask_question TEXT,
   ask_by TEXT,
   ask_at INTEGER,
@@ -112,6 +114,7 @@ func (s *Store) migrate() error {
 		{"jobs", "created_by", "TEXT"},
 		{"jobs", "promoted_by", "TEXT"},
 		{"jobs", "promoted_at", "INTEGER"},
+		{"jobs", "lease_token_hash", "BLOB"},
 		{"api_keys", "report", "INTEGER NOT NULL DEFAULT 0"},
 		{"api_keys", "promote", "INTEGER NOT NULL DEFAULT 0"},
 		{"api_keys", "repo", "TEXT"},
@@ -366,20 +369,6 @@ func (t *tx) hydrate(id string) (Job, error) {
 	return j, nil
 }
 
-func (t *tx) heldBy(agent string) (string, error) {
-	ms := t.now.UnixMilli()
-	var id string
-	err := t.tx.QueryRow(`
-SELECT id FROM jobs
- WHERE lease_agent = ? AND lease_until > ?
-   AND abandoned = 0 AND proof IS NULL
- LIMIT 1`, agent, ms).Scan(&id)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	return id, err
-}
-
 func (t *tx) touch(id string) error {
 	_, err := t.tx.Exec(`UPDATE jobs SET updated_at = ? WHERE id = ?`, t.now.UnixMilli(), id)
 	return err
@@ -395,18 +384,51 @@ func (t *tx) clearLeaseAsk(id string) error {
 	_, err := t.tx.Exec(`
 UPDATE jobs SET
   lease_agent = NULL, lease_principal = NULL, lease_until = NULL,
+  lease_token_hash = NULL,
   ask_question = NULL, ask_by = NULL, ask_at = NULL,
   updated_at = ?
 WHERE id = ?`, t.now.UnixMilli(), id)
 	return err
 }
 
-func (t *tx) setLease(id, agent, principal string) error {
+func (t *tx) setLease(id, agent, principal, claimToken string) error {
 	until := t.now.Add(t.s.ttl).UnixMilli()
 	_, err := t.tx.Exec(`
-UPDATE jobs SET lease_agent = ?, lease_principal = ?, lease_until = ?, updated_at = ?
-WHERE id = ?`, agent, principal, until, t.now.UnixMilli(), id)
+UPDATE jobs SET lease_agent = ?, lease_principal = ?, lease_until = ?,
+  lease_token_hash = ?, updated_at = ?
+WHERE id = ?`, agent, principal, until, hashClaim(claimToken), t.now.UnixMilli(), id)
 	return err
+}
+
+func (t *tx) claimMatches(j Job, claimToken string) (bool, error) {
+	if strings.TrimSpace(claimToken) == "" || !j.live(t.now) {
+		return false, nil
+	}
+	var stored []byte
+	if err := t.tx.QueryRow(`SELECT lease_token_hash FROM jobs WHERE id = ?`, j.ID).Scan(&stored); err != nil {
+		return false, err
+	}
+	return keyEqual(stored, hashClaim(claimToken)), nil
+}
+
+func (t *tx) requireClaim(j Job, claimToken string) error {
+	if j.terminal() {
+		return errf("terminal", "job %s is terminal", j.ID)
+	}
+	if strings.TrimSpace(claimToken) == "" {
+		return errf("claim_required", "claim token required for job %s", j.ID)
+	}
+	if !j.live(t.now) {
+		return errf("invalid_claim", "claim token is invalid or expired")
+	}
+	matches, err := t.claimMatches(j, claimToken)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return errf("invalid_claim", "claim token is invalid or expired")
+	}
+	return nil
 }
 
 func (s *Store) Create(a authz, id, title, spec string, repo *string, blockedBy []string) (Job, error) {
@@ -689,13 +711,11 @@ func blockedState(j Job, blockers map[string]Job) bool {
 	return false
 }
 
-func (s *Store) Take(a authz, id, agent string) (Job, error) {
+func (s *Store) Take(a authz, id, agent, claimToken string) (Job, string, error) {
 	var out Job
+	var resultToken string
 	var err error
 	err = s.write(func(t *tx) error {
-		if strings.TrimSpace(agent) == "" {
-			return errf("invalid_agent", "agent is required")
-		}
 		j, err := t.load(id)
 		if err != nil {
 			return err
@@ -706,16 +726,17 @@ func (s *Store) Take(a authz, id, agent string) (Job, error) {
 		if j.terminal() {
 			return errf("terminal", "job %s is terminal", id)
 		}
-		if j.live(t.now) && j.Lease.Agent == agent {
-			out, err = t.hydrate(id)
-			return err
-		}
-		held, err := t.heldBy(agent)
-		if err != nil {
-			return err
-		}
-		if held != "" && held != id {
-			return errf("already_holding", "agent %s already holds %s", agent, held)
+		if j.live(t.now) {
+			matches, err := t.claimMatches(j, claimToken)
+			if err != nil {
+				return err
+			}
+			if matches {
+				resultToken = claimToken
+				out, err = t.hydrate(id)
+				return err
+			}
+			return errf("held", "job %s is held", id)
 		}
 		bs, err := t.loadMany(j.BlockedBy)
 		if err != nil {
@@ -725,7 +746,15 @@ func (s *Store) Take(a authz, id, agent string) (Job, error) {
 		if !ok {
 			return errf(code, "take %s failed: %s", id, code)
 		}
-		if err := t.setLease(id, agent, a.ID); err != nil {
+		resultToken, err = randomClaim()
+		if err != nil {
+			return err
+		}
+		agent = strings.TrimSpace(agent)
+		if agent == "" {
+			agent = a.ID
+		}
+		if err := t.setLease(id, agent, a.ID, resultToken); err != nil {
 			return err
 		}
 		if err := t.addNote(id, agent, "took"); err != nil {
@@ -734,10 +763,13 @@ func (s *Store) Take(a authz, id, agent string) (Job, error) {
 		out, err = t.hydrate(id)
 		return err
 	})
-	return out, err
+	if err != nil {
+		resultToken = ""
+	}
+	return out, resultToken, err
 }
 
-func (s *Store) Release(a authz, id string) (Job, error) {
+func (s *Store) Release(a authz, id, claimToken string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
@@ -748,8 +780,12 @@ func (s *Store) Release(a authz, id string) (Job, error) {
 		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
+		if err := t.requireClaim(j, claimToken); err != nil {
+			return err
+		}
 		if _, err := t.tx.Exec(`
-UPDATE jobs SET lease_agent = NULL, lease_principal = NULL, lease_until = NULL, updated_at = ?
+UPDATE jobs SET lease_agent = NULL, lease_principal = NULL, lease_until = NULL,
+  lease_token_hash = NULL, updated_at = ?
 WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 			return err
 		}
@@ -762,18 +798,21 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 	return out, err
 }
 
-func (s *Store) Renew(a authz, id, agent string) (Job, error) {
+func (s *Store) Renew(a authz, id, agent, claimToken string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
-		j, err := t.requireHolder(id, agent)
+		j, err := t.load(id)
 		if err != nil {
 			return err
 		}
 		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
-		if err := t.setLease(id, j.Lease.Agent, j.Lease.Principal); err != nil {
+		if err := t.requireClaim(j, claimToken); err != nil {
+			return err
+		}
+		if err := t.setLease(id, j.Lease.Agent, j.Lease.Principal, claimToken); err != nil {
 			return err
 		}
 		out, err = t.hydrate(id)
@@ -782,51 +821,31 @@ func (s *Store) Renew(a authz, id, agent string) (Job, error) {
 	return out, err
 }
 
-func (t *tx) requireHolder(id, agent string) (Job, error) {
-	j, err := t.load(id)
-	if err != nil {
-		return j, err
-	}
-	if j.terminal() {
-		return j, errf("terminal", "job %s is terminal", id)
-	}
-	if !j.live(t.now) || j.Lease.Agent != agent {
-		return j, errf("not_holder", "agent %s does not hold %s", agent, id)
-	}
-	return j, nil
-}
-
-func (t *tx) requireHolderOrFree(id, agent string) (Job, error) {
-	j, err := t.load(id)
-	if err != nil {
-		return j, err
-	}
-	if j.terminal() {
-		return j, errf("terminal", "job %s is terminal", id)
-	}
-	if j.live(t.now) && j.Lease.Agent != agent {
-		return j, errf("held", "job %s is held by %s", id, j.Lease.Agent)
-	}
-	return j, nil
-}
-
-func (s *Store) Ask(a authz, id, agent, question string) (Job, error) {
+func (s *Store) Ask(a authz, id, agent, claimToken, question string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
 		if strings.TrimSpace(question) == "" {
 			return errf("invalid_ask", "question is required")
 		}
-		j, err := t.requireHolder(id, agent)
+		j, err := t.load(id)
 		if err != nil {
 			return err
 		}
 		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
+		if err := t.requireClaim(j, claimToken); err != nil {
+			return err
+		}
+		agent = strings.TrimSpace(agent)
+		if agent == "" {
+			agent = a.ID
+		}
 		if _, err := t.tx.Exec(`
 UPDATE jobs SET
   lease_agent = NULL, lease_principal = NULL, lease_until = NULL,
+  lease_token_hash = NULL,
   ask_question = ?, ask_by = ?, ask_at = ?, updated_at = ?
 WHERE id = ?`, question, agent, t.now.UnixMilli(), t.now.UnixMilli(), id); err != nil {
 			return err
@@ -871,23 +890,31 @@ WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
 	return out, err
 }
 
-func (s *Store) Done(a authz, id, agent, proof string) (Job, error) {
+func (s *Store) Done(a authz, id, agent, claimToken, proof string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
 		if strings.TrimSpace(proof) == "" {
 			return errf("empty_proof", "proof is required")
 		}
-		j, err := t.requireHolder(id, agent)
+		j, err := t.load(id)
 		if err != nil {
 			return err
 		}
 		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
+		if err := t.requireClaim(j, claimToken); err != nil {
+			return err
+		}
+		agent = strings.TrimSpace(agent)
+		if agent == "" {
+			agent = a.ID
+		}
 		if _, err := t.tx.Exec(`
 UPDATE jobs SET proof = ?, abandoned = 0,
   lease_agent = NULL, lease_principal = NULL, lease_until = NULL,
+  lease_token_hash = NULL,
   ask_question = NULL, ask_by = NULL, ask_at = NULL,
   updated_at = ?
 WHERE id = ?`, proof, t.now.UnixMilli(), id); err != nil {
@@ -902,20 +929,33 @@ WHERE id = ?`, proof, t.now.UnixMilli(), id); err != nil {
 	return out, err
 }
 
-func (s *Store) Abandon(a authz, id, agent string) (Job, error) {
+func (s *Store) Abandon(a authz, id, agent, claimToken string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
-		j, err := t.requireHolderOrFree(id, agent)
+		j, err := t.load(id)
 		if err != nil {
 			return err
 		}
 		if err := a.requirePromote(j.Repo); err != nil {
 			return err
 		}
+		if j.terminal() {
+			return errf("terminal", "job %s is terminal", id)
+		}
+		if j.live(t.now) {
+			if err := t.requireClaim(j, claimToken); err != nil {
+				return err
+			}
+		}
+		agent = strings.TrimSpace(agent)
+		if agent == "" {
+			agent = a.ID
+		}
 		if _, err := t.tx.Exec(`
 UPDATE jobs SET abandoned = 1, proof = NULL,
   lease_agent = NULL, lease_principal = NULL, lease_until = NULL,
+  lease_token_hash = NULL,
   ask_question = NULL, ask_by = NULL, ask_at = NULL,
   updated_at = ?
 WHERE id = ?`, t.now.UnixMilli(), id); err != nil {
@@ -989,18 +1029,26 @@ func (s *Store) Note(a authz, id, agent, text string) (Job, error) {
 	return out, err
 }
 
-func (s *Store) Patch(a authz, id, agent string, title, spec, repo *string, clearRepo bool, blockedBy *[]string) (Job, error) {
+func (s *Store) Patch(a authz, id, agent, claimToken string, title, spec, repo *string, clearRepo bool, blockedBy *[]string) (Job, error) {
 	var out Job
 	var err error
 	err = s.write(func(t *tx) error {
-		j, err := t.requireHolderOrFree(id, agent)
+		j, err := t.load(id)
 		if err != nil {
 			return err
 		}
-		if title != nil {
-			if err := a.requirePromote(j.Repo); err != nil {
+		if err := a.requirePromote(j.Repo); err != nil {
+			return err
+		}
+		if j.terminal() {
+			return errf("terminal", "job %s is terminal", id)
+		}
+		if j.live(t.now) {
+			if err := t.requireClaim(j, claimToken); err != nil {
 				return err
 			}
+		}
+		if title != nil {
 			if strings.TrimSpace(*title) == "" {
 				return errf("invalid_title", "title is required")
 			}
@@ -1009,9 +1057,6 @@ func (s *Store) Patch(a authz, id, agent string, title, spec, repo *string, clea
 			}
 		}
 		if spec != nil {
-			if err := a.requirePromote(j.Repo); err != nil {
-				return err
-			}
 			newSpec := *spec
 			if newSpec != j.Spec {
 				if newSpec != "" && j.PromotedBy == nil {
@@ -1029,9 +1074,6 @@ func (s *Store) Patch(a authz, id, agent string, title, spec, repo *string, clea
 			}
 		}
 		if clearRepo || repo != nil {
-			if err := a.requirePromote(j.Repo); err != nil {
-				return err
-			}
 			newRepo := repoOrNil(repo)
 			if clearRepo {
 				newRepo = nil
@@ -1048,9 +1090,6 @@ func (s *Store) Patch(a authz, id, agent string, title, spec, repo *string, clea
 			}
 		}
 		if blockedBy != nil {
-			if err := a.requirePromote(j.Repo); err != nil {
-				return err
-			}
 			if _, err := t.tx.Exec(`DELETE FROM blockers WHERE job_id = ?`, id); err != nil {
 				return err
 			}
@@ -1115,6 +1154,19 @@ func boolInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func hashClaim(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
+}
+
+func randomClaim() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
 func randomKey() (id, secret string, err error) {

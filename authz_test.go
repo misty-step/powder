@@ -93,7 +93,7 @@ func TestReportOnlyKeyRejectedMutations(t *testing.T) {
 	h.do("POST", "/api/jobs", map[string]any{
 		"id": "work", "title": "work", "spec": "work", "repo": repo,
 	})
-	st, raw = h.doAuth(report, "POST", "/api/jobs/work/take", map[string]any{"agent": "reporter"})
+	st, raw = h.doAuth(report, "POST", "/api/v2/jobs/work/take", map[string]any{"agent": "reporter"})
 	if st != 403 || h.code(raw) != "missing_capability" {
 		t.Fatalf("take: %d %s", st, raw)
 	}
@@ -166,7 +166,7 @@ func TestConcurrentPromotionKeepsOneImmutableFirstPromoter(t *testing.T) {
 		wg.Add(1)
 		go func(p authz) {
 			defer wg.Done()
-			_, _ = h.store.Patch(p, "draft", p.ID, nil, strPtr("spec-"+p.ID), nil, false, nil)
+			_, _ = h.store.Patch(p, "draft", p.ID, "", nil, strPtr("spec-"+p.ID), nil, false, nil)
 		}(p)
 	}
 	wg.Wait()

@@ -71,6 +71,11 @@ type Job struct {
 	Derived    Derived    `json:"derived"`
 }
 
+type TakeResult struct {
+	Job
+	ClaimToken string `json:"claim_token"`
+}
+
 type JobSummary struct {
 	ID         string     `json:"id"`
 	Title      string     `json:"title"`

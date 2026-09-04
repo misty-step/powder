@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net"
@@ -21,12 +23,17 @@ type harness struct {
 	key     string
 	authz   authz
 	secrets map[string]string
+	claims  map[string]string
 	now     time.Time
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, now: time.Date(2026, 8, 17, 21, 0, 0, 0, time.UTC)}
+	h := &harness{
+		t:      t,
+		now:    time.Date(2026, 8, 17, 21, 0, 0, 0, time.UTC),
+		claims: map[string]string{},
+	}
 	st, err := openStore(filepath.Join(t.TempDir(), "powder.db"), time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +63,50 @@ func (h *harness) fatal(err error) {
 
 func (h *harness) do(method, path string, body any) (int, json.RawMessage) {
 	h.t.Helper()
+	return h.doAuth(h.authz, method, path, h.withClaim(method, path, body))
+}
+
+func (h *harness) doRaw(method, path string, body any) (int, json.RawMessage) {
+	h.t.Helper()
 	return h.doAuth(h.authz, method, path, body)
+}
+
+func (h *harness) withClaim(method, path string, body any) any {
+	parts := strings.Split(strings.TrimPrefix(path, "/api/jobs/"), "/")
+	if len(parts) < 1 || parts[0] == "" {
+		return body
+	}
+	id := parts[0]
+	needs := method == http.MethodPatch
+	if len(parts) >= 2 {
+		switch parts[1] {
+		case "release", "renew", "ask", "done", "abandon":
+			needs = true
+		}
+	}
+	if !needs {
+		return body
+	}
+	token := h.claims[id]
+	if token == "" {
+		return body
+	}
+	m, ok := body.(map[string]any)
+	if !ok {
+		if body != nil {
+			return body
+		}
+		m = map[string]any{}
+	}
+	if _, exists := m["claim_token"]; exists {
+		return body
+	}
+	out := make(map[string]any, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	out["claim_token"] = token
+	return out
 }
 
 func (h *harness) doAuth(a authz, method, path string, body any) (int, json.RawMessage) {
@@ -125,12 +175,28 @@ func (h *harness) create(id, spec string, blocked ...string) Job {
 }
 
 func (h *harness) take(id, agent string) (int, Job, string) {
+	return h.takeWithClaim(id, agent, "")
+}
+
+func (h *harness) takeWithClaim(id, agent, claimToken string) (int, Job, string) {
 	h.t.Helper()
-	st, raw := h.do("POST", "/api/jobs/"+id+"/take", map[string]any{"agent": agent})
+	body := map[string]any{"agent": agent}
+	if claimToken != "" {
+		body["claim_token"] = claimToken
+	}
+	st, raw := h.do("POST", "/api/v2/jobs/"+id+"/take", body)
 	if st >= 300 {
 		return st, Job{}, h.code(raw)
 	}
-	return st, h.job(raw), ""
+	var result TakeResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		h.t.Fatalf("decode take: %v %s", err, raw)
+	}
+	if result.ClaimToken == "" {
+		h.t.Fatalf("take %s omitted claim token: %s", id, raw)
+	}
+	h.claims[id] = result.ClaimToken
+	return st, result.Job, ""
 }
 
 func TestHealthz(t *testing.T) {
@@ -154,7 +220,7 @@ func TestEmptySpec(t *testing.T) {
 	}
 }
 
-func TestTakeHeldAlreadyHolding(t *testing.T) {
+func TestTakeClaimPerJobAndNoSameLabelIdempotence(t *testing.T) {
 	h := newHarness(t)
 	h.create("a", "do a")
 	h.create("b", "do b")
@@ -162,13 +228,197 @@ func TestTakeHeldAlreadyHolding(t *testing.T) {
 	if st != 200 || code != "" || !j.Derived.Live {
 		t.Fatalf("take a: %d %s live=%v", st, code, j.Derived.Live)
 	}
+	tokenA := h.claims["a"]
+	decoded, err := base64.RawURLEncoding.DecodeString(tokenA)
+	if err != nil || len(decoded) != 32 {
+		t.Fatalf("claim token shape: %q (%v)", tokenA, err)
+	}
+	var stored []byte
+	if err := h.store.db.QueryRow(`SELECT lease_token_hash FROM jobs WHERE id = ?`, "a").Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(tokenA))
+	if !keyEqual(stored, sum[:]) {
+		t.Fatalf("stored claim hash does not match token")
+	}
+
 	st, _, code = h.take("a", "other")
 	if st != 409 || code != "held" {
-		t.Fatalf("other: %d %s", st, code)
+		t.Fatalf("same job: %d %s", st, code)
 	}
-	st, _, code = h.take("b", "ag")
-	if st != 409 || code != "already_holding" {
-		t.Fatalf("hoard: %d %s", st, code)
+	st, j, code = h.take("b", "ag")
+	if st != 200 || code != "" || !j.Derived.Live {
+		t.Fatalf("different job same label: %d %s", st, code)
+	}
+	if tokenA == h.claims["b"] {
+		t.Fatal("different jobs received the same claim token")
+	}
+}
+
+func TestConcurrentTakesShareLabelsOnlyAcrossJobs(t *testing.T) {
+	h := newHarness(t)
+	h.create("same", "x")
+	h.create("other", "y")
+
+	type result struct {
+		token string
+		err   error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			_, token, err := h.store.Take(h.authz, "same", "worker", "")
+			results <- result{token: token, err: err}
+		}()
+	}
+	var success, held int
+	for range 2 {
+		got := <-results
+		if got.err == nil {
+			success++
+			if got.token == "" {
+				t.Fatal("successful take omitted claim token")
+			}
+			continue
+		}
+		if ce, ok := got.err.(*CodeError); ok && ce.Code == "held" {
+			held++
+		} else {
+			t.Fatalf("concurrent take error: %v", got.err)
+		}
+	}
+	if success != 1 || held != 1 {
+		t.Fatalf("same-job concurrent takes: success=%d held=%d", success, held)
+	}
+	if _, token, err := h.store.Take(h.authz, "other", "worker", ""); err != nil || token == "" {
+		t.Fatalf("same label could not take another job: token=%q err=%v", token, err)
+	}
+}
+
+func TestTakeResumesOnlyWithMatchingClaim(t *testing.T) {
+	h := newHarness(t)
+	h.create("resume", "x")
+	if st, _, code := h.take("resume", "original"); st != 200 {
+		t.Fatalf("initial take: %d %s", st, code)
+	}
+	token := h.claims["resume"]
+
+	st, _, code := h.take("resume", "other")
+	if st != 409 || code != "held" {
+		t.Fatalf("same label without claim: %d %s", st, code)
+	}
+	st, _, code = h.takeWithClaim("resume", "other", "wrong")
+	if st != 409 || code != "held" {
+		t.Fatalf("wrong claim: %d %s", st, code)
+	}
+	st, j, code := h.takeWithClaim("resume", "other", token)
+	if st != 200 || code != "" {
+		t.Fatalf("matching claim: %d %s", st, code)
+	}
+	if j.Lease == nil || j.Lease.Agent != "original" {
+		t.Fatalf("resume changed audit lease: %+v", j.Lease)
+	}
+	if h.claims["resume"] != token {
+		t.Fatalf("resume returned a different claim token")
+	}
+}
+
+func TestLegacyTakeEndpointCannotCreateClaim(t *testing.T) {
+	h := newHarness(t)
+	h.create("legacy", "x")
+
+	st, raw := h.doRaw("POST", "/api/jobs/legacy/take", map[string]any{"agent": "old-client"})
+	if st != http.StatusNotFound {
+		t.Fatalf("legacy take status = %d, body=%s", st, raw)
+	}
+	j, err := h.store.Get("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Derived.Live {
+		t.Fatalf("legacy take created lease: %+v", j.Lease)
+	}
+	if strings.Contains(string(raw), "claim_token") {
+		t.Fatalf("legacy take exposed claim response: %s", raw)
+	}
+}
+
+func TestMigratedLiveLeaseWaitsForExpiryWithoutClaimHash(t *testing.T) {
+	h := newHarness(t)
+	h.create("migrated", "x")
+	if st, _, code := h.take("migrated", "old-client"); st != http.StatusOK {
+		t.Fatalf("take: %d %s", st, code)
+	}
+	oldToken := h.claims["migrated"]
+	if _, err := h.store.db.Exec(`UPDATE jobs SET lease_token_hash = NULL WHERE id = ?`, "migrated"); err != nil {
+		t.Fatal(err)
+	}
+
+	if st, _, code := h.takeWithClaim("migrated", "new-client", oldToken); st != http.StatusConflict || code != "held" {
+		t.Fatalf("resume migrated lease: %d %s", st, code)
+	}
+	st, raw := h.doRaw("POST", "/api/jobs/migrated/done", map[string]any{
+		"agent": "new-client", "proof": "proof", "claim_token": oldToken,
+	})
+	if st != http.StatusConflict || h.code(raw) != "invalid_claim" {
+		t.Fatalf("finish migrated lease: %d %s", st, raw)
+	}
+
+	h.now = h.now.Add(time.Hour + time.Millisecond)
+	if st, _, code := h.take("migrated", "new-client"); st != http.StatusOK {
+		t.Fatalf("take after migrated lease expiry: %d %s", st, code)
+	}
+	if h.claims["migrated"] == oldToken {
+		t.Fatal("take after expiry reused the old claim")
+	}
+}
+
+func TestClaimRequiredAndInvalidClaim(t *testing.T) {
+	h := newHarness(t)
+	h.create("claim", "x")
+	h.take("claim", "worker")
+	proof := map[string]any{"agent": "worker", "proof": "proof"}
+
+	st, raw := h.doRaw("POST", "/api/jobs/claim/done", proof)
+	if st != 409 || h.code(raw) != "claim_required" {
+		t.Fatalf("missing claim: %d %s", st, raw)
+	}
+	proof["claim_token"] = "wrong"
+	st, raw = h.doRaw("POST", "/api/jobs/claim/done", proof)
+	if st != 409 || h.code(raw) != "invalid_claim" {
+		t.Fatalf("wrong claim: %d %s", st, raw)
+	}
+	proof["claim_token"] = h.claims["claim"]
+	st, raw = h.doRaw("POST", "/api/jobs/claim/done", proof)
+	if st != 200 {
+		t.Fatalf("valid claim: %d %s", st, raw)
+	}
+	var cleared []byte
+	if err := h.store.db.QueryRow(`SELECT lease_token_hash FROM jobs WHERE id = ?`, "claim").Scan(&cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared != nil {
+		t.Fatalf("lease hash survived clear: %x", cleared)
+	}
+}
+
+func TestClaimTokenNeverLeaksFromShowOrList(t *testing.T) {
+	h := newHarness(t)
+	h.create("secret", "x")
+	h.take("secret", "worker")
+	token := h.claims["secret"]
+	for _, path := range []string{"/api/jobs/secret", "/api/jobs", "/api/jobs?summary=1"} {
+		st, raw := h.do("GET", path, nil)
+		if st != 200 {
+			t.Fatalf("%s: %d %s", path, st, raw)
+		}
+		if strings.Contains(string(raw), "claim_token") || strings.Contains(string(raw), token) {
+			t.Fatalf("%s leaked claim token: %s", path, raw)
+		}
+	}
+	show := h.html("/jobs/secret")
+	if strings.Contains(show, "claim_token") || strings.Contains(show, token) {
+		t.Fatalf("peek leaked claim token: %s", show)
 	}
 }
 
@@ -312,9 +562,14 @@ func TestAlreadyTerminal(t *testing.T) {
 	h.create("a", "x")
 	h.take("a", "ag")
 	h.do("POST", "/api/jobs/a/done", map[string]any{"agent": "ag", "proof": "p"})
-	for _, path := range []string{"/take", "/done", "/abandon", "/ask"} {
+	for _, path := range []string{
+		"/api/v2/jobs/a/take",
+		"/api/jobs/a/done",
+		"/api/jobs/a/abandon",
+		"/api/jobs/a/ask",
+	} {
 		body := map[string]any{"agent": "ag", "proof": "x", "question": "q"}
-		st, raw := h.do("POST", "/api/jobs/a"+path, body)
+		st, raw := h.do("POST", path, body)
 		if st != 409 || h.code(raw) != "terminal" {
 			t.Fatalf("%s: %d %s", path, st, raw)
 		}
@@ -328,7 +583,7 @@ func TestTTLExpiry(t *testing.T) {
 	h.take("ttl", "ticker")
 	h.now = h.now.Add(2 * time.Hour)
 	st, raw := h.do("POST", "/api/jobs/ttl/done", map[string]any{"agent": "ticker", "proof": "late"})
-	if st != 409 || h.code(raw) != "not_holder" {
+	if st != 409 || h.code(raw) != "invalid_claim" {
 		t.Fatalf("done after ttl: %d %s", st, raw)
 	}
 	st, _, code := h.take("ttl", "ticker")
@@ -513,6 +768,41 @@ func TestPeekRendersJobs(t *testing.T) {
 	}
 }
 
+func TestPeekAnswersWaitingJob(t *testing.T) {
+	h := newHarness(t)
+	h.create("waiting", "needs input")
+	if st, _, code := h.take("waiting", "worker"); st != http.StatusOK {
+		t.Fatalf("take: %d %s", st, code)
+	}
+	if st, raw := h.do("POST", "/api/jobs/waiting/ask", map[string]any{
+		"agent": "worker", "question": "continue?",
+	}); st != http.StatusOK {
+		t.Fatalf("ask: %d %s", st, raw)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.srv.URL+"/jobs/waiting/answer", strings.NewReader("text=yes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.key)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res, err := h.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("answer status = %d", res.StatusCode)
+	}
+	j, err := h.store.Get("waiting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Ask != nil {
+		t.Fatalf("answer left job waiting: %#v", j.Ask)
+	}
+}
+
 func TestPatchOmitClearSet(t *testing.T) {
 	h := newHarness(t)
 	h.create("blk", "x")
@@ -524,7 +814,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	repo := "new/repo"
-	j, err := h.store.Patch(h.authz, "p", "ag", nil, nil, &repo, false, nil)
+	j, err := h.store.Patch(h.authz, "p", "ag", "", nil, nil, &repo, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,7 +825,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 		t.Fatalf("omit blockers: %v", j.BlockedBy)
 	}
 
-	j, err = h.store.Patch(h.authz, "p", "ag", nil, nil, nil, true, nil)
+	j, err = h.store.Patch(h.authz, "p", "ag", "", nil, nil, nil, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +834,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	title := "q"
-	j, err = h.store.Patch(h.authz, "p", "ag", &title, nil, nil, false, nil)
+	j, err = h.store.Patch(h.authz, "p", "ag", "", &title, nil, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +843,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	blocks := []string{"blk"}
-	j, err = h.store.Patch(h.authz, "p", "ag", nil, nil, nil, false, &blocks)
+	j, err = h.store.Patch(h.authz, "p", "ag", "", nil, nil, nil, false, &blocks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +852,7 @@ func TestPatchOmitClearSet(t *testing.T) {
 	}
 
 	empty := []string{}
-	j, err = h.store.Patch(h.authz, "p", "ag", nil, nil, nil, false, &empty)
+	j, err = h.store.Patch(h.authz, "p", "ag", "", nil, nil, nil, false, &empty)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,10 +902,10 @@ func TestEmptyRepoIsNull(t *testing.T) {
 		t.Fatalf("create empty repo: %#v", j.Repo)
 	}
 	repo := "x/y"
-	if _, err := h.store.Patch(h.authz, "e", "ag", nil, nil, &repo, false, nil); err != nil {
+	if _, err := h.store.Patch(h.authz, "e", "ag", "", nil, nil, &repo, false, nil); err != nil {
 		t.Fatal(err)
 	}
-	j, err = h.store.Patch(h.authz, "e", "ag", nil, nil, &empty, false, nil)
+	j, err = h.store.Patch(h.authz, "e", "ag", "", nil, nil, &empty, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

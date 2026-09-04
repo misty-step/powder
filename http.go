@@ -44,7 +44,7 @@ func (s *server) handler() http.Handler {
 	api.HandleFunc("GET /jobs/{id}", s.apiAuthn(s.apiGet))
 	api.HandleFunc("GET /principal", s.apiAuthn(s.apiPrincipal))
 	api.HandleFunc("PATCH /jobs/{id}", s.apiAuthn(s.apiPatch))
-	api.HandleFunc("POST /jobs/{id}/take", s.apiAuthn(s.apiTake))
+	api.HandleFunc("POST /v2/jobs/{id}/take", s.apiAuthn(s.apiTake))
 	api.HandleFunc("POST /jobs/{id}/release", s.apiAuthn(s.apiRelease))
 	api.HandleFunc("POST /jobs/{id}/renew", s.apiAuthn(s.apiRenew))
 	api.HandleFunc("POST /jobs/{id}/note", s.apiAuthn(s.apiNote))
@@ -61,7 +61,6 @@ func (s *server) handler() http.Handler {
 	ui.HandleFunc("POST /jobs", s.uiAuthn(s.uiCreate))
 	ui.HandleFunc("GET /jobs/{id}", s.uiAuthn(s.uiShow))
 	ui.HandleFunc("POST /jobs/{id}/answer", s.uiAuthn(s.uiAnswer))
-	ui.HandleFunc("POST /jobs/{id}/release", s.uiAuthn(s.uiRelease))
 	mux.Handle("/", ui)
 
 	return mux
@@ -235,16 +234,6 @@ func (s *server) uiAnswer(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
 }
 
-func (s *server) uiRelease(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	_, err := s.store.Release(authzOf(r), id)
-	if err != nil {
-		http.Error(w, err.Error(), statusOf(err))
-		return
-	}
-	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
-}
-
 func (s *server) apiList(w http.ResponseWriter, r *http.Request) {
 	f, err := listFilterFromQuery(r.URL.Query())
 	if err != nil {
@@ -306,13 +295,14 @@ func (s *server) apiPrincipal(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) apiPatch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Agent     string   `json:"agent"`
-		Title     *string  `json:"title"`
-		Spec      *string  `json:"spec"`
-		Repo      *string  `json:"repo"`
-		ClearRepo bool     `json:"clear_repo"`
-		BlockedBy []string `json:"blocked_by"`
-		SetBlocks *bool    `json:"set_blockers"`
+		Agent      string   `json:"agent"`
+		ClaimToken string   `json:"claim_token"`
+		Title      *string  `json:"title"`
+		Spec       *string  `json:"spec"`
+		Repo       *string  `json:"repo"`
+		ClearRepo  bool     `json:"clear_repo"`
+		BlockedBy  []string `json:"blocked_by"`
+		SetBlocks  *bool    `json:"set_blockers"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
@@ -329,7 +319,8 @@ func (s *server) apiPatch(w http.ResponseWriter, r *http.Request) {
 	} else if body.BlockedBy != nil {
 		blocks = &body.BlockedBy
 	}
-	j, err := s.store.Patch(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.Title, body.Spec, body.Repo, body.ClearRepo, blocks)
+	j, err := s.store.Patch(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.ClaimToken,
+		body.Title, body.Spec, body.Repo, body.ClearRepo, blocks)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -339,22 +330,30 @@ func (s *server) apiPatch(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) apiTake(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Agent string `json:"agent"`
+		Agent      string `json:"agent"`
+		ClaimToken string `json:"claim_token"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Take(authzOf(r), r.PathValue("id"), body.Agent)
+	j, claimToken, err := s.store.Take(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.ClaimToken)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
 	}
-	writeJSON(w, 200, j)
+	writeJSON(w, 200, TakeResult{Job: j, ClaimToken: claimToken})
 }
 
 func (s *server) apiRelease(w http.ResponseWriter, r *http.Request) {
-	j, err := s.store.Release(authzOf(r), r.PathValue("id"))
+	var body struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
+		return
+	}
+	j, err := s.store.Release(authzOf(r), r.PathValue("id"), body.ClaimToken)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -364,10 +363,14 @@ func (s *server) apiRelease(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) apiRenew(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Agent string `json:"agent"`
+		Agent      string `json:"agent"`
+		ClaimToken string `json:"claim_token"`
 	}
-	_ = decodeJSON(r, &body)
-	j, err := s.store.Renew(authzOf(r), r.PathValue("id"), actor(r, body.Agent))
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
+		return
+	}
+	j, err := s.store.Renew(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.ClaimToken)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -394,14 +397,15 @@ func (s *server) apiNote(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) apiAsk(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Agent    string `json:"agent"`
-		Question string `json:"question"`
+		Agent      string `json:"agent"`
+		ClaimToken string `json:"claim_token"`
+		Question   string `json:"question"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Ask(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.Question)
+	j, err := s.store.Ask(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.ClaimToken, body.Question)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -427,14 +431,15 @@ func (s *server) apiAnswer(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) apiDone(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Agent string `json:"agent"`
-		Proof string `json:"proof"`
+		Agent      string `json:"agent"`
+		ClaimToken string `json:"claim_token"`
+		Proof      string `json:"proof"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
 		return
 	}
-	j, err := s.store.Done(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.Proof)
+	j, err := s.store.Done(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.ClaimToken, body.Proof)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -444,10 +449,14 @@ func (s *server) apiDone(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) apiAbandon(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Agent string `json:"agent"`
+		Agent      string `json:"agent"`
+		ClaimToken string `json:"claim_token"`
 	}
-	_ = decodeJSON(r, &body)
-	j, err := s.store.Abandon(authzOf(r), r.PathValue("id"), actor(r, body.Agent))
+	if err := decodeJSON(r, &body); err != nil {
+		writeErr(w, 400, errf("invalid_json", "%s", err.Error()))
+		return
+	}
+	j, err := s.store.Abandon(authzOf(r), r.PathValue("id"), actor(r, body.Agent), body.ClaimToken)
 	if err != nil {
 		writeErr(w, statusOf(err), err)
 		return
@@ -499,9 +508,7 @@ func statusOf(err error) int {
 		return 401
 	case "missing_capability", "repo_scope":
 		return 403
-	case "exists":
-		return 409
-	case "empty_spec", "blocked", "waiting", "held", "already_holding", "terminal", "not_holder", "not_waiting", "empty_proof":
+	case "exists", "empty_spec", "blocked", "waiting", "held", "claim_required", "invalid_claim", "terminal", "not_waiting", "empty_proof":
 		return 409
 	case "invalid_id", "invalid_title", "invalid_agent", "invalid_ask", "invalid_note", "invalid_json":
 		return 400
@@ -754,11 +761,6 @@ button.textish {
 {{if .Ask}}<p class="wait">Ask from <span class="id">{{.Ask.By}}</span>: {{.Ask.Question}}</p>{{end}}
 {{if .Proof}}<p>Proof: {{.Proof}}</p>{{end}}
 <div class="spec">{{.Spec}}</div>
-<div class="row">
-{{if .Derived.Live}}
-  <form method="post" action="/jobs/{{.ID}}/release"><button id="release" type="submit">Release</button></form>
-{{end}}
-</div>
 {{if .Derived.Waiting}}
 <form class="stack" method="post" action="/jobs/{{.ID}}/answer">
   <label for="text">Answer</label>
